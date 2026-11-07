@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -208,6 +209,39 @@ struct BufferCacheTestAccess {
 
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
+  }
+
+  static void NoteHotReadback(BufferCache &cache, uint64_t address, uint64_t size) {
+    cache.NoteHotReadback(address, size);
+  }
+
+  static size_t BufferCount(const BufferCache &cache) {
+    return cache.m_buffers.size();
+  }
+
+  // Called immediately after cache construction, before any download reservation.
+  static void ReplaceDownloadBuffer(BufferCache &cache, uint64_t size) {
+    std::destroy_at(&cache.m_download_buffer);
+    std::construct_at(&cache.m_download_buffer, cache.m_graphics, cache.m_scheduler,
+                      MemoryUsage::Download, size);
+  }
+
+  static size_t HotReadbackCount(const BufferCache &cache) {
+    return cache.m_hot_readbacks.Size();
+  }
+
+  static bool HotReadbackTick(const BufferCache &cache, uint64_t address,
+                              uint64_t &tick) {
+    return cache.m_hot_readbacks.TickOf(address, tick);
+  }
+
+  static const RecentGpuWriteRing &RecentWrites(const BufferCache &cache) {
+    return cache.m_recent_writes;
+  }
+
+  // Forgets every recent write, for tests that must observe the hot table alone.
+  static void ClearRecentWrites(BufferCache &cache) {
+    cache.m_recent_writes = RecentGpuWriteRing{};
   }
 };
 
@@ -4446,6 +4480,187 @@ public:
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  /// Maps guest memory, loads the flag, then drives real readbacks through ReadMemory and checks
+  /// what the hot table recorded. The scenario helper holds the checks.
+  void CheckHotReadbackRecording(bool flag_enabled) {
+    constexpr const char *name = "HotReadbackRecording";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.batch_hot_readbacks = flag_enabled;
+    Config::Load(options);
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "hot-readback direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "hot-readback fixed direct-memory mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      context.MapMemory(base, allocation_size);
+      CheckHotReadbackScenario(context, flag_enabled, base);
+      CheckRecentWriteScenario(context, flag_enabled, base);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "hot-readback mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "hot-readback allocation release failed");
+    options.batch_hot_readbacks = false;
+    Config::Load(options);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  /// Reads back a clean region and then a GPU-written one, checking what the hot table recorded.
+  void CheckHotReadbackScenario(RenderContext &context, bool flag_enabled,
+                                uint64_t base) {
+    constexpr const char *name = "HotReadbackRecording";
+    constexpr uint64_t dirty_offset = 0x1000;
+    constexpr uint64_t clean_offset = 0x100000;
+    constexpr uint64_t region_size = 0x1000;
+    constexpr uint64_t value_offset = 0x10;
+    constexpr uint32_t stale_value = 0x0badf00du;
+    constexpr uint32_t gpu_value = 0x13572468u;
+    auto &cache = context.GetBufferCache();
+    auto &scheduler = context.GetCommandScheduler();
+    Libs::LibKernel::Memory::WriteBacking(base + dirty_offset + value_offset,
+                                          &stale_value, sizeof(stale_value));
+
+    // The clean region differs from the dirty one only in having no GPU-written bytes.
+    (void)cache.FindBuffer(base + clean_offset, region_size);
+    cache.ReadMemory(base + clean_offset, sizeof(gpu_value));
+    Require(name, "clean readback records nothing",
+            BufferCacheTestAccess::HotReadbackCount(cache) == 0,
+            "a readback with nothing to download should not mark a buffer hot");
+
+    Require(name, "dirty allocation",
+            cache.ObtainBuffer(base + dirty_offset, region_size, true, false).first != nullptr,
+            "hot-readback buffer allocation failed");
+    cache.FillBuffer(base + dirty_offset + value_offset, sizeof(gpu_value), gpu_value, false);
+    // A CPU-side fill would put the value in guest memory without any readback, so the published
+    // value below only proves a download if the bytes were GPU-written first.
+    Require(name, "dirty before readback",
+            cache.IsRegionGpuModified(base + dirty_offset + value_offset, sizeof(gpu_value)),
+            "the fill did not leave GPU-written bytes to read back");
+    const auto tick_before = scheduler.CurrentTick();
+    cache.ReadMemory(base + dirty_offset + value_offset, sizeof(gpu_value));
+    uint32_t published = 0;
+    std::memcpy(&published, reinterpret_cast<void *>(base + dirty_offset + value_offset),
+                sizeof(published));
+    Require(name, "readback ran", published == gpu_value,
+            "the GPU write should have been downloaded, or the test checks nothing");
+    CheckHotReadbackEntry(cache, flag_enabled, base + dirty_offset, region_size, tick_before,
+                          scheduler.CurrentTick());
+  }
+
+  /// Obtains a large write, a read and a small write in one region and checks which of them the
+  /// recent write ring recorded. Counts are compared with the count before each step, because the
+  /// hot readback scenario before this one may have recorded writes of its own.
+  void CheckRecentWriteScenario(RenderContext &context, bool flag_enabled, uint64_t base) {
+    constexpr const char *name = "RecentWriteRecording";
+    constexpr uint64_t region_offset = 0x140000;
+    constexpr uint64_t large_size = 2 * RecentWriteMaxBytes;
+    constexpr uint64_t small_size = TRACKER_PAGE_SIZE;
+    constexpr uint64_t span_offset = region_offset + small_size;
+    auto &cache = context.GetBufferCache();
+    const auto &ring = BufferCacheTestAccess::RecentWrites(cache);
+    const auto count_before = ring.Size();
+    // With the flag off nothing is recorded at all, so the flag-on run is what proves the two
+    // checks below.
+    (void)cache.ObtainBuffer(base + region_offset, large_size, true, false);
+    Require(name, "large write is not recorded", ring.Size() == count_before,
+            "a write over RecentWriteMaxBytes should not enter the ring");
+    // A clean read could be served from the stream buffer without reaching the recording code,
+    // so the read span must be GPU-dirty for the next check to mean anything.
+    Require(name, "read span is GPU-dirty",
+            cache.IsRegionGpuModified(base + span_offset, small_size),
+            "the large write should have left the read span GPU-dirty");
+    (void)cache.ObtainBuffer(base + span_offset, small_size, false, false);
+    Require(name, "read is not recorded", ring.Size() == count_before,
+            "only written buffers should enter the ring");
+    // Only the is_written argument differs from the read above.
+    const auto write_tick = context.GetCommandScheduler().CurrentTick();
+    (void)cache.ObtainBuffer(base + span_offset, small_size, true, false);
+    if (!flag_enabled) {
+      Require(name, "flag off records nothing", ring.Size() == 0,
+              "only --batch-hot-readbacks should record recent writes");
+      std::printf("[host]    %-32s ok\n", name);
+      return;
+    }
+    CheckRecentWriteNewest(ring, count_before + 1, base + span_offset, small_size, write_tick);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  /// Checks that the ring holds the expected count and that its newest entry is the given span,
+  /// finished at the given tick and not before it.
+  static void CheckRecentWriteNewest(const RecentGpuWriteRing &ring, size_t expected_count,
+                                     uint64_t address, uint64_t size, uint64_t tick) {
+    constexpr const char *name = "RecentWriteRecording";
+    uint64_t newest_address = 0;
+    uint64_t newest_size = 0;
+    bool finished_at_tick = false;
+    ring.ForEachNewest(tick, [&](uint64_t span_address, uint64_t span_size, bool finished) {
+      newest_address = span_address;
+      newest_size = span_size;
+      finished_at_tick = finished;
+      return false;
+    });
+    bool finished_before = true;
+    ring.ForEachNewest(tick - 1, [&](uint64_t, uint64_t, bool finished) {
+      finished_before = finished;
+      return false;
+    });
+    Require(name, "small write is recorded",
+            ring.Size() == expected_count && newest_address == address && newest_size == size,
+            "a small written buffer should become the newest ring entry");
+    // A tick of zero or a fixed constant would fail one side of this window.
+    Require(name, "recorded tick is the write tick", tick > 0 && finished_at_tick && !finished_before,
+            "the entry should carry the scheduler tick of the write");
+  }
+
+  /// Checks the hot table after the dirty readback. With the flag on it holds one entry for the
+  /// buffer start whose tick lies in the readback window, and with it off the table is empty.
+  void CheckHotReadbackEntry(BufferCache &cache, bool flag_enabled, uint64_t address,
+                             uint64_t size, uint64_t tick_before, uint64_t tick_after) {
+    constexpr const char *name = "HotReadbackRecording";
+    const auto count = BufferCacheTestAccess::HotReadbackCount(cache);
+    if (!flag_enabled) {
+      Require(name, "flag off records nothing", count == 0,
+              "only --batch-hot-readbacks should record hot readbacks");
+      return;
+    }
+    const auto buffer_address = cache.GetBuffer(cache.FindBuffer(address, size)).CpuAddress();
+    uint64_t tick = 0;
+    const bool found = BufferCacheTestAccess::HotReadbackTick(cache, buffer_address, tick);
+    Require(name, "dirty readback records the buffer start",
+            count == 1 && found, "the readback should record exactly one entry for its buffer");
+    // A start tick of zero would let a recorded constant of zero pass the window check.
+    Require(name, "recorded tick is the readback tick",
+            tick_before > 0 && tick >= tick_before && tick <= tick_after,
+            "the entry should carry the scheduler tick of the readback");
   }
 
   void CheckBufferCacheDirtyGarbageCollection() {
@@ -23380,6 +23595,691 @@ private:
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
+
+// A guest memory mapping with a render context, for tests that fault GPU-written buffers through
+// the real ReadMemory path. The flag is loaded before the context so the cache reads it.
+class HotBatchBed {
+public:
+  static constexpr uintptr_t Base = 0x0000000208000000ull;
+  static constexpr uint64_t MappingSize = 0x1000000;
+  static constexpr uint64_t Alignment = 0x10000;
+  static constexpr uint64_t SmallRegion = 0x1000;
+  static constexpr uint64_t BigRegion = 0x100000;
+  static constexpr uint32_t StaleValue = 0x0badf00du;
+
+  HotBatchBed(GraphicContext &graphics, bool flag_enabled)
+      : context((LoadConfig(flag_enabled), graphics)) {
+    constexpr const char *name = "HotBatchBed";
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                MappingSize, Alignment, 0, &m_direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(Base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, MappingSize, 0x3, 0x10, m_direct_offset, Alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(Base),
+            "fixed direct-memory mapping failed");
+    auto &scheduler = context.GetCommandScheduler();
+    scheduler.Begin(m_registers, m_user_config, m_shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(Base, MappingSize);
+    Common::DebugCounters::SetEnabled(true);
+  }
+
+  ~HotBatchBed() {
+    Common::DebugCounters::SetEnabled(false);
+    context.UnmapMemory(Base, MappingSize);
+    context.GetCommandScheduler().Finish();
+    context.ShutdownGpu();
+    Require("HotBatchBed", "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(Base, MappingSize) == 0,
+            "mapping release failed");
+    Require("HotBatchBed", "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(m_direct_offset,
+                                                               MappingSize) == 0,
+            "allocation release failed");
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    Config::Load(options);
+  }
+
+  HotBatchBed(const HotBatchBed &) = delete;
+  HotBatchBed &operator=(const HotBatchBed &) = delete;
+
+  BufferCache &Cache() { return context.GetBufferCache(); }
+  CommandScheduler &Scheduler() { return context.GetCommandScheduler(); }
+  static uint64_t Address(uint64_t offset) { return Base + offset; }
+
+  // Writes a stale value to the backing, then makes the GPU write the new value over a region.
+  void GpuWrite(uint64_t offset, uint64_t size, uint32_t value) {
+    Libs::LibKernel::Memory::WriteBacking(Address(offset), &StaleValue, sizeof(StaleValue));
+    Require("HotBatchBed", "gpu write allocation",
+            Cache().ObtainBuffer(Address(offset), size, true, false).first != nullptr,
+            "buffer allocation for a GPU write failed");
+    Cache().FillBuffer(Address(offset), size, value, false);
+  }
+
+  [[nodiscard]] uint32_t Backing(uint64_t offset) const {
+    // Reads the backing directly, because touching a GPU-dirty guest page would fault and
+    // download it, which is the very thing these tests observe.
+    uint32_t value = 0;
+    Require("HotBatchBed", "backing read",
+            Libs::LibKernel::Memory::TryReadSparseBacking(Address(offset), &value, sizeof(value)),
+            "the guest backing could not be read");
+    return value;
+  }
+
+  [[nodiscard]] bool Dirty(uint64_t offset, uint64_t size) {
+    return Cache().IsRegionGpuModified(Address(offset), size);
+  }
+
+  // Faults a word and returns how many queue submits that readback caused.
+  uint64_t Fault(uint64_t offset) {
+    const auto before = Common::DebugCounters::Get(Common::DebugCounters::Counter::QueueSubmits);
+    Cache().ReadMemory(Address(offset), sizeof(uint32_t));
+    return Common::DebugCounters::Get(Common::DebugCounters::Counter::QueueSubmits) - before;
+  }
+
+  // Writes a region on the GPU, then reads it back once so its buffer becomes hot.
+  void MakeHot(uint64_t offset, uint64_t size, uint32_t value) {
+    GpuWrite(offset, size, value);
+    (void)Fault(offset);
+  }
+
+  // Submits empty commands so the scheduler tick moves forward.
+  void AdvanceTicks(uint64_t count) {
+    for (uint64_t index = 0; index < count; ++index) {
+      Scheduler().Flush();
+    }
+  }
+
+  RenderContext context;
+
+private:
+  static void LoadConfig(bool flag_enabled) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.batch_hot_readbacks = flag_enabled;
+    Config::Load(options);
+  }
+
+  int64_t m_direct_offset = -1;
+  HW::Context m_registers{};
+  HW::UserConfig m_user_config{};
+  HW::Shader m_shaders{};
+};
+
+namespace HotBatchOffsets {
+constexpr uint64_t Faulting = 0x0;
+constexpr uint64_t Hot = 0x100000;
+constexpr uint64_t Neighbour = Hot + 0x4000;
+constexpr uint64_t SecondHot = 0x200000;
+constexpr uint32_t FirstValue = 0x11111111u;
+constexpr uint32_t SecondValue = 0x22222222u;
+constexpr uint32_t ThirdValue = 0x33333333u;
+constexpr uint32_t FaultingValue = 0x44444444u;
+} // namespace HotBatchOffsets
+
+// Reads back a faulting buffer after a hot one was rewritten. Returns the submits that the
+// faulting readback cost, and fills in what the hot buffer looked like afterwards.
+struct HotBatchOutcome {
+  uint64_t faulting_submits = 0;
+  uint64_t hot_fault_submits = 0;
+  uint32_t hot_backing = 0;
+  bool hot_dirty = false;
+};
+
+HotBatchOutcome RunHotBatch(VulkanHarness &harness, bool flag_enabled, uint64_t entry_age) {
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), flag_enabled);
+  bed.MakeHot(Hot, HotBatchBed::SmallRegion, FirstValue);
+  bed.GpuWrite(Hot, HotBatchBed::SmallRegion, SecondValue);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  if (entry_age != 0) {
+    // The fault below collects at the current tick, so land the hot entry on an exact age.
+    uint64_t entry_tick = 0;
+    Require("HotBatch", "hot entry recorded",
+            BufferCacheTestAccess::HotReadbackTick(bed.Cache(), HotBatchBed::Address(Hot),
+                                                   entry_tick) &&
+                bed.Scheduler().CurrentTick() <= entry_tick + entry_age,
+            "the hot entry should exist and be no older than the age under test");
+    bed.AdvanceTicks(entry_tick + entry_age - bed.Scheduler().CurrentTick());
+    // The advanced ticks finish the hot buffer's rewrite, so the recent write ring would download
+    // it whatever its hot entry's age. Clearing the ring keeps these runs about the hot table.
+    BufferCacheTestAccess::ClearRecentWrites(bed.Cache());
+  }
+  HotBatchOutcome outcome;
+  outcome.faulting_submits = bed.Fault(Faulting);
+  Require("HotBatch", "faulting buffer published",
+          bed.Backing(Faulting) == FaultingValue && !bed.Dirty(Faulting, 4),
+          "the faulting readback should still download its own buffer");
+  outcome.hot_backing = bed.Backing(Hot);
+  outcome.hot_dirty = bed.Dirty(Hot, HotBatchBed::SmallRegion);
+  outcome.hot_fault_submits = bed.Fault(Hot);
+  return outcome;
+}
+
+// T1 and T2. A readback that waits also clears a recently read-back buffer, and one that is
+// older than HotReadbackTicks is left alone.
+void CheckHotBatchCoDownload(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchCoDownload";
+  using namespace HotBatchOffsets;
+  const auto off = RunHotBatch(harness, false, 0);
+  Require(name, "flag off leaves the hot buffer stale",
+          off.hot_backing != SecondValue && off.hot_dirty && off.hot_fault_submits > 0,
+          "without the flag only the faulting buffer should be downloaded");
+  const auto on = RunHotBatch(harness, true, 0);
+  Require(name, "flag on downloads the hot buffer in the same wait",
+          on.hot_backing == SecondValue && !on.hot_dirty,
+          "the hot buffer's GPU write should have been downloaded with the faulting one");
+  Require(name, "the hot buffer's next fault costs no submit", on.hot_fault_submits == 0,
+          "a co-downloaded buffer should fault without waiting");
+  Require(name, "the batch shares one wait", on.faulting_submits == off.faulting_submits,
+          "the co-download should not add a GPU wait");
+  // The ages straddle the limit by one tick, so a comparison off by one fails one of them.
+  const auto at_limit = RunHotBatch(harness, true, HotReadbackTicks);
+  Require(name, "an entry at the age limit is co-downloaded",
+          at_limit.hot_backing == SecondValue && !at_limit.hot_dirty,
+          "a buffer exactly HotReadbackTicks old should still be hot");
+  const auto aged = RunHotBatch(harness, true, HotReadbackTicks + 1);
+  Require(name, "an aged entry is not co-downloaded",
+          aged.hot_backing != SecondValue && aged.hot_dirty && aged.hot_fault_submits > 0,
+          "a buffer older than HotReadbackTicks should be left for its own fault");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T4 and T5. A co-download clears exactly the buffer it read, marks nothing CPU-modified, and a
+// later GPU rewrite is downloaded again.
+void CheckHotBatchTracking(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchTracking";
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(Hot, HotBatchBed::SmallRegion, FirstValue);
+  bed.GpuWrite(Neighbour, HotBatchBed::SmallRegion, ThirdValue);
+  bed.GpuWrite(Hot, HotBatchBed::SmallRegion, SecondValue);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  Require(name, "hot buffer starts CPU-clean",
+          !bed.Cache().IsRegionCpuModified(HotBatchBed::Address(Hot), HotBatchBed::SmallRegion),
+          "the hot buffer should not be CPU-modified before the batch");
+  (void)bed.Fault(Faulting);
+  Require(name, "hot buffer was co-downloaded", bed.Backing(Hot) == SecondValue,
+          "the batch did not download the hot buffer, so the checks below prove nothing");
+  Require(name, "co-download does not mark CPU-modified",
+          !bed.Cache().IsRegionCpuModified(HotBatchBed::Address(Hot), HotBatchBed::SmallRegion),
+          "only a faulting write may mark guest memory CPU-modified");
+  Require(name, "neighbour stays GPU-dirty",
+          bed.Dirty(Neighbour, HotBatchBed::SmallRegion),
+          "the co-download cleared a buffer it did not read");
+  // The two checks below guard against regressions in the dirty tracking and do not prove T5.
+  bed.GpuWrite(Hot, HotBatchBed::SmallRegion, FirstValue);
+  Require(name, "rewrite is GPU-dirty again", bed.Dirty(Hot, HotBatchBed::SmallRegion),
+          "a GPU write after a co-download should mark the buffer dirty");
+  (void)bed.Fault(Hot);
+  (void)bed.Fault(Neighbour);
+  Require(name, "rewrite and neighbour are downloaded",
+          bed.Backing(Hot) == FirstValue && bed.Backing(Neighbour) == ThirdValue,
+          "a later fault should download the rewrite and the untouched neighbour");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T3. Hot buffers beyond MaxHotReadbackBytes are left for their own faults.
+void CheckHotBatchByteCap(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchByteCap";
+  using namespace HotBatchOffsets;
+  constexpr uint64_t hot_count = MaxHotReadbackBytes / HotBatchBed::BigRegion + 1;
+  constexpr uint64_t spacing = 0x200000;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  for (uint64_t index = 1; index <= hot_count; ++index) {
+    bed.MakeHot(index * spacing, HotBatchBed::BigRegion, FirstValue);
+  }
+  for (uint64_t index = 1; index <= hot_count; ++index) {
+    bed.GpuWrite(index * spacing, HotBatchBed::BigRegion, SecondValue);
+  }
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  uint64_t cleaned = 0;
+  for (uint64_t index = 1; index <= hot_count; ++index) {
+    cleaned += bed.Dirty(index * spacing, HotBatchBed::BigRegion) ? 0 : 1;
+  }
+  Require(name, "extras stop at the byte cap", cleaned == hot_count - 1,
+          "all but the last hot buffer fit the cap and the last must be left dirty");
+  Require(name, "the buffer past the cap is still dirty",
+          bed.Dirty(hot_count * spacing, HotBatchBed::BigRegion),
+          "the buffer that did not fit must stay GPU-dirty for its own fault");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T6. A batch bigger than the download ring must not reuse ring bytes before they are
+// published, so every download still lands with the right value.
+void CheckHotBatchSmallRing(VulkanHarness &harness, uint64_t ring_units) {
+  constexpr const char *name = "HotBatchSmallRing";
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  const auto &limits = harness.RuntimeContext().physical_device_properties.limits;
+  const uint64_t unit = std::max<uint64_t>(64, limits.nonCoherentAtomSize);
+  // Each download is one word. Two units cannot hold a batch of three, so it uses a temporary
+  // buffer. Four units hold it only after the ring wraps, so the reservation waits and wraps.
+  BufferCacheTestAccess::ReplaceDownloadBuffer(bed.Cache(), unit * ring_units);
+  bed.MakeHot(Hot, sizeof(uint32_t), FirstValue);
+  bed.MakeHot(SecondHot, sizeof(uint32_t), FirstValue);
+  bed.GpuWrite(Hot, sizeof(uint32_t), SecondValue);
+  bed.GpuWrite(SecondHot, sizeof(uint32_t), ThirdValue);
+  bed.GpuWrite(Faulting, sizeof(uint32_t), FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "every download in the wrapped batch published",
+          bed.Backing(Faulting) == FaultingValue && bed.Backing(Hot) == SecondValue &&
+              bed.Backing(SecondHot) == ThirdValue,
+          "a batch that outgrew the ring lost or mixed up downloaded bytes");
+  Require(name, "the hot buffers were co-downloaded",
+          !bed.Dirty(Hot, HotBatchBed::SmallRegion) &&
+              !bed.Dirty(SecondHot, HotBatchBed::SmallRegion),
+          "the batch did not include the hot buffers, so the ring was never stressed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T7. A hot entry for a range that no buffer covers is skipped without creating a buffer.
+void CheckHotBatchStaleEntry(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchStaleEntry";
+  using namespace HotBatchOffsets;
+  constexpr uint64_t uncovered_offset = 0x800000;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  // The entry stands in for a buffer that was deleted after it took a readback.
+  BufferCacheTestAccess::NoteHotReadback(bed.Cache(), HotBatchBed::Address(uncovered_offset),
+                                         HotBatchBed::SmallRegion);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  const auto buffers_before = BufferCacheTestAccess::BufferCount(bed.Cache());
+  (void)bed.Fault(Faulting);
+  Require(name, "faulting buffer published", bed.Backing(Faulting) == FaultingValue,
+          "the readback should still run with a stale hot entry");
+  Require(name, "stale entry creates no buffer",
+          BufferCacheTestAccess::BufferCount(bed.Cache()) == buffers_before,
+          "resolving a hot entry created a buffer for a range that has none");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// The faulting buffer is almost always hot itself. It must not be collected again, or the bytes
+// outside its readback window would be downloaded without being unmarked or accounted for.
+void CheckHotBatchMainBuffer(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchMainBuffer";
+  constexpr uint64_t main_offset = 0x400000;
+  constexpr uint64_t main_size = 0x200000;
+  // One MiB in is outside the 512 KiB window of a fault at the start of the buffer.
+  constexpr uint64_t far_offset = main_offset + 0x100000;
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(main_offset, main_size, FirstValue);
+  Require(name, "far range is still GPU-dirty after the first window",
+          bed.Dirty(far_offset, HotBatchBed::SmallRegion),
+          "the first readback should only have taken its own window");
+  bed.GpuWrite(main_offset, sizeof(uint32_t), SecondValue);
+  (void)bed.Fault(main_offset);
+  Require(name, "the faulting window was downloaded",
+          bed.Backing(main_offset) == SecondValue && !bed.Dirty(main_offset, 4),
+          "the second readback should download the rewritten start of the buffer");
+  Require(name, "the hot main buffer is not collected again",
+          bed.Dirty(far_offset, HotBatchBed::SmallRegion),
+          "a hot faulting buffer must not have its far bytes downloaded as an extra");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Two hot keys inside one buffer download it once. Collecting is destructive, so a repeat finds
+// nothing and the bytes match with or without the dedupe. This guards that equivalence and does
+// not prove the dedupe, which only saves the repeated lookup and estimate.
+void CheckHotBatchDuplicateKeys(VulkanHarness &harness) {
+  constexpr const char *name = "HotBatchDuplicateKeys";
+  constexpr uint64_t copy_alignment = 64;
+  constexpr uint64_t second_key_offset = HotBatchOffsets::Hot + 0x2000;
+  using namespace HotBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(Hot, sizeof(uint32_t), FirstValue);
+  BufferCacheTestAccess::NoteHotReadback(bed.Cache(), HotBatchBed::Address(second_key_offset),
+                                         HotBatchBed::SmallRegion);
+  bed.GpuWrite(Hot, sizeof(uint32_t), SecondValue);
+  bed.GpuWrite(Faulting, sizeof(uint32_t), FaultingValue);
+  const auto counter = Common::DebugCounters::Counter::BufferDownloadBytes;
+  const auto bytes_before = Common::DebugCounters::Get(counter);
+  (void)bed.Fault(Faulting);
+  const auto bytes = Common::DebugCounters::Get(counter) - bytes_before;
+  Require(name, "the buffer is downloaded once",
+          bed.Backing(Hot) == SecondValue && bytes == 2 * copy_alignment,
+          "the faulting word and the hot word should each be counted once");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+namespace RecentBatchOffsets {
+constexpr uint64_t Recent = 0x300000;
+constexpr uint64_t CapBase = 0x400000;
+constexpr uint64_t CapSpacing = 0x20000;
+constexpr uint32_t RecentValue = 0x55555555u;
+constexpr uint32_t NewerValue = 0x66666666u;
+// A write's own tick and the one after it must complete before the ring treats it as finished.
+constexpr uint64_t FinishedTicks = 2;
+} // namespace RecentBatchOffsets
+
+// Submits and waits on the current tick, count times. A write is finished for the recent write
+// ring only once a tick after its own has completed, because its tick is the bind-time tick.
+void SettleTicks(HotBatchBed &bed, uint64_t count) {
+  for (uint64_t index = 0; index < count; ++index) {
+    bed.Scheduler().Wait(bed.Scheduler().CurrentTick());
+  }
+}
+
+// What a recent write looked like after another buffer's readback.
+struct RecentBatchOutcome {
+  uint32_t backing = 0;
+  bool dirty = false;
+  uint64_t fault_submits = 0;
+  // What the co-download counters gained during the other buffer's readback.
+  uint64_t co_downloads = 0;
+  uint64_t co_download_bytes = 0;
+};
+
+// Writes a region on the GPU that never faulted, settles the given ticks, then reads back another
+// buffer and reports what the region looked like.
+RecentBatchOutcome RunRecentBatch(VulkanHarness &harness, bool flag_enabled, uint64_t size,
+                                  uint64_t settle_ticks) {
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  HotBatchBed bed(harness.RuntimeContext(), flag_enabled);
+  bed.GpuWrite(Recent, size, RecentValue);
+  SettleTicks(bed, settle_ticks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  using Common::DebugCounters::Counter;
+  const auto ranges_before = Common::DebugCounters::Get(Counter::BufferCoDownloads);
+  const auto bytes_before = Common::DebugCounters::Get(Counter::BufferCoDownloadBytes);
+  (void)bed.Fault(Faulting);
+  Require("RecentBatch", "faulting buffer published", bed.Backing(Faulting) == FaultingValue,
+          "the faulting readback should still download its own buffer");
+  RecentBatchOutcome outcome;
+  outcome.co_downloads = Common::DebugCounters::Get(Counter::BufferCoDownloads) - ranges_before;
+  outcome.co_download_bytes =
+      Common::DebugCounters::Get(Counter::BufferCoDownloadBytes) - bytes_before;
+  outcome.backing = bed.Backing(Recent);
+  outcome.dirty = bed.Dirty(Recent, size);
+  outcome.fault_submits = bed.Fault(Recent);
+  return outcome;
+}
+
+// T8 and T10. A finished small write that never faulted is downloaded in another readback's wait,
+// and a write that is not finished yet is left alone.
+void CheckRecentBatchCoDownload(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchCoDownload";
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t size = HotBatchBed::SmallRegion;
+  const auto off = RunRecentBatch(harness, false, size, FinishedTicks);
+  Require(name, "flag off leaves the write stale",
+          off.backing != RecentValue && off.dirty && off.fault_submits > 0,
+          "without the flag only the faulting buffer should be downloaded");
+  // Only the flag differs from the baseline above.
+  const auto on = RunRecentBatch(harness, true, size, FinishedTicks);
+  Require(name, "flag on downloads the finished write",
+          on.backing == RecentValue && !on.dirty && on.fault_submits == 0,
+          "a finished small write should be downloaded with the faulting buffer");
+  // The flag-off run is the baseline that counts nothing.
+  Require(name, "the co-download is counted",
+          on.co_downloads == 1 && on.co_download_bytes == size && off.co_downloads == 0 &&
+              off.co_download_bytes == 0,
+          "one co-downloaded write should add one range and its bytes to the counters");
+  // A sub-page write is claimed as a whole page, so this tells the downloaded bytes from the span.
+  constexpr uint64_t sub_page_size = 0x100;
+  const auto sub_page = RunRecentBatch(harness, true, sub_page_size, FinishedTicks);
+  Require(name, "the counted bytes are the downloaded bytes",
+          sub_page.co_downloads == 1 && sub_page.co_download_bytes == sub_page_size,
+          "the byte counter should count what was downloaded, not the page it sits in");
+  // One settled tick only completes the write's own tick, which the strict check treats as pending.
+  const auto one_tick = RunRecentBatch(harness, true, size, FinishedTicks - 1);
+  Require(name, "a write in the last completed tick is pending",
+          one_tick.backing != RecentValue && one_tick.dirty,
+          "the write's own tick completing is not enough to treat it as finished");
+  const auto pending = RunRecentBatch(harness, true, size, 0);
+  Require(name, "an unsubmitted write is pending", pending.backing != RecentValue && pending.dirty,
+          "a write from the current tick should be left for its own fault");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T9. Only writes up to RecentWriteMaxBytes are co-downloaded.
+void CheckRecentBatchSizeEdge(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchSizeEdge";
+  using namespace RecentBatchOffsets;
+  const auto at_limit = RunRecentBatch(harness, true, RecentWriteMaxBytes, FinishedTicks);
+  Require(name, "a write at the limit is co-downloaded",
+          at_limit.backing == RecentValue && !at_limit.dirty,
+          "a write of exactly RecentWriteMaxBytes should be downloaded with the readback");
+  // Only the size differs from the case above.
+  const auto over =
+      RunRecentBatch(harness, true, RecentWriteMaxBytes + TRACKER_PAGE_SIZE, FinishedTicks);
+  Require(name, "a larger write is left alone", over.backing != RecentValue && over.dirty,
+          "a write over RecentWriteMaxBytes should not enter the ring");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T11. Recent writes share the MaxHotReadbackBytes budget and the newest are taken first, so the
+// one write past the budget is the oldest.
+void CheckRecentBatchBudget(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchBudget";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t write_count = MaxHotReadbackBytes / RecentWriteMaxBytes + 1;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  for (uint64_t index = 0; index < write_count; ++index) {
+    bed.GpuWrite(CapBase + index * CapSpacing, RecentWriteMaxBytes, RecentValue);
+  }
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  uint64_t cleaned = 0;
+  for (uint64_t index = 1; index < write_count; ++index) {
+    cleaned += bed.Dirty(CapBase + index * CapSpacing, RecentWriteMaxBytes) ? 0 : 1;
+  }
+  Require(name, "the newest writes fill the budget exactly", cleaned == write_count - 1,
+          "every write but the oldest fits the budget and should be downloaded");
+  Require(name, "the oldest write is left dirty", bed.Dirty(CapBase, RecentWriteMaxBytes),
+          "the write past the budget should be the oldest and stay GPU-dirty");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T11b. A hot buffer's download is charged to the same budget, so with one hot megabyte one fewer
+// megabyte of recent writes fits and the oldest of them is left dirty.
+void CheckRecentBatchSharedBudget(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchSharedBudget";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t write_count = (MaxHotReadbackBytes - HotBatchBed::BigRegion) /
+                                       RecentWriteMaxBytes + 1;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.MakeHot(Hot, HotBatchBed::BigRegion, FirstValue);
+  bed.GpuWrite(Hot, HotBatchBed::BigRegion, SecondValue);
+  for (uint64_t index = 0; index < write_count; ++index) {
+    bed.GpuWrite(CapBase + index * CapSpacing, RecentWriteMaxBytes, RecentValue);
+  }
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  using Common::DebugCounters::Counter;
+  const auto ranges_before = Common::DebugCounters::Get(Counter::BufferCoDownloads);
+  const auto bytes_before = Common::DebugCounters::Get(Counter::BufferCoDownloadBytes);
+  (void)bed.Fault(Faulting);
+  // The hot buffer shares the batch but is not a recent write, so only the ring pieces that fit
+  // are counted. The walk ends once they spend the budget, so the oldest write is never counted.
+  Require(name, "only the collected recent writes are counted",
+          Common::DebugCounters::Get(Counter::BufferCoDownloads) - ranges_before ==
+                  write_count - 1 &&
+              Common::DebugCounters::Get(Counter::BufferCoDownloadBytes) - bytes_before ==
+                  (write_count - 1) * RecentWriteMaxBytes,
+          "the counters should hold the recent writes that were downloaded and nothing else");
+  Require(name, "the hot buffer was co-downloaded", !bed.Dirty(Hot, HotBatchBed::BigRegion),
+          "the hot buffer did not take its share, so the checks below prove nothing");
+  uint64_t cleaned = 0;
+  for (uint64_t index = 1; index < write_count; ++index) {
+    cleaned += bed.Dirty(CapBase + index * CapSpacing, RecentWriteMaxBytes) ? 0 : 1;
+  }
+  // This rules out a ring that collected nothing, which would also leave the oldest write dirty.
+  Require(name, "the newest recent writes fill what is left", cleaned == write_count - 1,
+          "every recent write but the oldest should fit beside the hot buffer");
+  // A separate budget for recent writes would fit them all.
+  Require(name, "the oldest recent write is left dirty", bed.Dirty(CapBase, RecentWriteMaxBytes),
+          "recent writes should get only what the hot buffer left of the budget");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T12. A co-downloaded write clears only its own pages, so GPU-written bytes beside it that the
+// ring never saw stay dirty for their own fault.
+void CheckRecentBatchExactUnmark(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchExactUnmark";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t neighbour = Recent + TRACKER_PAGE_SIZE;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  // The large write is too big for the ring and leaves the whole buffer GPU-dirty.
+  bed.GpuWrite(Recent, 2 * RecentWriteMaxBytes, FirstValue);
+  bed.GpuWrite(Recent, TRACKER_PAGE_SIZE, RecentValue);
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the recent page was co-downloaded",
+          bed.Backing(Recent) == RecentValue && !bed.Dirty(Recent, TRACKER_PAGE_SIZE),
+          "the batch did not download the recent write, so the check below proves nothing");
+  Require(name, "the neighbouring page stays dirty", bed.Dirty(neighbour, TRACKER_PAGE_SIZE),
+          "the co-download cleared GPU-written bytes it did not download");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T13. The claimed set clips an older write to the part a newer one does not cover, and a newer
+// pending write holds back an older finished one under it.
+void CheckRecentBatchClaims(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchClaims";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t page = TRACKER_PAGE_SIZE;
+  {
+    HotBatchBed bed(harness.RuntimeContext(), true);
+    bed.GpuWrite(Recent, 2 * page, RecentValue);
+    bed.GpuWrite(Recent + page, 2 * page, NewerValue);
+    SettleTicks(bed, FinishedTicks);
+    bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+    (void)bed.Fault(Faulting);
+    // Skipping the older write whole would leave its first page dirty.
+    Require(name, "an older partly covered write keeps its own page",
+            bed.Backing(Recent) == RecentValue && !bed.Dirty(Recent, page) &&
+                bed.Backing(Recent + page) == NewerValue && !bed.Dirty(Recent + page, 2 * page),
+            "both writes should be downloaded, the older one clipped to its first page");
+  }
+  {
+    HotBatchBed bed(harness.RuntimeContext(), true);
+    bed.GpuWrite(Recent, page, RecentValue);
+    SettleTicks(bed, FinishedTicks);
+    // Without this pending write the older one is co-downloaded, as RecentBatchCoDownload shows.
+    bed.GpuWrite(Recent, 2 * page, NewerValue);
+    bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+    (void)bed.Fault(Faulting);
+    Require(name, "a pending write holds back the older one under it", bed.Dirty(Recent, page),
+            "an older finished write under a pending one should be left for its own fault");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T13c. Two small writes in one page are both downloaded. The older one finds no bytes left in
+// the page, so it is skipped by its estimate whether or not the page is claimed. This guards the
+// result and does not prove the claim, which RecentBatchClaims and RecentBatchWindowEdge do.
+void CheckRecentBatchSamePage(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchSamePage";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t first_offset = Recent + 0x100;
+  constexpr uint64_t second_offset = Recent + 0x800;
+  constexpr uint64_t write_size = 0x100;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.GpuWrite(first_offset, write_size, RecentValue);
+  bed.GpuWrite(second_offset, write_size, NewerValue);
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the shared page is downloaded",
+          bed.Backing(first_offset) == RecentValue && bed.Backing(second_offset) == NewerValue &&
+              !bed.Dirty(Recent, TRACKER_PAGE_SIZE),
+          "both writes in the page should be downloaded with the faulting buffer");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// T13d. A readback window that ends inside a page claims the whole page, so a recent write that
+// starts in that page is not collected over it a second time. The write runs one page past it,
+// so an unrounded claim leaves a piece that still has dirty bytes and is collected. A release
+// build only checks both pages are downloaded. A debug build's dirty-page validation is what
+// fails when the window is not rounded out.
+void CheckRecentBatchWindowEdge(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchWindowEdge";
+  using namespace RecentBatchOffsets;
+  constexpr uint64_t buffer_offset = 0x600000;
+  // Must match DownloadWindowSize in bufferCache.cpp, or the readback stops straddling the edge
+  // and this test passes without proving anything.
+  constexpr uint64_t window_size = 0x80000;
+  constexpr uint64_t edge_page = buffer_offset + window_size;
+  // A word that straddles the window end makes the readback window end two bytes into a page.
+  constexpr uint64_t straddling_offset = edge_page - sizeof(uint16_t);
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  // The large write is too big for the ring and makes one buffer that holds the whole window.
+  bed.GpuWrite(buffer_offset, HotBatchBed::BigRegion, NewerValue);
+  bed.GpuWrite(edge_page, 2 * TRACKER_PAGE_SIZE, RecentValue);
+  SettleTicks(bed, FinishedTicks);
+  (void)bed.Fault(straddling_offset);
+  Require(name, "the edge page and the one after it are downloaded",
+          bed.Backing(edge_page) == RecentValue &&
+              bed.Backing(edge_page + TRACKER_PAGE_SIZE) == RecentValue &&
+              !bed.Dirty(edge_page, 2 * TRACKER_PAGE_SIZE),
+          "the window should take the edge page and the recent write the page after it");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// A second readback walks past ring entries that an earlier readback already downloaded. Their
+// pieces have nothing left to collect, so they are skipped and not counted.
+void CheckRecentBatchStaleCount(VulkanHarness &harness) {
+  constexpr const char *name = "RecentBatchStaleCount";
+  using namespace HotBatchOffsets;
+  using namespace RecentBatchOffsets;
+  using Common::DebugCounters::Counter;
+  HotBatchBed bed(harness.RuntimeContext(), true);
+  bed.GpuWrite(Recent, HotBatchBed::SmallRegion, RecentValue);
+  SettleTicks(bed, FinishedTicks);
+  bed.GpuWrite(Faulting, HotBatchBed::SmallRegion, FaultingValue);
+  (void)bed.Fault(Faulting);
+  Require(name, "the first readback co-downloads the write",
+          bed.Backing(Recent) == RecentValue && !bed.Dirty(Recent, HotBatchBed::SmallRegion),
+          "the write was not co-downloaded, so the check below proves nothing");
+  // The second readback differs from the first only in finding the ring entry already clean.
+  bed.GpuWrite(SecondHot, HotBatchBed::SmallRegion, ThirdValue);
+  const auto ranges_before = Common::DebugCounters::Get(Counter::BufferCoDownloads);
+  (void)bed.Fault(SecondHot);
+  Require(name, "a clean ring entry is not counted",
+          Common::DebugCounters::Get(Counter::BufferCoDownloads) == ranges_before,
+          "a piece with nothing to download should not count as a co-download");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Runs the recent write co-download tests, which need a device.
+void CheckRecentBatchReadbacks(VulkanHarness &harness) {
+  CheckRecentBatchCoDownload(harness);
+  CheckRecentBatchSizeEdge(harness);
+  CheckRecentBatchBudget(harness);
+  CheckRecentBatchSharedBudget(harness);
+  CheckRecentBatchExactUnmark(harness);
+  CheckRecentBatchClaims(harness);
+  CheckRecentBatchSamePage(harness);
+  CheckRecentBatchWindowEdge(harness);
+  CheckRecentBatchStaleCount(harness);
+}
+
+void CheckHotBatchReadbacks(VulkanHarness &harness) {
+  CheckHotBatchCoDownload(harness);
+  CheckHotBatchTracking(harness);
+  CheckHotBatchByteCap(harness);
+  CheckHotBatchSmallRing(harness, 2);
+  CheckHotBatchSmallRing(harness, 4);
+  CheckHotBatchStaleEntry(harness);
+  CheckHotBatchMainBuffer(harness);
+  CheckHotBatchDuplicateKeys(harness);
+  CheckRecentBatchReadbacks(harness);
+}
 
 void CompareWords(const TestCase &test, const char *stage,
                   const std::vector<u32> &expected,
@@ -52064,6 +52964,292 @@ void CheckDynamicRenderingState() {
   std::printf("[host]    %-32s ok\n", "DynamicRenderingState");
 }
 
+// Counts the entries that ForEachHot reports at one tick.
+size_t CountHotReadbacks(HotReadbackTable &table, uint64_t now_tick) {
+  size_t count = 0;
+  table.ForEachHot(now_tick, [&](uint64_t, uint64_t) { ++count; });
+  return count;
+}
+
+// An entry is hot at exactly HotReadbackTicks old and gone one tick later.
+void CheckHotReadbackAging() {
+  constexpr const char *name = "HotReadbackTable";
+  constexpr uint64_t address = 0x1000;
+  constexpr uint64_t range_size = 0x100;
+  constexpr uint64_t first_tick = 100;
+  // The baseline is the same table queried at the last hot tick, so only age differs.
+  HotReadbackTable at_limit;
+  at_limit.Note(address, range_size, first_tick);
+  Require(name, "entry is hot at the age limit",
+          CountHotReadbacks(at_limit, first_tick + HotReadbackTicks) == 1,
+          "an entry at exactly HotReadbackTicks should still be hot");
+  HotReadbackTable aged;
+  aged.Note(address, range_size, first_tick);
+  Require(name, "entry ages out",
+          CountHotReadbacks(aged, first_tick + HotReadbackTicks + 1) == 0 && aged.Size() == 0,
+          "an entry older than HotReadbackTicks should be dropped");
+}
+
+// One entry past the cap evicts only the oldest.
+void CheckHotReadbackCap() {
+  constexpr const char *name = "HotReadbackTable";
+  constexpr uint64_t first_address = 0x1000;
+  constexpr uint64_t range_size = 0x100;
+  constexpr uint64_t first_tick = 100;
+  HotReadbackTable capped;
+  for (uint64_t index = 0; index <= MaxHotReadbackEntries; ++index) {
+    capped.Note(first_address + index * range_size, range_size, first_tick + index);
+  }
+  bool oldest_present = false;
+  bool newest_present = false;
+  capped.ForEachHot(first_tick, [&](uint64_t address, uint64_t) {
+    oldest_present |= address == first_address;
+    newest_present |= address == first_address + MaxHotReadbackEntries * range_size;
+  });
+  Require(name, "entry cap evicts the oldest",
+          capped.Size() == MaxHotReadbackEntries && !oldest_present && newest_present,
+          "the table should hold the cap and drop only the oldest entry");
+}
+
+// Noting a buffer again updates its tick and does not add a second entry.
+void CheckHotReadbackRefresh() {
+  constexpr const char *name = "HotReadbackTable";
+  constexpr uint64_t first_address = 0x1000;
+  constexpr uint64_t second_address = 0x2000;
+  constexpr uint64_t range_size = 0x100;
+  constexpr uint64_t first_tick = 100;
+  HotReadbackTable refreshed;
+  refreshed.Note(first_address, range_size, first_tick);
+  refreshed.Note(second_address, range_size, first_tick + 1);
+  refreshed.Note(first_address, range_size, first_tick + 2);
+  // Both entries are counted before any aging, so a duplicate entry shows up in Size.
+  const size_t entries_before_aging = refreshed.Size();
+  // One tick past the original note of the first buffer. Only its refreshed tick keeps it hot,
+  // so a refresh that leaves the old tick in place would count one entry instead of two.
+  const size_t hot_after_refresh = CountHotReadbacks(refreshed, first_tick + HotReadbackTicks + 1);
+  Require(name, "re-noting refreshes without duplicating",
+          entries_before_aging == 2 && hot_after_refresh == 2,
+          "a second Note of one buffer should update its tick and keep one entry");
+}
+
+// Covers the pure hot readback table behaviour, which needs no GPU.
+void CheckHotReadbackTableLogic() {
+  CheckHotReadbackAging();
+  CheckHotReadbackCap();
+  CheckHotReadbackRefresh();
+  std::printf("[host]    %-32s ok\n", "HotReadbackTable");
+}
+
+// Ring tests place writes this far apart so each one sits in its own pages.
+constexpr uint64_t RecentWriteTestStride = 0x10000;
+// A known tick past every tick the ring tests note, so every entry counts as finished.
+constexpr uint64_t RecentWriteAllFinished = 1000;
+
+// Collects the finished spans that ForEachNewest yields, in order.
+std::vector<std::pair<uint64_t, uint64_t>> FinishedRecentWrites(const RecentGpuWriteRing &ring,
+                                                                uint64_t known_tick) {
+  std::vector<std::pair<uint64_t, uint64_t>> spans;
+  ring.ForEachNewest(known_tick, [&](uint64_t address, uint64_t size, bool finished) {
+    if (finished) {
+      spans.emplace_back(address, size);
+    }
+    return true;
+  });
+  return spans;
+}
+
+// Entries come out newest first, and the visitor can stop the walk.
+void CheckRecentWriteOrder() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t base = 0x100000;
+  constexpr uint64_t stride = RecentWriteTestStride;
+  RecentGpuWriteRing ring;
+  for (uint64_t index = 0; index < 3; ++index) {
+    ring.Note(base + index * stride, TRACKER_PAGE_SIZE, 10 + index);
+  }
+  const auto spans = FinishedRecentWrites(ring, RecentWriteAllFinished);
+  Require(name, "walks newest first",
+          spans.size() == 3 && spans[0].first == base + 2 * stride &&
+              spans[1].first == base + stride && spans[2].first == base,
+          "the newest write should be visited first");
+  size_t visits = 0;
+  ring.ForEachNewest(RecentWriteAllFinished,
+                     [&](uint64_t, uint64_t, bool) { return ++visits < 2; });
+  Require(name, "visitor false stops the walk", visits == 2,
+          "returning false should end the walk after that entry");
+}
+
+// One write past the capacity overwrites only the oldest.
+void CheckRecentWriteWraparound() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t base = 0x100000;
+  constexpr uint64_t stride = RecentWriteTestStride;
+  RecentGpuWriteRing ring;
+  for (uint64_t index = 0; index <= RecentGpuWriteCapacity; ++index) {
+    ring.Note(base + index * stride, TRACKER_PAGE_SIZE, index);
+  }
+  const auto spans = FinishedRecentWrites(ring, RecentGpuWriteCapacity);
+  Require(name, "wraparound overwrites the oldest",
+          ring.Size() == RecentGpuWriteCapacity && spans.size() == RecentGpuWriteCapacity &&
+              spans.front().first == base + RecentGpuWriteCapacity * stride &&
+              spans.back().first == base + stride,
+          "the ring should hold the capacity, newest first, without the oldest entry");
+  // Exactly full puts the newest entry in the last slot, so its index wraps past zero.
+  RecentGpuWriteRing full;
+  for (uint64_t index = 0; index < RecentGpuWriteCapacity; ++index) {
+    full.Note(base + index * stride, TRACKER_PAGE_SIZE, index);
+  }
+  const uint64_t last = base + (RecentGpuWriteCapacity - 1) * stride;
+  full.Note(last, TRACKER_PAGE_SIZE, RecentGpuWriteCapacity);
+  const auto known_before = FinishedRecentWrites(full, RecentGpuWriteCapacity - 1);
+  Require(name, "refresh works in the last slot",
+          full.Size() == RecentGpuWriteCapacity &&
+              FinishedRecentWrites(full, RecentGpuWriteCapacity).size() ==
+                  RecentGpuWriteCapacity &&
+              known_before.size() == RecentGpuWriteCapacity - 1 &&
+              known_before.front().first != last,
+          "repeating the newest span in the last slot should refresh it, not overwrite the oldest");
+}
+
+// An entry is finished at exactly the known tick and not one tick later.
+void CheckRecentWriteFinished() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  constexpr uint64_t known_tick = 50;
+  RecentGpuWriteRing at_known;
+  at_known.Note(address, TRACKER_PAGE_SIZE, known_tick);
+  Require(name, "tick equal to known is finished",
+          FinishedRecentWrites(at_known, known_tick).size() == 1,
+          "an entry whose tick equals the known tick should be yielded");
+  // Only the tick differs from the baseline above.
+  RecentGpuWriteRing pending;
+  pending.Note(address, TRACKER_PAGE_SIZE, known_tick + 1);
+  Require(name, "tick past known is skipped", FinishedRecentWrites(pending, known_tick).empty(),
+          "an entry newer than the known tick should not be yielded");
+  // A pending newest entry must not hide an older finished one.
+  RecentGpuWriteRing mixed;
+  mixed.Note(address, TRACKER_PAGE_SIZE, known_tick);
+  mixed.Note(address + RecentWriteTestStride, TRACKER_PAGE_SIZE, known_tick + 1);
+  const auto spans = FinishedRecentWrites(mixed, known_tick);
+  Require(name, "pending entry does not hide older finished one",
+          spans.size() == 1 && spans[0].first == address,
+          "the walk should continue past an unfinished entry");
+  // The caller needs pending spans too, to keep older finished writes under them out.
+  std::vector<std::pair<uint64_t, bool>> visited;
+  mixed.ForEachNewest(known_tick, [&](uint64_t span_address, uint64_t, bool finished) {
+    visited.emplace_back(span_address, finished);
+    return true;
+  });
+  Require(name, "pending entry is visited as unfinished",
+          visited.size() == 2 && visited[0].first == address + RecentWriteTestStride &&
+              !visited[0].second &&
+              visited[1].first == address && visited[1].second,
+          "the walk should yield the pending entry flagged unfinished, then the finished one");
+}
+
+// Noting the newest span again refreshes its tick and adds no entry.
+void CheckRecentWriteRefresh() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  constexpr uint64_t first_tick = 5;
+  RecentGpuWriteRing ring;
+  ring.Note(address, TRACKER_PAGE_SIZE, first_tick);
+  ring.Note(address, TRACKER_PAGE_SIZE, first_tick + 1);
+  // The tick check separates a refresh from an ignored repeat, and the count from a duplicate.
+  Require(name, "repeat refreshes the tick",
+          FinishedRecentWrites(ring, first_tick).empty() &&
+              FinishedRecentWrites(ring, first_tick + 1).size() == 1,
+          "the repeated write should carry the later tick");
+  Require(name, "repeat adds no entry", ring.Size() == 1,
+          "a repeated newest span should not use a second slot");
+  // Each case below differs from the repeat above in one thing, so each must add an entry.
+  RecentGpuWriteRing other_size;
+  other_size.Note(address, TRACKER_PAGE_SIZE, first_tick);
+  other_size.Note(address, 2 * TRACKER_PAGE_SIZE, first_tick + 1);
+  Require(name, "same address with another size is a new entry", other_size.Size() == 2,
+          "a refresh should match the size as well as the address");
+  RecentGpuWriteRing not_newest;
+  not_newest.Note(address, TRACKER_PAGE_SIZE, first_tick);
+  not_newest.Note(address + RecentWriteTestStride, TRACKER_PAGE_SIZE, first_tick + 1);
+  not_newest.Note(address, TRACKER_PAGE_SIZE, first_tick + 2);
+  Require(name, "repeat of an older entry is a new entry", not_newest.Size() == 3,
+          "only the newest entry should be refreshed");
+}
+
+// Note keeps writes up to RecentWriteMaxBytes and drops empty or larger ones.
+void CheckRecentWriteSizeGate() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  RecentGpuWriteRing at_limit;
+  at_limit.Note(address, RecentWriteMaxBytes, 1);
+  Require(name, "write at the size limit is kept", at_limit.Size() == 1,
+          "a write of exactly RecentWriteMaxBytes should enter the ring");
+  // Only the size differs from the baseline above.
+  RecentGpuWriteRing over_limit;
+  over_limit.Note(address, RecentWriteMaxBytes + 1, 1);
+  Require(name, "write over the size limit is dropped", over_limit.Size() == 0,
+          "a write larger than RecentWriteMaxBytes should not enter the ring");
+  RecentGpuWriteRing empty;
+  empty.Note(address, 0, 1);
+  Require(name, "empty write is dropped", empty.Size() == 0,
+          "a zero-size write should not enter the ring");
+}
+
+// Overlapping spans all come out, because the caller drops spans it has already claimed.
+void CheckRecentWriteOverlap() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  constexpr uint64_t two_pages = 2 * TRACKER_PAGE_SIZE;
+  RecentGpuWriteRing overlapping;
+  overlapping.Note(address, two_pages, 1);
+  overlapping.Note(address + TRACKER_PAGE_SIZE, two_pages, 2);
+  const auto spans = FinishedRecentWrites(overlapping, RecentWriteAllFinished);
+  Require(name, "overlapping spans are both yielded",
+          spans.size() == 2 && spans[0].first == address + TRACKER_PAGE_SIZE &&
+              spans[1].first == address,
+          "the ring should not drop an overlapping older span");
+}
+
+// Spans are rounded out to whole tracker pages.
+void CheckRecentWriteRounding() {
+  constexpr const char *name = "RecentGpuWriteRing";
+  constexpr uint64_t address = 0x100000;
+  RecentGpuWriteRing inside;
+  inside.Note(address + 0x800, 0x100, 1);
+  const auto inside_spans = FinishedRecentWrites(inside, 1);
+  Require(name, "span inside a page rounds to the page",
+          inside_spans.size() == 1 && inside_spans[0].first == address &&
+              inside_spans[0].second == TRACKER_PAGE_SIZE,
+          "a small span should widen to its whole page");
+  RecentGpuWriteRing crossing;
+  crossing.Note(address + TRACKER_PAGE_SIZE - 0x100, 0x200, 1);
+  const auto crossing_spans = FinishedRecentWrites(crossing, 1);
+  Require(name, "span across a page boundary covers both pages",
+          crossing_spans.size() == 1 && crossing_spans[0].first == address &&
+              crossing_spans[0].second == 2 * TRACKER_PAGE_SIZE,
+          "a span that crosses a boundary should cover both pages");
+  // An aligned end must stay put rather than grow by a page.
+  RecentGpuWriteRing aligned;
+  aligned.Note(address, 2 * TRACKER_PAGE_SIZE, 1);
+  const auto aligned_spans = FinishedRecentWrites(aligned, 1);
+  Require(name, "aligned span keeps its size",
+          aligned_spans.size() == 1 && aligned_spans[0].first == address &&
+              aligned_spans[0].second == 2 * TRACKER_PAGE_SIZE,
+          "a page-aligned span should not be widened");
+}
+
+// Covers the pure recent GPU write ring behaviour, which needs no GPU.
+void CheckRecentGpuWriteRingLogic() {
+  CheckRecentWriteOrder();
+  CheckRecentWriteWraparound();
+  CheckRecentWriteFinished();
+  CheckRecentWriteRefresh();
+  CheckRecentWriteSizeGate();
+  CheckRecentWriteOverlap();
+  CheckRecentWriteRounding();
+  std::printf("[host]    %-32s ok\n", "RecentGpuWriteRing");
+}
+
 void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
@@ -55631,6 +56817,15 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--hot-readback-only") == 0) {
+    CheckHotReadbackTableLogic();
+    CheckRecentGpuWriteRingLogic();
+    VulkanHarness vulkan;
+    vulkan.CheckHotReadbackRecording(false);
+    vulkan.CheckHotReadbackRecording(true);
+    CheckHotBatchReadbacks(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -55797,6 +56992,9 @@ int main(int argc, char **argv) {
   const bool rasterization = vulkan.RasterizationSupported();
   bool skipped_device_checks = false;
 #endif
+  // Pure table logic, so every platform runs it whether or not a device is present.
+  CheckHotReadbackTableLogic();
+  CheckRecentGpuWriteRingLogic();
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
@@ -55909,6 +57107,9 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckHotReadbackRecording(false);
+    vulkan.CheckHotReadbackRecording(true);
+    CheckHotBatchReadbacks(vulkan);
   } else {
     skipped_device_checks = true;
   }

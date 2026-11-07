@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -29,6 +30,8 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
+// Packed download ranges start on their own cache line, as in shadPS4.
+constexpr uint64_t DownloadCopyAlignment = 64;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -48,6 +51,37 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	auto* buffer = temporary.get();
 	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
+}
+
+/// Calls visit(address, size) for each part of the range that claimed does not cover, in address
+/// order.
+template <class Visit>
+void ForEachUnclaimed(const RangeSet& claimed, uint64_t address, uint64_t size, Visit&& visit) {
+	const uint64_t end    = address + size;
+	uint64_t       cursor = address;
+	claimed.ForEachInRange(address, size, [&](uint64_t begin, uint64_t last) {
+		if (begin > cursor) {
+			visit(cursor, begin - cursor);
+		}
+		cursor = last;
+	});
+	if (cursor < end) {
+		visit(cursor, end - cursor);
+	}
+}
+
+/// Returns the tracker pages a batch already downloads. The main window is rounded out to whole
+/// pages, because its caller unmarks it only after the batch and a recent write that shares one of
+/// its pages must not collect that page a second time.
+template <class Batch>
+RangeSet ClaimedDownloadPages(const Batch& batch, uint64_t vaddr, uint64_t size) {
+	RangeSet   claimed;
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	claimed.Add(begin, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - begin);
+	for (size_t index = 1; index < batch.size(); ++index) {
+		claimed.Add(batch[index].unmark_address, batch[index].unmark_size);
+	}
+	return claimed;
 }
 
 } // namespace
@@ -151,41 +185,68 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+/// Takes the GPU-dirty ranges of a buffer window out of the tracking sets and lists the copies
+/// that download them. The result has no copies when nothing in the window was GPU-dirty.
+BufferCache::PendingDownload BufferCache::CollectDownloadCopies(const Buffer& buffer,
+                                                                uint64_t vaddr, uint64_t size) {
+	PendingDownload pending;
+	pending.buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    pending.copies.emplace_back(start - pending.buffer_address, pending.total_size,
+			                                end - start);
 			    // Start each packed range on its own 64-byte cache line.
-			    total_size += Common::AlignUp(end - start, 64);
+			    pending.total_size += Common::AlignUp(end - start, DownloadCopyAlignment);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
-	if (copies.empty()) {
-		return false;
+	return pending;
+}
+
+/// Reserves download memory for all the pending copies at once, from the stream buffer or from a
+/// temporary buffer that the pending downloads then share. One reservation for the whole batch
+/// lets the ring wait as a single download would, which is safe because nothing of the batch is
+/// recorded yet. Reserving per download could wrap onto an earlier download's unpublished bytes.
+void BufferCache::ReserveDownloadMemory(std::span<PendingDownload* const> items) {
+	uint64_t total_size = 0;
+	for (const auto* item: items) {
+		// A second reservation would orphan the first one's temporary buffer and offsets.
+		EXIT_IF(item->mapped != nullptr);
+		total_size += item->total_size;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
-
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
+	auto [mapped, offset] = m_download_buffer.Map(total_size, DownloadCopyAlignment);
+	std::shared_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		temporary = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
+		mapped    = temporary->Mapped().data();
 	} else {
 		m_download_buffer.Commit();
 	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
-	for (auto& copy: copies) {
-		copy.dstOffset += offset;
+	// Each download is a slice of the reservation. Every total_size is already a multiple of
+	// DownloadCopyAlignment, so each slice starts on its own cache line.
+	uint64_t slice = 0;
+	for (auto* item: items) {
+		item->temporary = temporary;
+		item->mapped    = mapped + slice;
+		item->offset    = offset + slice;
+		for (auto& copy: item->copies) {
+			copy.dstOffset += item->offset;
+		}
+		slice += item->total_size;
 	}
+}
+
+/// Records the reserved copies into the current command, wrapped in the barriers that make the
+/// GPU writes visible to the transfer and the downloaded bytes visible to the host.
+void BufferCache::RecordDownload(const Buffer& buffer, const PendingDownload& pending) {
+	EXIT_IF(pending.mapped == nullptr);
+	const auto& download = pending.temporary ? *pending.temporary : m_download_buffer;
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -202,33 +263,202 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
 	native.copyBuffer(buffer.Handle(), download.Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	                  static_cast<uint32_t>(pending.copies.size()), pending.copies.data());
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	after.buffer        = download.Handle();
-	after.offset        = offset;
-	after.size          = total_size;
+	after.offset        = pending.offset;
+	after.size          = pending.total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
-		}
-	};
+}
+
+/// Copies finished download bytes into guest memory. The GPU must have completed the copies.
+void BufferCache::PublishDownload(const PendingDownload& pending) {
+	(pending.temporary ? *pending.temporary : m_download_buffer)
+	    .Invalidate(pending.offset, pending.total_size);
+	for (const auto& copy: pending.copies) {
+		Libs::LibKernel::Memory::WriteBacking(pending.buffer_address + copy.srcOffset,
+		                                      pending.mapped + (copy.dstOffset - pending.offset),
+		                                      copy.size);
+	}
+}
+
+template <bool async>
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	auto pending = CollectDownloadCopies(buffer, vaddr, size);
+	if (pending.copies.empty()) {
+		return false;
+	}
+	PendingDownload* const items[] = {&pending};
+	ReserveDownloadMemory(items);
+	RecordDownload(buffer, pending);
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(
+		    [this, pending = std::move(pending)] { PublishDownload(pending); });
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
-		publish();
+		PublishDownload(pending);
+	}
+	return true;
+}
+
+/// Finds the buffer that owns a hot entry. The page table is read directly because FindBuffer
+/// would create a buffer on a miss, and a hot entry may outlive its buffer.
+BufferId BufferCache::FindHotBuffer(uint64_t address, uint64_t size) {
+	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+	if (owner == nullptr || IsBufferInvalid(*owner) ||
+	    !m_slot_buffers[*owner].IsInBounds(address, size)) {
+		return {};
+	}
+	return *owner;
+}
+
+/// Returns an upper bound on the bytes that downloading a range would add to the ring. It counts
+/// every GPU-written range inside it, which is at least what the page tracker lets through.
+uint64_t BufferCache::EstimateDownloadBytes(uint64_t address, uint64_t size) const {
+	uint64_t bytes = 0;
+	m_gpu_modified_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) {
+		bytes += Common::AlignUp(end - start, DownloadCopyAlignment);
+	});
+	return bytes;
+}
+
+/// Adds the GPU-written bytes of recently read-back buffers to a batch, so the wait that the main
+/// download needs anyway also clears their next fault. A buffer is skipped when it is the main
+/// buffer, was already added, no longer exists, or would cost more than what is left of budget.
+/// The main-buffer skip is needed for correctness. The main buffer is nearly always hot, and
+/// collecting it again would revisit window pages the caller has not unmarked yet, which breaks the
+/// debug invariant in ValidateGpuDirtyPages and downloads bytes outside the main window. The
+/// duplicate skip only saves a repeated estimate, since the first collect already removed the
+/// buffer's ranges.
+void BufferCache::CollectHotDownloads(BufferId main_id, uint64_t& budget,
+                                      std::vector<BatchedDownload>& batch) {
+	std::vector<BufferId> seen;
+	seen.reserve(MaxHotReadbackEntries + 1);
+	seen.push_back(main_id);
+	m_hot_readbacks.ForEachHot(m_scheduler.CurrentTick(), [&](uint64_t address, uint64_t size) {
+		// Merged buffers can leave two entries that resolve to the same buffer.
+		const auto id = FindHotBuffer(address, size);
+		if (!id || std::ranges::find(seen, id) != seen.end()) {
+			return;
+		}
+		seen.push_back(id);
+		auto&      hot      = m_slot_buffers[id];
+		const auto estimate = EstimateDownloadBytes(hot.CpuAddress(), hot.Size());
+		if (estimate == 0 || estimate > budget) {
+			return;
+		}
+		const auto hot_address = hot.CpuAddress();
+		const auto hot_size    = hot.Size();
+		auto       pending     = CollectDownloadCopies(hot, hot_address, hot_size);
+		if (pending.copies.empty()) {
+			return;
+		}
+		budget -= std::min(budget, pending.total_size);
+		batch.push_back({&hot, std::move(pending), hot_address, hot_size});
+	});
+}
+
+/// Walks the recent write ring newest first and collects each finished span that is not claimed
+/// yet. Every visited span is claimed afterwards, so an older entry under it is clipped to what it
+/// adds. Pending spans are claimed without being collected, which keeps an older finished write
+/// that the GPU is rewriting out of the download. Claims are whole tracker pages, so a pending
+/// write also holds back finished bytes that share its pages. That only leaves them for their own
+/// fault. The walk ends once the budget is spent.
+void BufferCache::CollectRecentWrites(RangeSet& claimed, uint64_t& budget,
+                                      std::vector<BatchedDownload>& batch) {
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto known_tick = master.KnownGpuTick();
+	if (known_tick == 0) {
+		return;
+	}
+	// An entry carries the tick that was current when its buffer was bound, and a submit during
+	// draw setup can put the write itself in the next tick. Only ticks before the known one are
+	// treated as finished, so the entry's own write is done. That says nothing about a later
+	// write the ring never records, such as a large buffer or an image, that is bound but not yet
+	// recorded. Like the hot buffers, this relies on no readback running between such a bind and
+	// its recording.
+	m_recent_writes.ForEachNewest(known_tick - 1, [&](uint64_t address, uint64_t size,
+	                                                  bool finished) {
+		if (finished) {
+			ForEachUnclaimed(claimed, address, size, [&](uint64_t piece, uint64_t piece_size) {
+				CollectRecentPiece(piece, piece_size, budget, batch);
+			});
+		}
+		claimed.Add(address, size);
+		return budget > 0;
+	});
+}
+
+/// Collects the GPU-written bytes of one unclaimed piece of a recent write and counts it for the
+/// overlay. A piece is skipped when no single buffer holds it or when it would cost more than
+/// budget.
+void BufferCache::CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& budget,
+                                     std::vector<BatchedDownload>& batch) {
+	const auto id = FindHotBuffer(address, size);
+	if (!id) {
+		return;
+	}
+	const auto estimate = EstimateDownloadBytes(address, size);
+	if (estimate == 0 || estimate > budget) {
+		return;
+	}
+	auto& buffer  = m_slot_buffers[id];
+	auto  pending = CollectDownloadCopies(buffer, address, size);
+	if (pending.copies.empty()) {
+		return;
+	}
+	budget -= std::min(budget, pending.total_size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferCoDownloads);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferCoDownloadBytes,
+	                           pending.total_size);
+	batch.push_back({&buffer, std::move(pending), address, size});
+}
+
+/// Downloads the main window, the GPU-written bytes of hot buffers and the finished recent small
+/// writes with one GPU wait. The extras are marked clean here, and the caller does that for the
+/// main window. Nothing is marked CPU-modified, since only a faulting write does that. Returns
+/// false when the window had nothing.
+bool BufferCache::DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
+                                         uint64_t size) {
+	auto main_pending = CollectDownloadCopies(buffer, vaddr, size);
+	if (main_pending.copies.empty()) {
+		return false;
+	}
+	std::vector<BatchedDownload> batch;
+	batch.reserve(MaxHotReadbackEntries + 1);
+	batch.push_back({&buffer, std::move(main_pending)});
+	uint64_t budget = MaxHotReadbackBytes;
+	CollectHotDownloads(main_id, budget, batch);
+	auto claimed = ClaimedDownloadPages(batch, vaddr, size);
+	CollectRecentWrites(claimed, budget, batch);
+	// The pointers are taken once the batch has stopped growing, so none can be invalidated.
+	std::vector<PendingDownload*> pendings;
+	pendings.reserve(batch.size());
+	for (auto& item: batch) {
+		pendings.push_back(&item.pending);
+	}
+	ReserveDownloadMemory(pendings);
+	for (const auto& item: batch) {
+		RecordDownload(*item.buffer, item.pending);
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto& item: batch) {
+		PublishDownload(item.pending);
+	}
+	for (size_t index = 1; index < batch.size(); ++index) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(batch[index].unmark_address,
+		                                           batch[index].unmark_size);
 	}
 	return true;
 }
@@ -244,7 +474,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-      m_texture_cache(texture_cache) {
+      m_texture_cache(texture_cache), m_batch_hot_readbacks(Config::BatchHotReadbacksEnabled()) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -290,6 +520,18 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	QueueBdaSync(vaddr, size);
 }
 
+void BufferCache::NoteHotReadback(uint64_t address, uint64_t size) {
+	if (m_batch_hot_readbacks) {
+		m_hot_readbacks.Note(address, size, m_scheduler.CurrentTick());
+	}
+}
+
+void BufferCache::NoteRecentWrite(uint64_t address, uint64_t size) {
+	if (m_batch_hot_readbacks) {
+		m_recent_writes.Note(address, size, m_scheduler.CurrentTick());
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -300,14 +542,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		const auto buffer_id = FindBuffer(vaddr, size);
+		auto&      buffer    = m_slot_buffers[buffer_id];
 		if (IsRegionGpuModified(vaddr, size)) {
 			const auto start =
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
-			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
+			const bool downloaded =
+			    m_batch_hot_readbacks
+			        ? DownloadWithHotBuffers(buffer_id, buffer, start, end - start)
+			        : DownloadBufferMemory<false>(buffer, start, end - start);
+			if (downloaded) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				NoteHotReadback(buffer.CpuAddress(), buffer.Size());
 			}
 		}
 		if (is_write) {
@@ -512,6 +760,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		NoteRecentWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

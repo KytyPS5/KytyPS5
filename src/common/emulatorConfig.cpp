@@ -209,6 +209,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool BatchHotReadbacksEnabled() {
+	return g_config->batch_hot_readbacks;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

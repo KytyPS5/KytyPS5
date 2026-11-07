@@ -89,6 +89,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
+	bool                   batch_hot_readbacks         = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   lod_stats_enabled           = false;
@@ -161,6 +162,9 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
+// Makes a fault readback that waits for the GPU also read back GPU-written bytes of buffers that
+// recently faulted.
+bool BatchHotReadbacksEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool LodStatsEnabled();

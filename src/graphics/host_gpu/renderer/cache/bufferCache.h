@@ -8,11 +8,14 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/hotReadbackTable.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -123,10 +126,58 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// A download in four stages, so several buffers can share one GPU wait. Collect takes the
+	// dirty ranges, Reserve picks the download memory, Record queues the copies, and Publish
+	// writes the finished bytes to guest memory.
+	struct PendingDownload {
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total_size     = 0;
+		uint64_t                    buffer_address = 0;
+		uint64_t                    offset         = 0;
+		uint8_t*                    mapped         = nullptr;
+		// Owns the memory behind mapped when the stream buffer was too full to serve it. The
+		// downloads of one batch share it, because the batch makes a single reservation.
+		std::shared_ptr<Buffer> temporary;
+	};
+	[[nodiscard]] PendingDownload CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr,
+	                                                    uint64_t size);
+	// A buffer's pending download inside a batch of downloads that share one GPU wait.
+	struct BatchedDownload {
+		Buffer*         buffer = nullptr;
+		PendingDownload pending;
+		// The range to mark clean once published. It must equal what was collected, because a
+		// partial span must not clear GPU-dirty pages that were never downloaded. The main
+		// entry leaves it empty, as its caller unmarks the main window.
+		uint64_t unmark_address = 0;
+		uint64_t unmark_size    = 0;
+	};
+	void ReserveDownloadMemory(std::span<PendingDownload* const> items);
+	void RecordDownload(const Buffer& buffer, const PendingDownload& pending);
+	void PublishDownload(const PendingDownload& pending);
+	// Resolves a hot entry to the buffer that now owns it, without creating one on a miss.
+	[[nodiscard]] BufferId FindHotBuffer(uint64_t address, uint64_t size);
+	[[nodiscard]] uint64_t EstimateDownloadBytes(uint64_t address, uint64_t size) const;
+	void CollectHotDownloads(BufferId main_id, uint64_t& budget, std::vector<BatchedDownload>& batch);
+	// Adds the finished small GPU writes the recent write ring remembers to a batch, skipping
+	// spans already in claimed and charging what it collects to budget.
+	void CollectRecentWrites(RangeSet& claimed, uint64_t& budget,
+	                         std::vector<BatchedDownload>& batch);
+	// Collects one unclaimed piece of a recent write when a single buffer holds it and it fits.
+	void CollectRecentPiece(uint64_t address, uint64_t size, uint64_t& budget,
+	                        std::vector<BatchedDownload>& batch);
+	[[nodiscard]] bool DownloadWithHotBuffers(BufferId main_id, Buffer& buffer, uint64_t vaddr,
+	                                          uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	// Records a buffer that took a sync readback, whatever its cause. Does nothing without
+	// --batch-hot-readbacks.
+	void NoteHotReadback(uint64_t address, uint64_t size);
+	// Records a GPU write so a later sync readback can download it once finished. Does nothing
+	// without --batch-hot-readbacks. The tick is the one current when the buffer is bound, and a
+	// submit during draw setup can land the write in the next tick, so treat it as a lower bound.
+	void NoteRecentWrite(uint64_t address, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -148,6 +199,10 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	// Read once because the fault path is hot and the flag must not change while the cache lives.
+	const bool                                        m_batch_hot_readbacks;
+	HotReadbackTable                                  m_hot_readbacks;
+	RecentGpuWriteRing                                m_recent_writes;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

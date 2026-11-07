@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -303,6 +304,52 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+
+  RangeSet random_ranges;
+  std::array<bool, 256> reference {};
+  uint64_t state = 0xd172ed03a61b495full;
+  const auto next = [&state] {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  for (size_t step = 0; step < 20000; ++step) {
+    const size_t first = next() % reference.size();
+    const size_t last = first + 1 + next() % (reference.size() - first);
+    const bool add = (next() & 1) != 0;
+    if (add) {
+      random_ranges.Add(first, last - first);
+    } else {
+      random_ranges.Subtract(first, last - first);
+    }
+    std::fill(reference.begin() + first, reference.begin() + last, add);
+    size_t cursor = 0;
+    random_ranges.ForEach([&](uint64_t begin, uint64_t end) {
+      while (cursor < reference.size() && !reference[cursor]) ++cursor;
+      Check(begin == cursor, "range set random run start differs from byte oracle");
+      while (cursor < reference.size() && reference[cursor]) ++cursor;
+      Check(end == cursor, "range set random run end differs from byte oracle");
+    });
+    while (cursor < reference.size() && !reference[cursor]) ++cursor;
+    Check(cursor == reference.size(), "range set random walk omitted a run");
+  }
+  for (uint64_t first = 0; first < 16; ++first) {
+    for (uint64_t last = first + 1; last <= 16; ++last) {
+      for (uint64_t cut = 0; cut < 17; ++cut) {
+        for (uint64_t end = cut + 1; end <= 17; ++end) {
+          RangeSet single;
+          single.Add(first, last - first);
+          single.Subtract(cut, end - cut);
+          for (uint64_t byte = 0; byte < 17; ++byte) {
+            Check(single.Contains(byte, 1) ==
+                      (byte >= first && byte < last && !(byte >= cut && byte < end)),
+                  "range set exhaustive subtraction differs from byte oracle");
+          }
+        }
+      }
+    }
+  }
 }
 
 void TestGuestRange() {

@@ -57,6 +57,7 @@ public:
 	void Umount(const std::string& folder_or_point);
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	[[nodiscard]] bool                  IsMountPoint(const std::string& point);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
@@ -126,6 +127,13 @@ static void SetStatTimes(FileStat* stat, std::optional<Common::File::Times> time
 	stat->st_mtim     = {times->write_ns / NANOS_PER_SEC, times->write_ns % NANOS_PER_SEC};
 	stat->st_ctim     = stat->st_atim;
 	stat->st_birthtim = stat->st_mtim;
+}
+
+// Directories report a 64 KiB st_blksize; games size one whole-directory getdents from it.
+static void SetStatSize(FileStat* stat, uint64_t size, bool directory) {
+	stat->st_size    = static_cast<int64_t>(size);
+	stat->st_blksize = directory ? 0x10000 : 512;
+	stat->st_blocks  = static_cast<int64_t>((size + 511) / 512);
 }
 
 static uint64_t AlignDown(uint64_t value, uint64_t alignment) {
@@ -295,6 +303,22 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 	}
 }
 
+// Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
+static std::string NormalizeGuestPath(const std::string& mounted_name) {
+	std::string normalized = Common::FixFilenameSlash(mounted_name);
+	normalized.erase(std::unique(normalized.begin(), normalized.end(),
+	                             [](char a, char b) { return a == '/' && b == '/'; }),
+	                 normalized.end());
+	return normalized;
+}
+
+bool MountPoints::IsMountPoint(const std::string& point) {
+	Common::LockGuard lock(m_mutex);
+
+	return std::ranges::any_of(m_mount_pairs,
+	                           [&point](const MountPair& p) { return p.point == point; });
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Resolve guest paths case-insensitively on case-sensitive hosts.
 static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
@@ -349,11 +373,7 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
-	// Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
-	std::string normalized = Common::FixFilenameSlash(mounted_name);
-	normalized.erase(std::unique(normalized.begin(), normalized.end(),
-	                             [](char a, char b) { return a == '/' && b == '/'; }),
-	                 normalized.end());
+	const std::string normalized = NormalizeGuestPath(mounted_name);
 
 	// Match the entire guest path so a mount root works with or without a trailing slash.
 	const auto mounted_path = Common::FixDirectorySlash(normalized);
@@ -1157,18 +1177,9 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-
-	if (is_dir) {
-		stat.st_size =
-		    static_cast<int64_t>(PackDirents(Common::File::GetDirEntries(real_file_name)).size());
-		stat.st_blksize = 512;
-		stat.st_blocks  = stat.st_size / 512;
-	} else {
-		stat.st_size    = static_cast<int64_t>(info->size);
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
-	}
-
+	const uint64_t size =
+	    is_dir ? PackDirents(Common::File::GetDirEntries(real_file_name)).size() : info->size;
+	SetStatSize(&stat, size, is_dir);
 	SetStatTimes(&stat, is_dir ? std::nullopt : Common::File::GetTimes(real_file_name));
 	*sb = stat;
 
@@ -1202,10 +1213,8 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	std::optional<Common::File::Times> times;
 
 	if (file->special != SpecialFile::None) {
-		stat.st_mode    = 0020644u;
-		stat.st_size    = 0;
-		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
+		stat.st_mode = 0020644u;
+		SetStatSize(&stat, 0, false);
 	} else if (!file->directory) {
 		file->mutex.Lock();
 
@@ -1220,13 +1229,9 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 			return KERNEL_ERROR_EIO;
 		}
 
-		stat.st_size    = static_cast<int64_t>(size);
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
+		SetStatSize(&stat, size, false);
 	} else {
-		stat.st_size    = static_cast<int64_t>(file->dirents.size());
-		stat.st_blksize = 512;
-		stat.st_blocks  = stat.st_size / 512;
+		SetStatSize(&stat, file->dirents.size(), true);
 	}
 
 	SetStatTimes(&stat, times);
@@ -1511,22 +1516,41 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (std::strlen(path) > 255) {
+		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
 	LOGF("\t path = %s\n", path);
 
-	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	const auto directory = Common::FixDirectorySlash(NormalizeGuestPath(path));
+	if (directory.ends_with("/./") || directory.ends_with("/../")) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (g_mount_points->IsMountPoint(directory)) {
+		return KERNEL_ERROR_EBUSY;
+	}
+
+	const auto real_name = g_mount_points->ResolvePath(path);
 	if (Common::IsArchivePath(real_name)) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (!Common::File::IsDirectoryExisting(real_name)) {
+	const auto info = Common::File::GetInfo(real_name);
+	if (!info) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	if (!Common::File::DeleteDirectory(real_name)) {
-		return KERNEL_ERROR_EIO;
+	if (info->is_file) {
+		return KERNEL_ERROR_ENOTDIR;
+	}
+
+	std::error_code error;
+	if (!std::filesystem::remove(real_name, error)) {
+		return error == std::errc::directory_not_empty ? KERNEL_ERROR_ENOTEMPTY : KERNEL_ERROR_EIO;
 	}
 
 	return OK;

@@ -61,6 +61,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// The access retries once the image write-backs over its page land.
+	if (WaitWriteBacks(fault_vaddr, fault_size)) {
+		return true;
+	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -71,7 +75,25 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
+	const auto tick = m_texture_cache.WriteBackTick(vaddr, size);
+	if (tick == 0) {
+		return false;
+	}
+	// The GPU thread can fault inside a draw, so it submits without running deferred operations.
+	if (GuestGpu::IsGpuThread()) {
+		m_command_scheduler.Wait(tick);
+	} else if (tick == m_command_scheduler.CurrentTick()) {
+		GetGpu().SendCommandSync([this, tick] { m_command_scheduler.Wait(tick); });
+	}
+	m_command_scheduler.WaitPriorityOperations(tick);
+	return true;
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	// Host I/O into the range, even one running past its mapping, would fail on its inaccessible
+	// pages, and a later write-back would overwrite it.
+	(void)WaitWriteBacks(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}

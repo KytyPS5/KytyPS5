@@ -1028,6 +1028,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
 	}
 
+	LaneSpills lane_spills;
+	lane_spills.fill({UINT32_MAX, 0u});
 	uint32_t vector_limit = 1u;
 	for (const auto& cfg_block: cfg.blocks) {
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
@@ -1040,6 +1042,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			IncludeInstructionVectorRegisters(instruction, vector_limit);
+			if (instruction.opcode == Decoder::Opcode::V_WRITELANE_B32) {
+				auto& first = lane_spills[instruction.dst.reg].first;
+				first       = std::min(first, instruction.pc);
+			} else if (instruction.opcode == Decoder::Opcode::V_READLANE_B32 &&
+			           instruction.src0.kind == Decoder::OperandKind::Vgpr) {
+				auto& last = lane_spills[instruction.src0.reg].second;
+				last       = std::max(last, instruction.pc);
+			}
 		}
 	}
 
@@ -1336,7 +1346,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
 			                              IR::U32(IR::Value(8u))));
 		} else if (options.stage == ShaderType::TessellationEvaluation) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			// GS_TG_INFO and the merged wave info both count one full wave of vertices.
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
+			                      IR::U32(IR::Value(options.wave_size << 12u)));
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+			                      IR::U32(IR::Value(options.wave_size)));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(4),
 			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));
@@ -1422,7 +1436,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, flush_f32_inputs,
+		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];

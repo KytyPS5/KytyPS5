@@ -156,10 +156,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
                                         const volatile void* index_addr, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexGetSize();
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
-                                                      const volatile void* index_addr,
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
                                                       const volatile void* object_ids,
-                                                      uint32_t instance_count, uint64_t modifier);
+                                                      const volatile void* index_addr,
+                                                      uint32_t index_count, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexMultiInstancedGetSize();
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,

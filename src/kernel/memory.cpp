@@ -856,7 +856,7 @@ const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
 	                                        : nullptr;
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+static bool IsGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		// Byte ranges the GPU wrote lie on GPU-dirty pages: the lock-free page check answers
 		// for most reads.
@@ -867,7 +867,26 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 	}
-	return TryReadBacking(vaddr, data, size);
+	return true;
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return IsGpuCleanBacking(vaddr, size) && TryReadBacking(vaddr, data, size);
+}
+
+bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
+                           bool (*equal)(const void*, const void*, uint64_t)) {
+	if (!IsGpuCleanBacking(vaddr, size)) {
+		return false;
+	}
+	if (const void* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
+		return equal != nullptr ? equal(backing, expected, size) : std::memcmp(backing, expected, size) == 0;
+	}
+	// A range over several mappings compares a copy.
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	return TryReadBacking(vaddr, bytes.data(), size) &&
+	       std::memcmp(bytes.data(), expected, size) == 0;
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {

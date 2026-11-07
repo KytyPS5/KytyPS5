@@ -1763,9 +1763,17 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	};
 	const auto element_count = static_cast<uint32_t>(state.elements.size());
 	EXIT_IF(state.checked.size() != element_count);
+	// The versions of the elements (GTA V's states have ~17 000) are compared by the helpers too.
 	m_table_checks.clear();
+	m_table_element_flags.assign(element_count, 0);
+	GetExecHelpers().ParallelFor(element_count, 2048, [&](uint32_t begin, uint32_t end) {
+		for (uint32_t index = begin; index < end; index++) {
+			m_table_element_flags[index] =
+			    state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index]) ? 1 : 0;
+		}
+	});
 	for (uint32_t index = 0; index < element_count; index++) {
-		if (state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index])) {
+		if (m_table_element_flags[index] != 0) {
 			m_table_checks.push_back(index);
 		}
 	}

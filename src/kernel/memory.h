@@ -143,6 +143,8 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadGpuCleanBacking() would read the size bytes at expected, compared in place.
+[[nodiscard]] bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size);
 // GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
 bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
 // Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU

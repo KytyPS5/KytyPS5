@@ -4,8 +4,10 @@
 #include "common/common.h"
 #include "common/spscQueue.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -131,6 +133,27 @@ private:
 inline ExecHelpers& GetExecHelpers() {
 	static ExecHelpers helpers;
 	return helpers;
+}
+
+// Execution thread: whether the size bytes at a and b are equal. Large ranges (GTA V's bindless
+// tables, 2 MB, compared every frame) are compared by the helpers too, in chunks: one thread
+// compares a few GB/s of memory that is not in its caches.
+inline bool ParallelEqual(const void* a, const void* b, uint64_t size) {
+	constexpr uint64_t Chunk = uint64_t {64} * 1024;
+	if (size < 4 * Chunk) {
+		return std::memcmp(a, b, size) == 0;
+	}
+	std::atomic_bool differ {false};
+	GetExecHelpers().ParallelFor(static_cast<uint32_t>((size + Chunk - 1) / Chunk), 1, [&](uint32_t begin, uint32_t end) {
+		for (auto chunk = begin; chunk < end && !differ.load(std::memory_order_relaxed); chunk++) {
+			const auto offset = uint64_t {chunk} * Chunk;
+			if (std::memcmp(static_cast<const uint8_t*>(a) + offset, static_cast<const uint8_t*>(b) + offset,
+			                std::min(Chunk, size - offset)) != 0) {
+				differ.store(true, std::memory_order_relaxed);
+			}
+		}
+	});
+	return !differ.load(std::memory_order_relaxed);
 }
 
 } // namespace Libs::Graphics

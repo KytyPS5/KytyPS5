@@ -628,6 +628,8 @@ private:
 		uint32_t index = 0;
 	};
 	std::vector<ChangedTableSlot>                      m_table_changed_slots;
+	// Per element of a table state: whether RebindReusedTables() checks it.
+	std::vector<uint8_t>                               m_table_element_flags;
 	// PatchTableSlots(): the changed slots that name an element the state already had.
 	std::vector<uint32_t>                              m_table_moved_slots;
 	// RebindReusedTables(): the elements whose versions moved, and whether their binding changed

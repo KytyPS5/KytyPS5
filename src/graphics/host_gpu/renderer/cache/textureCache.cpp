@@ -1847,7 +1847,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 			m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
 			                                               write_back.range.size);
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(std::ranges::find(m_write_backs, write_back));
+			m_write_backs.erase(std::ranges::find_if(
+			    m_write_backs, [&](const WriteBack& entry) { return entry == write_back; }));
 		}
 	});
 	return true;

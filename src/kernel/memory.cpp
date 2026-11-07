@@ -1966,16 +1966,38 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 	return OK;
 }
 
-static int UnmapMemoryRange(const VirtualRanges::Range& range, uint64_t vaddr, size_t len) {
-	UnmapGpuRange(vaddr, len);
-	const int result = UnmapMemoryOwner(range, vaddr, len);
-	if (result != OK && IsCommittedRangeType(range.type)) {
-		VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
-		EXIT_IF(!DecodeMemoryProtection(range.protection, &mode));
-		EXIT_IF(!g_guest_address_space->Protect(vaddr, len, mode));
-		MapGpuRange(vaddr, len);
+// Reserved fragments and holes hold nothing the GPU can cache, so each run of adjacent committed
+// fragments is unmapped from the GPU with one call.
+static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
+	for (size_t i = 0; i < ranges.size(); i++) {
+		if (IsReservedRangeType(ranges[i].type)) continue;
+		const auto start = ranges[i].start;
+		auto       end   = start + ranges[i].size;
+		while (i + 1 < ranges.size() && ranges[i + 1].start == end &&
+		       !IsReservedRangeType(ranges[i + 1].type)) {
+			end += ranges[++i].size;
+		}
+		UnmapGpuRange(start, end - start);
 	}
-	return result;
+}
+
+// A failed owner leaves its fragment and every later one mapped; their protection and GPU
+// mapping are restored.
+static int UnmapMemoryRanges(const std::vector<VirtualRanges::Range>& ranges) {
+	UnmapGpuRanges(ranges);
+	for (auto it = ranges.begin(); it != ranges.end(); ++it) {
+		const int result = UnmapMemoryOwner(*it, it->start, it->size);
+		if (result == OK) continue;
+		for (; it != ranges.end(); ++it) {
+			if (!IsCommittedRangeType(it->type)) continue;
+			VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
+			EXIT_IF(!DecodeMemoryProtection(it->protection, &mode));
+			EXIT_IF(!g_guest_address_space->Protect(it->start, it->size, mode));
+			MapGpuRange(it->start, it->size);
+		}
+		return result;
+	}
+	return OK;
 }
 
 // The ABI entry point and batch operations hold g_memory_operation_mutex.
@@ -1991,11 +2013,7 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
-	for (const auto& range: ranges) {
-		const int result = UnmapMemoryRange(range, range.start, range.size);
-		if (result != OK) return result;
-	}
-	return OK;
+	return UnmapMemoryRanges(ranges);
 }
 
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
@@ -2015,18 +2033,22 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
 
-	const auto end = vaddr + size;
-	while (vaddr < end) {
-		VirtualRanges::Range range {};
-		// AMM unmap accepts holes, including a completely unmapped range.
-		if (!g_virtual_ranges->Query(vaddr, 1, &range) || range.start >= end) break;
-		vaddr = std::max(vaddr, range.start);
-		const auto chunk = std::min(end, range.start + range.size) - vaddr;
-		const int result = UnmapMemoryRange(range, vaddr, chunk);
-		if (result != OK) return result;
-		vaddr += chunk;
+	// AMM unmap accepts holes, including a completely unmapped range.
+	const auto                        end = vaddr + size;
+	VirtualRanges::Range              range {};
+	std::vector<VirtualRanges::Range> ranges;
+	while (vaddr < end && g_virtual_ranges->Query(vaddr, 1, &range) && range.start < end) {
+		const auto start     = std::max(vaddr, range.start);
+		const auto range_end = std::min(end, range.start + range.size);
+		if (range.type == VirtualRangeType::Direct) {
+			range.offset += start - range.start;
+		}
+		range.start = start;
+		range.size  = range_end - start;
+		ranges.push_back(range);
+		vaddr = range_end;
 	}
-	return OK;
+	return UnmapMemoryRanges(ranges);
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -3634,7 +3656,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 		return KERNEL_ERROR_EACCES;
 	}
 
-	UnmapGpuRange(vaddr, len);
+	UnmapGpuRanges(ranges);
 	for (const auto& range: ranges) {
 		if (range.type == VirtualRangeType::Pooled &&
 		    UnmapMemoryOwner(range, range.start, range.size, true) != OK) {

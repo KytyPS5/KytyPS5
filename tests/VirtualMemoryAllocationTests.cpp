@@ -29,6 +29,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2825,6 +2826,46 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMunmapGpuRuns() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "MunmapGpuRuns";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	void*              reserve  = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto [offset, prot, name]:
+	     {std::tuple {0 * page, SceKernelProtCpuRw, "run_a"},
+	      {2 * page, SceKernelProtCpuRw, "run_b"}, {3 * page, SceKernelProtCpuRead, "run_c"}}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test, KernelMapNamedFlexibleMemory(&address, page, prot, SceKernelMapFixed, name),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	TestFailGuestBackingStoreUnmapAfter(1);
+	const int result = KernelMunmap(base, 4 * page);
+	TestSetGpuRangeCallback(nullptr);
+	CheckFailed(test, result, "KernelMunmap(third range fails)");
+	Check(test,
+	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
+	                                                        {false, base + 2 * page, 2 * page},
+	                                                        {true, base + 2 * page, page},
+	                                                        {true, base + 3 * page, page}},
+	      "munmap did not unmap each committed run once or restore every surviving range");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + page);
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 3 * page,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "run_b");
+	ExpectRange(test, Query(test, base + 3 * page), base + 3 * page, base + 4 * page,
+	            SceKernelProtCpuRead, 1, 0, 0, 1, "run_c");
+	ExpectHostReadOnly(test, base + 3 * page);
+	CheckOk(test, KernelMunmap(base + 2 * page, 2 * page), "KernelMunmap(surviving ranges)");
+	Check(test, AvailableFlexibleMemory(test) == baseline, "munmap leaked flexible-memory budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	const char* test = "NonzeroDirectOffsetAliasesSharedBacking";
 
@@ -3737,6 +3778,10 @@ void TestAutomaticMemoryReuseAndAliases() {
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
 	      "restored mappings remained available to the automatic allocator");
 	TestFailPhysicalMemoryUnmapAfter(0);
+	CheckFailed(test, UnmapAmmMemory(base + page, page * 3), "AMM unmap inside a range failure");
+	Check(test, *reinterpret_cast<uint64_t*>(base + page * 3) == 0x0123456789abcdefull,
+	      "failed AMM unmap inside a range restored the wrong backing");
+	TestFailPhysicalMemoryUnmapAfter(0);
 	g_gpu_range_events.clear();
 	TestSetGpuRangeCallback(ObserveGpuRange);
 	const int unmap_result = UnmapAmmMemory(base - page, block + page * 2);
@@ -3852,7 +3897,7 @@ void TestAutomaticMemoryFragmentedMapRollback() {
 	ExpectUnmapped(test, base);
 	Check(test, Query(test, base + block).offset == static_cast<uint64_t>(second) &&
 	                g_gpu_range_events == std::vector<GpuRangeEvent>{
-	                    {false, base, block}, {false, base + block, block}, {true, base + block, block}},
+	                    {false, base, block * 2}, {true, base + block, block}},
 	      "failed strict unmap restored a freed prefix or lost the surviving GPU range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(first, block), "release first donation");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(gap, block), "release ordinary allocation");
@@ -4200,8 +4245,16 @@ void TestMemoryPoolMultiRangeDecommit() {
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(mixed span)");
+	g_gpu_range_events.clear();
+	Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, expand_len, 0),
 	        "KernelMemoryPoolDecommit(reserved and committed span)");
+	Libs::LibKernel::Memory::TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {
+	              {false, base + SceKernelMemoryPoolCommitLen, SceKernelMemoryPoolCommitLen}},
+	      "decommit did not unmap exactly its committed pool block from the GPU");
 	const auto mixed_decommitted = Query(test, base);
 	Check(test,
 	      mixed_decommitted.start <= base && mixed_decommitted.end >= base + expand_len &&
@@ -5947,6 +6000,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestMunmapGpuRuns);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);

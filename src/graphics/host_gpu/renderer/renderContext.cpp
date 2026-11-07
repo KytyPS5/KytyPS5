@@ -313,6 +313,44 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	CacheTlasMemory(runtime);
 }
 
+bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
+	// The record count is in GPU-written memory, unknown here. Psr's BVHs in GTA V span 17 to 64
+	// KiB; device-address accesses past this find the cached buffers that hold those pages
+	// already, or record a fault, read zero and get the page cached for the next dispatch.
+	constexpr uint64_t CachedBytes = 4 * BufferCache::CACHING_PAGESIZE;
+	const auto&        program     = runtime.module->info;
+	const auto&        user_data   = runtime.resources->user_data;
+	const auto         value       = [&](uint32_t reg, uint32_t& result) {
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		if (reg < program.user_data_base || index >= user_data.size()) {
+			return false;
+		}
+		result = user_data[index];
+		return true;
+	};
+	bool             written = false;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	for (const auto& buffer: program.info.self_sized_buffers) {
+		uint32_t low  = 0;
+		uint32_t high = 0;
+		if (!value(buffer.base_low_register, low) || !value(buffer.base_high_register, high)) {
+			continue;
+		}
+		written |= buffer.written;
+		const auto base = low | (uint64_t {high & 0xffffu} << 32u);
+		if (base == 0) {
+			continue;
+		}
+		// Pinned, as memory the device-address faults cache: the accesses may be its only uses.
+		m_mapped_ranges.ForEachInRange(base, CachedBytes, [this](uint64_t start, uint64_t end) {
+			if (const auto id = m_buffer_cache.FindBuffer(start, end - start)) {
+				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
+			}
+		});
+	}
+	return written;
+}
+
 void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 	// The guest's traversal, and the walk that builds the host TLAS when the program traces
 	// natively, read zeros from TLAS memory without a cached buffer as well. ASTRO BOT writes its
@@ -346,8 +384,9 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
 			return;
 		}
-		const auto pointer = user_data[index] | (uint64_t {user_data[index + 1u]} << 32u);
-		if (pointer > UINT64_MAX - source.header_offset ||
+		const auto pointer = NativeRayTracing::UserPointer(
+		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
+		if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
 		    !readable(pointer + source.header_offset, sizeof(header))) {
 			return;
 		}

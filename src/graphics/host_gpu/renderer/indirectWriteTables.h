@@ -29,7 +29,10 @@ public:
 	// Caches every target of the table of V#s at [address, address + size) that a store can
 	// write. Returns whether the table names any.
 	bool Prepare(uint64_t address, uint64_t size);
-	// Whether a table was prepared since the last call.
+	// Other device-address stores whose written pages come back through the same bitmap: those
+	// through the V#s of self-sized buffers (IR::ShaderInfo::SelfSizedBuffer).
+	void NotePendingWrites() noexcept { m_pending_writes = true; }
+	// Whether a table was prepared, or NotePendingWrites() called, since the last call.
 	[[nodiscard]] bool TakePendingWrites() noexcept {
 		const bool pending = m_pending_writes;
 		m_pending_writes   = false;

@@ -646,6 +646,19 @@ struct ShaderInfo {
 	};
 	std::vector<DmaWindow>           dma_windows;
 	std::vector<DmaDescriptorTable>  dma_tables;
+	// A buffer whose V# takes its record count from a header at a fixed offset of the buffer's own
+	// base, which the GPU may write just before (GTA V's Psr BVH passes): the host would have to
+	// wait for the GPU to bind its range. Its accesses go through device addresses instead, with
+	// the V#'s own bounds checked on the GPU and the header read as a flattened SRT dword. The
+	// base is user data: register base_low_register, and the low 16 bits of base_high_register.
+	struct SelfSizedBuffer {
+		uint32_t base_low_register  = 0;
+		uint32_t base_high_register = 0;
+		bool     written            = false;
+
+		bool operator==(const SelfSizedBuffer& other) const = default;
+	};
+	std::vector<SelfSizedBuffer>     self_sized_buffers;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;

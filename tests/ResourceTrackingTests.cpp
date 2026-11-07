@@ -5594,6 +5594,61 @@ void TestIndirectScalarReads() {
         "a GPU-selected scalar read bound more than its V# table");
 }
 
+// GTA V Fidelity (cs c421273ce118f4a5, Psr): the V# of a BVH's nodes takes its record count from
+// a header at its own base + 0x58, which the GPU writes. Its loads and stores go through device
+// addresses, so the host never reads that header to bind a range. A V# whose record count is
+// another buffer's dword keeps its binding.
+void TestSelfSizedBuffers() {
+  for (const bool self : {true, false}) {
+    Fixture fixture;
+    const auto base_low = fixture.UserData(6);
+    const auto base_high = fixture.UserData(1);
+    const auto header = self ? fixture.Address(base_low, base_high, 0x10)
+                             : fixture.Address(fixture.UserData(4), fixture.UserData(5), 0x10);
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = 0x58;
+    const auto records = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                      {header, Value(0u), Value(0u), Value(true)},
+                                      fixture.AddMemory(scalar, 0x10));
+    const auto stride = fixture.Emit(ValueOpcode::BitwiseOr32, {base_high, Value(0x400000u)});
+    const auto nodes = fixture.Buffer({base_low, stride, records, Value(0x10016204u)}, 0x14c);
+    const auto lane = fixture.Emit(ValueOpcode::UndefU32);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.idxen = true;
+    memory.offen = true;
+    const auto load_flags = fixture.AddMemory(memory, 0x14c);
+    const auto node = fixture.Emit(ValueOpcode::LoadBufferU32,
+                                   {nodes, lane, lane, Value(0u), Value(true)}, load_flags);
+    const auto store_flags = fixture.AddMemory(memory, 0x228);
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {nodes, lane, lane, Value(0u), node, Value(true)}, store_flags);
+    fixture.PlanAndTrack();
+
+    const auto &info = fixture.program.info;
+    const auto load_kind = fixture.program.memory_info[load_flags.index].kind;
+    const auto store_kind = fixture.program.memory_info[store_flags.index].kind;
+    if (self) {
+      Check(load_kind == ResourceKind::IndirectBuffer &&
+                store_kind == ResourceKind::IndirectBuffer && info.buffers.empty() &&
+                !info.dma_bounded,
+            "a self-sized buffer was bound instead of reached through device addresses");
+      Check(info.self_sized_buffers.size() == 1u &&
+                info.self_sized_buffers[0].base_low_register == 6u &&
+                info.self_sized_buffers[0].base_high_register == 1u &&
+                info.self_sized_buffers[0].written,
+            "a self-sized buffer did not name its base registers and stores");
+      Check(fixture.program.srt_reads.size() == 1u,
+            "the header of a self-sized buffer is not a flattened SRT dword");
+    } else {
+      Check(load_kind == ResourceKind::Buffer && store_kind == ResourceKind::Buffer &&
+                info.buffers.size() == 1u && info.self_sized_buffers.empty(),
+            "a buffer sized by another buffer's dword lost its binding");
+    }
+  }
+}
+
 // GTA V ray tracing: the BVH traversal reads instance nodes at base + (node >> 3) << 7 with the
 // node it popped off a lane stack. Reads behind such an address cannot be flattened into host SRT
 // reads; reads the host can evaluate still are.
@@ -9776,6 +9831,7 @@ int main() {
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("V# table stores", TestVSharpTableStores);
     Run("indirect scalar reads", TestIndirectScalarReads);
+    Run("self-sized buffers", TestSelfSizedBuffers);
     Run("GPU-dependent address reads", TestGpuDependentAddressReads);
     Run("untrackable sampler border word", TestUntrackableSamplerBorderWord);
     Run("bindless image table", TestBindlessImageTable);

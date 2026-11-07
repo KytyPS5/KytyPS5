@@ -492,6 +492,7 @@ public:
 		m_info.dma_base_registers.clear();
 		m_info.dma_windows.clear();
 		m_info.dma_tables.clear();
+		m_info.self_sized_buffers.clear();
 		m_info.dma_bounded = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
@@ -4948,6 +4949,113 @@ private:
 		}
 	}
 
+	static bool UserDataRegister(Value value, uint32_t& reg) {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::GetUserData ||
+		    inst->Arg(0).GetType() != Type::ScalarReg) {
+			return false;
+		}
+		reg = RegIndex(inst->Arg(0).ScalarRegister());
+		return true;
+	}
+
+	// A V# whose base is user data and whose record count is the dword a scalar read takes at a
+	// fixed offset of that same base: a buffer that holds its own size in a header (see
+	// ShaderInfo::SelfSizedBuffer). GTA V's cs c421273ce118f4a5 (a pass of Psr over the nodes of a
+	// BVH) builds s[48:51] = {s6, s1 | stride 64, [s[6:7] + 0x58], format} after the BVH build
+	// before it wrote that header on the GPU.
+	bool MatchSelfSizedBuffer(const Inst& handle, uint32_t& low_reg, uint32_t& high_reg) const {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		const auto* flat = handle.Arg(2).Resolve().TryInstruction();
+		if (flat == nullptr || flat->GetOpcode() != ValueOpcode::ReadConst || flat->NumArgs() < 2u) {
+			return false;
+		}
+		const auto* srt  = flat->Arg(0).Resolve().TryInstruction();
+		const auto  slot = flat->Arg(1).Resolve();
+		if (srt == nullptr || srt->GetOpcode() != ValueOpcode::GetSrtResource || !slot.IsImmediate() ||
+		    slot.GetType() != Type::U32 || slot.U32() >= m_program.srt_reads.size()) {
+			return false;
+		}
+		const auto* read   = m_program.srt_reads[slot.U32()].value.Resolve().TryInstruction();
+		uint32_t    index  = 0;
+		const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+		if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
+		    !read->Arg(1).Resolve().IsImmediate()) {
+			return false;
+		}
+		const auto* address = read->Arg(0).Resolve().TryInstruction();
+		if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    address->NumArgs() != 2u) {
+			return false;
+		}
+		// DWORD 1 holds the high 16 base bits, often ORed with the stride or swizzle bits above them.
+		auto high = handle.Arg(1).Resolve();
+		if (const auto* inst = high.TryInstruction();
+		    inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseOr32) {
+			const auto left  = inst->Arg(0).Resolve();
+			const auto right = inst->Arg(1).Resolve();
+			const auto above_base = [](Value value) {
+				return value.IsImmediate() && value.GetType() == Type::U32 && (value.U32() & 0xffffu) == 0u;
+			};
+			if (above_base(right)) {
+				high = left;
+			} else if (above_base(left)) {
+				high = right;
+			}
+		}
+		return EquivalentValue(m_program, handle.Arg(0), address->Arg(0)) &&
+		       EquivalentValue(m_program, high, address->Arg(1)) &&
+		       UserDataRegister(handle.Arg(0), low_reg) && UserDataRegister(high, high_reg);
+	}
+
+	// Compute shaders only (the host prepares them at dispatch): accesses of a self-sized buffer
+	// become device-address accesses when every use of its V# is one an indirect buffer supports.
+	bool TryMakeSelfSizedBuffer(const Inst& handle) {
+		if (m_program.stage != ShaderType::Compute || handle.Uses().empty()) {
+			return false;
+		}
+		bool written = false;
+		for (const auto& use: handle.Uses()) {
+			const auto& user = *use.user;
+			const auto  op   = user.GetOpcode();
+			if (use.operand != 0u || BufferAccessOf(op) == BufferAccess::None ||
+			    op == ValueOpcode::ReadConstBuffer) {
+				return false;
+			}
+			const auto index = user.Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[index];
+			if (memory.planning_only ||
+			    (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::IndirectBuffer)) {
+				return false;
+			}
+			if (memory.SupportsIndirectBufferStore(op)) {
+				written = true;
+			} else if (!memory.SupportsIndirectBufferLoad(op)) {
+				return false;
+			}
+		}
+		uint32_t low_reg  = 0;
+		uint32_t high_reg = 0;
+		if (!MatchSelfSizedBuffer(handle, low_reg, high_reg)) {
+			return false;
+		}
+		auto& buffers = m_info.self_sized_buffers;
+		const auto found = std::ranges::find_if(buffers, [&](const ShaderInfo::SelfSizedBuffer& buffer) {
+			return buffer.base_low_register == low_reg && buffer.base_high_register == high_reg;
+		});
+		if (found != buffers.end()) {
+			found->written |= written;
+		} else {
+			buffers.push_back({low_reg, high_reg, written});
+		}
+		return true;
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -5173,6 +5281,13 @@ private:
 				} else {
 					m_dma_unbounded = true;
 				}
+				return;
+			}
+			if (indirect == nullptr && TryMakeSelfSizedBuffer(*handle)) {
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_dma_tracked                           = true;
+				// The record count bounds the reach, and the host does not know it.
+				m_dma_unbounded = true;
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);

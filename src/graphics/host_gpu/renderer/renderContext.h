@@ -95,6 +95,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
+	// Caches the memory from the base of each buffer the program sizes from a header (see
+	// ShaderInfo::SelfSizedBuffer); returns whether the program stores to one.
+	bool               CacheSelfSizedBuffers(const ShaderStageRuntime& runtime);
 	// Uploads the CPU writes of the guest memory that the device-address reads of the stages can
 	// reach (see ShaderInfo::dma_windows); false when a stage's reach is not known, and nothing
 	// was uploaded.

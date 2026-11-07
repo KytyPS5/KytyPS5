@@ -57,14 +57,28 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 // Cache every target of the tables so the BDA page table covers them. Returns whether any table
 // names a target.
 // Whether a dispatch may write memory that no bound range names: address stores and stores through
-// V#s selected from descriptor tables. Other buffers reached through memory offsets are written
-// within the ranges their V#s bind, recorded as GPU writes like any written binding.
+// V#s selected from descriptor tables or sized by a header (self-sized buffers). Other buffers
+// reached through memory offsets are written within the ranges their V#s bind, recorded as GPU
+// writes like any written binding.
 static bool MayWriteThroughDeviceAddresses(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
 	return program.has_address_writes ||
+	       std::ranges::any_of(program.info.self_sized_buffers,
+	                           [](const auto& buffer) { return buffer.written; }) ||
 	       (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0 &&
 	        std::ranges::any_of(program.info.buffers, [](const auto& buffer) {
 		        return buffer.indirect_write_table;
 	        }));
+}
+
+// Self-sized buffers (see ShaderInfo::SelfSizedBuffer): their memory is cached from the base before
+// PrepareBda() uploads the CPU writes of cached buffers, and the pages their stores write come back
+// through the write bitmap. Returns whether the program stores to one.
+static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRuntime& stage) {
+	if (stage.module->info.info.self_sized_buffers.empty() || !context.CacheSelfSizedBuffers(stage)) {
+		return false;
+	}
+	context.GetIndirectWriteTables().NotePendingWrites();
+	return true;
 }
 
 // The host acceleration structures of a program that traces through a guest TLAS (see
@@ -81,7 +95,10 @@ static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 	const auto& info   = module.info.info;
 	if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(info, source)) {
 		const auto& user    = cs_regs.cs_user_sgpr.value;
-		const auto  pointer = uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u);
+		// Through a V# (Marvel's Wolverine), read from guest memory: the game writes its tables.
+		const auto  pointer = NativeRayTracing::UserPointer(
+		    source, uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u),
+		    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
 		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
 		                  module.info.shader_hash);
 	} else if (info.bvh) {
@@ -479,7 +496,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
-	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings) |
+	                             PrepareSelfSizedBuffers(m_context, input_info.stage);
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
@@ -699,6 +717,8 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
+	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+	const bool self_sized_writes = PrepareSelfSizedBuffers(m_context, input_info.stage);
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;
@@ -802,7 +822,7 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
+	    HasShaderBufferWrites(input_info.stage) || self_sized_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
@@ -850,7 +870,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
-	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings) |
+	                             PrepareSelfSizedBuffers(m_context, input_info.stage);
 	if (program.info.uses_dma) {
 		m_context.CacheDmaBases(input_info.stage);
 		const ShaderStageRuntime* const dma_stage = &input_info.stage;

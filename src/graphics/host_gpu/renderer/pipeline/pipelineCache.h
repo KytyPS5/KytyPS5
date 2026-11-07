@@ -59,6 +59,9 @@ public:
 	// flattened SRT dword that is its only use (NoFlatSlot otherwise), a descriptor word with
 	// refreshable bits (DescriptorSlot()) or a bound tested for zero (ZeroTestSlot).
 	void               RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot);
+	// All the loads of one walk (see ShaderRecompiler::IR::SrtLoadsRecorder), as RecordLoad()
+	// each would record them.
+	void               RecordLoads(std::span<const uint64_t> loads);
 	void SetStage(uint32_t stage, const ShaderRecompiler::IR::ResourcePlan* plan = nullptr) {
 		m_stage = stage;
 		m_plan  = plan;

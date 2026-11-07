@@ -12,6 +12,11 @@ using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uin
 // flat_slot: the flattened SRT dword that is the load's only use, else NoFlatSlot.
 using SrtLoadRecorder = void (*)(void* userdata, uint64_t address, uint32_t value,
                                  uint32_t flat_slot);
+// The loads of a walk at once, in order: pairs of the address and the value | flat_slot << 32.
+// Loads below SrtGuestMemoryStart are included: their bytes read zero on every thread.
+using SrtLoadsRecorder = void (*)(void* userdata, std::span<const uint64_t> loads);
+// Guest memory starts here: nothing is mapped below.
+inline constexpr uint64_t SrtGuestMemoryStart = 0x40000;
 inline constexpr uint32_t NoFlatSlot = UINT32_MAX;
 // A load whose value is only one descriptor word with bits the execution thread may refresh
 // (DescriptorRefreshMask()) reports DescriptorSlot(source, word) instead of a flat slot.
@@ -88,6 +93,8 @@ struct SrtRuntime {
 	// above the null page with the value it read. A load whose value only fills a flattened SRT
 	// dword reports that dword: nothing else the walk resolved depends on its bytes.
 	SrtLoadRecorder           record_load           = nullptr;
+	// Optional with record_load: takes all the loads of a walk in one call instead.
+	SrtLoadsRecorder          record_loads          = nullptr;
 	// A walk ahead of execution: whether the GPU produces the dword at an address (a dispatch
 	// resolved lately writes it). A load whose value only decides control flow is not read there:
 	// a bound tested for zero (`lane < n` with an unknown lane: no lane when n is 0) or a value

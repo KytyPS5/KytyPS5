@@ -308,6 +308,10 @@ void RecordAheadLoad(void* userdata, uint64_t address, uint32_t value, uint32_t 
 	static_cast<GuestReadLog*>(userdata)->RecordLoad(address, value, flat_slot);
 }
 
+void RecordAheadLoads(void* userdata, std::span<const uint64_t> loads) {
+	static_cast<GuestReadLog*>(userdata)->RecordLoads(loads);
+}
+
 class ProgramLockGuard {
 public:
 	explicit ProgramLockGuard(std::atomic_flag& flag): m_flag(flag) {
@@ -577,6 +581,78 @@ void GuestReadLog::RecordLoad(uint64_t address, uint32_t value, uint32_t flat_sl
 		return;
 	}
 	Append(address, &value, sizeof(value), false);
+}
+
+void GuestReadLog::RecordLoads(std::span<const uint64_t> loads) {
+	// RecordLoad() for each load, with Append() written for one dword and the bytes written behind
+	// a cursor in room made once: called per load, the calls cost more than the logging.
+	auto bytes_end = m_bytes.size();
+	m_bytes.resize(bytes_end + loads.size() / 2u * sizeof(uint32_t));
+	const auto append = [&](uint64_t address, uint32_t value, bool zero_test) {
+		m_gpu_written =
+		    m_gpu_written || Libs::LibKernel::Memory::MayBeGpuWritten(address, sizeof(value));
+		const auto offset = static_cast<uint32_t>(bytes_end);
+		std::memcpy(m_bytes.data() + bytes_end, &value, sizeof(value));
+		bytes_end += sizeof(value);
+		if (!m_entries.empty() && !zero_test) {
+			auto& last = m_entries.back();
+			if (!last.strict && !last.zero_test && last.address + last.size == address &&
+			    last.offset + last.size == offset) {
+				last.size += sizeof(value);
+				return;
+			}
+		}
+		m_entries.push_back({.address = address, .size = sizeof(value), .offset = offset,
+		                     .strict = false, .zero_test = zero_test});
+	};
+	for (size_t i = 0; i + 1 < loads.size(); i += 2) {
+		const auto address = loads[i];
+		if (address < ShaderRecompiler::IR::SrtGuestMemoryStart) {
+			continue;
+		}
+		const auto value     = static_cast<uint32_t>(loads[i + 1]);
+		const auto flat_slot = static_cast<uint32_t>(loads[i + 1] >> 32u);
+		if (flat_slot == ShaderRecompiler::IR::ZeroTestSlot) {
+			append(address, value, true);
+			continue;
+		}
+		if (ShaderRecompiler::IR::IsDescriptorSlot(flat_slot)) {
+			const auto source = ShaderRecompiler::IR::DescriptorSlotSource(flat_slot);
+			const auto word   = ShaderRecompiler::IR::DescriptorSlotWord(flat_slot);
+			const auto kind   = m_plan != nullptr && source < m_plan->descriptor_refresh.size()
+			                        ? m_plan->descriptor_refresh[source]
+			                        : ShaderRecompiler::IR::DescriptorRefresh::None;
+			const auto offset = static_cast<uint32_t>(bytes_end);
+			append(address, value, false);
+			const auto mask = ShaderRecompiler::IR::DescriptorRefreshMask(kind, word);
+			if (mask != 0) {
+				auto&      entry = m_entries.back();
+				const auto index = static_cast<uint32_t>(m_words.size());
+				m_words.push_back(
+				    {.offset = offset, .stage = m_stage, .source = source, .word = word, .mask = mask});
+				if (entry.words_begin == entry.words_end) {
+					entry.words_begin = index;
+				}
+				entry.words_end = index + 1;
+			}
+			continue;
+		}
+		if (flat_slot != ShaderRecompiler::IR::NoFlatSlot) {
+			if (!m_flat_loads.empty()) {
+				auto&      last = m_flat_loads.back();
+				const auto next = last.address + uint64_t {last.count} * sizeof(uint32_t);
+				if (last.stage == m_stage && next == address && last.slot + last.count == flat_slot &&
+				    (address & 0xfffu) != 0) {
+					last.count++;
+					continue;
+				}
+			}
+			m_flat_loads.push_back({address, m_stage, flat_slot, 1});
+			continue;
+		}
+		append(address, value, false);
+	}
+	m_bytes.resize(bytes_end);
 }
 
 void GuestReadLog::RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
@@ -1762,15 +1838,18 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	ahead.reads.SetStage(stage_index, &entry->second.resource_plan);
 	// The walker's loads of GPU-owned pages read the backing store instead of downloading
 	// GPU-written bytes, and the loads that still fault fail the walk; every load is logged with
-	// the value it read, for the execution thread to check.
+	// the value it read, for the execution thread to check. The pending writes change only between
+	// operations, on this thread: without one, the walker's loads need not ask.
+	const auto pending_write = t_ahead_guest_writes.writes.empty() ? nullptr : AheadPendingWrite;
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 	    .shader_base                = params.Base(),
 	    .userdata                   = &ahead.reads,
 	    .read_specialization_memory = ReadAheadStrict,
 	    .record_load                = RecordAheadLoad,
+	    .record_loads               = RecordAheadLoads,
 	    .gpu_produced               = AheadGpuProduced,
-	    .pending_write              = AheadPendingWrite,
+	    .pending_write              = pending_write,
 	};
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		// As GetProgram(): descriptor tables indexed by the workgroup id probe one entry per group.
@@ -1944,6 +2023,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			    .userdata                   = &reads,
 			    .read_specialization_memory = ReadAheadStrict,
 			    .record_load                = RecordAheadLoad,
+			    .record_loads               = RecordAheadLoads,
 			};
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				runtime.workgroup_counts      = input_info.workgroup_counts;

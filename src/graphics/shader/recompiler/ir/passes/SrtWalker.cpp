@@ -175,7 +175,7 @@ thread_local bool                         t_walker_faulted = false;
 thread_local bool (*t_gpu_produced)(uint64_t address)   = nullptr;
 thread_local bool (*t_pending_write)(uint64_t address, uint32_t& value) = nullptr;
 // Guest memory starts here: a table pointer below it is null.
-constexpr uint64_t GuestMemoryStart = 0x40000;
+constexpr uint64_t GuestMemoryStart = SrtGuestMemoryStart;
 
 SrtWalkerGuestMemory    g_guest_memory;
 std::atomic_bool        g_guest_memory_set {false};
@@ -1828,7 +1828,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		auto* out = reads->data() + base;
 		for (auto* read = first; read != end; read += 2) *out++ = {read[0], uint64_t {sizeof(uint32_t)}};
 	}
-	if (runtime.record_load != nullptr) {
+	if (runtime.record_loads != nullptr) {
+		runtime.record_loads(runtime.userdata, std::span<const uint64_t>(first, end));
+	} else if (runtime.record_load != nullptr) {
 		for (auto* read = first; read != end; read += 2) {
 			// Nothing is mapped below guest memory: those bytes read zero on every thread.
 			if (read[0] >= GuestMemoryStart)

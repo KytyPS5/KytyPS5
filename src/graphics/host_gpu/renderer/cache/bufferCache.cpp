@@ -579,10 +579,17 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	// A copy onto itself changes no bytes. Invalidating here would refresh an image based at this
+	// address from a buffer that never received what the GPU wrote to the image.
+	if (src_memory && dst_memory && src_vaddr == dst_vaddr) {
+		return;
+	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
-		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
-		            size);
+		// A guest copy may overlap itself, where memcpy is undefined. memmove copies as if through a
+		// temporary buffer, which the GPU path below does as well.
+		std::memmove(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
+		             size);
 		return;
 	}
 
@@ -596,7 +603,25 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	// Cached buffers never overlap, so overlapping guest ranges always share one buffer.
+	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
+		CopyOverlapping(command, *dst, src_offset, dst_offset, size);
+		return;
+	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+}
+
+void BufferCache::CopyOverlapping(CommandBuffer& command, Buffer& buffer, uint64_t source_offset,
+                                  uint64_t destination_offset, uint64_t size) {
+	// Vulkan forbids overlapping regions in one copy, so the bytes go through a scratch buffer.
+	// Each CopyFrom places barriers around its copy, which orders the two copies.
+	auto scratch = std::make_unique<Buffer>(
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, size);
+	scratch->CopyFrom(command, buffer, source_offset, 0, size);
+	buffer.CopyFrom(command, *scratch, 0, destination_offset, size);
+	// The copies run later on the GPU, so the scratch buffer is freed once they have finished.
+	m_scheduler.DeferOperation([owner = std::move(scratch)]() mutable { owner.reset(); });
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {

@@ -129,6 +129,12 @@ template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
 	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
+	const auto nonzero_immediate = [&](size_t index) {
+		const auto value = inst.Arg(index);
+		return value.IsImmediate() &&
+		       (std::bit_cast<uint32_t>(value.F32Value()) & 0x7fffffffu) >= 0x00800000u;
+	};
+	const bool flush_values = flush && !nonzero_immediate(0) && !nonzero_immediate(1);
 	const auto operand = [&](size_t index) {
 		const auto value = inst.Arg(index);
 		if (flush && value.IsImmediate()) {
@@ -137,7 +143,7 @@ uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                  ? bits & 0x80000000u : bits);
 		}
 		const auto id = ctx.Arg(inst, index);
-		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
+		return flush_values ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
 	};
 	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
 }

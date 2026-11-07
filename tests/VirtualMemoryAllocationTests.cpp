@@ -3744,6 +3744,28 @@ void TestAutomaticMemoryFragmentedMap() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMemoryPoolReserveInsideReservation() {
+	const char*        test  = "MemoryPoolReserveInsideReservation";
+	constexpr uint64_t len   = SceKernelMemoryPoolReserveLen;
+	void*              outer = nullptr;
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&outer, 5 * len, 0, len),
+	        "KernelReserveVirtualRange(outer)");
+	// Free gaps on both sides keep the outer reservation from merging with other ranges.
+	const auto base = reinterpret_cast<uint64_t>(outer) + len;
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base - len, len), "KernelMunmap(front)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 3 * len, len), "KernelMunmap(back)");
+	void* pool = reinterpret_cast<void*>(base + len);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(pool, len, 0, SceKernelMapFixed, &pool),
+	        "KernelMemoryPoolReserve(inside a reservation)");
+	ExpectRange(test, Query(test, base), base, base + len, 0, 0, 0, 0, 0, "anon");
+	ExpectRange(test, Query(test, base + len), base + len, base + 2 * len, 0, 0, 0, 1, 0, "anon");
+	ExpectRange(test, Query(test, base + 2 * len), base + 2 * len, base + 3 * len, 0, 0, 0, 0, 0,
+	            "anon");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, 3 * len), "KernelMunmap(outer)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMemoryPoolAlignmentContracts() {
 	const char* test = "MemoryPoolAlignmentContracts";
 	void*       addr = nullptr;
@@ -5887,6 +5909,7 @@ int main(int argc, char** argv) {
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAutomaticMemoryFragmentedMap);
+	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);

@@ -3112,17 +3112,10 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 	const auto reserve_alignment = (alignment != 0 ? alignment : POOL_RESERVE_ALIGNMENT);
 	const int  ret = KernelReserveVirtualRange(&out_addr, len, flags, reserve_alignment);
 	if (ret == OK) {
-		const auto           out_vaddr = reinterpret_cast<uint64_t>(out_addr);
-		VirtualRanges::Range reserved_range {};
-		if (!g_virtual_ranges->Query(out_vaddr, 0, &reserved_range) ||
-		    reserved_range.start != out_vaddr || reserved_range.size != len ||
-		    !IsReservedRangeType(reserved_range.type)) {
-			return KERNEL_ERROR_EBUSY;
-		}
-		if (!g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0, 0, 0,
-		                                   VirtualRangeType::PoolReserved, reserved_range.name)) {
-			return KERNEL_ERROR_EBUSY;
-		}
+		// The reservation may merge with a neighboring one, so only its own span changes type.
+		EXIT_IF(!g_virtual_ranges->ReplaceSpan(reinterpret_cast<uint64_t>(out_addr), len,
+		                                       VirtualRangeType::Reserved, 0, 0, 0,
+		                                       VirtualRangeType::PoolReserved, "anon"));
 		*addr_out = out_addr;
 		LOGF("\t out_addr  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(out_addr));
 	}

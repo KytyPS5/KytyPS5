@@ -1562,20 +1562,8 @@ void TestAsanAliasedPhysicalRelease() {
 	        KernelSetVirtualRangeName(reinterpret_cast<void*>(bases[0] + 2 * page), page,
 	                                  "alias_split"),
 	        "split alias names after callback registration");
-	TestFailPhysicalMemoryUnmapAfter(1);
-	CheckFailed(test, KernelCheckedReleaseDirectMemory(physical + page, 2 * page),
-	            "release aliased middle with injected metadata failure");
-	for (const auto base: bases) {
-		Check(test,
-		      AsanShadowPresent(base) && *reinterpret_cast<uint64_t*>(AsanShadowAddress(
-		                                     base + 3 * page)) == 0x414c494153534844ull,
-		      "failed aliased physical release changed shadow coverage");
-		for (uint64_t i = 0; i < 4; ++i)
-			Check(test, *reinterpret_cast<const uint64_t*>(base + i * page) == 0xd1a0 + i,
-			      "failed aliased physical release changed backing contents");
-	}
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical + page, 2 * page),
-	        "release aliased middle after rollback");
+	        "release aliased middle");
 	for (const auto base: bases) {
 		ExpectUnmapped(test, base + page);
 		ExpectUnmapped(test, base + 2 * page);
@@ -2161,9 +2149,9 @@ void TestDirectPartialProtectUnmapPreservesNeighbors() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestDirectTrimmedAliasReleaseRollback() {
+void TestDirectTrimmedAliasRelease() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test     = "DirectTrimmedAliasReleaseRollback";
+	const char*        test     = "DirectTrimmedAliasRelease";
 	constexpr uint64_t page     = SceKernelPageSize;
 	constexpr uint64_t size     = 6 * page;
 	int64_t            physical = -1;
@@ -2199,39 +2187,40 @@ void TestDirectTrimmedAliasReleaseRollback() {
 	      "direct metadata edits fragmented backing ownership records");
 	CheckOk(test, KernelMunmap(base, page), "trim original prefix");
 	CheckOk(test, KernelMunmap(base + 5 * page, page), "trim original suffix");
-	const auto check_survivors = [&] {
-		ExpectUnmapped(test, base);
-		ExpectUnmapped(test, base + 5 * page);
-		ExpectRange(test, Query(test, base + page), base + page, base + 2 * page,
-		            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_middle", physical + page);
-		ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 4 * page,
-		            SceKernelProtCpuRead, 0, 1, 0, 1, "trim_middle", physical + 2 * page);
-		ExpectRange(test, Query(test, base + 4 * page), base + 4 * page, base + 5 * page,
-		            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_middle", physical + 4 * page);
-		ExpectRange(test, Query(test, alias_base), alias_base, alias_base + size,
-		            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_alias", physical);
-		for (uint64_t i = 0; i < 6; ++i) {
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + 5 * page);
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_middle", physical + page);
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 4 * page,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "trim_middle", physical + 2 * page);
+	ExpectRange(test, Query(test, base + 4 * page), base + 4 * page, base + 5 * page,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_middle", physical + 4 * page);
+	ExpectRange(test, Query(test, alias_base), alias_base, alias_base + size,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "trim_alias", physical);
+	for (uint64_t i = 0; i < 6; ++i) {
+		Check(test,
+		      *reinterpret_cast<const uint64_t*>(alias_base + i * page) ==
+		          0x414c494153000000ull + i,
+		      "trimmed mapping damaged its alias backing");
+		if (i > 0 && i < 5) {
 			Check(test,
-			      *reinterpret_cast<const uint64_t*>(alias_base + i * page) ==
+			      *reinterpret_cast<const uint64_t*>(base + i * page) ==
 			          0x414c494153000000ull + i,
-			      "trimmed mapping or rollback damaged its alias backing");
-			if (i > 0 && i < 5) {
-				Check(test,
-				      *reinterpret_cast<const uint64_t*>(base + i * page) ==
-				          0x414c494153000000ull + i,
-				      "trimmed mapping lost its physical offset after rekey or restore");
-			}
+			      "trimmed mapping lost its physical offset after rekey");
 		}
-	};
-	check_survivors();
-	TestFailPhysicalMemoryUnmapAfter(1);
-	CheckFailed(test, KernelCheckedReleaseDirectMemory(physical + 3 * page, page),
-	            "release aliases with injected second-range failure");
-	check_survivors();
-	// The failed physical release cut inside the read-only VMA. Its rollback restored a
-	// separate ownership extent there; a single semantic VMA now crosses two extents.
-	CheckOk(test, KernelMunmap(base + page, 4 * page), "unmap restored ownership fragments");
-	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, size), "release aliases");
+	}
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical + 3 * page, page),
+	        "release one page under both aliases");
+	ExpectUnmapped(test, base + 3 * page);
+	ExpectUnmapped(test, alias_base + 3 * page);
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 3 * page,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "trim_middle", physical + 2 * page);
+	ExpectRange(test, Query(test, alias_base + 4 * page), alias_base + 4 * page,
+	            alias_base + size, SceKernelProtCpuRw, 0, 1, 0, 1, "trim_alias",
+	            physical + 4 * page);
+	Check(test, *reinterpret_cast<const uint64_t*>(base + 4 * page) == 0x414c494153000004ull,
+	      "partial release changed a surviving page");
+	CheckOk(test, KernelReleaseDirectMemory(physical, size), "release aliases");
 	ExpectUnmapped(test, base + page);
 	ExpectUnmapped(test, alias_base);
 	std::printf("[host]    %-48s ok\n", test);
@@ -2536,37 +2525,35 @@ void TestDirectMapValidationBeforeOwnerMutation() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestDirectReleaseRollbackRestoresOwnerMapping() {
-	const char* test      = "DirectReleaseRollbackRestoresOwnerMapping";
-	int64_t     phys_addr = 0;
+void TestDirectReleaseUnmapsGpuRuns() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "DirectReleaseUnmapsGpuRuns";
+	constexpr uint64_t page     = SceKernelPageSize;
+	int64_t            physical = -1;
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
-	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 4 * page, page,
+	                                   SceKernelMtypeC, &physical),
 	        "KernelAllocateDirectMemory");
-	void* address = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &address, SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
-	            "release_rollback"),
-	        "KernelMapNamedDirectMemory");
-	const auto base                    = reinterpret_cast<uint64_t>(address);
-	*reinterpret_cast<uint64_t*>(base) = 0x52454c524f4c4c42ull; // "RELROLLB"
-
-	Libs::LibKernel::Memory::TestFailNextPhysicalMemoryUnmap();
-	CheckFailed(
-	    test,
-	    Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
-	    "KernelCheckedReleaseDirectMemory(injected failure)");
-	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 0, 1,
-	            0, 1, "release_rollback", static_cast<uint64_t>(phys_addr));
-	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x52454c524f4c4c42ull,
-	      "release rollback lost the shared-backing contents");
-
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
-	        "KernelCheckedReleaseDirectMemory(retry)");
-	ExpectUnmapped(test, base);
+	void* reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 2 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapDirectMemory(&address, 2 * page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                              physical + offset, page),
+		        "KernelMapDirectMemory");
+	}
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, 4 * page),
+	        "release memory behind two adjacent views");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, 4 * page}},
+	      "release did not unmap adjacent views from the GPU once");
+	for (uint64_t i = 0; i < 4; ++i)
+		ExpectUnmapped(test, base + i * page);
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -3599,13 +3586,10 @@ void TestAutomaticMemoryReuseAndAliases() {
 	        KernelMapDirectMemory(&second_alias, page * 2, SceKernelProtCpuRw, SceKernelMapFixed,
 	                              physical + page * 2, page),
 	        "KernelMapDirectMemory(overlapping alias)");
-	TestFailPhysicalMemoryUnmapAfter(1);
-	CheckFailed(test, KernelCheckedReleaseDirectMemory(physical, block),
-	            "KernelCheckedReleaseDirectMemory(rollback)");
 	Check(test,
 	      MapAutomaticMemory(base + block * 4, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
-	      "restored mappings remained available to the automatic allocator");
+	      "mapped donations remained available to the automatic allocator");
 	g_gpu_range_events.clear();
 	TestSetGpuRangeCallback(ObserveGpuRange);
 	CheckOk(test, UnmapAmmMemory(base + page, page * 3), "AMM unmap inside a range");
@@ -5709,7 +5693,7 @@ int main(int argc, char** argv) {
 		RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-		RunTest(TestDirectTrimmedAliasReleaseRollback);
+		RunTest(TestDirectTrimmedAliasRelease);
 		RunTest(TestDirectMappingNamesTypesAndValidation);
 		RunTest(TestAutomaticMemoryReuseAndAliases);
 		RunTest(TestAutomaticMemoryFragmentedMap);
@@ -5840,7 +5824,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveValidatesBeforeUnmapping);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-	RunTest(TestDirectTrimmedAliasReleaseRollback);
+	RunTest(TestDirectTrimmedAliasRelease);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
 #if defined(__linux__)
 	RunTest(TestPartialUnmapPreservesHostPermissions);
@@ -5851,7 +5835,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMappingNamesTypesAndValidation);
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
-	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
+	RunTest(TestDirectReleaseUnmapsGpuRuns);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);

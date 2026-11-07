@@ -23,7 +23,6 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
-#include <span>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -609,10 +608,6 @@ private:
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
 };
-
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
-#endif
 
 static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size) {
 	const auto end   = start + size;
@@ -1312,16 +1307,6 @@ std::map<uint64_t, PhysicalMemory::Mapping>::iterator PhysicalMemory::SplitMappi
 }
 
 bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-	if (g_test_physical_memory_unmaps_before_failure == 0) {
-		g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
-		return false;
-	}
-	if (g_test_physical_memory_unmaps_before_failure != UINT32_MAX) {
-		g_test_physical_memory_unmaps_before_failure--;
-	}
-#endif
-
 	Common::LockGuard lock(m_mutex);
 	if (size == 0 || UINT64_MAX - vaddr < size) {
 		return false;
@@ -1331,7 +1316,6 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	if (first != m_mappings.begin()) {
 		--first;
 	}
-	// Rollback can leave several ownership intervals inside one semantic virtual range.
 	// Validate the complete span before changing any ownership records.
 	auto current = vaddr;
 	for (auto it = first; current < end; ++it) {
@@ -2193,66 +2177,15 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool skip_gaps
 		return KERNEL_ERROR_EACCES;
 	}
 
+	// Validation precedes the first unmap; failing after it is an emulator fault.
 	const auto mapped_aliases = g_physical_memory->FindMappings(start, len);
+	UnmapGpuRanges(mapped_aliases);
 	for (const auto& alias: mapped_aliases) {
-		if (!g_guest_address_space->BackingContains(alias.start, alias.size)) {
-			EXIT("direct-memory alias escaped guest address-space ownership\n");
-		}
-	}
-
-	for (const auto& alias: mapped_aliases) {
-		UnmapGpuRange(alias.start, alias.size);
-	}
-
-	auto restore_gpu_aliases = [&mapped_aliases]() {
-		for (const auto& alias: mapped_aliases) {
-			MapGpuRange(alias.start, alias.size);
-		}
-	};
-	auto restore_owner_aliases = [](std::span<const VirtualRanges::Range> aliases) {
-		for (auto it = aliases.rbegin(); it != aliases.rend(); ++it) {
-			VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
-
-			EXIT_IF(!DecodeMemoryProtection(it->protection, &mode));
-			EXIT_IF(!g_guest_address_space->MapBacking(it->start, it->size, it->offset, mode));
-		}
-	};
-
-	size_t owner_unmapped = 0;
-	for (const auto& alias: mapped_aliases) {
-		if (!g_guest_address_space->UnmapBacking(alias.start, alias.size)) {
-			restore_owner_aliases(std::span(mapped_aliases).first(owner_unmapped));
-			restore_gpu_aliases();
-			return KERNEL_ERROR_EACCES;
-		}
-		++owner_unmapped;
-	}
-
-	size_t metadata_unmapped = 0;
-	for (const auto& alias: mapped_aliases) {
-		if (!g_physical_memory->Unmap(alias.start, alias.size)) {
-			for (const auto& removed: std::span(mapped_aliases).first(metadata_unmapped)) {
-				EXIT_IF(!g_physical_memory->Map(removed.start, removed.offset, removed.size));
-			}
-			restore_owner_aliases(std::span(mapped_aliases).first(owner_unmapped));
-			restore_gpu_aliases();
-			return KERNEL_ERROR_EACCES;
-		}
-		++metadata_unmapped;
-	}
-
-	for (const auto& alias: mapped_aliases) {
-		EXIT_IF(!g_virtual_ranges->Remove(alias.start, alias.size));
+		UnmapMemoryOwner(alias);
 	}
 
 	for (const auto& block: allocated_span) {
 		EXIT_IF(!g_physical_memory->Release(block.start_addr, block.size));
-	}
-
-	if (g_free_callback != nullptr) {
-		for (const auto& alias: mapped_aliases) {
-			g_free_callback(alias.start, alias.size);
-		}
 	}
 
 	return OK;
@@ -2641,14 +2574,6 @@ void TestBeforeNextBackingMap(callback_func_t callback) {
 
 void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
-}
-
-void TestFailNextPhysicalMemoryUnmap() {
-	TestFailPhysicalMemoryUnmapAfter(0);
-}
-
-void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
-	g_test_physical_memory_unmaps_before_failure = successful_unmaps;
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {

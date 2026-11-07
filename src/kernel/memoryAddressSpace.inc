@@ -652,8 +652,6 @@ public:
 		return true;
 	}
 
-	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
-
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);

@@ -206,7 +206,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		input_attr[index].binding  = vertex_input.attributes[index].binding;
 		input_attr[index].location = index;
 		input_attr[index].offset   = vertex_input.attributes[index].offset;
-		input_attr[index].format   = vertex.vertex_formats[index];
+		input_attr[index].format   = vertex_input.attributes[index].format;
 	}
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};

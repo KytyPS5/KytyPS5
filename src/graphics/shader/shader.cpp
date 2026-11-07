@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -461,7 +462,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& destination = info.resources_dst[i];
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		key.push_back(ShaderRecompiler::Format::VertexFetchSignature(resource.fields[3]));
 	}
 }
 

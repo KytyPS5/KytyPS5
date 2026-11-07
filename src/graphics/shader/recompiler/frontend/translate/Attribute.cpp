@@ -52,8 +52,8 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 	for (uint32_t component = 0; component < component_count; component++) {
 		auto source = Format::FormattedSource {Format::FormattedSourceKind::Memory, component};
 		if (inst.formatted && !inst.typed) {
-			source = Format::ResolveFormattedSource(
-			    format, GetDstSel(resource.DstSelXYZW(), component));
+			source = Format::ResolveVertexFetchSource(
+			    format, GetDstSel(resource.DstSelXYZW(), component), component);
 			if (source.kind == Format::FormattedSourceKind::Invalid) {
 				EXIT("invalid formatted vertex input %u at pc 0x%08x", attribute, inst.pc);
 			}

@@ -633,6 +633,10 @@ struct PipelineCacheTestAccess {
   }
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
+  static size_t Programs(const PipelineCache &cache) { return cache.m_program_cache.size(); }
+  static const auto &GraphicsPipelines(const PipelineCache &cache) {
+    return cache.m_graphics_pipelines;
+  }
 
   static void StoreLayout(PipelineCache &cache, uint64_t key,
                           const ShaderTessellationInputInfo &layout) {
@@ -19941,9 +19945,6 @@ public:
     vertex_shader.info.stage = ShaderType::Vertex;
     vertex_shader.info.info.vertex_fetch_components[0] = 2;
     vertex_shader.info.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
-    // No narrower host format covers the components the stage reads from either attribute.
-    vertex_shader.vertex_formats = {VulkanFormat(Prospero::BufferFormat::k32_32Float),
-                                    VulkanFormat(color_format)};
     ShaderModule pixel_shader{.id = 2, .module = CreateShaderModule(name, fragment.spirv)};
     pixel_shader.info.stage = ShaderType::Pixel;
     pixel_shader.info.info = fragment.program.info;
@@ -48841,6 +48842,145 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckVertexFetchCache(VulkanHarness &vulkan) {
+  constexpr const char *name = "VertexFetchCache";
+  const std::vector<u32> code{
+      EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02, 20, 4), EncodeSmem1(0),
+      EncodeVop2(0x01, 0, Vgpr(8), 5),
+      EncodeMubuf0(0x03, 0, true, false), EncodeMubuf1(9, 5, 0),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
+  std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1> offsets;
+  offsets.fill(ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData metadata{};
+  metadata.direct_resource_offset = offsets.data();
+  metadata.direct_resource_count = static_cast<uint16_t>(offsets.size());
+  ShaderSemantic semantic{};
+  semantic.hardware_mapping = 9;
+  semantic.size_in_elements = 4;
+  ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+      {.type = Prospero::ShaderBinaryType::kGs, .user_data = &metadata,
+       .input_semantics = &semantic, .num_input_semantics = 1,
+       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  struct Case {
+    u32 word;
+    vk::Format format;
+    u32 group, components;
+  };
+  const Case cases[]{
+      {0x4022c, vk::Format::eR32G32Sfloat, 0, 4},
+      {0x1722c, vk::Format::eR16G16Unorm, 0, 4},
+      {0x42fac, vk::Format::eR16G16B16A16Snorm, 0, 4},
+      {0x4a3ac, vk::Format::eR32G32B32Sfloat, 0, 4},
+      {(62u << 12u) | DstSel(4, 5, 0, 1), vk::Format::eR32G32Uint, 1, 4},
+      {(63u << 12u) | DstSel(4, 5, 0, 1), vk::Format::eR32G32Sint, 2, 4},
+      {(77u << 12u) | DstSel(4, 5, 6, 7), vk::Format::eR32G32B32A32Sfloat, 0, 4},
+      {(71u << 12u) | DstSel(4, 5, 6, 1), vk::Format::eR16G16B16A16Sfloat, 3, 3},
+      {(36u << 12u) | DstSel(4, 5, 6, 1), vk::Format::eB10G11R11UfloatPack32, 0, 4},
+      {(50u << 12u) | DstSel(4, 5, 6, 1), vk::Format::eA2B10G10R10UnormPack32, 3, 3},
+      {(14u << 12u) | DstSel(4, 5, 0, 1), vk::Format::eR8G8Unorm, 0, 4},
+      {(16u << 12u) | DstSel(4, 5, 0, 1), vk::Format::eR8G8Uscaled, 0, 4},
+      {(17u << 12u) | DstSel(4, 5, 0, 1), vk::Format::eR8G8Sscaled, 0, 4},
+      {(56u << 12u) | DstSel(4, 5, 6, 1), vk::Format::eR8G8B8A8Unorm, 3, 3},
+      {(66u << 12u) | DstSel(4, 5, 6, 1), vk::Format::eR16G16B16A16Snorm, 3, 3},
+      {(56u << 12u) | DstSel(6, 5, 4, 1), vk::Format::eR8G8B8A8Unorm, 4, 3},
+      {(64u << 12u) | DstSel(1, 5, 0, 1), vk::Format::eR32G32Sfloat, 5, 4},
+      {(64u << 12u) | DstSel(4, 5, 0, 0), vk::Format::eR32G32Sfloat, 6, 3},
+      {(77u << 12u) | DstSel(4, 5, 6, 1), vk::Format::eR32G32B32Sfloat, 3, 3}};
+  ShaderBufferResource buffer{{0x10000, 16u << 16u, 3, 0}};
+  const u32 attribute = 0;
+  const uint64_t tables[]{reinterpret_cast<uint64_t>(&buffer),
+                          reinterpret_cast<uint64_t>(&attribute)};
+  std::array<u32, 12> user_data{};
+  std::memcpy(user_data.data() + 8, tables, sizeof(tables));
+  const auto store = std::filesystem::temp_directory_path() /
+                     fmt::format("kyty_vertex_fetch_cache_{}",
+                                 std::chrono::steady_clock::now().time_since_epoch().count()) /
+                     "TEST00000.shaders";
+  std::vector<GraphicsPipelineKey> keys;
+  auto context_owner = std::make_unique<RenderContext>(vulkan.RuntimeContext(), store);
+  auto &context = *context_owner;
+  context.InitializeGpu(nullptr);
+  auto &cache = context.GetPipelineCache();
+  context.GetGpu().SendCommandSync([&] {
+    CommandProcessor processor(context, 0);
+    processor.BufferInit();
+    processor.GetCtx().SetViewportTransformControl(0x300);
+    processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    processor.GetShCtx().SetEsShaderBase(reinterpret_cast<uint64_t>(code.data()));
+    processor.GetShCtx().SetGsShaderResource2({.user_sgpr = 4});
+    for (u32 i = 0; i < 4; i++) processor.GetShCtx().SetGsUserSgpr(i, user_data[8 + i]);
+    std::array<uint64_t, 7> ids{};
+    std::vector<std::pair<u32, std::vector<u32>>> binaries;
+    size_t expected_programs = 0;
+    const auto profile = SpirvProfile(vulkan.RuntimeContext());
+    for (const auto &test : cases) {
+      if (!(vulkan.RuntimeContext().GetFormatProperties(test.format).bufferFeatures &
+            vk::FormatFeatureFlagBits::eVertexBuffer)) {
+        continue;
+      }
+      buffer.fields[3] = test.word;
+      DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+      auto &command = context.GetCommandScheduler().Current();
+      cache.GetGraphicsPrograms(command, state);
+      const auto &input = state.vertex_info[0];
+      const auto id = input.stage.module->id;
+      if (ids[test.group] == 0) ids[test.group] = id;
+      expected_programs = std::max(expected_programs, size_t{test.group + 1u});
+      Require(name, "program and module reuse",
+              ids[test.group] == id && PipelineCacheTestAccess::Programs(cache) == expected_programs &&
+                  PipelineCacheTestAccess::Compiled(cache)[static_cast<size_t>(ShaderType::Vertex)] ==
+                      expected_programs,
+              "fetch signatures did not partition Programs and modules");
+      auto &pipeline = cache.GetGraphicsPipeline(command, state);
+      const auto &pipelines = PipelineCacheTestAccess::GraphicsPipelines(cache);
+      const auto entry = std::ranges::find_if(pipelines, [&](const auto &item) {
+        return item.second.pipeline == pipeline.pipeline;
+      });
+      Require(name, "pipeline format",
+              entry != pipelines.end() && entry->first.vertex_input.attribute_count == 1 &&
+                  entry->first.vertex_input.attributes[0].format == test.format,
+              "pipeline did not retain the draw's exact host format");
+      if (std::ranges::find(keys, entry->first) == keys.end()) keys.push_back(entry->first);
+      ShaderRecompiler::CompileOptions options;
+      options.stage = ShaderType::Vertex;
+      options.wave_size = input.wave_size;
+      options.user_data_base = 8;
+      options.user_data = user_data;
+      options.input_info.vertex = &input;
+      options.profile = &profile;
+      auto compiled = ShaderRecompiler::CompileProgram(
+          ShaderRecompiler::TranslateProgram(code, options), options, input.stage.module->specialization);
+      Require(name, "fetch width", compiled.program.info.vertex_fetch_components[0] == test.components,
+              "test shader did not use the embedded fetch");
+      for (const auto &[group, binary] : binaries) {
+        Require(name, "SPIR-V identity", (binary == compiled.spirv) == (group == test.group),
+                "SPIR-V identity disagreed with the fetch signature");
+      }
+      binaries.emplace_back(test.group, std::move(compiled.spirv));
+    }
+    Require(name, "one pipeline per format", PipelineCacheTestAccess::Pipelines(cache)[0] == keys.size(),
+            "pipeline keys lost a format or split a shared module");
+    context.GetCommandScheduler().Finish();
+    Require(name, "pipeline recreation",
+            PipelineCacheTestAccess::RecreateGraphicsPipelines(cache) == keys.size(),
+            "pipeline creation still depends on format metadata outside the key");
+  });
+  context.ShutdownGpu();
+  context_owner.reset();
+  {
+    PipelineCache restored(vulkan.RuntimeContext(), nullptr, store);
+    const auto &pipelines = PipelineCacheTestAccess::GraphicsPipelines(restored);
+    Require(name, "stored pipeline formats",
+            pipelines.size() == keys.size() &&
+                std::ranges::all_of(keys, [&](const auto &key) { return pipelines.contains(key); }),
+            "shader store did not preserve the vertex pipeline keys");
+  }
+  std::filesystem::remove_all(store.parent_path());
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Module ids come from the module inputs, not from the order of compilation.
 void CheckStableProgramIds(VulkanHarness &vulkan) {
   constexpr const char *name = "StableProgramIds";
@@ -55096,6 +55236,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
     VulkanHarness vulkan;
+    CheckVertexFetchCache(vulkan);
     CheckShaderStore(vulkan);
     return 0;
   }
@@ -56363,6 +56504,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckVertexFetchCache(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();

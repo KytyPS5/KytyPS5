@@ -209,15 +209,21 @@ void TestCommandChunkQueueThreads() {
 	Check(submits == tick && last_submit_tick == tick, "every submit is replayed once");
 }
 
-// Move-only elements pass through a small queue in order while both sides sleep and wake.
+// Move-only elements pass through a small queue in order while both sides sleep and wake; a
+// peek shows the element the next pop returns.
 void TestSpscQueue() {
 	constexpr uint64_t              Count = 1000000;
 	Common::SpscQueue<std::unique_ptr<uint64_t>> queue(8);
 	Check(queue.Capacity() == 8, "capacity is a power of two");
+	Check(queue.TryPeek() == nullptr, "an empty queue has nothing to peek");
 	uint64_t     received = 0;
 	bool         ordered  = true;
+	bool         peeked   = true;
 	std::jthread consumer([&] {
 		for (;;) {
+			if (const auto* next = queue.TryPeek(); next != nullptr) {
+				peeked &= **next == received;
+			}
 			auto value = queue.Pop();
 			if (!value) {
 				return;
@@ -240,6 +246,7 @@ void TestSpscQueue() {
 	queue.Stop();
 	consumer.join();
 	Check(ordered && received == Count, "every element arrives once, in order");
+	Check(peeked, "a peeked element is the one the next pop returns");
 
 	// Elements left in a stopped queue are still popped, then destroyed with the queue.
 	Common::SpscQueue<std::unique_ptr<uint64_t>> leftover(4);
@@ -417,7 +424,8 @@ void TestHostCopyQueue() {
 }
 
 // CopyInline() copies from a source the caller reuses at once, across several laps of its ring,
-// and mixes with plain copies; sources larger than a ring chunk are copied directly.
+// and mixes with plain copies, which Drain() waits for; sources larger than a ring chunk are
+// copied directly.
 void TestHostCopyQueueInline() {
 	constexpr size_t     Copies = 60000;
 	constexpr size_t     Bytes  = 520;
@@ -426,6 +434,7 @@ void TestHostCopyQueueInline() {
 	std::vector<uint8_t> plain(Bytes);
 	std::vector<uint8_t> scratch(Bytes);
 	Libs::Graphics::HostCopyQueue queue;
+	bool                          drained = true;
 	for (size_t i = 0; i < Copies; i++) {
 		for (size_t k = 0; k < Bytes; k++) {
 			scratch[k] = static_cast<uint8_t>(i * 31 + k * 7 + k / 13);
@@ -436,6 +445,7 @@ void TestHostCopyQueueInline() {
 			std::memcpy(plain.data(), scratch.data(), Bytes);
 			queue.Copy(targets.data() + i * Bytes, plain.data(), Bytes);
 			queue.Drain();
+			drained &= std::memcmp(targets.data() + i * Bytes, plain.data(), Bytes) == 0;
 		} else {
 			queue.CopyInline(targets.data() + i * Bytes, scratch.data(), Bytes);
 		}
@@ -451,7 +461,8 @@ void TestHostCopyQueueInline() {
 	std::vector<uint8_t> large(size_t {200} << 10u, 0x5a);
 	std::vector<uint8_t> large_target(large.size(), 0);
 	queue.CopyInline(large_target.data(), large.data(), large.size());
-	queue.Drain();
+	queue.WaitFor(queue.Flush());
+	Check(drained, "Drain() waits for the plain copies");
 	Check(targets == expected, "every inline copy lands with the bytes of its call");
 	Check(large_target == large, "a large inline copy lands");
 }

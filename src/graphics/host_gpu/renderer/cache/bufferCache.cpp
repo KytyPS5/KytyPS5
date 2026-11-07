@@ -910,11 +910,19 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	// The execution thread hands its copies to the host copy thread (see HostCopyQueue: writing
 	// the stream buffer itself would stall it on its next fence). The copy reads the backing
 	// store, which holds the same bytes as the guest range and is never protected, so a copy that
-	// runs after a later draw protected the range for GPU writes does not fault.
+	// runs after a later draw protected the range for GPU writes does not fault. When the next
+	// operation waits for the copies (GpuOperation::stream_in_place), the bytes go into the copy
+	// queue's ring right away instead: ASTRO BOT (PPSA21564) streams ~9,000 small constant ranges
+	// a frame between ~20,000 occlusion counter dumps and WRITE_DATAs, and waiting for the copy
+	// thread at those took 4 ms a frame of the execution thread.
 	auto* copies = m_scheduler.HostCopies();
 	if (copies != nullptr && m_stream_buffer.IsCoherent() && GuestGpu::IsGpuThread()) {
 		if (const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
-			copies->Copy(destination, source, size);
+			if (m_stream_in_place) {
+				copies->CopyInline(destination, source, size);
+			} else {
+				copies->Copy(destination, source, size);
+			}
 			return;
 		}
 	}

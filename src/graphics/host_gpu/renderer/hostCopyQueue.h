@@ -25,8 +25,9 @@ namespace Libs::Graphics {
 // the count with a release store after the copies, ProgressCounter::WaitFor() acquires it).
 //
 // The producer must wait for its copies before anything may read their destinations (a queue
-// submission, through Flush() and WaitFor() on the submitting thread) and before the guest may
-// legally overwrite their sources (any guest-visible effect, through Drain()).
+// submission, through Flush() and WaitFor() on the submitting thread) and, for copies that read
+// their source when they run (Copy()), before the guest may legally overwrite it (any
+// guest-visible effect, through Drain()).
 //
 // The destinations are mapped device memory, which the CPU writes combined: a fence or a locked
 // instruction on the writing thread waits until those writes drained over the bus. The producer
@@ -55,12 +56,10 @@ public:
 	KYTY_CLASS_NO_COPY(HostCopyQueue);
 
 	// Producer: queues a copy of `size` bytes; `source` must stay readable and `destination`
-	// writable until the copy completed.
+	// writable until the copy completed (see Drain()).
 	void Copy(void* destination, const void* source, size_t size) {
-		m_pending.jobs[m_pending.count++] = {destination, source, size};
-		if (m_pending.count == BatchSize) {
-			(void)Flush();
-		}
+		Queue(destination, source, size);
+		m_source_copies = m_queued + m_pending.count;
 	}
 	// Producer: queues a copy of `size` bytes from a source that may change once this returns.
 	// The bytes go through a ring of cached host memory that the copy thread copies from.
@@ -77,7 +76,7 @@ public:
 		m_ring_offset += Common::AlignUp(size, size_t {16});
 		// The copy queued below is the (m_queued + m_pending.count + 1)-th one.
 		m_ring_users[m_ring_chunk] = m_queued + m_pending.count + 1;
-		Copy(destination, staged, size);
+		Queue(destination, staged, size);
 	}
 	// Producer: hands the gathered copies to the copy thread; returns the number of copies
 	// queued so far.
@@ -91,12 +90,14 @@ public:
 	}
 	// Any thread: waits until the first `count` copies completed.
 	void WaitFor(uint64_t count) noexcept { m_completed.WaitFor(count); }
-	// Producer: waits until every queued copy completed.
+	// Producer: waits until the copies that read a source passed to Copy() completed, before the
+	// guest may change it. Copies queued with CopyInline() read their own copy of the source.
 	void Drain() {
-		const auto queued = Flush();
-		if (m_completed.Load() != queued) {
-			m_completed.WaitFor(queued);
+		if (m_completed.Load() >= m_source_copies) {
+			return;
 		}
+		(void)Flush();
+		m_completed.WaitFor(m_source_copies);
 	}
 
 private:
@@ -111,6 +112,13 @@ private:
 		if (const auto user = m_ring_users[m_ring_chunk]; user != 0 && m_completed.Load() < user) {
 			(void)Flush();
 			m_completed.WaitFor(user);
+		}
+	}
+
+	void Queue(void* destination, const void* source, size_t size) {
+		m_pending.jobs[m_pending.count++] = {destination, source, size};
+		if (m_pending.count == BatchSize) {
+			(void)Flush();
 		}
 	}
 
@@ -156,6 +164,8 @@ private:
 	// Producer side.
 	alignas(64) Batch m_pending;
 	uint64_t    m_queued = 0;
+	// Copies queued up to the last one that reads a source passed to Copy().
+	uint64_t    m_source_copies = 0;
 	// CopyInline() sources, in chunks; each chunk remembers the last copy that reads it.
 	std::unique_ptr<std::byte[]>     m_ring = std::make_unique<std::byte[]>(RingChunkSize * RingChunks);
 	std::array<uint64_t, RingChunks> m_ring_users {};

@@ -108,6 +108,10 @@ struct GpuOperation {
 	// The guest ordered the operation after the earlier work of its queue (ACQUIRE_MEM or
 	// WAIT_REG_MEM since the operation before).
 	bool guest_sync = true;
+	// Draws and dispatches: the next operation is not a draw, so it waits for the host copies of
+	// this one before it executes (HostCopyQueue::Drain()); this one copies the guest data it
+	// streams into the copy queue's ring right away instead (BufferCache::StreamGuestData()).
+	bool stream_in_place = false;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

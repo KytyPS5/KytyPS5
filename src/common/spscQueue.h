@@ -239,6 +239,19 @@ public:
 		return Take(head);
 	}
 
+	// Consumer: the element Pop() would return next, left in the ring, or null when the ring is
+	// empty. It stays valid until the consumer pops it.
+	[[nodiscard]] const T* TryPeek() {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		if (m_consumer_tail == head) {
+			m_consumer_tail = m_tail.load(std::memory_order_acquire);
+			if (m_consumer_tail == head) {
+				return nullptr;
+			}
+		}
+		return Element(head);
+	}
+
 	// Any thread: wakes the consumer, whose Pop() returns nothing once the ring is empty.
 	void Stop() {
 		m_stopped.store(true, std::memory_order_seq_cst);

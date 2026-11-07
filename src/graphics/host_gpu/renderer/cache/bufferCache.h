@@ -130,6 +130,9 @@ public:
 	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
 	// CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
+	// Execution thread: whether the operation about to execute streams its guest data through the
+	// host copy queue's ring (see GpuOperation::stream_in_place).
+	void SetStreamInPlace(bool in_place) noexcept { m_stream_in_place = in_place; }
 	// Copies host data into the stream buffer (on the host copy thread from the execution thread)
 	// and returns its offset there.
 	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
@@ -519,6 +522,7 @@ private:
 		uint64_t offset           = 0;
 	};
 	static constexpr size_t                                  StreamMemoSlots = 1024;
+	bool                                                     m_stream_in_place = false;
 	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
 	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();
 	static constexpr size_t                                  ObtainMemoSlots = 4096;

@@ -59,6 +59,11 @@ constexpr size_t ResolvedQueueSize = 256;
 // How long a command processor whose queues all wait spins before it retries them.
 constexpr auto BlockedRetryInterval = std::chrono::microseconds(20);
 
+static bool IsDrawOperation(GpuOperationKind kind) {
+	return kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
+	       kind == GpuOperationKind::DrawIndirect;
+}
+
 // Reads memory other threads may write, with the widest aligned accesses.
 static void CopyFromGuest(void* destination, const volatile void* source, size_t size) {
 	auto*      out     = static_cast<uint8_t*>(destination);
@@ -382,6 +387,11 @@ void GuestGpu::ExecutionThread() {
 				continue;
 			}
 		}
+		// See GpuOperation::stream_in_place (the resolve thread sets it when there is one).
+		if (!m_resolving && operation->kind != GpuOperationKind::Callback) {
+			const auto* next = operations.TryPeek();
+			operation->stream_in_place = next != nullptr && !IsDrawOperation(next->kind);
+		}
 		operation->processor->Execute(*operation);
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
@@ -452,6 +462,11 @@ void GuestGpu::ResolveThread() {
 			    *operation->state.context, *operation->state.shaders, operation->dispatch.mode,
 			    operation->dispatch.args_addr,
 			    operation->processor->IsAsyncComputeQueue());
+		}
+		// See GpuOperation::stream_in_place: the command processor is usually far ahead.
+		if (operation->kind != GpuOperationKind::Callback) {
+			const auto* next = m_operations.TryPeek();
+			operation->stream_in_place = next != nullptr && !IsDrawOperation(next->kind);
 		}
 		m_resolved.Push(std::move(*operation));
 	}
@@ -643,6 +658,8 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			copies->Drain();
 		}
 	}
+	// See GpuOperation::stream_in_place.
+	m_renderer.GetBufferCache().SetStreamInPlace(operation.stream_in_place);
 	struct CommitWriteTicks {
 		RenderContext& renderer;
 		~CommitWriteTicks() {

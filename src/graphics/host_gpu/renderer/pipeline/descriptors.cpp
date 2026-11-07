@@ -140,7 +140,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 // Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state.
 static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
-	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
+	constexpr uint32_t field1_reserved_mask = 1u << 29u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
@@ -285,10 +285,11 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	// A 4.8 fixed-point MIN_LOD at or below BASE_LEVEL clamps no level of the view.
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d || is_2d_msaa) &&
 	       supported_tile && descriptor.BaseLevel() <= descriptor.LastLevel() &&
-	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
-	       !descriptor.MsaaDepth();
+	       descriptor.MinLod() <= descriptor.BaseLevel() * 256u && supported_swizzle &&
+	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,

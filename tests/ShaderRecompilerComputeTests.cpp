@@ -51021,6 +51021,11 @@ ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
   return resource;
 }
 
+ShaderTextureResource Ppsa02110MinLodStorageTextureDescriptor() {
+  return {{0x13053000u, 0xc3e40000u, 0x003fc03fu, 0xd054402cu, 0x00000000u,
+           0x00700080u, 0x000000d1u, 0x00000000u}};
+}
+
 ShaderTextureResource Ppsa02527R16FloatStorageTextureDescriptor() {
   return {{0x00ce3500u, 0xc0d00000u, 0x010dc1dfu, 0x91b00204u, 0x00000000u,
            0x00700000u, 0x00000000u, 0x00000000u}};
@@ -51663,6 +51668,19 @@ void CheckBasicStorageTextureDescriptor() {
 }
 #endif
 
+void CheckStorageTextureMinLodAtBaseLevel() {
+  const auto descriptor = Ppsa02110MinLodStorageTextureDescriptor();
+  Require("StorageTextureMinLod", "PPSA02110 mip-four descriptor",
+          descriptor.BaseLevel() == 4 && descriptor.LastLevel() == 4 &&
+              descriptor.MinLod() == 4u << 8u &&
+              descriptor.Format() == Prospero::BufferFormat::k32_32UInt &&
+              descriptor.TileMode() == Prospero::TileMode::kStandard4KB,
+          "PPSA02110 MIN_LOD storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), descriptor,
+                         0xab000);
+  std::printf("[host]    %-32s ok\n", "StorageTextureMinLod");
+}
+
 void CheckStorageTextureLinearUploadLayout() {
   constexpr auto format = Prospero::BufferFormat::k8_8_8_8UNorm;
   constexpr uint32_t width = 3840;
@@ -52139,6 +52157,13 @@ void CheckShaderRecompilerFatalContracts() {
     AppendEnd(&test.code);
     test.opcodes = {ShaderOpcode::DS_OR_B64, ShaderOpcode::S_ENDPGM};
     (void)CompileCase(test);
+  });
+
+  ExpectFatal("StorageTextureMinLodAboveBase", [] {
+    auto descriptor = Ppsa02110MinLodStorageTextureDescriptor();
+    descriptor.fields[1] += 1u << 8u;
+    ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), descriptor,
+                           0xab000);
   });
 
   {
@@ -56377,6 +56402,7 @@ int main(int argc, char **argv) {
   bool skipped_device_checks = false;
 #endif
   CheckImageSamplerSpecialization();
+  CheckStorageTextureMinLodAtBaseLevel();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();

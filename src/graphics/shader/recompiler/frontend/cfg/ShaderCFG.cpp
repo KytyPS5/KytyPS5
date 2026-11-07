@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -66,18 +67,6 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END: return BranchCondition::ScalarInstruction;
 		default: return BranchCondition::Unknown;
-	}
-}
-
-bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
-	switch (operand.kind) {
-		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
-		case Decoder::OperandKind::VccLo: code = 106u; return true;
-		case Decoder::OperandKind::VccHi: code = 107u; return true;
-		case Decoder::OperandKind::M0: code = 124u; return true;
-		case Decoder::OperandKind::ExecLo: code = 126u; return true;
-		case Decoder::OperandKind::ExecHi: code = 127u; return true;
-		default: return false;
 	}
 }
 
@@ -758,25 +747,7 @@ struct TarjanState {
 	std::vector<StronglyConnectedComponent> components;
 };
 
-void TarjanVisit(TarjanState& state, uint32_t block_id) {
-	state.index[block_id]   = state.next_index;
-	state.lowlink[block_id] = state.next_index;
-	state.next_index++;
-	state.stack.push_back(block_id);
-	state.on_stack[block_id] = true;
-
-	const auto* block = state.graph->FindBlock(block_id);
-	if (block != nullptr) {
-		for (auto succ: block->successors) {
-			if (state.index[succ] == UINT32_MAX) {
-				TarjanVisit(state, succ);
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
-			} else if (state.on_stack[succ]) {
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
-			}
-		}
-	}
-
+void TarjanFinish(TarjanState& state, uint32_t block_id) {
 	if (state.lowlink[block_id] != state.index[block_id]) {
 		return;
 	}
@@ -810,6 +781,41 @@ void TarjanVisit(TarjanState& state, uint32_t block_id) {
 	SortUnique(component.entry_blocks);
 	component.irreducible = cyclic && component.entry_blocks.size() > 1u;
 	state.components.push_back(std::move(component));
+}
+
+// Iterative, so a long block path cannot overflow the translating thread's stack.
+void TarjanVisit(TarjanState& state, uint32_t root) {
+	struct Frame {
+		uint32_t block;
+		uint32_t next_successor;
+	};
+	std::vector<Frame> frames {{root, 0}};
+	while (!frames.empty()) {
+		const auto block_id = frames.back().block;
+		if (state.index[block_id] == UINT32_MAX) {
+			state.index[block_id] = state.lowlink[block_id] = state.next_index++;
+			state.stack.push_back(block_id);
+			state.on_stack[block_id] = true;
+		}
+
+		const auto* block = state.graph->FindBlock(block_id);
+		if (block != nullptr && frames.back().next_successor < block->successors.size()) {
+			const auto succ = block->successors[frames.back().next_successor++];
+			if (state.index[succ] == UINT32_MAX) {
+				frames.push_back({succ, 0});
+			} else if (state.on_stack[succ]) {
+				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
+			}
+			continue;
+		}
+
+		frames.pop_back();
+		if (!frames.empty()) {
+			const auto parent     = frames.back().block;
+			state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[block_id]);
+		}
+		TarjanFinish(state, block_id);
+	}
 }
 
 void ComputeComponents(Graph& graph) {
@@ -1658,6 +1664,18 @@ Graph Structurize(const Graph& graph) {
 		return failed;
 	}
 	return GotoStructurizer(graph).Run();
+}
+
+bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
+	switch (operand.kind) {
+		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
+		case Decoder::OperandKind::VccLo: code = 106u; return true;
+		case Decoder::OperandKind::VccHi: code = 107u; return true;
+		case Decoder::OperandKind::M0: code = 124u; return true;
+		case Decoder::OperandKind::ExecLo: code = 126u; return true;
+		case Decoder::OperandKind::ExecHi: code = 127u; return true;
+		default: return false;
+	}
 }
 
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {

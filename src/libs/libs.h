@@ -62,7 +62,7 @@ namespace Libs {
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
-	if (Log::GetDirection() != Log::Direction::Silent) {
+	if (!Log::IsSilent()) {
 		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
 		const auto print_name_time = fmt::format(
 		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,

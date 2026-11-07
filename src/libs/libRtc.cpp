@@ -1,5 +1,4 @@
 #include "common/abi.h"
-#include "common/dateTime.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -7,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <limits>
 
 namespace Libs {
@@ -49,6 +49,18 @@ struct RtcTick {
 
 static_assert(sizeof(RtcTick) == 8);
 
+static int GetDaysInMonth(int year, int month) {
+	if (year <= 0 || year > 9999) {
+		return RTC_ERROR_INVALID_YEAR;
+	}
+	if (month <= 0 || month > 12) {
+		return RTC_ERROR_INVALID_MONTH;
+	}
+
+	return static_cast<int>(
+	    static_cast<unsigned>((std::chrono::year {year} / month / std::chrono::last).day()));
+}
+
 static int KYTY_SYSV_ABI RtcCheckValid(const RtcDateTime* time) {
 	if (time == nullptr) {
 		return RTC_ERROR_INVALID_POINTER;
@@ -59,7 +71,7 @@ static int KYTY_SYSV_ABI RtcCheckValid(const RtcDateTime* time) {
 	if (time->month == 0 || time->month > 12) {
 		return RTC_ERROR_INVALID_MONTH;
 	}
-	if (time->day == 0 || !Common::Date::IsValid(time->year, time->month, time->day)) {
+	if (time->day == 0 || time->day > GetDaysInMonth(time->year, time->month)) {
 		return RTC_ERROR_INVALID_DAY;
 	}
 	if (time->hour >= 24) {
@@ -78,21 +90,6 @@ static int KYTY_SYSV_ABI RtcCheckValid(const RtcDateTime* time) {
 	return OK;
 }
 
-static int GetDaysInMonth(int year, int month) {
-	if (year <= 0 || year > 9999) {
-		return RTC_ERROR_INVALID_YEAR;
-	}
-	if (month <= 0 || month > 12) {
-		return RTC_ERROR_INVALID_MONTH;
-	}
-
-	if (month == 2 && Common::Date::IsLeapYear(year)) {
-		return 29;
-	}
-
-	return Common::Date::DaysInMonth(month);
-}
-
 static int KYTY_SYSV_ABI RtcIsLeapYear(int year) {
 	PRINT_NAME();
 
@@ -100,7 +97,7 @@ static int KYTY_SYSV_ABI RtcIsLeapYear(int year) {
 		return RTC_ERROR_INVALID_YEAR;
 	}
 
-	return Common::Date::IsLeapYear(year) ? 1 : 0;
+	return std::chrono::year {year}.is_leap() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI RtcGetDayOfWeek(int year, int month, int day) {
@@ -114,8 +111,10 @@ static int KYTY_SYSV_ABI RtcGetDayOfWeek(int year, int month, int day) {
 		return RTC_ERROR_INVALID_DAY;
 	}
 
-	const auto dow = Common::Date(year, month, day).DayOfWeek();
-	return (dow == 7 ? 0 : dow);
+	// Sunday is 0.
+	return static_cast<int>(
+	    std::chrono::weekday {std::chrono::sys_days {std::chrono::year {year} / month / day}}
+	        .c_encoding());
 }
 
 static int KYTY_SYSV_ABI RtcGetDaysInMonth(int year, int month) {
@@ -128,28 +127,6 @@ static int KYTY_SYSV_ABI RtcGetTickResolution() {
 	PRINT_NAME();
 
 	return 1000000;
-}
-
-static int KYTY_SYSV_ABI RtcGetCurrentClockLocalTime(RtcDateTime* time) {
-	PRINT_NAME();
-
-	if (time == nullptr) {
-		return RTC_ERROR_DATETIME_UNINITIALIZED;
-	}
-
-	const auto now  = Common::DateTime::FromSystem();
-	const auto date = now.GetDate();
-	const auto tod  = now.GetTime();
-
-	time->year        = static_cast<uint16_t>(date.Year());
-	time->month       = static_cast<uint16_t>(date.Month());
-	time->day         = static_cast<uint16_t>(date.Day());
-	time->hour        = static_cast<uint16_t>(tod.Hour24());
-	time->minute      = static_cast<uint16_t>(tod.Minute());
-	time->second      = static_cast<uint16_t>(tod.Second());
-	time->microsecond = static_cast<uint32_t>(tod.Msec() * 1000);
-
-	return OK;
 }
 
 static int KYTY_SYSV_ABI RtcSetTick(RtcDateTime* time, const RtcTick* tick) {
@@ -278,6 +255,25 @@ static int KYTY_SYSV_ABI RtcGetCurrentClock(RtcDateTime* time, int time_zone_min
 	tick.tick += static_cast<int64_t>(time_zone_minutes) * 60000000ll;
 
 	return RtcSetTick(time, &tick);
+}
+
+static int KYTY_SYSV_ABI RtcGetCurrentClockLocalTime(RtcDateTime* time) {
+	PRINT_NAME();
+
+	const std::time_t now = std::time(nullptr);
+	std::tm           local {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	_localtime64_s(&local, &now);
+	long zone_seconds = 0;
+	long dst_bias     = 0;
+	_get_timezone(&zone_seconds);
+	_get_dstbias(&dst_bias);
+	const auto offset = -(zone_seconds + (local.tm_isdst > 0 ? dst_bias : 0));
+#else
+	localtime_r(&now, &local);
+	const auto offset = local.tm_gmtoff;
+#endif
+	return RtcGetCurrentClock(time, static_cast<int>(offset / 60));
 }
 
 static int KYTY_SYSV_ABI RtcConvertUtcToLocalTime(const RtcTick* utc, RtcTick* local_time) {

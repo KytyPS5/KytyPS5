@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -601,7 +602,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		return resource.indirect_root != UINT32_MAX;
 	};
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, uses_mapping);
+	                           std::ranges::any_of(info.images, uses_mapping) ||
+	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
 	switch (program.stage) {
 		case ShaderType::Vertex:

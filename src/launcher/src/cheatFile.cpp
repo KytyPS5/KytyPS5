@@ -8,6 +8,12 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QXmlStreamReader>
+
+extern "C" {
+#include <libavutil/aes.h>
+#include <libavutil/mem.h>
+}
 
 namespace Cheats {
 
@@ -37,7 +43,74 @@ QString ValidateDocument(const QJsonDocument& document) {
 	return {};
 }
 
+// MC4 is base64 of AES-256-CBC with a fixed key and IV. The XML reader stops at the root end tag,
+// before the padding.
+void Decrypt(QByteArray* data) {
+	static const uint8_t key[] = "304c6528f659c766110239a51cl5dd9c";
+	uint8_t              iv[]  = "u@}kzW2u[u(8DWar";
+	*data                      = QByteArray::fromBase64(*data);
+	auto* aes                  = av_aes_alloc();
+	auto* blocks               = reinterpret_cast<uint8_t*>(data->data());
+	av_aes_init(aes, key, 256, 1);
+	av_aes_crypt(aes, blocks, blocks, static_cast<int>(data->size() / 16), iv, 1);
+	av_free(aes);
+}
+
 } // namespace
+
+QString ConvertTrainer(QByteArray* data, bool encrypted) {
+	if (encrypted) {
+		Decrypt(data);
+	}
+	QXmlStreamReader xml(*data);
+	if (!xml.readNextStartElement() || xml.name() != u"Trainer") {
+		return Tr("Invalid cheat XML.");
+	}
+	const auto trainer = xml.attributes();
+	QJsonArray mods;
+	while (xml.readNextStartElement()) {
+		if (xml.name() != u"Cheat") {
+			xml.skipCurrentElement();
+			continue;
+		}
+		QJsonObject mod {{QStringLiteral("name"), xml.attributes().value(u"Text").toString()}};
+		QJsonArray  memory;
+		while (xml.readNextStartElement()) {
+			QJsonObject write;
+			while (xml.readNextStartElement()) {
+				const auto field = xml.name().toString();
+				auto       value = xml.readElementText().trimmed();
+				if (field == u"Offset") {
+					write.insert(QStringLiteral("offset"), value);
+				} else if (field == u"ValueOn") {
+					write.insert(QStringLiteral("on"), value.remove(QLatin1Char('-')));
+				} else if (field == u"ValueOff") {
+					write.insert(QStringLiteral("off"), value.remove(QLatin1Char('-')));
+				} else if (field == u"Section" && value != u"0") {
+					// Section-relative and absolute writes are rejected on import.
+					write.insert(QStringLiteral("section"), value);
+				} else if (field == u"Absolute") {
+					write.insert(QStringLiteral("absolute"), true);
+				}
+			}
+			memory.append(write);
+		}
+		mod.insert(QStringLiteral("memory"), memory);
+		mods.append(mod);
+	}
+	if (xml.hasError()) {
+		return Tr("Invalid cheat XML.");
+	}
+	const QJsonObject root {
+	    {QStringLiteral("name"), trainer.value(u"Game").toString()},
+	    {QStringLiteral("id"), trainer.value(u"Cusa").toString()},
+	    {QStringLiteral("version"), trainer.value(u"Version").toString()},
+	    {QStringLiteral("process"), trainer.value(u"Process").toString()},
+	    {QStringLiteral("credits"), QJsonArray {trainer.value(u"Moder").toString()}},
+	    {QStringLiteral("mods"), mods}};
+	*data = QJsonDocument(root).toJson();
+	return {};
+}
 
 bool IsSupportedTitleId(const QString& title_id) {
 	static const QRegularExpression pattern(QStringLiteral("\\APPSA[0-9]{5}\\z"));
@@ -116,7 +189,8 @@ QString ValidateImport(const QJsonDocument& document, const QString& title_id,
 			    write.contains(QStringLiteral("sectionProtection")) ||
 			    write.contains(QStringLiteral("logicalOffset")) ||
 			    write.contains(QStringLiteral("sectionOffset"))) {
-				return Tr("This JSON uses memory addressing features that are not supported yet.");
+				return Tr(
+				    "This cheat file uses memory addressing features that are not supported yet.");
 			}
 			if (!entry.isObject() || !offset_pattern.match(offset).hasMatch() ||
 			    !bytes_pattern.match(off).hasMatch() || !bytes_pattern.match(on).hasMatch() ||

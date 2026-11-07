@@ -153,8 +153,6 @@ public:
 		return combined == 0;
 	}
 
-	[[nodiscard]] constexpr bool Any() const { return !None(); }
-
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};
@@ -229,19 +227,6 @@ public:
 
 	[[nodiscard]] const_iterator begin() const { return Iterator(*this, 0); }
 	[[nodiscard]] const_iterator end() const { return Iterator(*this, N); }
-
-	constexpr BitArray& operator^=(const BitArray& other) {
-		for (size_t word = 0; word < WORD_COUNT; word++) {
-			m_data[word] ^= other.m_data[word];
-		}
-		return *this;
-	}
-
-	[[nodiscard]] constexpr BitArray operator^(const BitArray& other) const {
-		auto result = *this;
-		result ^= other;
-		return result;
-	}
 
 	[[nodiscard]] constexpr BitArray operator~() const {
 		auto result = *this;

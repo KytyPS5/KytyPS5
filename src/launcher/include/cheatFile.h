@@ -10,6 +10,8 @@ namespace Cheats {
 
 [[nodiscard]] bool    IsSupportedTitleId(const QString& title_id);
 [[nodiscard]] QString PlanPath(const QString& title_id);
+// Replaces MC4 (encrypted) or SHN trainer XML with the equivalent cheat JSON.
+[[nodiscard]] QString ConvertTrainer(QByteArray* data, bool encrypted);
 
 // Local files retain their existing defaults; remote imports receive additional validation.
 [[nodiscard]] QString       ParseDocument(const QByteArray& data, QJsonDocument* document);

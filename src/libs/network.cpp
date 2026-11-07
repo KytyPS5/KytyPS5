@@ -2,9 +2,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
@@ -115,6 +112,7 @@ public:
 
 	int  PoolCreate(const char* name, int size);
 	bool PoolDestroy(int memid);
+	int  PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats);
 	int  ResolverCreate(const char* name, int memid);
 	bool ResolverDestroy(int rid);
 	bool ResolverValid(int rid);
@@ -286,6 +284,22 @@ bool Network::PoolDestroy(int memid) {
 	}
 
 	return false;
+}
+
+int Network::PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
+	Common::LockGuard lock(m_mutex);
+
+	if (memid < 0 || memid >= POOLS_MAX || !m_pools[memid].used) {
+		return NET_ERROR_EBADF;
+	}
+	if (stats == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	// Pool allocations are not tracked; only the configured size is available.
+	*stats = {};
+	stats->pool_size = static_cast<uint64_t>(m_pools[memid].size);
+	return OK;
 }
 
 int Network::ResolverCreate(const char* name, int memid) {
@@ -1081,6 +1095,7 @@ static int ConvertSocketOptionLevel(int level) {
 static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
 		switch (option) {
+			case 0x0004: return SO_REUSEADDR;
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
@@ -1418,6 +1433,13 @@ int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	}
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->PoolGetMemoryPoolStats(memid, stats);
 }
 
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {

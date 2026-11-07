@@ -15,7 +15,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <bit>
 
@@ -83,15 +82,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
-	static constexpr std::array image_types {Prospero::ImageType::kColor1D,
-	                                         Prospero::ImageType::kColor2D,
-	                                         Prospero::ImageType::kColor3D};
-	if (rt.attrib3.dimension >= image_types.size()) {
+	if (rt.attrib3.dimension > 2u) {
 		EXIT("unsupported render-target dimension: %u\n", rt.attrib3.dimension);
 	}
-	const auto image_type = image_types[rt.attrib3.dimension];
-	const bool is_1d      = image_type == Prospero::ImageType::kColor1D;
-	const bool volume     = image_type == Prospero::ImageType::kColor3D;
+	// 1D targets are 2D images one texel high.
+	const bool is_1d  = rt.attrib3.dimension == 0u;
+	const bool volume = rt.attrib3.dimension == 2u;
 	if (is_1d && rt.attrib2.height != 0) {
 		EXIT("1D render target has nonzero height: %u\n", rt.attrib2.height);
 	}
@@ -131,26 +127,17 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 	}
 
-	// Color-control state selects the color-buffer operation and logical blend operation.
-	// The normal copy operation is a regular color write, not an attachment clear.
-	// Nonlinear clear values are still stored as normalized components.
-	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
-	uint32_t   width  = 0;
-	uint32_t       height       = 0;
-	bool       tile   = false;
-	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
-	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
-	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
-
+	const bool tile         = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
+	const bool standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	bool       texture_tile = false;
 	switch (rt.attrib3.tile_mode) {
-		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
 		case Prospero::TileMode::kStandard4KB:
 		case Prospero::TileMode::kStandard64KB:
-		case Prospero::TileMode::kDepth:
-		case Prospero::TileMode::kRenderTarget:
-			tile = rt.attrib3.tile_mode != Prospero::TileMode::kLinear;
-			break;
+		case Prospero::TileMode::kDepth: texture_tile = true; break;
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kRenderTarget: break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
 	}
 	if (samples > 1 && (!tile || levels != 1)) {
@@ -163,8 +150,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		EXIT("linear 3D render targets are unsupported\n");
 	}
 
-	width  = rt.attrib2.width + 1;
-	height = rt.attrib2.height + 1;
+	const uint32_t width  = rt.attrib2.width + 1;
+	const uint32_t height = rt.attrib2.height + 1;
 	const auto target_format =
 	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
 	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
@@ -214,7 +201,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.data            = {rt.base.addr, 0};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
-	desc.info.type         = image_type;
+	desc.info.type         = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
 	desc.info.extent       = {width, height, depth};
 	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
 	desc.info.bytes_per_block = bytes_per_element;
@@ -250,13 +237,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.clear_register_valid = true;
 	}
 	desc.view_info.format = target_format.format;
-	if (is_1d) {
-		desc.view_info.type =
-		    view.layer_count == 1 ? vk::ImageViewType::e1D : vk::ImageViewType::e1DArray;
-	} else {
-		desc.view_info.type =
-		    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
-	}
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
 	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.base_level  = mip;
 	desc.view_info.level_count = 1;

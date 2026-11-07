@@ -39,9 +39,13 @@ struct ImageMetadataInfo {
 };
 
 struct ImageSubresources {
-	uint32_t levels                                      = 1;
-	uint32_t layers                                      = 1;
-	auto     operator<=>(const ImageSubresources&) const = default;
+	uint32_t levels = 1;
+	uint32_t layers = 1;
+
+	[[nodiscard]] bool           operator==(const ImageSubresources&) const noexcept = default;
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 // The level and first layer of a container that a single-level image occupies, or -1.

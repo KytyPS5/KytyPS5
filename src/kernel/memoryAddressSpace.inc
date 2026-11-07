@@ -897,10 +897,12 @@ private:
 		}};
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		constexpr uint64_t MinimumRegionSize = 0x1000000;
-		const auto         process           = GetCurrentProcess();
+		constexpr uint64_t MinimumRegionSize  = 0x1000000;
+		constexpr uint32_t MaxReserveAttempts = 16;
+		const auto         process            = GetCurrentProcess();
 		for (const auto& [guest_start, guest_end]: regions) {
-			auto next_addr = guest_start;
+			auto     next_addr = guest_start;
+			uint32_t retries   = 0;
 			while (next_addr < guest_end) {
 				MEMORY_BASIC_INFORMATION info {};
 				if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) == 0) {
@@ -916,10 +918,19 @@ private:
 
 				if (info.State == MEM_FREE && reserve_end > reserve_start &&
 				    reserve_end - reserve_start > MinimumRegionSize) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+					if (const auto callback = g_test_before_guest_reserve) {
+						g_test_before_guest_reserve = nullptr;
+						callback(reserve_start, reserve_end - reserve_start);
+					}
+#endif
 					auto* ptr = VirtualAlloc2(
 					    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
 					    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
 					if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+						if (++retries < MaxReserveAttempts) {
+							continue;
+						}
 						EXIT("failed to reserve guest address space at 0x%016" PRIx64
 						     ", size 0x%016" PRIx64 "\n",
 						     reserve_start, reserve_end - reserve_start);
@@ -929,6 +940,7 @@ private:
 				}
 
 				next_addr = region_end;
+				retries   = 0;
 			}
 		}
 #else

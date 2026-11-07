@@ -445,6 +445,63 @@ void TestProsperoArgumentAndInfoSizeContracts() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+uintptr_t g_guest_hole_start   = 0;
+uintptr_t g_guest_hole_end     = 0;
+void*     g_guest_hole_blocker = nullptr;
+
+void ReserveGuestHoleBlocker(uintptr_t start, size_t size) {
+	SYSTEM_INFO info {};
+	GetSystemInfo(&info);
+	const size_t granularity = info.dwAllocationGranularity;
+	const auto   padding     = 0x1000000 + granularity;
+	if (size < padding * 2 + granularity) {
+		Libs::LibKernel::Memory::TestBeforeNextGuestReserve(ReserveGuestHoleBlocker);
+		return;
+	}
+	g_guest_hole_start   = start;
+	g_guest_hole_end     = start + size;
+	g_guest_hole_blocker = VirtualAlloc(reinterpret_cast<void*>(start + padding), granularity,
+	                                    MEM_RESERVE, PAGE_NOACCESS);
+}
+#endif
+
+void TestGuestReservationRace() {
+	const char* test = "GuestReservationRace";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	using namespace Libs::LibKernel::Memory;
+	Shutdown();
+	TestBeforeNextGuestReserve(ReserveGuestHoleBlocker);
+	Initialize();
+	TestBeforeNextGuestReserve(nullptr);
+	Check(test, g_guest_hole_blocker != nullptr, "failed to inject guest reservation blocker");
+
+	SYSTEM_INFO system_info {};
+	GetSystemInfo(&system_info);
+	const auto               granularity = system_info.dwAllocationGranularity;
+	const auto               blocker     = reinterpret_cast<uintptr_t>(g_guest_hole_blocker);
+	MEMORY_BASIC_INFORMATION info {};
+	const bool intact = VirtualQuery(g_guest_hole_blocker, &info, sizeof(info)) != 0 &&
+	                    info.AllocationBase == g_guest_hole_blocker && info.State == MEM_RESERVE &&
+	                    info.RegionSize == granularity;
+	const bool excluded = !TestGuestAddressRangeIsOwned(blocker, granularity);
+	const bool before =
+	    TestGuestAddressRangeIsOwned(g_guest_hole_start, blocker - g_guest_hole_start);
+	const bool after     = TestGuestAddressRangeIsOwned(blocker + granularity,
+	                                                    g_guest_hole_end - blocker - granularity);
+	const bool released  = VirtualFree(g_guest_hole_blocker, 0, MEM_RELEASE) != 0;
+	g_guest_hole_blocker = nullptr;
+	Shutdown();
+	Initialize();
+	Check(test, intact && excluded, "guest reservation took ownership of the blocker");
+	Check(test, before && after, "guest reservation skipped a free fragment around the blocker");
+	Check(test, released, "failed to release guest reservation blocker");
+	std::printf("[host]    %-48s ok\n", test);
+#else
+	std::printf("[host]    %-48s skipped\n", test);
+#endif
+}
+
 void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	const char* test = "GuestAddressSpaceOwnsReservationsBeforeBacking";
 	void*       addr = nullptr;
@@ -5838,6 +5895,7 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
+	RunTest(TestGuestReservationRace);
 	RunTest(TestFlexibleZeroingTracksBackingLifetime);
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);

@@ -878,6 +878,7 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;

@@ -41,6 +41,9 @@ bool InstallHandler(Handler handler);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
+// The host signal that delivers guest signals. Fault handling blocks it, so a guest handler runs
+// only once the faulting instruction is resolved.
+int GuestSignalDispatchSignal();
 #endif
 
 } // namespace Common::HostException

@@ -37,6 +37,7 @@ struct OutputBinding : IR::StageOutput {
 
 using ImageDimension = Decoder::ImageDimension;
 
+// Component counts are the guest's; 1D images are host 2D images one texel high.
 struct ImageDimensionInfo {
 	ImageDimension dimension;
 	uint32_t       spirv_dimension;
@@ -44,16 +45,17 @@ struct ImageDimensionInfo {
 	uint32_t       spatial_components;
 	uint32_t       arrayed;
 	uint32_t       multisampled;
+	bool           one_dimensional;
 };
 
 constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
-    {ImageDimension::Dim1D, spv::Dim1D, 1, 1, 0, 0},
-    {ImageDimension::Dim1DArray, spv::Dim1D, 2, 1, 1, 0},
-    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0},
-    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0},
-    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0},
-    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1},
-    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1},
+    {ImageDimension::Dim1D, spv::Dim2D, 1, 1, 0, 0, true},
+    {ImageDimension::Dim1DArray, spv::Dim2D, 2, 1, 1, 0, true},
+    {ImageDimension::Dim2D, spv::Dim2D, 2, 2, 0, 0, false},
+    {ImageDimension::Dim2DArray, spv::Dim2D, 3, 2, 1, 0, false},
+    {ImageDimension::Dim3D, spv::Dim3D, 3, 3, 0, 0, false},
+    {ImageDimension::Dim2DMsaa, spv::Dim2D, 2, 2, 0, 1, false},
+    {ImageDimension::Dim2DMsaaArray, spv::Dim2D, 3, 2, 1, 1, false},
 }};
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
@@ -187,6 +189,7 @@ uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint3
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePhysicalU32BufferPointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
@@ -522,6 +525,8 @@ void DefineGetBdaPointer(EmitterState& state);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
+uint32_t BvhNode(EmitterState& state, uint32_t address);
+uint32_t BvhNodeWord(EmitterState& state, uint32_t block, uint32_t word);
 uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32_t, 3>, 3>& positions,
                          std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
                          uint32_t remap, uint32_t triangle_id, uint32_t bary);

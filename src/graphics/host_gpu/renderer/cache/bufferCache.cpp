@@ -207,29 +207,22 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
-	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
-	} else {
-		m_download_buffer.Commit();
-	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
+	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
-		copy.dstOffset += offset;
+		copy.dstOffset += download.offset;
 	}
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	RecordDownloadCopies(command.Handle(), buffer, download, copies, offset, total_size);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+	RecordDownloadCopies(command.Handle(), buffer, *download.buffer, copies, download.offset,
+	                     total_size);
+	auto publish = [total_size, buffer_address, copies = std::move(copies),
+	                download = std::move(download)] {
+		download.buffer->Invalidate(download.offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			Libs::LibKernel::Memory::WriteBacking(
+			    buffer_address + copy.srcOffset,
+			    download.mapped + (copy.dstOffset - download.offset), copy.size);
 		}
 	};
 	if constexpr (async) {
@@ -796,6 +789,10 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	return m_gpu_modified_ranges.Contains(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

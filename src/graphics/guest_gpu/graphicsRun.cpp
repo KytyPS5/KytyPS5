@@ -307,6 +307,27 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
+void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset) {
+	auto& counters = m_renderer.GetRenderExecutor().m_mip_stats;
+	// Each of up to 256 2-dword slots after the 16-dword header holds the clamped sample count
+	// (dword 0 bits 0-23), the slot id (bits 24-31), the unclamped sample count (dword 1 bits 0-23)
+	// and the finest mip sampled (bits 24-27, 15 for none). A non-zero header dword 0 then marks
+	// the report complete.
+	if (dst != nullptr && size >= 64) {
+		const auto slots = std::min((size - 64) / 8, 256u);
+		for (uint32_t slot = 0; slot < slots; slot++) {
+			const auto& counter = counters[slot];
+			dst[16 + slot * 2]  = (slot << 24u) | uint32_t {counter.clamped};
+			dst[16 + slot * 2 + 1] =
+			    (uint32_t {counter.finest_level} << 24u) | uint32_t {counter.unclamped};
+		}
+		dst[0] = 1;
+	}
+	if (reset) {
+		counters = {};
+	}
+}
+
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
 	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
@@ -425,7 +446,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		if (command) {
-			command();
+			{
+				Common::DebugCounters::ScopedTimer busy(
+				    Common::DebugCounters::Counter::GpuThreadBusyNs);
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -435,7 +460,11 @@ void GuestGpu::ThreadRun(void* data) {
 			continue;
 		}
 
-		const bool complete = gpu->Process(submission);
+		const bool complete = [&] {
+			Common::DebugCounters::ScopedTimer busy(
+			    Common::DebugCounters::Counter::GpuThreadBusyNs);
+			return gpu->Process(submission);
+		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -850,7 +879,8 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
-                                  uint64_t data, uint32_t interrupt_context_id) {
+                                  uint64_t data, uint32_t interrupt_context_id,
+                                  bool gl2_writeback) {
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -869,6 +899,10 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	if (address == nullptr || interrupt_selector == 4 ||
 	    (interrupt_selector == 1 && !IsAsyncComputeQueue())) {
 		data_sel = 0;
+	}
+	// A GL2 writeback makes GPU writes CPU-visible even without a signal.
+	if (gl2_writeback) {
+		WriteBackImages();
 	}
 	if (data_sel == 0 && !interrupt) {
 		return;
@@ -916,6 +950,14 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		    });
+	}
+}
+
+void CommandProcessor::WriteBackImages() {
+	// GPU-written images are copied back without holding any signal: a held signal exposes the host
+	// GPU's speed. Guest accesses to them wait for the copies.
+	if (m_renderer.GetTextureCache().WriteBackImages()) {
+		GetScheduler().Flush();
 	}
 }
 

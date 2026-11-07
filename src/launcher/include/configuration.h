@@ -78,9 +78,6 @@ public:
 
 	static QString NormalizeResolution(const QString& text);
 
-	enum class ShaderOptimizationType { None, Size, Performance };
-	Q_ENUM(ShaderOptimizationType)
-
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
@@ -120,6 +117,7 @@ public:
 	bool                   stretch_enabled             = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
+	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
@@ -134,7 +132,6 @@ public:
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
-	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -166,6 +163,7 @@ public:
 		stretch_enabled             = other.stretch_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		readback_tiled_images       = other.readback_tiled_images;
+		readback_storage_images     = other.readback_storage_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
@@ -180,7 +178,6 @@ public:
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
-		shader_optimization_type    = other.shader_optimization_type;
 		shader_log_direction        = other.shader_log_direction;
 		shader_log_folder           = other.shader_log_folder;
 		command_buffer_dump_enabled = other.command_buffer_dump_enabled;

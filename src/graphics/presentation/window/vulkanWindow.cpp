@@ -6,7 +6,6 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -193,8 +192,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		vk::PhysicalDeviceImageViewMinLodFeaturesEXT  min_lod {};
-		vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write {.pNext = &min_lod};
-		vk::PhysicalDeviceDepthClipEnableFeaturesEXT  clip_enable {.pNext = &color_write};
+		vk::PhysicalDeviceDepthClipEnableFeaturesEXT  clip_enable {.pNext = &min_lod};
 		vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control {.pNext = &clip_enable};
 		vk::PhysicalDeviceRobustness2FeaturesEXT      robustness2 {.pNext = &clip_control};
 		vk::PhysicalDeviceVulkan11Features            features11 {.pNext = &robustness2};
@@ -214,13 +212,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			}
 		};
 
-#if defined(__APPLE__)
-		if (color_write.colorWriteEnable != VK_TRUE) {
-			LOGF("colorWriteEnable is not supported\n");
-		}
-#else
-		check_feature(color_write.colorWriteEnable, "colorWriteEnable");
-#endif
 		check_feature(min_lod.minLod, "image view minLod");
 
 		check_feature(clip_control.depthClipControl, "depthClipControl");
@@ -454,9 +445,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
+	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -601,7 +594,6 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceDepthClipControlFeaturesEXT {.depthClipControl = VK_TRUE},
 	    vk::PhysicalDeviceImageViewMinLodFeaturesEXT {.minLod = VK_TRUE},
 	    vk::PhysicalDeviceDepthClipEnableFeaturesEXT {.depthClipEnable = VK_TRUE},
-	    vk::PhysicalDeviceColorWriteEnableFeaturesEXT {.colorWriteEnable = VK_TRUE},
 	    vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR {
 	        .workgroupMemoryExplicitLayout = workgroup_layout.workgroupMemoryExplicitLayout},
 	    barycentric,
@@ -618,7 +610,6 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 #if defined(__APPLE__)
 	// MoltenVK lacks these extensions (see CreateVulkan).
 	create.unlink<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>();
-	create.unlink<vk::PhysicalDeviceColorWriteEnableFeaturesEXT>();
 	create.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 #else
 	if (!barycentric_supported) {
@@ -772,8 +763,8 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
+		     callback_data->pMessage);
 	}
 
 	if (!skip) {
@@ -913,13 +904,11 @@ void WindowContext::CreateVulkan() {
 	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
-	// falls back to default depth clipping and static color-write masks on macOS. It also
-	// requires VK_KHR_portability_subset per the Vulkan portability spec.
+	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
+	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
 	device_extensions.push_back("VK_KHR_portability_subset");
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 #endif
 
 	if (Config::SpirvDebugPrintfEnabled()) {

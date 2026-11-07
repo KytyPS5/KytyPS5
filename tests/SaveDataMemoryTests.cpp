@@ -513,6 +513,12 @@ void TestSaveAllocations() {
 		CHECK(SaveDataMount3(&invalid, &result) == SAVE_DATA_ERROR_PARAMETER);
 		CHECK(!fs::exists("_SaveData/CAPACITY/Options"));
 	}
+	struct SaveDataMount3 open_missing {};
+	open_missing.user_id = 1;
+	open_missing.dir_name = &names[0];
+	open_missing.mount_mode = 1;
+	SaveDataMountResult missing_result {};
+	CHECK(SaveDataMount3(&open_missing, &missing_result) == SAVE_DATA_ERROR_NOT_FOUND);
 	for (size_t i = 0; i < names.size(); i++) {
 		struct SaveDataMount3 mount {};
 		mount.user_id = 1;
@@ -543,9 +549,11 @@ void TestSaveAllocations() {
 		struct SaveDataMount3 mount {};
 		mount.user_id = 1;
 		mount.dir_name = &names[i];
-		mount.mount_mode = 34;
+		mount.mount_mode = 4;
 		mount.blocks = 16384;
 		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_EXISTS);
+		mount.mount_mode = 34;
 		CHECK(SaveDataMount3(&mount, &result) == OK && result.mount_status == 0);
 		std::ofstream(g_mounted_directory / "USR-DATA", std::ios::app) << "more data";
 		SaveDataMountInfo info {};

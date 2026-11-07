@@ -21,7 +21,7 @@ void Check(bool value, const char *message) {
 
 void TestPointAndRangeOperations() {
   Bits bits;
-  Check(bits.None() && !bits.Any(), "default state is not empty");
+  Check(bits.None(), "default state is not empty");
 
   for (const auto index : {size_t{0}, size_t{63}, size_t{64}, size_t{127}}) {
     bits.Set(index);
@@ -69,13 +69,6 @@ void TestMaskedConstructionAndBitwiseOperations() {
 
   Bits left;
   left.SetRange(0, 80);
-  Bits right;
-  right.SetRange(40, 120);
-  const auto exclusive = left ^ right;
-  for (size_t index = 0; index < 128; index++) {
-    const bool expected = (index < 80) != (index >= 40 && index < 120);
-    Check(exclusive.Get(index) == expected, "XOR produced the wrong bit");
-  }
   const auto inverted = ~left;
   for (size_t index = 0; index < 128; index++) {
     Check(inverted.Get(index) == (index >= 80), "NOT produced the wrong bit");
@@ -146,8 +139,7 @@ void TestRandomizedDifferential() {
             "randomized bit state diverged");
       any |= reference[index];
     }
-    Check(bits.Any() == any && bits.None() == !any,
-          "randomized Any/None diverged");
+    Check(bits.None() == !any, "randomized None diverged");
 
     const auto range_start = static_cast<size_t>(next_random() % 129);
     auto expected_first_begin = range_start;

@@ -25,8 +25,12 @@ namespace Libs::Controller {
 
 LIB_NAME("Pad", "Pad");
 
-constexpr int PAD_HANDLE = 1;
-static_assert(PAD_HANDLE + Config::MAX_PLAYERS <= PAD_HANDLE_VR_LEFT);
+constexpr int PAD_PORT_TYPE_STANDARD = 0;
+constexpr int PAD_PORT_TYPE_SPECIAL  = 2;
+
+constexpr int PAD_HANDLE         = 1;
+constexpr int PAD_HANDLE_SPECIAL = PAD_HANDLE + Config::MAX_PLAYERS;
+static_assert(PAD_HANDLE_SPECIAL + Config::MAX_PLAYERS <= PAD_HANDLE_VR_LEFT);
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
@@ -104,11 +108,13 @@ struct ControllerState {
 
 class GameController {
 public:
-	explicit GameController(int player): m_player(player) {}
+	GameController(int player, int type): m_player(player), m_type(type) {}
 
 	KYTY_CLASS_NO_COPY(GameController);
 
-	[[nodiscard]] int Handle() const { return PAD_HANDLE + m_player; }
+	[[nodiscard]] int Handle() const {
+		return (m_type == PAD_PORT_TYPE_SPECIAL ? PAD_HANDLE_SPECIAL : PAD_HANDLE) + m_player;
+	}
 
 	int InitPort();
 	int OpenPort(int user_id, int type, int index);
@@ -145,6 +151,7 @@ private:
 	[[nodiscard]] bool PadOpenArgsAreValid(int user_id, int type, int index) const;
 
 	const int m_player;
+	const int m_type;
 
 	void AddState();
 	// Emulated tilt: the right stick drives pitch and roll instead of the stick axes.
@@ -183,6 +190,8 @@ private:
 };
 
 static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
+// Each player's special port (wheels, guitars, ...); no host device feeds it.
+static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_special_ports;
 
 // Maps host gamepads to players; the keyboard follows the configured keyboard player.
 static Common::Mutex g_router_mutex;
@@ -192,6 +201,14 @@ static uint32_t g_keyboard_player = 0;
 
 static void RefreshPlayers();
 static void StopHostPad(SDL_Gamepad* pad);
+
+// A mono LED cannot show the colour, and on Switch pads each write waits for the pad's reply.
+static void SetHostPadLED(SDL_Gamepad* pad, uint8_t r, uint8_t g, uint8_t b) {
+	if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad),
+	                            SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN, false)) {
+		(void)SDL_SetGamepadLED(pad, r, g, b);
+	}
+}
 
 static int KeyboardPlayer() {
 	return g_keyboard_player == 0 ? 0 : static_cast<int>(g_keyboard_player) - 1;
@@ -211,8 +228,11 @@ static GameController* PlayerForDevice(int id) {
 }
 
 static GameController* PlayerForHandle(int handle) {
-	if (handle >= PAD_HANDLE && handle < PAD_HANDLE + Config::MAX_PLAYERS) {
+	if (handle >= PAD_HANDLE && handle < PAD_HANDLE_SPECIAL) {
 		return g_players[handle - PAD_HANDLE].get();
+	}
+	if (handle >= PAD_HANDLE_SPECIAL && handle < PAD_HANDLE_SPECIAL + Config::MAX_PLAYERS) {
+		return g_special_ports[handle - PAD_HANDLE_SPECIAL].get();
 	}
 	// The Sense controller ports belong to the initial user.
 	return PadVrHand(handle) >= 0 ? g_players[0].get() : nullptr;
@@ -441,7 +461,8 @@ void Initialize() {
 	EXIT_IF(g_players[0] != nullptr);
 
 	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
-		g_players[i] = std::make_unique<GameController>(i);
+		g_players[i]       = std::make_unique<GameController>(i, PAD_PORT_TYPE_STANDARD);
+		g_special_ports[i] = std::make_unique<GameController>(i, PAD_PORT_TYPE_SPECIAL);
 	}
 	g_keyboard_player = Config::GetKeyboardPlayer();
 	RefreshPlayers();
@@ -449,9 +470,8 @@ void Initialize() {
 
 void Shutdown() {
 	EmergencyShutdown();
-	for (auto& player: g_players) {
-		player.reset();
-	}
+	g_players       = {};
+	g_special_ports = {};
 }
 
 void EmergencyShutdown() {
@@ -487,7 +507,7 @@ void GameController::SetDevices(int active_id) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
 		    pad != nullptr) {
 			if (const auto& color = Config::GetControllerColor()) {
-				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+				SetHostPadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
 			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
@@ -841,7 +861,7 @@ static void StopHostPad(SDL_Gamepad* pad) {
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
 	(void)SDL_RumbleGamepad(pad, 0, 0, 0);
-	(void)SDL_SetGamepadLED(pad, 0, 0, 0);
+	SetHostPadLED(pad, 0, 0, 0);
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -894,7 +914,7 @@ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
-		(void)SDL_SetGamepadLED(pad, r, g, b);
+		SetHostPadLED(pad, r, g, b);
 	}
 }
 
@@ -1153,8 +1173,7 @@ bool IsPlayerConnected(int player) {
 }
 
 bool GameController::PadOpenArgsAreValid(int user_id, int type, int index) const {
-	// The host keyboard and gamepads of a player feed one standard port for that player's user.
-	return user_id == Config::GetPlayerUserId(m_player) && type == 0 && index == 0;
+	return user_id == Config::GetPlayerUserId(m_player) && type == m_type && index == 0;
 }
 
 int GameController::InitPort() {
@@ -1229,10 +1248,16 @@ bool PadInitialized() {
 
 int KYTY_SYSV_ABI PadInit() {
 	PRINT_NAME();
-	for (const auto& player: g_players) {
-		(void)player->InitPort();
+	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
+		(void)g_players[i]->InitPort();
+		(void)g_special_ports[i]->InitPort();
 	}
 	return OK;
+}
+
+// Unsupported port types reach the standard port, which rejects them.
+static GameController* PortForType(int player, int type) {
+	return (type == PAD_PORT_TYPE_SPECIAL ? g_special_ports : g_players)[player].get();
 }
 
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
@@ -1248,7 +1273,21 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 		return PadVrPort(user_id, hand, index, true);
 	}
 	const int player = Config::GetPlayerFromUserId(user_id);
-	return player >= 0 ? g_players[player]->OpenPort(user_id, type, index) : PAD_ERROR_INVALID_ARG;
+	return player >= 0 ? PortForType(player, type)->OpenPort(user_id, type, index)
+	                   : PAD_ERROR_INVALID_ARG;
+}
+
+// Opens the port of a third-party controller chosen by vendor and product; none is ever connected.
+int KYTY_SYSV_ABI PadOpenExt(int user_id, int type, int index, const void* param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = 0x%016" PRIx64 "\n",
+	     user_id, type, index, reinterpret_cast<uint64_t>(param));
+
+	return PAD_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
@@ -1263,7 +1302,7 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 		return PadVrPort(user_id, hand, index, false);
 	}
 	const int player = Config::GetPlayerFromUserId(user_id);
-	return player >= 0 ? g_players[player]->GetPortHandle(user_id, type, index)
+	return player >= 0 ? PortForType(player, type)->GetPortHandle(user_id, type, index)
 	                   : PAD_ERROR_NO_HANDLE;
 }
 

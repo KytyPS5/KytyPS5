@@ -53,6 +53,7 @@
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
+#include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -5898,6 +5899,37 @@ void TestNativeConstantSamplerSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNullImageTakesDeclaredCube() {
+  using namespace ShaderRecompiler::IR;
+  // image_sample_lz v0, v[2:4], s[8:15], s[16:19] dmask:0x1 dim:CUBE, then the result is stored.
+  const uint32_t shader[] = {
+      EncodeMimg0(0x27, 0x1, false, 3), EncodeMimg1(0, 2, 4, 2),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto user_data = ImageTestUserData();
+  user_data[0] = 0x1000u;
+  user_data[1] = 0u;
+  user_data[2] = 4u;
+  user_data[3] = 0x30005204u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto plan = ExtractResourcePlan(ShaderRecompiler::TranslateProgram(shader, options).program);
+  const auto specialize = [&](std::array<uint32_t, 8> descriptor) {
+    std::ranges::copy(descriptor, user_data.begin() + 8);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization),
+          "cube sample resources did not materialize");
+    return specialization;
+  };
+  const auto cube = specialize({0x100u, static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u,
+                                0u, DstSel(4, 5, 6, 7) |
+                                    (static_cast<uint32_t>(Prospero::ImageType::kCube) << 28u)});
+  Check(cube.images.size() == 1u && cube.images[0].cube && specialize({}) == cube,
+        "a null T# sampled as a cube specialized as another image type");
+}
+
 void TestPackedZeroHighSamplerTableKey() {
   // s_pack_ll_b32_b16 with a zero high lane zero-extends a GPU-selected table key, so the
   // sampler table stays bounded to 64Ki records.
@@ -6647,6 +6679,44 @@ void TestNewShaderRecompilerCfgIrreducibleDispatcher() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void TestNewShaderRecompilerCfgComponentsOfLongPath() {
+  using namespace ShaderRecompiler;
+  // Each s_branch to the next instruction ends a block, so the loop below spans blocks 1..path.
+  constexpr uint32_t path = 1024;
+  std::vector<uint32_t> shader(path, EncodeSopp(0x02, 0));
+  shader.push_back(EncodeSopp(0x04, 0u - path)); // s_cbranch_scc0 back to block 1
+  shader.push_back(EncodeSopp(0x01));            // s_endpgm
+  struct Build {
+    Decoder::Program decoded;
+    CFG::Graph graph;
+  } build;
+  Decoder::DecodeProgram(std::span{shader}, build.decoded);
+
+  // A 64 KiB stack holds far fewer host frames than the path has blocks.
+  pthread_attr_t attributes;
+  Check(pthread_attr_init(&attributes) == 0 &&
+            pthread_attr_setstacksize(&attributes, 64 * 1024) == 0,
+        "configure a small translation stack");
+  pthread_t thread;
+  Check(pthread_create(&thread, &attributes, [](void *opaque) -> void * {
+    auto &build = *static_cast<Build *>(opaque);
+    build.graph = CFG::BuildGraph(build.decoded);
+    return nullptr;
+  }, &build) == 0 && pthread_join(thread, nullptr) == 0,
+        "build the CFG on a 64 KiB stack");
+  pthread_attr_destroy(&attributes);
+
+  const auto &components = build.graph.components;
+  Check(components.size() == 3u &&
+            components[0].blocks == std::vector<uint32_t>{path + 1u} &&
+            components[1].blocks.size() == path &&
+            components[1].entry_blocks == std::vector<uint32_t>{1u} &&
+            components[2].blocks == std::vector<uint32_t>{0u},
+        "long block path lost its loop component or the completion order");
+}
+#endif
+
 void TestNewShaderRecompilerDispatcherSpillsU32x3() {
   using namespace ShaderRecompiler;
 
@@ -7199,7 +7269,7 @@ void TestGraphicsComputeGetreg() {
       IR::Program program;
       program.wave_size = wave;
       IR::Block block;
-      Frontend::Translator translator(program, &block, 1, false, true);
+      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false, true);
       translator.TranslateInstruction(decoded);
       bool wrote_vcc = false;
       for (const auto& inst : block) {
@@ -13508,6 +13578,7 @@ int main() {
   TestNativeGuardedSamplerSource(false);
   TestNativeGuardedSamplerSource(true);
   TestNativeConstantSamplerSelection();
+  TestNullImageTakesDeclaredCube();
   TestPackedZeroHighSamplerTableKey();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
@@ -13524,6 +13595,9 @@ int main() {
   TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
   TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph();
   TestNewShaderRecompilerCfgIrreducibleDispatcher();
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  TestNewShaderRecompilerCfgComponentsOfLongPath();
+#endif
   TestNewShaderRecompilerDispatcherSpillsU32x3();
   TestNewShaderRecompilerPlanningOnlyLoads();
   TestNewShaderRecompilerNativeU64Translation();

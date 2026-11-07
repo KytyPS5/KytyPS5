@@ -283,6 +283,15 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
+StreamBuffer::Download StreamBuffer::MapDownload(uint64_t size, uint64_t alignment) {
+	if (const auto [mapped, offset] = Map(size, alignment); mapped != nullptr) {
+		Commit();
+		return {this, mapped, offset, nullptr};
+	}
+	auto owner = std::make_unique<Buffer>(Graphics(), Scheduler(), Usage(), 0, AllFlags, size);
+	return {owner.get(), owner->Mapped().data(), 0, std::move(owner)};
+}
+
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {
 	EXIT_IF(source == nullptr);
 	const auto [data, offset] = Map(size, alignment);

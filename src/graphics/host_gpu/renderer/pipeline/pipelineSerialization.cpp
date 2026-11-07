@@ -99,9 +99,9 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 		m_file.Truncate(kept);
 		m_file.Seek(kept);
 	}
-	if (m_file.IsInvalid()) {
-		return;
-	}
+}
+
+ShaderStoreWriter::ShaderStoreWriter() {
 	m_thread = std::jthread([this](std::stop_token stop) {
 		std::unique_lock lock(m_mutex);
 		// Once stop is requested the wait returns false only when the queue is empty.

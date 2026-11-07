@@ -22,8 +22,6 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Config::Shutdown;
 };
 
-enum class ShaderOptimizationType { None, Size, Performance };
-
 enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
@@ -77,7 +75,6 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_cache_enabled        = false;
-	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -91,9 +88,11 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
+	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
+	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -142,7 +141,6 @@ bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 bool                   ShaderCacheEnabled();
-ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 
@@ -163,9 +161,11 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
+bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
+bool LodStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

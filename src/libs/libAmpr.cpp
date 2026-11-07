@@ -1,6 +1,5 @@
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -31,13 +30,6 @@
 #include <variant>
 #include <vector>
 
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
-
 namespace Libs {
 
 namespace AprShared {
@@ -45,6 +37,11 @@ namespace AprShared {
 struct ResultBuffer {
 	int32_t  result      = 0;
 	uint32_t errorOffset = 0;
+};
+
+struct HostFile {
+	std::filesystem::path path;
+	uint64_t              size;
 };
 
 struct ResolvedPathInfo {
@@ -57,11 +54,10 @@ struct ResolvedPathInfo {
 
 static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
-static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, bool>                g_submissions;
 static std::condition_variable                           g_submission_cv;
-static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
-static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
+// Resolved files by ID - 1; IDs are never released.
+static std::vector<HostFile>                             g_files;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
@@ -119,64 +115,20 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 
 static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto       it = g_files.find(file_id);
-	if (it == g_files.end()) {
+	if (file_id == 0 || file_id > g_files.size()) {
 		return false;
 	}
-	*out = it->second;
+	*out = g_files[file_id - 1].path;
 	return true;
 }
 
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto       it = g_file_sizes.find(file_id);
-	if (it == g_file_sizes.end()) {
+	if (file_id == 0 || file_id > g_files.size()) {
 		return false;
 	}
-	*out = it->second;
+	*out = g_files[file_id - 1].size;
 	return true;
-}
-
-static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
-	if (st == nullptr) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
-	}
-
-	const bool is_dir  = Common::File::IsDirectoryExisting(host_path);
-	const bool is_file = Common::File::IsFileExisting(host_path);
-	if (!is_dir && !is_file) {
-		return LibKernel::KERNEL_ERROR_ENOENT;
-	}
-
-	LibKernel::FileSystem::FileStat stat {};
-	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-
-	auto at = Common::DateTime::FromSystemUTC();
-	auto wt = at;
-
-	if (is_dir) {
-		stat.st_size    = 0;
-		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
-	} else {
-		stat.st_size    = static_cast<int64_t>(Common::File::Size(host_path));
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
-
-		Common::File::GetLastAccessAndWriteTimeUTC(host_path, &at, &wt);
-	}
-
-	stat.st_atim.tv_sec  = static_cast<int64_t>(at.ToUnix());
-	stat.st_atim.tv_nsec = static_cast<int64_t>(
-	    (at.ToUnix() - static_cast<double>(stat.st_atim.tv_sec)) * 1000000000.0);
-	stat.st_mtim.tv_sec  = static_cast<int64_t>(wt.ToUnix());
-	stat.st_mtim.tv_nsec = static_cast<int64_t>(
-	    (wt.ToUnix() - static_cast<double>(stat.st_mtim.tv_sec)) * 1000000000.0);
-	stat.st_ctim     = stat.st_atim;
-	stat.st_birthtim = stat.st_mtim;
-	*st              = stat;
-
-	return OK;
 }
 
 // Mounts can appear after a failed lookup (e.g. additional content), so forget negative results.
@@ -208,13 +160,13 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = real_path;
 
-		if (Common::File::IsDirectoryExisting(real_path)) {
+		if (const auto host = Common::File::GetInfo(real_path); !host) {
+			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+		} else if (host->is_file) {
+			info.file_size = host->size;
+		} else {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
-		} else if (Common::File::IsFileExisting(real_path)) {
-			info.file_size = Common::File::Size(real_path);
-		} else {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
 		}
 
 		bool log_missing = false;
@@ -224,14 +176,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
-				// Allocate once under the cache lock; distinct paths can share a hash.
-				if (g_next_file_id == 0xffffffffu) {
-					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
-				} else {
-					info.file_id = it->second.file_id = g_next_file_id++;
-					g_files.emplace(info.file_id, info.host_path);
-					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
-				}
+				g_files.push_back({info.host_path, info.is_dir ? 0 : info.file_size});
+				info.file_id = it->second.file_id = static_cast<uint32_t>(g_files.size());
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
@@ -433,7 +379,7 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	return KernelSyscallResult(AprShared::GetHostPathStat(host_path, st));
+	return KernelSyscallResult(LibKernel::FileSystem::StatHostPath(host_path, st));
 }
 
 static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
@@ -446,27 +392,12 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	std::filesystem::path host_path;
-	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
+	uint64_t cached_size = 0;
+	if (!AprShared::TryGetHostFileSize(file_id, &cached_size)) {
 		LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
-
-	uint64_t cached_size = 0;
-	if (AprShared::TryGetHostFileSize(file_id, &cached_size)) {
-		*size = cached_size;
-		return OK;
-	}
-
-	if (Common::File::IsDirectoryExisting(host_path)) {
-		*size = 0;
-		return OK;
-	}
-	if (!Common::File::IsFileExisting(host_path)) {
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
-	}
-
-	*size = Common::File::Size(host_path);
+	*size = cached_size;
 	return OK;
 }
 

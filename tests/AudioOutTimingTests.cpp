@@ -107,15 +107,13 @@ bool ClearAudioStream(SDL_AudioStream* stream) {
 }
 } // namespace Fake
 
-namespace Common {
-class TimingThread: public Thread {
-public:
-	static void SleepMicro(uint32_t micros) {
-		sleeps.push_back(micros);
-		now += micros + oversleep;
-	}
-};
-} // namespace Common
+namespace Common::TimingThread {
+using namespace Thread;
+inline void SleepMicro(uint32_t micros) {
+	sleeps.push_back(micros);
+	now += micros + oversleep;
+}
+} // namespace Common::TimingThread
 
 #define Thread                      TimingThread
 #define SDL_InitSubSystem           Fake::InitSubSystem

@@ -92,6 +92,17 @@ TEST_F(NetResolverTest, NtoaStoresFirstAddress) {
   EXPECT_EQ(addr, 0x0100007fu);
 }
 
+// An asynchronous lookup (flag 0x1) stores the address as a host-order integer:
+// EA's DirtySDK reads it back as one and writes it out high byte first.
+TEST_F(NetResolverTest, NtoaAsyncStoresHostOrderAddress) {
+  constexpr int async = 0x1;
+  uint32_t addr = 0;
+  ASSERT_EQ(ntoa(rid, "10.1.2.3", &addr, 0, 0, async), 0);
+  EXPECT_EQ(addr, 0x0a010203u);
+  ASSERT_EQ(ntoa(rid, "localhost", &addr, 0, 0, async), 0);
+  EXPECT_EQ(addr, 0x7f000001u);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {

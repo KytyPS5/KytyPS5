@@ -131,6 +131,45 @@ constexpr uint8_t kMwaitx[] = {
 	0xc3,             // ret
 };
 
+// SHA-NI: Rosetta 2 has none. Each blob loads xmm0 from (%rcx), the source from (%rdx) and the
+// destination from (%rsi), runs one SHA instruction, and stores the destination to (%rdi). The
+// expected values were taken from native SHA-NI. The first is the encoding PPSA08804 stopped on.
+constexpr uint8_t kSha1Msg1Xmm7Xmm8[] = {
+	0x0f, 0x10, 0x01,             // movups (%rcx), %xmm0
+	0xf3, 0x44, 0x0f, 0x6f, 0x02, // movdqu (%rdx), %xmm8
+	0xf3, 0x0f, 0x6f, 0x3e,       // movdqu (%rsi), %xmm7
+	0x41, 0x0f, 0x38, 0xc9, 0xf8, // sha1msg1 xmm7, xmm8
+	0xf3, 0x0f, 0x7f, 0x3f,       // movdqu %xmm7, (%rdi)
+	0xc3,
+};
+
+constexpr uint8_t kSha1Rnds4Xmm1Xmm2Func2[] = {
+	0x0f, 0x10, 0x01,             // movups (%rcx), %xmm0
+	0xf3, 0x0f, 0x6f, 0x12,       // movdqu (%rdx), %xmm2
+	0xf3, 0x0f, 0x6f, 0x0e,       // movdqu (%rsi), %xmm1
+	0x0f, 0x3a, 0xcc, 0xca, 0x02, // sha1rnds4 xmm1, xmm2, 2
+	0xf3, 0x0f, 0x7f, 0x0f,       // movdqu %xmm1, (%rdi)
+	0xc3,
+};
+
+// Reads xmm0 implicitly.
+constexpr uint8_t kSha256Rnds2Xmm10Xmm9[] = {
+	0x0f, 0x10, 0x01,             // movups (%rcx), %xmm0
+	0xf3, 0x44, 0x0f, 0x6f, 0x0a, // movdqu (%rdx), %xmm9
+	0xf3, 0x44, 0x0f, 0x6f, 0x16, // movdqu (%rsi), %xmm10
+	0x45, 0x0f, 0x38, 0xcb, 0xd1, // sha256rnds2 xmm10, xmm9
+	0xf3, 0x44, 0x0f, 0x7f, 0x17, // movdqu %xmm10, (%rdi)
+	0xc3,
+};
+
+constexpr uint8_t kSha1NexteXmm3Memory[] = {
+	0x0f, 0x10, 0x01,       // movups (%rcx), %xmm0
+	0xf3, 0x0f, 0x6f, 0x1e, // movdqu (%rsi), %xmm3
+	0x0f, 0x38, 0xc8, 0x1a, // sha1nexte xmm3, [rdx]
+	0xf3, 0x0f, 0x7f, 0x1f, // movdqu %xmm3, (%rdi)
+	0xc3,
+};
+
 constexpr size_t kPageSize = 4096;
 
 std::atomic<int>    g_illegal_hits {0};
@@ -287,6 +326,105 @@ void TestMwaitxEmulated() {
 	const int before = IllegalHits();
 	fn();
 	Check(IllegalHits() > before, "host raises SIGILL for MWAITX");
+}
+
+// ADX: Rosetta 2 has no ADCX. The blob stores the result and RFLAGS. It also covers a 32-bit
+// destination with a memory source.
+constexpr uint8_t kAdcxRaxRdx[] = {
+	0x45, 0x31, 0xc0,                   // xor r8d, r8d (ZF=1, CF=0)
+	0xf9,                               // stc
+	0x48, 0x8b, 0x06,                   // mov rax, [rsi]
+	0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc2, // adcx rax, rdx
+	0x9c, 0x59,                         // pushfq; pop rcx
+	0x48, 0x89, 0x07,                   // mov [rdi], rax
+	0x48, 0x89, 0x4f, 0x08,             // mov [rdi+8], rcx
+	0xc3,
+};
+
+constexpr uint8_t kAdcxEaxMemory[] = {
+	0xf9,                         // stc
+	0x48, 0x89, 0xd0,             // mov rax, rdx
+	0x66, 0x0f, 0x38, 0xf6, 0x06, // adcx eax, [rsi]
+	0x9c, 0x59,                   // pushfq; pop rcx
+	0x48, 0x89, 0x07,             // mov [rdi], rax
+	0x48, 0x89, 0x4f, 0x08,       // mov [rdi+8], rcx
+	0xc3,
+};
+
+using AdxBlobFn = void (*)(uint64_t *out, const uint64_t *memory, uint64_t value);
+
+constexpr uint64_t kCarryFlag    = 1u << 0u;
+constexpr uint64_t kZeroFlag     = 1u << 6u;
+constexpr uint64_t kOverflowFlag = 1u << 11u;
+
+// ADOX is not emulated: the stop names it, and why.
+void TestAdoxIsNamedAsUnsupported() {
+	constexpr uint8_t kAdoxRaxRdx[] = {0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc2}; // adox rax, rdx
+	const char*       reason = Loader::X64InstructionEmulator::UnsupportedReason(kAdoxRaxRdx);
+	Check(reason != nullptr && std::strstr(reason, "ADOX") != nullptr,
+	      "an illegal ADOX gives no reason that names it");
+	constexpr uint8_t kAdcx[] = {0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc2}; // adcx rax, rdx
+	Check(Loader::X64InstructionEmulator::UnsupportedReason(kAdcx) == nullptr,
+	      "ADCX, which is emulated, was given a reason");
+}
+
+void TestAdcx() {
+	auto           fn = MapCode<AdxBlobFn>(kAdcxRaxRdx);
+	uint64_t       out[2] {};
+	const uint64_t all_ones = UINT64_MAX;
+	const int      before   = IllegalHits();
+	fn(out, &all_ones, 0);
+	Check(IllegalHits() > before, "host raises SIGILL for ADCX");
+	Check(out[0] == 0, "adcx adds the carry in: ~0 + 0 + 1 wraps to 0");
+	Check((out[1] & kCarryFlag) != 0, "adcx sets CF on a carry out");
+	Check((out[1] & kZeroFlag) != 0 && (out[1] & kOverflowFlag) == 0,
+	      "adcx leaves ZF and OF as they were");
+	const uint64_t five = 5;
+	fn(out, &five, 7);
+	Check(out[0] == 13, "adcx: 5 + 7 + 1");
+	Check((out[1] & kCarryFlag) == 0, "adcx clears CF without a carry out");
+}
+
+void TestAdcx32Memory() {
+	auto           fn     = MapCode<AdxBlobFn>(kAdcxEaxMemory);
+	uint64_t       out[2] {};
+	const uint64_t memory = 0xdeadbeef0000000full;
+	const int      before = IllegalHits();
+	fn(out, &memory, 0xaaaaaaaafffffff0ull);
+	Check(IllegalHits() > before, "host raises SIGILL for a 32-bit ADCX");
+	Check(out[0] == 0, "adcx eax: 0xfffffff0 + 0xf + 1 wraps, and the upper half is cleared");
+	Check((out[1] & kCarryFlag) != 0, "32-bit adcx sets CF on a carry out");
+}
+
+using ShaBlobFn = void (*)(uint32_t *out, const uint32_t *dest, const uint32_t *src,
+                          const uint32_t *xmm0);
+
+void TestShaNi() {
+	alignas(16) const uint32_t dest[4] {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
+	alignas(16) const uint32_t src[4] {0x61626380u, 0x00000000u, 0x00000018u, 0xc3d2e1f0u};
+	alignas(16) const uint32_t xmm0[4] {0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u};
+	struct Case {
+		ShaBlobFn   fn;
+		uint32_t    expected[4];
+		const char *text;
+	};
+	const Case cases[] = {
+	    {MapCode<ShaBlobFn>(kSha1Msg1Xmm7Xmm8),
+	     {0x67452319u, 0x2c1f4a79u, 0xffffffffu, 0xffffffffu}, "sha1msg1 xmm7, xmm8"},
+	    {MapCode<ShaBlobFn>(kSha1Rnds4Xmm1Xmm2Func2),
+	     {0xd241b645u, 0x6f5aae87u, 0xb04f413bu, 0x34ddb52eu}, "sha1rnds4 xmm1, xmm2, 2"},
+	    {MapCode<ShaBlobFn>(kSha256Rnds2Xmm10Xmm9),
+	     {0x3257db20u, 0x8179ea9eu, 0x0ea4a476u, 0xa650ba9au}, "sha256rnds2 xmm10, xmm9"},
+	    {MapCode<ShaBlobFn>(kSha1NexteXmm3Memory),
+	     {0x61626380u, 0x00000000u, 0x00000018u, 0x47df770du}, "sha1nexte xmm3, [rdx]"},
+	};
+	for (const auto &test: cases) {
+		uint32_t  out[4] {};
+		const int before = IllegalHits();
+		test.fn(out, dest, src, xmm0);
+		Check(IllegalHits() > before, test.text);
+		Check(std::memcmp(out, test.expected, sizeof(out)) == 0, test.text);
+	}
 }
 
 void TestUnknownInstructionRefused() {
@@ -476,6 +614,10 @@ int main() {
 	TestRexHighRegisterInsertqWithIndex();
 	TestInsertqRegister();
 	TestMwaitxEmulated();
+	TestAdcx();
+	TestAdcx32Memory();
+	TestAdoxIsNamedAsUnsupported();
+	TestShaNi();
 	TestUnknownInstructionRefused();
 	TestPatchedExtrqImmediate();
 	TestPatchedExtrqRexHigh();

@@ -1,6 +1,9 @@
 #include "common/hostException.h"
 
+#include "common/trace.h"
+
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -213,6 +216,14 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return;
+	}
+
+	if (Trace::Enabled()) {
+		char reason[160];
+		std::snprintf(reason, sizeof(reason),
+		              "host signal %d at rip=0x%016" PRIx64 " address=0x%016" PRIx64, signal_number,
+		              info.exception_address, info.access_violation_vaddr);
+		Trace::Fatal(reason);
 	}
 
 	struct sigaction restore {};

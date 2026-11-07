@@ -59,7 +59,10 @@ private:
 
 	struct Element {
 		DescriptorValue value;
-		TextureBinding  binding;
+		// binding.texture is cleared: the decoded-texture table it points into is dropped when
+		// full, while an element lives on. desc holds what the element needs of it.
+		TextureBinding         binding;
+		TextureCache::ImageDesc desc;
 		uint32_t        kind   = 0;
 		uint32_t        refs   = 0; // Slots of the owning view that select it.
 		bool            stale  = false;

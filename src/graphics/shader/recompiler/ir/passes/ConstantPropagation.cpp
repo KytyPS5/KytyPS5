@@ -47,19 +47,48 @@ public:
 		}
 	}
 
+	// The operations whose operands a fold of one of their users inspects (beyond the operation's
+	// own opcode and value): a change below such an operation can change how its users fold.
+	// Every other fold reads only its direct operands, so the walk stops at other operations.
+	static bool InspectedThrough(ValueOpcode opcode) {
+		switch (opcode) {
+			case ValueOpcode::Identity:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::GetBuiltin:
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x4:
+			case ValueOpcode::Ballot:
+			case ValueOpcode::LogicalNot:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::Phi: return true;
+			default: return false;
+		}
+	}
+
 	void QueueUsers(const std::vector<Use>& users) {
 		for (const auto& use: users) affected.push_back(use.user);
 	}
 
 	void FlushUsers() {
 		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit their union once per drain, including cyclic Phi edges;
-		// the drain left nothing queued, so a queued instruction was visited here.
+		// stay dynamic. Visit their union once per drain, including cyclic Phi edges, through the
+		// operations such folds look into (see InspectedThrough); the drain left nothing queued,
+		// so a queued instruction was visited here. Walking every transitive user made the pass
+		// quadratic in large shaders.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
 			const auto found = locations.find(inst);
 			if (found == locations.end() || found->second.queued) continue;
 			Queue(found->second);
+			if (!InspectedThrough(inst->GetOpcode())) continue;
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
 		affected.clear();

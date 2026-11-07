@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,6 +40,9 @@ struct Plan {
 	std::vector<Write>       writes;
 	std::vector<std::string> mod_names;
 	std::vector<uint64_t>    cave_pages;
+	// The first write's old bytes are found by search, at any address: its offset says nothing. For
+	// the plans the emulator makes itself (ApplyBuiltIn).
+	bool                     find_anywhere = false;
 };
 
 using Json = nlohmann::json;
@@ -62,12 +67,7 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 	return true;
 }
 
-bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
-	std::ifstream file(path, std::ios::binary);
-	if (!file) {
-		return Fail(error, "could not read cheat file");
-	}
-
+bool LoadPlan(std::istream& file, Plan* plan, std::string* error) {
 	const auto root = Json::parse(file, nullptr, false);
 	if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
 	    !root.contains("process") || !root.contains("mods")) {
@@ -167,7 +167,7 @@ bool Matches(Plan* plan, const Program& program, uint64_t* source_base) {
 				break;
 			}
 			const auto rva = static_cast<uint64_t>(found - begin) + segment.p_vaddr;
-			if (anchor->source_address >= rva) {
+			if (plan->find_anywhere || anchor->source_address >= rva) {
 				*source_base = anchor->source_address - rva;
 				if (TranslateAndValidate(plan, program, *source_base)) {
 					return true;
@@ -245,14 +245,7 @@ bool ApplyWrites(Plan* plan, const Program& program, std::string* error) {
 
 } // namespace
 
-bool Apply(const std::filesystem::path& plan_path, Program* main_program,
-           const std::vector<Program*>& programs) {
-	Plan        plan;
-	std::string error;
-	if (!LoadPlan(plan_path, &plan, &error) || !ValidateGame(plan, main_program, &error)) {
-		::printf("Game cheat error: %s\n", error.c_str());
-		return false;
-	}
+bool ApplyLoaded(Plan plan, Program* main_program, const std::vector<Program*>& programs) {
 	if (plan.writes.empty()) {
 		return true;
 	}
@@ -268,6 +261,100 @@ bool Apply(const std::filesystem::path& plan_path, Program* main_program,
 	}
 	::printf("Game cheat: waiting for the matching module\n");
 	return true;
+}
+
+bool Apply(const std::filesystem::path& plan_path, Program* main_program,
+           const std::vector<Program*>& programs) {
+	Plan        plan;
+	std::string error;
+	std::ifstream file(plan_path, std::ios::binary);
+	if (!file) {
+		::printf("Game cheat error: could not read cheat file\n");
+		return false;
+	}
+	if (!LoadPlan(file, &plan, &error) || !ValidateGame(plan, main_program, &error)) {
+		::printf("Game cheat error: %s\n", error.c_str());
+		return false;
+	}
+	return ApplyLoaded(std::move(plan), main_program, programs);
+}
+
+bool ApplyBuiltIn(const std::string& json, Program* main_program, const std::vector<Program*>& programs) {
+	Plan        plan;
+	std::string error;
+	std::istringstream stream(json);
+	if (!LoadPlan(stream, &plan, &error)) {
+		::printf("Built-in patch error: %s\n", error.c_str());
+		return false;
+	}
+	plan.find_anywhere = true;
+	if (!ValidateGame(plan, main_program, &error)) {
+		// Another version of the game: its data is somewhere else, and the patch does not apply.
+		::printf("Built-in patch not applied: %s\n", error.c_str());
+		return false;
+	}
+	return ApplyLoaded(std::move(plan), main_program, programs);
+}
+
+bool ApplyKnownFixes(Program* main_program, const std::vector<Program*>& programs) {
+	const char* switch_value = std::getenv("KYTY_GAME_FIXES");
+	if (switch_value != nullptr && std::string(switch_value) == "0") {
+		return false;
+	}
+	std::string title_id;
+	std::string version;
+	if (main_program == nullptr || main_program->file_name.empty() ||
+	    !SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
+	    !SystemContentParamSfoGetString("APP_VER", &version)) {
+		return false;
+	}
+	// Marvel's Spider-Man 2 (PPSA08338). When the game turns its depth-reprojection culling on (its
+	// first 3D frame), the main thread waits for a result that only the render thread's frame can
+	// produce, and the render thread's frame waits for the main thread: the game stops on its
+	// logo. On a console the render thread is ahead of the main thread, and the wait is not
+	// entered; here the first 3D frames are slower and the order flips. The jump into the wait
+	// (jmp +0x15) becomes a jump past it (jmp +0x72): the culling uses the last frame's result,
+	// as it does while that result is not ready anyway. The old bytes (the lea before the jump
+	// included) are unique in the game's eboot.
+	if (title_id == "PPSA08338") {
+		const Json plan = {
+		    {"id", title_id},
+		    {"version", version},
+		    {"process", main_program->file_name.filename().string()},
+		    {"mods",
+		     Json::array({Json {
+		         {"name", "Reprojection wait"},
+		         {"memory", Json::array({Json {{"offset", "437ea50"},
+		                                       {"off", "4989c64c8d3d6dc15103eb15"},
+		                                       {"on", "4989c64c8d3d6dc15103eb72"}}})}}})}};
+		return ApplyBuiltIn(plan.dump(), main_program, programs);
+	}
+	return false;
+}
+
+bool ContainsBytes(const std::vector<Program*>& programs, const std::vector<uint8_t>& bytes) {
+	if (bytes.empty()) {
+		return false;
+	}
+	for (const auto* program: programs) {
+		if (program == nullptr || program->elf == nullptr || program->base_vaddr == 0) {
+			continue;
+		}
+		const auto* ehdr = program->elf->GetEhdr();
+		const auto* phdr = program->elf->GetPhdr();
+		for (Elf64_Half index = 0; index < ehdr->e_phnum; index++) {
+			const auto& segment = phdr[index];
+			if ((segment.p_type != PT_LOAD && segment.p_type != PT_OS_RELRO) || segment.p_filesz < bytes.size()) {
+				continue;
+			}
+			const auto* begin = reinterpret_cast<const uint8_t*>(program->base_vaddr + segment.p_vaddr);
+			const auto* end   = begin + segment.p_filesz;
+			if (std::search(begin, end, bytes.begin(), bytes.end()) != end) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 bool ApplyPending(Program* program) {

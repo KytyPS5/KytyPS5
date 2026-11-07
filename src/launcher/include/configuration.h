@@ -81,6 +81,10 @@ public:
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
+	// The emulator's --video-out-resolution: the output resolution the console reports to games.
+	enum class VideoOutResolution { Title, FullHd, Uhd };
+	Q_ENUM(VideoOutResolution)
+
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
@@ -110,6 +114,7 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	VideoOutResolution     video_out_resolution        = VideoOutResolution::Title;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
@@ -127,12 +132,15 @@ public:
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
+	bool                   ea_emulation_enabled        = true;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
+	// Empty: the emulator's default, the user's cache folder.
+	QString                pipeline_cache_folder;
 	bool                   command_buffer_dump_enabled = false;
 	QString                command_buffer_dump_folder  = "_Buffers";
 	LogDirection           printf_direction            = LogDirection::Silent;
@@ -155,6 +163,7 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		video_out_resolution        = other.video_out_resolution;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hdr_enabled                 = other.hdr_enabled;
@@ -172,12 +181,14 @@ public:
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		psn_emulation_enabled       = other.psn_emulation_enabled;
+		ea_emulation_enabled        = other.ea_emulation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
 		shader_log_direction        = other.shader_log_direction;
 		shader_log_folder           = other.shader_log_folder;
+		pipeline_cache_folder       = other.pipeline_cache_folder;
 		command_buffer_dump_enabled = other.command_buffer_dump_enabled;
 		command_buffer_dump_folder  = other.command_buffer_dump_folder;
 		printf_direction            = other.printf_direction;

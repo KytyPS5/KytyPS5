@@ -37,6 +37,8 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// The first reads are the guest code and tables of the program's linked calls.
+	size_t                       source_reads = 0;
 	UniformFill                 uniform_fill;
 };
 

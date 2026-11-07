@@ -74,6 +74,7 @@ void SetTouchPad(int id, int finger, bool down, float, float) {
 void SetRightStick(int, int, int) {}
 void ToggleGyroEmulation(int) {}
 void CycleSetting(Setting) {}
+int  GetGamepadOfPlayer(int) { return -1; }
 } // namespace Libs::Controller
 
 namespace {

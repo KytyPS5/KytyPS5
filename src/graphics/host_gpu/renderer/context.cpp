@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -7,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -19,9 +21,33 @@ namespace Libs::Graphics {
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
+bool CommandBuffer::IsInvalid() const {
+	return m_buffer == nullptr;
+}
+
+vk::CommandBuffer CommandBuffer::Handle() const {
+	EndComputeChain();
+	return StateHandle();
+}
+
+vk::CommandBuffer CommandBuffer::StateHandle() const {
+	EXIT_IF(IsInvalid());
+	m_used = true;
+	return m_buffer;
+}
+
+void CommandBuffer::EndComputeChain() const {
+	if (!m_compute_chain) {
+		return;
+	}
+	m_compute_chain = false;
+	ShaderAccessBarrier(StateHandle(), vk::PipelineStageFlagBits::eComputeShader);
+}
+
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	m_compute_chain = false;
+	auto buffer     = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -29,6 +55,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_used = false;
 }
 
 void CommandBuffer::End() const {
@@ -40,11 +67,41 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
-	if (m_rendering && m_render_state == state) {
+void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
+                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	m_debug_op        = op;
+	m_debug_submit_id = submit_id;
+	m_debug_arg0      = arg0;
+	m_debug_arg1      = arg1;
+	m_debug_arg2      = arg2;
+	m_debug_arg3      = arg3;
+	m_debug_arg4      = arg4;
+}
+
+void CommandBuffer::BeginRendering(const RenderState& wanted) const {
+	if (m_rendering && m_render_state.Covers(wanted)) {
 		return;
 	}
+	auto state = wanted;
+	// The same attachments with draws outside the open area: the next pass takes both areas, so that
+	// a run of draws with different scissors does not restart the pass at each one.
+	if (m_rendering) {
+		auto open = m_render_state;
+		open.depth_stencil_attachment.depth_clear   = state.depth_stencil_attachment.depth_clear;
+		open.depth_stencil_attachment.stencil_clear = state.depth_stencil_attachment.stencil_clear;
+		RenderState same = open;
+		same.area_x = same.area_y = 0;
+		same.area_width = same.area_height = 0;
+		RenderState want = state;
+		want.area_x = want.area_y = 0;
+		want.area_width = want.area_height = 0;
+		if (same == want) state.Grow(m_render_state);
+	}
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	InsertDebugLabel(m_buffer, "Pass {}x{} layers={} colors={}", state.width, state.height,
+	                 state.num_layers, state.num_color_attachments);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -74,12 +131,17 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 
 	vk::RenderingInfo rendering {};
 	rendering.renderArea.extent    = {state.width, state.height};
+	if (state.area_width != 0u && state.area_height != 0u) {
+		rendering.renderArea.offset = vk::Offset2D {state.area_x, state.area_y};
+		rendering.renderArea.extent = vk::Extent2D {state.area_width, state.area_height};
+	}
 	rendering.layerCount           = state.num_layers;
 	rendering.colorAttachmentCount = state.num_color_attachments;
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	PerfCounters::Add(PerfCounters::Counter::RenderPasses);
 	m_render_state = state;
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
@@ -20,8 +21,9 @@ constexpr uint32_t SpirvVersion15 = 0x00010500u;
 
 class RectListEmitter {
 public:
-	RectListEmitter(const std::vector<RectListParameter>& parameters_, spv::ExecutionModel model)
-	    : parameters(parameters_) {
+	RectListEmitter(const std::vector<RectListParameter>& parameters_, uint32_t clip_count_,
+	                spv::ExecutionModel model)
+	    : parameters(parameters_), clip_count(clip_count_) {
 		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
 		void_type       = builder.Type(spv::OpTypeVoid);
@@ -31,22 +33,34 @@ public:
 		vec4_float_type = builder.Type(spv::OpTypeVector, float_type, 4u);
 		function_type   = builder.Type(spv::OpTypeFunction, void_type);
 
-		per_vertex_type = builder.DecoratedType(
-		    spv::OpTypeStruct,
-		    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
-		     {spv::OpDecorate, {spv::DecorationBlock}}},
-		    vec4_float_type);
+		if (clip_count == 0) {
+			per_vertex_type = builder.DecoratedType(
+			    spv::OpTypeStruct,
+			    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+			     {spv::OpDecorate, {spv::DecorationBlock}}},
+			    vec4_float_type);
+		} else {
+			// The block matches the vertex shader's outputs: a host that passes the vertex
+			// outputs to the control shader by memory (MoltenVK) needs the same layout.
+			builder.RequireCapability(spv::CapabilityClipDistance);
+			per_vertex_type = builder.DecoratedType(
+			    spv::OpTypeStruct,
+			    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+			     {spv::OpMemberDecorate, {1u, spv::DecorationBuiltIn, spv::BuiltInClipDistance}},
+			     {spv::OpDecorate, {spv::DecorationBlock}}},
+			    vec4_float_type, Array(float_type, clip_count));
+		}
 
 		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
 		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
+		ptr_input_float       = Pointer(spv::StorageClassInput, float_type);
+		ptr_output_float      = Pointer(spv::StorageClassOutput, float_type);
 		if (model == spv::ExecutionModelTessellationControl) {
-			bool_type        = builder.Type(spv::OpTypeBool);
-			vec2_bool_type   = builder.Type(spv::OpTypeVector, bool_type, 2u);
-			vec2_float_type  = builder.Type(spv::OpTypeVector, float_type, 2u);
-			ptr_output_float = Pointer(spv::StorageClassOutput, float_type);
+			bool_type       = builder.Type(spv::OpTypeBool);
+			vec2_bool_type  = builder.Type(spv::OpTypeVector, bool_type, 2u);
+			vec2_float_type = builder.Type(spv::OpTypeVector, float_type, 2u);
 		} else {
 			vec3_float_type = builder.Type(spv::OpTypeVector, float_type, 3u);
-			ptr_input_float = Pointer(spv::StorageClassInput, float_type);
 		}
 	}
 
@@ -106,6 +120,19 @@ public:
 		    Result(spv::OpSelect, vec4_float_type, is_fourth, position3,
 		           Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0))));
 		Store(Access(ptr_output_vec4_float, gl_out, invocation, Int(0)), position);
+		for (uint32_t plane = 0; plane < clip_count; plane++) {
+			const auto clip = [&](uint32_t vertex) {
+				return Load(float_type, Access(ptr_input_float, gl_in, vertex, Int(1), Int(plane)));
+			};
+			const auto fourth = Result(
+			    spv::OpFAdd, float_type,
+			    Result(spv::OpFMul, float_type, clip(Int(0)), barycentric[0]),
+			    Result(spv::OpFAdd, float_type,
+			           Result(spv::OpFMul, float_type, clip(Int(1)), barycentric[1]),
+			           Result(spv::OpFMul, float_type, clip(Int(2)), barycentric[2])));
+			Store(Access(ptr_output_float, gl_out, invocation, Int(1), Int(plane)),
+			      Result(spv::OpSelect, float_type, is_fourth, fourth, clip(index)));
+		}
 
 		for (uint32_t i = 0; i < parameters.size(); i++) {
 			const auto input0 =
@@ -143,6 +170,10 @@ public:
 		const auto position =
 		    Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0)));
 		Store(Access(ptr_output_vec4_float, gl_out, Int(0)), position);
+		for (uint32_t plane = 0; plane < clip_count; plane++) {
+			Store(Access(ptr_output_float, gl_out, Int(1), Int(plane)),
+			      Load(float_type, Access(ptr_input_float, gl_in, index, Int(1), Int(plane))));
+		}
 		for (uint32_t i = 0; i < parameters.size(); i++) {
 			Store(outputs[i],
 			      Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
@@ -281,6 +312,7 @@ private:
 
 	Builder                               builder {SpirvVersion15};
 	const std::vector<RectListParameter>& parameters;
+	uint32_t                              clip_count = 0;
 	std::vector<uint32_t>                 interfaces;
 	std::vector<uint32_t>                 inputs;
 	std::vector<uint32_t>                 outputs;
@@ -329,7 +361,7 @@ std::vector<RectListParameter> RectListParameters(
 }
 
 RectListShaders BuildRectListShaders(std::span<const RectListParameter> parameters,
-                                     uint32_t                           param_export_mask) {
+                                     uint32_t param_export_mask, uint32_t clip_count) {
 	std::vector<RectListParameter> exported;
 	std::array<bool, 32>           output_locations {};
 	for (const auto& parameter: parameters) {
@@ -339,8 +371,8 @@ RectListShaders BuildRectListShaders(std::span<const RectListParameter> paramete
 			output_locations[parameter.output_location] = true;
 		}
 	}
-	RectListEmitter control(exported, spv::ExecutionModelTessellationControl);
-	RectListEmitter evaluation(exported, spv::ExecutionModelTessellationEvaluation);
+	RectListEmitter control(exported, clip_count, spv::ExecutionModelTessellationControl);
+	RectListEmitter evaluation(exported, clip_count, spv::ExecutionModelTessellationEvaluation);
 	return {control.EmitControl(), evaluation.EmitEvaluation()};
 }
 

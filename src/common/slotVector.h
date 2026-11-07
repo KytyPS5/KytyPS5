@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <algorithm>
 #include <compare>
 #include <cstdint>
 #include <functional>
@@ -61,6 +62,12 @@ public:
 
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
 		return id.index < m_stored.size() && m_stored[id.index] != 0;
+	}
+
+	// The live objects: a walk over the occupancy bytes.
+	[[nodiscard]] size_t size() const {
+		return static_cast<size_t>(
+		    std::count_if(m_stored.begin(), m_stored.end(), [](auto stored) { return stored != 0; }));
 	}
 
 	template <typename... Args>

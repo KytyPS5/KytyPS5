@@ -94,6 +94,10 @@ public:
 		m_maybe_cpu_dirty = false;
 	}
 
+	// Counts the writes to the image's contents (GPU writes, uploads, clears, copies, draws
+	// that write depth or stencil). A reader that holds a copy compares it.
+	[[nodiscard]] uint64_t ContentGeneration() const noexcept { return m_content_generation; }
+	void                   NoteContentWrite() noexcept { m_content_generation++; }
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
@@ -139,6 +143,9 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// The submission of the last download of the image to guest memory: the download writes the
+	// whole range when that submission ends (TextureCache::DownloadImageMemory).
+	uint64_t         download_tick  = 0;
 	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
@@ -147,7 +154,13 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
+	// The cache's GC tick (frames) when the image was last used: its age for collection.
 	uint64_t         tick_accessed_last = 0;
+	// The command buffer (CommandScheduler::CurrentTick) that last used the image: a second use in
+	// the same command buffer needs no checks again (TextureCache::ReuseImage).
+	uint64_t         command_tick_used  = 0;
+	// The cache's GC tick when the image was last put at the back of the LRU list.
+	uint64_t         lru_touched_gc     = ~uint64_t {0};
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
@@ -167,6 +180,7 @@ private:
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
+	uint64_t          m_content_generation = 0;
 	bool              m_buffer_modified = false;
 };
 

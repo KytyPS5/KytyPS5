@@ -133,10 +133,27 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// How many bytes from vaddr have backing, page by page (0x4000), stopping at the first page without.
+// Sparse (PRT) ranges read as zeros where this stops, so only this tells resident pages from empty ones.
+[[nodiscard]] uint64_t BackedPrefix(uint64_t vaddr, uint64_t size);
+// Changes when guest backing is mapped or unmapped.
+[[nodiscard]] uint64_t BackingGeneration();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// The file of guest direct memory (a memfd on Linux, -1 elsewhere) and its size.
+struct DirectMemoryFile {
+	int      fd   = -1;
+	uint64_t size = 0;
+};
+[[nodiscard]] DirectMemoryFile GetDirectMemoryFile();
+// Where [vaddr, vaddr + size) lies in that file, when it is mapped from it in one piece.
+[[nodiscard]] bool TranslateDirectMemory(uint64_t vaddr, uint64_t size, uint64_t* file_offset);
+// The largest range within [low, high) around [vaddr, vaddr + size) that is mapped from that file
+// in one piece, or false when [vaddr, vaddr + size) itself is not.
+[[nodiscard]] bool ContiguousDirectMemory(uint64_t vaddr, uint64_t size, uint64_t low,
+                                          uint64_t high, uint64_t* begin, uint64_t* end);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;

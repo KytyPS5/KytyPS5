@@ -1355,15 +1355,13 @@ void TestFragmentedBackingPublicationRollback() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFlexibleReplacementRollbackPreservesMetadata() {
+void TestFixedReserveReplacesFragmentedFlexibleRange() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test = "FlexibleReplacementRollbackPreservesMetadata";
-	constexpr uint64_t page = SceKernelPageSize;
-	const auto         base = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "flex_restore");
+	const char*        test     = "FixedReserveReplacesFragmentedFlexibleRange";
+	constexpr uint64_t page     = SceKernelPageSize;
+	const auto         baseline = AvailableFlexibleMemory(test);
+	const auto         base = MapNamedFlexible(test, 3 * page, SceKernelProtCpuRw, "flex_replace");
 	const auto         mapping_count = TestFlexibleMappingCount();
-	for (uint64_t i = 0; i < 3; ++i) {
-		*reinterpret_cast<uint64_t*>(base + i * page) = 0x12345678 + i;
-	}
 	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRead),
 	        "protect middle flexible page");
 	CheckOk(test,
@@ -1371,23 +1369,15 @@ void TestFlexibleReplacementRollbackPreservesMetadata() {
 	        "rename middle flexible page");
 	Check(test, TestFlexibleMappingCount() == mapping_count,
 	      "flexible metadata edits fragmented backing ownership records");
-	const auto zeroed_before = TestBackingBytesZeroed();
-	TestFailNextFixedReserveRangeRegistration();
 	void* replacement = reinterpret_cast<void*>(base);
-	CheckFailed(test, KernelReserveVirtualRange(&replacement, 3 * page, SceKernelMapFixed, page),
-	            "replace fragmented flexible range with injected failure");
-	Check(test, TestBackingBytesZeroed() == zeroed_before,
-	      "rollback cleared preserved flexible backing");
-	for (uint64_t i = 0; i < 3; ++i) {
-		ExpectRange(test, Query(test, base + i * page), base + i * page, base + (i + 1) * page,
-		            i == 1 ? SceKernelProtCpuRead : SceKernelProtCpuRw, 1, 0, 0, 1,
-		            i == 1 ? "flex_middle" : "flex_restore");
-		Check(test, *reinterpret_cast<const uint64_t*>(base + i * page) == 0x12345678 + i,
-		      "rollback lost flexible contents across protection boundaries");
-		Check(test, !TestPlaceholderRangeIsFree(base + i * page, page),
-		      "restored flexible range remained marked as a free placeholder");
-	}
-	CheckOk(test, KernelMunmap(base, 3 * page), "release restored flexible range");
+	CheckOk(test, KernelReserveVirtualRange(&replacement, 3 * page, SceKernelMapFixed, page),
+	        "replace fragmented flexible range");
+	ExpectRange(test, Query(test, base), base, base + 3 * page, 0, 0, 0, 0, 0);
+	Check(test, TestPlaceholderRangeIsFree(base, 3 * page),
+	      "replaced flexible range was not released to the placeholder");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "reserve-fixed replacement leaked flexible budget");
+	CheckOk(test, KernelMunmap(base, 3 * page), "release replacement reservation");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1557,7 +1547,15 @@ void TestAsanShadowLifetimeAcrossRangeEdits() {
 	      "fixed runtime allocation beside a flexible mapping failed");
 	CheckOk(test, KernelMunmap(runtime + page, page), "unmap runtime memory");
 	Check(test, AsanShadowPresent(runtime), "runtime unmap released a neighbor's shadow");
-	CheckOk(test, KernelMunmap(runtime, page), "unmap the runtime page's neighbor");
+	Check(test,
+	      AllocateRuntimeMemory(runtime + page, page, Common::VirtualMemory::Mode::ReadWrite,
+	                            "asan_runtime", true) == runtime + page,
+	      "fixed runtime reallocation beside a flexible mapping failed");
+	void* fixed = reinterpret_cast<void*>(runtime + page);
+	CheckOk(test, KernelReserveVirtualRange(&fixed, page, SceKernelMapFixed, page),
+	        "reserve over runtime memory");
+	Check(test, AsanShadowPresent(runtime), "runtime replacement released a neighbor's shadow");
+	CheckOk(test, KernelMunmap(runtime, 2 * page), "unmap the neighbor and the reservation");
 	Check(test, !AsanShadowPresent(runtime), "neighbor unmap retained shadow");
 	CheckOk(test, KernelMunmap(runtime + 2 * page, coverage - 2 * page),
 	        "release runtime reservation");
@@ -2809,6 +2807,73 @@ void TestMprotectSkipsUncommittedRanges() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFixedReplacementGpuUnmaps() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test    = "FixedReplacementGpuUnmaps";
+	constexpr uint64_t page    = SceKernelPageSize;
+	void*              reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 2 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, offset == 0 ? page : 2 * page,
+		                                     SceKernelProtCpuRw, SceKernelMapFixed, "replaced"),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, SceKernelMapFixed, page),
+	        "reserve over mappings and a reserved gap");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {false, base + 2 * page, 2 * page}},
+	      "reserve-fixed did not unmap each run of committed ranges from the GPU once");
+	ExpectRange(test, Query(test, base), base, base + 4 * page, 0, 0, 0, 0, 0);
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	for (const auto size: {page, 2 * page}) {
+		void* address = reserve;
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, size, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "fixed_map"),
+		        "map into a reservation, then over a mapping and a reservation");
+	}
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
+	                                                        {true, base, page},
+	                                                        {false, base, page},
+	                                                        {false, base, 2 * page},
+	                                                        {true, base, 2 * page}},
+	      "fixed flexible maps did not unmap their whole target from the GPU");
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFixedReserveValidatesBeforeUnmapping() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test = "FixedReserveValidatesBeforeUnmapping";
+	constexpr uint64_t page = SceKernelPageSize;
+	constexpr uint64_t top  = 0xfc00000000ull - page;
+	Check(test,
+	      AllocateRuntimeMemory(top, page, Common::VirtualMemory::Mode::ReadWrite, "top_runtime",
+	                            true) == top,
+	      "fixed runtime allocation at the top of the user area failed");
+	*reinterpret_cast<uint64_t*>(top) = 0x544f5052554e5449ull;
+	void* past_end                    = reinterpret_cast<void*>(top);
+	Check(test,
+	      KernelReserveVirtualRange(&past_end, 2 * page, SceKernelMapFixed, page) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "reserve-fixed accepted a span past the user area");
+	Check(test, *reinterpret_cast<const uint64_t*>(top) == 0x544f5052554e5449ull,
+	      "rejected reserve-fixed changed runtime memory");
+	Check(test, FreeGuestMemory(top, page), "free top runtime memory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapRoundsToPages() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "MunmapRoundsToPages";
@@ -3464,161 +3529,6 @@ void TestFixedReserveReplacesPartialDirectMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFixedReserveRollbackSkipsUntouchedChunks() {
-	const char*        test       = "FixedReserveRollbackSkipsUntouchedChunks";
-	constexpr uint64_t part_size  = SceKernelPageSize * 2;
-	constexpr uint64_t total_size = part_size * 2;
-	int64_t            left_phys  = 0;
-	int64_t            right_phys = 0;
-
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            part_size, SceKernelPageSize, SceKernelMtypeC, &left_phys),
-	        "KernelAllocateDirectMemory(left)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            part_size, SceKernelPageSize, SceKernelMtypeC, &right_phys),
-	        "KernelAllocateDirectMemory(right)");
-
-	void* reserve = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
-	                                                           SceKernelPageSize),
-	        "KernelReserveVirtualRange");
-	const auto base  = reinterpret_cast<uint64_t>(reserve);
-	void*      left  = reserve;
-	void*      right = reinterpret_cast<void*>(base + part_size);
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &left, part_size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            left_phys, SceKernelPageSize, "rollback_left"),
-	        "KernelMapNamedDirectMemory(left)");
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &right, part_size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            right_phys, SceKernelPageSize, "rollback_right"),
-	        "KernelMapNamedDirectMemory(right)");
-	*reinterpret_cast<uint64_t*>(left)  = 0x4b5954594c454654ull; // "KYTYLEFT"
-	*reinterpret_cast<uint64_t*>(right) = 0x4b59545952474854ull; // "KYTYRGHT"
-
-	Libs::LibKernel::Memory::TestFailPhysicalMemoryUnmapAfter(1);
-	void* replacement = reserve;
-	CheckFailed(test,
-	            Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	                &replacement, total_size, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	                SceKernelPageSize),
-	            "KernelReserveVirtualRange(second-chunk rollback)");
-	Check(test, *reinterpret_cast<uint64_t*>(left) == 0x4b5954594c454654ull,
-	      "rollback did not restore the mutated first chunk");
-	Check(test, *reinterpret_cast<uint64_t*>(right) == 0x4b59545952474854ull,
-	      "rollback damaged the failing second chunk");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, part_size),
-	      "first restored mapping remained recorded as a free placeholder");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base + part_size, part_size),
-	      "second restored mapping remained recorded as a free placeholder");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, part_size), "KernelMunmap(left)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + part_size, part_size),
-	        "KernelMunmap(right)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(left_phys, part_size),
-	        "KernelReleaseDirectMemory(left)");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(right_phys, part_size),
-	        "KernelReleaseDirectMemory(right)");
-
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestFixedReserveRollbackConsumesRestoredPlaceholder() {
-	const char*        test       = "FixedReserveRollbackConsumesRestoredPlaceholder";
-	constexpr uint64_t total_size = SceKernelPageSize * 4;
-
-	int64_t phys_addr = 0;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            total_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
-	        "KernelAllocateDirectMemory");
-
-	void* reserve = nullptr;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
-	                                                           SceKernelPageSize),
-	        "KernelReserveVirtualRange");
-	const auto base = reinterpret_cast<uint64_t>(reserve);
-
-	void* mapped = reserve;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &mapped, total_size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            phys_addr, SceKernelPageSize, "rollback_direct"),
-	        "KernelMapNamedDirectMemory");
-	*reinterpret_cast<uint64_t*>(base) = 0x4b595459524f4c4cull; // "KYTYROLL"
-
-	Libs::LibKernel::Memory::TestFailNextPhysicalMemoryUnmap();
-	void* replacement = reserve;
-	CheckFailed(test,
-	            Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	                &replacement, total_size, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	                SceKernelPageSize),
-	            "KernelReserveVirtualRange(injected rollback)");
-	Check(test, *reinterpret_cast<uint64_t*>(base) == 0x4b595459524f4c4cull,
-	      "rollback did not restore direct-memory contents");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, total_size),
-	      "rollback left a mapped direct range recorded as a free placeholder");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, total_size), "KernelMunmap");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, total_size),
-	        "KernelReleaseDirectMemory");
-
-	std::printf("[host]    %-48s ok\n", test);
-}
-
-void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
-	const char*        test      = "FixedReserveRangeAddRollbackKeepsPlaceholder";
-	constexpr uint64_t size      = SceKernelPageSize * 4;
-	int64_t            phys_addr = 0;
-
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-	            size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
-	        "KernelAllocateDirectMemory");
-	void* reserve = nullptr;
-	CheckOk(
-	    test,
-	    Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, size, 0, SceKernelPageSize),
-	    "KernelReserveVirtualRange");
-	const auto base   = reinterpret_cast<uint64_t>(reserve);
-	void*      mapped = reserve;
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
-	            &mapped, size, SceKernelProtCpuRw, SceKernelMapFixed | SceKernelMapNoCoalesce,
-	            phys_addr, SceKernelPageSize, "range_add_rollback"),
-	        "KernelMapNamedDirectMemory");
-	*reinterpret_cast<uint64_t*>(mapped) = 0x4b59545952414e47ull; // "KTYRANG"
-
-	Libs::LibKernel::Memory::TestFailNextFixedReserveRangeRegistration();
-	void* replacement = mapped;
-	CheckFailed(
-	    test,
-	    Libs::LibKernel::Memory::KernelReserveVirtualRange(
-	        &replacement, size, SceKernelMapFixed | SceKernelMapNoCoalesce, SceKernelPageSize),
-	    "KernelReserveVirtualRange(range-add rollback)");
-	Check(test, *reinterpret_cast<uint64_t*>(mapped) == 0x4b59545952414e47ull,
-	      "range-add rollback did not restore direct-memory contents");
-	Check(test, !Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, size),
-	      "range-add rollback left the restored mapping recorded as free");
-	ExpectRange(test, Query(test, base), base, base + size, SceKernelProtCpuRw, 0, 1, 0, 1,
-	            "range_add_rollback");
-
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
-	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
-	        "KernelReleaseDirectMemory");
-	std::printf("[host]    %-48s ok\n", test);
-}
-
 void TestExtendedAndUserMappingsDoNotAlias() {
 	const char* test = "ExtendedAndUserMappingsDoNotAlias";
 	// macOS starts its ordinary guest range at 448 GiB.
@@ -3821,9 +3731,9 @@ void TestAutomaticMemoryReuseAndAliases() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestAutomaticMemoryFragmentedMapRollback() {
+void TestAutomaticMemoryFragmentedMap() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test   = "AutomaticMemoryFragmentedMapRollback";
+	const char*        test   = "AutomaticMemoryFragmentedMap";
 	constexpr uint64_t block  = 0x200000;
 	constexpr uint64_t base   = kExtendedMemoryBase + 0x22000000;
 	const auto         end    = static_cast<int64_t>(KernelGetDirectMemorySize());
@@ -3840,12 +3750,8 @@ void TestAutomaticMemoryFragmentedMapRollback() {
 	auto* address = reinterpret_cast<void*>(base);
 	CheckOk(test, KernelReserveVirtualRange(&address, block, SceKernelMapFixed, block),
 	        "reserve first mapping piece");
-	TestFailNextFixedReserveRangeRegistration();
-	CheckFailed(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
-	            "MapAutomaticMemory(second-piece failure)");
-	ExpectUnmapped(test, base);
 	CheckOk(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
-	        "MapAutomaticMemory(after rollback)");
+	        "MapAutomaticMemory(over a reservation and a hole)");
 	Check(test,
 	      Query(test, base).offset == static_cast<uint64_t>(first) &&
 	          Query(test, base + block).offset == static_cast<uint64_t>(second),
@@ -4177,6 +4083,12 @@ void TestMemoryPoolMultiRangeDecommit() {
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(read-only)");
+	void* fixed = arena;
+	Check(test,
+	      Libs::LibKernel::Memory::KernelReserveVirtualRange(&fixed, SceKernelMemoryPoolCommitLen,
+	                                                         SceKernelMapFixed, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "reserve-fixed replaced committed pool memory");
 	Check(test,
 	      Libs::LibKernel::Memory::KernelMemoryPoolDecommit(
 	          reinterpret_cast<void*>(base + SceKernelPageSize), SceKernelMemoryPoolCommitLen, 0) ==
@@ -5821,7 +5733,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
-		RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
+		RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 		RunTest(TestFragmentedBackingPublicationRollback);
 		RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 		RunTest(TestFragmentedGuestFreeRangeHints);
@@ -5831,10 +5743,8 @@ int main(int argc, char** argv) {
 		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 		RunTest(TestDirectTrimmedAliasReleaseRollback);
 		RunTest(TestDirectMappingNamesTypesAndValidation);
-		RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
-		RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 		RunTest(TestAutomaticMemoryReuseAndAliases);
-		RunTest(TestAutomaticMemoryFragmentedMapRollback);
+		RunTest(TestAutomaticMemoryFragmentedMap);
 		RunTest(TestFragmentedMemoryPoolBacking);
 		RunTest(TestMemoryPoolMiddleDecommitAndReuse);
 		RunTest(TestMemoryPoolMultiRangeDecommit);
@@ -5859,7 +5769,6 @@ int main(int argc, char** argv) {
 		RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif
 		RunTest(TestFixedReserveReplacesPartialDirectMapping);
-		RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 		RunTest(TestMemoryPoolMultiRangeDecommit);
 		RunTest(TestProgramMemoryAllocationAndProtection);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -5945,7 +5854,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingPublicationRollback);
-	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
+	RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
@@ -5959,6 +5868,8 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
 	RunTest(TestMprotectSkipsUncommittedRanges);
+	RunTest(TestFixedReplacementGpuUnmaps);
+	RunTest(TestFixedReserveValidatesBeforeUnmapping);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);
@@ -5987,13 +5898,10 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
-	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
-	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
-	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
-	RunTest(TestAutomaticMemoryFragmentedMapRollback);
+	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolAlignmentContracts);
 	RunTest(TestProsperoSampleMemoryPoolExpandCommit);
 	RunTest(TestFragmentedMemoryPoolBacking);

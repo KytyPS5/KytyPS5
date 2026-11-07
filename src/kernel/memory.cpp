@@ -199,11 +199,6 @@ static bool IsCommittedRangeType(VirtualRangeType type) {
 	return !IsReservedRangeType(type);
 }
 
-static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
-	return type == VirtualRangeType::Stack || type == VirtualRangeType::Code ||
-	       type == VirtualRangeType::Runtime;
-}
-
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static bool g_test_fail_next_range_replace = false;
 #endif
@@ -627,7 +622,6 @@ private:
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
-static bool     g_test_fail_next_fixed_reserve_range_add     = false;
 #endif
 
 static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size) {
@@ -756,8 +750,6 @@ public:
 
 	bool Map(uint64_t vaddr, size_t len, VirtualMemory::Mode mode);
 	bool Unmap(uint64_t vaddr, uint64_t size);
-	bool Snapshot(uint64_t vaddr, uint64_t size, std::vector<Mapping>* blocks);
-	bool Restore(const std::vector<Mapping>& blocks, VirtualMemory::Mode mode);
 
 	[[nodiscard]] Common::Mutex&                     GetMutex() { return m_mutex; }
 	[[nodiscard]] const std::map<uint64_t, Mapping>& GetMappings() const { return m_mappings; }
@@ -982,7 +974,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 #endif
 }
 
-static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
+static int ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 void Initialize() {
 	const auto params = Loader::SystemContentGetMemoryParams();
@@ -1491,64 +1483,6 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
-bool FlexibleMemory::Snapshot(uint64_t vaddr, uint64_t size, std::vector<Mapping>* blocks) {
-	EXIT_IF(blocks == nullptr);
-	Common::LockGuard lock(m_mutex);
-	blocks->clear();
-	if (size == 0 || UINT64_MAX - vaddr < size) return false;
-
-	auto it = m_mappings.upper_bound(vaddr);
-	if (it == m_mappings.begin()) return false;
-	--it;
-	const auto end     = vaddr + size;
-	auto       current = vaddr;
-	for (; it != m_mappings.end() && current < end; ++it) {
-		const auto& block = it->second;
-		if (block.vaddr > current || current >= block.vaddr + block.size) break;
-		const auto part_end = std::min(end, block.vaddr + block.size);
-		blocks->push_back(
-		    {current, part_end - current, block.backing_offset + current - block.vaddr});
-		current = part_end;
-	}
-	if (current == end) return true;
-	blocks->clear();
-	return false;
-}
-
-bool FlexibleMemory::Restore(const std::vector<Mapping>& blocks, VirtualMemory::Mode mode) {
-	Common::LockGuard lock(m_mutex);
-	if (blocks.empty()) return false;
-
-	for (const auto& block: blocks) {
-		auto next = m_free.upper_bound(block.backing_offset);
-		if (next == m_free.begin()) return false;
-		const auto range = std::prev(next);
-		if (!GuestFreeRangeContains(range->first, range->second, block.backing_offset,
-		                            block.size)) {
-			return false;
-		}
-	}
-
-	size_t mapped = 0;
-	for (const auto& block: blocks) {
-		if (!g_guest_address_space->MapBacking(block.vaddr, block.size, block.backing_offset,
-		                                       mode)) {
-			while (mapped != 0) {
-				const auto& previous = blocks[--mapped];
-				EXIT_IF(!g_guest_address_space->UnmapBacking(previous.vaddr, previous.size));
-			}
-			return false;
-		}
-		++mapped;
-	}
-	for (const auto& block: blocks) {
-		RemoveFreeRange(m_free, block.backing_offset, block.size);
-		EXIT_IF(!m_mappings.emplace(block.vaddr, block).second);
-		m_allocated_total += block.size;
-	}
-	return true;
-}
-
 uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
@@ -1648,6 +1582,13 @@ uint64_t PooledMemory::Available() {
 }
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
+static bool IsReservedSpan(uint64_t start, uint64_t size) {
+	std::vector<VirtualRanges::Range> ranges;
+	return g_virtual_ranges->QuerySpan(start, size, &ranges) &&
+	       std::all_of(ranges.begin(), ranges.end(),
+	                   [](const auto& range) { return range.type == VirtualRangeType::Reserved; });
+}
+
 static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                              const char* name) {
 	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
@@ -1708,19 +1649,15 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
-		std::vector<VirtualRanges::Range> reserved_ranges;
-		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
-		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
-			    return range.type == VirtualRangeType::Reserved;
-		    })) {
-			UnmapGpuRange(in_addr, len);
-			reserved_target = true;
-			out_addr        = in_addr;
+		if (!IsReservedSpan(in_addr, len)) {
+			const int result = ReplaceFixedRangeWithReserved(in_addr, len);
+			if (result != OK) {
+				return result;
+			}
 		}
-		if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
-			reserved_target = true;
-			out_addr        = in_addr;
-		}
+		UnmapGpuRange(in_addr, len);
+		reserved_target = true;
+		out_addr        = in_addr;
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
@@ -2444,8 +2381,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			return KERNEL_ERROR_ENOMEM;
 		}
 
-		std::vector<VirtualRanges::Range> reserved_ranges;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		std::vector<VirtualRanges::Range> reserved_ranges;
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Direct;
@@ -2470,19 +2407,14 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		} else
 #endif
 		{
-			if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
-			    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
-				    return range.type == VirtualRangeType::Reserved;
-			    })) {
-				UnmapGpuRange(in_addr, len);
-				reserved_target = true;
+			if (!IsReservedSpan(in_addr, len)) {
+				const int result = ReplaceFixedRangeWithReserved(in_addr, len);
+				if (result != OK) {
+					return result;
+				}
 			}
-			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
-				reserved_target = true;
-			}
-			if (!reserved_target) {
-				return KERNEL_ERROR_ENOMEM;
-			}
+			UnmapGpuRange(in_addr, len);
+			reserved_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr       = in_addr;
 				shared_backing = true;
@@ -2491,11 +2423,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	} else {
 		constexpr size_t DEFAULT_ALIGNMENT = 0x4000;
 		alignment                          = (alignment != 0 ? alignment : DEFAULT_ALIGNMENT);
-		std::vector<VirtualRanges::Range> reserved_ranges;
-		if (in_addr != 0 && g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
-		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
-			    return range.type == VirtualRangeType::Reserved;
-		    })) {
+		if (in_addr != 0 && IsReservedSpan(in_addr, len)) {
 			UnmapGpuRange(in_addr, len);
 			reserved_target = true;
 			if (map_shared_fixed(in_addr)) {
@@ -2674,183 +2602,21 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 	return OK;
 }
 
-static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
-
-	struct ReplacedChunk {
-		VirtualRanges::Range                        range {};
-		VirtualMemory::Mode                         mode     = VirtualMemory::Mode::NoAccess;
-
-		std::vector<FlexibleMemory::Mapping>        flexible_blocks;
-		bool                                        host_unmapped    = false;
-		bool                                        backend_unmapped = false;
-	};
-
-	std::vector<ReplacedChunk> chunks;
-	const auto                 end     = start + size;
-	auto                       current = start;
-
-	while (current < end) {
-		VirtualRanges::Range range {};
-		if (!g_virtual_ranges->Query(current, 1, &range)) {
-			break;
-		}
-		if (range.start >= end) {
-			break;
-		}
-		if (current < range.start) {
-			current = std::min<uint64_t>(end, range.start);
-			continue;
-		}
-
-		const auto range_end = range.start + range.size;
-		const auto chunk     = std::min<uint64_t>(end, range_end) - current;
-
-		ReplacedChunk replaced {};
-		replaced.range       = range;
-		replaced.range.start = current;
-		replaced.range.size  = chunk;
-		if (range.type == VirtualRangeType::Direct) {
-			replaced.range.offset += current - range.start;
-		}
-		DecodeMemoryProtection(replaced.range.protection, &replaced.mode);
-		if (range.type == VirtualRangeType::Direct &&
-		    !g_guest_address_space->BackingContains(current, chunk)) {
-			return false;
-		}
-		if (range.type == VirtualRangeType::Flexible &&
-		    !g_flexible_memory->Snapshot(current, chunk, &replaced.flexible_blocks)) {
-			return false;
-		}
-		if (range.type == VirtualRangeType::Pooled) {
-			EXIT("reserve-fixed replacement of pooled memory is unsupported: addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     replaced.range.start, replaced.range.size);
-		}
-		chunks.push_back(std::move(replaced));
-
-		current += chunk;
+// Validation precedes the first unmap; failing after it is an emulator fault.
+static int ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
+	std::vector<VirtualRanges::Range> ranges;
+	g_virtual_ranges->QueryFragments(start, size, &ranges);
+	if (!g_guest_address_space->Owns(start, size) ||
+	    std::any_of(ranges.begin(), ranges.end(),
+	                [](const auto& range) { return range.type == VirtualRangeType::Pooled; })) {
+		return KERNEL_ERROR_EINVAL;
 	}
-
-	auto restore_chunks = [&chunks]() -> bool {
-		bool ok = true;
-		for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
-			const auto& chunk            = *it;
-			bool        host_restored    = true;
-			bool        backend_restored = true;
-
-			if (chunk.range.type == VirtualRangeType::Direct) {
-				if (chunk.host_unmapped) {
-					host_restored = g_guest_address_space->MapBacking(
-					    chunk.range.start, chunk.range.size, chunk.range.offset, chunk.mode);
-				}
-				if (chunk.backend_unmapped) {
-					backend_restored = g_physical_memory->Map(chunk.range.start, chunk.range.offset,
-					                                          chunk.range.size);
-				}
-			} else if (chunk.range.type == VirtualRangeType::Flexible && chunk.backend_unmapped) {
-				host_restored = backend_restored =
-				    g_flexible_memory->Restore(chunk.flexible_blocks, chunk.mode);
-			} else if (IsPrivateCommittedRangeType(chunk.range.type) && chunk.host_unmapped) {
-				host_restored =
-				    g_guest_address_space->Commit(chunk.range.start, chunk.range.size, chunk.mode);
-			}
-			ok = host_restored && backend_restored && ok;
-		}
-
-		for (const auto& chunk: chunks) {
-			const bool range_restored = g_virtual_ranges->Add(
-			    chunk.range.start, chunk.range.size, chunk.range.offset, chunk.range.protection,
-			    chunk.range.memory_type, chunk.range.type, chunk.range.name,
-			    chunk.range.disallow_merge);
-			ok = range_restored && ok;
-		}
-		if (ok) {
-			for (const auto& chunk: chunks) {
-				if (IsCommittedRangeType(chunk.range.type)) {
-					MapGpuRange(chunk.range.start, chunk.range.size);
-				}
-			}
-		}
-		return ok;
-	};
-
-	UnmapGpuRange(start, size);
-	g_virtual_ranges->Remove(start, size);
-
-	for (auto& chunk: chunks) {
-		bool unmapped = true;
-
-		if (chunk.range.type == VirtualRangeType::Direct) {
-			if (!g_guest_address_space->UnmapBacking(chunk.range.start, chunk.range.size)) {
-				unmapped = false;
-			} else {
-				chunk.host_unmapped = true;
-			}
-			if (unmapped) {
-				unmapped = g_physical_memory->Unmap(chunk.range.start, chunk.range.size);
-				chunk.backend_unmapped = unmapped;
-			}
-		} else if (chunk.range.type == VirtualRangeType::Flexible) {
-			unmapped               = g_flexible_memory->Unmap(chunk.range.start, chunk.range.size);
-			chunk.host_unmapped    = unmapped;
-			chunk.backend_unmapped = unmapped;
-		} else if (IsPrivateCommittedRangeType(chunk.range.type)) {
-			unmapped = g_guest_address_space->ReleaseCommitted(chunk.range.start, chunk.range.size);
-			chunk.host_unmapped    = unmapped;
-			chunk.backend_unmapped = unmapped;
-		} else if (IsReservedRangeType(chunk.range.type)) {
-			unmapped = g_guest_address_space->ContainsFree(chunk.range.start, chunk.range.size);
-		} else {
-			unmapped = false;
-		}
-		if (!unmapped) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t reserve-fixed replace: backend unmap failed at 0x%016" PRIx64
-			           ", size=0x%016" PRIx64 ", type=%s\n",
-			           chunk.range.start, chunk.range.size,
-			           magic_enum::enum_name(chunk.range.type));
-			if (!restore_chunks()) {
-				EXIT("reserve-fixed backend-unmap rollback failed\n");
-			}
-			return false;
-		}
+	UnmapGpuRanges(ranges);
+	for (const auto& range: ranges) {
+		UnmapMemoryOwner(range);
 	}
-
-	if (!g_guest_address_space->ContainsFree(start, size)) {
-		if (!restore_chunks()) {
-			EXIT("reserve-fixed host-reservation rollback failed\n");
-		}
-		return false;
-	}
-
-	bool range_added = false;
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-	if (g_test_fail_next_fixed_reserve_range_add) {
-		g_test_fail_next_fixed_reserve_range_add = false;
-	} else
-#endif
-	{
-		range_added =
-		    g_virtual_ranges->Add(start, size, 0, 0, 0, VirtualRangeType::Reserved, "anon");
-	}
-	if (!range_added) {
-		LOGF_COLOR(Log::Color::Red,
-		           "\t reserve-fixed replace: range add failed at 0x%016" PRIx64
-		           ", size=0x%016" PRIx64 "\n",
-		           start, size);
-		if (!restore_chunks()) {
-			EXIT("reserve-fixed range-registration rollback failed\n");
-		}
-		return false;
-	}
-
-	for (const auto& chunk: chunks) {
-		if (g_free_callback != nullptr && IsCommittedRangeType(chunk.range.type)) {
-			g_free_callback(chunk.range.start, chunk.range.size);
-		}
-	}
-
-	return true;
+	EXIT_IF(!g_virtual_ranges->Add(start, size, 0, 0, 0, VirtualRangeType::Reserved, "anon"));
+	return OK;
 }
 
 int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
@@ -2887,10 +2653,12 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		if ((flags & GUEST_MAP_NO_OVERWRITE) != 0 && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
-		if (ReplaceFixedRangeWithReserved(in_addr, len)) {
-			out_addr            = in_addr;
-			range_already_added = true;
+		const int result = ReplaceFixedRangeWithReserved(in_addr, len);
+		if (result != OK) {
+			return result;
 		}
+		out_addr            = in_addr;
+		range_already_added = true;
 	} else {
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
@@ -2934,10 +2702,6 @@ void TestFailNextPhysicalMemoryUnmap() {
 
 void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
 	g_test_physical_memory_unmaps_before_failure = successful_unmaps;
-}
-
-void TestFailNextFixedReserveRangeRegistration() {
-	g_test_fail_next_fixed_reserve_range_add = true;
 }
 
 void TestFailNextVirtualRangeReplacement() {

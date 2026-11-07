@@ -113,16 +113,16 @@ MeshEmulationVertexProgram EmitMeshEmulationVertexProgram(const IR::Program&   p
 	                                        push_array);
 	const auto push = b.DefineGlobalVariable(pointer(spv::StorageClassPushConstant, push_block),
 	                                         spv::StorageClassPushConstant);
-	std::vector<uint32_t> interface;
+	std::vector<uint32_t> entry_interface;
 	const auto            vertex_index =
 	    b.DefineGlobalVariable(pointer(spv::StorageClassInput, t_i32), spv::StorageClassInput);
 	b.AddAnnotation(spv::OpDecorate, vertex_index, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
-	interface.push_back(vertex_index);
+	entry_interface.push_back(vertex_index);
 	const auto position_variable =
 	    b.DefineGlobalVariable(pointer(spv::StorageClassOutput, t_v4), spv::StorageClassOutput);
 	b.AddAnnotation(spv::OpDecorate, position_variable, spv::DecorationBuiltIn,
 	                spv::BuiltInPosition);
-	interface.push_back(position_variable);
+	entry_interface.push_back(position_variable);
 	uint32_t clip_variable = 0;
 	if (layout.clip_distances != 0) {
 		const auto t_clip = b.Type(spv::OpTypeArray, t_f32, u32c(layout.clip_distances));
@@ -130,21 +130,21 @@ MeshEmulationVertexProgram EmitMeshEmulationVertexProgram(const IR::Program&   p
 		                                           spv::StorageClassOutput);
 		b.AddAnnotation(spv::OpDecorate, clip_variable, spv::DecorationBuiltIn,
 		                spv::BuiltInClipDistance);
-		interface.push_back(clip_variable);
+		entry_interface.push_back(clip_variable);
 	}
 	std::vector<uint32_t> parameters(locations.size(), 0);
 	for (size_t i = 0; i < locations.size(); i++) {
 		parameters[i] =
 		    b.DefineGlobalVariable(pointer(spv::StorageClassOutput, t_v4), spv::StorageClassOutput);
 		b.AddAnnotation(spv::OpDecorate, parameters[i], spv::DecorationLocation, locations[i]);
-		interface.push_back(parameters[i]);
+		entry_interface.push_back(parameters[i]);
 	}
 	uint32_t layer_variable = 0;
 	if (has_layer) {
 		layer_variable = b.DefineGlobalVariable(pointer(spv::StorageClassOutput, t_u32),
 		                                        spv::StorageClassOutput);
 		b.AddAnnotation(spv::OpDecorate, layer_variable, spv::DecorationBuiltIn, spv::BuiltInLayer);
-		interface.push_back(layer_variable);
+		entry_interface.push_back(layer_variable);
 	}
 
 	const auto main = b.AllocateId();
@@ -280,7 +280,7 @@ MeshEmulationVertexProgram EmitMeshEmulationVertexProgram(const IR::Program&   p
 	}
 	b.AddFunction(spv::OpReturn);
 	b.AddFunction(spv::OpFunctionEnd);
-	b.AddEntryPoint(spv::ExecutionModelVertex, main, "main", interface);
+	b.AddEntryPoint(spv::ExecutionModelVertex, main, "main", entry_interface);
 	return {b.Build(), layout.RecordWords()};
 }
 

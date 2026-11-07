@@ -63,12 +63,12 @@ Interface GetInterface(const ShaderVertexInputInfo& vertex_info,
 		}
 	}
 
-	Interface interface;
-	interface.clip_distances =
+	Interface vertex_interface;
+	vertex_interface.clip_distances =
 	    ShaderRecompiler::Spirv::VertexClipDistanceCount(vertex_program.stage, vertex_program.info);
-	interface.provoking_last = provoking_vertex_last;
-	uint32_t used            = 0;
-	uint32_t per_vertex      = 0;
+	vertex_interface.provoking_last = provoking_vertex_last;
+	uint32_t used                   = 0;
+	uint32_t per_vertex             = 0;
 	for (const auto& input: pixel_info.stage.module->info.info.inputs) {
 		if (input.kind != IR::StageInputKind::Parameter) {
 			continue;
@@ -79,27 +79,27 @@ Interface GetInterface(const ShaderVertexInputInfo& vertex_info,
 		const bool exported = (vertex_program.param_export_mask & (1u << input_location)) != 0;
 		const auto bit      = 1u << output_location;
 		if (exported && (used & bit) == 0u) {
-			interface.parameters.push_back(
+			vertex_interface.parameters.push_back(
 			    {input_location, output_location,
 			     ShaderPixelParameterIsFlat(pixel_info, input.location)});
 		}
 		if (input.per_vertex && (per_vertex & bit) == 0u) {
-			interface.vertex_values.push_back({input_location, exported, {output_location}});
+			vertex_interface.vertex_values.push_back({input_location, exported, {output_location}});
 		}
 		used |= bit;
 		per_vertex |= input.per_vertex ? bit : 0u;
 	}
-	for (auto& value: interface.vertex_values) {
+	for (auto& value: vertex_interface.vertex_values) {
 		value.output_locations =
 		    ShaderPixelVertexValueLocations(used, per_vertex, value.output_locations[0]);
 	}
-	return interface;
+	return vertex_interface;
 }
 
 class Emitter {
 public:
 	Emitter(const Interface& interface_, spv::ExecutionModel model_)
-	    : interface(interface_), control(model_ == spv::ExecutionModelTessellationControl) {
+	    : vertex_interface(interface_), control(model_ == spv::ExecutionModelTessellationControl) {
 		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
 		void_type       = builder.Type(spv::OpTypeVoid);
@@ -111,8 +111,8 @@ public:
 		vec4_float_type = builder.Type(spv::OpTypeVector, float_type, 4u);
 		function_type   = builder.Type(spv::OpTypeFunction, void_type);
 
-		if (interface.clip_distances != 0) {
-			clip_type       = Array(float_type, interface.clip_distances);
+		if (vertex_interface.clip_distances != 0) {
+			clip_type       = Array(float_type, vertex_interface.clip_distances);
 			per_vertex_type = builder.DecoratedType(
 			    spv::OpTypeStruct,
 			    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
@@ -146,17 +146,17 @@ public:
 
 		const auto invocation = Load(int_type, invocation_id);
 		CopyBuiltins(invocation, gl_out, invocation);
-		const auto provoking = Int(interface.provoking_last ? 2u : 0u);
-		for (uint32_t i = 0; i < interface.parameters.size(); i++) {
+		const auto provoking = Int(vertex_interface.provoking_last ? 2u : 0u);
+		for (uint32_t i = 0; i < vertex_interface.parameters.size(); i++) {
 			// A flat input has the value of the provoking vertex at every vertex, so that the
 			// order in which the tessellator emits the vertices does not matter.
-			const auto vertex = interface.parameters[i].flat ? provoking : invocation;
+			const auto vertex = vertex_interface.parameters[i].flat ? provoking : invocation;
 			Store(Access(OutputVec4(), outputs[i], invocation),
 			      Load(vec4_float_type, Access(InputVec4(), inputs[i], vertex)));
 		}
-		for (uint32_t i = 0; i < interface.vertex_values.size(); i++) {
+		for (uint32_t i = 0; i < vertex_interface.vertex_values.size(); i++) {
 			const auto value =
-			    interface.vertex_values[i].exported
+			    vertex_interface.vertex_values[i].exported
 			        ? Load(vec4_float_type, Access(InputVec4(), value_inputs[i], invocation))
 			        : zero;
 			Store(Access(OutputVec4(), value_outputs[i][0], invocation), value);
@@ -180,10 +180,10 @@ public:
 		                          Result(spv::OpSelect, int_type, is(2), Int(2), Int(0)));
 
 		CopyBuiltins(index, gl_out, 0);
-		for (uint32_t i = 0; i < interface.parameters.size(); i++) {
+		for (uint32_t i = 0; i < vertex_interface.parameters.size(); i++) {
 			Store(outputs[i], Load(vec4_float_type, Access(InputVec4(), inputs[i], index)));
 		}
-		for (uint32_t i = 0; i < interface.vertex_values.size(); i++) {
+		for (uint32_t i = 0; i < vertex_interface.vertex_values.size(); i++) {
 			for (uint32_t vertex = 0; vertex < 3u; vertex++) {
 				Store(value_outputs[i][vertex],
 				      Load(vec4_float_type, Access(InputVec4(), value_inputs[i], Int(vertex))));
@@ -254,7 +254,7 @@ private:
 		};
 		Store(Target(vec4_float_type, 0),
 		      Load(vec4_float_type, Access(InputVec4(), gl_in, from, Int(0))));
-		if (interface.clip_distances != 0) {
+		if (vertex_interface.clip_distances != 0) {
 			Store(Target(clip_type, 1),
 			      Load(clip_type,
 			           Access(Pointer(spv::StorageClassInput, clip_type), gl_in, from, Int(1))));
@@ -264,7 +264,7 @@ private:
 	void DefineEntry() {
 		builder.RequireCapability(spv::CapabilityShader);
 		builder.RequireCapability(spv::CapabilityTessellation);
-		if (interface.clip_distances != 0) {
+		if (vertex_interface.clip_distances != 0) {
 			builder.RequireCapability(spv::CapabilityClipDistance);
 		}
 		const auto model = control ? spv::ExecutionModelTessellationControl
@@ -309,10 +309,10 @@ private:
 			}
 			return by_location[location];
 		};
-		for (const auto& parameter: interface.parameters) {
+		for (const auto& parameter: vertex_interface.parameters) {
 			inputs.push_back(Input(control ? parameter.input_location : parameter.output_location));
 		}
-		for (const auto& value: interface.vertex_values) {
+		for (const auto& value: vertex_interface.vertex_values) {
 			value_inputs.push_back(!control         ? Input(value.output_locations[0])
 			                       : value.exported ? Input(value.input_location)
 			                                        : 0u);
@@ -334,11 +334,11 @@ private:
 			gl_out = AddInterface(spv::StorageClassOutput, per_vertex_type);
 		}
 		const auto type = control ? Array(vec4_float_type, 3u) : vec4_float_type;
-		for (const auto& parameter: interface.parameters) {
+		for (const auto& parameter: vertex_interface.parameters) {
 			outputs.push_back(
 			    AddLocation(spv::StorageClassOutput, type, parameter.output_location));
 		}
-		for (const auto& value: interface.vertex_values) {
+		for (const auto& value: vertex_interface.vertex_values) {
 			// The control shader passes each vertex's value on at the first of the three
 			// locations. The evaluation shader writes all three.
 			std::array<uint32_t, 3> variables {};
@@ -351,7 +351,7 @@ private:
 	}
 
 	Builder                              builder {SpirvVersion15};
-	const Interface&                     interface;
+	const Interface&                     vertex_interface;
 	bool                                 control = false;
 	std::vector<uint32_t>                interfaces;
 	std::vector<uint32_t>                inputs;
@@ -392,9 +392,9 @@ bool ShaderPixelReadsVertexValues(const ShaderPixelInputInfo& pixel_info) {
 TriangleVertexValueShaders BuildTriangleVertexValueShaders(const ShaderVertexInputInfo& vertex_info,
                                                            const ShaderPixelInputInfo&  pixel_info,
                                                            bool provoking_vertex_last) {
-	const auto interface = GetInterface(vertex_info, pixel_info, provoking_vertex_last);
-	Emitter    control(interface, spv::ExecutionModelTessellationControl);
-	Emitter    evaluation(interface, spv::ExecutionModelTessellationEvaluation);
+	const auto vertex_interface = GetInterface(vertex_info, pixel_info, provoking_vertex_last);
+	Emitter    control(vertex_interface, spv::ExecutionModelTessellationControl);
+	Emitter    evaluation(vertex_interface, spv::ExecutionModelTessellationEvaluation);
 	return {control.EmitControl(), evaluation.EmitEvaluation()};
 }
 

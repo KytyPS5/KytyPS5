@@ -131,8 +131,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(zstd zarchive_source)
 
 # Keep the fetched libraries' install rules out of the package.
-foreach(kyty_dir "${opus_SOURCE_DIR}" "${openxr_SOURCE_DIR}" "${xbyak_SOURCE_DIR}" "${zydis_SOURCE_DIR}"
-		"${zstd_SOURCE_DIR}/build/cmake")
+foreach(kyty_dir "${opus_SOURCE_DIR}" "${mbedtls_SOURCE_DIR}" "${openxr_SOURCE_DIR}" "${xbyak_SOURCE_DIR}"
+		"${zydis_SOURCE_DIR}" "${zstd_SOURCE_DIR}/build/cmake")
 	set_property(DIRECTORY "${kyty_dir}" PROPERTY EXCLUDE_FROM_ALL TRUE)
 endforeach()
 

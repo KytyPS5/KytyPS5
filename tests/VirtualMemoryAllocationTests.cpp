@@ -658,9 +658,43 @@ void TestSparseReadDuringDirectCommit() {
 std::counting_semaphore<2>* g_backing_reads_entered  = nullptr;
 std::counting_semaphore<2>* g_continue_backing_reads = nullptr;
 
-void ParkBackingRead(uintptr_t, size_t) {
+// Counts how many times a read reaches the hook and records the first address and size it
+// reported, so a test can prove a read takes its lock once and reports the whole range.
+std::atomic<int>       g_backing_read_hook_calls {0};
+std::atomic<uintptr_t> g_backing_read_hook_address {0};
+std::atomic<size_t>    g_backing_read_hook_size {0};
+// Only this many hook calls park. A reader that wrongly calls the hook once per byte then
+// fails the call count instead of hanging or over-releasing the semaphores.
+std::atomic<int> g_backing_read_park_limit {0};
+
+void ParkBackingRead(uintptr_t address, size_t size) {
+	const int previous_calls = g_backing_read_hook_calls.fetch_add(1);
+	if (previous_calls == 0) {
+		g_backing_read_hook_address.store(address);
+		g_backing_read_hook_size.store(size);
+	}
+	if (previous_calls >= g_backing_read_park_limit.load()) {
+		return;
+	}
 	g_backing_reads_entered->release();
 	g_continue_backing_reads->acquire();
+}
+
+// Hook that only counts, for proving a rejected read never reaches the lock.
+void CountBackingRead(uintptr_t, size_t) {
+	g_backing_read_hook_calls.fetch_add(1);
+}
+
+// Resets the hook counters and installs ParkBackingRead for park_limit simultaneous readers.
+void ArmParkingHook(std::counting_semaphore<2>& entered, std::counting_semaphore<2>& resume,
+                    int park_limit) {
+	g_backing_read_hook_calls.store(0);
+	g_backing_read_hook_address.store(0);
+	g_backing_read_hook_size.store(0);
+	g_backing_read_park_limit.store(park_limit);
+	g_backing_reads_entered  = &entered;
+	g_continue_backing_reads = &resume;
+	Libs::LibKernel::Memory::TestSetBackingReadCallback(ParkBackingRead);
 }
 
 void TestConcurrentBackingReads() {
@@ -676,9 +710,7 @@ void TestConcurrentBackingReads() {
 		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
 		std::counting_semaphore<2> entered {0};
 		std::counting_semaphore<2> resume {0};
-		g_backing_reads_entered  = &entered;
-		g_continue_backing_reads = &resume;
-		TestSetBackingReadCallback(ParkBackingRead);
+		ArmParkingHook(entered, resume, 2);
 		std::array<uint64_t, 2> values {};
 		std::array<bool, 2>     results {};
 		std::thread first([&] { results[0] = readers.first(base, &values[0], sizeof(values[0])); });
@@ -705,16 +737,23 @@ void TestBackingReadExcludesWritesAndUnmap() {
 	const char*        test        = "BackingReadExcludesWritesAndUnmap";
 	constexpr uint64_t original    = 0x123456789abcdef0ull;
 	constexpr uint64_t replacement = 0xfedcba9876543210ull;
-	for (const auto read: {TryReadBacking, TryReadSparseBacking, CopySparseMemory}) {
+	// A stride of one byte makes the strided read cover the same eight bytes as the others.
+	constexpr auto strided_read = [](uint64_t vaddr, void* data, uint64_t size) {
+		return TryReadBackingStrided(vaddr, 1, static_cast<uint32_t>(size),
+		                             static_cast<uint8_t*>(data));
+	};
+	using ReadFunction = bool (*)(uint64_t, void*, uint64_t);
+	for (const ReadFunction read: {static_cast<ReadFunction>(TryReadBacking),
+	                               static_cast<ReadFunction>(TryReadSparseBacking),
+	                               static_cast<ReadFunction>(CopySparseMemory),
+	                               static_cast<ReadFunction>(strided_read)}) {
 		for (const bool unmap: {false, true}) {
 			const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
 			                                   "backing_read_exclusion");
 			std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
 			std::counting_semaphore<2> entered {0};
 			std::counting_semaphore<2> resume {0};
-			g_backing_reads_entered  = &entered;
-			g_continue_backing_reads = &resume;
-			TestSetBackingReadCallback(ParkBackingRead);
+			ArmParkingHook(entered, resume, 1);
 			uint64_t    snapshot = 0;
 			bool        read_ok  = false;
 			std::thread reader([&] { read_ok = read(base, &snapshot, sizeof(snapshot)); });
@@ -749,11 +788,213 @@ void TestBackingReadExcludesWritesAndUnmap() {
 			Check(test, read_ok && snapshot == original,
 			      "backing mutation changed an in-progress read");
 			Check(test,
+			      g_backing_read_hook_calls.load() == 1 &&
+			          g_backing_read_hook_address.load() == base &&
+			          g_backing_read_hook_size.load() == sizeof(snapshot),
+			      "a backing read did not report its first address and whole range to the "
+			      "hook once");
+			Check(test,
 			      unmap ? unmap_result == OK && !still_backed
 			            : write_ok && still_backed && after == replacement,
 			      "backing mutation failed after the reader released its lock");
 		}
 	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Reads the same addresses one byte at a time, which is the behaviour the strided read must
+// reproduce. Returns false at the first unreadable address.
+bool ReadBackingBytewise(uint64_t first, uint64_t stride, uint32_t count,
+                         std::vector<uint8_t>& out) {
+	out.assign(count, 0);
+	for (uint32_t index = 0; index < count; ++index) {
+		if (!Libs::LibKernel::Memory::TryReadBacking(first + stride * index, &out[index], 1)) {
+			return false;
+		}
+	}
+	return count != 0;
+}
+
+// Gives every mapped address its own byte. The multiplier spreads neighbours apart and the
+// shifted term separates addresses exactly one page or 256 bytes apart, so a reader that
+// returns one address's byte for all of them cannot match.
+constexpr uint8_t StridedTestByte(uint64_t offset) {
+	constexpr uint64_t spread    = 131;
+	constexpr uint64_t high_mix  = 17;
+	constexpr uint64_t bias      = 3;
+	constexpr unsigned high_bits = 8;
+	return static_cast<uint8_t>(offset * spread + (offset >> high_bits) * high_mix + bias);
+}
+
+// Maps eight flexible pages into pages 0 and 1 as separate adjacent entries, 2 and 3 as one
+// entry, page 4 as a hole, 5 and 6 as one entry and page 7 as an unmapped tail. Map entries
+// are never coalesced, so strides that cross a page boundary must look up the next entry.
+uint64_t MapStridedTestLayout(const char* test, uint64_t page) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t pages = 8;
+	const auto         base  = MapNamedFlexible(test, page * pages, SceKernelProtCpuRw,
+	                                            "backing_strided");
+	CheckOk(test, KernelMunmap(base + page, page), "unmap page 1");
+	void* remapped = reinterpret_cast<void*>(base + page);
+	CheckOk(test,
+	        KernelMapNamedFlexibleMemory(&remapped, page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                                     "backing_strided_page1"),
+	        "remap page 1");
+	CheckOk(test, KernelMunmap(base + 4 * page, page), "unmap page 4");
+	CheckOk(test, KernelMunmap(base + 7 * page, page), "unmap page 7");
+	for (const uint64_t mapped_page: {0ull, 1ull, 2ull, 3ull, 5ull, 6ull}) {
+		for (uint64_t offset = 0; offset < page; ++offset) {
+			const uint64_t absolute = mapped_page * page + offset;
+			*reinterpret_cast<uint8_t*>(base + absolute) = StridedTestByte(absolute);
+		}
+	}
+	return base;
+}
+
+// Strided reads that the up-front checks must reject. The counting hook proves none of them
+// reaches the lock.
+void CheckStridedRejectionsSkipTheLock(const char* test, uint64_t mapped) {
+	using namespace Libs::LibKernel::Memory;
+	struct Rejected {
+		const char* name;
+		uint64_t    first;
+		uint64_t    stride;
+		uint32_t    count;
+		bool        null_output;
+	};
+	// A stride of 2^63 with count 3 makes stride * 2 wrap to zero, which would look like a
+	// single in-range address without the divide-back check.
+	constexpr uint64_t wrapping_stride = 1ull << 63;
+	const std::array<Rejected, 6>
+	    rejected {{{"null output", mapped, SceKernelPageSize, 2, true},
+	               {"count zero", mapped, SceKernelPageSize, 0, false},
+	               {"multiplication wraps", mapped, wrapping_stride, 3, false},
+	               {"last address overflows", mapped, UINT64_MAX / 2, 3, false},
+	               {"first address is the maximum", UINT64_MAX, 1, 1, false},
+	               {"last address is the maximum", UINT64_MAX - 1, 1, 2, false}}};
+	std::array<uint8_t, 3> out_bytes {};
+	TestSetBackingReadCallback(CountBackingRead);
+	for (const auto& item: rejected) {
+		g_backing_read_hook_calls.store(0);
+		const bool accepted = TryReadBackingStrided(
+		    item.first, item.stride, item.count, item.null_output ? nullptr : out_bytes.data());
+		Check(test, !accepted && g_backing_read_hook_calls.load() == 0, item.name);
+	}
+	TestSetBackingReadCallback(nullptr);
+}
+
+void TestBackingReadStridedMatchesSingleReads() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "BackingReadStridedMatchesSingleReads";
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint8_t  sentinel = 0xa5;
+	const auto         base     = MapStridedTestLayout(test, page);
+
+	struct Case {
+		const char* name;
+		uint64_t    first;
+		uint64_t    stride;
+		uint32_t    count;
+		bool        expect_ok;
+	};
+	// The expected outcomes are written out so the strided and single readers cannot drift
+	// together.
+	const std::array<Case, 15> cases {{
+	    {"adjacent entries", 0, page, 2, true},
+	    {"four pages across entries", 5, page + 1, 4, true},
+	    {"byte stride across a boundary", page - 3, 1, 6, true},
+	    {"stride ends on last mapped byte", 0, 4 * page - 1, 2, true},
+	    {"stride past last mapped byte", 0, 4 * page - 1, 3, false},
+	    {"two bytes ending an entry", 4 * page - 2, 1, 2, true},
+	    {"one byte into the hole", 4 * page - 2, 1, 3, false},
+	    {"stride lands in hole", 3 * page, page, 3, false},
+	    {"stride lands in unmapped tail", 5 * page + 2, page, 3, false},
+	    {"stride stops before tail", 5 * page + 2, page, 2, true},
+	    {"single mapped byte", page + 5, page, 1, true},
+	    {"single unmapped byte", 4 * page + 1, page, 1, false},
+	    {"zero stride", 2 * page + 9, 0, 5, true},
+	    {"count zero", 0, page, 0, false},
+	    {"single byte in the last pages", 6 * page + 1, page - 1, 1, true},
+	}};
+	for (const auto& item: cases) {
+		std::vector<uint8_t> expected;
+		std::vector<uint8_t> actual(item.count + 1, sentinel);
+		const bool           single_ok = ReadBackingBytewise(base + item.first, item.stride,
+		                                                     item.count, expected);
+		const bool           actual_ok = TryReadBackingStrided(base + item.first, item.stride,
+		                                                       item.count, actual.data());
+		std::printf("[host]    strided case %-34s -> %s\n", item.name, actual_ok ? "read" : "false");
+		Check(test, single_ok == item.expect_ok && actual_ok == item.expect_ok, item.name);
+		Check(test, actual[item.count] == sentinel, "strided read wrote past its output");
+		if (item.expect_ok) {
+			Check(test, std::equal(expected.begin(), expected.end(), actual.begin()),
+			      "strided read returned different bytes from single reads");
+			Check(test,
+			      item.count < 2 || item.stride == 0 ||
+			          std::any_of(expected.begin(), expected.end(),
+			                      [&](uint8_t value) { return value != expected[0]; }),
+			      "test data did not distinguish the addresses");
+		}
+	}
+	CheckStridedRejectionsSkipTheLock(test, base);
+
+	CheckOk(test, KernelMunmap(base, 4 * page), "unmap first half");
+	CheckOk(test, KernelMunmap(base + 5 * page, 2 * page), "unmap second half");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Maps three direct-memory pages at consecutive guest pages, backed by physical pages 1, 0 and
+// 2, so page 1's backing sits before page 0's instead of after it. Each page is filled with
+// its own byte.
+void MapDiscontiguousEntries(const char* test, uint64_t base, int64_t physical,
+                             const std::array<uint8_t, 3>& fill) {
+	using namespace Libs::LibKernel::Memory;
+	constexpr uint64_t                page = SceKernelPageSize;
+	constexpr std::array<uint64_t, 3> physical_page {1, 0, 2};
+	for (uint64_t index = 0; index < physical_page.size(); ++index) {
+		void*         address = reinterpret_cast<void*>(base + index * page);
+		const int64_t source  = physical + static_cast<int64_t>(physical_page[index] * page);
+		CheckOk(test,
+		        KernelMapNamedDirectMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                   source, page, "backing_strided_discontiguous"),
+		        "KernelMapNamedDirectMemory");
+		std::memset(address, fill[index], page);
+	}
+}
+
+// The adjacent-entry cases above can pass by accident when neighbouring entries are backed
+// contiguously, because reusing the first entry then lands on the right byte. Here the second
+// entry is backed by the physical page before the first entry's, so only a fresh lookup finds
+// the right byte. The setup relies on direct maps backing guest pages with the requested
+// physical pages, and no accessor exposes the backing offsets to confirm it.
+void TestBackingReadStridedAcrossDiscontiguousEntries() {
+	using namespace Libs::LibKernel::Memory;
+	const char*                      test  = "BackingReadStridedAcrossDiscontiguousEntries";
+	constexpr uint64_t               page  = SceKernelPageSize;
+	constexpr uint64_t               base  = 0x80180000000ull;
+	constexpr uint64_t               probe = 5;
+	constexpr std::array<uint8_t, 3> fill {0x11, 0x62, 0xc3};
+	int64_t                          physical = 0;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), page * 3, page,
+	                                   SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	MapDiscontiguousEntries(test, base, physical, fill);
+
+	std::array<uint8_t, 2> actual {};
+	std::vector<uint8_t>   expected;
+	const bool             strided_ok = TryReadBackingStrided(base + probe, page, 2, actual.data());
+	const bool             single_ok  = ReadBackingBytewise(base + probe, page, 2, expected);
+	std::printf("[host]    strided discontiguous: first=%02x second=%02x contiguous guess=%02x\n",
+	            actual[0], actual[1], fill[2]);
+	Check(test, strided_ok && single_ok, "reads across discontiguous entries failed");
+	Check(test, expected[0] == fill[0] && expected[1] == fill[1],
+	      "single reads did not return each entry's own bytes");
+	Check(test, std::equal(expected.begin(), expected.end(), actual.begin()),
+	      "strided read across discontiguous entries differs from single reads");
+
+	CheckOk(test, KernelMunmap(base, page * 3), "KernelMunmap");
+	CheckOk(test, KernelReleaseDirectMemory(physical, page * 3), "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -764,9 +1005,7 @@ void TestTrackerProtectSharesBackingReads() {
 	                                    "tracker_protect_shares_reads");
 	std::counting_semaphore<2> entered {0};
 	std::counting_semaphore<2> resume {0};
-	g_backing_reads_entered  = &entered;
-	g_continue_backing_reads = &resume;
-	TestSetBackingReadCallback(ParkBackingRead);
+	ArmParkingHook(entered, resume, 1);
 	uint64_t    value = 0;
 	std::thread reader([&] { CopySparseMemory(base, &value, sizeof(value)); });
 	const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
@@ -5860,6 +6099,8 @@ int main(int argc, char** argv) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadExcludesWritesAndUnmap);
+		RunTest(TestBackingReadStridedMatchesSingleReads);
+		RunTest(TestBackingReadStridedAcrossDiscontiguousEntries);
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
@@ -5923,6 +6164,8 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadExcludesWritesAndUnmap);
+	RunTest(TestBackingReadStridedMatchesSingleReads);
+	RunTest(TestBackingReadStridedAcrossDiscontiguousEntries);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);

@@ -95,6 +95,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <ranges>
 #include <semaphore>
 #include <set>
@@ -174,6 +175,10 @@ struct BufferCacheTestAccess {
                              Common::SlotVector<Buffer>>);
 
   static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
+
+  static void ForgetColorMetadataChecks(BufferCache &cache, uint64_t address, uint64_t size) {
+    cache.ForgetColorMetadataChecks(address, size);
+  }
 
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
@@ -262,6 +267,17 @@ struct TextureCacheTestAccess {
   // Suspend points that collect nothing.
   static void SkipFrames(TextureCache &cache, uint64_t frames) {
     cache.m_gc_tick += frames;
+  }
+
+  static bool IsColorClearChecked(TextureCache &cache, uint64_t address, uint64_t slice_size,
+                                  uint64_t mip_size, uint32_t count, uint32_t keys) {
+    return cache.IsColorClearChecked(address, slice_size, mip_size, count, keys);
+  }
+
+  static void MarkColorClearChecked(TextureCache &cache, uint64_t address,
+                                    uint64_t slice_size, uint64_t mip_size, uint32_t count,
+                                    uint32_t keys) {
+    cache.MarkColorClearChecked(address, slice_size, mip_size, count, keys);
   }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
@@ -2121,6 +2137,9 @@ constexpr u32 EncodeD16AsD24(uint16_t value) {
 u32 EncodeD16AsD32(uint16_t value) {
   return std::bit_cast<u32>(static_cast<float>(value) / 65535.0f);
 }
+
+// A clear word that no fixed DCC code produces, so only the register clear can explain it.
+constexpr uint32_t ColorClearRegisterWord = 0x2a5a96a5u;
 
 class VulkanHarness {
 public:
@@ -11599,6 +11618,529 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "color-volume direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The color and metadata planes slice differently. A color slice is a volume depth slice and
+  // a metadata slice is the 4 KiB block whose first byte is that slice's clear code.
+  static constexpr uint64_t ColorClearMetadataSliceSize = 0x1000;
+  static constexpr uint32_t ColorClearSliceCount = 32;
+  static constexpr uint8_t ColorClearConsumedCode = 0xff;
+  static constexpr uint8_t ColorClearRegisterCode = 0x20;
+  // Slices whose code is one bit off a real clear code, or a real code with one stray byte.
+  static constexpr uint32_t ColorClearNearMiss21Slice = 5;
+  static constexpr uint32_t ColorClearNearMiss41Slice = 9;
+  static constexpr uint32_t ColorClearStrayByteSlice = 13;
+  static constexpr uint64_t ColorClearStrayByteOffset = 77;
+  // The texels that the fixed DCC codes and the register word clear a 10_10_10_2 target to.
+  static constexpr u32 ColorClearTexel00 = 0;
+  static constexpr u32 ColorClearTexel40 = 0xc0000000u;
+  static constexpr u32 ColorClearTexel80 = 0x3fffffffu;
+  static constexpr u32 ColorClearTexelC0 = 0xffffffffu;
+  static constexpr u32 ColorClearTexelRegister = ColorClearRegisterWord;
+
+  // One slice of a color clear script. A slice that clears ends up as this texel and 0xff
+  // metadata, and any other listed slice keeps the painted texel and its written metadata.
+  struct ColorClearSlice {
+    uint32_t slice;
+    uint8_t code;
+    bool clears;
+    u32 texel;
+    bool stray_byte;
+  };
+
+  // A view over metadata slices first to last. Slices outside the view and slices missing from
+  // the list hold other_code and must be left alone.
+  struct ColorClearCase {
+    const char *label;
+    uint32_t first;
+    uint32_t last;
+    uint8_t other_code;
+    std::vector<ColorClearSlice> slices;
+  };
+
+  // What a color clear pass leaves behind, one texel per volume slice plus all metadata.
+  struct ColorClearScriptResult {
+    std::vector<u32> texels;
+    std::vector<uint8_t> metadata;
+  };
+
+  // The metadata the case writes before the pass.
+  static std::vector<uint8_t> BuildColorClearMetadata(const ColorClearCase &item) {
+    std::vector<uint8_t> metadata(ColorClearSliceCount * ColorClearMetadataSliceSize,
+                                  item.other_code);
+    for (const auto &entry : item.slices) {
+      const auto begin = metadata.begin() + entry.slice * ColorClearMetadataSliceSize;
+      std::fill(begin, begin + ColorClearMetadataSliceSize, entry.code);
+      if (entry.stray_byte) {
+        // One stray byte in an otherwise valid slice means the slice was not cleared.
+        begin[ColorClearStrayByteOffset] = 0x00;
+      }
+    }
+    return metadata;
+  }
+
+  // Invalidates the cached metadata buffer and writes the case's codes to guest backing, so the
+  // pass reads them as a CPU write rather than stale buffer contents.
+  static void WriteColorClearCodes(RenderContext &context, uint64_t dcc_address,
+                                   const std::vector<uint8_t> &metadata) {
+    Require("ColorClearCodeReads", "guest write range",
+            context.InvalidateMemory(dcc_address, metadata.size()),
+            "metadata write is outside the mapped allocation");
+    LibKernel::Memory::WriteBacking(dcc_address, metadata.data(), metadata.size());
+  }
+
+  // Checks every slice against the case's table, so a reader that never clears, clears the wrong
+  // slice or clears the right slice to the wrong colour all fail.
+  static void CheckColorClearCase(const char *name, const ColorClearCase &item,
+                                  u32 painted_texel,
+                                  const ColorClearScriptResult &result) {
+    auto expected_metadata = BuildColorClearMetadata(item);
+    std::vector<u32> expected_texels(ColorClearSliceCount, painted_texel);
+    for (const auto &entry : item.slices) {
+      if (entry.clears && entry.slice >= item.first && entry.slice <= item.last) {
+        expected_texels[entry.slice] = entry.texel;
+        const auto begin = expected_metadata.begin() + entry.slice * ColorClearMetadataSliceSize;
+        std::fill(begin, begin + ColorClearMetadataSliceSize, ColorClearConsumedCode);
+      }
+    }
+    for (uint32_t slice = 0; slice < ColorClearSliceCount; slice++) {
+      char detail[96];
+      std::snprintf(detail, sizeof(detail),
+                    "slice %u has the wrong texel after the color clear pass", slice);
+      Require(name, item.label, result.texels[slice] == expected_texels[slice], detail);
+    }
+    Require(name, item.label, result.metadata == expected_metadata,
+            "the color clear pass left unexpected metadata bytes");
+  }
+
+  // The 32-slice volume target shared by the color clear checks. Its metadata starts out
+  // consumed (0xff) so creating the image clears nothing.
+  static constexpr uintptr_t ColorClearVolumeBase = 0x0000000203e00000ull;
+  static constexpr uint64_t ColorClearVolumeSliceSize = 0x10000;
+  static constexpr uint64_t ColorClearVolumeColorSize = 0x200000;
+  static constexpr uint64_t ColorClearVolumeAllocation = 56 * ColorClearVolumeSliceSize;
+  static constexpr uint64_t ColorClearDccAddress =
+      ColorClearVolumeBase + ColorClearVolumeColorSize;
+  static constexpr uint64_t ColorClearMetadataSize =
+      ColorClearSliceCount * ColorClearMetadataSliceSize;
+
+  // Allocates and fixes the volume's guest memory. Returns the direct-memory offset to release.
+  int64_t MapColorClearVolume(const char *name) {
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                ColorClearVolumeAllocation, ColorClearVolumeSliceSize, 0, &direct_offset) == 0,
+            "color-clear direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(ColorClearVolumeBase);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, ColorClearVolumeAllocation, 0x3, 0x10, direct_offset,
+                ColorClearVolumeSliceSize) == 0 &&
+                mapped == reinterpret_cast<void *>(ColorClearVolumeBase),
+            "color-clear fixed mapping failed");
+    std::memset(mapped, 0x5a, ColorClearVolumeAllocation);
+    return direct_offset;
+  }
+
+  static void UnmapColorClearVolume(const char *name, int64_t direct_offset) {
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(ColorClearVolumeBase,
+                                                  ColorClearVolumeAllocation) == 0,
+            "color-clear direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, ColorClearVolumeAllocation) == 0,
+            "color-clear direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Programs a DCC 10_10_10_2 render target over the volume with a register clear word.
+  static void SetColorClearVolumeRegisters(HW::Context &registers) {
+    registers.SetColorBase(0, {.addr = ColorClearVolumeBase});
+    registers.SetColorInfo(
+        0, {.dcc_compression_enable = true,
+            .format = Prospero::ChannelLayout::k10_10_10_2,
+            .channel_type = Prospero::ChannelType::kUNorm,
+            .channel_order = Prospero::ChannelOrder::kStandard});
+    registers.SetColorAttrib2(0, {.height = 31, .width = 31});
+    registers.SetColorAttrib3(0, {.depth = 31,
+                                  .tile_mode = Prospero::TileMode::kRenderTarget,
+                                  .dimension = 2,
+                                  .metadata_pipe_aligned = true});
+    registers.SetColorDccAddr(0, {.addr = ColorClearDccAddress});
+    registers.SetColorClearWord0(0, {.word0 = ColorClearRegisterWord});
+    registers.SetColorClearWord1(0, {.word1 = 0});
+    registers.SetRenderTargetMask(0x0f);
+  }
+
+  // Maps the volume, creates its render target and hands the live pieces to body. body gets the
+  // context, registers, scheduler, executor, texture cache and the resolved target.
+  template <typename Body>
+  void WithColorClearVolume(const char *name, Body &&body) {
+    const int64_t direct_offset = MapColorClearVolume(name);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      SetColorClearVolumeRegisters(registers);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(ColorClearVolumeBase, ColorClearVolumeAllocation);
+      WriteMetadata(context, ColorClearDccAddress, ColorClearMetadataSize, UINT32_MAX);
+      auto &executor = context.GetRenderExecutor();
+      auto &texture_cache = context.GetTextureCache();
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         color, 0);
+      (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
+      body(context, registers, scheduler, executor, texture_cache, color);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(ColorClearVolumeBase, ColorClearVolumeAllocation);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    UnmapColorClearVolume(name, direct_offset);
+  }
+
+  // Paints every volume slice with one color so a later clear shows up as a texel change.
+  template <typename Cache, typename Scheduler>
+  static void PaintColorClearVolume(Cache &texture_cache, Scheduler &scheduler,
+                                    ImageId image) {
+    vk::ClearValue painted{};
+    painted.color.float32 = std::array{0.5f, 0.25f, 0.75f, 0.33f};
+    for (uint32_t slice = 0; slice < ColorClearSliceCount; slice++) {
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), image,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, slice, 1},
+                                         painted);
+    }
+  }
+
+  // The scripted views and slice tables of ColorClearCodeReads.
+  static std::vector<ColorClearCase> ColorClearCodeCases() {
+    return {
+        {"full view",
+         0,
+         ColorClearSliceCount - 1,
+         ColorClearConsumedCode,
+         {{3, 0x00, true, ColorClearTexel00, false},
+          {11, 0x40, true, ColorClearTexel40, false},
+          {17, 0x80, true, ColorClearTexel80, false},
+          {23, 0xc0, true, ColorClearTexelC0, false},
+          {19, ColorClearRegisterCode, true, ColorClearTexelRegister, false},
+          {ColorClearNearMiss21Slice, 0x21, false, 0, false},
+          {ColorClearNearMiss41Slice, 0x41, false, 0, false},
+          {ColorClearStrayByteSlice, 0x40, false, 0, true}}},
+        {"view from slice 4",
+         4,
+         7,
+         0xc0,
+         {{4, 0x80, true, ColorClearTexel80, false},
+          {5, ColorClearConsumedCode, false, 0, false},
+          {6, 0x40, true, ColorClearTexel40, false},
+          {7, 0x21, false, 0, false}}}};
+  }
+
+  // Runs distinct clear codes, near misses and consumed codes through one strided code read and
+  // checks every slice's texel and metadata against an explicit table.
+  void CheckColorClearCodeReads() {
+    constexpr const char *name = "ColorClearCodeReads";
+    const auto cases = ColorClearCodeCases();
+    WithColorClearVolume(name, [&](auto &context, auto &registers, auto &scheduler,
+                                   auto &executor, auto &texture_cache,
+                                   RenderColorInfo &color) {
+      for (const auto &item : cases) {
+        PaintColorClearVolume(texture_cache, scheduler, color.image_id);
+        const u32 painted_texel = ReadCachedTexel(name, context, color.image_id, {0, 0, 1})[0];
+        WriteColorClearCodes(context, ColorClearDccAddress, BuildColorClearMetadata(item));
+        RenderExecutorTestAccess::ResetBindings(executor);
+        registers.SetColorView(0, {.base_array_slice_index = item.first,
+                                   .last_array_slice_index = item.last});
+        RenderColorInfo view{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                           view, 0);
+        (void)texture_cache.FindRenderTarget(view.image_id, view.desc);
+        ColorClearScriptResult result;
+        for (uint32_t slice = 0; slice < ColorClearSliceCount; slice++) {
+          result.texels.push_back(ReadCachedTexel(name, context, color.image_id,
+                                                  {0, 0, static_cast<int32_t>(slice)})[0]);
+        }
+        result.metadata.resize(ColorClearMetadataSize);
+        context.GetBufferCache().ReadMemory(ColorClearDccAddress, ColorClearMetadataSize);
+        Require(name, "metadata readback",
+                LibKernel::Memory::TryReadBacking(ColorClearDccAddress, result.metadata.data(),
+                                                  result.metadata.size()),
+                "the metadata backing could not be read");
+        CheckColorClearCase(name, item, painted_texel, result);
+      }
+    });
+  }
+
+  // Makes the GPU write zero clear keys over slices first_slice onward, as a native fill does.
+  template <typename Context>
+  static void GpuFillZeroColorKeys(Context &context, uint32_t first_slice, uint32_t slices) {
+    auto [writer, offset] = context.GetBufferCache().ObtainBuffer(
+        ColorClearDccAddress + first_slice * ColorClearMetadataSliceSize,
+        slices * ColorClearMetadataSliceSize, true);
+    writer->Fill(offset, slices * ColorClearMetadataSliceSize, 0);
+  }
+
+  // Rebinds a view of the first layers slices of the volume target.
+  template <typename Registers, typename Scheduler, typename Executor, typename Cache>
+  static void BindColorClearLayers(Registers &registers, Scheduler &scheduler,
+                                   Executor &executor, Cache &texture_cache, uint32_t layers) {
+    RenderExecutorTestAccess::ResetBindings(executor);
+    registers.SetColorView(0, {.base_array_slice_index = 0,
+                               .last_array_slice_index = layers - 1});
+    RenderColorInfo view{};
+    RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), view, 0);
+    (void)texture_cache.FindRenderTarget(view.image_id, view.desc);
+  }
+
+  // Reads one texel from each of the first layers slices.
+  std::vector<u32> ReadColorClearLayers(const char *name, RenderContext &context, ImageId image,
+                                        uint32_t layers) {
+    std::vector<u32> result;
+    for (uint32_t slice = 0; slice < layers; slice++) {
+      result.push_back(
+          ReadCachedTexel(name, context, image, {0, 0, static_cast<int32_t>(slice)})[0]);
+    }
+    return result;
+  }
+
+  // Binds a layered view of four slices whose metadata the GPU wrote. A rebind must add no
+  // check, and after the GPU rewrites slice 2 alone a rebind must add one check and clear only
+  // that slice.
+  void CheckColorClearLayeredGpuMetadata() {
+    constexpr const char *name = "ColorClearLayeredGpuMetadata";
+    constexpr uint32_t layers = 4;
+    constexpr uint32_t rewritten = 2;
+    WithColorClearVolume(name, [&](auto &context, auto &registers, auto &scheduler,
+                                   auto &executor, auto &texture_cache,
+                                   RenderColorInfo &color) {
+      const auto bind = [&] {
+        BindColorClearLayers(registers, scheduler, executor, texture_cache, layers);
+      };
+      const auto texels = [&] { return ReadColorClearLayers(name, context, color.image_id, layers); };
+      const auto checks = [] {
+        return Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+      };
+      const bool counters_were_enabled = Common::DebugCounters::Enabled();
+      Common::DebugCounters::SetEnabled(true);
+      PaintColorClearVolume(texture_cache, scheduler, color.image_id);
+      const u32 painted_texel = texels()[0];
+      GpuFillZeroColorKeys(context, 0, layers);
+      auto before = checks();
+      bind();
+      Require(name, "first bind", checks() == before + 1 &&
+                  texels() == std::vector<u32>(layers, ColorClearTexel00),
+              "GPU-written zero keys did not clear all four layers with one check");
+      PaintColorClearVolume(texture_cache, scheduler, color.image_id);
+      before = checks();
+      bind();
+      Require(name, "rebind", checks() == before &&
+                  texels() == std::vector<u32>(layers, painted_texel),
+              "rebinding checked GPU metadata repeated its check or reapplied a clear");
+      GpuFillZeroColorKeys(context, rewritten, 1);
+      before = checks();
+      bind();
+      std::vector<u32> expected(layers, painted_texel);
+      expected[rewritten] = ColorClearTexel00;
+      Require(name, "rebind after one slice is rewritten",
+              checks() == before + 1 && texels() == expected,
+              "a rewritten slice was not rechecked or cleared alone");
+      Common::DebugCounters::SetEnabled(counters_were_enabled);
+    });
+  }
+
+  // Slices of a checked-metadata grid. Eight 4 KiB slices cover every interior, edge and partial
+  // forget the range lookup has to survive.
+  static constexpr uint64_t RangeGridAddress = 0x300000000ull;
+  static constexpr uint64_t RangeGridSlice = ColorClearMetadataSliceSize;
+  static constexpr uint32_t RangeGridSlices = 8;
+  static constexpr uint32_t RangeGridRandomSteps = 600;
+  static constexpr uint32_t RangeGridSeed = 20261103;
+  // The key sets that matter are none, a single bit and several bits.
+  static constexpr uint32_t RangeGridKeySets[] = {0x0, 0x1, 0x4, 0x80, 0x7, 0x83, 0xff};
+
+  // A grid of checked-metadata slices with an independent model of what was marked. The model
+  // only ever holds whole-slice marks, so a slice counts as checked for a key until a forget
+  // touches any of its bytes.
+  struct RangeGrid {
+    const char *name;
+    TextureCache &texture_cache;
+    BufferCache &buffers;
+    std::array<uint32_t, RangeGridSlices> checked_keys{};
+
+    // Marks slices one at a time, the way a per-slice reader would.
+    void MarkEach(uint32_t first, uint32_t count, uint32_t keys) {
+      for (uint32_t slice = first; slice < first + count; slice++) {
+        buffers.MarkColorMetadataChecked(RangeGridAddress + slice * RangeGridSlice,
+                                         RangeGridSlice, keys);
+        checked_keys[slice] |= keys;
+      }
+    }
+
+    // Marks the run through the texture cache, which marks contiguous slices as one range.
+    void MarkRun(uint32_t first, uint32_t count, uint32_t keys) {
+      TextureCacheTestAccess::MarkColorClearChecked(
+          texture_cache, RangeGridAddress + first * RangeGridSlice, RangeGridSlice,
+          RangeGridSlice, count, keys);
+      for (uint32_t slice = first; slice < first + count; slice++) {
+        checked_keys[slice] |= keys;
+      }
+    }
+
+    // Forgets a byte range in the cache and unchecks every slice it touches in the model.
+    void Forget(uint64_t offset, uint64_t size) {
+      BufferCacheTestAccess::ForgetColorMetadataChecks(buffers, RangeGridAddress + offset,
+                                                       size);
+      for (uint64_t slice = offset / RangeGridSlice; slice <= (offset + size - 1) / RangeGridSlice;
+           slice++) {
+        checked_keys[slice] = 0;
+      }
+    }
+
+    // Looks up a run of slices through the texture cache's single-range path.
+    bool WholeRun(uint32_t first, uint32_t count, uint32_t keys) const {
+      return TextureCacheTestAccess::IsColorClearChecked(
+          texture_cache, RangeGridAddress + first * RangeGridSlice, RangeGridSlice,
+          RangeGridSlice, count, keys);
+    }
+
+    // The single range lookup and the per-slice lookups must both equal the model for every key
+    // set and every run of slices starting at the grid's first or second slice.
+    void Check(const char *step) const {
+      for (const uint32_t keys : RangeGridKeySets) {
+        for (uint32_t first = 0; first < 2; first++) {
+          for (uint32_t count = 2; count + first <= RangeGridSlices; count++) {
+            bool modeled = true;
+            bool each = true;
+            for (uint32_t slice = first; slice < first + count; slice++) {
+              modeled &= (checked_keys[slice] & keys) == keys;
+              each &= buffers.IsColorMetadataChecked(RangeGridAddress + slice * RangeGridSlice,
+                                                     RangeGridSlice, keys);
+            }
+            Require(name, step, each == modeled && WholeRun(first, count, keys) == modeled,
+                    "a range or slice lookup disagrees with the marks and forgets so far");
+          }
+        }
+      }
+    }
+  };
+
+  // Marks every slice, then forgets an interior slice, only the last slice and part of a slice,
+  // remarking each afterwards.
+  static void RunScriptedRangeSteps(RangeGrid &grid) {
+    constexpr uint32_t keys = 0x7;
+    constexpr uint32_t interior = 3;
+    grid.Check("empty");
+    grid.MarkEach(0, RangeGridSlices, keys);
+    grid.Check("all marked");
+    Require(grid.name, "all marked covers the grid",
+            grid.WholeRun(0, RangeGridSlices, keys) && !grid.WholeRun(0, RangeGridSlices, 0x8),
+            "marking every slice did not make the whole grid checked for exactly those keys");
+    grid.Forget(interior * RangeGridSlice, RangeGridSlice);
+    grid.Check("interior slice forgotten");
+    Require(grid.name, "interior forget is seen", !grid.WholeRun(0, RangeGridSlices, 0x1),
+            "the range lookup missed a forgotten interior slice");
+    grid.MarkRun(interior, 1, keys);
+    grid.Forget((RangeGridSlices - 1) * RangeGridSlice, RangeGridSlice);
+    grid.Check("last slice forgotten");
+    Require(grid.name, "last forget is seen", !grid.WholeRun(0, RangeGridSlices, 0x1),
+            "the range lookup missed a forgotten last slice");
+    grid.MarkEach(RangeGridSlices - 1, 1, keys);
+    grid.Forget(4 * RangeGridSlice + RangeGridSlice / 4, RangeGridSlice / 2);
+    grid.Check("partial slice forgotten");
+    Require(grid.name, "partial forget is seen", !grid.WholeRun(0, RangeGridSlices, 0x1),
+            "the range lookup missed a partly forgotten slice");
+    grid.MarkRun(4, 1, keys);
+    grid.Check("partial slice remarked");
+  }
+
+  // Seeded random marks and forgets. Marks go in slice by slice or as a run through the texture
+  // cache, and forgets start at any byte.
+  static void RunRandomRangeSteps(RangeGrid &grid) {
+    std::mt19937 random(RangeGridSeed);
+    for (uint32_t step = 0; step < RangeGridRandomSteps; step++) {
+      const uint32_t first = random() % RangeGridSlices;
+      const uint32_t count = 1 + random() % (RangeGridSlices - first);
+      const uint32_t keys = RangeGridKeySets[random() % std::size(RangeGridKeySets)];
+      switch (random() % 3) {
+        case 0: {
+          const uint64_t offset = first * RangeGridSlice + random() % RangeGridSlice;
+          const uint64_t room = RangeGridSlices * RangeGridSlice - offset;
+          grid.Forget(offset, 1 + random() % std::min<uint64_t>(count * RangeGridSlice, room));
+          break;
+        }
+        case 1: grid.MarkEach(first, count, keys); break;
+        default: grid.MarkRun(first, count, keys); break;
+      }
+      grid.Check("random step");
+    }
+  }
+
+  // Differential check of the single range lookup and mark against per-slice behaviour and an
+  // independent model.
+  void CheckColorClearRangeLookup() {
+    constexpr const char *name = "ColorClearRangeLookup";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    RangeGrid grid{name, context.GetTextureCache(), context.GetBufferCache()};
+    RunScriptedRangeSteps(grid);
+    RunRandomRangeSteps(grid);
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Partial mips leave gaps between the viewed slices, so those views must be marked and looked
+  // up slice by slice. The decision itself is also pinned for every count and size relation.
+  void CheckColorClearPartialMipLookup() {
+    constexpr const char *name = "ColorClearPartialMipLookup";
+    constexpr uint64_t mip_size = RangeGridSlice / 2;
+    constexpr uint32_t slices = 4;
+    constexpr uint32_t keys = 0x5;
+    Require(name, "decision",
+            !ColorClearSlicesContiguous(RangeGridSlice, RangeGridSlice, 0) &&
+                !ColorClearSlicesContiguous(RangeGridSlice, RangeGridSlice, 1) &&
+                ColorClearSlicesContiguous(RangeGridSlice, RangeGridSlice, 2) &&
+                ColorClearSlicesContiguous(RangeGridSlice, RangeGridSlice, slices) &&
+                !ColorClearSlicesContiguous(mip_size, RangeGridSlice, 0) &&
+                !ColorClearSlicesContiguous(mip_size, RangeGridSlice, 1) &&
+                !ColorClearSlicesContiguous(mip_size, RangeGridSlice, 2) &&
+                !ColorClearSlicesContiguous(mip_size, RangeGridSlice, slices),
+            "the contiguous-slice decision is wrong for a count or size relation");
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    auto &texture_cache = context.GetTextureCache();
+    auto &buffers = context.GetBufferCache();
+    TextureCacheTestAccess::MarkColorClearChecked(texture_cache, RangeGridAddress,
+                                                  RangeGridSlice, mip_size, slices, keys);
+    bool gaps_unmarked = true;
+    for (uint32_t slice = 0; slice < slices; slice++) {
+      gaps_unmarked &= !buffers.IsColorMetadataChecked(
+          RangeGridAddress + slice * RangeGridSlice + mip_size, mip_size, keys);
+    }
+    Require(name, "partial mips mark only their own bytes",
+            TextureCacheTestAccess::IsColorClearChecked(texture_cache, RangeGridAddress,
+                                                        RangeGridSlice, mip_size, slices, keys) &&
+                gaps_unmarked,
+            "a view with gaps between its slices was marked as one range");
+    BufferCacheTestAccess::ForgetColorMetadataChecks(buffers, RangeGridAddress + RangeGridSlice,
+                                                     1);
+    Require(name, "partial mip forget is seen",
+            !TextureCacheTestAccess::IsColorClearChecked(texture_cache, RangeGridAddress,
+                                                         RangeGridSlice, mip_size, slices, keys),
+            "a forgotten byte of a partial mip was not seen");
+    context.ShutdownGpu();
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -51993,6 +52535,120 @@ void CheckDepthFeedbackAspects() {
   std::printf("[host]    %-32s ok\n", "DepthFeedbackAspects");
 }
 
+// One combination of the inputs DecodeColorClear reads.
+struct ColorClearKeyCase {
+  ImageMetadataKind kind;
+  TextureCache::BindingType type;
+  bool register_valid;
+  bool whitelisted_format;
+  bool depth;
+};
+
+// Builds a descriptor with only the fields DecodeColorClear reads. The format is whitelisted or
+// not, and a depth image takes its format from the guest format and ignores the view format.
+TextureCache::ImageDesc MakeColorClearKeyDesc(const ColorClearKeyCase &item) {
+  TextureCache::ImageDesc desc{};
+  desc.type = item.type;
+  desc.info.metadata.kind = item.kind;
+  desc.info.metadata.clear_register_valid = item.register_valid;
+  // A nonzero word that decodes for the whitelisted formats, so the register key is live.
+  desc.info.metadata.clear_word = ColorClearRegisterWord;
+  desc.view_info.format =
+      item.whitelisted_format ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR8G8B8A8Uint;
+  if (item.depth) {
+    desc.info.pixel_format = vk::Format::eD32Sfloat;
+    desc.info.guest_format = Prospero::BufferFormat::k32Float;
+  }
+  return desc;
+}
+
+constexpr uint32_t ColorClearKeySlots = 8;
+constexpr uint32_t ColorClearKeyCodeShift = 5;
+
+// The old way of building the key mask, decoding each key's code on its own.
+uint32_t ColorClearKeysOneByOne(const TextureCache::ImageDesc &desc) {
+  uint32_t keys = 0;
+  for (uint32_t key = 0; key < ColorClearKeySlots; key++) {
+    vk::ClearColorValue unused{};
+    if (DecodeColorClear(desc, static_cast<uint8_t>(key << ColorClearKeyCodeShift), unused)) {
+      keys |= 1u << key;
+    }
+  }
+  return keys;
+}
+
+// Checks one descriptor. The key mask must equal the one-by-one mask, and a code is accepted
+// only when its low bits are clear and its key is in the mask.
+void CheckColorClearKeysOfDesc(const char *name, const TextureCache::ImageDesc &desc) {
+  constexpr uint32_t low_code_mask = (1u << ColorClearKeyCodeShift) - 1u;
+  constexpr uint32_t code_count = 256;
+  const uint32_t keys = ColorClearKeys(desc);
+  Require(name, "keys match per-key decode", keys == ColorClearKeysOneByOne(desc),
+          "the key mask differs from decoding each key's code");
+  for (uint32_t code = 0; code < code_count; code++) {
+    vk::ClearColorValue unused{};
+    if (DecodeColorClear(desc, static_cast<uint8_t>(code), unused)) {
+      Require(name, "accepted codes have clear low bits",
+              (code & low_code_mask) == 0 &&
+                  (keys & (1u << (code >> ColorClearKeyCodeShift))) != 0,
+              "a code with low bits set was accepted or missing from the key mask");
+    }
+  }
+}
+
+// Known masks for the combinations that matter. A DCC render target with a valid register has
+// keys 0, 1, 2, 4 and 6 (codes 0x00, 0x20, 0x40, 0x80 and 0xc0), and the register key (code
+// 0x20) needs a render target with a valid register word.
+void CheckPinnedColorClearKeys(const char *name) {
+  constexpr uint32_t all_dcc_keys = 0x57;
+  constexpr uint32_t register_key = 0x2;
+  constexpr uint32_t dcc_keys_without_register = all_dcc_keys & ~register_key;
+  constexpr uint32_t zero_code_key = 0x1;
+  constexpr bool register_valid = true;
+  using Binding = TextureCache::BindingType;
+  const auto keys_of = [](ImageMetadataKind kind, Binding type, bool valid, bool whitelisted,
+                          bool depth) {
+    return ColorClearKeys(MakeColorClearKeyDesc({kind, type, valid, whitelisted, depth}));
+  };
+  const auto dcc = ImageMetadataKind::Dcc;
+  const auto cmask = ImageMetadataKind::Cmask;
+  Require(name, "pinned DCC masks",
+          keys_of(dcc, Binding::RenderTarget, register_valid, true, false) == all_dcc_keys &&
+              keys_of(dcc, Binding::RenderTarget, register_valid, true, true) == all_dcc_keys &&
+              keys_of(dcc, Binding::RenderTarget, false, true, false) ==
+                  dcc_keys_without_register &&
+              keys_of(dcc, Binding::Texture, register_valid, true, false) ==
+                  dcc_keys_without_register &&
+              keys_of(dcc, Binding::RenderTarget, register_valid, false, false) ==
+                  zero_code_key,
+          "a key mask for a known DCC combination is wrong");
+  Require(name, "pinned CMask masks",
+          keys_of(cmask, Binding::RenderTarget, register_valid, true, false) == zero_code_key &&
+              keys_of(cmask, Binding::Texture, register_valid, true, false) == 0,
+          "a key mask for a known CMask combination is wrong");
+}
+
+// The key mask the shader check uses must equal what decoding each key's code one at a time
+// accepts, and no code with a low bit set may ever be accepted because the mask drops them.
+void CheckColorClearKeys() {
+  constexpr const char *name = "ColorClearKeys";
+  for (const auto kind : {ImageMetadataKind::Dcc, ImageMetadataKind::Cmask}) {
+    for (const auto type : {TextureCache::BindingType::RenderTarget,
+                            TextureCache::BindingType::Texture}) {
+      for (const bool register_valid : {false, true}) {
+        for (const bool whitelisted : {false, true}) {
+          for (const bool depth : {false, true}) {
+            CheckColorClearKeysOfDesc(
+                name, MakeColorClearKeyDesc({kind, type, register_valid, whitelisted, depth}));
+          }
+        }
+      }
+    }
+  }
+  CheckPinnedColorClearKeys(name);
+  std::printf("[host]    %-48s ok\n", name);
+}
+
 void CheckDynamicRenderingState() {
   RenderState first{};
   first.width = 64;
@@ -55569,7 +56225,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
+    CheckColorClearKeys();
     VulkanHarness vulkan;
+    vulkan.CheckColorClearCodeReads();
+    vulkan.CheckColorClearLayeredGpuMetadata();
+    vulkan.CheckColorClearRangeLookup();
+    vulkan.CheckColorClearPartialMipLookup();
     vulkan.CheckRenderExecutorColorMetadataClear();
     return 0;
   }
@@ -55785,6 +56446,7 @@ int main(int argc, char **argv) {
   CheckDepthAttachmentWrites();
   CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();
+  CheckColorClearKeys();
   CheckDepthTargetFootprints();
 #else
   if (argc != 1) {
@@ -55896,6 +56558,10 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckColorResolvePlacedTarget();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckColorClearCodeReads();
+    vulkan.CheckColorClearLayeredGpuMetadata();
+    vulkan.CheckColorClearRangeLookup();
+    vulkan.CheckColorClearPartialMipLookup();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();

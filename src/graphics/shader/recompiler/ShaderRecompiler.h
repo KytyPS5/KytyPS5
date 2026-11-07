@@ -27,6 +27,8 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Native subgroup size for stages without workgroup metadata; 0 derives it from that metadata.
+	uint32_t                    host_subgroup_size = 0;
 };
 
 struct TranslateResult {

@@ -8958,6 +8958,25 @@ public:
           texture_cache.IsMetaCleared(base + metadata_b, 0),
           "BufferCache fill did not publish an exact-address metadata clear");
 
+      // A dynamic-resolution depth target keeps its HTile range at every extent; freeing the
+      // superseded image must leave its successor's consumed clear state alone.
+      constexpr uint64_t shared_htile = 0x13200;
+      auto retired_depth = MakeMetadataDepth(0x12400, shared_htile);
+      auto live_depth = MakeMetadataDepth(0x12500, shared_htile);
+      const auto retired_id = texture_cache.FindImage(retired_depth);
+      const auto live_id = texture_cache.FindImage(live_depth);
+      (void)texture_cache.FindDepthTarget(retired_id, retired_depth);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      const bool live_consumed = texture_cache.TouchMeta(base + shared_htile, 0, false);
+      TextureCacheTestAccess::DeleteImage(texture_cache, retired_id);
+      (void)texture_cache.FindDepthTarget(live_id, live_depth);
+      Require(name, "superseded HTile image release",
+              live_consumed && !texture_cache.IsMetaCleared(base + shared_htile, 0),
+              "freeing a superseded depth image re-armed its successor's HTile clear");
+      TextureCacheTestAccess::DeleteImage(texture_cache, live_id);
+      Require(name, "HTile owner release", !texture_cache.IsMeta(base + shared_htile),
+              "freeing the HTile owner kept its clear state");
+
       // R-Type Final 3 reuses an old color allocation inside a new stencil plane,
       // with the same metadata address changing from DCC to HTile.
       auto reused_depth = MakeMetadataDepth(0x12300, 0x28000);

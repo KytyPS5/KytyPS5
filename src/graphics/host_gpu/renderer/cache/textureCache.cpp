@@ -250,7 +250,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	m_download_images.erase(id);
 	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-		m_surface_metas.erase(image.info.metadata.range.address);
+		// Only the last image to acquire an HTile range releases its clear state.
+		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
+			m_surface_metas.erase(metadata);
+		}
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1455,6 +1459,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		metadata->second.owner = id;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);

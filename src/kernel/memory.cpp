@@ -3576,8 +3576,9 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	constexpr uint64_t POOL_COMMIT_ALIGNMENT = 0x10000;
 	constexpr int      PROT_CPU_EXEC         = 0x04;
 
+	const auto vaddr = reinterpret_cast<uint64_t>(addr);
 	if (addr == nullptr || len == 0 || !IsAligned(len, POOL_COMMIT_ALIGNMENT) ||
-	    (prot & PROT_CPU_EXEC) != 0) {
+	    !IsAligned(vaddr, POOL_COMMIT_ALIGNMENT) || (prot & PROT_CPU_EXEC) != 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -3586,8 +3587,6 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	if (!DecodeMemoryProtection(prot, &mode)) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	const auto vaddr = reinterpret_cast<uint64_t>(addr);
 
 	VirtualRanges::Range old_range {};
 	if (!g_virtual_ranges->Query(vaddr, 0, &old_range) ||
@@ -3659,7 +3658,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 	}
 
 	const auto vaddr = reinterpret_cast<uint64_t>(addr);
-	if (UINT64_MAX - vaddr < len) {
+	if (!IsAligned(vaddr, POOL_COMMIT_ALIGNMENT) || UINT64_MAX - vaddr < len) {
 		return KERNEL_ERROR_EINVAL;
 	}
 	std::vector<VirtualRanges::Range> ranges;

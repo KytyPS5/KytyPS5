@@ -4271,6 +4271,17 @@ void TestMemoryPoolMultiRangeDecommit() {
 	            reinterpret_cast<void*>(base + SceKernelMemoryPoolCommitLen),
 	            SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRead, 0),
 	        "KernelMemoryPoolCommit(read-only)");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolDecommit(
+	          reinterpret_cast<void*>(base + SceKernelPageSize), SceKernelMemoryPoolCommitLen, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "decommit accepted an address not aligned to 64 KiB");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMemoryPoolCommit(
+	          reinterpret_cast<void*>(base + 2 * SceKernelMemoryPoolCommitLen + SceKernelPageSize),
+	          SceKernelMemoryPoolCommitLen, SceKernelMtypeC, SceKernelProtCpuRw, 0) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "commit accepted an address not aligned to 64 KiB");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, expand_len, 0),
 	        "KernelMemoryPoolDecommit(different protections)");
 	const auto decommitted = Query(test, base);

@@ -2419,6 +2419,21 @@ void SetComputeIndirectFloors(size_t keys, size_t images) {
 	g_stable_indirect_layouts.store(true, std::memory_order_relaxed);
 }
 
+bool ResourceSpecializationFits(const Program& program, const ResourceSpecialization& specialization) {
+	const auto fits = [](size_t count, const auto& elements, uint32_t none) {
+		if (count > elements.size()) return false;
+		for (size_t index = 0; index < elements.size(); index++) {
+			const auto root = elements[index].indirect_root;
+			if (index >= count ? root >= count : root != none && root >= elements.size()) return false;
+		}
+		return true;
+	};
+	return fits(program.info.buffers.size(), specialization.buffers, BufferResource::NoIndirectBuffer) &&
+	       fits(program.info.images.size(), specialization.images, ImageResource::NoIndirectImage) &&
+	       fits(program.info.samplers.size(), specialization.samplers,
+	            SamplerResource::NoIndirectSampler);
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||

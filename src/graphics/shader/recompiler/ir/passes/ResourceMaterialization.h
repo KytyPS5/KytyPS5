@@ -80,6 +80,11 @@ bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
+// Whether specialization has an element for each of program's resources and its added elements
+// name resources that exist: a pipeline manifest record written by another build may hold a
+// specialization for another list of resources, which ApplyResourceSpecialization rejects.
+bool ResourceSpecializationFits(const Program& program, const ResourceSpecialization& specialization);
+
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
 // null. Entries of one kind specialize identically.
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value);

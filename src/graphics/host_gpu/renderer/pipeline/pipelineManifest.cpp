@@ -2028,6 +2028,13 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		return;
 	}
 	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	// A record from a build that found other resources in the program: no dispatch or draw of
+	// this build asks for its specialization.
+	if (!ShaderRecompiler::IR::ResourceSpecializationFits(translated.program,
+	                                                      record.specialization)) {
+		finish(nullptr, false);
+		return;
+	}
 	auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 	auto module = BuildModule(key, options, std::move(translated), record.specialization, {},
 	                          record.push_data_cursor, spirv, plain_spirv);

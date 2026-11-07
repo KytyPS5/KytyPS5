@@ -1412,6 +1412,36 @@ void TestEmptyScalarBufferSpecialization() {
           "empty root folded a scalar read with nonempty candidates");
 }
 
+// A pipeline manifest record may hold the specialization another build derived for the same
+// program: one element too many, one too few, or an added element whose root does not exist.
+void TestSpecializationFitsProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  auto plan = Extract(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "mixed sampler materialization failed");
+  Check(ResourceSpecializationFits(program, specialization),
+        "a specialization of the program did not fit it");
+  auto added = specialization;
+  added.samplers.push_back(added.samplers[0]);
+  Check(!ResourceSpecializationFits(program, added),
+        "an added element that is no variant of a resource fit the program");
+  added.samplers.back().indirect_root = 0u;
+  Check(ResourceSpecializationFits(program, added),
+        "an added variant of a resource did not fit the program");
+  added.samplers.back().indirect_root = static_cast<uint32_t>(program.info.samplers.size());
+  Check(!ResourceSpecializationFits(program, added),
+        "an added variant of a missing resource fit the program");
+  auto fewer = specialization;
+  fewer.samplers.pop_back();
+  Check(!ResourceSpecializationFits(program, fewer),
+        "a specialization without an element for each resource fit the program");
+}
+
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
@@ -1745,6 +1775,7 @@ int main() {
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestSpecializationFitsProgram();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);

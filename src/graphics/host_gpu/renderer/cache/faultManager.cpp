@@ -121,7 +121,7 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128; // Four words per invocation.
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;

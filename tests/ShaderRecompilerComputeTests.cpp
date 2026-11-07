@@ -11,6 +11,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -6076,6 +6077,104 @@ public:
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // The fault scan reports each set page once and leaves the pages past its records set.
+  void CheckFaultBufferScan() {
+    constexpr const char *name = "FaultBufferScan";
+    constexpr u32 words = 2048;
+    constexpr u32 records = 1024; // Record 0 holds the count.
+    const vk::DescriptorSetLayoutBinding bindings[]{
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute}};
+    vk::DescriptorSetLayoutCreateInfo descriptors{};
+    descriptors.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    descriptors.bindingCount = 2;
+    descriptors.pBindings = bindings;
+    vk::DescriptorSetLayout descriptor_layout = nullptr;
+    RequireVk(name, "descriptors",
+              m_device.createDescriptorSetLayout(&descriptors, nullptr, &descriptor_layout),
+              "vkCreateDescriptorSetLayout");
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &descriptor_layout;
+    vk::PipelineLayout layout = nullptr;
+    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_info, nullptr, &layout),
+              "vkCreatePipelineLayout");
+    const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_device);
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateComputePipelines");
+    m_device.destroyShaderModule(module, nullptr);
+
+    const auto bitmap = [](const auto &pages) {
+      std::vector<u32> ret(words, 0);
+      for (const auto page : pages) {
+        ret[page / 32] |= 1u << (page % 32);
+      }
+      return ret;
+    };
+    // Scans a bitmap of the pages and checks the records and the bits left.
+    const auto scan = [&](const char *stage, const std::vector<u32> &pages) {
+      auto fault = CreateStorageBuffer(name, bitmap(pages), words);
+      auto output = CreateStorageBuffer(name, {}, records * 2);
+      const vk::DescriptorBufferInfo infos[]{{fault.buffer, 0, fault.size},
+                                             {output.buffer, 0, output.size}};
+      std::array<vk::WriteDescriptorSet, 2> writes{};
+      for (u32 i = 0; i < writes.size(); i++) {
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = vk::DescriptorType::eStorageBuffer;
+        writes[i].pBufferInfo = &infos[i];
+      }
+      auto cmd = BeginCommands(name, stage);
+      cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+      cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+      cmd.dispatch(words / 4 / 64, 1, 1);
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
+                          nullptr);
+      EndSubmitAndFree(name, stage, cmd);
+
+      const auto left = ReadBuffer(name, fault, words);
+      const auto out = ReadBuffer(name, output, records * 2);
+      DestroyBuffer(&fault);
+      DestroyBuffer(&output);
+      const auto stored = std::min(out[0], records - 1);
+      std::set<u32> unreported(pages.begin(), pages.end());
+      bool reported_once = stored == std::min<size_t>(pages.size(), records - 1);
+      for (u32 i = 1; i <= stored; i++) {
+        const uint64_t record = out[i * 2] | (uint64_t{out[i * 2 + 1]} << 32);
+        const auto page = static_cast<u32>(record >> BufferCache::CACHING_PAGEBITS);
+        reported_once &= unreported.erase(page) == 1;
+      }
+      Require(name, stage, reported_once && left == bitmap(unreported),
+              "the scan lost, repeated or kept a reported page");
+    };
+    // Bits in each word of a block, several in one word, and in the last word.
+    scan("sparse", {0, 63, 6 * 32 + 3, 6 * 32 + 4, 6 * 32 + 5, 1000 * 32 + 17, 2047 * 32 + 31});
+    // 1200 pages, two per word, overflow the 1023 records; an odd record count leaves a word
+    // partly reported.
+    std::vector<u32> overflow;
+    for (u32 i = 0; i < 600; i++) {
+      overflow.push_back((3 * i + 1) * 32 + i % 31);
+      overflow.push_back((3 * i + 1) * 32 + 31);
+    }
+    scan("overflow", overflow);
+
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(layout, nullptr);
+    m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -55624,6 +55723,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
     vulkan.CheckBdaSyncUploads();
+    vulkan.CheckFaultBufferScan();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -55885,6 +55985,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckFaultBufferScan();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

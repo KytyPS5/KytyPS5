@@ -775,6 +775,7 @@ int RunPipelineHelper(std::string_view spec_text, Config::ConfigOptions config) 
 	// The emulator's options give the device; its log file is its own.
 	config.printf_direction = Config::LogDirection::Silent;
 	config.printf_output_file.clear();
+	config.session_log_file.clear();
 	Config::Initialize();
 	Config::Load(config);
 	Log::Initialize();

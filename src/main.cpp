@@ -1,6 +1,7 @@
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
@@ -144,6 +145,9 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf("  --session-log <path>                 Keep the warnings, errors and the report of a\n"
+	         "                                       fatal error of this session in a file, without\n"
+	         "                                       the printf log.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
@@ -520,6 +524,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--session-log") {
+			options.config.session_log_file = Common::PathFromUtf8(value);
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
@@ -543,21 +549,25 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // An exception no one catches (a worker thread of the program cache, for one) ends the process
 // with 0xC0000409 and no message: name the exception first.
 static void ReportUncaughtException() {
+	std::string message;
 #if defined(__cpp_exceptions)
 	try {
 		if (const auto exception = std::current_exception(); exception != nullptr) {
 			std::rethrow_exception(exception);
 		}
-		std::fprintf(stderr, "terminate called without an active exception\n");
+		message = "terminate called without an active exception\n";
 	} catch (const std::exception& error) {
-		std::fprintf(stderr, "terminate: uncaught exception: %s\n", error.what());
+		message = std::string("terminate: uncaught exception: ") + error.what() + "\n";
 	} catch (...) {
-		std::fprintf(stderr, "terminate: uncaught exception of an unknown type\n");
+		message = "terminate: uncaught exception of an unknown type\n";
 	}
 #else
-	std::fprintf(stderr, "terminate called\n");
+	message = "terminate called\n";
 #endif
+	std::fputs(message.c_str(), stderr);
 	std::fflush(stderr);
+	Log::WriteToSessionLog(message);
+	Log::Flush();
 	std::abort();
 }
 

@@ -104,6 +104,8 @@ struct ConfigOptions {
 	bool                   graphics_debug_dump_enabled = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
+	// See GetSessionLogFile(). Empty: none.
+	std::filesystem::path  session_log_file;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
@@ -190,6 +192,9 @@ bool GraphicsDebugDumpEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
+// --session-log: the console messages of the session and the report of a fatal error, without the
+// printf log (see Log::WriteToSessionLog).
+std::filesystem::path GetSessionLogFile();
 
 bool ProfilerEnabled();
 

@@ -26,17 +26,19 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
 
 namespace Libs::Graphics {
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
-	std::fputs("Depth target fatal: ", stderr);
+	char    text[1024];
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(text, sizeof(text), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
+	std::fprintf(stderr, "Depth target fatal: %s\n", text);
 	std::fflush(stderr);
+	Log::WriteToSessionLog(std::string("Depth target fatal: ") + text + "\n");
 	EXIT("unsupported render state; details were printed above\n");
 }
 

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -39,13 +41,15 @@ constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
 [[noreturn]] void Fatal(const char* format, ...) {
-	std::fputs("PageManager fatal: ", stderr);
+	char    text[1024];
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(text, sizeof(text), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
+	std::fprintf(stderr, "PageManager fatal: %s\n", text);
 	std::fflush(stderr);
+	Log::WriteToSessionLog(std::string("PageManager fatal: ") + text + "\n");
+	Log::Flush();
 	std::_Exit(322);
 }
 

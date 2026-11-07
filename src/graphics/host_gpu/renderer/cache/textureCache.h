@@ -52,6 +52,10 @@ public:
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
 		bool          heap = false; // PS5: resolved for a resident image heap.
+		// A T# the shader selects at run time, which it may never select (see
+		// RenderExecutor::ResolveTexture()): an overlap the cache cannot resolve declines the
+		// lookup (an empty id) instead of exiting.
+		bool candidate = false;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -355,7 +359,7 @@ private:
 
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged,
-	                                           bool speculative = false);
+	                                           bool speculative = false, bool candidate = false);
 	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
 	                                          ImageId* depth_source = nullptr);
 	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,

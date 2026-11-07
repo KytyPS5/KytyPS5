@@ -1109,7 +1109,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
-                                                         ImageId merged_id, bool speculative) {
+                                                         ImageId merged_id, bool speculative,
+                                                         bool candidate) {
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.registered) {
 		return {merged_id};
@@ -1210,6 +1211,21 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                                        requested.pixel_format)
 			            ? result_id
 			            : ImageId {}};
+		}
+		// Demon's Souls (PPSA01341): a T# candidate past the T#s a shader selects at run time
+		// can keep the words of an older T# of a texture array and go on with other data (4609
+		// layers of one level at the address of an array of 10 levels and 256 layers). The shader
+		// never selects it: its lookup is declined.
+		if (candidate) {
+			static std::atomic_bool reported {false};
+			if (!reported.exchange(true, std::memory_order_relaxed)) {
+				LOGF("TextureCache: a T# candidate that overlaps another image at its address "
+				     "(%ux%u over %ux%u at 0x%016" PRIx64 ") is bound as a null image\n",
+				     requested.resources.levels, requested.resources.layers,
+				     cached.info.resources.levels, cached.info.resources.layers,
+				     requested.data.address);
+			}
+			return {.rejected = true};
 		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
@@ -1796,7 +1812,8 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap =
-				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative);
+				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative,
+				                   desc.candidate);
 				if (overlap.rejected) {
 					if (depth_source != nullptr) {
 						*depth_source = overlap.depth_source;

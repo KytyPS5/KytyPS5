@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -45,6 +46,9 @@ struct TextureDescDerivation {
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
 	uint64_t                size              = 0;
+	// Why the host cannot view the T# as the shader reads it (the rest is then unset); empty when
+	// it can. See RenderExecutor::ResolveTexture().
+	std::string unsupported;
 	// The image the last lookup of a sampled texture with this description found, the
 	// description it was found with and the view acquired for it. Reused while no image on the
 	// pages of the range was registered or unregistered since and the image keeps the state the

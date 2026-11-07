@@ -168,10 +168,9 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-static uint32_t              g_test_backing_store_unmaps_before_failure = UINT32_MAX;
-static callback_func_t       g_test_before_backing_map                  = nullptr;
-static callback_func_t       g_test_backing_read                        = nullptr;
-static uint64_t              g_test_backing_bytes_zeroed                = 0;
+static callback_func_t       g_test_before_backing_map   = nullptr;
+static callback_func_t       g_test_backing_read         = nullptr;
+static uint64_t              g_test_backing_bytes_zeroed = 0;
 static std::atomic<uint64_t> g_test_free_range_visits {0};
 #endif
 
@@ -1913,55 +1912,40 @@ int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 	return RenameVirtualRange(vaddr, len, "");
 }
 
-static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
-	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
-	       g_virtual_ranges->Remove(vaddr, size);
-}
-
-static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, size_t len,
-                            bool keep_pool_reserved = false) {
-	if (IsReservedRangeType(range.type)) {
-		if (!g_guest_address_space->ContainsFree(vaddr, len)) {
-			return KERNEL_ERROR_EACCES;
-		}
-		g_virtual_ranges->Remove(vaddr, len);
-		return OK;
+// The caller validated the span and unmapped it from the GPU; failing here is an emulator fault.
+static void UnmapMemoryOwner(const VirtualRanges::Range& range, bool keep_pool_reserved = false) {
+	const auto vaddr    = range.start;
+	const auto len      = range.size;
+	bool       unmapped = false;
+	switch (range.type) {
+		case VirtualRangeType::Reserved:
+		case VirtualRangeType::PoolReserved:
+			unmapped = g_guest_address_space->ContainsFree(vaddr, len);
+			break;
+		case VirtualRangeType::Direct:
+			unmapped = g_guest_address_space->UnmapBacking(vaddr, len) &&
+			           g_physical_memory->Unmap(vaddr, len);
+			break;
+		case VirtualRangeType::Flexible: unmapped = g_flexible_memory->Unmap(vaddr, len); break;
+		case VirtualRangeType::Pooled:
+			unmapped = g_guest_address_space->UnmapBacking(vaddr, len) &&
+			           g_pooled_memory->Release(vaddr, len);
+			break;
+		case VirtualRangeType::Stack:
+		case VirtualRangeType::Code:
+		case VirtualRangeType::Runtime:
+			unmapped = g_guest_address_space->ReleaseCommitted(vaddr, len);
+			break;
 	}
-	if (range.type == VirtualRangeType::Code || range.type == VirtualRangeType::Runtime) {
-		return FreeGuestMemoryOwner(vaddr, len) ? OK : KERNEL_ERROR_EACCES;
-	}
-
-	bool owner_unmapped = false;
-	if (range.type == VirtualRangeType::Pooled) {
-		owner_unmapped = g_guest_address_space->UnmapBacking(vaddr, len);
-		if (owner_unmapped && !g_pooled_memory->Release(vaddr, len)) {
-			EXIT("failed to release unmapped pooled-memory range\n");
-		}
-		if (!owner_unmapped) {
-			return KERNEL_ERROR_EACCES;
-		}
-	} else if (range.type == VirtualRangeType::Direct) {
-		VirtualMemory::Mode direct_mode = VirtualMemory::Mode::NoAccess;
-
-		const auto direct_offset = range.offset + vaddr - range.start;
-		if (DecodeMemoryProtection(range.protection, &direct_mode) &&
-		    g_guest_address_space->UnmapBacking(vaddr, len)) {
-			if (g_physical_memory->Unmap(vaddr, len)) {
-				owner_unmapped = true;
-			} else {
-				EXIT_IF(!g_guest_address_space->MapBacking(vaddr, len, direct_offset, direct_mode));
-			}
-		}
-	} else if (range.type == VirtualRangeType::Stack) {
-		owner_unmapped = g_guest_address_space->ReleaseCommitted(vaddr, len);
-	} else {
-		owner_unmapped = g_flexible_memory->Unmap(vaddr, len);
-	}
-	if (!owner_unmapped) {
-		return KERNEL_ERROR_EACCES;
+	if (!unmapped) {
+		EXIT("failed to unmap guest memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr,
+		     len);
 	}
 
 	g_virtual_ranges->Remove(vaddr, len);
+	if (range.type == VirtualRangeType::Code || range.type == VirtualRangeType::Runtime) {
+		return;
+	}
 	if (keep_pool_reserved) {
 		EXIT_IF(!g_virtual_ranges->Add(vaddr, len, 0, 0, 0, VirtualRangeType::PoolReserved,
 		                               range.name));
@@ -1973,8 +1957,6 @@ static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, s
 	if (range.type == VirtualRangeType::Pooled) {
 		MemoryPoolSubtractCommitted(len);
 	}
-
-	return OK;
 }
 
 // Reserved fragments and holes hold nothing the GPU can cache, so each run of adjacent committed
@@ -1992,25 +1974,6 @@ static void UnmapGpuRanges(const std::vector<VirtualRanges::Range>& ranges) {
 	}
 }
 
-// A failed owner leaves its fragment and every later one mapped; their protection and GPU
-// mapping are restored.
-static int UnmapMemoryRanges(const std::vector<VirtualRanges::Range>& ranges) {
-	UnmapGpuRanges(ranges);
-	for (auto it = ranges.begin(); it != ranges.end(); ++it) {
-		const int result = UnmapMemoryOwner(*it, it->start, it->size);
-		if (result == OK) continue;
-		for (; it != ranges.end(); ++it) {
-			if (!IsCommittedRangeType(it->type)) continue;
-			VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
-			EXIT_IF(!DecodeMemoryProtection(it->protection, &mode));
-			EXIT_IF(!g_guest_address_space->Protect(it->start, it->size, mode));
-			MapGpuRange(it->start, it->size);
-		}
-		return result;
-	}
-	return OK;
-}
-
 // The ABI entry point and batch operations hold g_memory_operation_mutex.
 static int UnmapMemory(uint64_t vaddr, size_t len) {
 	LOGF("\t start = 0x%016" PRIx64 "\n"
@@ -2026,7 +1989,11 @@ static int UnmapMemory(uint64_t vaddr, size_t len) {
 	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
-	return UnmapMemoryRanges(ranges);
+	UnmapGpuRanges(ranges);
+	for (const auto& range: ranges) {
+		UnmapMemoryOwner(range);
+	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
@@ -2051,17 +2018,17 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	VirtualRanges::Range              range {};
 	std::vector<VirtualRanges::Range> ranges;
 	while (vaddr < end && g_virtual_ranges->Query(vaddr, 1, &range) && range.start < end) {
-		const auto start     = std::max(vaddr, range.start);
 		const auto range_end = std::min(end, range.start + range.size);
-		if (range.type == VirtualRangeType::Direct) {
-			range.offset += start - range.start;
-		}
-		range.start = start;
-		range.size  = range_end - start;
+		range.start          = std::max(vaddr, range.start);
+		range.size           = range_end - range.start;
 		ranges.push_back(range);
 		vaddr = range_end;
 	}
-	return UnmapMemoryRanges(ranges);
+	UnmapGpuRanges(ranges);
+	for (const auto& part: ranges) {
+		UnmapMemoryOwner(part);
+	}
+	return OK;
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -2976,10 +2943,6 @@ void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
 	g_test_physical_memory_unmaps_before_failure = successful_unmaps;
 }
 
-void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps) {
-	g_test_backing_store_unmaps_before_failure = successful_unmaps;
-}
-
 void TestFailNextFixedReserveRangeRegistration() {
 	g_test_fail_next_fixed_reserve_range_add = true;
 }
@@ -3316,7 +3279,8 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
 	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
 	UnmapGpuRange(vaddr, mapped_size);
-	return FreeGuestMemoryOwner(vaddr, mapped_size);
+	return g_guest_address_space->ReleaseCommitted(vaddr, mapped_size) &&
+	       g_virtual_ranges->Remove(vaddr, mapped_size);
 }
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
@@ -3670,11 +3634,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 
 	UnmapGpuRanges(ranges);
 	for (const auto& range: ranges) {
-		if (range.type == VirtualRangeType::Pooled &&
-		    UnmapMemoryOwner(range, range.start, range.size, true) != OK) {
-			EXIT("pooled-memory backing transaction failed after GPU unmap: addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     range.start, range.size);
+		if (range.type == VirtualRangeType::Pooled) {
+			UnmapMemoryOwner(range, true);
 		}
 	}
 	return OK;

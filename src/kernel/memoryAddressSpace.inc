@@ -309,16 +309,6 @@ public:
 	}
 
 	bool UnmapOne(uint64_t vaddr, uint64_t size) {
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (g_test_backing_store_unmaps_before_failure == 0) {
-			g_test_backing_store_unmaps_before_failure = UINT32_MAX;
-			return false;
-		}
-		if (g_test_backing_store_unmaps_before_failure != UINT32_MAX) {
-			g_test_backing_store_unmaps_before_failure--;
-		}
-#endif
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MapEntry old {};
 		{

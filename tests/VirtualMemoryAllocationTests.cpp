@@ -363,22 +363,6 @@ size_t AvailableFlexibleMemory(const char* test) {
 	return size;
 }
 
-void ExpectHostReadOnly(const char* test, uint64_t address) {
-#if defined(__linux__)
-	uint64_t value = 0;
-	iovec    local {&value, sizeof(value)};
-	iovec    remote {reinterpret_cast<void*>(address), sizeof(value)};
-	Check(test, process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == -1,
-	      "failed unmap lost read-only host protection");
-#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	MEMORY_BASIC_INFORMATION info {};
-	Check(test,
-	      VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
-	          info.Protect == PAGE_READONLY,
-	      "failed unmap lost read-only host protection");
-#endif
-}
-
 size_t ConfiguredFlexibleMemory(const char* test) {
 	size_t size = 0;
 	CheckOk(test, Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&size),
@@ -1308,9 +1292,9 @@ void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestFragmentedBackingUnmapRollback() {
+void TestFragmentedBackingPublicationRollback() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test     = "FragmentedBackingUnmapRollback";
+	const char*        test     = "FragmentedBackingPublicationRollback";
 	constexpr uint64_t page     = SceKernelPageSize;
 	const auto         baseline = AvailableFlexibleMemory(test);
 	const auto left    = MapNamedFlexible(test, 2 * page, SceKernelProtCpuRw, "backing_hole_left");
@@ -1348,29 +1332,10 @@ void TestFragmentedBackingUnmapRollback() {
 	      std::all_of(bytes, bytes + 4 * page, [](uint8_t byte) { return byte == 0; }) &&
 	          *reinterpret_cast<uint64_t*>(blocker) == 0x424c4f434b455231ull,
 	      "fragmented publication retry exposed stale bytes or changed the live gap");
-	auto* first_word = reinterpret_cast<uint64_t*>(fragmented);
-	auto* last_word  = reinterpret_cast<uint64_t*>(fragmented + 4 * page - sizeof(uint64_t));
-	*first_word      = 0x465241474c454654ull;
-	*last_word       = 0x4652414752474854ull;
-	CheckOk(test, KernelMprotect(target, 4 * page, SceKernelProtCpuRead),
-	        "protect fragmented backing before partial unmap");
-	TestFailGuestBackingStoreUnmapAfter(1);
-	CheckFailed(test, KernelMunmap(fragmented + page, 2 * page),
-	            "KernelMunmap(partial first view then injected second-view failure)");
-	ExpectRange(test, Query(test, fragmented), fragmented, fragmented + 4 * page,
-	            SceKernelProtCpuRead, 1, 0, 0, 1, "fragmented_backing");
-	Check(test, *first_word == 0x465241474c454654ull && *last_word == 0x4652414752474854ull,
-	      "transactional backing-unmap rollback lost mapped contents");
-	ExpectHostReadOnly(test, fragmented + page);
-	ExpectHostReadOnly(test, fragmented + 2 * page);
-	CheckOk(test, KernelMprotect(target, 4 * page, SceKernelProtCpuRead),
-	        "reprotect views after partial-first-view rollback");
-	for (uint64_t i = 0; i < 4; ++i)
-		ExpectHostReadOnly(test, fragmented + i * page);
-	CheckOk(test, KernelMunmap(fragmented, 4 * page), "KernelMunmap(retry)");
+	CheckOk(test, KernelMunmap(fragmented, 4 * page), "KernelMunmap(fragmented backing)");
 	CheckOk(test, KernelMunmap(blocker, page), "KernelMunmap(blocker)");
 	Check(test, AvailableFlexibleMemory(test) == baseline,
-	      "fragmented backing rollback test leaked flexible capacity");
+	      "fragmented publication rollback test leaked flexible capacity");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1565,96 +1530,21 @@ void TestAsanShadowLifetimeAcrossRangeEdits() {
 	CheckOk(test, KernelMunmap(crossing, coverage - page), "release crossing prefix reservation");
 	CheckOk(test, KernelMunmap(crossing + coverage + page, coverage - page),
 	        "release crossing suffix reservation");
-	std::printf("[host]    %-48s ok\n", test);
-}
 
-void TestAsanFailedUnmapPreservesShadow() {
-	using namespace Libs::LibKernel::Memory;
-	const char*        test = "AsanFailedUnmapPreservesShadow";
-	constexpr uint64_t page = SceKernelPageSize;
-	for (const bool direct: {false, true}) {
-		const auto base     = ReserveAsanCoverage(test);
-		void*      address  = reinterpret_cast<void*>(base);
-		int64_t    physical = -1;
-		if (direct) {
-			CheckOk(test,
-			        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 3 * page, page,
-			                                   SceKernelMtypeC, &physical),
-			        "allocate failed-unmap direct fixture");
-			CheckOk(test,
-			        KernelMapNamedDirectMemory(&address, 3 * page, SceKernelProtCpuRw,
-			                                   SceKernelMapFixed, physical, page, "asan_failure"),
-			        "map failed-unmap direct fixture");
-		} else {
-			MapAsanFlexible(test, base, 3 * page, "asan_failure");
-		}
-		for (uint64_t i = 0; i < 3; ++i)
-			*reinterpret_cast<uint64_t*>(base + i * page) = 0xabc0 + i;
-		auto* sentinel = reinterpret_cast<uint64_t*>(AsanShadowAddress(base + 2 * page));
-		*sentinel      = 0x4641494c53484457ull;
-		CheckOk(test,
-		        KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRead),
-		        "split protection after callback registration");
-		CheckOk(test, KernelMprotect(address, 3 * page, SceKernelProtCpuRead),
-		        "merge protection after callback registration");
-		CheckOk(
-		    test,
-		    KernelSetVirtualRangeName(reinterpret_cast<void*>(base + page), page, "split_shadow"),
-		    "split name after callback registration");
-		CheckOk(test, KernelSetVirtualRangeName(address, 3 * page, "asan_failure"),
-		        "merge name after callback registration");
-		const auto check_ranges = [&](uint64_t first) {
-			for (uint64_t i = first; i < 3; ++i) {
-				ExpectRange(test, Query(test, base + i * page), base + (direct ? i : first) * page,
-				            base + (direct ? i + 1 : 3) * page, SceKernelProtCpuRead, !direct,
-				            direct, 0, 1, "asan_failure", direct ? physical + i * page : 0);
-			}
-		};
-		check_ranges(0);
-		if (direct)
-			TestFailPhysicalMemoryUnmapAfter(0);
-		else
-			TestFailGuestBackingStoreUnmapAfter(0);
-		CheckFailed(test, KernelMunmap(base, 3 * page), "reject unmap before any range completes");
-		Check(test, AsanShadowPresent(base) && *sentinel == 0x4641494c53484457ull,
-		      "failed unmap released or changed ASan shadow");
-		for (uint64_t i = 0; i < 3; ++i) {
-			Check(test, *reinterpret_cast<const uint64_t*>(base + i * page) == 0xabc0 + i,
-			      "failed unmap changed guest data");
-			// Windows recreates untouched direct neighbors with their original host mode.
-			if (!direct || i == 0 || KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS)
-				ExpectHostReadOnly(test, base + i * page);
-		}
-		CheckOk(test, KernelMprotect(address, 3 * page, SceKernelProtCpuRead),
-		        "restore complete fixture protection before partial-progress unmap");
-		CheckOk(test, KernelMprotect(address, page, SceKernelProtCpuRw), "split first unmap chunk");
-		if (direct)
-			TestFailPhysicalMemoryUnmapAfter(1);
-		else
-			TestFailGuestBackingStoreUnmapAfter(1);
-		CheckFailed(test, KernelMunmap(base, 3 * page),
-		            "reject later unmap after first range completes");
-		ExpectUnmapped(test, base);
-		check_ranges(1);
-		Check(test,
-		      AsanShadowPresent(base) && *sentinel == 0x4641494c53484457ull &&
-		          *reinterpret_cast<const uint64_t*>(base + 2 * page) == 0xabc2,
-		      "partially completed unmap damaged the remaining shadow or data");
-		ExpectHostReadOnly(test, base + page);
-		if (!direct || KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS)
-			ExpectHostReadOnly(test, base + 2 * page);
-		CheckOk(test, KernelMunmap(base + page, page), "retry first surviving page");
-		Check(test, AsanShadowPresent(base) && *sentinel == 0x4641494c53484457ull,
-		      "partial retry released shadow still covering the last page");
-		CheckOk(test, KernelMunmap(base + 2 * page, page), "retry final surviving page");
-		Check(test, !AsanShadowPresent(base),
-		      "final retry leaked shadow coverage after failed unmap");
-		CheckOk(test, KernelMunmap(base + 3 * page, AsanShadowCoverage - 3 * page),
-		        "release failure fixture reservation");
-		if (direct)
-			CheckOk(test, KernelReleaseDirectMemory(physical, 3 * page),
-			        "release failed-unmap physical memory");
-	}
+	// Runtime memory gets no shadow, so unmapping it must leave a neighbor's shadow alone.
+	const auto runtime = ReserveAsanCoverage(test);
+	MapAsanFlexible(test, runtime, page);
+	CheckOk(test, KernelMunmap(runtime + page, page), "free the runtime page's reservation");
+	Check(test,
+	      AllocateRuntimeMemory(runtime + page, page, Common::VirtualMemory::Mode::ReadWrite,
+	                            "asan_runtime", true) == runtime + page,
+	      "fixed runtime allocation beside a flexible mapping failed");
+	CheckOk(test, KernelMunmap(runtime + page, page), "unmap runtime memory");
+	Check(test, AsanShadowPresent(runtime), "runtime unmap released a neighbor's shadow");
+	CheckOk(test, KernelMunmap(runtime, page), "unmap the runtime page's neighbor");
+	Check(test, !AsanShadowPresent(runtime), "neighbor unmap retained shadow");
+	CheckOk(test, KernelMunmap(runtime + 2 * page, coverage - 2 * page),
+	        "release runtime reservation");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -2844,24 +2734,14 @@ void TestMunmapGpuRuns() {
 	}
 	g_gpu_range_events.clear();
 	TestSetGpuRangeCallback(ObserveGpuRange);
-	TestFailGuestBackingStoreUnmapAfter(1);
-	const int result = KernelMunmap(base, 4 * page);
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap(reserved gap)");
 	TestSetGpuRangeCallback(nullptr);
-	CheckFailed(test, result, "KernelMunmap(third range fails)");
 	Check(test,
-	      g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, page},
-	                                                        {false, base + 2 * page, 2 * page},
-	                                                        {true, base + 2 * page, page},
-	                                                        {true, base + 3 * page, page}},
-	      "munmap did not unmap each committed run once or restore every surviving range");
-	ExpectUnmapped(test, base);
-	ExpectUnmapped(test, base + page);
-	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 3 * page,
-	            SceKernelProtCpuRw, 1, 0, 0, 1, "run_b");
-	ExpectRange(test, Query(test, base + 3 * page), base + 3 * page, base + 4 * page,
-	            SceKernelProtCpuRead, 1, 0, 0, 1, "run_c");
-	ExpectHostReadOnly(test, base + 3 * page);
-	CheckOk(test, KernelMunmap(base + 2 * page, 2 * page), "KernelMunmap(surviving ranges)");
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {false, base + 2 * page, 2 * page}},
+	      "munmap did not unmap each run of committed ranges from the GPU once");
+	for (uint64_t i = 0; i < 4; ++i)
+		ExpectUnmapped(test, base + i * page);
 	Check(test, AvailableFlexibleMemory(test) == baseline, "munmap leaked flexible-memory budget");
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -3816,22 +3696,24 @@ void TestAutomaticMemoryReuseAndAliases() {
 	      MapAutomaticMemory(base + block * 4, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
 	      "restored mappings remained available to the automatic allocator");
-	TestFailPhysicalMemoryUnmapAfter(0);
-	CheckFailed(test, UnmapAmmMemory(base + page, page * 3), "AMM unmap inside a range failure");
-	Check(test, *reinterpret_cast<uint64_t*>(base + page * 3) == 0x0123456789abcdefull,
-	      "failed AMM unmap inside a range restored the wrong backing");
-	TestFailPhysicalMemoryUnmapAfter(0);
 	g_gpu_range_events.clear();
 	TestSetGpuRangeCallback(ObserveGpuRange);
-	const int unmap_result = UnmapAmmMemory(base - page, block + page * 2);
-	TestSetGpuRangeCallback(nullptr);
-	CheckFailed(test, unmap_result, "AMM unmap owner failure");
-	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent>{{false, base, block}, {true, base, block}},
-	      "failed AMM unmap did not restore exactly the surviving GPU range");
-	Check(test, *reinterpret_cast<uint64_t*>(base + page * 3) == 0x0123456789abcdefull,
-	      "failed AMM unmap did not restore the original backing");
+	CheckOk(test, UnmapAmmMemory(base + page, page * 3), "AMM unmap inside a range");
+	ExpectRange(test, Query(test, base), base, base + page, SceKernelProtCpuRw, 0, 1, 0, 1, nullptr,
+	            physical);
+	ExpectRange(test, Query(test, base + page * 4), base + page * 4, base + block,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, nullptr, physical + page * 4);
 	CheckOk(test, UnmapAmmMemory(base - page, block + page * 2),
 	        "AMM unmap original with leading and trailing holes");
+	CheckOk(test, UnmapAmmMemory(base - page, block + page * 2),
+	        "AMM repeat unmap of an empty span");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base + page, page * 3},
+	                                      {false, base, page},
+	                                      {false, base + page * 4, block - page * 4}},
+	      "AMM unmap did not unmap each mapped run from the GPU once");
 	Check(test,
 	      MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
@@ -3927,17 +3809,14 @@ void TestAutomaticMemoryFragmentedMapRollback() {
 	            "automatic allocation beyond donated capacity");
 	CheckOk(test, MapAutomaticMemory(base, block * 2, SceKernelMtypeC, SceKernelProtCpuRw),
 	        "reuse both donations after final alias removal");
-	TestFailPhysicalMemoryUnmapAfter(1);
 	g_gpu_range_events.clear();
 	TestSetGpuRangeCallback(ObserveGpuRange);
-	const int unmap_result = KernelMunmap(base, block * 2);
+	CheckOk(test, KernelMunmap(base, block * 2), "unmap both donated ranges");
 	TestSetGpuRangeCallback(nullptr);
-	CheckFailed(test, unmap_result, "unmap second backing failure");
 	ExpectUnmapped(test, base);
-	Check(test, Query(test, base + block).offset == static_cast<uint64_t>(second) &&
-	                g_gpu_range_events == std::vector<GpuRangeEvent>{
-	                    {false, base, block * 2}, {true, base + block, block}},
-	      "failed strict unmap restored a freed prefix or lost the surviving GPU range");
+	ExpectUnmapped(test, base + block);
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base, block * 2}},
+	      "unmap of two ranges did not unmap its span from the GPU exactly once");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(first, block), "release first donation");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(gap, block), "release ordinary allocation");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(second, block), "release second donation");
@@ -4133,8 +4012,6 @@ void TestFragmentedMemoryPoolBacking() {
 	            "KernelMemoryPoolCommit(exhausted)");
 	ExpectRange(test, Query(test, base + commit_len), base + commit_len,
 	            base + SceKernelMemoryPoolReserveLen, 0, 0, 0, 1, 0);
-	for (uint64_t i = 0; i < 3; ++i)
-		*reinterpret_cast<uint64_t*>(base + i * block) = 0x504f4f4c0000ull + i;
 	CheckOk(test, KernelMemoryPoolDecommit(arena, commit_len, 0),
 	        "KernelMemoryPoolDecommit(fragmented)");
 	KernelMemoryPoolBlockStats stats {};
@@ -4144,40 +4021,6 @@ void TestFragmentedMemoryPoolBacking() {
 	      "fragmented decommit did not restore all pool blocks");
 	CheckOk(test, KernelMemoryPoolCommit(arena, commit_len, SceKernelMtypeC, SceKernelProtCpuRw, 0),
 	        "KernelMemoryPoolCommit(fragmented recommit)");
-	CheckOk(test, KernelMprotect(arena, commit_len, SceKernelProtCpuRead),
-	        "protect fragmented pool views");
-	for (const bool partial: {true, false}) {
-		const auto address = partial ? base + block : base;
-		const auto size    = partial ? 2 * block : commit_len;
-		g_gpu_range_events.clear();
-		TestSetGpuRangeCallback(ObserveGpuRange);
-		TestFailGuestBackingStoreUnmapAfter(1);
-		const int result = KernelMunmap(address, size);
-		TestSetGpuRangeCallback(nullptr);
-		CheckFailed(test, result,
-		            partial ? "KernelMunmap(partial pooled view rollback)"
-		                    : "KernelMunmap(whole pooled range after split rollback)");
-		ExpectRange(test, Query(test, base), base, base + commit_len, SceKernelProtCpuRead, 0, 0, 1,
-		            1);
-		Check(test,
-		      g_gpu_range_events ==
-		          std::vector<GpuRangeEvent> {{false, address, size}, {true, address, size}},
-		      "failed pooled unmap did not restore the complete GPU range");
-		if (partial) {
-			CheckOk(test, KernelMprotect(arena, commit_len, SceKernelProtCpuRead),
-			        "protect whole pool range after partial-first-view rollback");
-		}
-		for (uint64_t i = 0; i < 3; ++i) {
-			Check(test,
-			      *reinterpret_cast<const uint64_t*>(base + i * block) == 0x504f4f4c0000ull + i,
-			      "pooled rollback changed a backing view's contents");
-			ExpectHostReadOnly(test, base + i * block);
-		}
-	}
-	CheckOk(test, KernelMemoryPoolGetBlockStats(&stats, sizeof(stats)),
-	        "query pooled rollback budget");
-	Check(test, stats.available_flushed_blocks == 0 && stats.allocated_flushed_blocks == 3,
-	      "failed pooled unmap changed the pool budget");
 	CheckOk(test, KernelMunmap(base, commit_len), "KernelMunmap(fragmented commit)");
 	CheckOk(test, KernelMunmap(base + commit_len, SceKernelMemoryPoolReserveLen - commit_len),
 	        "KernelMunmap(fragmented reserve remainder)");
@@ -5916,7 +5759,7 @@ int main(int argc, char** argv) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 		RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
-		RunTest(TestFragmentedBackingUnmapRollback);
+		RunTest(TestFragmentedBackingPublicationRollback);
 		RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 		RunTest(TestFragmentedGuestFreeRangeHints);
 		RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
@@ -5935,7 +5778,6 @@ int main(int argc, char** argv) {
 		RunTest(TestFragmentedPoolDecommitOnSmallStack);
 		// Memory callbacks remain registered for the rest of the process.
 		RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
-		RunTest(TestAsanFailedUnmapPreservesShadow);
 		RunTest(TestAsanAliasedPhysicalRelease);
 		RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -6039,7 +5881,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
-	RunTest(TestFragmentedBackingUnmapRollback);
+	RunTest(TestFragmentedBackingPublicationRollback);
 	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
@@ -6103,7 +5945,6 @@ int main(int argc, char** argv) {
 #endif
 	// Memory callbacks remain registered for the rest of the process.
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
-	RunTest(TestAsanFailedUnmapPreservesShadow);
 	RunTest(TestAsanAliasedPhysicalRelease);
 	RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
 

@@ -379,39 +379,40 @@ public:
 		return true;
 	}
 
-	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
+	// Ranges overlapping the span, clipped to it; holes are skipped. Returns the bytes covered.
+	uint64_t QueryFragments(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
 		Common::LockGuard lock(m_mutex);
 		out->clear();
-		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+		const auto end     = End(start, size);
+		uint64_t   covered = 0;
+		auto       it      = FindContaining(start);
+		if (it == m_ranges.end()) {
+			it = m_ranges.upper_bound(start);
+		}
+		for (; it != m_ranges.end() && it->second.start < end; ++it) {
+			const auto& range = it->second;
+			Range       part  = range;
+			part.start        = std::max(start, range.start);
+			part.size         = std::min(end, End(range.start, range.size)) - part.start;
+			if (part.type == VirtualRangeType::Direct) {
+				part.offset += part.start - range.start;
+			}
+			covered += part.size;
+			out->push_back(part);
+		}
+		return covered;
+	}
+
+	// Fragments of a span with no holes.
+	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
+		if (start == 0 || size == 0 || size > UINT64_MAX - start ||
+		    QueryFragments(start, size, out) != size) {
+			out->clear();
 			return false;
 		}
-
-		const auto end     = start + size;
-		auto       current = start;
-		for (auto it = FindContaining(start); it != m_ranges.end(); ++it) {
-			const auto& range     = it->second;
-			const auto  range_end = End(range.start, range.size);
-			if (range.start > current) {
-				break;
-			}
-
-			Range part = range;
-			part.start = current;
-			part.size  = std::min(end, range_end) - current;
-			if (part.type == VirtualRangeType::Direct) {
-				part.offset += current - range.start;
-			}
-			out->push_back(part);
-			current += part.size;
-			if (current == end) {
-				return true;
-			}
-		}
-
-		out->clear();
-		return false;
+		return true;
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
@@ -2014,19 +2015,11 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
 
 	// AMM unmap accepts holes, including a completely unmapped range.
-	const auto                        end = vaddr + size;
-	VirtualRanges::Range              range {};
 	std::vector<VirtualRanges::Range> ranges;
-	while (vaddr < end && g_virtual_ranges->Query(vaddr, 1, &range) && range.start < end) {
-		const auto range_end = std::min(end, range.start + range.size);
-		range.start          = std::max(vaddr, range.start);
-		range.size           = range_end - range.start;
-		ranges.push_back(range);
-		vaddr = range_end;
-	}
+	g_virtual_ranges->QueryFragments(vaddr, size, &ranges);
 	UnmapGpuRanges(ranges);
-	for (const auto& part: ranges) {
-		UnmapMemoryOwner(part);
+	for (const auto& range: ranges) {
+		UnmapMemoryOwner(range);
 	}
 	return OK;
 }
@@ -3288,15 +3281,15 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
 	LOGF("\t addr = 0x%016" PRIx64 "\n"
-	     "\t len  = 0x%016" PRIx64 "\n",
-	     vaddr, static_cast<uint64_t>(len));
+	     "\t len  = 0x%016" PRIx64 "\n"
+	     "\t prot = 0x%08" PRIx32 "\n",
+	     vaddr, static_cast<uint64_t>(len), static_cast<uint32_t>(prot));
 
 	constexpr uint64_t PAGE_SIZE    = 0x4000;
 	auto               aligned_addr = vaddr & ~(PAGE_SIZE - 1);
 	const auto         page_offset  = vaddr - aligned_addr;
-	if (len > UINT64_MAX - page_offset || len + page_offset > UINT64_MAX - (PAGE_SIZE - 1)) {
-		EXIT("memory-protection range overflows: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, static_cast<uint64_t>(len));
+	if (len > UINT64_MAX - (PAGE_SIZE - 1) - page_offset) {
+		return KERNEL_ERROR_EINVAL;
 	}
 	auto aligned_len = (len + page_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
@@ -3306,30 +3299,22 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 
-	if (!DecodeMemoryProtection(prot, &mode)) {
+	if (!DecodeMemoryProtection(prot, &mode) ||
+	    !g_guest_address_space->Owns(aligned_addr, aligned_len)) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	std::vector<VirtualRanges::Range> old_ranges;
-	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
-	    std::any_of(old_ranges.begin(), old_ranges.end(),
-	                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
-		EXIT("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     aligned_addr, aligned_len);
+	// Reserved ranges and holes have nothing to protect.
+	std::vector<VirtualRanges::Range> ranges;
+	g_virtual_ranges->QueryFragments(aligned_addr, aligned_len, &ranges);
+	for (const auto& range: ranges) {
+		if (!IsCommittedRangeType(range.type)) continue;
+		if (!g_guest_address_space->Protect(range.start, range.size, mode)) {
+			EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " prot=0x%08x\n",
+			     range.start, range.size, prot);
+		}
+		g_virtual_ranges->Protect(range.start, range.size, prot);
 	}
-	const auto old_mode = static_cast<VirtualMemory::Mode>(
-	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
-	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
-
-	if (!ok) {
-		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " prot=0x%08x\n",
-		     aligned_addr, aligned_len, prot);
-	}
-	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
-
-	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
-
 	return OK;
 }
 

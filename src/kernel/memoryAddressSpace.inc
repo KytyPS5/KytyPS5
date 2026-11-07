@@ -1036,7 +1036,12 @@ private:
 			}
 
 			AddFreeUnlocked(start, size);
-			m_owned.emplace_back(start, size);
+			// Free ranges merge across region boundaries, so owned ranges do as well.
+			if (!m_owned.empty() && m_owned.back().first + m_owned.back().second == start) {
+				m_owned.back().second += size;
+			} else {
+				m_owned.emplace_back(start, size);
+			}
 		};
 
 		for (const auto& [region_start, region_end]: regions) {

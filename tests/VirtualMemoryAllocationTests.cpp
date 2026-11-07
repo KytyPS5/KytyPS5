@@ -363,6 +363,22 @@ size_t AvailableFlexibleMemory(const char* test) {
 	return size;
 }
 
+void ExpectHostReadOnly(const char* test, uint64_t address) {
+#if defined(__linux__)
+	uint64_t value = 0;
+	iovec    local {&value, sizeof(value)};
+	iovec    remote {reinterpret_cast<void*>(address), sizeof(value)};
+	Check(test, process_vm_writev(getpid(), &local, 1, &remote, 1, 0) == -1,
+	      "host protection is not read-only");
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION info {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0 &&
+	          info.Protect == PAGE_READONLY,
+	      "host protection is not read-only");
+#endif
+}
+
 size_t ConfiguredFlexibleMemory(const char* test) {
 	size_t size = 0;
 	CheckOk(test, Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&size),
@@ -2743,6 +2759,53 @@ void TestMunmapGpuRuns() {
 	for (uint64_t i = 0; i < 4; ++i)
 		ExpectUnmapped(test, base + i * page);
 	Check(test, AvailableFlexibleMemory(test) == baseline, "munmap leaked flexible-memory budget");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestMprotectSkipsUncommittedRanges() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test    = "MprotectSkipsUncommittedRanges";
+	constexpr uint64_t page    = SceKernelPageSize;
+	void*              reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 2 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "protect"),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	CheckOk(test, KernelMunmap(base + 3 * page, page), "leave a hole after the mappings");
+	CheckOk(test, KernelMprotect(reserve, 4 * page, SceKernelProtCpuRead),
+	        "protect across a reservation and a hole");
+	for (const auto offset: {0 * page, 2 * page}) {
+		ExpectRange(test, Query(test, base + offset), base + offset, base + offset + page,
+		            SceKernelProtCpuRead, 1, 0, 0, 1, "protect");
+		ExpectHostReadOnly(test, base + offset);
+	}
+	ExpectRange(test, Query(test, base + page), base + page, base + 2 * page, 0, 0, 0, 0, 0);
+	Check(test,
+	      KernelMprotect(reinterpret_cast<void*>(page), page, SceKernelProtCpuRead) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "mprotect accepted a range outside the address space");
+	Check(test,
+	      KernelMprotect(reserve, UINT64_MAX, SceKernelProtCpuRead) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "mprotect accepted an overflowing length");
+	CheckOk(test, KernelMunmap(base, 3 * page), "KernelMunmap");
+#if defined(__linux__)
+	void* straddle = reinterpret_cast<void*>(0x1000000000ull - page);
+	CheckOk(test,
+	        KernelMapNamedFlexibleMemory(&straddle, 2 * page, SceKernelProtCpuRw,
+	                                     SceKernelMapFixed | SceKernelMapNoOverwrite, "straddle"),
+	        "map across the host user-space boundary");
+	CheckOk(test, KernelMprotect(straddle, 2 * page, SceKernelProtCpuRead),
+	        "protect across the host user-space boundary");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(straddle), 2 * page),
+	        "unmap across the host user-space boundary");
+#endif
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5895,6 +5958,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapGpuRuns);
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
+	RunTest(TestMprotectSkipsUncommittedRanges);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasReleaseRollback);

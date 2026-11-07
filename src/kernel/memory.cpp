@@ -199,10 +199,6 @@ static bool IsCommittedRangeType(VirtualRangeType type) {
 	return !IsReservedRangeType(type);
 }
 
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-static bool g_test_fail_next_range_replace = false;
-#endif
-
 class VirtualRanges {
 public:
 	struct Range {
@@ -306,12 +302,6 @@ public:
 			current = std::min(end, End(candidate->second.start, candidate->second.size));
 		}
 
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (g_test_fail_next_range_replace) {
-			g_test_fail_next_range_replace = false;
-			return false;
-		}
-#endif
 		Range replacement {};
 		replacement.start          = start;
 		replacement.size           = size;
@@ -1685,10 +1675,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	                           : g_virtual_ranges->Add(out_addr, len, 0, prot, 0,
 	                                                   VirtualRangeType::Flexible, name,
 	                                                   (map_flags & GUEST_MAP_NO_COALESCE) != 0);
-	if (!published) {
-		EXIT_IF(!g_flexible_memory->Unmap(out_addr, len));
-		return KERNEL_ERROR_EBUSY;
-	}
+	EXIT_IF(!published);
 
 	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
 	     "\t out_addr = 0x%016" PRIx64 "\n"
@@ -2346,31 +2333,17 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	auto     in_addr         = reinterpret_cast<uint64_t>(*addr);
-	uint64_t out_addr        = 0;
-	bool     shared_backing  = false;
-	bool     reserved_target = false;
-	auto     shared_failure  = GuestBackingStore::FailureReason::None;
+	auto                              in_addr        = reinterpret_cast<uint64_t>(*addr);
+	uint64_t                          out_addr       = 0;
+	bool                              replace_target = false;
+	auto                              replaced_type  = VirtualRangeType::Reserved;
+	auto                              shared_failure = GuestBackingStore::FailureReason::None;
+	std::vector<VirtualRanges::Range> replaced;
 	// Direct mappings must remain views of the single backing object. Anonymous fallbacks break
 	// aliasing and lose direct-memory contents when a range is unmapped and mapped again.
 	auto map_shared_fixed = [&](uint64_t target_addr) -> bool {
 		return g_guest_address_space->MapBacking(target_addr, len, direct_memory_start, mode,
 		                                         &shared_failure);
-	};
-	std::vector<VirtualRanges::Range> replaced_mappings;
-	auto restore_mappings = [&](size_t count, bool restore_views) {
-		for (size_t index = 0; index < count; ++index) {
-			const auto& old = replaced_mappings[index];
-			if (restore_views) {
-				VirtualMemory::Mode old_mode = VirtualMemory::Mode::NoAccess;
-
-				EXIT_IF(!DecodeMemoryProtection(old.protection, &old_mode));
-				EXIT_IF(
-				    !g_guest_address_space->MapBacking(old.start, old.size, old.offset, old_mode));
-			}
-			EXIT_IF(!g_physical_memory->Map(old.start, old.offset, old.size));
-		}
-		MapGpuRange(in_addr, len);
 	};
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
@@ -2382,28 +2355,19 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-		std::vector<VirtualRanges::Range> reserved_ranges;
-		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
-		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
-			    return range.type == VirtualRangeType::Direct;
-		    })) {
-			replaced_mappings = std::move(reserved_ranges);
+		if (g_virtual_ranges->QuerySpan(in_addr, len, &replaced) &&
+		    std::all_of(replaced.begin(), replaced.end(),
+		                [](const auto& range) { return range.type == VirtualRangeType::Direct; })) {
 			UnmapGpuRange(in_addr, len);
-			for (size_t index = 0; index < replaced_mappings.size(); ++index) {
-				const auto& old = replaced_mappings[index];
-				if (!g_physical_memory->Unmap(old.start, old.size)) {
-					restore_mappings(index, false);
-					return KERNEL_ERROR_EBUSY;
-				}
+			for (const auto& old: replaced) {
+				EXIT_IF(!g_physical_memory->Unmap(old.start, old.size));
 			}
 			// Keep the old view accessible until mmap atomically replaces it. In particular,
 			// do not publish a temporary reserved/PROT_NONE range between two direct views.
-			if (!map_shared_fixed(in_addr)) {
-				restore_mappings(replaced_mappings.size(), true);
-				return KERNEL_ERROR_ENOMEM;
-			}
+			EXIT_IF(!map_shared_fixed(in_addr));
+			replaced_type  = VirtualRangeType::Direct;
+			replace_target = true;
 			out_addr       = in_addr;
-			shared_backing = true;
 		} else
 #endif
 		{
@@ -2414,10 +2378,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				}
 			}
 			UnmapGpuRange(in_addr, len);
-			reserved_target = true;
+			replace_target = true;
 			if (map_shared_fixed(in_addr)) {
-				out_addr       = in_addr;
-				shared_backing = true;
+				out_addr = in_addr;
 			}
 		}
 	} else {
@@ -2425,18 +2388,16 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		alignment                          = (alignment != 0 ? alignment : DEFAULT_ALIGNMENT);
 		if (in_addr != 0 && IsReservedSpan(in_addr, len)) {
 			UnmapGpuRange(in_addr, len);
-			reserved_target = true;
+			replace_target = true;
 			if (map_shared_fixed(in_addr)) {
-				out_addr       = in_addr;
-				shared_backing = true;
+				out_addr = in_addr;
 			}
 		}
-		if (!reserved_target) {
+		if (!replace_target) {
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
 				UnmapGpuRange(out_addr, len);
-				shared_backing = map_shared_fixed(out_addr);
-				if (!shared_backing) {
+				if (!map_shared_fixed(out_addr)) {
 					out_addr = 0;
 				}
 			}
@@ -2445,11 +2406,6 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 
 	*addr = reinterpret_cast<void*>(out_addr);
 
-	const char* shared_reason = "n/a";
-	if (!shared_backing) {
-		shared_reason = GuestBackingStore::GetFailureReasonName(shared_failure);
-	}
-
 	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
 	     "\t out_addr = 0x%016" PRIx64 "\n"
 	     "\t dmem     = 0x%016" PRIx64 "\n"
@@ -2457,11 +2413,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	     "\t mode     = %s\n"
 	     "\t flags    = 0x%08" PRIx32 "\n"
 	     "\t align    = 0x%016" PRIx64 "\n"
-	     "\t shared   = %s\n"
 	     "\t reason   = %s\n",
 	     in_addr, out_addr, static_cast<uint64_t>(direct_memory_start), len,
 	     magic_enum::enum_name(mode), static_cast<uint32_t>(flags), alignment,
-	     shared_backing ? "yes" : "no", shared_reason);
+	     GuestBackingStore::GetFailureReasonName(shared_failure));
 
 	if (out_addr == 0) {
 		return KERNEL_ERROR_ENOMEM;
@@ -2470,40 +2425,26 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	PhysicalMemory::AllocatedBlock mapped_block {};
 	g_physical_memory->Find(direct_memory_start, &mapped_block);
 	const int memory_type = type == -1 ? mapped_block.memory_type : type;
-	if (!g_physical_memory->Map(out_addr, direct_memory_start, len)) {
-		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
-		if (replaced_mappings.empty()) {
-			EXIT_IF(!g_guest_address_space->UnmapBacking(out_addr, len));
-		} else {
-			restore_mappings(replaced_mappings.size(), true);
-		}
-		return KERNEL_ERROR_EBUSY;
-	}
-
-	const bool published = !replaced_mappings.empty() || reserved_target
-	                           ? g_virtual_ranges->ReplaceSpan(
-	                                 out_addr, len, replaced_mappings.empty()
-	                                                    ? VirtualRangeType::Reserved
-	                                                    : VirtualRangeType::Direct,
-	                                 direct_memory_start,
-	                                 prot, memory_type, VirtualRangeType::Direct, name)
-	                           : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot,
-	                                                   memory_type,
-	                                                   VirtualRangeType::Direct, name);
-	if (!published) {
-		EXIT_IF(!g_physical_memory->Unmap(out_addr, len));
-		if (replaced_mappings.empty()) {
-			EXIT_IF(!g_guest_address_space->UnmapBacking(out_addr, len));
-		} else {
-			restore_mappings(replaced_mappings.size(), true);
-		}
-		return KERNEL_ERROR_EBUSY;
-	}
+	// CanMapDirect and the target were validated under this lock.
+	EXIT_IF(!g_physical_memory->Map(out_addr, direct_memory_start, len));
+	const bool published =
+	    replace_target
+	        ? g_virtual_ranges->ReplaceSpan(out_addr, len, replaced_type, direct_memory_start, prot,
+	                                        memory_type, VirtualRangeType::Direct, name)
+	        : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot, memory_type,
+	                                VirtualRangeType::Direct, name);
+	EXIT_IF(!published);
 
 	MapGpuRange(out_addr, len);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
+	}
+	// The replaced views stay accessible until here, so their callbacks follow the new one.
+	if (g_free_callback != nullptr && replaced_type == VirtualRangeType::Direct) {
+		for (const auto& old: replaced) {
+			g_free_callback(old.start, old.size);
+		}
 	}
 
 	LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
@@ -2530,22 +2471,28 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
 	constexpr uint64_t                    page_size = 0x4000;
 	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
 
+	VirtualMemory::Mode mode = VirtualMemory::Mode::NoAccess;
+	if (!DecodeMemoryProtection(prot, &mode)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if ((prot & PROT_CPU_EXEC) != 0) {
+		return KERNEL_ERROR_EACCES;
+	}
 	PhysicalMemory::PhysicalRanges ranges;
 	if (!g_physical_memory->ReserveAutomatic(size, &ranges)) {
 		return KERNEL_ERROR_EAGAIN;
 	}
+	const int result = ReplaceFixedRangeWithReserved(vaddr, size);
+	if (result != OK) {
+		g_physical_memory->RestoreAutomatic(ranges);
+		return result;
+	}
+	// The pieces map into the validated reservation.
 	uint64_t mapped = 0;
 	for (const auto& [offset, length]: ranges) {
-		void*     address = reinterpret_cast<void*>(vaddr + mapped);
-		const int result  = MapDirectMemory(&address, length, prot, 0x10,
-		                                    static_cast<int64_t>(offset), page_size, "", type);
-		if (result != OK) {
-			if (mapped != 0) {
-				EXIT_IF(UnmapMemory(vaddr, mapped) != OK);
-			}
-			g_physical_memory->RestoreAutomatic(ranges);
-			return result;
-		}
+		void* address = reinterpret_cast<void*>(vaddr + mapped);
+		EXIT_IF(MapDirectMemory(&address, length, prot, 0x10, static_cast<int64_t>(offset),
+		                        page_size, "", type) != OK);
 		mapped += length;
 	}
 	return OK;
@@ -2702,10 +2649,6 @@ void TestFailNextPhysicalMemoryUnmap() {
 
 void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
 	g_test_physical_memory_unmaps_before_failure = successful_unmaps;
-}
-
-void TestFailNextVirtualRangeReplacement() {
-	g_test_fail_next_range_replace = true;
 }
 
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {

@@ -4221,10 +4221,9 @@ public:
 
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest
-    // memory, and guest accesses wait for the copy; a plain rewrite, a rewrite
-    // after a CPU write beside the image, or an image larger than the download
-    // ring, is not copied. Without it, a GL2 writeback copies nothing and a
-    // download blocks no access.
+    // memory, and guest accesses wait for the copy; a plain rewrite or a
+    // rewrite after a CPU write beside the image is not copied. Without it, a
+    // GL2 writeback copies nothing and a download blocks no access.
     {
       constexpr uint64_t storage_address = fault_base + 0x10000;
       constexpr uint64_t storage_off_address = fault_base + 0x20000;
@@ -4362,8 +4361,8 @@ public:
         TextureCacheTestAccess::DeleteImage(texture_cache, half_buffered);
         (void)shader_write(large_address, {2048, 2304, 1});
         Require("GpuCommandLane", "storage readback past the download ring",
-                release(1u << 9u, large_address, stale),
-                "an image larger than the download ring was read back");
+                release(1u << 9u, large_address, written),
+                "an image larger than the download ring was not read back");
         // Without storage readback, an image enrolled for linear readback is
         // copied back at the suspend point only, without trapping its pages.
         TextureCacheTestAccess::SetStorageReadback(texture_cache, false);

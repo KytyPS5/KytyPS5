@@ -93,6 +93,13 @@ private:
 		int32_t layer = -1;
 	};
 
+	// Byte range of a registered image, kept apart from Image so lookups read 16 dense bytes
+	// instead of a large object. An unregistered slot holds an empty span.
+	struct ImageSpan {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
@@ -123,8 +130,13 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
-	// Caller holds m_lock; it also serializes Image::picked.
+	// Caller holds m_lock. Walks the page owners and tests overlap against m_image_spans, so no
+	// Image object is read or written. Results are page-major, then in registration order.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size) const;
+	// Same walk with an optional count of span overlap tests, which the tests use to prove each
+	// owner is tested at most once.
+	[[nodiscard]] ImageIds      FindImagesInRegionCounted(uint64_t address, uint64_t size,
+	                                                      uint64_t* overlap_tests) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -167,6 +179,8 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// Indexed by ImageId. Written only by RegisterImage and UnregisterImage, under m_lock.
+	std::vector<ImageSpan>                            m_image_spans;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

@@ -215,6 +215,10 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	if (id.index >= m_image_spans.size()) {
+		m_image_spans.resize(id.index + 1);
+	}
+	m_image_spans[id.index] = {image.info.data.address, image.info.data.End()};
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -230,6 +234,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_spans[id.index] = {};
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
@@ -403,28 +408,42 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 }
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size) const {
+	return FindImagesInRegionCounted(address, size, nullptr);
+}
+
+TextureCache::ImageIds TextureCache::FindImagesInRegionCounted(uint64_t address, uint64_t size,
+                                                               uint64_t* overlap_tests) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return {};
 	}
 
-	ImageIds result;
-	ForEachPage(address, size, [&](uint64_t page) {
+	// A bigger image owns every page it spans, so it shows up once per page. Only its first page
+	// in the walk is a first sighting. On a later page, an owner that begins before the page was
+	// already on the page before it. It overlaps the range there, since both boundary bytes lie
+	// inside the range, so it is already in the result. That makes the check O(1) per owner.
+	const uint64_t end = address + size;
+	ImageIds       result;
+	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		const auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr) {
-			return;
+			continue;
 		}
+		const uint64_t page_begin = static_cast<uint64_t>(page) << ImagePageTable::kPageBits;
+		const bool     first_page = page == pages.first;
 		owners->ForEach([&](ImageId id) {
-			const auto& image = m_slot_images[id];
-			if (image.picked || !image.Overlaps(address, size)) {
+			const auto& span = m_image_spans[id.index];
+			// Already accepted on an earlier walked page.
+			if (!first_page && span.begin < page_begin) {
 				return;
 			}
-			image.picked = true;
-			result.push_back(id);
+			if (overlap_tests != nullptr) {
+				++*overlap_tests;
+			}
+			if (span.begin < end && address < span.end) {
+				result.push_back(id);
+			}
 		});
-	});
-	for (const auto id: result) {
-		m_slot_images[id].picked = false;
 	}
 	return result;
 }

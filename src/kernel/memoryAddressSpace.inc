@@ -293,17 +293,25 @@ public:
 			std::lock_guard lock(m_mutex);
 			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
 		}
-		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size));
-
 		const uint64_t left_size  = vaddr - old.vaddr;
 		const uint64_t right_addr = vaddr + size;
 		const uint64_t right_size = old.vaddr + old.size - right_addr;
+		// Re-mapping resets the survivors to the view's mode, so the protections guest mprotect and
+		// write tracking set on them are re-applied afterwards.
+		std::vector<MEMORY_BASIC_INFORMATION> protections;
+		QueryProtections(old.vaddr, left_size, old.mode, &protections);
+		QueryProtections(right_addr, right_size, old.mode, &protections);
+
+		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size));
 		EXIT_IF(left_size != 0 && !SplitPlaceholder(old.vaddr, left_size));
 		EXIT_IF(right_size != 0 && !SplitPlaceholder(vaddr, size));
 		EXIT_IF(left_size != 0 && !MapFixed(old.vaddr, left_size, old.backing_offset, old.mode));
 		EXIT_IF(right_size != 0 &&
 		        !MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
 		                  old.mode));
+		for (const auto& info: protections) {
+			EXIT_IF(!ApplyProtection(info.BaseAddress, info.RegionSize, info.Protect));
+		}
 	}
 #endif
 
@@ -372,9 +380,24 @@ private:
 		}
 	}
 
-	static bool ApplyProtection(void* ptr, uint64_t size, VirtualMemory::Mode mode) {
+	// Collects the page runs of the span whose protection differs from the view's mode.
+	static void QueryProtections(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+	                             std::vector<MEMORY_BASIC_INFORMATION>* out) {
+		const auto end = vaddr + size;
+		for (auto addr = vaddr; addr < end;) {
+			MEMORY_BASIC_INFORMATION info {};
+			EXIT_IF(VirtualQuery(reinterpret_cast<void*>(addr), &info, sizeof(info)) == 0);
+			info.RegionSize = std::min<SIZE_T>(info.RegionSize, end - addr);
+			if (info.Protect != GetProtect(mode)) {
+				out->push_back(info);
+			}
+			addr += info.RegionSize;
+		}
+	}
+
+	static bool ApplyProtection(void* ptr, uint64_t size, DWORD protect) {
 		DWORD old_protect = 0;
-		return VirtualProtect(ptr, size, GetProtect(mode), &old_protect) != 0;
+		return VirtualProtect(ptr, size, protect, &old_protect) != 0;
 	}
 
 	static bool SplitPlaceholder(uint64_t vaddr, uint64_t size) {
@@ -397,7 +420,7 @@ private:
 			return false;
 		}
 
-		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
+		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, PAGE_NOACCESS)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return false;

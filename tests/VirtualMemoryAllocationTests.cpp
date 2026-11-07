@@ -2308,11 +2308,14 @@ void TestFixedArenaChurnKeepsRangesExact() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void TestPartialUnmapPreservesHostPermissions() {
-	const char* test = "PartialUnmapPreservesHostPermissions";
+	const char* test     = "PartialUnmapPreservesHostPermissions";
+	const auto  mappings = Libs::LibKernel::Memory::TestFlexibleMappingCount();
 	const auto base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
 	                                   "unmap_host_permissions");
+	Check(test, Libs::LibKernel::Memory::TestFlexibleMappingCount() == mappings + 1,
+	      "the mapping is split into several backing views");
 	using Common::VirtualMemory::Mode;
 	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
 	      "could not protect the left survivor from writes");
@@ -2324,6 +2327,15 @@ void TestPartialUnmapPreservesHostPermissions() {
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(middle)");
 
+	ExpectHostReadOnly(test, base);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION right {};
+	Check(test,
+	      VirtualQuery(reinterpret_cast<void*>(base + SceKernelPageSize * 2), &right,
+	                   sizeof(right)) != 0 &&
+	          right.Protect == PAGE_NOACCESS,
+	      "partial unmap removed the right survivor's read protection");
+#else
 	// Probe actual host access without taking a signal or changing the page protections.
 	uint64_t value = 0;
 	iovec local {&value, sizeof(value)};
@@ -2331,10 +2343,9 @@ void TestPartialUnmapPreservesHostPermissions() {
 	iovec right {reinterpret_cast<void*>(base + SceKernelPageSize * 2), sizeof(value)};
 	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value),
 	      "partial unmap removed read access to the left survivor");
-	Check(test, process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1,
-	      "partial unmap removed the left survivor's write protection");
 	Check(test, process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
 	      "partial unmap removed the right survivor's read protection");
+#endif
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
 	        "KernelMunmap(left cleanup)");
@@ -5881,7 +5892,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 	RunTest(TestDirectTrimmedAliasRelease);
 	RunTest(TestFixedArenaChurnKeepsRangesExact);
-#if defined(__linux__)
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPartialUnmapPreservesHostPermissions);
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

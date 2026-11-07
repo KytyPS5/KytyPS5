@@ -495,6 +495,14 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	return ballot;
 }
 
+uint32_t ValueEmitContext::BallotOf(uint32_t predicate) {
+	// A wide wave32 context never has a peer half, so the hardware ballot is one instruction.
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+	return ballot;
+}
+
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	// An empty ballot (EXEC zero) gives lane 0, which V_READFIRSTLANE reads on hardware. FindILsb
 	// returns -1 for zero, unlike BallotFindLSB, whose result is then undefined.
@@ -514,6 +522,13 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	return Select(state, TypeU32(state),
 	              Binary(state, spv::OpINotEqual, TypeBool(state), low, ConstantU32(state, 0)),
 	              low_first, high_lane);
+}
+
+uint32_t ValueEmitContext::HalfBallotWord(uint32_t ballot) {
+	// Ballot word N holds native lanes 32N..32N+31; a 32-lane guest wave lives in one word.
+	const auto word = EmitBinaryU32(state, spv::OpShiftRightLogical,
+	                                EmitSubgroupLocalInvocationId(state), ConstantU32(state, 5));
+	return EmitNative<spv::OpVectorExtractDynamic, IR::Type::U32>(state, ballot, word);
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {

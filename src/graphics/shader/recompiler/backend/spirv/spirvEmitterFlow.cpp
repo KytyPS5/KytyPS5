@@ -819,6 +819,17 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.other_half != nullptr) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
+	} else if (ctx.state.program.wave_size == 32u && ctx.state.host_subgroup_size != 32u) {
+		// A 32-lane guest wave shares its 64-lane native subgroup with another wave, which may be
+		// at a different instruction: the vote must only see the caller's ballot word.
+		const auto word = ctx.HalfBallotWord(ctx.Ballot(inst.Arg(0)));
+		if (!zero) {
+			return EmitNative<spv::OpINotEqual, IR::Type::U1>(ctx.state, word,
+			                                                  ConstantU32(ctx.state, 0));
+		}
+		const auto active = ctx.HalfBallotWord(ctx.Ballot(IR::Value(true)));
+		const auto yes    = EmitBinaryU32(ctx.state, spv::OpBitwiseAnd, word, active);
+		return EmitNative<spv::OpIEqual, IR::Type::U1>(ctx.state, yes, active);
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
@@ -854,6 +865,16 @@ static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& ins
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
 		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	} else if (state.program.wave_size == 32u && state.host_subgroup_size != 32u) {
+		// The other half of the native subgroup belongs to a different guest wave, so reduce this
+		// wave with a shuffle butterfly over the five lane bits of its half.
+		const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+		for (const uint32_t mask : {1u, 2u, 4u, 8u, 16u}) {
+			const auto shuffled = EmitNative<spv::OpGroupNonUniformShuffleXor, IR::Type::U32>(
+			    state, scope, value, ConstantU32(state, mask));
+			value = Combine(state, value, shuffled);
+		}
+		return value;
 	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(Reduce, TypeU32(state), result,

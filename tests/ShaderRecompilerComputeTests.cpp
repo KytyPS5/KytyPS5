@@ -20934,6 +20934,37 @@ public:
       }
       registers.SetTargetOutputMode(0, 4);
 
+      // An empty screen scissor resolves no target: No Man's Sky's last 0x0
+      // reduction pass draws to a mip past the target's last level.
+      registers.SetColorAttrib2(3, {.height = extent - 1, .width = extent - 1,
+                                    .num_mip_levels = 1});
+      registers.SetColorView(3, {.current_mip_level = 2});
+      registers.SetScreenScissor(0, 0, 0, 0);
+      RenderExecutorTestAccess::DrawAuto(
+          executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      // Vertex-stage buffer writes still run, so that draw resolves the target.
+      ExpectFatal("EmptyScissorVertexBufferWrite", [&] {
+        auto code = native_vertex;
+        code.insert(code.end() - 1, {EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 0)});
+        shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(code.data()));
+        ShaderMapUserData(shaders.GetVs().es_regs.data_addr,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        shaders.SetGsShaderResource2({.user_sgpr = 4});
+        shaders.SetGsUserSgpr(0, static_cast<u32>(index_address));
+        shaders.SetGsUserSgpr(1, static_cast<u32>(index_address >> 32u));
+        shaders.SetGsUserSgpr(2, 16);
+        shaders.SetGsUserSgpr(3, DstSel(4, 5, 6, 7) |
+                                     (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u));
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      });
+#endif
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetColorView(3, {});
+      registers.SetColorAttrib2(3, {.height = extent - 1, .width = extent - 1});
+
       // Indirect arguments also reach s8/s9. Native VS prologs must add them
       // exactly once, for both indexed and automatically generated indices.
       static const auto indirect_vertex = [&] {

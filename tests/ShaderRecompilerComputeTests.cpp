@@ -16455,6 +16455,30 @@ public:
                     std::vector<uint32_t>{1, 1},
                 "query/store did not access the standalone 1x1 mip");
       }
+      {
+        // No Man's Sky compresses mip 1 through a T# that declares one level.
+        constexpr uint64_t address = base + 0x400000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc3e00000u, 0x003fc03fu, 0xd051102cu, 0, 0x00700000u, 0, 0};
+        descriptor.dword_count = 8;
+        const auto store =
+            RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, descriptor);
+        Require(name, "mip view past MAX_MIP",
+                store.desc.info.extent.width == 128 &&
+                    store.desc.info.extent.height == 128 &&
+                    store.desc.info.resources.levels == 1 &&
+                    store.desc.info.data.size == 0x20000 &&
+                    store.desc.view_info.base_level == 0,
+                "a view past MAX_MIP did not rebase to its own 128x128 chain");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+        ExpectFatal("TailMipViewPastMaxMip", [&] {
+          auto tail = descriptor;
+          tail.dwords[3] = 0xd054402cu;
+          (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, tail);
+        });
+#endif
+      }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);

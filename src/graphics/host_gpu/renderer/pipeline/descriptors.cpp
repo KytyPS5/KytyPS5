@@ -422,7 +422,14 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	if (!info.IsTiled()) {
 		return false;
 	}
-	ImageInfo physical        = info;
+	ImageInfo physical = info;
+	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
+	// compresses mip 1 through a T# that declares one level).
+	if (base_level >= physical_levels) {
+		const auto mip  = info.MipExtent(base_level);
+		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
+		physical_levels = view_levels;
+	}
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
 	info.UpdateSize();

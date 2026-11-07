@@ -32706,10 +32706,11 @@ TestCase VectorCompareClassF32ImmediateAndDynamicMasks(u32 wave) {
   using O = ShaderOpcode;
   // One input for each architectural class bit, in bit order.
   constexpr std::array<u32, 10> values{
-      0x7f800001u, 0x7fc00001u, 0xff800000u, 0xbf800000u, 0x80000001u,
+      0x7f800001u, 0x7fc00000u, 0xff800000u, 0xbf800000u, 0x80000001u,
       0x80000000u, 0x00000000u, 0x00000001u, 0x3f800000u, 0x7f800000u};
-  constexpr std::array<u32, 8> masks{
-      0u, 0x3ffu, 3u, 7u, 0xfffffc00u, 0xffffffffu, 0xfffffc03u, 0xfffffc07u};
+  constexpr std::array<u32, 10> masks{
+      0u, 0x3ffu,      1u,          2u,          3u,
+      7u, 0xfffffc00u, 0xffffffffu, 0xfffffc03u, 0xfffffc07u};
   TestCase test;
   test.name = "VectorCompareClassF32ImmediateAndDynamicMasks";
   test.has_compute_info = true;

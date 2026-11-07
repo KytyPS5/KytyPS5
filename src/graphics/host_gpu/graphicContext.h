@@ -33,6 +33,7 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	bool                               denorm_preserve_f32                   = false;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;

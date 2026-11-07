@@ -28,9 +28,7 @@ struct HostCapabilities {
 	bool depth_clamp          = false;
 	// Depth clipping can be set apart from depth clamping (VK_EXT_depth_clip_enable).
 	bool depth_clip_enable = false;
-	// Colour writes can be turned off per attachment at draw time (VK_EXT_color_write_enable).
-	bool color_write_enable = false;
-	bool mesh_shader        = false;
+	bool mesh_shader       = false;
 	// Derivatives in compute shaders, over 2x2 groups of invocations
 	// (VK_KHR_compute_shader_derivatives).
 	bool compute_derivatives = false;
@@ -52,6 +50,16 @@ struct HostCapabilities {
 	// VK_KHR_maintenance8: images can be copied between depth and color formats, and a sample
 	// can take a texel offset that is not a constant.
 	bool maintenance8 = false;
+	// A storage buffer access out of its bounds reads zero and writes nothing, at the granularity
+	// of one element (robustBufferAccess2 with robustStorageBufferAccessSizeAlignment 1). The
+	// shaders then need no bounds checks of their own.
+	bool robust_buffer_access = false;
+	// R8 and R8G8 images can have sRGB views (VK_FORMAT_R8_SRGB, VK_FORMAT_R8G8_SRGB as sampled
+	// formats). Without them the shader decodes sRGB itself.
+	bool r8_srgb_views   = false;
+	bool r8g8_srgb_views = false;
+	// A sampler can return the minimum or maximum of its texels (samplerFilterMinmax).
+	bool sampler_filter_minmax = false;
 	// The tick of the device clock (shaderDeviceClock) in picoseconds, for S_MEMREALTIME; 0 when
 	// the device has no such clock.
 	uint32_t device_clock_period_ps = 0;
@@ -90,7 +98,6 @@ struct HostCapabilities {
 		all.depth_bounds              = true;
 		all.depth_clamp               = true;
 		all.depth_clip_enable         = true;
-		all.color_write_enable        = true;
 		all.mesh_shader               = true;
 		all.compute_derivatives       = true;
 		all.push_descriptors          = true;
@@ -100,6 +107,10 @@ struct HostCapabilities {
 		all.compute_subgroup_size_control = true;
 		all.block_texel_view              = true;
 		all.maintenance8                  = true;
+		all.robust_buffer_access          = true;
+		all.r8_srgb_views                 = true;
+		all.r8g8_srgb_views               = true;
+		all.sampler_filter_minmax         = true;
 		all.draw_indirect_first_instance  = true;
 		all.subgroup_supported_stages     = ~0u;
 		all.subgroup_supported_operations = ~0u;

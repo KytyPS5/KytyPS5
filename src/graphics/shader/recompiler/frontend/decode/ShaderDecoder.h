@@ -559,6 +559,7 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
 	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
 	BUFFER_LOAD_FORMAT_D16_XY,
 	BUFFER_LOAD_FORMAT_D16_XYZ,
 	BUFFER_LOAD_FORMAT_D16_XYZW,
@@ -573,7 +574,10 @@ enum class Opcode {
 	BUFFER_STORE_FORMAT_D16_XYZW,
 	BUFFER_LOAD_UBYTE,
 	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
 	BUFFER_LOAD_SBYTE,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
 	BUFFER_LOAD_SHORT_D16,
@@ -751,6 +755,7 @@ enum class Opcode {
 	S_TRAP,
 	S_TTRACEDATA,
 	S_INST_PREFETCH,
+	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
 	COUNT
@@ -873,6 +878,7 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
 	// The address a linked call returns to, when its own PC is not the call's in the guest code.
 	uint32_t       return_pc                                    = UINT32_MAX;

@@ -14,8 +14,8 @@ void Check(bool condition, const char* message) {
 
 std::array<Sint16, 2> physical_stick {};
 std::array<int, 2>    guest_stick {128, 128};
-uint32_t             guest_buttons = 0;
-bool                 guest_touch   = false;
+uint32_t              guest_buttons = 0;
+bool                  guest_touch   = false;
 } // namespace
 
 namespace Fake {

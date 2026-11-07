@@ -5,7 +5,6 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Block.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
@@ -75,6 +74,7 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	bool                    image_cube                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
@@ -104,30 +104,25 @@ struct MemoryInfo {
 enum class ExportTargetKind { Unknown, Null, Position, Primitive, Parameter, Mrt, MrtZ };
 
 struct ExportInfo {
-	ExportTargetKind kind   = ExportTargetKind::Unknown;
-	uint32_t         target = 0;
-	uint32_t         index  = 0;
-	uint32_t         en     = 0;
-	bool             done   = false;
-	bool             compr  = false;
-	bool             vm     = false;
+	ExportTargetKind kind  = ExportTargetKind::Unknown;
+	uint32_t         index = 0;
+	uint32_t         en    = 0;
+	bool             compr = false;
+	bool             vm    = false;
 
 	bool operator==(const ExportInfo& other) const = default;
 };
 
 struct BufferResource {
-	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
-	uint32_t               write_extent       = 0; // UINT32_MAX once a write is runtime-addressed or formatted
 	uint32_t               packed_stride      = 0;
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
-	uint32_t               image_alias        = NoImageAlias;
 	bool                   read               = false;
 	bool                   written            = false;
 	bool                   atomic             = false;
@@ -159,12 +154,14 @@ struct ImageResource {
 	uint32_t                      mip_count         = 1;
 	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
+	Prospero::BufferFormat        srgb_decode       = Prospero::BufferFormat::kInvalid;
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
 	bool                          depth_compare     = false;
+	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
@@ -381,6 +378,9 @@ struct PushData {
 	// Depth bounds test of a pixel shader: depth buffer copy address (two dwords), row width in
 	// pixels, minimum and maximum bound as float bits.
 	static constexpr uint32_t        DepthBoundsDwordCount = 5;
+	// Indirect mesh draws read the draw parameters, then the record's first instance, from the
+	// task payload (gpu_mesh_indirect.task).
+	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -541,6 +541,7 @@ struct ShaderInfo {
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
+	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
@@ -605,7 +606,11 @@ struct DescriptorSource {
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
+			// V#-strided reads select records first_record + k * record_step.
+			uint32_t first_record = 0;
+			uint32_t record_step = 1;
 			uint32_t maximum = UINT32_MAX;
+			bool non_negative = false; // Signed-negative fields read as zero before the maximum.
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
 			bool global = false;
@@ -676,18 +681,16 @@ struct ResourceBlock {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
-	ShaderType                    stage               = ShaderType::Unknown;
-	uint64_t                      shader_hash         = 0;
-	uint32_t                      wave_size           = 64;
-	uint32_t                      user_data_base      = 0;
-	uint32_t                      user_data_count     = 64;
-	uint32_t                      scratch_dwords      = 0;
-	uint32_t                      param_export_mask   = 0;
-	bool                          has_address_writes  = false;
+	ShaderType stage              = ShaderType::Unknown;
+	uint64_t   shader_hash        = 0;
+	uint32_t   wave_size          = 64;
+	uint32_t   user_data_base     = 0;
+	uint32_t   param_export_mask  = 0;
+	bool       has_address_writes = false;
 	// A mesh program compiled as a compute shader (see capturedVertexLayout.h).
-	bool                          mesh_emulated = false;
-	ShaderInfo                    info;
-	Bindings                      bindings;
+	bool       mesh_emulated = false;
+	ShaderInfo info;
+	Bindings   bindings;
 };
 
 struct UniformFillPlan {
@@ -761,8 +764,6 @@ struct Program: ResourcePlan {
 	bool                          dispatcher_fallback = false;
 	// The shader has a DS_ORDERED_COUNT: it adds once per wave, so it needs real waves.
 	bool                          uses_ordered_count  = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
-	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
@@ -780,7 +781,7 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
-void  ValidateProgram(const Program& program, bool require_ssa);
+void  ValidateProgram(const Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,

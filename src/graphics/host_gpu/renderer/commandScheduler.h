@@ -195,8 +195,7 @@ private:
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
-	bool                         m_priority_active      = false;
-	uint64_t                     m_priority_active_tick = 0;
+	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	OperationState               m_operation_state      = OperationState::Open;
 };
 

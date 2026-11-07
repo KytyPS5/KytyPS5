@@ -65,7 +65,7 @@ void GraphicContext::LogMemoryBudget() const {
 		return;
 	}
 
-	const auto& properties = GetPhysicalDeviceMemoryProperties();
+	const auto& properties = physical_device_memory_properties;
 	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {

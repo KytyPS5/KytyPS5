@@ -23,9 +23,7 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics)
 }
 
 MasterSemaphore::~MasterSemaphore() {
-	if (m_semaphore != nullptr) {
-		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
-	}
+	m_graphics.device.destroySemaphore(m_semaphore, nullptr);
 }
 
 vk::Fence MasterSemaphore::FenceOps::Create() const {

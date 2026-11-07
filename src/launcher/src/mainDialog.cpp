@@ -286,7 +286,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
 	AddFlag(args, info.shader_validation_enabled, "--shader-validation");
-	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
 	if (!info.pipeline_cache_folder.isEmpty()) {
@@ -299,6 +298,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.pro_enabled, "--trinity");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
+	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)
 	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif

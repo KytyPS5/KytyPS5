@@ -76,6 +76,14 @@ names=(
 	video_out_resolution
 	virtual_memory_allocation
 	write_heat
+	ajm_resample
+	common
+	jpeg_dec
+	jpeg_enc
+	net_resolver
+	occlusion_queries
+	psml
+	rtc
 )
 
 # Registered ctest names that run a binary of the list or the emulator (no target of their own).
@@ -87,6 +95,7 @@ ctest_only=(
 	emulator_video_out_resolution_cli
 	emulator_video_out_resolution_invalid
 	guest_red_zone_patcher
+	trinity_mode
 )
 
 # Tests that need a GPU. CI builds shader_recompiler_compute_tests but its runners have no GPU to
@@ -119,6 +128,19 @@ local_only=(
 	texture_cache_image_views
 	texture_cache_layered_image
 	texture_cache_storage_sampled
+	depth_bits
+	device_creation
+	msaa_storage
+	pm4_flip
+	pssr
+	shader_recompiler_float_min_max
+	shader_recompiler_integer16_ternary
+	shader_recompiler_mad_u16
+	shader_recompiler_mul_hi24
+	shader_recompiler_quadmask
+	shader_recompiler_vop3_conversions
+	srgb_texture
+	video_out_hdr10_to_sdr
 )
 
 # Tests that only some platforms build, given as extras by the jobs that build them.

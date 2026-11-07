@@ -211,6 +211,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setAllColumnsShowFocus(true);
 	m_ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
 	m_ui->cfgs_list->setIconSize(QSize(48, 48));
+	m_ui->cfgs_list->setItemDelegateForColumn(GAME_NAME_COLUMN,
+	                                          new GameListNameDelegate(m_ui->cfgs_list));
 	m_ui->cfgs_list->setUniformRowHeights(true);
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
@@ -482,6 +484,7 @@ struct GameMetadata {
 	QString title_id;
 	QString gameVersion;
 	QString firmwareVer;
+	bool    pro_supported = false;
 };
 
 static QString GetJsonString(const QJsonObject& obj, const QString& key) {
@@ -575,7 +578,8 @@ static GameMetadata GetGameMetadata(const QByteArray& param_data, const QString&
 	if (ret.gameVersion.isEmpty()) {
 		ret.gameVersion = GetJsonString(root, QStringLiteral("contentVersion"));
 	}
-	ret.firmwareVer = GetFirmwareVersion(root);
+	ret.firmwareVer   = GetFirmwareVersion(root);
+	ret.pro_supported = (root.value(QStringLiteral("attribute3")).toInteger() & (1 << 22)) != 0;
 
 	return ret;
 }
@@ -584,12 +588,13 @@ static void SetGameFiles(Configuration& info, const QString& game_dir, const QSt
                          const GameMetadata& metadata, bool archive) {
 	const QFileInfo game(game_dir);
 
-	info.game_path   = game_path;
-	info.basedir     = archive ? game.absoluteFilePath() : QDir(game_dir).absolutePath();
-	info.name        = metadata.title_name;
-	info.title_id    = metadata.title_id;
-	info.gameVersion = metadata.gameVersion;
-	info.firmwareVer = metadata.firmwareVer;
+	info.game_path     = game_path;
+	info.basedir       = archive ? game.absoluteFilePath() : QDir(game_dir).absolutePath();
+	info.name          = metadata.title_name;
+	info.title_id      = metadata.title_id;
+	info.gameVersion   = metadata.gameVersion;
+	info.firmwareVer   = metadata.firmwareVer;
+	info.pro_supported = metadata.pro_supported;
 
 	if (info.name.isEmpty()) {
 		info.name = archive ? game.completeBaseName() : QDir(game_dir).dirName();

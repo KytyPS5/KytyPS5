@@ -2,9 +2,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
@@ -124,6 +121,7 @@ public:
 
 	int  PoolCreate(const char* name, int size);
 	bool PoolDestroy(int memid);
+	int  PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats);
 	int  ResolverCreate(const char* name, int memid);
 	bool ResolverDestroy(int rid);
 	bool ResolverValid(int rid);
@@ -305,6 +303,22 @@ bool Network::PoolDestroy(int memid) {
 	}
 
 	return false;
+}
+
+int Network::PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
+	Common::LockGuard lock(m_mutex);
+
+	if (memid < 0 || memid >= POOLS_MAX || !m_pools[memid].used) {
+		return NET_ERROR_EBADF;
+	}
+	if (stats == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	// Pool allocations are not tracked; only the configured size is available.
+	*stats = {};
+	stats->pool_size = static_cast<uint64_t>(m_pools[memid].size);
+	return OK;
 }
 
 int Network::ResolverCreate(const char* name, int memid) {
@@ -1582,6 +1596,13 @@ int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->PoolGetMemoryPoolStats(memid, stats);
+}
+
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	PRINT_NAME();
 
@@ -1623,8 +1644,9 @@ int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
-                                       int retry, int flags) {
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+                                                      NetResolverInfo* info, int timeout, int retry,
+                                                      int flags) {
 	PRINT_NAME();
 
 	LOGF("\t rid      = %d\n"
@@ -1634,12 +1656,7 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	     "\t flags    = 0x%08x\n",
 	     rid, hostname != nullptr ? hostname : "<null>", timeout, retry, flags);
 
-	(void)timeout;
-	(void)retry;
-
-	// 0x1: the game asks for an asynchronous lookup. The answer is ready when this call returns.
-	constexpr int resolver_flag_async = 0x00000001;
-	if (hostname == nullptr || addr == nullptr || (flags & ~(0x00010000 | resolver_flag_async)) != 0) {
+	if (hostname == nullptr || info == nullptr || (flags & ~0x00010000) != 0) {
 		return NET_ERROR_EINVAL;
 	}
 
@@ -1648,7 +1665,11 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 		return NET_ERROR_EBADF;
 	}
 
-	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, addr) == 1) {
+	*info = {};
+	if ((flags & 0x00010000) == 0 && NetInetPton(2, hostname, &info->addrs[0].addr) == 1) {
+		info->addrs[0].af = 2;
+		info->records     = 1;
+		info->dns4records = 1;
 		return OK;
 	}
 
@@ -1662,11 +1683,10 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	if (EaEmulation::Port() != 0 && host_view.size() > blaze_suffix.size() &&
 	    host_view.substr(host_view.size() - blaze_suffix.size()) == blaze_suffix) {
 		const uint8_t loopback[4] = {127, 0, 0, 1};
-		std::memcpy(addr, loopback, sizeof(loopback));
-		if ((flags & resolver_flag_async) != 0) {
-			std::swap(static_cast<uint8_t*>(addr)[0], static_cast<uint8_t*>(addr)[3]);
-			std::swap(static_cast<uint8_t*>(addr)[1], static_cast<uint8_t*>(addr)[2]);
-		}
+		std::memcpy(&info->addrs[0].addr, loopback, sizeof(loopback));
+		info->addrs[0].af = 2;
+		info->records     = 1;
+		info->dns4records = 1;
 		return OK;
 	}
 
@@ -1692,25 +1712,44 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
 		if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
 		    ai->ai_addrlen >= sizeof(sockaddr_in)) {
-			const auto* in = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
-			std::memcpy(addr, &in->sin_addr, sizeof(in->sin_addr));
-			if ((flags & resolver_flag_async) != 0) {
-				// Observed with a game of EA: for an asynchronous lookup the game connects to the bytes of the
-				// answer in the reverse order. Not confirmed against a console.
-				std::swap(static_cast<uint8_t*>(addr)[0], static_cast<uint8_t*>(addr)[3]);
-				std::swap(static_cast<uint8_t*>(addr)[1], static_cast<uint8_t*>(addr)[2]);
+			if (info->records < static_cast<int>(std::size(info->addrs))) {
+				NetResolverAddr& out = info->addrs[info->records++];
+				const auto*      in  = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
+				std::memcpy(&out.addr, &in->sin_addr, sizeof(out.addr));
+				out.af = 2;
 			}
-			LOGF("\t resolved = %u.%u.%u.%u\n", static_cast<unsigned>(static_cast<const uint8_t*>(addr)[0]),
-			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[1]),
-			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[2]),
-			     static_cast<unsigned>(static_cast<const uint8_t*>(addr)[3]));
-			freeaddrinfo(result);
-			return OK;
+			info->dns4records++;
 		}
 	}
 
 	freeaddrinfo(result);
-	return NET_ERROR_RESOLVER_ENORECORD;
+	return info->records > 0 ? OK : NET_ERROR_RESOLVER_ENORECORD;
+}
+
+int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
+                                       int retry, int flags) {
+	PRINT_NAME();
+
+	if (addr == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	// 0x1 asks for an asynchronous lookup; the answer is ready when this call returns. A game
+	// reads that answer as a host-order integer (EA's DirtySDK loads it and writes it out high
+	// byte first), so its bytes are the reverse of the network order of a synchronous lookup.
+	constexpr int resolver_flag_async = 0x00000001;
+
+	NetResolverInfo info;
+	const int       ret = NetResolverStartNtoaMultipleRecords(rid, hostname, &info, timeout, retry,
+	                                                          flags & ~resolver_flag_async);
+	if (ret == OK) {
+		uint32_t address = info.addrs[0].addr;
+		if ((flags & resolver_flag_async) != 0) {
+			address = __builtin_bswap32(address);
+		}
+		std::memcpy(addr, &address, sizeof(address));
+	}
+	return ret;
 }
 
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
@@ -4302,6 +4341,7 @@ struct NpCheckPremiumResult {
 
 constexpr int      np_error_invalid_argument            = -2141913085; /* 0x80550003 */
 constexpr int      np_error_signed_out                  = -2141913082; /* 0x80550006 */
+constexpr int      np_error_user_not_found              = -2141913081; /* 0x80550007 */
 constexpr int      np_error_callback_already_registered = -2141913080; /* 0x80550008 */
 constexpr int      np_error_invalid_size                = -2141913071; /* 0x80550011 */
 constexpr int      np_error_aborted                     = -2141913070; /* 0x80550012 */
@@ -4312,6 +4352,7 @@ constexpr int      np_error_network_not_available       = -2141872086; /* 0x8055
 constexpr int      np_request_max                       = 128;
 constexpr uint32_t np_state_signed_out                  = 1;
 constexpr uint32_t np_state_signed_in                   = 2;
+constexpr uint64_t np_account_id                        = 0x00000000feedfaceull;
 
 // A simulated account belongs only to the primary user and survives network loss. A title whose
 // servers the emulator answers itself (libs/eaEmulation) has one too.
@@ -4547,11 +4588,30 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 	*account_id = 0;
 
 	if (IsSignedIn(user_id)) {
-		*account_id = 0x00000000feedfaceull;
+		*account_id = np_account_id;
 		return OK;
 	}
 
 	return np_error_signed_out;
+}
+
+int KYTY_SYSV_ABI NpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
+	PRINT_NAME();
+
+	LOGF("\t account_id = 0x%016" PRIx64 "\n", account_id);
+
+	if (account_id == 0 || user_id == nullptr) {
+		return np_error_invalid_argument;
+	}
+	if (!Config::PsnEmulationEnabled()) {
+		return np_error_signed_out;
+	}
+	if (account_id != np_account_id) {
+		return np_error_user_not_found;
+	}
+
+	*user_id = Config::GetUserId();
+	return OK;
 }
 
 int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {

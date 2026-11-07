@@ -172,6 +172,14 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 		sampler_info.mipLodBias       = 0.0f;
 	}
 
+	// FILTER_MODE 0-2 equal VkSamplerReductionMode; 3 is undefined, compare samplers average.
+	vk::SamplerReductionModeCreateInfo reduction {};
+	if (m_graphics.host.capabilities.sampler_filter_minmax && !sampler_info.compareEnable &&
+	    r.FilterMode() < 3) {
+		reduction.reductionMode = static_cast<vk::SamplerReductionMode>(r.FilterMode());
+	}
+	sampler_info.pNext = &reduction;
+
 	vk::Sampler vk_sampler = nullptr;
 	const auto  result     = m_graphics.device.createSampler(&sampler_info, nullptr, &vk_sampler);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);

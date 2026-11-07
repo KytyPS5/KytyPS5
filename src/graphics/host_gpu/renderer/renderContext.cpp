@@ -1,7 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/timer.h"
@@ -163,10 +162,6 @@ void RenderContext::PrepareBda(bool shader_writes_addresses) {
 		m_texture_cache.DropColorMetadataFills();
 		m_buffer_cache.NoteAddressWrites();
 	}
-	if (!m_bda_logged) {
-		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		m_bda_logged = true;
-	}
 	m_fault_process_pending = true;
 	PerfCounters::Add(PerfCounters::Counter::UploadPasses);
 	// Shaders that read through device addresses can read any cached buffer, so every buffer must
@@ -211,8 +206,7 @@ void RenderContext::FinishList() {
 void RenderContext::RunGarbageCollector() {
 	// Pages the guest stopped rewriting are protected again after a while.
 	constexpr uint64_t CoolPeriodMs = 5000;
-	if (const auto now = Common::Timer::QueryPerformanceCounter() * 1000 /
-	                     Common::Timer::QueryPerformanceFrequency();
+	if (const auto now = Common::SteadyNs() / 1'000'000;
 	    now - m_last_heat_cool_ms >= CoolPeriodMs) {
 		m_last_heat_cool_ms = now;
 		RegionManager::CoolAllRegions();

@@ -43,6 +43,7 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
+// What a command buffer recorded last, for the report of a lost device (SetDebugInfo).
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
@@ -65,25 +66,23 @@ struct DrawIndirectArgs {
 };
 
 struct DrawIndexArgs {
-	uint32_t         index_count                = 0;
-	const void*      index_addr                 = nullptr;
-	uint32_t         instance_count             = 0;
-	uint32_t         index_type_and_size        = 0;
-	int32_t          base_vertex                = 0;
-	uint32_t         first_instance             = 0;
-	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	uint32_t         render_target_slice_offset = 0;
+	uint32_t         index_count         = 0;
+	const void*      index_addr          = nullptr;
+	uint32_t         instance_count      = 0;
+	uint32_t         index_type_and_size = 0;
+	int32_t          base_vertex         = 0;
+	uint32_t         first_instance      = 0;
+	DrawOffsetSource offset_source       = DrawOffsetSource::DrawState;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
-	uint32_t         vertex_count               = 0;
-	uint32_t         instance_count             = 0;
-	uint32_t         first_vertex               = 0;
-	uint32_t         first_instance             = 0;
-	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	uint32_t         render_target_slice_offset = 0;
+	uint32_t         vertex_count   = 0;
+	uint32_t         instance_count = 0;
+	uint32_t         first_vertex   = 0;
+	uint32_t         first_instance = 0;
+	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
 	DrawIndirectArgs indirect;
 };
 
@@ -229,7 +228,7 @@ private:
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
-		std::optional<PreparedBindings> pixel;
+		PreparedBindings                pixel;
 	};
 
 	// Remembered in m_decoded_textures.
@@ -238,15 +237,13 @@ private:
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
-	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
-	                              bool ignore_target_mask = false, bool exact_format = false);
+	                              uint32_t render_target_slot, bool ignore_target_mask = false,
+	                              bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
-	                                          const DrawCallInfo& draw,
-	                                          uint32_t            render_target_slice_offset,
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
 	// The part of PrepareDrawRenderState after the program lookups.
 	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -301,10 +298,8 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
-	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t render_target_slice_offset);
-	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
-	                                                       uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
@@ -314,8 +309,17 @@ private:
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
+	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
+	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
+	struct MipStatsCounter {
+		uint8_t finest_level = 15; // no samples
+		bool    clamped      = false;
+		bool    unclamped    = false;
+	};
+
 	RenderContext&                        m_context;
 	std::unique_ptr<ThreadDimensionDispatch> m_thread_dimensions; // created on first use
+	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	// Created on the first pipelined draw or dispatch (see FrontWorkerEnabled).
@@ -380,9 +384,6 @@ private:
 	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	// CommitBindings: the (address, size) ranges a draw or dispatch writes.
-	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
-	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 	// Dropped whole at the end of a frame when full (bindings point into it): a frame of Crash
 	// Bandicoot 4 decodes about 1,500 different ones, and one image heap of Marvel's Spider-Man 2
 	// holds about 9,000 (a limit below that decoded the whole heap again in every frame).
@@ -406,6 +407,8 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	// Counted at each texture binding (ResolveTexture), for GET_LOD_STATS.
+	std::array<MipStatsCounter, 256> m_mip_stats {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

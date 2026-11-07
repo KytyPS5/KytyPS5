@@ -81,6 +81,10 @@ struct DeviceFacts {
 	bool dynamic_rendering   = false;
 	bool synchronization2    = false;
 	bool subgroup_size_control = false;
+	bool sampler_filter_minmax = false; // Vulkan 1.2 samplerFilterMinmax
+	// R8 and R8G8 sRGB images can be sampled with linear filtering.
+	bool r8_srgb_filtered   = false;
+	bool r8g8_srgb_filtered = false;
 
 	// VkPhysicalDeviceSubgroupSizeControlProperties.
 	uint32_t min_subgroup_size             = 0;
@@ -90,7 +94,6 @@ struct DeviceFacts {
 	bool block_texel_view = false;
 
 	// Features of extensions.
-	bool color_write_enable               = false; // VK_EXT_color_write_enable
 	bool depth_clip_control               = false; // VK_EXT_depth_clip_control
 	bool depth_clip_enable                = false; // VK_EXT_depth_clip_enable
 	bool image_view_min_lod               = false; // VK_EXT_image_view_min_lod
@@ -98,11 +101,15 @@ struct DeviceFacts {
 	bool workgroup_memory_explicit_layout = false; // VK_KHR_workgroup_memory_explicit_layout
 	bool shader_image_int64_atomics       = false; // VK_EXT_shader_image_atomic_int64
 	bool mesh_shader                      = false; // VK_EXT_mesh_shader
+	bool task_shader                      = false; // VK_EXT_mesh_shader
 	bool provoking_vertex_last            = false; // VK_EXT_provoking_vertex
 	bool maintenance8                     = false; // VK_KHR_maintenance8
 	// VK_EXT_attachment_feedback_loop_layout and VK_EXT_attachment_feedback_loop_dynamic_state.
 	bool attachment_feedback_loop_layout        = false;
 	bool attachment_feedback_loop_dynamic_state = false;
+	// robustBufferAccess2 of VK_EXT_robustness2, and the granularity of its storage buffer bounds.
+	bool     robust_buffer_access2                       = false;
+	uint64_t robust_storage_buffer_access_size_alignment = 0;
 	// computeDerivativeGroupQuads of VK_KHR_compute_shader_derivatives.
 	bool compute_derivative_group_quads = false;
 };

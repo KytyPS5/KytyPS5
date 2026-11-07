@@ -22,8 +22,6 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Config::Shutdown;
 };
 
-enum class ShaderOptimizationType { None, Size, Performance };
-
 enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
@@ -73,6 +71,7 @@ struct ConfigOptions {
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
 	bool                   ea_emulation_enabled        = true;
@@ -87,7 +86,6 @@ struct ConfigOptions {
 	bool                   shader_validation_enabled   = false;
 	bool                   pipeline_wait_enabled       = false;
 	bool                   shader_cache_enabled        = false;
-	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	// Empty: the host's per-user cache folder (cacheFolder.h).
@@ -117,6 +115,7 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
+	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -157,6 +156,7 @@ bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
 bool     AmdCpuEnabled();
+bool     GuestTscEnabled();
 bool     IsNetworkConnected();
 // For a title whose servers the emulator answers itself (libs/eaEmulation): its network is reachable.
 void     SetNetworkConnected();
@@ -174,7 +174,6 @@ bool                   ShaderValidationEnabled();
 // Every draw waits for its pipeline to be built, instead of being left out while it builds.
 bool                   PipelineWaitEnabled();
 bool                   ShaderCacheEnabled();
-ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 std::filesystem::path  GetPipelineCacheFolder();
@@ -204,6 +203,7 @@ bool ReadbackTiledImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
+bool LodStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

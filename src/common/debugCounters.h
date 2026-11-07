@@ -47,6 +47,11 @@ enum class Counter {
 	GuestFileReadBytes,
 	GuestFileWriteBytes,
 	AudioUnderruns,
+	// Overlapping host elapsed timings, including waits.
+	GpuThreadBusyNs,
+	PresentNs, // Includes image acquire and overlay preparation.
+	PresentAcquireNs,
+	OverlayNs,
 	Count
 };
 
@@ -75,6 +80,7 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 
 class ScopedTimer final {
 public:
+	explicit ScopedTimer(Counter duration): ScopedTimer(Counter::Count, duration) {}
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
 	      m_start(Enabled() ? std::chrono::steady_clock::now()
@@ -87,7 +93,9 @@ public:
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                              std::chrono::steady_clock::now() - m_start)
 		                              .count());
-		Add(m_count);
+		if (m_count != Counter::Count) {
+			Add(m_count);
+		}
 		Add(m_duration, elapsed);
 		if (m_peak != Peak::Count) {
 			auto& peak     = Detail::g_peaks[static_cast<int>(m_peak)];

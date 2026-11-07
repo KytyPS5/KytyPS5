@@ -114,18 +114,16 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
+bool        ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code);
 // A vector compare or carry-out writes a scalar pair in wave64 and one scalar register in wave32.
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
 // The instruction that defines a scalar register before an instruction on every path to it,
-// UINT32_MAX when that is the entry, or nothing when paths disagree. crossed_calls, if given,
-// receives the calls (S_SWAPPC_B64) the paths pass.
-std::optional<uint32_t> TryFindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                                                uint32_t before, uint32_t code,
-                                                std::vector<uint32_t>* crossed_calls,
-                                                uint32_t wave_size);
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, std::vector<uint32_t>& crossed_calls,
-                              uint32_t wave_size);
+// UINT32_MAX when that is the entry, or nullopt when paths disagree or no definition is found.
+// crossed_calls, if given, receives the calls (S_SWAPPC_B64) the paths pass; a call that may write
+// the register then makes the search fail.
+std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                                             uint32_t before, uint32_t code, uint32_t wave_size,
+                                             std::vector<uint32_t>* crossed_calls = nullptr);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

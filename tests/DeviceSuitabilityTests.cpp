@@ -42,7 +42,7 @@ DeviceFacts FullFacts() {
 	                                                     "VK_EXT_image_view_min_lod",
 	                                                     "VK_KHR_fragment_shader_barycentric",
 	                                                     "VK_KHR_workgroup_memory_explicit_layout",
-	                                                     "VK_EXT_color_write_enable",
+	                                                     "VK_EXT_robustness2",
 	                                                     "VK_EXT_depth_clip_enable",
 	                                                     "VK_EXT_shader_image_atomic_int64",
 	                                                     "VK_EXT_mesh_shader",
@@ -102,7 +102,12 @@ DeviceFacts FullFacts() {
 	f.robust_image_access                             = true;
 	f.dynamic_rendering                               = true;
 	f.synchronization2                                = true;
-	f.color_write_enable                              = true;
+	f.task_shader                                     = true;
+	f.robust_buffer_access2                           = true;
+	f.robust_storage_buffer_access_size_alignment     = 1;
+	f.sampler_filter_minmax                           = true;
+	f.r8_srgb_filtered                                = true;
+	f.r8g8_srgb_filtered                              = true;
 	f.depth_clip_control                              = true;
 	f.depth_clip_enable                               = true;
 	f.image_view_min_lod                              = true;
@@ -130,7 +135,7 @@ DeviceFacts MoltenVkFacts() {
 	f.shader_float64                   = false;
 	f.shader_buffer_int64_atomics      = false;
 	f.shader_shared_int64_atomics      = false;
-	f.color_write_enable               = false;
+	f.task_shader                      = false;
 	f.depth_clip_enable                = false;
 	f.image_view_min_lod               = false;
 	f.workgroup_memory_explicit_layout = false;
@@ -151,8 +156,8 @@ void TestMoltenVkLikeDeviceIsAccepted() {
 	Check(!c.shared_int64_atomics, "shared int64 atomics must be off");
 	Check(!c.image_int64_atomics, "image int64 atomics must be off");
 	Check(!c.depth_bounds, "depth bounds must be off");
-	Check(!c.depth_clip_enable && !c.color_write_enable && !c.mesh_shader && !c.float64 &&
-	          !c.compute_derivatives,
+	Check(!c.depth_clip_enable && !c.mesh_shader && !c.float64 && !c.compute_derivatives &&
+	          !c.robust_buffer_access,
 	      "capabilities the device does not report must be off");
 	Check(c.depth_clamp, "depth clamp must be on: the device reports it");
 	Check(c.fragment_barycentric,
@@ -231,15 +236,13 @@ void TestOptionalFeaturesDoNotRejectADevice() {
 	Check(!decision.capabilities.fragment_barycentric, "barycentrics must be off");
 	Check(!decision.capabilities.depth_bounds, "depth bounds must be off");
 
-	facts                    = FullFacts();
-	facts.color_write_enable = false;
-	facts.depth_clip_enable  = false;
-	facts.depth_clamp        = false;
-	decision                 = EvaluateDeviceSuitability(facts, kRequiredExtensions);
-	Check(decision.Accepted(), "colour write, depth clip and depth clamp are optional");
-	Check(!decision.capabilities.color_write_enable && !decision.capabilities.depth_clip_enable &&
-	          !decision.capabilities.depth_clamp,
-	      "the three capabilities must be off");
+	facts                   = FullFacts();
+	facts.depth_clip_enable = false;
+	facts.depth_clamp       = false;
+	decision                = EvaluateDeviceSuitability(facts, kRequiredExtensions);
+	Check(decision.Accepted(), "depth clip and depth clamp are optional");
+	Check(!decision.capabilities.depth_clip_enable && !decision.capabilities.depth_clamp,
+	      "the two capabilities must be off");
 }
 
 void TestCapabilityNeedsBothFeatureAndExtension() {
@@ -251,8 +254,8 @@ void TestCapabilityNeedsBothFeatureAndExtension() {
 	      "minLod feature without the extension must not enable the capability");
 	Check(!c.fragment_barycentric,
 	      "barycentric feature without the extension must not enable the capability");
-	Check(!c.color_write_enable && !c.depth_clip_enable && !c.image_int64_atomics &&
-	          !c.mesh_shader && !c.push_descriptors && !c.compute_derivatives,
+	Check(!c.depth_clip_enable && !c.image_int64_atomics && !c.mesh_shader &&
+	          !c.push_descriptors && !c.compute_derivatives && !c.robust_buffer_access,
 	      "no extension, no capability");
 
 	facts                    = FullFacts();
@@ -430,9 +433,37 @@ void TestDepthColorCopyNeedsMaintenance8() {
 	      "depth/color copy was taken without VK_KHR_maintenance8");
 }
 
+// Storage buffer bounds come from robustBufferAccess2 only at the granularity of one element. A
+// driver whose pushed buffers have no size still gets them: its storage buffers come in descriptor
+// sets (ChooseDescriptorDelivery, HostLoweringTests).
+void TestRobustBufferAccessNeedsElementBounds() {
+	auto f = FullFacts();
+	Check(EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.robust_buffer_access,
+	      "a device with robustBufferAccess2 at one byte got no buffer bounds");
+	f.robust_storage_buffer_access_size_alignment = 4;
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.robust_buffer_access,
+	      "buffer bounds were taken at a coarser alignment");
+	f        = MoltenVkFacts();
+	f.extensions.emplace_back("VK_EXT_robustness2");
+	f.robust_buffer_access2                       = true;
+	f.robust_storage_buffer_access_size_alignment = 1;
+	Check(EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.robust_buffer_access,
+	      "a driver fault turned off a capability the device has");
+}
+
+// Indirect mesh draws need a task shader as well.
+void TestMeshShadersNeedTaskShaders() {
+	auto f        = FullFacts();
+	f.task_shader = false;
+	Check(!EvaluateDeviceSuitability(f, kRequiredExtensions).capabilities.mesh_shader,
+	      "mesh shaders were taken without task shaders");
+}
+
 int main() {
 	TestComputeSubgroupSizeControlNeedsSize64();
 	TestDepthColorCopyNeedsMaintenance8();
+	TestRobustBufferAccessNeedsElementBounds();
+	TestMeshShadersNeedTaskShaders();
 	TestFeedbackLoopsNeedBothFeatures();
 	TestMoltenVkLikeDeviceIsAccepted();
 	TestDriverDefectsAreNotCapabilities();

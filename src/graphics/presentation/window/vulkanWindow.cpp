@@ -168,7 +168,6 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT        image_atomic_int64 {};
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR     barycentric {};
-	vk::PhysicalDeviceColorWriteEnableFeaturesEXT              color_write {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT               min_lod {};
 	vk::PhysicalDeviceDepthClipEnableFeaturesEXT               depth_clip_enable {};
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT              depth_clip_control {};
@@ -176,6 +175,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT  feedback_layout {};
 	vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic {};
 	vk::PhysicalDeviceMaintenance8FeaturesKHR                  maintenance8 {};
+	vk::PhysicalDeviceRobustness2FeaturesEXT                   robustness2 {};
 	vk::PhysicalDeviceVulkan11Features                         features11 {};
 	vk::PhysicalDeviceVulkan12Features                         features12 {};
 	vk::PhysicalDeviceVulkan13Features                         features13 {};
@@ -183,8 +183,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	image_atomic_int64.pNext = &mesh;
 	workgroup_layout.pNext   = &image_atomic_int64;
 	barycentric.pNext        = &workgroup_layout;
-	color_write.pNext        = &barycentric;
-	min_lod.pNext            = &color_write;
+	min_lod.pNext            = &barycentric;
 	depth_clip_enable.pNext  = &min_lod;
 	depth_clip_control.pNext = &depth_clip_enable;
 	provoking_vertex.pNext   = &depth_clip_control;
@@ -192,9 +191,18 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	feedback_dynamic.pNext   = &feedback_layout;
 	maintenance8.pNext       = &feedback_dynamic;
 	features11.pNext         = &maintenance8;
-	features12.pNext         = &features11;
-	features13.pNext         = &features12;
-	features2.pNext          = &features13;
+	// The structs of an extension the device lacks must not be chained.
+	const bool robustness2_extension =
+	    std::any_of(extensions.begin(), extensions.end(), [](const vk::ExtensionProperties& e) {
+		    return std::string_view(e.extensionName.data()) == VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
+	    });
+	if (robustness2_extension) {
+		robustness2.pNext = features11.pNext;
+		features11.pNext  = &robustness2;
+	}
+	features12.pNext = &features11;
+	features13.pNext = &features12;
+	features2.pNext  = &features13;
 	device.getFeatures2(&features2);
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
@@ -203,6 +211,11 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	vk::PhysicalDeviceProperties2                   properties2 {};
 	properties11.pNext = &subgroup_size_control;
 	properties12.pNext = &properties11;
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+	if (robustness2_extension) {
+		robustness2_properties.pNext = properties12.pNext;
+		properties12.pNext           = &robustness2_properties;
+	}
 	properties2.pNext  = &properties12;
 	device.getProperties2(&properties2);
 
@@ -289,7 +302,18 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	facts.block_texel_view =
 	    device.getImageFormatProperties2(block_texel_view_info).result == vk::Result::eSuccess;
 
-	facts.color_write_enable          = color_write.colorWriteEnable == VK_TRUE;
+	facts.sampler_filter_minmax       = features12.samplerFilterMinmax == VK_TRUE;
+	facts.robust_buffer_access2       = robustness2.robustBufferAccess2 == VK_TRUE;
+	facts.robust_storage_buffer_access_size_alignment =
+	    robustness2_properties.robustStorageBufferAccessSizeAlignment;
+	constexpr vk::FormatFeatureFlags filtered_sampling =
+	    vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+	const auto filters = [&](vk::Format format) {
+		return (device.getFormatProperties(format).optimalTilingFeatures & filtered_sampling) ==
+		       filtered_sampling;
+	};
+	facts.r8_srgb_filtered   = filters(vk::Format::eR8Srgb);
+	facts.r8g8_srgb_filtered = filters(vk::Format::eR8G8Srgb);
 	facts.packed_scaled_vertex_format =
 	    static_cast<bool>(device.getFormatProperties(vk::Format::eA2B10G10R10UscaledPack32)
 	                          .bufferFeatures &
@@ -302,6 +326,7 @@ DeviceFacts WindowContext::ReadDeviceFacts(vk::PhysicalDevice                   
 	    workgroup_layout.workgroupMemoryExplicitLayout == VK_TRUE;
 	facts.shader_image_int64_atomics = image_atomic_int64.shaderImageInt64Atomics == VK_TRUE;
 	facts.mesh_shader                = mesh.meshShader == VK_TRUE;
+	facts.task_shader                = mesh.taskShader == VK_TRUE;
 	facts.compute_derivative_group_quads = derivatives.computeDerivativeGroupQuads == VK_TRUE;
 	facts.provoking_vertex_last          = provoking_vertex.provokingVertexLast == VK_TRUE;
 	facts.maintenance8                   = maintenance8.maintenance8 == VK_TRUE;
@@ -494,12 +519,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	// The feature struct of an optional extension is chained only when the capability is on.
 	void*                                         optional_features = nullptr;
-	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
-	if (caps.color_write_enable) {
-		color_write_ext.colorWriteEnable = VK_TRUE;
-		color_write_ext.pNext            = optional_features;
-		optional_features                = &color_write_ext;
-	}
 	vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_enable {};
 	if (caps.depth_clip_enable) {
 		depth_clip_enable.depthClipEnable = VK_TRUE;
@@ -596,6 +615,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features12.shaderBufferInt64Atomics = caps.buffer_int64_atomics ? VK_TRUE : VK_FALSE;
 	features12.shaderSharedInt64Atomics = caps.shared_int64_atomics ? VK_TRUE : VK_FALSE;
 	features12.shaderFloat16            = caps.float16 ? VK_TRUE : VK_FALSE;
+	features12.samplerFilterMinmax      = caps.sampler_filter_minmax ? VK_TRUE : VK_FALSE;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -624,11 +644,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
-	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
-	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
+	     static_cast<vk::ShaderStageFlags::MaskType>(subgroup_size_control.requiredSubgroupSizeStages),
 	     graphics.host.capabilities.compute_subgroup_size_control ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	// Decided by the device decision; on only when the extensions are among the enabled ones.
@@ -721,14 +740,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.subgroupSizeControl =
 	    graphics.host.capabilities.compute_subgroup_size_control ? VK_TRUE : VK_FALSE;
 
-	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
+	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
-	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
+	     caps.robust_buffer_access ? "robustBufferAccess2" : "shader checks");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = caps.mesh_shader ? VK_TRUE : VK_FALSE;
+	// Indirect mesh draws launch their records' groups from a task shader.
+	mesh_features.taskShader            = caps.mesh_shader ? VK_TRUE : VK_FALSE;
 	feedback_dynamic.pNext =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	create_info.pNext = graphics.host.capabilities.attachment_feedback_loop
@@ -936,8 +958,8 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		error = false;
 	}
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
+		     callback_data->pMessage);
 	}
 
 	if (!skip) {
@@ -1171,7 +1193,6 @@ void WindowContext::CreateVulkan() {
 		    {caps.push_descriptors, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME},
 		    {caps.image_view_min_lod, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME},
 		    {caps.depth_clip_enable, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME},
-		    {caps.color_write_enable, VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME},
 		    {caps.fragment_barycentric, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME},
 		    {caps.compute_derivatives, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME},
 		    {caps.maintenance8, VK_KHR_MAINTENANCE_8_EXTENSION_NAME},

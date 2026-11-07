@@ -33,12 +33,17 @@ struct DecodedTexture {
 	bool                    shader_conversion = false;
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
+	// The view of a sampled color image: set after the image is found, since the metadata clears
+	// of TextureCache::FindImage need the attachment-capable format (SampledViewFormat).
+	vk::Format              sampled_view_format = vk::Format::eUndefined;
 	// The image a plain backing match found for the description (TextureCache::FindImage), and
 	// the image bound for it (the depth owner of a stencil plane): kept until an image over the
 	// description's range changes (TextureCache::RangeUnchangedSince from image_since).
 	mutable ImageId  found_image;
 	mutable ImageId  bound_image;
 	mutable uint64_t image_since = 0;
+	// The found image is a sampled color image: its view takes sampled_view_format.
+	mutable bool     bound_sampled_color = false;
 };
 
 struct TextureBinding {

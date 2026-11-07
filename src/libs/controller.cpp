@@ -254,6 +254,14 @@ private:
 
 static GameController* g_controller = nullptr;
 
+// A mono LED cannot show the colour, and on Switch pads each write waits for the pad's reply.
+static void SetHostPadLED(SDL_Gamepad* pad, uint8_t r, uint8_t g, uint8_t b) {
+	if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad),
+	                            SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN, false)) {
+		(void)SDL_SetGamepadLED(pad, r, g, b);
+	}
+}
+
 static void pad_fill_data(PadData* data, const PadState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
@@ -502,7 +510,7 @@ void GameController::PrepareGamepad(int id) {
 		return;
 	}
 	if (const auto& color = Config::GetControllerColor()) {
-		(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+		SetHostPadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
 	}
 	for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 		if (SDL_GamepadHasSensor(pad, sensor) && !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
@@ -928,7 +936,7 @@ void GameController::ReleaseHostPads() {
 	for (const auto id: m_gamepads) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id)); pad != nullptr) {
 			StopOutputs(id);
-			(void)SDL_SetGamepadLED(pad, 0, 0, 0);
+			SetHostPadLED(pad, 0, 0, 0);
 			pads.push_back(pad);
 		}
 	}
@@ -1043,7 +1051,7 @@ void GameController::SetLightBar(int handle, uint8_t r, uint8_t g, uint8_t b) {
 	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(player->input.ActiveId()));
 	    pad != nullptr) {
-		(void)SDL_SetGamepadLED(pad, r, g, b);
+		SetHostPadLED(pad, r, g, b);
 	}
 }
 
@@ -1332,6 +1340,19 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 		return PadVrPort(user_id, hand, index, true);
 	}
 	return g_controller->OpenPort(user_id, type, index);
+}
+
+// Opens the port of a third-party controller chosen by vendor and product; none is ever connected.
+int KYTY_SYSV_ABI PadOpenExt(int user_id, int type, int index, const void* param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = 0x%016" PRIx64 "\n",
+	     user_id, type, index, reinterpret_cast<uint64_t>(param));
+
+	return PAD_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {

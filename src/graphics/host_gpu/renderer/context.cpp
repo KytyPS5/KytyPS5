@@ -89,9 +89,6 @@ void CommandBuffer::BeginRendering(const RenderState& wanted) const {
 		auto open = m_render_state;
 		open.depth_stencil_attachment.depth_clear   = state.depth_stencil_attachment.depth_clear;
 		open.depth_stencil_attachment.stencil_clear = state.depth_stencil_attachment.stencil_clear;
-		for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
-			open.color_attachments[i].is_clear = state.color_attachments[i].is_clear;
-		}
 		RenderState same = open;
 		same.area_x = same.area_y = 0;
 		same.area_width = same.area_height = 0;
@@ -111,10 +108,8 @@ void CommandBuffer::BeginRendering(const RenderState& wanted) const {
 		const auto& attachment = state.color_attachments[i];
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
-		colors[i].loadOp =
-		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
-		colors[i].clearValue.color.uint32 = attachment.clear_value;
+		colors[i].loadOp       = vk::AttachmentLoadOp::eLoad;
+		colors[i].storeOp      = vk::AttachmentStoreOp::eStore;
 	}
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;
@@ -147,11 +142,8 @@ void CommandBuffer::BeginRendering(const RenderState& wanted) const {
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
 	PerfCounters::Add(PerfCounters::Counter::RenderPasses);
-	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
-	for (auto& color: m_render_state.color_attachments) {
-		color.is_clear = false;
-	}
+	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
@@ -162,8 +154,7 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
-	m_rendering    = false;
-	m_render_state = {};
+	m_rendering = false;
 }
 
 } // namespace Libs::Graphics

@@ -15,7 +15,6 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -37,13 +36,6 @@
 #include <limits>
 #include <span>
 #include <vector>
-
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
 
 namespace Libs::Graphics {
 
@@ -97,9 +89,11 @@ static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) 
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
 }
 
+// 1D textures are 2D images one texel high, so they share 2D surfaces at their address.
 static Prospero::ImageType TextureBaseType(Prospero::ImageType type) {
 	switch (type) {
-		case Prospero::ImageType::kColor1DArray: return Prospero::ImageType::kColor1D;
+		case Prospero::ImageType::kColor1D:
+		case Prospero::ImageType::kColor1DArray:
 		case Prospero::ImageType::kColor2DArray:
 		case Prospero::ImageType::kColor2DMsaa:
 		case Prospero::ImageType::kColor2DMsaaArray: return Prospero::ImageType::kColor2D;
@@ -119,6 +113,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
+		if (context.GetGraphics().null_descriptor_enabled) {
+			// Null descriptors read zero and drop writes, with or without shader bounds checks.
+			return {nullptr, 0, vk::WholeSize};
+		}
 		// A buffer of no records: loads read zero and stores are dropped. The offset puts every
 		// index past the end of the shared null buffer, so no dispatch sees another's writes.
 		buffer_offset = 16;
@@ -179,11 +177,13 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
-	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
-	if (metadata_control == 0) {
+	// META_PIPE_ALIGNED only affects metadata addressing, which a clear COMPRESSION_EN disables.
+	const auto         metadata_control = descriptor.fields[6] & 0x00ffffffu;
+	constexpr uint32_t pipe_aligned     = 1u << 19u;
+	if ((metadata_control & ~pipe_aligned) == 0) {
 		return true;
 	}
-	constexpr uint32_t htile_control = 0x00280000u;
+	constexpr uint32_t htile_control = pipe_aligned | 1u << 21u;
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
 	return metadata_control == expected_control && GuestRange {metadata_addr, 1}.Valid() &&
@@ -344,6 +344,29 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
+// sRGB views decode before filtering; a sampler that skips degamma reads through a UNorm view.
+static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::BufferFormat format,
+                                    vk::Format pixel_format, bool skip_degamma) {
+	if (skip_degamma) return SrgbUnormViewFormat(pixel_format);
+	switch (format) {
+		case Prospero::BufferFormat::k8Srgb:
+			return graphics.host.capabilities.r8_srgb_views ? vk::Format::eR8Srgb : pixel_format;
+		case Prospero::BufferFormat::k8_8Srgb:
+			return graphics.host.capabilities.r8g8_srgb_views ? vk::Format::eR8G8Srgb : pixel_format;
+		default: return pixel_format;
+	}
+}
+
+// Atomics and raw signed stores use unsigned integer views; sRGB images store through UNorm.
+static vk::Format StorageViewFormat(const ShaderRecompiler::IR::ImageResource& resource,
+                                    Prospero::BufferFormat format, vk::Format pixel_format) {
+	if (resource.atomic64) return vk::Format::eR64Uint;
+	if (resource.atomic) return vk::Format::eR32Uint;
+	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
+	if (raw_sint_format != Prospero::BufferFormat::kInvalid) return VulkanFormat(raw_sint_format);
+	return SrgbUnormViewFormat(pixel_format);
+}
+
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
@@ -367,27 +390,12 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
-		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
-			view.type       = vk::ImageViewType::e1D;
-			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
-			}
-			view.layer_count = 1;
-			break;
-		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
-			view.type       = vk::ImageViewType::e1DArray;
-			view.base_layer = descriptor.BaseArray5();
-			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
-			}
-			view.layer_count = image_layers - view.base_layer;
-			break;
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
 			view.base_layer  = 0;
 			view.layer_count = 1;
 			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
 			view.type       = vk::ImageViewType::e2DArray;
@@ -397,6 +405,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
@@ -570,15 +579,34 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (texture.null_descriptor) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
+	// Each binding counts, also of a texture decoded before. Image heap resolves do not follow the
+	// draws that sample them: they report no samples.
+	if (m_lod_stats && !resource.heap) {
+		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+		if (descriptor.MipStatsCntEn()) {
+			auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
+			const uint8_t base    = descriptor.BaseLevel();
+			counter.finest_level  = std::min(counter.finest_level, base);
+			if (descriptor.MinLod() > base << 8u) {
+				counter.clamped = true;
+			} else {
+				counter.unclamped = true;
+			}
+		}
+	}
 	// The image this texture found before, while the registered images are the same; it was
 	// checked for the binding then.
 	const auto& range = texture.desc.info.data;
 	if (texture.bound_image &&
 	    texture_cache.RangeUnchangedSince(range.address, range.size, texture.image_since)) {
 		texture_cache.ReuseImage(texture.found_image, texture.desc);
+		auto view_info = texture.desc.view_info;
+		if (texture.bound_sampled_color) {
+			view_info.format = texture.sampled_view_format;
+		}
 		return {.image_id  = texture.bound_image,
 		        .texture   = &texture,
-		        .view_info = texture.desc.view_info,
+		        .view_info = view_info,
 		        .type      = texture.desc.type};
 	}
 	const auto pixel_format = texture.pixel_format;
@@ -612,13 +640,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                            desc.info.data.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, swizzle);
-	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format, swizzle);
+	}
+	const bool sampled_color = !stencil_association && !image->info.IsDepth() && !storage;
+	if (sampled_color) {
+		desc.view_info.format = texture.sampled_view_format;
+		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format, swizzle);
 	}
 	if (plain) {
-		texture.found_image   = found;
-		texture.bound_image   = id;
-		texture.image_since   = texture_cache.m_image_change_count;
+		texture.found_image         = found;
+		texture.bound_image         = id;
+		texture.image_since         = texture_cache.m_image_change_count;
+		texture.bound_sampled_color = sampled_color;
 	}
 	return {.image_id = id, .texture = &texture, .view_info = desc.view_info, .type = desc.type};
 }
@@ -639,7 +671,6 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 		// the device has none, as a zero-filled placeholder (see NullTextures).
 		return {.null_descriptor = true};
 	}
-
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -721,16 +752,9 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto raw_sint_format = ShaderRecompiler::IR::RawSignedStorageFormat(resource, format);
-	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
-	                                 : storage && resource.atomic ? vk::Format::eR32Uint
-	                                 : raw_sint_format != Prospero::BufferFormat::kInvalid
-	                                     ? VulkanFormat(raw_sint_format)
-	                                     : SrgbStorageViewFormat(pixel_format);
-	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
-	                                     ? storage_view_format
-	                                     : pixel_format;
-	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	const auto view_format =
+	    storage ? StorageViewFormat(resource, format, pixel_format) : pixel_format;
+	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;
@@ -800,6 +824,9 @@ DecodedTexture RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageRe
 	desc.heap = resource.heap;
 
 	DecodedTexture result {std::move(desc), false, sparse, generation, probe, shader_conversion, pixel_format, view_format};
+	result.sampled_view_format =
+	    storage ? view_format
+	            : SampledViewFormat(m_context.GetGraphics(), format, pixel_format, resource.skip_degamma);
 	return result;
 }
 
@@ -821,8 +848,6 @@ static vk::Sampler NativeSampler(RenderContext&                                 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto& command_buffer = context.GetCommandScheduler().Current();
-	EXIT_IF(command_buffer.IsInvalid());
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
@@ -912,11 +937,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
-		auto& prepared = *stage;
-		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
-		const auto& layout = program.bindings;
+		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
@@ -970,14 +994,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program   = prepared.runtime->module->info;
-	const auto& snapshot  = *prepared.runtime->resources;
-	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+	const auto& program  = prepared.runtime->module->info;
+	const auto& snapshot = *prepared.runtime->resources;
+	const auto& layout   = program.bindings;
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -1006,12 +1027,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
-	const auto& program  = prepared.runtime->module->info;
-	const auto& snapshot = *prepared.runtime->resources;
-	auto&       images   = prepared.images;
-	EXIT_IF(images.size() != program.info.images.size());
-	auto& texture_cache = m_context.GetTextureCache();
+	const auto& program       = prepared.runtime->module->info;
+	const auto& snapshot      = *prepared.runtime->resources;
+	auto&       images        = prepared.images;
+	auto&       texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	// One lock for the lookups of the draw: each call below finds it held. No caller of this
 	// function holds the lock, so the discovery can let it go: that can submit the scheduler.
@@ -1048,9 +1067,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			binding.image_view = texture_cache.FindTexture(
 			    binding.image_id, binding.texture->desc.info, binding.view_info, binding.type);
 		}
-		auto&      image   = texture_cache.GetImage(binding.image_id);
-		const bool storage = binding.type == TextureCache::BindingType::Storage;
-		image.usage.storage |= storage;
 	}
 }
 
@@ -1093,35 +1109,6 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
-// Sorted and merged: disjoint ranges by address, for FindOverlap.
-static void MergeRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
-	std::sort(ranges.begin(), ranges.end());
-	size_t merged = 0;
-	for (const auto& [address, size]: ranges) {
-		if (merged != 0 && address <= ranges[merged - 1].first + ranges[merged - 1].second) {
-			auto&      last = ranges[merged - 1];
-			const auto end  = std::max(last.first + last.second, address + size);
-			last.second     = end - last.first;
-		} else {
-			ranges[merged++] = {address, size};
-		}
-	}
-	ranges.resize(merged);
-}
-
-// The merged range (MergeRanges) that a range overlaps, or null.
-static const std::pair<uint64_t, uint64_t>* FindOverlap(
-    const std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t address, uint64_t size) {
-	if (ranges.empty()) return nullptr;
-	// The only range that can overlap is the first one that ends after the address.
-	const auto found = std::upper_bound(
-	    ranges.begin(), ranges.end(), address,
-	    [](uint64_t at, const std::pair<uint64_t, uint64_t>& range) { return at < range.first + range.second; });
-	return found != ranges.end() && ImageRangeOverlaps(address, size, found->first, found->second)
-	           ? &*found
-	           : nullptr;
-}
-
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1158,65 +1145,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
-	}
-	// The ranges this draw or dispatch writes, gathered once for every captured read below.
-	auto& written_images  = m_written_image_ranges;
-	auto& written_buffers = m_written_buffer_ranges;
-	bool  gathered        = false;
-	for (const auto* reader: prepared_bindings) {
-		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
-		// Guest code and function tables of linked calls are not memory a shader writes.
-		const bool captures = reads.size() > reader->runtime->resources->source_reads;
-		for (const auto* writer: prepared_bindings) {
-			if (!captures) break;
-			if (writer->runtime->module->info.has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
-			}
-		}
-		if (!gathered) {
-			gathered = true;
-			written_images.clear();
-			written_buffers.clear();
-			for (const auto id: m_bound_images) {
-				const auto& image = m_context.GetTextureCache().m_slot_images[id];
-				if (!image.binding.shader_write && !image.binding.is_target) continue;
-				for (const auto written: {image.info.data, image.info.stencil,
-				                          image.info.metadata.range}) {
-					if (written.size != 0) written_images.emplace_back(written.address, written.size);
-				}
-			}
-			for (const auto* writer: prepared_bindings) {
-				const auto& program = writer->runtime->module->info;
-				for (const auto& resource: program.info.buffers) {
-					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
-					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					// Scalar loads go through the scalar cache, which a dispatch's own vector stores
-					// do not update: the values read when the shader was specialized are the ones the
-					// hardware would read too. Only a later draw or dispatch sees the new values.
-					// ADD_TID and swizzle move fixed-offset writes past write_extent.
-					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
-					const auto written_size =
-					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0) written_buffers.emplace_back(written.address, written_size);
-				}
-			}
-			MergeRanges(written_images);
-			MergeRanges(written_buffers);
-		}
-		for (const auto [address, size]: reads) {
-			if (FindOverlap(written_images, address, size) != nullptr) {
-				EXIT("scalar resource reads overlap an image or attachment write\n");
-			}
-			if (const auto* written = FindOverlap(written_buffers, address, size)) {
-				static std::atomic<uint32_t> warned {0};
-				if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
-					LOGF("scalar read %" PRIx64 "+%" PRIx64 " overlaps buffer write %" PRIx64
-					     "+%" PRIx64 "\n",
-					     address, size, written->first, written->second);
-				}
-			}
-		}
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
@@ -1309,10 +1237,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:
-						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
-						for (const auto& view: descriptors.buffers) {
-							EXIT_IF(view.buffer == nullptr);
-						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
@@ -1344,7 +1268,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 					case BindingKind::Samplers:
 						for (const auto sampler: descriptors.samplers) {
-							EXIT_IF(sampler == nullptr);
 							m_descriptor_images[image_cursor++] = {sampler, nullptr, vk::ImageLayout::eUndefined};
 						}
 						break;
@@ -1360,8 +1283,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto& resource = program.info.images[i];
 			const auto& texture = descriptors.images[i];
 			if (resource.heap) continue;
-			EXIT_IF(texture.image_id &&
-			        resource.mip_count != (texture.mip_views.empty() ? 1u : texture.mip_views.size()));
 			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
@@ -1374,8 +1295,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
-		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
@@ -1393,7 +1312,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (!m_descriptor_writes.empty()) {
-		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),

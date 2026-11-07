@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostLowering.h"
@@ -161,6 +162,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
+	// An indirect mesh draw: a task shader reads the draw records on the GPU.
+	const auto task_module = vertex.mesh_task && !mesh_emulated
+	                             ? CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device)
+	                             : vk::ShaderModule {};
 
 	if (rect_list) {
 		std::span<const RectListParameter> parameters;
@@ -192,6 +197,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			                                       .module = stage->module,
 			                                       .pName  = "main"};
 		}
+	}
+	if (task_module) {
+		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
+		                                       .module = task_module,
+		                                       .pName  = "main"};
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =
@@ -308,27 +318,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                           : color_blend_attachment[i].colorBlendOp);
 	}
 
-	vk::Bool32 color_write_enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t i = 0; i < rendering.color_count; i++) {
-		color_write_enable[i] = VK_TRUE;
-	}
-
-	vk::PipelineColorWriteCreateInfoEXT color_write {};
-	color_write.attachmentCount    = rendering.color_count;
-	color_write.pColorWriteEnables = color_write_enable;
-
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	// Colour writes are turned off at draw time only for a slot with no image, and a slot with no
-	// image takes no writes anyway. So without VK_EXT_color_write_enable nothing is lost.
-	if (host.color_write_enable) {
-		color_blending.pNext = &color_write;
-	}
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
+	if (task_module) {
+		graphics_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+	}
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
 			const auto native_stage = NativeShaderStage(stage->info.stage);
@@ -395,9 +394,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
 		dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	}
-	if (host.color_write_enable && rendering.color_count != 0) {
-		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
-	}
 	if (graphics.host.capabilities.attachment_feedback_loop) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
@@ -453,6 +449,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+	graphics.device.destroyShaderModule(task_module, nullptr);
 }
 
 // KYTY_PIPELINE_IR=<guest shader hashes in hex, comma-separated>: the compute pipelines of those

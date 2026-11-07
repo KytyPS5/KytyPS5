@@ -19,12 +19,7 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #undef MemoryBarrier
 #elif defined(__APPLE__)
 #include <pthread.h>
@@ -133,9 +128,6 @@ class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
-		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
-			EXIT("invalid region tracking manager construction\n");
-		}
 		m_cpu_dirty.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
@@ -143,19 +135,18 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
-	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto [start, end] = GetPageRange(offset, size);
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
 	template <DirtySource source, bool enable>
-	void ChangeState(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void ChangeState(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
 		ForgetOldHeat();
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.FirstRangeFrom(start).first < end) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 			// A write to a clean page: the page came back after an upload.
@@ -181,7 +172,7 @@ public:
 			if (m_write_heat.Cool(start, end)) {
 				UpdateProtection<true, false>();
 			}
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.FirstRangeFrom(start).first < end) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -199,8 +190,8 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(offset, size);
 		auto&      bits         = GetBits<source>();
 		if (bits.FirstRangeFrom(start).first >= end) {
 			return;
@@ -225,7 +216,7 @@ public:
 						               (last - first) * TRACKER_PAGE_SIZE);
 					}
 					m_armed |= arm;
-					if (arm.Any()) {
+					if (!arm.None()) {
 						maybe_armed.store(true, std::memory_order_relaxed);
 						s_arm_generation.fetch_add(1, std::memory_order_relaxed);
 					}
@@ -246,20 +237,21 @@ public:
 	// they are protected before their bytes are copied, as at the end of a lease (writeHeat.h). An
 	// open page could take a CPU write after the copy; the GPU's version of the page would then
 	// hide that write, and a later read-back would overwrite it.
-	void EndHeat(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void EndHeat(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
 		ForgetOldHeat();
 		m_write_heat.Cool(start, end);
 		// Armed pages written since their scan are dirty for this upload; then they are closed.
 		const RegionBits armed(m_armed, start, end);
-		if (armed.Any()) {
+		if (!armed.None()) {
 			std::vector<GuestRange> written;
 			for (const auto [first, last]: armed) {
 				UffdWriteWatch::Get()->TakeWritten(m_cpu_addr + first * TRACKER_PAGE_SIZE,
 				                                   (last - first) * TRACKER_PAGE_SIZE, written);
 			}
 			for (const auto& range: written) {
-				const auto [first, last] = GetPageRange(range.address, range.size);
+				// The watch reports guest addresses.
+				const auto [first, last] = GetPageRange(range.address - m_cpu_addr, range.size);
 				m_cpu_dirty.SetRange(first, last);
 			}
 			m_armed.UnsetRange(start, end);
@@ -268,8 +260,8 @@ public:
 	}
 
 	// Memory that is no longer tracked: its pages are no longer armed.
-	void Disarm(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void Disarm(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
 		m_armed.UnsetRange(start, end);
 	}
 
@@ -305,7 +297,8 @@ public:
 			UffdWriteWatch::Get()->TakeWritten(m_cpu_addr + first * TRACKER_PAGE_SIZE,
 			                                   (last - first) * TRACKER_PAGE_SIZE, m_scan);
 			for (const auto& range: m_scan) {
-				const auto [start, end] = GetPageRange(range.address, range.size);
+				// The watch reports guest addresses.
+				const auto [start, end] = GetPageRange(range.address - m_cpu_addr, range.size);
 				for (const auto [armed_start, armed_end]: RegionBits(m_armed, start, end)) {
 					for (size_t page = armed_start; page < armed_end; page++) {
 						if (!m_cpu_dirty.Get(page)) {
@@ -319,7 +312,7 @@ public:
 			}
 		}
 		const auto still_hot = m_armed & m_write_heat.Hot();
-		if ((still_hot ^ m_armed).Any()) {
+		if (!(still_hot ^ m_armed).None()) {
 			m_armed = still_hot;
 			UpdateProtection<true, false>();
 		}
@@ -379,12 +372,7 @@ private:
 		}
 	}
 
-	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
-		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
-		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
-			EXIT("range lies outside its tracking region\n");
-		}
-		const auto offset = vaddr - m_cpu_addr;
+	[[nodiscard]] static std::pair<size_t, size_t> GetPageRange(uint64_t offset, uint64_t size) {
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}

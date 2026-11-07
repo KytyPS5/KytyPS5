@@ -12,8 +12,6 @@ vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 // An emulated mesh program runs as a compute shader.
 vk::ShaderStageFlagBits NativeShaderStage(const ShaderRecompiler::IR::CompiledShaderInfo& program);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
-vk::MemoryBarrier       MakeShaderAccessDependency();
-vk::MemoryBarrier       MakeShaderWriteHazardDependency();
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);

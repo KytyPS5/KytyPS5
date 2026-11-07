@@ -10,7 +10,7 @@ constexpr const char* kMinLodExtension          = "VK_EXT_image_view_min_lod";
 constexpr const char* kBarycentricExtension     = "VK_KHR_fragment_shader_barycentric";
 constexpr const char* kWorkgroupLayoutExtension = "VK_KHR_workgroup_memory_explicit_layout";
 constexpr const char* kPushDescriptorExtension  = "VK_KHR_push_descriptor";
-constexpr const char* kColorWriteExtension      = "VK_EXT_color_write_enable";
+constexpr const char* kRobustness2Extension     = "VK_EXT_robustness2";
 constexpr const char* kDepthClipEnableExtension = "VK_EXT_depth_clip_enable";
 constexpr const char* kImageAtomic64Extension   = "VK_EXT_shader_image_atomic_int64";
 constexpr const char* kMeshShaderExtension      = "VK_EXT_mesh_shader";
@@ -100,8 +100,9 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.depth_bounds       = facts.depth_bounds;
 	caps.depth_clamp        = facts.depth_clamp;
 	caps.depth_clip_enable  = with_extension(facts.depth_clip_enable, kDepthClipEnableExtension);
-	caps.color_write_enable = with_extension(facts.color_write_enable, kColorWriteExtension);
-	caps.mesh_shader        = with_extension(facts.mesh_shader, kMeshShaderExtension);
+	// Indirect mesh draws launch their records' groups from a task shader.
+	caps.mesh_shader =
+	    with_extension(facts.mesh_shader, kMeshShaderExtension) && facts.task_shader;
 	caps.compute_derivatives =
 	    with_extension(facts.compute_derivative_group_quads, kComputeDerivativesExtension);
 	caps.push_descriptors   = HasExtension(facts.extensions, kPushDescriptorExtension);
@@ -123,8 +124,17 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	caps.subgroup_supported_stages = facts.subgroup_supported_stages;
 	caps.subgroup_supported_operations = facts.subgroup_supported_operations;
 	caps.max_stage_samplers            = facts.max_per_stage_samplers;
+	caps.r8_srgb_views                 = facts.r8_srgb_filtered;
+	caps.r8g8_srgb_views               = facts.r8g8_srgb_filtered;
+	caps.sampler_filter_minmax         = facts.sampler_filter_minmax;
 
 	decision.faults = FaultsOf(facts.driver);
+	// A coarser alignment rounds a buffer's range up past the guest's last byte. Where pushed
+	// buffers have no size, storage buffers come in descriptor sets (ChooseDescriptorDelivery),
+	// which have it.
+	caps.robust_buffer_access =
+	    with_extension(facts.robust_buffer_access2, kRobustness2Extension) &&
+	    facts.robust_storage_buffer_access_size_alignment == 1u;
 	// Metal runs SIMD-group functions in a vertex function on an Apple GPU, and MoltenVK passes
 	// them through, but reports no subgroup operations for the vertex stage (MoltenVK 1.4.2;
 	// the vertex ordered-count GPU test checks it). A wave of the vertex stage is then one
@@ -151,7 +161,6 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.depth_bounds, "depthBounds");
 	note(caps.depth_clamp, "depthClamp");
 	note(caps.depth_clip_enable, "depthClipEnable");
-	note(caps.color_write_enable, "colorWriteEnable");
 	note(caps.packed_scaled_vertex_input, "a packed 10-10-10-2 scaled vertex format");
 	note(caps.mesh_shader, "meshShader");
 	note(caps.compute_derivatives, "computeDerivativeGroupQuads");
@@ -162,6 +171,9 @@ DeviceDecision EvaluateDeviceSuitability(const DeviceFacts&              facts,
 	note(caps.block_texel_view, "block texel views");
 	note(caps.maintenance8, "depth/color image copies and dynamic sample offsets");
 	note(caps.draw_indirect_first_instance, "drawIndirectFirstInstance");
+	note(caps.robust_buffer_access, "robustBufferAccess2 storage buffer bounds");
+	note(caps.r8_srgb_views && caps.r8g8_srgb_views, "filtered R8 and R8G8 sRGB views");
+	note(caps.sampler_filter_minmax, "samplerFilterMinmax");
 	note(!decision.faults.pushed_buffers_have_no_size,
 	     "a buffer size table for pushed descriptors (driver defect)");
 	note(!decision.faults.no_per_vertex_inputs, "per-vertex pixel shader inputs (driver defect)");

@@ -72,10 +72,10 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
 
 	struct Submission {
-		SubmissionType            type     = SubmissionType::Graphics;
+		SubmissionType            type     = SubmissionType::Commands;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
@@ -129,8 +129,8 @@ private:
 	// thread submits before it waits only when that submission is still open: what others
 	// record into the scheduler (the test harness does) is theirs to submit.
 	uint64_t        m_recorded_tick = UINT64_MAX;
-	uint64_t        m_submit_id = 0;
-	std::atomic_int m_done_num  = 0;
+	uint64_t        m_submit_id     = 0;
+	std::atomic_int m_done_num      = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

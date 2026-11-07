@@ -45,8 +45,9 @@ private:
 	};
 
 	GraphicContext&                                             m_graphics;
-	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
+	// Front workers ask for samplers too (see frontWorker.h).
+	Common::Mutex m_mutex;
 };
 
 } // namespace Libs::Graphics

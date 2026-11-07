@@ -493,7 +493,7 @@ std::optional<ShaderSource::Call::Table> FindCallTable(const Decoder::Program& p
 	const auto& call      = program.instructions[call_index];
 	const auto  source_of = [&](uint32_t before, uint32_t code) -> std::optional<std::pair<uint32_t, uint32_t>> {
 		for (uint32_t depth = 0; depth < 16u; ++depth) {
-			const auto found = CFG::TryFindScalarDefinition(program, graph, before, code, nullptr, wave_size);
+			const auto found = CFG::FindScalarDefinition(program, graph, before, code, wave_size);
 			if (!found.has_value() || *found == UINT32_MAX) return std::nullopt;
 			const auto& inst = program.instructions[*found];
 			if ((inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOV_B64) &&
@@ -523,7 +523,7 @@ std::optional<ShaderSource::Call::Table> FindCallTable(const Decoder::Program& p
 	                                 .stride = load.data_dwords * 4u,
 	                                 .offset = static_cast<int32_t>(load.offset)};
 	// The entry's index is scaled to its offset: that scale is the stride of the table.
-	if (const auto scale = CFG::TryFindScalarDefinition(program, graph, low->first, index_code, nullptr, wave_size);
+	if (const auto scale = CFG::FindScalarDefinition(program, graph, low->first, index_code, wave_size);
 	    scale.has_value() && *scale != UINT32_MAX) {
 		const auto& inst  = program.instructions[*scale];
 		uint32_t    value = 0;
@@ -577,7 +577,11 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls, options.wave_size);
+		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code,
+		                                                  source.wave_size, &crossed_calls);
+		// Several reaching definitions select the value on the GPU, so no SRT walk evaluates it.
+		if (!definition) return Value(&block.AppendNewInst(ValueOpcode::UndefU32));
+		const auto index = *definition;
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
@@ -589,7 +593,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		auto& producer = entry->second;
 		if (inserted) {
 			Block translated;
-			Frontend::Translator translator(query, &translated, 1u,
+			Frontend::Translator translator(query, &translated, 1u, Frontend::NoLaneSpills,
 			    (options.input_info.compute->float_mode & 0x10u) == 0u,
 			    !options.input_info.compute->async_compute);
 			translator.TranslateInstruction(source.decoded.instructions[index]);
@@ -1186,13 +1190,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
 				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
 		}
-	}
-	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
-	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
-	    options.stage != ShaderType::TessellationEvaluation) {
-		EXIT("shader recompiler received unsupported stage %u\n",
-		     static_cast<unsigned>(options.stage));
 	}
 
 	const auto* stage        = StageName(options.stage);

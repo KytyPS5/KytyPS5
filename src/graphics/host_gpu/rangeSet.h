@@ -54,8 +54,6 @@ public:
 		}
 	}
 
-	void Clear() { m_ranges.clear(); }
-
 	template <typename Func>
 	void ForEach(Func&& func) const {
 		for (const auto& [begin, end]: m_ranges) {
@@ -110,6 +108,8 @@ public:
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+
+	void Clear() { m_ranges.clear(); }
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {

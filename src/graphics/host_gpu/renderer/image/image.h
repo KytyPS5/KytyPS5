@@ -30,7 +30,6 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
-	bool storage       = false;
 	bool render_target = false;
 	bool video_out     = false;
 };
@@ -85,19 +84,12 @@ public:
 			HeapChanged();
 		}
 	}
-	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
-		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
-			EXIT("image cannot resolve maybe-dirty hash\n");
-		}
+	void ResolveMaybeCpuHash(uint64_t hash) {
 		m_maybe_cpu_dirty = false;
-		m_cpu_dirty |= hash != m_maybe_cpu_hash;
-		return m_cpu_dirty;
+		m_cpu_dirty       = hash != m_maybe_cpu_hash;
 	}
 
 	void RefreshComplete() {
-		if (!IsCpuDirty()) {
-			EXIT("clean image cannot complete a refresh\n");
-		}
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 	}
@@ -117,10 +109,8 @@ public:
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
-	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
-	                            bool pages = false) const noexcept {
-		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
-		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
+	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const noexcept {
+		return info.data.address < address + size && address < info.data.End();
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
@@ -164,7 +154,11 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
+	// The cache's GC tick (frames) when the image was last used: its age for collection.
 	uint64_t         tick_accessed_last = 0;
+	// The command buffer (CommandScheduler::CurrentTick) that last used the image: a second use in
+	// the same command buffer needs no checks again (TextureCache::ReuseImage).
+	uint64_t         command_tick_used  = 0;
 	// The cache's GC tick when the image was last put at the back of the LRU list.
 	uint64_t         lru_touched_gc     = ~uint64_t {0};
 	size_t           lru_id             = 0;

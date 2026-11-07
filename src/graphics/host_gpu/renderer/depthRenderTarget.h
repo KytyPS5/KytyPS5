@@ -11,13 +11,6 @@
 
 namespace Libs::Graphics {
 
-// Without a stencil plane, Hi-Stencil fields are inactive. An active plane is compatible when
-// Hi-Stencil is disabled or HTile backing is present.
-inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
-                                                                  bool htile_stencil_disabled) {
-	return !has_stencil || htile_stencil_disabled || has_htile;
-}
-
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;

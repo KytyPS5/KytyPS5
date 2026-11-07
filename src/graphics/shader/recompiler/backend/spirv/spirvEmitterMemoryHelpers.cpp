@@ -357,6 +357,16 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	return in_bounds;
 }
 
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index) {
+	// The descriptor range ends where access.length does.
+	if (state.host.capabilities.robust_buffer_access && (access.kind == IR::ResourceKind::Buffer ||
+	                                           access.kind == IR::ResourceKind::ScalarBuffer)) {
+		return ConstantBool(state, true);
+	}
+	return EmitMemoryElementInBounds(state, access, index);
+}
+
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
@@ -393,7 +403,7 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 	return pointer;
 }
 
-uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
+static uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeI32(state), ret, value);
 	return ret;
@@ -404,7 +414,7 @@ bool IsSignedFormatComponent(Format::ComponentType type) {
 	       type == Format::ComponentType::Sscaled;
 }
 
-uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
+static uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits) {
 	const auto mantissa_bits = bits == 11u ? 6u : 5u;
 	const auto mantissa_mask = (1u << mantissa_bits) - 1u;
 	const auto mantissa =

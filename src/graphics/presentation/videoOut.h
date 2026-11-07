@@ -36,7 +36,6 @@ public:
 	                       int64_t flip_arg, uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
-	void SubmitFlipPreparation(uint64_t request_id);
 	// A command buffer with a flip of `handle` was submitted: the flip is pending and queued on the
 	// GPU from now on (VideoOutFlipStatus), before the command processor reaches it.
 	void NoteGpuFlipSubmitted(int handle);

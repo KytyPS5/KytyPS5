@@ -160,6 +160,11 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
 
+uint32_t TypePhysicalU32BufferPointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+	                   StorageBufferType(state, state.storage_buffers[2]));
+}
+
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPushConstant, TypeU32(state));
 }
@@ -421,33 +426,18 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 	    location >= static_cast<uint32_t>(state.input_info.vertex->resources_num)) {
 		return VertexInputScalarKind::Float;
 	}
-
-	switch (state.input_info.vertex->resources[location].Format()) {
-		case Prospero::BufferFormat::k8UInt:
-		case Prospero::BufferFormat::k16UInt:
-		case Prospero::BufferFormat::k8_8UInt:
-		case Prospero::BufferFormat::k32UInt:
-		case Prospero::BufferFormat::k16_16UInt:
-		case Prospero::BufferFormat::k8_8_8_8UInt:
-		case Prospero::BufferFormat::k32_32UInt:
-		case Prospero::BufferFormat::k16_16_16_16UInt:
-		case Prospero::BufferFormat::k32_32_32UInt:
-		case Prospero::BufferFormat::k32_32_32_32UInt: return VertexInputScalarKind::Uint;
-		case Prospero::BufferFormat::k8SInt:
-		case Prospero::BufferFormat::k16SInt:
-		case Prospero::BufferFormat::k8_8SInt:
-		case Prospero::BufferFormat::k32SInt:
-		case Prospero::BufferFormat::k16_16SInt:
-		case Prospero::BufferFormat::k8_8_8_8SInt:
-		case Prospero::BufferFormat::k32_32SInt:
-		case Prospero::BufferFormat::k16_16_16_16SInt:
-		case Prospero::BufferFormat::k32_32_32SInt:
-		case Prospero::BufferFormat::k32_32_32_32SInt: return VertexInputScalarKind::Sint;
+	const auto format = state.input_info.vertex->resources[location].Format();
+	switch (format) {
 		case Prospero::BufferFormat::k10_10_10_2UScaled:
 			return state.host.capabilities.packed_scaled_vertex_input
 			           ? VertexInputScalarKind::Float
 			           : VertexInputScalarKind::Uscaled1010102;
 		case Prospero::BufferFormat::k10_10_10_2SScaled: return VertexInputScalarKind::Sscaled1010102;
+		default: break;
+	}
+	switch (Format::GetFormatComponentType(format)) {
+		case Format::ComponentType::Sint: return VertexInputScalarKind::Sint;
+		case Format::ComponentType::Uint: return VertexInputScalarKind::Uint;
 		default: return VertexInputScalarKind::Float;
 	}
 }
@@ -865,6 +855,13 @@ void DefineModule(EmitterState& state) {
 			                               state.input_info.vertex->mesh.max_vertices);
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 			                               state.input_info.vertex->mesh.max_primitives);
+			if (state.input_info.vertex->indirect_draw) {
+				// The task shader's payload (gpu_mesh_indirect.task).
+				const auto count   = ConstantU32(state, IR::PushData::MeshTaskPayloadDwordCount);
+				state.mesh_payload = DefineInterfaceVariable(
+				    state, state.builder.Type(spv::OpTypeArray, TypeU32(state), count),
+				    spv::StorageClassTaskPayloadWorkgroupEXT, "payload");
+			}
 		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||

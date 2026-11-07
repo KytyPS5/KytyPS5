@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/logging/log.h"
+#include "common/parallelFor.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -78,7 +79,6 @@ uint64_t HostSignature(const HostGpu& host) {
 	    c.depth_bounds,
 	    c.depth_clamp,
 	    c.depth_clip_enable,
-	    c.color_write_enable,
 	    c.mesh_shader,
 	    c.compute_derivatives,
 	    c.push_descriptors,
@@ -88,6 +88,10 @@ uint64_t HostSignature(const HostGpu& host) {
 	    c.compute_subgroup_size_control,
 	    c.block_texel_view,
 	    c.maintenance8,
+	    c.robust_buffer_access,
+	    c.r8_srgb_views,
+	    c.r8g8_srgb_views,
+	    c.sampler_filter_minmax,
 	    c.device_clock_period_ps,
 	    c.draw_indirect_first_instance,
 	    c.guest_float_min_max,
@@ -126,8 +130,9 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters);
+	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
+	       mesh_task] = stage;
+	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
 } // namespace
@@ -143,9 +148,9 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 		m_file.Truncate(kept);
 		m_file.Seek(kept);
 	}
-	if (m_file.IsInvalid()) {
-		return;
-	}
+}
+
+ShaderStoreWriter::ShaderStoreWriter() {
 	m_thread = std::jthread([this](std::stop_token stop) {
 		std::unique_lock lock(m_mutex);
 		// Once stop is requested the wait returns false only when the queue is empty.
@@ -199,35 +204,50 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
-	Log::WriteToConsoleAndLog(
-	    fmt::format("Shader cache: compiling shaders and pipelines from {} ({:.1f} MB)\n",
-	                Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0));
-	std::vector<GraphicsPipelineKey> pipelines;
-	auto                             records = std::span<const uint8_t>(bytes);
+	// Builds that share the driver cache run one at a time under its lock on some drivers: more
+	// threads only wait (DriverFaults::pipeline_cache_serializes_builds).
+	const bool serial = m_graphics.host.faults.pipeline_cache_serializes_builds;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
+	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
+	    serial ? size_t {1} : Common::ParallelThreads()));
+	auto       records = std::span<const uint8_t>(bytes);
 	const bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (reusable) {
 		records = records.subspan(header.size());
-		while (LoadRecord(records, pipelines)) {
+		while (LoadRecord(records)) {
 		}
 	}
 	// A damaged record ends the store; the records before it stay.
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
 
 	const auto modules = MapModules();
-	for (const auto& key: pipelines) {
-		Pipeline pipeline;
-		if (CreateGraphicsPipeline(pipeline, key, modules)) {
-			m_graphics_pipelines.emplace(key, pipeline);
-		}
+	std::vector<Common::UniqueFunction<void>> jobs;
+	jobs.reserve(m_graphics_pipelines.size() + modules.size());
+	for (auto& node: m_graphics_pipelines) {
+		jobs.emplace_back([this, &modules, &node] {
+			CreateGraphicsPipeline(node.second, node.first, modules);
+		});
 	}
 	// A compute pipeline depends only on its module.
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-			CreatePipelineInternal(m_graphics, m_compute_pipelines[module->id], *module,
-			                       m_driver_cache);
+			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
+				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
+			});
 		}
 	}
+	if (serial) {
+		for (auto& job: jobs) {
+			job();
+		}
+	} else {
+		Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	}
+	// A key with a stage missing from the store keeps no pipeline.
+	std::erase_if(m_graphics_pipelines,
+	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
 	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
 		CheckpointDriverCache();
 	}
@@ -240,8 +260,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	        .count()));
 }
 
-bool PipelineCache::LoadRecord(std::span<const uint8_t>&        records,
-                               std::vector<GraphicsPipelineKey>& pipelines) {
+bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 	Frame frame;
 	if (records.size() < sizeof(frame)) {
 		return false;
@@ -283,9 +302,6 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>&        records,
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
-			if (module.module == nullptr) {
-				return false;
-			}
 			program->second.modules.push_back(std::move(module));
 			break;
 		}
@@ -295,7 +311,8 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>&        records,
 			if (!complete()) {
 				return false;
 			}
-			pipelines.push_back(key);
+			// WarmUp creates the pipeline once every record is loaded.
+			m_graphics_pipelines.try_emplace(key);
 			break;
 		}
 		case Record::TessellationLayout: {

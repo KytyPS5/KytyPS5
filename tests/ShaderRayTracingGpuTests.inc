@@ -25,7 +25,7 @@ TestCase TrinityBvhIntersections(bool compressed, bool bary, bool sorted,
   data[NodeStart + 29] = 9u << 22; // Force opaque and flip facing.
   data[NodeStart + 30] = 0x98;
   data[NodeStart + 31] = 0x04123456;
-  const std::array<float, 8> near {5,1,3,7,4,2,6,8};
+  const std::array<float, 8> nearDist {5,1,3,7,4,2,6,8};
   const std::array<float, 8> length {1,8,3,5,7,2,4,6};
   const std::array<u32, 8> children {128,138,171,190,256,266,299,318};
   const auto set_bits = [&](u32 base, u32 offset, u32 count, u32 value) {
@@ -43,12 +43,12 @@ TestCase TrinityBvhIntersections(bool compressed, bool bary, bool sorted,
       const u32 index = slot * 4 + i;
       if (compressed) {
         // Exact integer minima; positive maxima round outward within one quantization step.
-        const std::array<u32, 6> planes {0x30000, 0x30000, u32(near[index]) * 8192,
-            0x10000, 0x10000, u32(near[index] + length[index]) * 8192};
+        const std::array<u32, 6> planes {0x30000, 0x30000, u32(nearDist[index]) * 8192,
+            0x10000, 0x10000, u32(nearDist[index] + length[index]) * 8192};
         for (u32 axis = 0; axis < 6; ++axis) set_bits(base, 80 + i * 108 + axis * 18, 18, planes[axis]);
       } else {
         data[base + i] = children[index];
-        const std::array<float, 6> bounds {-1,-1,near[index], 1,1,near[index] + length[index]};
+        const std::array<float, 6> bounds {-1,-1,nearDist[index], 1,1,nearDist[index] + length[index]};
         for (u32 axis = 0; axis < 6; ++axis) data[base + 4 + i * 6 + axis] = bits(bounds[axis]);
       }
     }
@@ -126,8 +126,8 @@ TestCase TrinityBvhIntersections(bool compressed, bool bary, bool sorted,
         const bool xt = (children[x] & 7) < 2, yt = (children[y] & 7) < 2;
         if (triangles_first && xt != yt) return xt;
         if (heuristic == 1) return length[x] > length[y];
-        if (heuristic == 2) return 2 * near[x] + length[x] < 2 * near[y] + length[y];
-        return near[x] < near[y];
+        if (heuristic == 2) return 2 * nearDist[x] + length[x] < 2 * nearDist[y] + length[y];
+        return nearDist[x] < nearDist[y];
       };
       if (sorted) {
         if (wide_sort && which == 3) std::stable_sort(order.begin(), order.end(), compare);
@@ -243,6 +243,7 @@ TestCase TrinityBvhIntersections(bool compressed, bool bary, bool sorted,
   test.has_compute_info = true;
   test.decoded_counts = {{"IMAGE_BVH8_INTERSECT_RAY", 1}};
   test.required_spirv = {"trinity_bvh_intersect"};
+  test.max_spirv_words = wave_size == 32 ? 10950 : 13300;
   return test;
 }
 
@@ -676,5 +677,6 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.required_spirv = {"get_bda_pointer"};
+  test.max_spirv_words = 6350;
   return test;
 }

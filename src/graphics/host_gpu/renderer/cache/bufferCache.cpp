@@ -36,6 +36,8 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
+constexpr uint64_t DownloadWindowSize = 512 * 1024;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -154,15 +156,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
-	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
-	}
+	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
-	if (IsBufferInvalid(id)) {
-		return;
-	}
 	Unregister(id);
 	m_scheduler.DeferDestruction([this, id] { m_slot_buffers.erase(id); });
 }
@@ -183,7 +180,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Keep packed ranges on separate cache lines, as in shadPS4.
+			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    std::lock_guard lock(m_gpu_modified_mutex);
@@ -319,7 +316,6 @@ BufferCache::~BufferCache() {
 			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
 		}
 	}
-	m_buffers.clear();
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -508,8 +504,16 @@ std::optional<uint64_t> BufferCache::ReadBack(uint64_t vaddr, uint64_t size, boo
 	          .caller_can_wait = caller_can_wait,
     });
 	if (plan.step == ReadbackStep::CopyThroughGpu) {
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// One copy takes the 512 KiB window around a range the GPU wrote: the guest reads the
+		// bytes nearby next, and each copy waits for the GPU. A clean range publishes nothing.
+		if (IsRegionGpuModified(vaddr, size)) {
+			const auto start =
+			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
+			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
+			                          buffer.CpuAddress() + buffer.Size());
+			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+			}
 		}
 	} else {
 		if (plan.submit_first) {
@@ -673,10 +677,12 @@ void BufferCache::DemoteGuestBackedBuffers() {
 	if (m_demote.empty()) {
 		return;
 	}
+	// A buffer written again before the collector runs is listed once per write: each is
+	// demoted once.
 	std::vector<BufferId> demote;
 	for (const auto id: m_demote) {
 		if (!IsBufferInvalid(id) && !m_slot_buffers[id].is_deleted &&
-		    m_slot_buffers[id].IsGuestBacked()) {
+		    m_slot_buffers[id].IsGuestBacked() && std::ranges::find(demote, id) == demote.end()) {
 			demote.push_back(id);
 		}
 	}
@@ -1289,7 +1295,8 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsGuestBacked(uint64_t vaddr, uint64_t size) {
-	if (!m_import.Enabled() || vaddr == 0) {
+	// Labels and other guest writes may name any address; the page table covers guest ranges only.
+	if (!m_import.Enabled() || !GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
@@ -1303,7 +1310,8 @@ bool BufferCache::IsGuestBacked(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size) {
-	if (!m_import.Enabled() || vaddr == 0) {
+	// Labels and other guest writes may name any address; the page table covers guest ranges only.
+	if (!m_import.Enabled() || !GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
@@ -1327,7 +1335,8 @@ bool BufferCache::ReadGuestBacked(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool BufferCache::WriteGuestBacked(uint64_t vaddr, const void* data, uint64_t size) {
-	if (!m_import.Enabled() || vaddr == 0) {
+	// Labels and other guest writes may name any address; the page table covers guest ranges only.
+	if (!m_import.Enabled() || !GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
@@ -1470,7 +1479,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
-			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}

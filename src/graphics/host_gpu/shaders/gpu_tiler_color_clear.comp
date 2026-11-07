@@ -9,6 +9,7 @@ layout(set = 0, binding = 1, std430) writeonly buffer Predicates { uint data[]; 
 layout(push_constant, std430) uniform Check {
 	uint metadata_base;
 	uint words;
+	uint stride;
 	uint keys;
 	uint expand;
 } params;
@@ -20,7 +21,7 @@ shared uint mismatch;
 
 void main() {
 	const uint slice = gl_WorkGroupID.x;
-	const uint base  = (params.metadata_base >> 2u) + slice * params.words;
+	const uint base  = (params.metadata_base >> 2u) + slice * params.stride;
 	// Each invocation reads, and may rewrite, only its own words.
 	if (gl_LocalInvocationIndex == 0u) {
 		key      = metadata.data[base] & 0xffu;

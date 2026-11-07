@@ -161,18 +161,6 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
-            <!--
-            <item row="4" column="0">
-             <widget class="QLabel" name="label_shader_optimization">
-              <property name="text"><string>Shader optimization:</string></property>
-             </widget>
-            </item>
-            <item row="4" column="1">
-             <widget class="QComboBox" name="comboBox_shader_optimization_type">
-              <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
-             </widget>
-            </item>
-            -->
             <item row="4" column="0">
              <widget class="QLabel" name="label_pipeline_cache_folder">
               <property name="text"><string>Pipeline cache folder:</string></property>
@@ -277,8 +265,8 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable experimental Pro mode for supported titles. PSSR uses linear scaling. Disabled by default.</string></property>
-              <property name="text"><string>Pro mode (experimental)</string></property>
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
              </widget>
             </item>
             <item>
@@ -324,6 +312,12 @@
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
               <property name="text"><string>AMD CPU patch (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_guest_tsc">
+              <property name="toolTip"><string>Run the CPU time stamp counter (TSC) at the PS5's 1.6 GHz instead of the host rate. Fixes games that run too fast.</string></property>
+              <property name="text"><string>PS5 TSC rate (experimental)</string></property>
              </widget>
             </item>
             <item>

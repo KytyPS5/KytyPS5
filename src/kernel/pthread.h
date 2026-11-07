@@ -114,6 +114,7 @@ uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
+bool                  PthreadHasAnyPendingSignal(Pthread thread);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -200,6 +201,8 @@ int KYTY_SYSV_ABI      KernelConvertLocaltimeToUtc(int64_t local_time, int64_t r
 int KYTY_SYSV_ABI      KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_time,
                                                    KernelTimesec* st, uint64_t* dst_sec);
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency();
+// Guest TSC = host TSC * multiplier >> 32.
+uint64_t               KernelGuestTscMultiplier();
 uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();

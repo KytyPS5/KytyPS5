@@ -29,6 +29,7 @@ bool                               haptics_handles_rumble = false;
 std::array<Rumble, 6>               pad_rumble {};
 std::vector<int>                    closed_pads;
 std::array<std::array<Uint8, 3>, 6> pad_colors {};
+std::array<bool, 6>                 mono_led {};
 } // namespace
 
 namespace Fake {
@@ -71,6 +72,12 @@ void CloseGamepad(SDL_Gamepad* pad) {
 	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
 }
 void Delay(Uint32) {}
+SDL_PropertiesID GetGamepadProperties(SDL_Gamepad* pad) {
+	return static_cast<SDL_PropertiesID>(reinterpret_cast<uintptr_t>(pad));
+}
+bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
+	return std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0 && mono_led[pad];
+}
 } // namespace Fake
 
 #define SDL_GetTicks                Fake::GetTicks
@@ -83,6 +90,8 @@ void Delay(Uint32) {}
 #define SDL_SetGamepadSensorEnabled Fake::SetGamepadSensorEnabled
 #define SDL_CloseGamepad            Fake::CloseGamepad
 #define SDL_Delay                   Fake::Delay
+#define SDL_GetGamepadProperties    Fake::GetGamepadProperties
+#define SDL_GetBooleanProperty      Fake::GetBooleanProperty
 #include "libs/controller.cpp"
 #undef SDL_GetTicks
 #undef SDL_GetGamepadFromID
@@ -94,6 +103,8 @@ void Delay(Uint32) {}
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
+#undef SDL_GetGamepadProperties
+#undef SDL_GetBooleanProperty
 
 namespace Libs::Controller {
 // No virtual headset in these tests (padVr.cpp is not linked here).
@@ -219,6 +230,25 @@ void TestPadPortOwnership() {
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
 	Shutdown();
+}
+
+void TestSpecialPortWithoutDevice() {
+	Controller controller;
+	const int user = Config::GetUserId();
+	Check(PadOpenExt(user, 2, 0, nullptr) == PAD_ERROR_DEVICE_NOT_CONNECTED,
+	      "a third-party controller port opened without a device");
+	const int special = PadOpen(user, 2, 0, nullptr);
+	Check(special > 1 && PadGetHandle(user, 2, 0) == special,
+	      "the special port did not open its own handle");
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	PadData data {};
+	Check(PadReadState(special, &data) == OK && !data.connected && data.buttons == 0,
+	      "host input reached the special port");
+	Check(PadReadState(1, &data) == OK && data.connected && data.buttons == PAD_BUTTON_CROSS,
+	      "the special port took the standard pad");
+	Check(PadClose(special) == OK && PadGetHandle(user, 2, 0) == PAD_ERROR_NO_HANDLE &&
+	          PadGetHandle(user, 0, 0) == 1,
+	      "closing the special port changed the standard one");
 }
 
 void TestSettingCycles() {
@@ -577,6 +607,18 @@ void TestTheSpecialPortIsAPortOfItsOwn() {
 	      "the special port did not close");
 }
 
+void TestMonoLedPadGetsNoLightBar() {
+	Controller             controller;
+	const PadLightBarParam first {10, 20, 30, 0};
+	const PadLightBarParam second {40, 50, 60, 0};
+	Check(PadSetLightBar(1, &first) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a pad without an LED capability did not receive the light bar");
+	mono_led[1] = true;
+	Check(PadSetLightBar(1, &second) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a mono-LED pad received the light bar");
+	mono_led[1] = false;
+}
+
 void TestPlayerUserIds() {
 	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
 	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
@@ -886,6 +928,7 @@ int main() {
 	Config::Initialize();
 	TestPlayerUserIds();
 	TestPadPortOwnership();
+	TestSpecialPortWithoutDevice();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
@@ -898,6 +941,7 @@ int main() {
 	TestAPadWithoutASeatPlaysAsNobody();
 	TestTheKeyboardIsNeverSeated();
 	TestTheLoginListHasNoGaps();
+	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestGuestsHaveTheirPlayersUserIds();
 	TestAKeyboardOfItsOwn();

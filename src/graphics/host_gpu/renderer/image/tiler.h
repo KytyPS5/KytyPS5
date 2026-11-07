@@ -56,11 +56,11 @@ public:
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
 	// Color-clear keys are multiples of 0x20, so key >> 5 selects one of these slots.
 	static constexpr uint32_t ColorClearSlots = 8;
-	// Returns the buffer whose dword slice * ColorClearSlots + (key >> 5) is set when every byte
-	// of that metadata slice equals a key whose bit `keys` selects; a hit expands to 0xff when
-	// `expand` is set.
-	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
-	                                         bool expand);
+	// metadata spans `slices` equal runs `stride` bytes apart. Returns the buffer whose dword
+	// slice * ColorClearSlots + (key >> 5) is set when every byte of that run equals a key whose
+	// bit `keys` selects; a hit expands to 0xff when `expand` is set.
+	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
+	                                         uint32_t keys, bool expand);
 
 private:
 	friend struct TileManagerTestAccess;
@@ -118,8 +118,8 @@ private:
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
-	                             const ImageInfo& info, uint32_t levels, uint64_t source_base,
-	                             uint64_t target_base);
+	                             const ImageInfo& info, uint32_t levels, uint64_t source_offset,
+	                             uint64_t target_offset);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling, bool clear_target);

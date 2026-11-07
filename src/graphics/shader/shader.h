@@ -27,7 +27,6 @@ enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
-	Fetch,
 	Compute,
 	Mesh,
 	Local,
@@ -254,7 +253,6 @@ struct ShaderPixelInputInfo {
 	// normalized; 0 = no test. The test parameters are in push data from the given dword.
 	uint32_t                                       ps_depth_bounds_format       = 0;
 	uint32_t                                       ps_depth_bounds_dword        = 0;
-	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }

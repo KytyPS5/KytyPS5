@@ -58,7 +58,6 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
-	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	// What every submitter committed to the queue. Under queue_mutex.
 	QueueCommits queue_commits;
@@ -82,11 +81,6 @@ struct GraphicContext {
 		return physical_device_properties;
 	}
 
-	[[nodiscard]] const vk::PhysicalDeviceMemoryProperties&
-	GetPhysicalDeviceMemoryProperties() const {
-		return physical_device_memory_properties;
-	}
-
 	[[nodiscard]] vk::FormatProperties GetFormatProperties(vk::Format format) const {
 		std::scoped_lock lock(m_format_properties_mutex);
 		auto [it, inserted] = m_format_properties.try_emplace(format);
@@ -94,6 +88,14 @@ struct GraphicContext {
 			physical_device.getFormatProperties(format, &it->second);
 		}
 		return it->second;
+	}
+
+	// Sampled views of format filter linearly, as guest samplers may.
+	[[nodiscard]] bool SamplesFiltered(vk::Format format) const {
+		constexpr vk::FormatFeatureFlags features =
+		    vk::FormatFeatureFlagBits::eSampledImage |
+		    vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+		return (GetFormatProperties(format).optimalTilingFeatures & features) == features;
 	}
 
 	[[nodiscard]] vk::Result GetImageFormatProperties(vk::Format format, vk::ImageType type,

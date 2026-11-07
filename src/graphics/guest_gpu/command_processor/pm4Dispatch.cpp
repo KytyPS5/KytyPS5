@@ -2,251 +2,109 @@
 
 namespace Libs::Graphics {
 
-hw_ctx_indirect_func_t g_hw_ctx_indirect_func[Pm4::CX_NUM] = {};
-hw_sh_indirect_func_t  g_hw_sh_indirect_func[Pm4::SH_NUM]  = {};
-hw_uc_indirect_func_t  g_hw_uc_indirect_func[Pm4::UC_NUM]  = {};
-
 namespace {
 
-constexpr auto MakeContextDispatchTable() {
-	std::array<hw_ctx_parser_func_t, Pm4::CX_NUM> g_hw_ctx_func {};
-
-	g_hw_ctx_func[Pm4::DB_RENDER_CONTROL]            = HwCtxSetRenderControl;
-	g_hw_ctx_func[Pm4::DB_COUNT_CONTROL]             = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE]           = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RENDER_OVERRIDE2]          = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_DFSM_CONTROL]              = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::DB_RMI_L2_CACHE_CONTROL]      = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::CB_RMI_GL2_CACHE_CONTROL]     = HwCtxSetDepthMetadataRegisters;
-	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR]              = HwCtxSetBorderColorTableAddr;
-	g_hw_ctx_func[Pm4::TA_BC_BASE_ADDR_HI]           = HwCtxSetBorderColorTableAddr;
-	g_hw_ctx_func[Pm4::DB_STENCIL_CLEAR]             = HwCtxSetStencilClear;
-	g_hw_ctx_func[Pm4::DB_DEPTH_CLEAR]               = HwCtxSetDepthClear;
-	g_hw_ctx_func[Pm4::PA_SC_SCREEN_SCISSOR_TL]      = HwCtxSetScreenScissor;
-	g_hw_ctx_func[Pm4::DB_STENCIL_INFO]              = HwCtxSetStencilInfo;
-	g_hw_ctx_func[Pm4::PA_SU_HARDWARE_SCREEN_OFFSET] = HwCtxSetHardwareScreenOffset;
-	g_hw_ctx_func[Pm4::PA_SC_WINDOW_OFFSET]          = HwCtxSetWindowOffset;
-	g_hw_ctx_func[Pm4::PA_SC_WINDOW_SCISSOR_TL]      = HwCtxSetWindowScissor;
-	for (auto cmd_offset = Pm4::PA_SC_CLIPRECT_RULE; cmd_offset < Pm4::PA_SC_CLIPRECT_0_TL + 8u;
-	     cmd_offset++) {
-		g_hw_ctx_func[cmd_offset] = HwCtxSetClipRect;
-	}
-	g_hw_ctx_func[Pm4::CB_TARGET_MASK]                 = HwCtxSetRenderTargetMask;
-	g_hw_ctx_func[Pm4::PA_SC_GENERIC_SCISSOR_TL]       = HwCtxSetGenericScissor;
-	g_hw_ctx_func[Pm4::CB_DCC_CONTROL]                 = HwCtxSetCbDccControl;
-	g_hw_ctx_func[Pm4::DB_STENCIL_CONTROL]             = HwCtxSetStencilControl;
-	g_hw_ctx_func[Pm4::DB_STENCILREFMASK]              = HwCtxSetStencilMask;
-	g_hw_ctx_func[Pm4::SPI_PS_INPUT_CNTL_0]            = HwCtxSetPsInput;
-	g_hw_ctx_func[Pm4::SPI_TMPRING_SIZE]               = HwCtxSetSpiTmpringSize;
-	g_hw_ctx_func[Pm4::DB_DEPTH_CONTROL]               = HwCtxSetDepthControl;
-	g_hw_ctx_func[Pm4::DB_EQAA]                        = HwCtxSetEqaaControl;
-	g_hw_ctx_func[Pm4::CB_COLOR_CONTROL]               = HwCtxSetColorControl;
-	g_hw_ctx_func[Pm4::DB_DEPTH_BOUNDS_MIN]            = HwCtxSetDepthBounds;
-	g_hw_ctx_func[Pm4::DB_DEPTH_BOUNDS_MAX]            = HwCtxSetDepthBounds;
-	g_hw_ctx_func[Pm4::PA_SU_POINT_SIZE]               = HwCtxSetPointState;
-	g_hw_ctx_func[Pm4::PA_SU_POINT_MINMAX]             = HwCtxSetPointState;
-	g_hw_ctx_func[Pm4::PA_CL_CLIP_CNTL]                = HwCtxSetClipControl;
-	g_hw_ctx_func[Pm4::PA_SU_SC_MODE_CNTL]             = HwCtxSetModeControl;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL]  = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_CLAMP]        = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_FRONT_SCALE]  = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_FRONT_OFFSET] = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_BACK_SCALE]   = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET]  = HwCtxSetPolyOffsetRegisters;
-	g_hw_ctx_func[Pm4::PA_CL_VTE_CNTL]                 = HwCtxSetViewportTransformControl;
-	g_hw_ctx_func[Pm4::PA_SU_LINE_CNTL]                = HwCtxSetLineControl;
-	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_LR]            = HwCtxSetFovWindow;
-	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_TB]            = HwCtxSetFovWindow;
-	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_0]              = HwCtxSetScanModeControl;
-	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_1]              = HwCtxSetScanModeControl1;
-	g_hw_ctx_func[Pm4::PA_SC_AA_CONFIG]                = HwCtxSetAaConfig;
-	for (auto cmd_offset = Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0;
-	     cmd_offset < Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + 16; cmd_offset++) {
-		g_hw_ctx_func[cmd_offset] = HwCtxSetAaSampleControl;
-	}
-	g_hw_ctx_func[Pm4::PA_SC_CENTROID_PRIORITY_0]             = HwCtxSetCentroidPriority;
-	g_hw_ctx_func[Pm4::PA_SC_CENTROID_PRIORITY_1]             = HwCtxSetCentroidPriority;
-	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0]               = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1]               = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SU_VTX_CNTL]                        = HwCtxSetVtxControl;
-	g_hw_ctx_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK]       = HwCtxSetAaMask;
-	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_0]                   = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_BINNER_CNTL_1]                   = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] = HwCtxSetPaScExtendedControl;
-	g_hw_ctx_func[Pm4::VGT_DRAW_PAYLOAD_CNTL]                 = HwCtxSetDrawPayloadControl;
-	g_hw_ctx_func[Pm4::VGT_PRIMITIVEID_RESET]                 = HwCtxSetPrimitiveIdReset;
-	g_hw_ctx_func[Pm4::PA_CL_OBJPRIM_ID_CNTL]                 = HwCtxSetObjprimIdControl;
-	g_hw_ctx_func[Pm4::VGT_SHADER_STAGES_EN]                  = HwCtxSetShaderStages;
-
-	for (uint32_t slot = 0; slot < 8; slot++) {
-		g_hw_ctx_func[Pm4::CB_COLOR0_INFO + slot * 15] = HwCtxSetColorInfo;
-
-		g_hw_ctx_func[Pm4::CB_BLEND0_CONTROL + slot * 1] = HwCtxSetBlendControl;
-	}
-
-	for (uint32_t viewport = 0; viewport < 16; viewport++) {
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_SCISSOR_0_TL + viewport * 2] = HwCtxSetViewportScissor;
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_SCISSOR_0_BR + viewport * 2] = HwCtxSetViewportScissor;
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_ZMIN_0 + viewport * 2]       = HwCtxSetViewportZ;
-		g_hw_ctx_func[Pm4::PA_SC_VPORT_ZMAX_0 + viewport * 2]       = HwCtxSetViewportZ;
-		for (uint32_t field = 0; field < 6; field++) {
-			g_hw_ctx_func[Pm4::PA_CL_VPORT_XSCALE + viewport * 6 + field] =
-			    HwCtxSetViewportScaleOffset;
-		}
-	}
-
-	return g_hw_ctx_func;
-}
-
 constexpr auto MakeShaderDispatchTable() {
-	std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func {};
+	std::array<hw_sh_parser_func_t, Pm4::SH_NUM> table {};
 
 	for (uint32_t slot = 0; slot < 32; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot * 1] = HwShSetPsUserSgpr;
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot * 1] = HwShSetGsUserSgpr;
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot * 1] = HwShSetHsUserSgpr;
+		table[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot] = HwShSetPsUserSgpr;
+		table[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] = HwShSetGsUserSgpr;
+		table[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] = HwShSetHsUserSgpr;
 	}
 	for (uint32_t slot = 0; slot < 16; slot++) {
-		g_hw_sh_func[Pm4::COMPUTE_USER_DATA_0 + slot * 1] = HwShSetCsUserSgpr;
+		table[Pm4::COMPUTE_USER_DATA_0 + slot] = HwShSetCsUserSgpr;
 	}
-
-	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] = HwShIgnoreUserAccumulator;
+	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
+	                       Pm4::SPI_SHADER_USER_ACCUM_LSHS_0, Pm4::COMPUTE_USER_ACCUM_0}) {
+		for (uint32_t slot = 0; slot < 4; slot++) {
+			table[base + slot] = HwShIgnoreUserAccumulator;
+		}
 	}
+	table[Pm4::COMPUTE_PGM_LO]          = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_PGM_HI]          = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_PGM_RSRC1]       = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_PGM_RSRC2]       = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_START_X]         = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_START_Y]         = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_START_Z]         = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_NUM_THREAD_X]    = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_NUM_THREAD_Y]    = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_NUM_THREAD_Z]    = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_RESOURCE_LIMITS] = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_TMPRING_SIZE]    = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_PGM_RSRC3]       = HwShSetCsRegisters;
+	table[Pm4::COMPUTE_PACE_ID]         = HwShSetCsRegisters;
 
-	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] = HwShIgnoreUserAccumulator;
-	}
-	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] = HwShIgnoreUserAccumulator;
-	}
-
-	for (uint32_t slot = 0; slot < 4; slot++) {
-		g_hw_sh_func[Pm4::COMPUTE_USER_ACCUM_0 + slot] = HwShIgnoreUserAccumulator;
-	}
-	g_hw_sh_func[Pm4::COMPUTE_PGM_LO]                  = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_PGM_HI]                  = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC1]               = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC2]               = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_START_X]                 = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_START_Y]                 = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_START_Z]                 = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_NUM_THREAD_X]            = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_NUM_THREAD_Y]            = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_NUM_THREAD_Z]            = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_RESOURCE_LIMITS]         = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_TMPRING_SIZE]            = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC3]               = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::COMPUTE_PACE_ID]                 = HwShSetCsRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS]  = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS] = HwShSetRegisters;
-	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS] = HwShSetRegisters;
-
-	return g_hw_sh_func;
-}
-
-constexpr auto MakeUconfigDispatchTable() {
-	std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func {};
-
-	g_hw_uc_func[Pm4::VGT_PRIMITIVE_TYPE]        = HwUcSetPrimitiveType;
-	g_hw_uc_func[Pm4::VGT_INDEX_TYPE]            = HwUcSetIndexType;
-	g_hw_uc_func[Pm4::VGT_OBJECT_ID]             = HwUcSetObjectId;
-	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_FACTORS]  = HwUcSetTextureGradientFactors;
-	g_hw_uc_func[Pm4::TEXTURE_GRADIENT_CONTROL]  = HwUcSetTextureGradientFactors;
-	g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM]        = HwUcSetIaMultiVgtParam;
-	g_hw_uc_func[Pm4::GE_MULTI_PRIM_IB_RESET_EN] = HwUcSetMultiPrimIbReset;
-	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR]        = HwUcSetBorderColorTableAddr;
-	g_hw_uc_func[Pm4::TA_CS_BC_BASE_ADDR_HI]     = HwUcSetBorderColorTableAddr;
-	g_hw_uc_func[Pm4::GE_INDX_OFFSET]            = HwUcSetGeIndexOffset;
-	g_hw_uc_func[Pm4::GDS_OA_CNTL]               = HwUcSetGdsOaRegisters;
-	g_hw_uc_func[Pm4::GDS_OA_COUNTER]            = HwUcSetGdsOaRegisters;
-	g_hw_uc_func[Pm4::GDS_OA_ADDRESS]            = HwUcSetGdsOaRegisters;
-
-	return g_hw_uc_func;
+	return table;
 }
 
 constexpr auto MakeOpcodeDispatchTable() {
-	std::array<cp_op_parser_func_t, 256> g_cp_op_func {};
+	std::array<cp_op_parser_func_t, 256> table {};
 
-	g_cp_op_func[Pm4::IT_NOP]                       = CpOpNop;
-	g_cp_op_func[Pm4::IT_SET_BASE]                  = CpOpSetBase;
-	g_cp_op_func[Pm4::IT_CLEAR_STATE]               = CpOpClearState;
-	g_cp_op_func[Pm4::IT_INDEX_BASE]                = CpOpIndexBase;
-	g_cp_op_func[Pm4::IT_INDEX_BUFFER_SIZE]         = CpOpIndexBufferSize;
-	g_cp_op_func[Pm4::IT_DISPATCH_DIRECT]           = CpOpDispatchDirect;
-	g_cp_op_func[Pm4::IT_DISPATCH_INDIRECT]         = CpOpDispatchIndirect;
-	g_cp_op_func[Pm4::IT_DRAW_INDIRECT]             = CpOpDrawIndirect;
-	g_cp_op_func[Pm4::IT_DRAW_INDEX_INDIRECT]       = CpOpDrawIndirect;
-	g_cp_op_func[Pm4::IT_DRAW_INDIRECT_MULTI]       = CpOpDrawIndirectMulti;
-	g_cp_op_func[Pm4::IT_DRAW_INDEX_INDIRECT_MULTI] = CpOpDrawIndirectMulti;
-	g_cp_op_func[Pm4::IT_DRAW_INDEX_2]              = CpOpDrawIndex;
-	g_cp_op_func[Pm4::IT_DRAW_INDEX_OFFSET_2]       = CpOpDrawIndexOffset;
-	g_cp_op_func[Pm4::IT_DISPATCH_DRAW_PREAMBLE]    = CpOpDrawIndex;
-	g_cp_op_func[Pm4::IT_PFP_SYNC_ME]               = CpOpPfpSyncMe;
-	g_cp_op_func[Pm4::IT_INDEX_TYPE]                = CpOpIndexType;
-	g_cp_op_func[Pm4::IT_NUM_INSTANCES]             = CpOpNumInstances;
-	g_cp_op_func[Pm4::IT_DRAW_INDEX_AUTO]           = CpOpDrawIndexAuto;
-	g_cp_op_func[Pm4::IT_COND_EXEC]                 = CpOpCondExec;
-	g_cp_op_func[Pm4::IT_SET_PREDICATION]           = CpOpSetPredication;
-	g_cp_op_func[Pm4::IT_WRITE_DATA]                = CpOpWriteData;
-	g_cp_op_func[Pm4::IT_WAIT_REG_MEM]              = CpOpWaitRegMem32;
-	g_cp_op_func[Pm4::IT_INDIRECT_BUFFER]           = CpOpIndirectBuffer;
-	g_cp_op_func[Pm4::IT_COPY_DATA]                 = CpOpCopyData;
-	g_cp_op_func[Pm4::IT_EVENT_WRITE]               = CpOpEventWrite;
-	g_cp_op_func[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
-	g_cp_op_func[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
-	g_cp_op_func[Pm4::IT_RELEASE_MEM]               = CpOpReleaseMem;
-	g_cp_op_func[Pm4::IT_MEM_SEMAPHORE]             = CpOpMemSemaphore;
-	g_cp_op_func[Pm4::IT_REWIND]                    = CpOpRewind;
-	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG]           = CpOpSetContextReg;
-	g_cp_op_func[Pm4::IT_SET_SH_REG]                = CpOpSetShaderReg;
-	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG]           = CpOpSetUconfigReg;
-	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG_INDEX]     = CpOpSetUconfigReg;
-	g_cp_op_func[Pm4::IT_SET_CONTEXT_REG_INDIRECT]  = CpOpIndirectCxRegs;
-	g_cp_op_func[Pm4::IT_SET_SH_REG_INDIRECT]       = CpOpIndirectShRegs;
-	g_cp_op_func[Pm4::IT_SET_UCONFIG_REG_INDIRECT]  = CpOpIndirectUcRegs;
-	g_cp_op_func[Pm4::IT_GET_LOD_STATS]             = CpOpGetLodStats;
-	g_cp_op_func[Pm4::IT_WAIT_REG_MEM_64]           = CpOpWaitRegMem64;
+	table[Pm4::IT_NOP]                       = CpOpNop;
+	table[Pm4::IT_SET_BASE]                  = CpOpSetBase;
+	table[Pm4::IT_CLEAR_STATE]               = CpOpClearState;
+	table[Pm4::IT_INDEX_BASE]                = CpOpIndexBase;
+	table[Pm4::IT_INDEX_BUFFER_SIZE]         = CpOpIndexBufferSize;
+	table[Pm4::IT_DISPATCH_DIRECT]           = CpOpDispatchDirect;
+	table[Pm4::IT_DISPATCH_INDIRECT]         = CpOpDispatchIndirect;
+	table[Pm4::IT_DRAW_INDIRECT]             = CpOpDrawIndirect;
+	table[Pm4::IT_DRAW_INDEX_INDIRECT]       = CpOpDrawIndirect;
+	table[Pm4::IT_DRAW_INDIRECT_MULTI]       = CpOpDrawIndirectMulti;
+	table[Pm4::IT_DRAW_INDEX_INDIRECT_MULTI] = CpOpDrawIndirectMulti;
+	table[Pm4::IT_DRAW_INDEX_2]              = CpOpDrawIndex;
+	table[Pm4::IT_DRAW_INDEX_OFFSET_2]       = CpOpDrawIndexOffset;
+	table[Pm4::IT_DRAW_INDEX_MULTI_INST]     = CpOpDrawIndexMultiInst;
+	table[Pm4::IT_PFP_SYNC_ME]               = CpOpPfpSyncMe;
+	table[Pm4::IT_INDEX_TYPE]                = CpOpIndexType;
+	table[Pm4::IT_NUM_INSTANCES]             = CpOpNumInstances;
+	table[Pm4::IT_DRAW_INDEX_AUTO]           = CpOpDrawIndexAuto;
+	table[Pm4::IT_COND_EXEC]                 = CpOpCondExec;
+	table[Pm4::IT_SET_PREDICATION]           = CpOpSetPredication;
+	table[Pm4::IT_WRITE_DATA]                = CpOpWriteData;
+	table[Pm4::IT_WAIT_REG_MEM]              = CpOpWaitRegMem32;
+	table[Pm4::IT_INDIRECT_BUFFER]           = CpOpIndirectBuffer;
+	table[Pm4::IT_COPY_DATA]                 = CpOpCopyData;
+	table[Pm4::IT_EVENT_WRITE]               = CpOpEventWrite;
+	table[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
+	table[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
+	table[Pm4::IT_RELEASE_MEM]               = CpOpReleaseMem;
+	table[Pm4::IT_MEM_SEMAPHORE]             = CpOpMemSemaphore;
+	table[Pm4::IT_REWIND]                    = CpOpRewind;
+	table[Pm4::IT_SET_CONTEXT_REG]           = CpOpSetContextReg;
+	table[Pm4::IT_SET_SH_REG]                = CpOpSetShaderReg;
+	table[Pm4::IT_SET_UCONFIG_REG]           = CpOpSetUconfigReg;
+	table[Pm4::IT_SET_UCONFIG_REG_INDEX]     = CpOpSetUconfigReg;
+	table[Pm4::IT_SET_CONTEXT_REG_INDIRECT]  = CpOpIndirectCxRegs;
+	table[Pm4::IT_SET_SH_REG_INDIRECT]       = CpOpIndirectShRegs;
+	table[Pm4::IT_SET_UCONFIG_REG_INDIRECT]  = CpOpIndirectUcRegs;
+	table[Pm4::IT_GET_LOD_STATS]             = CpOpGetLodStats;
+	table[Pm4::IT_WAIT_REG_MEM_64]           = CpOpWaitRegMem64;
 
-	return g_cp_op_func;
+	return table;
 }
 
 constexpr auto MakeCustomOpcodeDispatchTable() {
-	std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func {};
+	std::array<cp_op_parser_func_t, Pm4::R_NUM> table {};
 
-	g_cp_op_custom_func[Pm4::R_DISPATCH_RESET] = CpOpDispatchReset;
-	g_cp_op_custom_func[Pm4::R_WAIT_FLIP_DONE] = CpOpWaitFlipDone;
-	g_cp_op_custom_func[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
-	g_cp_op_custom_func[Pm4::R_POP_MARKER]     = CpOpPopMarker;
-	g_cp_op_custom_func[Pm4::R_FLIP]           = CpOpFlip;
-	g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
-	g_cp_op_custom_func[Pm4::R_PSSR]           = CpOpPssr;
+	table[Pm4::R_DISPATCH_RESET] = CpOpDispatchReset;
+	table[Pm4::R_WAIT_FLIP_DONE] = CpOpWaitFlipDone;
+	table[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
+	table[Pm4::R_POP_MARKER]     = CpOpPopMarker;
+	table[Pm4::R_FLIP]           = CpOpFlip;
+	table[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
+	table[Pm4::R_PSSR]           = CpOpPssr;
 
-	return g_cp_op_custom_func;
+	return table;
 }
 
 } // namespace
 
-constinit const std::array<hw_ctx_parser_func_t, Pm4::CX_NUM> g_hw_ctx_func =
-    MakeContextDispatchTable();
 constinit const std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func =
     MakeShaderDispatchTable();
-constinit const std::array<hw_uc_parser_func_t, Pm4::UC_NUM> g_hw_uc_func =
-    MakeUconfigDispatchTable();
 constinit const std::array<cp_op_parser_func_t, 256> g_cp_op_func = MakeOpcodeDispatchTable();
 constinit const std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func =
     MakeCustomOpcodeDispatchTable();
-
-void GraphicsInitJmpTables() {
-	GraphicsInitJmpTablesCxIndirect();
-	GraphicsInitJmpTablesShIndirect();
-	GraphicsInitJmpTablesUcIndirect();
-}
 
 } // namespace Libs::Graphics

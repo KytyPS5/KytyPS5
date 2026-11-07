@@ -2187,6 +2187,11 @@ void TestNetCtlHostIpv4() {
 
 template <int Mode>
 void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
+  // The API refuses a callback that is already registered, so each instantiation
+  // has to stay distinct: without this per-mode counter the four identical bodies
+  // are folded into one address and the second registration is rejected.
+  static int registrations = 0;
+  ++registrations;
   auto& event = *static_cast<std::array<int, 3>*>(arg);
   ++event[0];
   event[1] = user_id;
@@ -2723,11 +2728,13 @@ void CheckSocketWakeup() {
     const std::array<int64_t, 2> timeout {2, 0};
     return Net::Select(fd + 1, readable.data(), nullptr, nullptr, timeout.data()) == 1;
   };
-  Check(shutdown(-1, 1) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF &&
-            shutdown(shutdown_writer, 3) == -1 &&
+  // The net ABI reports SCE_NET_ERROR_* instead of -1, like sendto above.
+  Check(shutdown(-1, 1) == Libs::Network::NET_ERROR_EBADF &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "shutdown rejects an invalid descriptor");
+  Check(shutdown(shutdown_writer, 3) == Libs::Network::NET_ERROR_EINVAL &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-        "shutdown rejects invalid descriptors and directions");
+        "shutdown rejects an invalid direction");
   Check(Net::Send(shutdown_writer, "x", 1, 0) == 1 && shutdown(shutdown_writer, 1) == 0 &&
             ready_to_read(shutdown_reader) &&
             Net::Recv(shutdown_reader, received.data(), 1, 0) == 1 && received[0] == 'x' &&

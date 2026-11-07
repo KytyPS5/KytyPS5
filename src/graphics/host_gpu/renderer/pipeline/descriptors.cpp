@@ -138,7 +138,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
-// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state.
+// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state and the
+// mip-stats counter only counts sampling.
 static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
 	constexpr uint32_t field1_reserved_mask = 1u << 29u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
@@ -149,6 +150,7 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                     (uint32_t {descriptor.MipStatsCntEn()} << 25u) |
 	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
 	if ((descriptor.fields[1] & field1_reserved_mask) != 0 ||
 	    (descriptor.fields[2] & field2_reserved_mask) != 0 || descriptor.fields[3] != field3_expected) {
@@ -485,8 +487,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
-	// Image heap resolves do not follow the draws that sample them: they report no samples.
-	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap) {
+	// Image heap resolves do not follow the draws that sample them and storage access is not
+	// sampling: neither reports samples.
+	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap && !storage) {
 		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
 		const uint8_t base    = descriptor.BaseLevel();
 		counter.finest_level  = std::min(counter.finest_level, base);

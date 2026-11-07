@@ -51026,6 +51026,11 @@ ShaderTextureResource Ppsa02110MinLodStorageTextureDescriptor() {
            0x00700080u, 0x000000d1u, 0x00000000u}};
 }
 
+ShaderTextureResource Ppsa02110MipStatsStorageTextureDescriptor() {
+  return {{0x150f0000u, 0xc4b40000u, 0x003fc03fu, 0xd0544facu, 0x00000000u,
+           0x02700080u, 0x00000046u, 0x00000000u}};
+}
+
 ShaderTextureResource Ppsa02527R16FloatStorageTextureDescriptor() {
   return {{0x00ce3500u, 0xc0d00000u, 0x010dc1dfu, 0x91b00204u, 0x00000000u,
            0x00700000u, 0x00000000u, 0x00000000u}};
@@ -51668,17 +51673,25 @@ void CheckBasicStorageTextureDescriptor() {
 }
 #endif
 
-void CheckStorageTextureMinLodAtBaseLevel() {
-  const auto descriptor = Ppsa02110MinLodStorageTextureDescriptor();
-  Require("StorageTextureMinLod", "PPSA02110 mip-four descriptor",
-          descriptor.BaseLevel() == 4 && descriptor.LastLevel() == 4 &&
-              descriptor.MinLod() == 4u << 8u &&
-              descriptor.Format() == Prospero::BufferFormat::k32_32UInt &&
-              descriptor.TileMode() == Prospero::TileMode::kStandard4KB,
+void CheckStorageTextureDescriptors() {
+  constexpr const char *name = "StorageTextureDescriptors";
+  const auto min_lod = Ppsa02110MinLodStorageTextureDescriptor();
+  Require(name, "PPSA02110 mip-four descriptor",
+          min_lod.BaseLevel() == 4 && min_lod.LastLevel() == 4 &&
+              min_lod.MinLod() == 4u << 8u &&
+              min_lod.Format() == Prospero::BufferFormat::k32_32UInt &&
+              min_lod.TileMode() == Prospero::TileMode::kStandard4KB,
           "PPSA02110 MIN_LOD storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), descriptor,
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), min_lod,
                          0xab000);
-  std::printf("[host]    %-32s ok\n", "StorageTextureMinLod");
+  const auto mip_stats = Ppsa02110MipStatsStorageTextureDescriptor();
+  Require(name, "PPSA02110 mip-stats descriptor",
+          mip_stats.MipStatsCntEn() && mip_stats.MipStatsCntId() == 0x46 &&
+              mip_stats.Format() == Prospero::BufferFormat::k32_32_32_32UInt,
+          "PPSA02110 mip-stats storage descriptor fixture is malformed");
+  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_stats,
+                         0x156000);
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckStorageTextureLinearUploadLayout() {
@@ -54849,9 +54862,9 @@ void CheckPm4LodStats(RenderContext &renderer) {
 }
 
 // With --lod-stats, GET_LOD_STATS reports the counter of a bound T# as sampled at its BASE_LEVEL,
-// clamped when MIN_LOD lies above that level; image heap elements and other counters report no
-// samples. Bit 18 or 19 resets the counters after its report. Without --lod-stats no slot reports
-// samples.
+// clamped when MIN_LOD lies above that level; image heap elements, storage images and other
+// counters report no samples. Bit 18 or 19 resets the counters after its report. Without
+// --lod-stats no slot reports samples.
 void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
   constexpr const char *name = "Pm4LodStatsBoundTextures";
   constexpr uintptr_t base = 0x0000000205100000ull;
@@ -54902,12 +54915,14 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
       u32 base_level;
       u32 min_lod; // u4.8
       bool heap;
+      bool storage;
     };
     // Counter 7 combines levels 1, 0 and 2; only the level 0 T# has MIN_LOD above its level.
     const std::array bindings{Binding{3, true, 0, 0, false}, Binding{5, true, 1, 0x200, false},
                               Binding{7, true, 1, 0x100, false}, Binding{7, true, 0, 0x80, false},
                               Binding{7, true, 2, 0x200, false}, Binding{9, true, 0, 0x200, true},
-                              Binding{11, false, 0, 0x200, false}};
+                              Binding{11, false, 0, 0x200, false},
+                              Binding{13, true, 0, 0, false, true}};
     auto &executor = context.GetRenderExecutor();
     const auto bind = [&] {
       for (u32 index = 0; index < bindings.size(); index++) {
@@ -54926,10 +54941,13 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
         value.dword_count = 8;
         std::copy_n(descriptor.fields, 8, value.dwords.begin());
         ShaderRecompiler::IR::ImageResource resource{};
-        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.resource_class =
+            binding.storage ? ShaderRecompiler::IR::ImageResourceClass::Storage
+                            : ShaderRecompiler::IR::ImageResourceClass::Sampled;
         resource.numeric_class = Prospero::TextureNumericClass::Float;
         resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-        resource.read = true;
+        resource.read = !binding.storage;
+        resource.written = binding.storage;
         resource.heap = binding.heap;
         static_cast<void>(RenderExecutorTestAccess::ResolveTexture(executor, resource, value));
       }
@@ -56402,7 +56420,7 @@ int main(int argc, char **argv) {
   bool skipped_device_checks = false;
 #endif
   CheckImageSamplerSpecialization();
-  CheckStorageTextureMinLodAtBaseLevel();
+  CheckStorageTextureDescriptors();
   CheckResourcePlanHandoff();
   CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();

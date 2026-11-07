@@ -16987,6 +16987,23 @@ public:
                 "a view past MAX_MIP of a complete chain changed its stored "
                 "layout");
       }
+      {
+        // ASTRO BOT samples mip 6 of a target that declares mips 0-5: past MAX_MIP, in the
+        // declared chain's mip tail. It reads the declared chain there.
+        constexpr uint64_t address = base + 0x480000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc3e00000u, 0x003fc03fu, 0xd056602cu, 0, 0x00700050u, 0, 0};
+        descriptor.dword_count = 8;
+        const auto store =
+            RenderExecutorTestAccess::ResolveTexture(executor, storage_resource, descriptor);
+        Require(name, "mip view past MAX_MIP in the mip tail",
+                store.desc.info.extent.width == 256 &&
+                    store.desc.info.extent.height == 256 &&
+                    store.desc.info.resources.levels == 7 &&
+                    store.desc.view_info.base_level == 6,
+                "a view past MAX_MIP in the mip tail did not read the declared chain");
+      }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);

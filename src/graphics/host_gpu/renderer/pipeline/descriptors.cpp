@@ -418,19 +418,34 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
+static bool MatchTextureMipView(ImageInfo& info, ImageInfo physical, uint32_t physical_levels,
+                                bool metadata, uint32_t view_levels, uint32_t& base_level);
+
 static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
                                   uint32_t view_levels, uint32_t& base_level) {
 	if (!info.IsTiled()) {
 		return false;
 	}
-	ImageInfo physical = info;
 	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
 	// compresses mip 1 through a T# that declares one level).
 	if (base_level >= physical_levels) {
-		const auto mip  = info.MipExtent(base_level);
-		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
-		physical_levels = view_levels;
+		ImageInfo  physical = info;
+		const auto mip      = info.MipExtent(base_level);
+		physical.extent     = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
+		if (MatchTextureMipView(info, std::move(physical), view_levels, metadata, view_levels,
+		                        base_level)) {
+			return true;
+		}
 	}
+	// Otherwise the view reads the declared chain, past MAX_MIP in its mip tail too (ASTRO BOT
+	// samples mip 6 of a 1920x1080 target that declares mips 0-5).
+	return MatchTextureMipView(info, info, physical_levels, metadata, view_levels, base_level);
+}
+
+// Whether the view of `info` from base_level fits in `physical` with physical_levels mips; if so,
+// `info` becomes `physical` where they differ and base_level the view's mip in it.
+static bool MatchTextureMipView(ImageInfo& info, ImageInfo physical, uint32_t physical_levels,
+                                bool metadata, uint32_t view_levels, uint32_t& base_level) {
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
 	info.UpdateSize();

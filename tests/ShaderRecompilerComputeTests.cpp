@@ -16814,6 +16814,21 @@ public:
                 "a view past MAX_MIP of a complete chain changed its stored "
                 "layout");
       }
+      {
+        constexpr uint64_t address = base + 0x800000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc4700000u, 0x010dc1dfu, 0x91b66facu, 0, 0x00700050u, 0, 0};
+        descriptor.dword_count = 8;
+        const auto store = RenderExecutorTestAccess::ResolveTexture(
+            executor, fixed_storage_resource, descriptor);
+        Require(name, "tail mip view past MAX_MIP",
+                store.desc.info.extent.width == 1920 &&
+                    store.desc.info.extent.height == 1080 &&
+                    store.desc.info.resources.levels == 7 &&
+                    store.desc.view_info.base_level == 6,
+                "ASTRO BOT's mip 6 of a six-level 1920x1080 chain left the chain");
+      }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
                                                    mipped_storage_descriptor);

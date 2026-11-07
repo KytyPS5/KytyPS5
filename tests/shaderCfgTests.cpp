@@ -137,7 +137,8 @@ struct TestCompileResult {
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
-    uint32_t push_data_start_dword = 0) {
+    uint32_t push_data_start_dword = 0,
+    uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -151,7 +152,8 @@ TestCompileResult RecompileForTest(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), options, specialization, push_data_start_dword,
+      push_data_ceiling);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -7654,9 +7656,16 @@ void TestMeshExportStorage() {
         options, push_data_start);
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
-    Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
-              layout.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
-          "mesh shader did not retain its user-data placement and buffer offset");
+    Check(
+        layout.UsesPushData() ==
+                (push_data_start == PushData::MeshDrawDwordCount) &&
+            layout.push_data_start_dword ==
+                (push_data_start == PushData::MeshDrawDwordCount
+                     ? PushData::DwordCount - layout.ShaderDataDwords()
+                     : PushData::NoStart) &&
+            layout.descriptor_counts[static_cast<size_t>(
+                ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
+        "mesh shader did not retain its user-data placement and buffer offset");
     const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
     Check(reg != result.program.info.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
@@ -7666,7 +7675,9 @@ void TestMeshExportStorage() {
       const auto operand =
           std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
           " %uint_0 %uint_" +
-          std::to_string(dword + (layout.UsesPushData() ? push_data_start : 0u));
+          std::to_string(dword + (layout.UsesPushData()
+                                      ? layout.push_data_start_dword
+                                      : 0u));
       Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
             "mesh user SGPR or buffer offset loaded from the wrong storage");
     }
@@ -12619,6 +12630,74 @@ void TestGraphicsPushConstantPlacement() {
   CheckSpirvBinaryValidates(spill.spirv);
 }
 
+void TestVertexPushConstantPlacement() {
+  using ShaderRecompiler::IR::PushData;
+  constexpr uint32_t PrefixDwords = PushData::GraphicsDrawDwords(false, true);
+  constexpr uint32_t FirstPixelDwords = 2;
+  constexpr uint32_t SecondPixelDwords = 7;
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 0),
+      EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2),
+      EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  const auto options = MakeCompileOptions(ShaderType::Vertex);
+  const auto first =
+      RecompileForTest(shader, options, PrefixDwords + FirstPixelDwords);
+  const auto second =
+      RecompileForTest(shader, options, PrefixDwords + SecondPixelDwords);
+  const auto size = first.program.bindings.ShaderDataDwords();
+  Check(size != 0 && first.program.bindings.UsesPushData() &&
+            first.program.bindings.push_data_start_dword ==
+                PushData::DwordCount - size &&
+            first.program.bindings == second.program.bindings &&
+            first.spirv == second.spirv,
+        "vertex shader placement depended on the paired pixel data size");
+  CheckSpirvBinaryValidates(first.spirv);
+  constexpr uint32_t Ceiling = 16;
+  const auto exact = RecompileForTest(shader, options, Ceiling - size, Ceiling);
+  const auto spill =
+      RecompileForTest(shader, options, Ceiling - size + 1, Ceiling);
+  Check(exact.program.bindings.push_data_start_dword == Ceiling - size &&
+            !spill.program.bindings.UsesPushData(),
+        "vertex shader ignored the preceding vertex stage's push-data ceiling");
+  CheckSpirvBinaryValidates(exact.spirv);
+  CheckSpirvBinaryValidates(spill.spirv);
+}
+
+void TestGraphicsPushConstantFit() {
+  using ShaderRecompiler::IR::PushData;
+  for (uint32_t prefix = 0; prefix <= PushData::DwordCount; prefix++) {
+    for (uint32_t ps = 0; ps <= PushData::DwordCount; ps++) {
+      const bool ps_fits = ps != 0 && prefix + ps <= PushData::DwordCount;
+      const auto floor = prefix + (ps_fits ? ps : 0u);
+      const auto ps_start = ps_fits ? prefix : PushData::NoStart;
+      Check(PushData::StartFor(ShaderType::Pixel, prefix, ps) == ps_start &&
+                PushData::StartFor(ShaderType::Compute, prefix, ps) == ps_start,
+            "bottom-up shader data changed push/spill selection");
+      for (uint32_t used = 0; used <= PushData::DwordCount; used++) {
+        const auto ceiling = PushData::DwordCount - used;
+        for (uint32_t vs = 0; vs <= PushData::DwordCount; vs++) {
+          const bool fits =
+              vs != 0 && floor + used + vs <= PushData::DwordCount;
+          const auto start = fits ? ceiling - vs : PushData::NoStart;
+          for (const auto stage :
+               {ShaderType::Vertex, ShaderType::Mesh, ShaderType::Local,
+                ShaderType::TessellationControl,
+                ShaderType::TessellationEvaluation}) {
+            Check(PushData::StartFor(stage, floor, vs, ceiling) == start,
+                  "top-down shader data changed push/spill selection or "
+                  "placement");
+          }
+        }
+      }
+    }
+  }
+}
+
 void TestCapturedBufferLoadUbyteD16Decode() {
   namespace Decoder = ShaderRecompiler::Decoder;
   const uint32_t code[] = {0xe080e000u, 0x80040003u};
@@ -13680,6 +13759,8 @@ int main() {
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
+  TestVertexPushConstantPlacement();
+  TestGraphicsPushConstantFit();
   TestCapturedBufferLoadUbyteD16Decode();
   TestCapturedGlobalLoadShortD16HiDecode();
   TestFlatLoadShortD16HiLlvmEncodingAnchor();

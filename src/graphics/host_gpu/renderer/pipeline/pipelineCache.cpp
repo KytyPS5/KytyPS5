@@ -373,8 +373,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (options.stage == ShaderType::Mesh ||
 		    options.stage == ShaderType::TessellationControl) {
 			options.user_data_base = 0;
-			options.wave_size =
-			    options.stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+		}
+		if (options.stage == ShaderType::Mesh) {
+			options.wave_size = input_info.mesh.wave_size;
 		}
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 		options.stage            = ShaderType::Pixel;

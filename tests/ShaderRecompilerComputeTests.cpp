@@ -634,6 +634,12 @@ struct PipelineCacheTestAccess {
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 
+  static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
+                                        ShaderVertexInputInfo &input) {
+    uint32_t push_data_cursor = 0;
+    return cache.GetProgram(params, input, push_data_cursor);
+  }
+
   static void StoreLayout(PipelineCache &cache, uint64_t key,
                           const ShaderTessellationInputInfo &layout) {
     cache.StoreLayout(key, layout);
@@ -49014,6 +49020,76 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// The HS wave runs the fused LS and HS and the GS wave runs the TES, so VGT_SHADER_STAGES_EN
+// gives each stage its wave size; a GS that amplifies tessellated primitives stays rejected.
+// The TES gates its vertices on GS_TG_INFO's group vertex count (PPSA02110's prologue) and
+// on the merged wave info's lane count.
+void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler;
+  constexpr const char *name = "TessellationWaveSizes";
+  const std::vector<u32> local{EncodeSop1(0x20, 0, 6), 0xffffffffu};
+  const std::vector<u32> control{EncodeSopp(0x01)};
+  const std::vector<u32> evaluation{
+      0x93ebff03u, 0x00040018u, 0x8f6a856bu, 0xd7650001u, 0x0000d4c1u, // v1: wave lane id
+      0x9381ff02u, 0x0009000cu, 0x7da80201u, // v_cmpx_gt_u32 s1 = GS_TG_INFO[20:12], v1
+      0x9380ff03u, 0x00080000u, 0x7da80200u, // v_cmpx_gt_u32 s0 = s3[7:0], v1
+      EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01)};
+  static ShaderUserData user_data{};
+  const auto map = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type) {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = type, .user_data = &user_data,
+                       .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  };
+  map(local, Prospero::ShaderBinaryType::kHsFront);
+  map(control, Prospero::ShaderBinaryType::kHsBack);
+  map(evaluation, Prospero::ShaderBinaryType::kGs);
+  HW::VertexShaderInfo regs{};
+  regs.ls_regs.data_addr = reinterpret_cast<uint64_t>(local.data());
+  regs.hs_regs.data_addr = reinterpret_cast<uint64_t>(control.data());
+  regs.hs_regs.user_data_addr = 1;
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(evaluation.data());
+  HW::Context context;
+  context.SetLsHsConfig(0x0001062au); // 42 patches, 6 input and 4 output control points
+  context.SetTfParam(0x00040042u);    // quads
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  // The captured draw sets HS_W32 (bit 21) and GS_W32 (bit 22).
+  for (const auto [stages, hs_wave, gs_wave] :
+       {std::tuple{0x0260210du, 32u, 32u}, {0x0020210du, 32u, 64u}, {0x0040210du, 64u, 32u}}) {
+    context.SetShaderStages(stages);
+    std::array<ShaderVertexInputInfo, 3> info;
+    const auto params = PrepareTessellationPrograms(regs, context, info);
+    for (u32 i = 0; i < 3; i++) {
+      info[i].tess.ls_stride = info[i].tess.hs_stride = 16;
+      Require(name, "stage wave size",
+              PipelineCacheTestAccess::GetProgram(cache, params[i], info[i])->info.wave_size ==
+                  (i < 2 ? hs_wave : gs_wave),
+              "a tessellation stage did not run in its HS or GS wave size");
+    }
+    CompileOptions options{.stage = ShaderType::TessellationEvaluation, .wave_size = gs_wave};
+    options.input_info.vertex = &info[2];
+    const auto translated = TranslateProgram(evaluation, options);
+    u32 full_wave_gates = 0;
+    for (const auto *block : translated.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
+          const auto count = inst.Arg(0).Resolve();
+          full_wave_gates += count.IsImmediate() && count.U32() == gs_wave;
+        }
+      }
+    }
+    Require(name, "TES vertex gates", full_wave_gates == 2,
+            "GS_TG_INFO or the merged wave info did not count one full TES wave");
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  context.SetShaderStages(0x0260212du);
+  ExpectFatal("TessellationGsAmplification", [&] {
+    std::array<ShaderVertexInputInfo, 3> info;
+    (void)PrepareTessellationPrograms(regs, context, info);
+  });
+#endif
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Module ids come from the module inputs, not from the order of compilation.
 void CheckStableProgramIds(VulkanHarness &vulkan) {
   constexpr const char *name = "StableProgramIds";
@@ -55507,8 +55583,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--tessellation-only") == 0) {
+    VulkanHarness vulkan;
     CheckTessellationPrograms();
     CheckEmbeddedFetchVertexOffset();
+    CheckTessellationWaveSizes(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-eq-u16-only") == 0) {
@@ -56584,6 +56662,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();

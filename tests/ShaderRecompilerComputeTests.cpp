@@ -7115,7 +7115,7 @@ public:
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x3000000;
+    constexpr uint64_t allocation_size = 0x4c00000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -7156,6 +7156,92 @@ public:
                   wide_download != nullptr && wide_download_offset % 16 == 0,
               "wide/block image readback was not aligned to its texel block");
       resources.MapMemory(base, allocation_size);
+
+      {
+        constexpr uint64_t offset = 0x4800000;
+        std::memset(memory + offset, 0x5a, 0x2c0000);
+        auto cached = MakeLinearDesc(
+            base + offset, 0, vk::Format::eR8Uint,
+            Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
+            {1024, 1024, 1}, 1, 1, 1);
+        cached.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        cached.info.resources = {11, 1};
+        cached.view_info.level_count = 11;
+        cached.info.UpdateSize();
+        auto requested = cached;
+        requested.info.data.size = 0;
+        requested.info.resources = {9, 2};
+        requested.view_info.level_count = 9;
+        requested.view_info.layer_count = 2;
+        requested.view_info.type = vk::ImageViewType::e2DArray;
+        requested.info.UpdateSize();
+        Require(name, "mixed resource footprints",
+                cached.info.data.size == 0x160000 &&
+                    requested.info.data.size == 0x2c0000 &&
+                    cached.info.first_tail_level == 3 &&
+                    requested.info.first_tail_level == 3,
+                "unexpected tiled fixture layout");
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+          vk::ClearValue clear{};
+          clear.color.uint32.fill(0x10u + mip);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), before,
+              {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
+        }
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "layer growth with fewer levels",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "insufficient backing was retained");
+        (void)texture_cache.FindTexture(after, requested);
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+          Require(name, "mixed resource contents",
+                  ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 0, mip) ==
+                          std::vector<u32>{(0x10u + mip) * 0x01010101u} &&
+                      ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 1, mip) ==
+                          std::vector<u32>{0x5a5a5a5au},
+                  "lost GPU contents or failed to initialize the added layer");
+        }
+      }
+      {
+        constexpr uint64_t offset = 0x4b00000;
+        const std::array<uint32_t, 4> values{
+            0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+        std::memcpy(memory + offset, values.data(), sizeof(values));
+        auto cached = MakeLinearDesc(
+            base + offset, sizeof(values), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {2, 1, 1}, 1, 4, 1);
+        cached.info.resources = {2, 1};
+        cached.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
+        cached.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
+        cached.info.linear_slice_stride = 0;
+        cached.view_info.level_count = 2;
+        auto requested = MakeLinearDesc(
+            base + offset, sizeof(values), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {2, 1, 1}, 2, 4, 1);
+        requested.view_info.base_layer = 1;
+        requested.view_info.layer_count = 1;
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "missing-layer fallback replacement",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "FindImage returned a backing without the requested layer");
+        Require(name, "missing-layer texture acquisition",
+                texture_cache.FindTexture(after, requested) != nullptr &&
+                    ReadCachedTexel(name, context, after, {}, {1, 1, 1}, 1) ==
+                        std::vector<u32>{values[2]},
+                "the requested layer was not usable");
+      }
 
       auto sampled =
           MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,
@@ -53798,10 +53884,12 @@ void CheckDepthTargetFootprints() {
               IsSupportedDepthPlaneReadback(compressed_stencil),
           "stencil metadata incorrectly blocked independent depth-plane "
           "readback");
-  Require("DepthTargetFootprints", "lexicographic subresource comparison",
-          ImageSubresources{2, 1} > ImageSubresources{1, 4} &&
-              ImageSubresources{1, 4} < ImageSubresources{2, 1},
-          "subresource ordering diverged from required overlap semantics");
+  Require("DepthTargetFootprints", "subresource containment",
+          ImageSubresources{2, 4}.Contains(ImageSubresources{2, 1}) &&
+              ImageSubresources{2, 4}.Contains(ImageSubresources{1, 4}) &&
+              !ImageSubresources{2, 1}.Contains(ImageSubresources{1, 4}) &&
+              !ImageSubresources{1, 4}.Contains(ImageSubresources{2, 1}),
+          "a backing must cover both the requested levels and layers");
   struct TransferPlaneCase {
     const char *name;
     vk::Format attachment;

@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "graphics/host_gpu/renderer/cache/textureTrackRange.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -30,6 +32,8 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+static_assert(TRACKER_PAGE_SIZE == kTrackPage);
 
 namespace {
 
@@ -345,7 +349,7 @@ void TextureCache::UntrackImage(ImageId id) {
 		return;
 	}
 	const auto address   = image.track_addr;
-	const auto size      = image.track_addr_end - image.track_addr;
+	const auto size      = TrackedBytes(image.track_addr, image.track_addr_end);
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
 	if (size != 0) {
@@ -359,15 +363,15 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
-	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
-	const auto size    = address - begin;
-	image.track_addr   = address;
+	const auto released = ReleaseTrackedHead(begin, image.track_addr, image.track_addr_end);
+	image.track_addr     = released.track_begin;
+	image.track_addr_end = released.track_end;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
 	}
-	if (size != 0) {
-		m_page_manager.UpdatePageWatchers<false>(begin, size);
+	if (released.size != 0) {
+		m_page_manager.UpdatePageWatchers<false>(released.address, released.size);
 	}
 }
 
@@ -377,15 +381,15 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
-	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
-	const auto size      = end - address;
-	image.track_addr_end = address;
+	const auto released = ReleaseTrackedTail(end, image.track_addr, image.track_addr_end);
+	image.track_addr     = released.track_begin;
+	image.track_addr_end = released.track_end;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
 	}
-	if (size != 0) {
-		m_page_manager.UpdatePageWatchers<false>(address, size);
+	if (released.size != 0) {
+		m_page_manager.UpdatePageWatchers<false>(released.address, released.size);
 	}
 }
 

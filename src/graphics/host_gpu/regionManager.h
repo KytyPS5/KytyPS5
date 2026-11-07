@@ -33,13 +33,16 @@ public:
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+			// Wait on reads, so the holder's cache line is not written until the lock is free.
+			while (m_lock.test(std::memory_order_relaxed)) {
 #if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
+				_mm_pause();
 #elif defined(_M_ARM64)
-			__yield();
+				__yield();
 #elif defined(__aarch64__)
-			asm volatile("yield");
+				asm volatile("yield");
 #endif
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}

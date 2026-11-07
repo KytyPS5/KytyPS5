@@ -1414,6 +1414,10 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  // A 32-lane guest wave votes with a ballot word only when it shares a wider native
+  // subgroup; a 32-lane host votes with the native opcode.
+  std::vector<std::string> required_spirv_wide;
+  std::vector<std::string> forbidden_spirv_wide;
   const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
@@ -1697,7 +1701,8 @@ size_t SpirvCodeWords(const std::vector<u32> &spirv) {
   return words;
 }
 
-void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
+void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv,
+                          u32 host_subgroup_size = 64) {
   std::vector<u32> result_types(spirv[3]);
   for (size_t offset = 5; offset < spirv.size();) {
     const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
@@ -1712,7 +1717,13 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
     }
     offset += words.size();
   }
-  if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
+  // Only a 32-lane guest wave on a wider host subgroup lowers votes to ballot words; the
+  // plain lists describe the native and 32-lane-host lowering.
+  const bool wide_wave32 = test.has_compute_info && test.compute_info.wave_size == 32u &&
+                           host_subgroup_size != 32u;
+  const auto &required = wide_wave32 ? test.required_spirv_wide : test.required_spirv;
+  const auto &forbidden = wide_wave32 ? test.forbidden_spirv_wide : test.forbidden_spirv;
+  if (required.empty() && forbidden.empty()) {
     return;
   }
 
@@ -1722,16 +1733,16 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
     Fail(test.name, "SPIR-V disassembly",
          "failed to disassemble emitted SPIR-V");
   }
-  for (const auto &required : test.required_spirv) {
-    if (text.find(required) == std::string::npos) {
+  for (const auto &entry : required) {
+    if (text.find(entry) == std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
-           std::string("missing required text: ") + required);
+           std::string("missing required text: ") + entry);
     }
   }
-  for (const auto &forbidden : test.forbidden_spirv) {
-    if (text.find(forbidden) != std::string::npos) {
+  for (const auto &entry : forbidden) {
+    if (text.find(entry) != std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
-           std::string("found forbidden text: ") + forbidden);
+           std::string("found forbidden text: ") + entry);
     }
   }
 }
@@ -1853,7 +1864,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  CheckSpirvEmission(test, result.spirv);
+  CheckSpirvEmission(test, result.spirv, host_subgroup_size);
   if (test.max_spirv_words != 0u) {
     const auto words = SpirvCodeWords(result.spirv);
     Require(test.name, "emitted shader size", words <= test.max_spirv_words,
@@ -30048,6 +30059,36 @@ TestCase VectorLaneWave32RuntimeSelectorWraps() {
   return test;
 }
 
+TestCase VectorBranchVoteStaysInsideWave32() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovU32(&code, 2, 32);
+  code.push_back(EncodeVopc(0xc1, Vgpr(0), 2)); // v_cmp_lt_u32 vcc, v0, v2
+  code.push_back(EncodeSopp(0x07, 1));                     // s_cbranch_vccnz over the marker
+  AppendVMovU32(&code, 1, 7);
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorBranchVoteStaysInsideWave32";
+  test.code = code;
+  test.expected.assign(32, 0);  // Only the wave whose lanes compare true takes the branch.
+  test.expected.resize(64, 7u);
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_LT_U32, O::S_CBRANCH_VCCNZ,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv_wide = {"OpGroupNonUniformBallot"};
+  test.forbidden_spirv_wide = {"OpGroupNonUniformAny", "OpGroupNonUniformAll"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+
 TestCase VectorReadlaneSelectsTwoKeysWithinWave() {
   using O = ShaderOpcode;
 
@@ -34394,7 +34435,15 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
                   upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
                   O::V_READLANE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // A 32-lane guest wave votes with its own ballot word only when it shares a wider native
+  // subgroup, so the other wave cannot leak EXEC into the vote; a 32-lane host and every
+  // wave64 wave vote with the native opcode.
   test.required_spirv = {"OpGroupNonUniformAny"};
+  test.forbidden_spirv = {"OpGroupNonUniformBallot"};
+  if (wave_size == 32) {
+    test.required_spirv_wide = {"OpGroupNonUniformBallot"};
+    test.forbidden_spirv_wide = {"OpGroupNonUniformAny"};
+  }
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = threads;
   test.compute_info.thread_ids_num = 1;
@@ -47978,6 +48027,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
+  AddCase(VectorBranchVoteStaysInsideWave32);
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
   for (const u32 op_sel : {0u, 1u, 2u})

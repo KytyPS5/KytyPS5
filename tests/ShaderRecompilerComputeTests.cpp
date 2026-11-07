@@ -29895,6 +29895,34 @@ TestCase VectorCvtF16U16ByteSource() {
   return test;
 }
 
+TestCase VectorCvtF16I16ByteSource() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 8, 0xa5a55a5au);
+  u32 index = 0;
+  for (u32 sext : {0u, 1u}) {
+    for (u32 input : {0x123456ffu, 0x12345680u, 0x1234567fu}) {
+      AppendSMovLiteral(&code, 106, input);
+      // Convert byte0 of vcc_lo, zero- then sign-extended, to FP16 word0 while
+      // preserving word1 of v8.
+      code.insert(code.end(), {0x7e10a2f9u, 0x0080146au | (sext << 19u)});
+      AppendStoreVgpr(&code, 8, index++);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorCvtF16I16ByteSource";
+  test.code = std::move(code);
+  test.expected = {0xa5a55bf8u, 0xa5a55800u, 0xa5a557f0u,
+                   0xa5a5bc00u, 0xa5a5d800u, 0xa5a557f0u};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_CVT_F16_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertSToF"};
+  return test;
+}
+
 TestCase VectorCvtU16F16Sdwa() {
   using O = ShaderOpcode;
 
@@ -48378,6 +48406,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtF16U16ByteSource);
+  AddCase(VectorCvtF16I16ByteSource);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);

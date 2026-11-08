@@ -1,0 +1,233 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1746" viewBox="0 0 1400 1746" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect width="1400" height="1746" fill="#ffffff"/>
+  <text x="700" y="44" text-anchor="middle" font-size="26" font-weight="700" fill="#0f172a">Where the work of a frame runs</text>
+  <text x="700" y="72" text-anchor="middle" font-size="15" fill="#475569">Each row: work the draw can do on the GPU thread, where KytyPS5 does it, and what each part is worth in Crash Bandicoot 4</text>
+  <rect x="40" y="96" width="500" height="40" rx="8" fill="#fee2e2"/>
+  <text x="290" y="122" text-anchor="middle" font-size="17" font-weight="700" fill="#991b1b">In the draw, on the GPU thread</text>
+  <rect x="600" y="96" width="500" height="40" rx="8" fill="#dcfce7"/>
+  <text x="850" y="122" text-anchor="middle" font-size="17" font-weight="700" fill="#166534">KytyPS5: ahead, in parallel, or once</text>
+  <rect x="1120" y="96" width="240" height="40" rx="8" fill="#dbeafe"/>
+  <text x="1240" y="122" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">Measured: without → with</text>
+  <g font-size="14">
+    <text x="40" y="172" font-size="15" font-weight="700" fill="#475569">Game start and new shaders</text>
+    <line x1="40" y1="179" x2="1360" y2="179" stroke="#e2e8f0" stroke-width="1"/>
+    <!-- Driver pipeline cache -->
+    <rect x="40" y="184" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="208" font-weight="700" fill="#0f172a">Driver pipeline cache</text>
+    <text x="58" y="230" font-size="13" fill="#334155">Loading MoltenVK's cache file holds the game's start.</text>
+    <line x1="546" y1="216" x2="594" y2="216" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="184" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="208" font-weight="700" fill="#0f172a">Not kept on disk on MoltenVK</text>
+    <text x="618" y="230" font-size="13" fill="#334155">The game's pipeline list is built ahead instead.</text>
+    <rect x="1120" y="184" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="212" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">76 s → none</text>
+    <text x="1240" y="232" text-anchor="middle" font-size="12" fill="#475569">to load 75 MB at start</text>
+    <!-- Shader translation -->
+    <rect x="40" y="258" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="282" font-weight="700" fill="#0f172a">Shader translation</text>
+    <text x="58" y="304" font-size="13" fill="#334155">Each new shader is translated in its first draw.</text>
+    <line x1="546" y1="290" x2="594" y2="290" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="258" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="282" font-weight="700" fill="#0f172a">Translated ahead on worker threads</text>
+    <text x="618" y="304" font-size="13" fill="#334155">About 900 programs in 1.7 s on 4 threads.</text>
+    <rect x="1120" y="258" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="286" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">17 → 0–1</text>
+    <text x="1240" y="306" text-anchor="middle" font-size="12" fill="#475569">frame gaps over 200 ms in 115 s</text>
+    <!-- Pipeline build -->
+    <rect x="40" y="332" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="356" font-weight="700" fill="#0f172a">Pipeline build</text>
+    <text x="58" y="378" font-size="13" fill="#334155">The draw waits for each new pipeline, up to 1.45 s.</text>
+    <line x1="546" y1="364" x2="594" y2="364" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="332" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="356" font-weight="700" fill="#0f172a">Built on worker threads</text>
+    <text x="618" y="378" font-size="13" fill="#334155">A draw that only changes the picture is left out.</text>
+    <rect x="1120" y="332" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="360" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">8.2 → 13 fps</text>
+    <text x="1240" y="380" text-anchor="middle" font-size="12" fill="#475569">level average on a first run</text>
+    <text x="40" y="428" font-size="15" font-weight="700" fill="#475569">Per draw, on the GPU thread</text>
+    <line x1="40" y1="435" x2="1360" y2="435" stroke="#e2e8f0" stroke-width="1"/>
+    <!-- Resource walk (SRT) -->
+    <rect x="40" y="440" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="464" font-weight="700" fill="#0f172a">Resource walk (SRT)</text>
+    <text x="58" y="486" font-size="13" fill="#334155">The walker interprets the shader's reads per draw.</text>
+    <line x1="546" y1="472" x2="594" y2="472" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="440" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="464" font-weight="700" fill="#0f172a">SRT tape: a flat list of steps</text>
+    <text x="618" y="486" font-size="13" fill="#334155">Plans with control flow use the walker.</text>
+    <rect x="1120" y="440" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="468" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">6.76 → 2.90 ms</text>
+    <text x="1240" y="488" text-anchor="middle" font-size="12" fill="#475569">resource walk per frame</text>
+    <!-- Texture descriptors -->
+    <rect x="40" y="514" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="538" font-weight="700" fill="#0f172a">Texture descriptors</text>
+    <text x="58" y="560" font-size="13" fill="#334155">The same descriptor is decoded on each draw.</text>
+    <line x1="546" y1="546" x2="594" y2="546" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="514" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="538" font-weight="700" fill="#0f172a">Decoded once per shader resource</text>
+    <text x="618" y="560" font-size="13" fill="#334155">The decode is remembered.</text>
+    <rect x="1120" y="514" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="542" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">4.10 → 3.38 ms</text>
+    <text x="1240" y="562" text-anchor="middle" font-size="12" fill="#475569">binding work per frame</text>
+    <!-- Texture layouts -->
+    <rect x="40" y="588" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="612" font-weight="700" fill="#0f172a">Texture layouts</text>
+    <text x="58" y="634" font-size="13" fill="#334155">Each draw computes its layouts again: 16,800 per frame.</text>
+    <line x1="546" y1="620" x2="594" y2="620" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="588" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="612" font-weight="700" fill="#0f172a">The last 64 layouts kept per thread</text>
+    <text x="618" y="634" font-size="13" fill="#334155">A layout depends only on format, size, mips, tiling.</text>
+    <rect x="1120" y="588" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="616" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">86%</text>
+    <text x="1240" y="636" text-anchor="middle" font-size="12" fill="#475569">of layout calls answered from them</text>
+    <!-- Guest tables -->
+    <rect x="40" y="662" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="686" font-weight="700" fill="#0f172a">Guest tables</text>
+    <text x="58" y="708" font-size="13" fill="#334155">A table read waits when its page holds any GPU-written byte.</text>
+    <line x1="546" y1="694" x2="594" y2="694" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="662" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="686" font-weight="700" fill="#0f172a">Read by their exact bytes</text>
+    <text x="618" y="708" font-size="13" fill="#334155">A read waits only for bytes the GPU wrote.</text>
+    <rect x="1120" y="662" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="690" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">92 → 54 ms</text>
+    <text x="1240" y="710" text-anchor="middle" font-size="12" fill="#475569">GPU-thread busy per frame</text>
+    <!-- Depth snapshots -->
+    <rect x="40" y="736" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="760" font-weight="700" fill="#0f172a">Depth snapshots</text>
+    <text x="58" y="782" font-size="13" fill="#334155">A buffer is made and freed per draw, 0.45 ms each.</text>
+    <line x1="546" y1="768" x2="594" y2="768" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="736" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="760" font-weight="700" fill="#0f172a">Snapshot buffers come from a pool</text>
+    <text x="618" y="782" font-size="13" fill="#334155">A run of depth-bounds draws shares one snapshot.</text>
+    <rect x="1120" y="736" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="764" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">1,400 → 140</text>
+    <text x="1240" y="784" text-anchor="middle" font-size="12" fill="#475569">buffers made per 8 s</text>
+    <text x="40" y="832" font-size="15" font-weight="700" fill="#475569">GPU work and memory</text>
+    <line x1="40" y1="839" x2="1360" y2="839" stroke="#e2e8f0" stroke-width="1"/>
+    <!-- NoContraction marks -->
+    <rect x="40" y="844" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="868" font-weight="700" fill="#0f172a">NoContraction marks</text>
+    <text x="58" y="890" font-size="13" fill="#334155">MoltenVK makes each mark a call it never inlines.</text>
+    <line x1="546" y1="876" x2="594" y2="876" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="844" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="868" font-weight="700" fill="#0f172a">Left out where the driver makes them slow</text>
+    <text x="618" y="890" font-size="13" fill="#334155">A depth prepass takes about 1 ms, not 9–25 ms.</text>
+    <rect x="1120" y="844" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="882" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">5–7 → 11–12 fps</text>
+    <!-- Render resolution -->
+    <rect x="40" y="918" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="942" font-weight="700" fill="#0f172a">Render resolution</text>
+    <text x="58" y="964" font-size="13" fill="#334155">The game renders at 4K for a 1080p window.</text>
+    <line x1="546" y1="950" x2="594" y2="950" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="918" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="942" font-weight="700" fill="#0f172a">--video-out-resolution FullHd</text>
+    <text x="618" y="964" font-size="13" fill="#334155">The game renders at 1080p.</text>
+    <rect x="1120" y="918" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="956" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">10–14 → 16–17 fps</text>
+    <!-- Cache memory -->
+    <rect x="40" y="992" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1016" font-weight="700" fill="#0f172a">Cache memory</text>
+    <text x="58" y="1035" font-size="13" fill="#334155">On system memory every image is kept, and MoltenVK</text>
+    <text x="58" y="1050" font-size="13" fill="#334155">attaches each one to every command buffer.</text>
+    <line x1="546" y1="1024" x2="594" y2="1024" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="992" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1016" font-weight="700" fill="#0f172a">Idle images freed</text>
+    <text x="618" y="1038" font-size="13" fill="#334155">Images the GPU wrote are kept.</text>
+    <rect x="1120" y="992" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1020" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">7 → 20–25 fps</text>
+    <text x="1240" y="1040" text-anchor="middle" font-size="12" fill="#475569">after six minutes of play</text>
+    <text x="40" y="1088" font-size="15" font-weight="700" fill="#475569">Recording and submitting</text>
+    <line x1="40" y1="1095" x2="1360" y2="1095" stroke="#e2e8f0" stroke-width="1"/>
+    <!-- Render passes -->
+    <rect x="40" y="1100" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1124" font-weight="700" fill="#0f172a">Render passes</text>
+    <text x="58" y="1146" font-size="13" fill="#334155">Upload copies and barriers end the pass again and again.</text>
+    <line x1="546" y1="1132" x2="594" y2="1132" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1100" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1124" font-weight="700" fill="#0f172a">Passes kept whole</text>
+    <text x="618" y="1146" font-size="13" fill="#334155">No barrier between read-only uses of an image.</text>
+    <rect x="1120" y="1100" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1128" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">36 → 11 ms</text>
+    <text x="1240" y="1148" text-anchor="middle" font-size="12" fill="#475569">encoding per frame</text>
+    <!-- Command encoding -->
+    <rect x="40" y="1174" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1198" font-weight="700" fill="#0f172a">Command encoding</text>
+    <text x="58" y="1220" font-size="13" fill="#334155">MoltenVK encodes Metal commands on the GPU thread.</text>
+    <line x1="546" y1="1206" x2="594" y2="1206" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1174" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1198" font-weight="700" fill="#0f172a">MoltenVK encodes on its own thread</text>
+    <text x="618" y="1220" font-size="13" fill="#334155">The GPU thread records the next draws.</text>
+    <rect x="1120" y="1174" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1202" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">66.5 → 48.2 ms</text>
+    <text x="1240" y="1222" text-anchor="middle" font-size="12" fill="#475569">renderer work per frame</text>
+    <!-- Submissions -->
+    <rect x="40" y="1248" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1272" font-weight="700" fill="#0f172a">Submissions</text>
+    <text x="58" y="1294" font-size="13" fill="#334155">Each guest command buffer is its own Metal one.</text>
+    <line x1="546" y1="1280" x2="594" y2="1280" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1248" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1272" font-weight="700" fill="#0f172a">Batches of 128 draws or 2 ms</text>
+    <text x="618" y="1294" font-size="13" fill="#334155">A guest wait for GPU-written bytes ends sooner.</text>
+    <rect x="1120" y="1248" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1286" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">14 → 16–17 fps</text>
+    <text x="40" y="1344" font-size="15" font-weight="700" fill="#475569">Guest memory</text>
+    <line x1="40" y1="1351" x2="1360" y2="1351" stroke="#e2e8f0" stroke-width="1"/>
+    <!-- Hot range uploads -->
+    <rect x="40" y="1356" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1380" font-weight="700" fill="#0f172a">Hot range uploads</text>
+    <text x="58" y="1402" font-size="13" fill="#334155">Each upload pass uploads the hot ranges again.</text>
+    <line x1="546" y1="1388" x2="594" y2="1388" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1356" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1380" font-weight="700" fill="#0f172a">Uploaded once per guest submission</text>
+    <text x="618" y="1402" font-size="13" fill="#334155">210 → 133 MB uploaded per frame.</text>
+    <rect x="1120" y="1356" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1394" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">18.3 → 21.5 fps</text>
+    <!-- Hot pages -->
+    <rect x="40" y="1430" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1454" font-weight="700" fill="#0f172a">Hot pages</text>
+    <text x="58" y="1476" font-size="13" fill="#334155">A page the game keeps writing faults on every write.</text>
+    <line x1="546" y1="1462" x2="594" y2="1462" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1430" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1454" font-weight="700" fill="#0f172a">Hot pages stay open for 32 guest frames</text>
+    <text x="618" y="1476" font-size="13" fill="#334155">1,457 → 83 faults per frame.</text>
+    <rect x="1120" y="1430" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1468" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">21.5 → 26.6 fps</text>
+    <!-- Uploads -->
+    <rect x="40" y="1504" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1528" font-weight="700" fill="#0f172a">Uploads</text>
+    <text x="58" y="1550" font-size="13" fill="#334155">One thread copies about 155 MB per frame, 5.6 ms.</text>
+    <line x1="546" y1="1536" x2="594" y2="1536" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1504" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1528" font-weight="700" fill="#0f172a">Copy workers fill staging in parallel</text>
+    <text x="618" y="1550" font-size="13" fill="#334155">The ranges of a batch copy at once.</text>
+    <rect x="1120" y="1504" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1542" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">27 → 30.5 fps</text>
+    <!-- GPU-written bytes -->
+    <rect x="40" y="1578" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1602" font-weight="700" fill="#0f172a">GPU-written bytes</text>
+    <text x="58" y="1624" font-size="13" fill="#334155">The GPU thread copies them back and waits for all its work.</text>
+    <line x1="546" y1="1610" x2="594" y2="1610" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1578" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1602" font-weight="700" fill="#0f172a">Read from buffer memory</text>
+    <text x="618" y="1624" font-size="13" fill="#334155">The thread that asked waits, not the GPU thread.</text>
+    <rect x="1120" y="1578" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1606" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">7–20 → about 1 ms</text>
+    <text x="1240" y="1626" text-anchor="middle" font-size="12" fill="#475569">per read-back; 8–10 → 11–14 fps</text>
+    <!-- Colour fast clears -->
+    <rect x="40" y="1652" width="500" height="64" rx="8" fill="#fff" stroke="#fca5a5" stroke-width="2"/>
+    <text x="58" y="1676" font-weight="700" fill="#0f172a">Colour fast clears</text>
+    <text x="58" y="1698" font-size="13" fill="#334155">The first draw on the target reads the GPU's metadata back.</text>
+    <line x1="546" y1="1684" x2="594" y2="1684" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="600" y="1652" width="500" height="64" rx="8" fill="#fff" stroke="#86efac" stroke-width="2"/>
+    <text x="618" y="1676" font-weight="700" fill="#0f172a">The clear code is read from the guest's fill</text>
+    <text x="618" y="1698" font-size="13" fill="#334155">No read-back for a fast-cleared target.</text>
+    <rect x="1120" y="1652" width="240" height="64" rx="8" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="1240" y="1680" text-anchor="middle" font-size="17" font-weight="700" fill="#1e3a8a">130–170 ms → none</text>
+    <text x="1240" y="1700" text-anchor="middle" font-size="12" fill="#475569">GPU-thread read-backs per frame</text>
+  </g>
+  <text x="700" y="1738" text-anchor="middle" font-size="12" fill="#64748b">Each number compares a build with that part and without it. The numbers do not add up.</text>
+</svg>

@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="780" viewBox="0 0 1200 780" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="780" fill="#ffffff"/>
+  <text x="600" y="44" text-anchor="middle" font-size="26" font-weight="700" fill="#0f172a">Pipelines: built when a draw needs them, or built ahead</text>
+  <text x="600" y="72" text-anchor="middle" font-size="15" fill="#475569">Same game, same scene. Time runs left to right.</text>
+
+  <!-- in the draw -->
+  <text x="40" y="118" font-size="18" font-weight="700" fill="#991b1b">In the draw</text>
+  <text x="160" y="118" font-size="14" fill="#475569">Lane: GPU thread</text>
+  <line x1="40" y1="190" x2="1160" y2="190" stroke="#cbd5e1" stroke-width="2" marker-end="url(#arrow)"/>
+  <g font-size="13">
+    <rect x="40" y="140" width="110" height="40" rx="6" fill="#e2e8f0"/><text x="95" y="165" text-anchor="middle" fill="#0f172a">Game start</text>
+    <rect x="160" y="140" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="205" y="165" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="260" y="140" width="250" height="40" rx="6" fill="#fca5a5"/><text x="385" y="159" text-anchor="middle" font-weight="700" fill="#7f1d1d">Translate shader + build pipeline</text><text x="385" y="174" text-anchor="middle" fill="#7f1d1d">the draw waits, up to 1.45 s</text>
+    <rect x="520" y="140" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="565" y="165" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="620" y="140" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="665" y="165" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="720" y="140" width="250" height="40" rx="6" fill="#fca5a5"/><text x="845" y="159" text-anchor="middle" font-weight="700" fill="#7f1d1d">New effect: build again</text><text x="845" y="174" text-anchor="middle" fill="#7f1d1d">the draw waits, up to 1.45 s</text>
+    <rect x="980" y="140" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="1025" y="165" text-anchor="middle" fill="#0f172a">Frame</text>
+  </g>
+  <text x="40" y="220" font-size="14" fill="#7f1d1d">Every new shader stops the frame. With every build at 150 ms, the stops add up to 75 s in one level run.</text>
+
+  <!-- KytyPS5 -->
+  <text x="40" y="276" font-size="18" font-weight="700" fill="#166534">KytyPS5</text>
+  <text x="160" y="276" font-size="14" fill="#475569">Lanes: GPU thread and worker threads</text>
+  <g font-size="13">
+    <!-- GPU thread lane -->
+    <text x="40" y="318" fill="#475569">GPU thread</text>
+    <line x1="140" y1="345" x2="1160" y2="345" stroke="#cbd5e1" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="140" y="298" width="150" height="40" rx="6" fill="#e2e8f0"/><text x="215" y="315" text-anchor="middle" fill="#0f172a">Game start: read</text><text x="215" y="330" text-anchor="middle" fill="#0f172a">pipeline list</text>
+    <rect x="300" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="345" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="400" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="445" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="500" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="545" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="600" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="645" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="700" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="745" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="800" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="845" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="900" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="945" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+    <rect x="1000" y="298" width="90" height="40" rx="6" fill="#bfdbfe"/><text x="1045" y="323" text-anchor="middle" fill="#0f172a">Frame</text>
+
+    <!-- worker lanes -->
+    <text x="40" y="388" fill="#475569">Worker 1</text>
+    <rect x="300" y="368" width="300" height="32" rx="6" fill="#86efac"/><text x="450" y="389" text-anchor="middle" fill="#14532d">translate + build listed programs</text>
+    <text x="40" y="428" fill="#475569">Worker 2</text>
+    <rect x="300" y="408" width="260" height="32" rx="6" fill="#86efac"/><text x="430" y="429" text-anchor="middle" fill="#14532d">translate + build listed programs</text>
+    <text x="40" y="468" fill="#475569">Worker N</text>
+    <rect x="300" y="448" width="330" height="32" rx="6" fill="#86efac"/><text x="465" y="469" text-anchor="middle" fill="#14532d">translate + build listed programs</text>
+    <rect x="800" y="448" width="150" height="32" rx="6" fill="#bbf7d0" stroke="#22c55e" stroke-dasharray="4 3"/><text x="875" y="469" text-anchor="middle" fill="#14532d">new pipeline</text>
+    <line x1="215" y1="340" x2="300" y2="384" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <line x1="845" y1="340" x2="845" y2="446" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  </g>
+  <text x="140" y="508" font-size="14" fill="#166534">Frames keep running while workers build: 11.5 fps with the same 150 ms builds; on a first run, 13 fps against 8.2.</text>
+
+  <!-- decision box -->
+  <rect x="40" y="532" width="1120" height="228" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="60" y="562" font-size="16" font-weight="700" fill="#0f172a">A draw finds its pipeline still building. What happens?</text>
+  <g font-size="14">
+    <rect x="60" y="578" width="340" height="124" rx="8" fill="#dcfce7"/>
+    <text x="76" y="604" font-weight="700" fill="#14532d">It only changes the picture</text>
+    <text x="76" y="628" fill="#14532d">A short wait: up to 2 ms, within 4 ms</text>
+    <text x="76" y="648" fill="#14532d">per frame. Then it is left out of the</text>
+    <text x="76" y="668" fill="#14532d">frame if the pipeline is not built.</text>
+
+    <rect x="420" y="578" width="340" height="124" rx="8" fill="#fef9c3"/>
+    <text x="436" y="604" font-weight="700" fill="#713f12">Its target was reset this frame</text>
+    <text x="436" y="628" fill="#713f12">It waits, within 16 ms per frame for</text>
+    <text x="436" y="648" fill="#713f12">all such draws. Past the budget, it</text>
+    <text x="436" y="668" fill="#713f12">gets the short wait on the left.</text>
+    <text x="436" y="690" font-size="12" fill="#92400e">Without the budget, a level start stops for 10–40 s.</text>
+
+    <rect x="780" y="578" width="360" height="124" rx="8" fill="#fee2e2"/>
+    <text x="796" y="604" font-weight="700" fill="#7f1d1d">Writes memory, clears depth, or</text>
+    <text x="796" y="622" font-weight="700" fill="#7f1d1d">draws into a fresh target</text>
+    <text x="796" y="646" fill="#7f1d1d">It waits. Later work reads that result,</text>
+    <text x="796" y="666" fill="#7f1d1d">so leaving it out would be wrong.</text>
+  </g>
+  <text x="60" y="734" font-size="14" fill="#0f172a"><tspan font-weight="700">A draw that waits</tspan> moves its pipeline to the front of the build queue.</text>
+  <text x="60" y="752" font-size="13" fill="#475569">Without that, the wait sits behind every listed pipeline that is still queued.</text>
+</svg>

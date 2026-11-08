@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -29,7 +30,8 @@ struct IndirectDrawRegisters {
 	uint32_t vertex_offset;
 	uint32_t instance_offset;
 	uint32_t index_offset;
-	uint32_t draw_index;
+	// Multi-draws only: the register that gets the index of each draw in the packet.
+	uint32_t draw_index = Pm4::SH_NOP;
 };
 
 class Pm4Execution {
@@ -64,6 +66,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	// Submits the open host command buffer only when PlanSubmit says so.
+	void            BufferFlushIfDue();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
@@ -78,9 +82,9 @@ public:
 		return m_dispatch_indirect_args_base_addr;
 	}
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(DrawIndexArgs args);
+	bool DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
-	void DrawIndexAuto(DrawAutoArgs args);
+	bool DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
 	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
@@ -89,11 +93,24 @@ public:
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id, bool gl2_writeback);
 	void WriteBackImages();
-	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
+	// interrupt: the queue's end-of-pipe interrupt is raised when the flip completes.
+	void Flip(int handle, int index, int flip_mode, int64_t flip_arg, bool interrupt);
+	// True when the game raised an end-of-pipe interrupt of its own on this queue since the last
+	// flip.
+	[[nodiscard]] bool HadInterruptSinceFlip() const { return m_interrupt_since_flip; }
 	void PrepareCpuFlip(uint64_t request_id);
+	void               SynchronizeGpu();
+	// A 32-bit value as WAIT_REG_MEM and COND_EXEC see it.
+	[[nodiscard]] uint32_t ReadLabel(const uint32_t* address);
+	// Guest memory as the command processor reads it, without waiting for GPU work that does not
+	// write it (BufferCache::ReadGuestBacked).
+	template <typename T>
+	[[nodiscard]] T ReadMemory(const T* address);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
+	// Starts translating the compute programs `commands` will dispatch (computePrescan.h).
+	void PrefetchPrograms(std::span<const uint32_t> commands);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
@@ -105,6 +122,11 @@ public:
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	// The GPU thread writes guest memory (a packet's data, a label): a later shader of the same
+	// submission must see it, also on a page the buffer cache keeps open (guestWriteLog.h).
+	// WriteGuest copies and logs. NoteGuestWrite only logs, for a write made in place.
+	void               WriteGuest(void* dst, const void* src, uint64_t size);
+	void               NoteGuestWrite(const void* dst, uint64_t size);
 	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
 	void DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes);
@@ -115,11 +137,14 @@ public:
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
-	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
+	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
+	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void                CompleteFlipInOrder(uint64_t request, bool interrupt);
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
@@ -141,6 +166,8 @@ private:
 	uint64_t m_num_instances_addr = 0;
 
 	const int m_interrupt_event_id;
+	bool      m_interrupt_since_flip        = true;
+	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };

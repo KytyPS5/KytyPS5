@@ -328,6 +328,7 @@ struct AaSampleControl {
 };
 
 struct DepthShaderControl {
+	uint8_t conservative_z_export_value = 0;
 	uint8_t shader_z_behavior         = 0;
 	bool    shader_kill_enable        = false;
 	bool    shader_z_export_enable    = false;

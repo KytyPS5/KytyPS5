@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -26,6 +27,13 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Scans the armed pages of every region that is due (RegionManager::HarvestIfDue).
+	void HarvestArmedWrites();
+	// Called, under a region's lock, with each range of armed pages a scan found written.
+	void SetArmedWriteHook(std::function<void(uint64_t, uint64_t)> hook) {
+		m_armed_write_hook = std::move(hook);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -76,6 +84,10 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
+			Harvest(manager);
+			if (is_written) {
+				manager->EndHeat(offset, bytes);
+			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
 			if (!is_written) {
 				manager->lock.unlock();
@@ -93,6 +105,28 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+
+	// Under the region's lock, before its CPU dirty state is read.
+	void Harvest(RegionManager* manager) {
+		if (!manager->maybe_armed.load(std::memory_order_relaxed)) {
+			return;
+		}
+		static thread_local std::vector<GuestRange> written;
+		written.clear();
+		manager->HarvestIfDue(written);
+		if (m_armed_write_hook) {
+			for (const auto& range: written) {
+				m_armed_write_hook(range.address, range.size);
+			}
+		}
+	}
+
+	void CheckNotInUploadCallback() const noexcept {
+		if (s_upload_owner == this) {
+			EXIT("memory tracker re-entered from upload callback\n");
+		}
+	}
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
@@ -130,7 +164,10 @@ private:
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
+	std::atomic<uint64_t>                          m_harvested_submission {0};
+	std::atomic<uint64_t>                          m_harvested_generation {~uint64_t {0}};
 	PageManager&                                   m_page_manager;
+	std::function<void(uint64_t, uint64_t)>        m_armed_write_hook;
 };
 
 } // namespace Libs::Graphics

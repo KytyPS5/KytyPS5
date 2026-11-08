@@ -4,15 +4,16 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
+#include <magic_enum.hpp>
 #include <string_view>
 #include <vector>
-#include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;
@@ -43,6 +44,11 @@ static void PrintUsage() {
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
+	    "  --video-out-resolution <value>       Title, FullHd, or Uhd: the output resolution the\n"
+	    "                                       console reports to games, which render at it.\n"
+	    "                                       Default: Title (4K unless the title may detect\n"
+	    "                                       a smaller output).\n");
+	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --hdr                                Enable HDR10 output when supported.\n");
@@ -57,6 +63,10 @@ static void PrintUsage() {
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --gpu-frames-in-flight <1-3>         Guest frames recorded ahead of the host GPU. "
+	         "Default: 2.\n");
+	::printf("  --gpu-guest-memory-import <0|1>      The GPU uses guest memory in place where the "
+	         "host can import it. Default: 1.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
@@ -80,6 +90,8 @@ static void PrintUsage() {
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
+	::printf("  --gpu-debug-labels                   Name GPU objects and label GPU work for "
+	         "captures.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
@@ -219,6 +231,7 @@ static constexpr Flag FLAGS[] = {
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
+    {"--gpu-debug-labels", &ConfigOptions::gpu_debug_labels_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
     {"--perf-counters", &ConfigOptions::perf_counters_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
@@ -387,6 +400,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid gpu index: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-guest-memory-import") {
+			if (value != "0" && value != "1") {
+				::printf("invalid guest memory import: %s\n", value.c_str());
+				return false;
+			}
+			options.config.gpu_guest_memory_import = value == "1";
+		} else if (arg == "--gpu-frames-in-flight") {
+			if (!ParseUint32(value, options.config.gpu_frames_in_flight) ||
+			    options.config.gpu_frames_in_flight < 1 ||
+			    options.config.gpu_frames_in_flight > Config::MAX_GPU_FRAMES_IN_FLIGHT) {
+				::printf("invalid GPU frames in flight: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
@@ -400,6 +426,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--video-out-resolution") {
+			if (!ParseEnum(value, options.config.video_out_resolution)) {
+				::printf("invalid video out resolution: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-log-direction") {
@@ -455,6 +486,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+	Libs::Graphics::PrepareVulkanDriverEnvironment();
 	InitializeThreads();
 
 	RunOptions options;

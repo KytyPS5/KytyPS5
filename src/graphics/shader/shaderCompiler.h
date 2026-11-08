@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -36,11 +37,13 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info);
-ShaderParams PrepareProgram(
-    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               input_info);
+ShaderParams PrepareProgram(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                            std::span<const ShaderColorTarget, 8> color_targets,
+                            ShaderPixelInputInfo&                 input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
+// PrepareProgram for a run-ahead guess: nothing when no shader is mapped at the address.
+std::optional<ShaderParams> TryPrepareProgram(const HW::ComputeShaderInfo& regs,
+                                              ShaderComputeInputInfo&      input_info);
 
 } // namespace Libs::Graphics
 

@@ -63,7 +63,6 @@ struct EventKeyboard {
 	double   timestamp_seconds;
 };
 
-
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
 		case SDL_GAMEPAD_AXIS_LEFTX: return Controller::Axis::LeftX;
@@ -337,8 +336,6 @@ static void LogGamepad(SDL_Gamepad* pad, int id) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
-
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
 		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
@@ -1168,6 +1165,7 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	// TODO: show the progress of pipelines built ahead in the title.
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

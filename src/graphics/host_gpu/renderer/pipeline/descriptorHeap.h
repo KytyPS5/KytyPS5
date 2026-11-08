@@ -30,13 +30,22 @@ private:
 		uint32_t                                          allocation = DescriptorSetBatch;
 	};
 
+	struct PendingPool {
+		vk::DescriptorPool pool;
+		uint64_t           tick;
+		uint32_t           scale;
+	};
+
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
 	void               CreateDescriptorPool();
+	// Sets of a layout that holds more descriptors than a pool does need a pool of more.
+	void GrowDescriptorPool();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;
 	vk::DescriptorPool                                  m_current_pool = nullptr;
-	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
+	uint32_t                                            m_pool_scale   = 1;
+	std::deque<PendingPool>                             m_pending_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
 };
 

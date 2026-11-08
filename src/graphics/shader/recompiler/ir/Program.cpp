@@ -146,6 +146,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .wave_size          = wave_size,
 	    .user_data_base     = user_data_base,
 	    .has_address_writes = has_address_writes,
+	    .mesh_emulated      = mesh_emulated,
 	    .info               = std::move(info),
 	    .bindings           = std::move(bindings),
 	};

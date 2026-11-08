@@ -26,6 +26,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(user_id);
 	KYTY_CFG_SET(audio_input_device);
 	KYTY_CFG_SET(present_mode);
+	KYTY_CFG_SET(video_out_resolution);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hdr_enabled);
@@ -51,6 +52,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(shader_validation_enabled);
 	KYTY_CFG_SET(shader_log_direction);
 	KYTY_CFG_SET(shader_log_folder);
+	KYTY_CFG_SET(pipeline_cache_folder);
 	KYTY_CFG_SET(command_buffer_dump_enabled);
 	KYTY_CFG_SET(command_buffer_dump_folder);
 	KYTY_CFG_SET(printf_direction);
@@ -85,6 +87,10 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	if (EnumToText(present_mode).isEmpty()) {
 		present_mode = PresentMode::Mailbox;
 	}
+	KYTY_CFG_GET(video_out_resolution);
+	if (EnumToText(video_out_resolution).isEmpty()) {
+		video_out_resolution = VideoOutResolution::Title;
+	}
 	KYTY_CFG_GET(fullscreen_enabled);
 	KYTY_CFG_GET(hdr_enabled);
 	KYTY_CFG_GET(hide_cursor_enabled);
@@ -112,6 +118,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(shader_validation_enabled);
 	KYTY_CFG_GET(shader_log_direction);
 	KYTY_CFG_GET(shader_log_folder);
+	KYTY_CFG_GET(pipeline_cache_folder);
 	KYTY_CFG_GET(command_buffer_dump_enabled);
 	KYTY_CFG_GET(command_buffer_dump_folder);
 	KYTY_CFG_GET(printf_direction);

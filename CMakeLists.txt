@@ -318,6 +318,7 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(dispatch_thread_dimensions dispatch_thread_dimensions.comp)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
@@ -395,12 +396,46 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/MaskedSelectElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+
+add_executable(device_suitability_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DeviceSuitabilityTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/window/deviceSuitability.cpp"
+)
+target_include_directories(device_suitability_tests PRIVATE ${inc_headers})
+
+add_executable(write_heat_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WriteHeatTests.cpp"
+)
+target_include_directories(write_heat_tests PRIVATE ${inc_headers})
+
+add_executable(guest_write_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestWriteLogTests.cpp"
+)
+target_include_directories(guest_write_log_tests PRIVATE ${inc_headers})
+
+add_executable(copy_workers_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CopyWorkersTests.cpp"
+)
+target_include_directories(copy_workers_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(copy_workers_tests Threads::Threads)
+endif()
+
+add_executable(frame_pacer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FramePacerTests.cpp"
+)
+target_include_directories(frame_pacer_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(frame_pacer_tests Threads::Threads)
+endif()
+
 add_executable(ea_emulation_tdf_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EaEmulationTdfTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/eaEmulation/eaTdf.cpp"
@@ -440,21 +475,70 @@ add_executable(ea_emulation_patch_plan_tests EXCLUDE_FROM_ALL
 target_include_directories(ea_emulation_patch_plan_tests PRIVATE ${inc_headers})
 target_link_libraries(ea_emulation_patch_plan_tests fmt::fmt nlohmann_json::nlohmann_json)
 
+add_executable(guest_memory_window_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestMemoryWindowTests.cpp"
+)
+target_include_directories(guest_memory_window_tests PRIVATE ${inc_headers})
+
+add_executable(gpu_write_ticks_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuWriteTicksTests.cpp"
+)
+target_include_directories(gpu_write_ticks_tests PRIVATE ${inc_headers})
+
 add_executable(perf_counters_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PerfCountersTests.cpp"
 )
 target_include_directories(perf_counters_tests PRIVATE ${inc_headers})
+
+add_executable(readback_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackPlanTests.cpp"
+)
+target_include_directories(readback_plan_tests PRIVATE ${inc_headers})
+
+add_executable(compute_prescan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ComputePrescanTests.cpp"
+)
+target_include_directories(compute_prescan_tests PRIVATE ${inc_headers})
+
+add_executable(submit_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubmitPlanTests.cpp"
+)
+target_include_directories(submit_plan_tests PRIVATE ${inc_headers})
+
+add_executable(cache_collection_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CacheCollectionTests.cpp"
+)
+target_include_directories(cache_collection_tests PRIVATE ${inc_headers})
+
+add_executable(buffer_chunk_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BufferChunkTests.cpp"
+)
+target_include_directories(buffer_chunk_tests PRIVATE ${inc_headers})
+
+add_executable(video_out_resolution_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VideoOutResolutionTests.cpp"
+)
+target_include_directories(video_out_resolution_tests PRIVATE ${inc_headers})
 
 add_executable(bench_script_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BenchScriptTests.cpp"
 )
 target_include_directories(bench_script_tests PRIVATE ${inc_headers})
 
+add_executable(queue_commits_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/QueueCommitsTests.cpp"
+)
+target_include_directories(queue_commits_tests PRIVATE ${inc_headers})
+
 add_executable(cache_folder_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/CacheFolderTests.cpp"
 )
 target_include_directories(cache_folder_tests PRIVATE ${inc_headers})
 
+add_executable(host_lowering_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
+)
+target_include_directories(host_lowering_tests PRIVATE ${inc_headers})
 
 add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
 
@@ -502,6 +586,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(soft_float64_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SoftFloat64Tests.cpp"
+)
+target_include_directories(soft_float64_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -521,6 +610,7 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MemoryTrackerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/pageManager.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/memoryTracker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/uffdWriteWatch.cpp"
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
@@ -583,6 +673,16 @@ add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
+
+add_executable(image_readback_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ImageReadbackTests.cpp"
+)
+target_include_directories(image_readback_tests PRIVATE ${inc_headers})
+
+add_executable(overlay_queue_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/OverlayQueueTests.cpp"
+)
+target_include_directories(overlay_queue_tests PRIVATE ${inc_headers})
 
 add_executable(pad_input_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadInputTests.cpp"
@@ -648,6 +748,9 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(np_entitlement_access_pft_tests
+	"${KYTY_TESTS_DIR}/NpEntitlementAccessPftTests.cpp")
+
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
@@ -680,6 +783,15 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
+
+add_executable(metadata_fill_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MetadataFillTests.cpp"
+)
+target_include_directories(metadata_fill_tests PRIVATE ${inc_headers})
+add_executable(fence_retirement_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FenceRetirementTests.cpp"
+)
+target_include_directories(fence_retirement_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
@@ -749,18 +861,40 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_video_out_resolution_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --video-out-resolution Uhd)
+	add_test(NAME emulator_video_out_resolution_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --video-out-resolution Invalid)
+	set_tests_properties(emulator_video_out_resolution_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
+	add_test(NAME device_suitability COMMAND $<TARGET_FILE:device_suitability_tests>)
+	add_test(NAME host_lowering COMMAND $<TARGET_FILE:host_lowering_tests>)
+	add_test(NAME write_heat COMMAND $<TARGET_FILE:write_heat_tests>)
 	add_test(NAME perf_counters COMMAND $<TARGET_FILE:perf_counters_tests>)
+	add_test(NAME guest_write_log COMMAND $<TARGET_FILE:guest_write_log_tests>)
+	add_test(NAME copy_workers COMMAND $<TARGET_FILE:copy_workers_tests>)
+	add_test(NAME frame_pacer COMMAND $<TARGET_FILE:frame_pacer_tests>)
 	add_test(NAME ea_emulation_tdf COMMAND $<TARGET_FILE:ea_emulation_tdf_tests>)
 	add_test(NAME ea_emulation_pre_auth COMMAND $<TARGET_FILE:ea_emulation_pre_auth_tests>)
 	add_test(NAME ea_emulation_authentication COMMAND $<TARGET_FILE:ea_emulation_authentication_tests>)
 	add_test(NAME np_webapi2_entitlements COMMAND $<TARGET_FILE:np_webapi2_entitlements_tests>)
 	add_test(NAME ea_emulation_patch_plan COMMAND $<TARGET_FILE:ea_emulation_patch_plan_tests>)
+	add_test(NAME guest_memory_window COMMAND $<TARGET_FILE:guest_memory_window_tests>)
+	add_test(NAME gpu_write_ticks COMMAND $<TARGET_FILE:gpu_write_ticks_tests>)
+	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
+	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
+	add_test(NAME compute_prescan COMMAND $<TARGET_FILE:compute_prescan_tests>)
+	add_test(NAME cache_collection COMMAND $<TARGET_FILE:cache_collection_tests>)
+	add_test(NAME buffer_chunk COMMAND $<TARGET_FILE:buffer_chunk_tests>)
+	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
+	add_test(NAME queue_commits COMMAND $<TARGET_FILE:queue_commits_tests>)
 	add_test(NAME bench_script COMMAND $<TARGET_FILE:bench_script_tests>)
 	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
+	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
@@ -770,6 +904,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME soft_float64 COMMAND $<TARGET_FILE:soft_float64_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -786,6 +921,8 @@ if(BUILD_TESTING)
 	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
 	add_test(NAME player_seats COMMAND $<TARGET_FILE:player_seats_tests>)
 	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
+	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
+	add_test(NAME overlay_queue COMMAND $<TARGET_FILE:overlay_queue_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
@@ -795,7 +932,9 @@ if(BUILD_TESTING)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME np_entitlement_access_pft COMMAND $<TARGET_FILE:np_entitlement_access_pft_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
+	add_test(NAME net_resolver COMMAND $<TARGET_FILE:net_resolver_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -858,12 +997,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-view-cache-only)
 	add_test(NAME texture_cache_storage_sampled
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-sampled-only)
+	add_test(NAME texture_cache_image_save
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-save-only)
 	add_test(NAME texture_cache_depth_readback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_guest_backed
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-guest-backed-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -875,18 +1018,36 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		psml_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
+		device_suitability_tests
+		host_lowering_tests
+		write_heat_tests
 		perf_counters_tests
+		guest_write_log_tests
+		copy_workers_tests
+		frame_pacer_tests
 		ea_emulation_tdf_tests
 		ea_emulation_pre_auth_tests
 		ea_emulation_authentication_tests
 		ea_emulation_patch_plan_tests
 		np_webapi2_entitlements_tests
+		guest_memory_window_tests
+		gpu_write_ticks_tests
+		readback_plan_tests
+		submit_plan_tests
+		compute_prescan_tests
+		cache_collection_tests
+		buffer_chunk_tests
+		video_out_resolution_tests
+		queue_commits_tests
 		bench_script_tests
 		cache_folder_tests
 		image_page_table_tests
+		metadata_fill_tests
+		fence_retirement_tests
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests
@@ -896,6 +1057,7 @@ if(BUILD_TESTING)
 		vdecsw_tests
 		bit_array_tests
 		lru_cache_tests
+		soft_float64_tests
 		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
@@ -914,6 +1076,8 @@ if(BUILD_TESTING)
 		pad_input_tests
 		player_seats_tests
 		gamepad_quit_tests
+		image_readback_tests
+		overlay_queue_tests
 		host_input_tests
 		save_data_memory_tests
 		png_enc_tests
@@ -923,7 +1087,9 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		np_entitlement_access_pft_tests
 		rtc_tests
+		net_resolver_tests
 	)
 endif()
 

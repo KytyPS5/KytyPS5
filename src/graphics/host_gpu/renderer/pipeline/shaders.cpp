@@ -167,6 +167,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		tess_eval_shader_module    = CompileSPV(shaders.evaluation, graphics.device);
 	}
 
+	// KYTY_DYNAMIC_EXPORT_MAPPING: the PS reads its MRT component orders from these.
+	std::array<uint32_t, 8>                  export_mapping_values {};
+	std::array<vk::SpecializationMapEntry, 8> export_mapping_entries {};
+	for (uint32_t i = 0; i < 8u; i++) {
+		const uint32_t packed = static_params.export_mapping[i] != 0
+		                            ? static_params.export_mapping[i]
+		                            : Prospero::ColorComponentMapping::kIdentity;
+		export_mapping_values[i]  = packed | (i << 8u);
+		export_mapping_entries[i] = {ShaderExportMappingSpecId + i,
+		                             static_cast<uint32_t>(i * sizeof(uint32_t)), sizeof(uint32_t)};
+	}
+	const vk::SpecializationInfo export_mapping_info {
+	    static_cast<uint32_t>(export_mapping_entries.size()), export_mapping_entries.data(),
+	    sizeof(export_mapping_values), export_mapping_values.data()};
+	bool dynamic_export_mapping = false;
+	for (const auto value: static_params.export_mapping) dynamic_export_mapping |= value != 0;
+
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
 	for (const auto* stage: stages) {
@@ -174,6 +191,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
 			                                       .module = stage->module,
 			                                       .pName  = "main"};
+			if (stage == pixel && dynamic_export_mapping) {
+				shader_stages[shader_stage_count - 1].pSpecializationInfo = &export_mapping_info;
+			}
 		}
 	}
 	if (task_module) {

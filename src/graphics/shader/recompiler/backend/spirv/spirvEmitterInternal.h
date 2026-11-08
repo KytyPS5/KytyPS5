@@ -93,6 +93,8 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	const Profile&                                      profile;
 	uint32_t                                        debug_source = 0;
+	// Specialization constants of the dynamic MRT export mappings, per export index.
+	std::array<uint32_t, 8>                         export_mapping_specs {};
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;

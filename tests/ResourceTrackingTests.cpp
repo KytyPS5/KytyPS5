@@ -2019,6 +2019,7 @@ void TestBoundedComputeImageLoop() {
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
     WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
+    ExitTest, ExitTestWrongPolarity,
     IncrementBypass, PreviousBound, Forwarded, ForwardedChain, ForwardedJoin,
     ForwardedBranch, ForwardedIncrementBypass,
     Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
@@ -2109,10 +2110,18 @@ void TestBoundedComputeImageLoop() {
       count = fixture.Emit(ValueOpcode::LoadAddressU32,
           {fixture.Address(fixture.UserData(0), fixture.UserData(1)), Value(0u), Value(0u), Value(true)},
           fixture.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x10));
-    const auto in_range = post_test ? Value{} : fixture.Emit(material ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
+    auto in_range = post_test ? Value{} : fixture.Emit(material ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, compare);
+    if (variant == Variant::ExitTest || variant == Variant::ExitTestWrongPolarity) {
+      // The loop runs while !(other | key >= count).
+      const auto other = fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(3u), Value(7u)}, 0, compare);
+      const auto exit_test = fixture.Emit(ValueOpcode::LogicalOr,
+          {other, fixture.Emit(ValueOpcode::SGreaterThanEqual32, {key, count}, 0, compare)}, 0, compare);
+      in_range = variant == Variant::ExitTest
+                     ? fixture.Emit(ValueOpcode::LogicalNot, {exit_test}, 0, compare) : exit_test;
+    }
     const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
     if (forwarded && !post_test) {
@@ -2347,6 +2356,8 @@ void TestBoundedComputeImageLoop() {
       Check(first == 0u ? indirect->key_count.Resolve() == count.Resolve()
                         : indirect->selector_first == Value(first) && !indirect->signed_count,
             "bounded compute loop lost its runtime image count");
+    Check(variant != Variant::ExitTest || indirect->signed_count,
+          "signed exit-tested loop lost its signed count");
     if (first != 0u)
       for (const auto word : words)
         Check(!word.Instruction()->HasUses() &&
@@ -2368,7 +2379,9 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::GuardedDiamond);
   make_plan(Variant::Forwarded);
   make_plan(Variant::ForwardedChain);
-  for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
+  // DS DC cs 0x8f78cb8c66569743 masks lanes off by EXEC = active & !(test | key >= 11).
+  make_plan(Variant::ExitTest);
+  for (const auto variant : {Variant::ExitTestWrongPolarity, Variant::IncrementBypass, Variant::PreviousBound,
                              Variant::ForwardedJoin, Variant::ForwardedBranch,
                              Variant::ForwardedIncrementBypass,
                              Variant::MaskedWrongGuard,

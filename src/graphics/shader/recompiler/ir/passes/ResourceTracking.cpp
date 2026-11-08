@@ -190,8 +190,11 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 // unsupported expressions remain unconstrained. This state exists only while tracking.
 class LoopBoundProof {
 public:
-	LoopBoundProof(const Program& program, const Inst& induction, const Inst& bound)
-	    : m_program(program), m_induction(induction), m_bound(bound) {}
+	// An exit test (key >= bound) holds where the loop stops instead of where it runs.
+	LoopBoundProof(const Program& program, const Inst& induction, const Inst& bound,
+	               bool exit_test = false)
+	    : m_program(program), m_induction(induction), m_bound(bound),
+	      m_bound_fails(exit_test ? 1u : 0u) {}
 
 	bool Excludes(Value condition, bool positive) {
 		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
@@ -231,9 +234,11 @@ public:
 				                         ? enabled : Unknown(phi.GetType());
 			}
 			m_values[1][&carried] = Select(enabled, Unknown(Type::U32), in_range());
-			if (in_body) m_values[1][&m_bound] = 1u;
-			m_values[1][&candidate] = Select(Evaluate(Value(const_cast<Inst*>(&m_bound)), true),
-			                                  in_range(), Unknown(Type::U32));
+			if (in_body) m_values[1][&m_bound] = m_bound_fails ^ 1u;
+			const auto tested       = Evaluate(Value(const_cast<Inst*>(&m_bound)), true);
+			m_values[1][&candidate] = m_bound_fails != 0u
+			                              ? Select(tested, Unknown(Type::U32), in_range())
+			                              : Select(tested, in_range(), Unknown(Type::U32));
 		};
 		for (uint32_t arm = 0; arm < carried.NumArgs(); ++arm) {
 			const auto initial = mask.Arg(arm).Resolve();
@@ -330,7 +335,7 @@ private:
 			return node;
 		}
 		const auto* inst = value.TryInstruction();
-		if (current && m_exclude_bound && inst == &m_bound) return 0u;
+		if (current && m_exclude_bound && inst == &m_bound) return m_bound_fails;
 		auto& values = m_values[current ? m_current : 0u];
 		if (const auto found = values.find(inst); found != values.end()) {
 			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
@@ -394,6 +399,7 @@ private:
 	const Program& m_program;
 	const Inst& m_induction;
 	const Inst& m_bound;
+	const uint32_t                          m_bound_fails;
 	const Block* m_incoming = nullptr;
 	uint32_t m_current = 1;
 	uint32_t m_variables = 0;
@@ -1815,9 +1821,46 @@ private:
 		return {};
 	}
 
+	static bool IsExitTest(const Inst& compare) {
+		return compare.GetOpcode() == ValueOpcode::SGreaterThanEqual32 ||
+		       compare.GetOpcode() == ValueOpcode::UGreaterThanEqual32;
+	}
+
+	// Loop bounds are key < count, or an exit test key >= count; signed either way.
+	static bool SignedLoopBound(const Inst& compare) {
+		return compare.GetOpcode() == ValueOpcode::SLessThan32 ||
+		       compare.GetOpcode() == ValueOpcode::SGreaterThanEqual32;
+	}
+
+	// Whether guard proves test false.
+	bool Refutes(Value guard, Value test, uint32_t depth = 0) const {
+		const auto* inst = SimplifyGuard(guard).TryInstruction();
+		if (inst == nullptr || depth >= 16u) return false;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::LogicalAnd:
+				return Refutes(inst->Arg(0), test, depth + 1u) ||
+				       Refutes(inst->Arg(1), test, depth + 1u);
+			case ValueOpcode::LogicalOr:
+				return Refutes(inst->Arg(0), test, depth + 1u) &&
+				       Refutes(inst->Arg(1), test, depth + 1u);
+			case ValueOpcode::LogicalNot: return ImpliesAnyTerm(test, inst->Arg(0), depth + 1u);
+			default: return false;
+		}
+	}
+
+	// Whether guard implies some term of a LogicalOr tree.
+	bool ImpliesAnyTerm(Value guard, Value terms, uint32_t depth) const {
+		const auto* inst = SimplifyGuard(terms).TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalOr && depth < 16u)
+			return ImpliesAnyTerm(guard, inst->Arg(0), depth + 1u) ||
+			       ImpliesAnyTerm(guard, inst->Arg(1), depth + 1u);
+		return Implies(guard, terms);
+	}
+
 	const Inst* BoundedInduction(Value key, const Block* use, const auto& accepts_step,
-	                             const auto& accepts_bound,
-	                             LaneQuantifier lanes = LaneQuantifier::Any) const {
+	                             const auto&    accepts_bound,
+	                             LaneQuantifier lanes      = LaneQuantifier::Any,
+	                             bool           exit_tests = false) const {
 		const auto induction = MatchInduction(key, accepts_step);
 		if (!induction) return {};
 		const auto [phi, step, initial_arm] = *induction;
@@ -1839,15 +1882,20 @@ private:
 			const auto* compare = use_of_key.user;
 			if (use_of_key.operand != 0u ||
 			    !accepts_bound(*compare, initial_arm)) continue;
-			if (!GuardedOnEntry(use != nullptr ? use : increment_block, stops, [&](const EdgePredicate& edge) {
-				return edge.positive && (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
-				       Implies(edge.condition, Value(use_of_key.user));
-			})) continue;
+			const bool exit = exit_tests && IsExitTest(*compare);
+			if (!GuardedOnEntry(use != nullptr ? use : increment_block, stops,
+			                    [&](const EdgePredicate& edge) {
+				                    return edge.positive &&
+				                           (lanes == LaneQuantifier::Any || edge.lanes == lanes) &&
+				                           (exit ? Refutes(edge.condition, Value(use_of_key.user))
+				                                 : Implies(edge.condition, Value(use_of_key.user)));
+			                    }))
+				continue;
 			// The image bound and the increment guard are separate obligations: a
 			// skipped image alone does not prevent signed induction wraparound.
-			const auto [found, inserted] = m_loop_proofs.try_emplace(compare);
+			const auto [found, inserted] = m_loop_proofs.try_emplace({compare, exit});
 			if (inserted) {
-				LoopBoundProof proof(m_program, *phi, *compare);
+				LoopBoundProof proof(m_program, *phi, *compare, exit);
 				found->second =
 				    GuardedOnEntry(increment_block, stops, [&](const EdgePredicate& edge) {
 					    return proof.Excludes(edge.condition, edge.positive);
@@ -1898,12 +1946,14 @@ private:
 
 	const Inst* BoundedLoop(Value key, const Block* use, const auto& accepts_bound,
 	                       LaneQuantifier lanes = LaneQuantifier::Any) const {
-		return BoundedInduction(key, use, ZeroBased,
+		return BoundedInduction(
+		    key, use, ZeroBased,
 		    [&](const Inst& compare, uint32_t initial) {
 			    return (compare.GetOpcode() == ValueOpcode::SLessThan32 ||
-			            compare.GetOpcode() == ValueOpcode::ULessThan32) &&
+			            compare.GetOpcode() == ValueOpcode::ULessThan32 || IsExitTest(compare)) &&
 			           accepts_bound(compare, initial);
-		    }, lanes);
+		    },
+		    lanes, true);
 	}
 
 	const Inst* DescendingLoop(Value key, const Block* use, uint32_t& maximum) const {
@@ -1942,7 +1992,7 @@ private:
 		std::printf("Warning: shader 0x%016llx bounds a per-lane table loop by its uniform loops' "
 		            "count\n", static_cast<unsigned long long>(m_program.shader_hash));
 		indirect.key_count    = count->Arg(1);
-		indirect.signed_count = count->GetOpcode() == ValueOpcode::SLessThan32;
+		indirect.signed_count = SignedLoopBound(*count);
 		return true;
 	}
 
@@ -2477,7 +2527,7 @@ private:
 		if (affine) {
 			workgroup_axis = WorkgroupAxis(index, &first);
 			const auto* bound = BoundedLoop(index, read->Parent());
-			if (bound != nullptr && bound->GetOpcode() == ValueOpcode::ULessThan32) {
+			if (bound != nullptr && !SignedLoopBound(*bound)) {
 				count = bound->Arg(1);
 			} else if (workgroup_axis == UINT32_MAX && !require_bound) {
 				// Other bounded indices, such as bit scans, read the records up to their maximum;
@@ -2650,11 +2700,11 @@ private:
 					const auto initial = induction->Arg(0).Resolve().IsImmediate() ? 0u : 1u;
 					const auto enabled = mask.Arg(initial).Resolve();
 					if (!enabled.IsImmediate() || enabled.GetType() != Type::U1 || !enabled.U1()) continue;
-					LoopBoundProof proof(m_program, *induction, *bound);
+					LoopBoundProof proof(m_program, *induction, *bound, IsExitTest(*bound));
 					if (!proof.SelectsRange(*selected, active, *candidate, *carried, mask, exits)) continue;
 					indirect.selector_first = first;
 					indirect.key_count = bound->Arg(1);
-					indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
+					indirect.signed_count   = SignedLoopBound(*bound);
 					return true;
 				}
 			}
@@ -3325,18 +3375,24 @@ private:
 				return false;
 			} else {
 				uint32_t first = 0;
-				const auto* bound = BoundedInduction(key, handle.Parent(),
+				const auto* bound = BoundedInduction(
+				    key, handle.Parent(),
 				    [&](uint32_t initial, uint32_t step) {
 					    first = initial;
 					    return initial <= INT32_MAX && step == 1u;
-				    }, [&](const Inst& compare, uint32_t) {
-					    return (compare.GetOpcode() == ValueOpcode::SLessThan32 ||
-					            (first == 0u && compare.GetOpcode() == ValueOpcode::ULessThan32)) &&
-					           ValidateRuntimeValue(m_program, compare.Arg(1), RuntimeValueType::Integer);
-				    });
+				    },
+				    [&](const Inst& compare, uint32_t) {
+					    return (SignedLoopBound(compare) ||
+					            (first == 0u &&
+					             (compare.GetOpcode() == ValueOpcode::ULessThan32 ||
+					              compare.GetOpcode() == ValueOpcode::UGreaterThanEqual32))) &&
+					           ValidateRuntimeValue(m_program, compare.Arg(1),
+					                                RuntimeValueType::Integer);
+				    },
+				    LaneQuantifier::Any, true);
 				if (bound != nullptr) {
 					indirect.key_count = bound->Arg(1);
-					indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
+					indirect.signed_count = SignedLoopBound(*bound);
 					if (first != 0u) {
 						// Clamp before enumerating: negative signed bounds have no reachable keys.
 						auto& nonempty = m_program.value_storage.emplace_back(ValueOpcode::SGreaterThanEqual32);
@@ -3551,7 +3607,7 @@ private:
 		};
 		if (const auto* bound = BoundedLoop(key, handle.Parent()); bound != nullptr) {
 			indirect.key_count = bound->Arg(1);
-			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
+			indirect.signed_count = SignedLoopBound(*bound);
 			return finish();
 		}
 		if (table_source.dword_count == 4u && !plan.split_offsets &&
@@ -4445,7 +4501,8 @@ private:
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
-	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
+	mutable std::map<std::pair<const Inst*, bool>, bool>
+	    m_loop_proofs; // By loop-bound comparison and exit form.
 	bool                                       m_shader_writes = false;
 };
 

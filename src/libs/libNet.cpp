@@ -744,6 +744,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
 	LIB_FUNC("EY28T2bkN7k", Http::HttpAddRequestHeader);
 	LIB_FUNC("1e2BNwI-XzE", Http::HttpSendRequest);
+	LIB_FUNC("P5pdoykPYTk", Http::HttpReadData);
 	LIB_FUNC("hvG6GfBMXg8", Http::HttpAbortRequest);
 	LIB_FUNC("qISjDHrxONc", Http::HttpWaitRequest);
 	LIB_FUNC("0a2TBNfE3BU", Http::HttpGetStatusCode);

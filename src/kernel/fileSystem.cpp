@@ -129,6 +129,13 @@ static void SetStatTimes(FileStat* stat, std::optional<Common::File::Times> time
 	stat->st_birthtim = stat->st_mtim;
 }
 
+// Directories report a 64 KiB st_blksize; games size one whole-directory getdents from it.
+static void SetStatSize(FileStat* stat, uint64_t size, bool directory) {
+	stat->st_size    = static_cast<int64_t>(size);
+	stat->st_blksize = directory ? 0x10000 : 512;
+	stat->st_blocks  = static_cast<int64_t>((size + 511) / 512);
+}
+
 static uint64_t AlignDown(uint64_t value, uint64_t alignment) {
 	return (alignment != 0 ? value & ~(alignment - 1) : value);
 }
@@ -1170,18 +1177,9 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-
-	if (is_dir) {
-		stat.st_size =
-		    static_cast<int64_t>(PackDirents(Common::File::GetDirEntries(real_file_name)).size());
-		stat.st_blksize = 512;
-		stat.st_blocks  = stat.st_size / 512;
-	} else {
-		stat.st_size    = static_cast<int64_t>(info->size);
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
-	}
-
+	const uint64_t size =
+	    is_dir ? PackDirents(Common::File::GetDirEntries(real_file_name)).size() : info->size;
+	SetStatSize(&stat, size, is_dir);
 	SetStatTimes(&stat, is_dir ? std::nullopt : Common::File::GetTimes(real_file_name));
 	*sb = stat;
 
@@ -1215,10 +1213,8 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	std::optional<Common::File::Times> times;
 
 	if (file->special != SpecialFile::None) {
-		stat.st_mode    = 0020644u;
-		stat.st_size    = 0;
-		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
+		stat.st_mode = 0020644u;
+		SetStatSize(&stat, 0, false);
 	} else if (!file->directory) {
 		file->mutex.Lock();
 
@@ -1233,13 +1229,9 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 			return KERNEL_ERROR_EIO;
 		}
 
-		stat.st_size    = static_cast<int64_t>(size);
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
+		SetStatSize(&stat, size, false);
 	} else {
-		stat.st_size    = static_cast<int64_t>(file->dirents.size());
-		stat.st_blksize = 512;
-		stat.st_blocks  = stat.st_size / 512;
+		SetStatSize(&stat, file->dirents.size(), true);
 	}
 
 	SetStatTimes(&stat, times);

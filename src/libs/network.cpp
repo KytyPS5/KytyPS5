@@ -1095,6 +1095,7 @@ static int ConvertSocketOptionLevel(int level) {
 static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
 		switch (option) {
+			case 0x0004: return SO_REUSEADDR;
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;

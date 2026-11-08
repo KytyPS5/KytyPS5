@@ -92,6 +92,19 @@ TEST_F(NetResolverTest, NtoaStoresFirstAddress) {
   EXPECT_EQ(addr, 0x0100007fu);
 }
 
+TEST_F(NetResolverTest, SocketReuseAddressOption) {
+  const int s = Network::Net::Socket(2, 1, 6);
+  ASSERT_GE(s, 0);
+  const int enable = 1;
+  EXPECT_EQ(Network::Net::Setsockopt(s, 0xffff, 0x4, &enable, sizeof(enable)),
+            0);
+  int value = 0;
+  uint32_t length = sizeof(value);
+  EXPECT_EQ(Network::Net::Getsockopt(s, 0xffff, 0x4, &value, &length), 0);
+  EXPECT_NE(value, 0);
+  EXPECT_EQ(Network::Net::SocketClose(s), 0);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {

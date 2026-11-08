@@ -78,8 +78,8 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		uint8_t write_watchers  = 0;
+		uint8_t access_watchers = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -96,7 +96,7 @@ struct PageManager::Impl {
 			static_assert(delta >= -1 && delta <= 1);
 			if constexpr (is_read) {
 				if constexpr (delta == 1) {
-					if (access_watchers != 0) {
+					if (access_watchers == UINT8_MAX) {
 						Fatal("read-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++access_watchers;
@@ -110,7 +110,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == UINT8_MAX) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -125,7 +125,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -274,13 +274,15 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
-template <bool track>
+template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
 }
 
-template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
-template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<true, true>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<true, false>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {

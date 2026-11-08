@@ -119,9 +119,12 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
 }
 
-static uint32_t EmitOrderKeyF32(EmitterState& state, uint32_t value) {
-	constexpr uint32_t mantissa_bits = 0x7fffffu;
+static constexpr uint32_t OrderKeyBiasF32    = 0x7fffffu;
+static constexpr uint32_t InfinityKeyF32     = 0x7f800000u - OrderKeyBiasF32;
+static constexpr uint32_t NegativeZeroKeyF32 = 0xffffffffu - OrderKeyBiasF32;
+static constexpr uint32_t PositiveZeroKeyF32 = 0u - OrderKeyBiasF32;
 
+static uint32_t EmitOrderKeyF32(EmitterState& state, uint32_t value) {
 	const auto bits = EmitBitcastF32ToU32(state, value);
 	const auto sign =
 	    Binary(state, spv::OpShiftRightArithmetic, TypeU32(state), bits, ConstantU32(state, 31));
@@ -129,7 +132,7 @@ static uint32_t EmitOrderKeyF32(EmitterState& state, uint32_t value) {
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), sign, ConstantU32(state, 1));
 	return Binary(state, spv::OpISub, TypeU32(state),
 	              Binary(state, spv::OpBitwiseXor, TypeU32(state), bits, magnitude_flip),
-	              ConstantU32(state, mantissa_bits));
+	              ConstantU32(state, OrderKeyBiasF32));
 }
 
 static uint32_t EmitSignedMinMaxU32(EmitterState& state, uint32_t lhs, uint32_t rhs,
@@ -148,10 +151,6 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 		const auto ac = EmitMinMaxF32Value(state, a, c, true);
 		return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, ab, bc, false), ac, false);
 	}
-	constexpr uint32_t infinity_key      = 0x7f000001u;
-	constexpr uint32_t negative_zero_key = 0xff800000u;
-	constexpr uint32_t positive_zero_key = 0xff800001u;
-
 	const auto below = [&](uint32_t lhs, uint32_t rhs) {
 		return Binary(state, spv::OpSLessThan, TypeBool(state), lhs, rhs);
 	};
@@ -164,7 +163,7 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto a_key     = EmitOrderKeyF32(state, a);
 	const auto b_key     = EmitOrderKeyF32(state, b);
 	const auto c_key     = EmitSignedMinMaxU32(state, EmitOrderKeyF32(state, c),
-	                                           ConstantU32(state, infinity_key + 1u), false);
+	                                           ConstantU32(state, InfinityKeyF32 + 1u), false);
 	const auto a_below_b = below(a_key, b_key);
 	const auto a_below_c = below(a_key, c_key);
 	const auto b_below_c = below(b_key, c_key);
@@ -173,11 +172,11 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto max_key =
 	    EmitSignedMinMaxU32(state, EmitSignedMinMaxU32(state, a_key, b_key, true), c_key, true);
 	const auto any_nan = Binary(state, spv::OpSGreaterThan, TypeBool(state), max_key,
-	                            ConstantU32(state, infinity_key));
+	                            ConstantU32(state, InfinityKeyF32));
 	const auto max_tie_key =
 	    Select(state, TypeU32(state),
-	           EmitCompareU32Constant(state, spv::OpIEqual, max_key, positive_zero_key),
-	           ConstantU32(state, negative_zero_key), max_key);
+		       EmitCompareU32Constant(state, spv::OpIEqual, max_key, PositiveZeroKeyF32),
+		       ConstantU32(state, NegativeZeroKeyF32), max_key);
 	const auto a_is_max = at_least(a_key, max_tie_key);
 	const auto b_is_max = at_least(b_key, max_tie_key);
 	const auto median   = pick(a_is_max, pick(b_below_c, c, b),

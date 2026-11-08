@@ -67,6 +67,7 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -198,6 +199,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},

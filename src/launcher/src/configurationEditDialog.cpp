@@ -296,6 +296,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
+	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
@@ -534,6 +535,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
+	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();

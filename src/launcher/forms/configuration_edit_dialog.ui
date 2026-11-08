@@ -203,6 +203,12 @@
               <property name="text"><string>Cache shaders</string></property>
              </widget>
             </item>
+            <item row="12" column="1">
+             <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
+              <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
+              <property name="text"><string>Relaxed shader float math</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

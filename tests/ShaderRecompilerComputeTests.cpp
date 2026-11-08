@@ -1403,6 +1403,7 @@ using ShaderProfile = ShaderRecompiler::Spirv::Profile;
 constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
 constexpr ShaderProfile SrgbViewProfile{
     .maintenance8 = true, .r8_srgb_views = true, .r8g8_srgb_views = true};
+constexpr ShaderProfile RelaxedFloatProfile{.maintenance8 = true, .relaxed_float = true};
 
 struct TestCase {
   const char *name = "";
@@ -31618,6 +31619,70 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   return test;
 }
 
+// Relaxed float emits native min/max/med3 and drops the input denormal flush and the sin(-0)
+// fixup. Every input gives the same bits in both modes.
+TestCase RelaxedFloatNativeOps() {
+  constexpr u32 nan = 0x7fc00000u, one = 0x3f800000u, two = 0x40000000u, three = 0x40400000u;
+  // a, b, c, then min(a, b), max(a, b), min3, max3 and med3.
+  constexpr u32 cases[][8] = {
+      {two, three, one, two, three, one, three, two},
+      {nan, one, 0u, one, one, 0u, one, 0u},
+      {one, nan, 0u, one, one, 0u, one, 0u},
+      {0xbf800000u, one, nan, 0xbf800000u, one, 0xbf800000u, one, 0xbf800000u},
+      {0xff800000u, 0x7f800000u, 0xc0000000u, 0xff800000u, 0x7f800000u, 0xff800000u,
+       0x7f800000u, 0xc0000000u},
+      {0x40a00000u, 0xc0e00000u, 0x3e800000u, 0xc0e00000u, 0x40a00000u, 0xc0e00000u,
+       0x40a00000u, 0x3e800000u}};
+  // lhs, rhs, min and max.
+  constexpr uint64_t f64_cases[][4] = {
+      {0x4000000000000000ull, 0x7ff8000000000000ull, 0x4000000000000000ull, 0x4000000000000000ull},
+      {0xbff8000000000000ull, 0x4008000000000000ull, 0xbff8000000000000ull, 0x4008000000000000ull}};
+  TestCase test;
+  test.name = "RelaxedFloatNativeOps";
+  test.profile = &RelaxedFloatProfile;
+  auto &code = test.code;
+  const auto load = [&](u32 vgpr, u32 bits) {
+    AppendVMovU32(&code, 30, static_cast<u32>(test.initial.size()) * 4u);
+    AppendBufferLoadDword(&code, vgpr, 30);
+    test.initial.push_back(bits);
+    test.expected.push_back(bits);
+  };
+  const auto store = [&](u32 vgpr, u32 bits) {
+    AppendStoreVgpr(&code, vgpr, static_cast<u32>(test.expected.size()));
+    test.initial.push_back(0u);
+    test.expected.push_back(bits);
+  };
+  for (const auto &item : cases) {
+    for (u32 operand = 0; operand < 3; ++operand)
+      load(operand, item[operand]);
+    code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+    AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x154, 13, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x157, 14, Vgpr(0), Vgpr(1), Vgpr(2));
+    for (u32 result = 0; result < 5; ++result)
+      store(10 + result, item[3 + result]);
+  }
+  load(0, 0u);
+  code.push_back(EncodeVop1(0x33, 1, Vgpr(0)));
+  code.push_back(EncodeVop1(0x35, 2, Vgpr(0)));
+  store(1, 0u);
+  store(2, 0u);
+  for (const auto &item : f64_cases) {
+    for (u32 word = 0; word < 4; ++word)
+      load(2 + word, u32(item[word / 2] >> (word % 2 * 32)));
+    AppendVop3(&code, 0x166, 6, Vgpr(2), Vgpr(4));
+    AppendVop3(&code, 0x167, 8, Vgpr(2), Vgpr(4));
+    for (u32 word = 0; word < 4; ++word)
+      store(6 + word, u32(item[2 + word / 2] >> (word % 2 * 32)));
+  }
+  AppendEnd(&code);
+  test.required_spirv = {" NMin ", " NMax "};
+  // Only the exact paths emit NaN tests, FAbs and the 0x7fffffff magnitude mask.
+  test.forbidden_spirv = {" OpIsNan ", " FAbs ", "%uint_2147483647"};
+  return test;
+}
+
 TestCase Vop3FloatConversions(u32 wave_size) {
   using O = ShaderOpcode;
   struct ConversionCase {
@@ -55431,6 +55496,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
     RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--relaxed-float-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, RelaxedFloatNativeOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {

@@ -15639,6 +15639,78 @@ public:
       scheduler.Finish();
     }
 
+    {
+      // A 32-bit 32x32x128 volume is eight 32x32x16 thick 64 KiB blocks.
+      TileBlockLayout block{};
+      Require(name, "volume block",
+              TileGetBlockLayout(TileBlockFamily::Standard64KB3D, 4, block) &&
+                  block.block_width == 32 && block.block_height == 32 &&
+                  block.block_depth == 16,
+              "Standard64KB volume blocks changed");
+      constexpr std::array<vk::Offset3D, 2> texels{{{3, 5, 77}, {31, 31, 127}}};
+      for (uint32_t i = 0; i < texels.size(); ++i) {
+        const auto &texel = texels[i];
+        uint32_t local = 0;
+        Require(
+            name, "volume texel offset",
+            TileGetBlockOffset(block, texel.x, texel.y, texel.z % 16, local),
+            "Standard64KB volume texel has no block offset");
+        const uint32_t value = 0x11110000u + i;
+        std::memcpy(
+            reinterpret_cast<void *>(base + texel.z / 16 * 0x10000ull + local),
+            &value, sizeof(value));
+      }
+
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k32,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorView(0, {.last_array_slice_index = 127});
+      registers.SetColorAttrib2(0, {.height = 31, .width = 31});
+      registers.SetColorAttrib3(0,
+                                {.depth = 127,
+                                 .tile_mode = Prospero::TileMode::kStandard64KB,
+                                 .dimension = 2});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &texture_cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0);
+      const auto attachment =
+          texture_cache.FindRenderTarget(color.image_id, color.desc);
+      const auto &image = texture_cache.GetImage(color.image_id);
+      Require(name, "captured volume target",
+              color.image_id && attachment != nullptr &&
+                  color.desc.info.data.size == 0x80000 &&
+                  color.desc.info.extent == vk::Extent3D{32, 32, 128} &&
+                  color.desc.info.resources == ImageSubresources{1, 1} &&
+                  color.desc.view_info.type == vk::ImageViewType::e2DArray &&
+                  color.desc.view_info.layer_count == 128 &&
+                  image.backing.image_type == vk::ImageType::e3D,
+              "the 128-slice Standard64KB volume target was not resolved");
+      for (uint32_t i = 0; i < texels.size(); ++i) {
+        Require(name, "volume texel upload",
+                ReadCachedTexel(name, context, color.image_id, texels[i]) ==
+                    std::vector<u32>{0x11110000u + i},
+                "a Standard64KB volume texel missed its thick-block address");
+      }
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
     Require(name, "unmap direct backing",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "standard-tiled color mapping release failed");

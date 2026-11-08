@@ -5987,6 +5987,8 @@ int main(int argc, char** argv) {
 	RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
+	RunTest(TestFragmentedBackingPublication);
+	RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);

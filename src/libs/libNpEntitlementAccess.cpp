@@ -517,7 +517,11 @@ namespace LibNpEntitlementAccessPft {
 
 LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
 
-// Unknown function; return state 2 for the FC27 investigation.
+// The game's trial state. The name of the function is not known. A game reads 0 as "not a trial"
+// and 1 as "trial". It reads any other value as a failed check and falls back to its trial version.
+// The emulator runs the full game, so the answer is 0, as for NpEntitlementAccessGetGameTrialsFlag.
+constexpr uint32_t NP_ENTITLEMENT_ACCESS_PFT_STATE_NOT_TRIAL = 0;
+
 static int KYTY_SYSV_ABI NpEntitlementAccessPftUnknowneDXKe9FndlE(uint32_t* state) {
 	PRINT_NAME();
 
@@ -525,7 +529,7 @@ static int KYTY_SYSV_ABI NpEntitlementAccessPftUnknowneDXKe9FndlE(uint32_t* stat
 		return LibNpEntitlementAccess::NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
 	}
 
-	*state = 2;
+	*state = NP_ENTITLEMENT_ACCESS_PFT_STATE_NOT_TRIAL;
 	return 0;
 }
 

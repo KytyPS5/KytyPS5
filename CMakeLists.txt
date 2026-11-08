@@ -399,6 +399,13 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+add_executable(np_webapi2_entitlements_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NpWebApi2EntitlementsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/npWebApi2Entitlements.cpp"
+)
+target_include_directories(np_webapi2_entitlements_tests PRIVATE ${inc_headers})
+target_link_libraries(np_webapi2_entitlements_tests nlohmann_json::nlohmann_json)
+
 add_executable(perf_counters_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PerfCountersTests.cpp"
 )
@@ -690,6 +697,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME perf_counters COMMAND $<TARGET_FILE:perf_counters_tests>)
+	add_test(NAME np_webapi2_entitlements COMMAND $<TARGET_FILE:np_webapi2_entitlements_tests>)
 	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -807,6 +815,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		scalar_provenance_tests
 		perf_counters_tests
+		np_webapi2_entitlements_tests
 		cache_folder_tests
 		image_page_table_tests
 		memory_tracker_tests

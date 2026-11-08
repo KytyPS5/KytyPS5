@@ -6,6 +6,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/npWebApi2Entitlements.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>

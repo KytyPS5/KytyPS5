@@ -74,6 +74,8 @@ public:
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	/// Copies between GDS and guest memory. Overlapping guest ranges give memmove's result, and a
+	/// copy onto itself does nothing. GPU thread only.
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -94,6 +96,9 @@ public:
 	void               RunGarbageCollector();
 
 private:
+	/// Copies between overlapping ranges of one buffer on the GPU, with memmove's result.
+	void CopyOverlapping(CommandBuffer& command, Buffer& buffer, uint64_t source_offset,
+	                     uint64_t destination_offset, uint64_t size);
 	friend struct BufferCacheTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }

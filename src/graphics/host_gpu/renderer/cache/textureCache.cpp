@@ -2045,18 +2045,13 @@ void TextureCache::RunGarbageCollector() {
 		}
 		age = std::min(age, tick);
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
-			candidates.push_back(id);
-			return candidates.size() == deletions;
-		});
+		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
@@ -2066,18 +2061,11 @@ void TextureCache::RunGarbageCollector() {
 				TouchImage(*owner);
 				continue;
 			}
-			if (owner->IsGpuModified()) {
-				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && !pressured) {
-					continue;
-				}
-				if (safe && !DownloadImageMemory(id)) {
-					continue;
-				}
+			if (owner->SafeToDownload() &&
+			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+				continue;
 			}
+			--deletions;
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {

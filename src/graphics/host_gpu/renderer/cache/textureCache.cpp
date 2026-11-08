@@ -1830,24 +1830,22 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	// With storage readback, guest accesses to its pages wait until the stored data lands.
-	const WriteBack write_back {range, m_scheduler.CurrentTick()};
 	if (m_readback_storage_images) {
 		{
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.push_back(write_back);
+			m_write_backs.push_back({range, m_scheduler.CurrentTick()});
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
-	m_scheduler.DeferPriorityOperation([this, download = std::move(download), write_back,
+	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
 	                                    trapped = m_readback_storage_images] {
-		download.buffer->Invalidate(download.offset, write_back.range.size);
-		LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
-		                                write_back.range.size);
+		download.buffer->Invalidate(download.offset, range.size);
+		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
 		if (trapped) {
-			m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
-			                                               write_back.range.size);
+			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
+			// Priority operations run in queue order, so this write-back is the oldest.
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(std::ranges::find(m_write_backs, write_back));
+			m_write_backs.erase(m_write_backs.begin());
 		}
 	});
 	return true;

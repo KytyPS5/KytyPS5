@@ -4478,6 +4478,13 @@ public:
       parked.release();
       reader.join();
       writer.join();
+      // Only the unsubmitted copy's write-back is still pending.
+      auto &texture_cache = resources.GetTextureCache();
+      Require("GpuCommandLane", "storage readback landing order",
+              texture_cache.WriteBackTick(shared_page, 1) == 0 &&
+                  texture_cache.WriteBackTick(suspended_address, 1) ==
+                      suspended_tick,
+              "a landed copy cleared another pending write-back");
       const auto wait_faults = g_handled_gpu_faults.load() - faults;
       const bool unsubmitted =
           resources.GetCommandScheduler().CurrentTick() == suspended_tick;
@@ -4486,8 +4493,7 @@ public:
                   reinterpret_cast<const void *>(suspended_address),
                   sizeof(suspended));
       gpu.SendCommandSync([&] {
-        TextureCacheTestAccess::SetStorageReadback(resources.GetTextureCache(),
-                                                   false);
+        TextureCacheTestAccess::SetStorageReadback(texture_cache, false);
       });
       LibKernel::Memory::InstallGpuResources(nullptr);
       Require("GpuCommandLane", "linear readback at the suspend point",
@@ -4496,8 +4502,7 @@ public:
       Require("GpuCommandLane", "storage readback while the copy lands",
               signalled && waited && read == written && wait_faults < 16 &&
                   stored &&
-                  !TextureCacheTestAccess::WriteBacksPending(
-                      resources.GetTextureCache()),
+                  !TextureCacheTestAccess::WriteBacksPending(texture_cache),
               "a GL2 label waited for its copies, or an access did not");
       resources.UnmapMemory(large_address, large_size);
       Require("GpuCommandLane", "storage readback large release",

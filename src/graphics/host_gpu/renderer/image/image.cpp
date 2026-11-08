@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <fmt/format.h>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -50,6 +51,16 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 [[nodiscard]] bool HasFormatFeature(vk::FormatProperties      properties,
                                     vk::FormatFeatureFlagBits feature) {
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
+}
+
+[[nodiscard]] uint32_t CopyTexels(uint32_t source_texels, uint32_t source_block,
+                                  uint32_t destination_texels, uint32_t destination_block) {
+	if (source_block == destination_block) {
+		return std::min(source_texels, destination_texels);
+	}
+	const uint32_t destination_blocks =
+	    (destination_texels + destination_block - 1) / destination_block;
+	return std::min(source_texels, destination_blocks * source_block);
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
@@ -360,14 +371,18 @@ void Image::CopyImage(Image& source) {
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
 	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	const auto source_block      = vk::blockExtent(source.backing.format);
+	const auto destination_block = vk::blockExtent(backing.format);
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
 		// destination writes out of bounds and loses the device.
-		const auto width  = std::min(std::max(source.backing.extent.width >> level, 1u),
-		                             std::max(backing.extent.width >> level, 1u));
-		const auto height = std::min(std::max(source.backing.extent.height >> level, 1u),
-		                             std::max(backing.extent.height >> level, 1u));
+		const auto width  = CopyTexels(std::max(source.backing.extent.width >> level, 1u),
+		                               source_block[0], std::max(backing.extent.width >> level, 1u),
+		                               destination_block[0]);
+		const auto height = CopyTexels(std::max(source.backing.extent.height >> level, 1u),
+		                               source_block[1], std::max(backing.extent.height >> level, 1u),
+		                               destination_block[1]);
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 

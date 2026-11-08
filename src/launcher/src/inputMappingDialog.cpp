@@ -34,13 +34,29 @@ constexpr char PAD_DISABLED[]            = "Pad=Disabled";
 
 constexpr char PAD_PREFIX[] = "Pad:";
 
-enum Section { Face, Dpad, Shoulders, Sticks, System, LeftStick, RightStick, Shortcuts, SectionCount };
+enum Section {
+	Face,
+	Dpad,
+	Shoulders,
+	Sticks,
+	System,
+	LeftStick,
+	RightStick,
+	Shortcuts,
+	TouchPadSwipes,
+	SectionCount
+};
 
 const char* const SECTION_TITLES[SectionCount] = {
-    QT_TR_NOOP("Face buttons"),         QT_TR_NOOP("D-pad"),
-    QT_TR_NOOP("Shoulders && triggers"), QT_TR_NOOP("Stick clicks"),
-    QT_TR_NOOP("System"),               QT_TR_NOOP("Left stick"),
-    QT_TR_NOOP("Right stick"),          QT_TR_NOOP("In-game shortcuts (cycle)"),
+    QT_TR_NOOP("Face buttons"),
+    QT_TR_NOOP("D-pad"),
+    QT_TR_NOOP("Shoulders && triggers"),
+    QT_TR_NOOP("Stick clicks"),
+    QT_TR_NOOP("System"),
+    QT_TR_NOOP("Left stick"),
+    QT_TR_NOOP("Right stick"),
+    QT_TR_NOOP("In-game shortcuts (cycle)"),
+    QT_TR_NOOP("Touch pad swipes"),
 };
 
 // pad_default is null for controls that have no gamepad equivalent.
@@ -72,6 +88,10 @@ constexpr PadControl PAD_CONTROLS[] = {
     {"TouchPadRight", "Touch pad right", "Tab", nullptr, System},
     {"GyroToggle", "Gyro emulation toggle", "", "Back", System},
     {"TouchPadMode", "Emulated touch pad mode", "F6", "", System},
+    {"TouchPadSwipeUp", "Swipe up", "", nullptr, TouchPadSwipes},
+    {"TouchPadSwipeDown", "Swipe down", "", nullptr, TouchPadSwipes},
+    {"TouchPadSwipeLeft", "Swipe left", "", nullptr, TouchPadSwipes},
+    {"TouchPadSwipeRight", "Swipe right", "", nullptr, TouchPadSwipes},
     {"LeftStickUp", "Up", "W", nullptr, LeftStick},
     {"LeftStickDown", "Down", "S", nullptr, LeftStick},
     {"LeftStickLeft", "Left", "A", nullptr, LeftStick},
@@ -289,10 +309,10 @@ public:
 
 private:
 	void UpdateText(const ControllerPreview* preview) {
-		m_label->setText(preview->DeviceName().isEmpty()
-		                     ? tr("No controller connected.\nConnect one, or press Esc to cancel.")
-		                     : tr("Press a button or trigger on %1.\nEsc cancels.")
-		                           .arg(preview->DeviceName()));
+		m_label->setText(
+		    preview->DeviceName().isEmpty()
+		        ? tr("No controller connected.\nConnect one, or press Esc to cancel.")
+		        : tr("Press a button or trigger on %1.\nEsc cancels.").arg(preview->DeviceName()));
 	}
 
 	QLabel*       m_label = nullptr;
@@ -422,7 +442,7 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, ControllerPre
 	defaults->setObjectName(QStringLiteral("defaults"));
 	defaults->setAutoDefault(false);
 	defaults->setToolTip(tr("Restore the defaults of the current tab."));
-	auto* tip = new QLabel(tr("Tip: right-click a binding to unmap it."), this);
+	auto* tip    = new QLabel(tr("Tip: right-click a binding to unmap it."), this);
 	auto* footer = new QHBoxLayout;
 	footer->addWidget(tip);
 	footer->addStretch();
@@ -481,8 +501,8 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 	columns->setAlignment(Qt::AlignTop);
 
 	// Section order and the column each one lives in.
-	static constexpr Section ORDER[] = {Face, Dpad, Shoulders, Sticks, System, LeftStick,
-	                                    RightStick, Shortcuts};
+	static constexpr Section ORDER[] = {Face,      Dpad,       Shoulders, Sticks,        System,
+	                                    LeftStick, RightStick, Shortcuts, TouchPadSwipes};
 	int                      column_rows[2] = {0, 0};
 	for (const auto section: ORDER) {
 		QGroupBox*   group = nullptr;
@@ -500,13 +520,13 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 				rows->setColumnStretch(0, 1);
 				rows->setColumnMinimumWidth(1, 190);
 			}
-			const auto id    = QString::fromLatin1(control.id);
-			const auto label = !pad && id == QLatin1String("TouchPad") ? tr("Touch pad left")
-			                                                           : tr(control.label);
-			auto* name = new QLabel(label, group);
+			const auto id = QString::fromLatin1(control.id);
+			const auto label =
+			    !pad && id == QLatin1String("TouchPad") ? tr("Touch pad left") : tr(control.label);
+			auto* name   = new QLabel(label, group);
 			auto* button = new QPushButton(group);
-			button->setObjectName((pad ? QStringLiteral("padBinding_") : QStringLiteral("binding_")) +
-			                      id);
+			button->setObjectName(
+			    (pad ? QStringLiteral("padBinding_") : QStringLiteral("binding_")) + id);
 			button->setAutoDefault(false);
 			button->setMinimumWidth(190);
 			button->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -515,13 +535,19 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 			rows->addWidget(button, row, 1);
 			++row;
 			(pad ? m_pad_buttons : m_buttons).insert(id, button);
-			connect(button, &QPushButton::clicked, this, [this, pad, id] {
-				pad ? ChangePadBinding(id) : ChangeKeyboardBinding(id);
-			});
+			connect(button, &QPushButton::clicked, this,
+			        [this, pad, id] { pad ? ChangePadBinding(id) : ChangeKeyboardBinding(id); });
 			connect(button, &QPushButton::customContextMenuRequested, this,
 			        [this, pad, id] { ClearBinding(pad, id); });
 		}
 		if (group != nullptr) {
+			if (section == TouchPadSwipes) {
+				auto* note = new QLabel(tr("Each press sends one swipe without clicking. "
+				                           "Touch pad mode is not required."),
+				                        group);
+				note->setWordWrap(true);
+				rows->addWidget(note, row, 0, 1, 2);
+			}
 			const int target = column_rows[0] <= column_rows[1] ? 0 : 1;
 			columns->addWidget(group, column_rows[target]++, target);
 		}
@@ -538,11 +564,10 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 		m_controller->setObjectName(QStringLiteral("controllerDiagram"));
 		m_controller->setMinimumWidth(320);
 		body->addWidget(m_controller, 2);
-		connect(m_controller, &DualSenseWidget::ControlClicked, this,
-		        [this](const QString& id) {
-			        ChangePadBinding(id == QLatin1String("TouchPadRight") ? QStringLiteral("TouchPad")
-			                                                               : id);
-		        });
+		connect(m_controller, &DualSenseWidget::ControlClicked, this, [this](const QString& id) {
+			ChangePadBinding(id == QLatin1String("TouchPadRight") ? QStringLiteral("TouchPad")
+			                                                      : id);
+		});
 		auto* note = new QLabel(tr("The gyro emulation toggle activates tilt mode on gamepads "
 		                           "without a gyroscope: the right stick then controls pitch and "
 		                           "roll. It defaults to the View/Back button."),
@@ -564,7 +589,6 @@ QWidget* InputMappingDialog::BuildTab(bool pad) {
 		    new QLabel(tr("F7 in-game toggles mouse movement on the right stick."), page));
 		sensitivity_layout->addStretch();
 		layout->addLayout(sensitivity_layout);
-
 	}
 	return page;
 }
@@ -683,16 +707,16 @@ void InputMappingDialog::UpdateButtons() {
 		const auto binding = m_bindings.value(item.key());
 		const auto label   = binding.isEmpty() ? tr("None") : binding;
 		button->setText(QString(label).replace(QLatin1Char('&'), QLatin1String("&&")));
-		button->setToolTip(
-		    tr("%1: %2. Click to change, right-click to clear.").arg(button->accessibleName(), label));
+		button->setToolTip(tr("%1: %2. Click to change, right-click to clear.")
+		                       .arg(button->accessibleName(), label));
 	}
 	for (auto item = m_pad_buttons.begin(); item != m_pad_buttons.end(); ++item) {
-		auto*      button  = item.value();
-		const auto source  = m_pad_bindings.value(item.key());
-		const auto label   = source.isEmpty() ? tr("None") : PadSourceLabel(source);
+		auto*      button = item.value();
+		const auto source = m_pad_bindings.value(item.key());
+		const auto label  = source.isEmpty() ? tr("None") : PadSourceLabel(source);
 		button->setText(QString(label).replace(QLatin1Char('&'), QLatin1String("&&")));
-		button->setToolTip(
-		    tr("%1: %2. Click to change, right-click to clear.").arg(button->accessibleName(), label));
+		button->setToolTip(tr("%1: %2. Click to change, right-click to clear.")
+		                       .arg(button->accessibleName(), label));
 	}
 	UpdateHighlights();
 }

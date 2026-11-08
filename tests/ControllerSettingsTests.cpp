@@ -752,6 +752,30 @@ void TestUnreadPressSurvivesStickBurst() {
 	      "a stick move after a read did not add a sample");
 }
 
+void TestTouchWithoutClick() {
+	Controller controller;
+	PadData data {};
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, true, 0.2f, 0.5f, false);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 &&
+	          (data.buttons & PAD_BUTTON_TOUCH_PAD) == 0,
+	      "a swipe touch pressed the touchpad button");
+	const auto id = data.touch_data.touch[0].id;
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, true, 0.8f, 0.5f, false);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 &&
+	          data.touch_data.touch[0].id == id && data.touch_data.touch[0].x == 1536 &&
+	          (data.buttons & PAD_BUTTON_TOUCH_PAD) == 0,
+	      "swipe movement changed its touch ID or pressed the touchpad button");
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, true, 0.25f, 0.5f);
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, false, 0.8f, 0.5f, false);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 &&
+	          (data.buttons & PAD_BUTTON_TOUCH_PAD) != 0,
+	      "releasing a swipe also released an independent touchpad click");
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, false, 0.25f, 0.5f);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 0 &&
+	          (data.buttons & PAD_BUTTON_TOUCH_PAD) == 0,
+	      "the existing touchpad click mapping stopped releasing");
+}
+
 } // namespace
 
 int main() {
@@ -768,6 +792,7 @@ int main() {
 	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestUnreadPressSurvivesStickBurst();
+	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();

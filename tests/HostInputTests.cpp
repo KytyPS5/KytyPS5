@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 void Check(bool condition, const char* message) {
@@ -16,6 +17,15 @@ std::array<Sint16, 2> physical_stick {};
 std::array<int, 2>    guest_stick {128, 128};
 uint32_t              guest_buttons = 0;
 bool                  guest_touch   = false;
+Uint64                now           = 1000;
+int                   wait_timeout  = -1;
+SDL_Event             pending_event {};
+struct TouchSample {
+	bool down;
+	float x, y;
+	bool emulate_click;
+};
+std::vector<TouchSample> touches;
 } // namespace
 
 namespace Fake {
@@ -27,7 +37,14 @@ Sint16 GetGamepadAxis(SDL_Gamepad*, SDL_GamepadAxis axis) {
 	return physical_stick[axis == SDL_GAMEPAD_AXIS_LEFTY ? 1 : 0];
 }
 Uint64 GetTicks() {
-	return 1000;
+	return now;
+}
+SDL_WindowID GetWindowID(SDL_Window*) { return 1; }
+bool WaitEventTimeout(SDL_Event* event, Sint32 timeout) {
+	wait_timeout = timeout;
+	*event = pending_event;
+	pending_event = {};
+	return event->type != 0;
 }
 bool HideCursor() {
 	return true;
@@ -44,6 +61,8 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 #define SDL_GetGamepadFromID Fake::GetGamepadFromID
 #define SDL_GetGamepadAxis   Fake::GetGamepadAxis
 #define SDL_GetTicks         Fake::GetTicks
+#define SDL_GetWindowID      Fake::GetWindowID
+#define SDL_WaitEventTimeout Fake::WaitEventTimeout
 #define SDL_HideCursor       Fake::HideCursor
 #define SDL_ShowCursor       Fake::ShowCursor
 #define SDL_GetMouseState    Fake::GetMouseState
@@ -51,6 +70,8 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 #undef SDL_GetGamepadFromID
 #undef SDL_GetGamepadAxis
 #undef SDL_GetTicks
+#undef SDL_GetWindowID
+#undef SDL_WaitEventTimeout
 #undef SDL_HideCursor
 #undef SDL_ShowCursor
 #undef SDL_GetMouseState
@@ -66,9 +87,12 @@ void SetAxis(int id, Axis axis, int value) {
 		guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
 	}
 }
-void SetTouchPad(int id, int finger, bool down, float, float) {
+void SetTouchPad(int id, int finger, bool down, float x, float y, bool emulate_click) {
 	if (id == 1 && finger == 1) {
 		guest_touch = down;
+	}
+	if (id == HOST_INPUT_CONTROLLER_ID && finger == 1) {
+		touches.push_back({down, x, y, emulate_click});
 	}
 }
 void SetRightStick(int, int, int) {}
@@ -86,6 +110,9 @@ struct Inputs {
 		guest_stick    = {128, 128};
 		guest_buttons  = 0;
 		guest_touch    = false;
+		now            = 1000;
+		pending_event  = {};
+		touches.clear();
 		HostInputInit(nullptr);
 	}
 	~Inputs() { HostInputShutdown(); }
@@ -188,17 +215,121 @@ void TestDisabledMappingTabs() {
 	          mapped.PadControl(south) == ControlFromName("Circle"),
 	      "explicit mappings no longer override defaults");
 }
+
+void PollSwipeAt(Uint64 time) {
+	now = time;
+	SDL_Event event {};
+	(void) HostInputWaitEvent(&event, 1000);
+}
+
+void TestSwipeDirections() {
+	for (const auto key: {SDLK_U, SDLK_N, SDLK_B, SDLK_M}) {
+		Inputs inputs;
+		HostInputKey(key, true);
+		Check(touches.size() == 1 && touches.back().down,
+		      "a mapped swipe did not start a touch");
+		const auto start = touches.back();
+		PollSwipeAt(1000);
+		Check(wait_timeout == 8 && touches.size() == 1,
+		      "the event loop did not schedule the swipe's next sample");
+		PollSwipeAt(1100);
+		Check(touches.back().down && std::abs(touches.back().x - 0.5f) < 0.001f &&
+		          std::abs(touches.back().y - 0.5f) < 0.001f,
+		      "a swipe did not move through the centre");
+		PollSwipeAt(1200);
+		const auto end = touches.back();
+		Check(end.down && (key == SDLK_U ? end.y < start.y :
+		                      key == SDLK_N ? end.y > start.y :
+		                      key == SDLK_B ? end.x < start.x : end.x > start.x),
+		      "a swipe moved in the wrong direction or released before its endpoint");
+		Check(key == SDLK_U || key == SDLK_N ? end.x == start.x : end.y == start.y,
+		      "a swipe drifted along its other axis");
+		PollSwipeAt(1208);
+		Check(!touches.back().down && touches.back().x == end.x && touches.back().y == end.y,
+		      "a completed swipe did not release at its endpoint");
+		for (const auto& sample: touches) {
+			Check(!sample.emulate_click && sample.x >= 0 && sample.x <= 1 &&
+			          sample.y >= 0 && sample.y <= 1,
+			      "a swipe clicked the pad or left its coordinate range");
+		}
+		const auto count = touches.size();
+		HostInputKey(key, true);
+		PollSwipeAt(1500);
+		Check(touches.size() == count, "a held swipe key repeated the gesture");
+		HostInputKey(key, false);
+		HostInputKey(key, true);
+		Check(touches.size() == count + 1 && touches.back().down,
+		      "releasing and pressing a swipe key did not start another gesture");
+	}
+}
+
+void TestSwipeTapAndReplacement() {
+	Inputs inputs;
+	HostInputKey(SDLK_U, true);
+	HostInputKey(SDLK_U, false);
+	PollSwipeAt(1100);
+	Check(touches.back().down && touches.back().y < touches.front().y,
+	      "a quick tap cancelled its swipe");
+	HostInputKey(SDLK_M, true);
+	Check(touches.size() == 4 && !touches[2].down && touches[3].down &&
+	          touches[3].x < 0.5f,
+	      "a new direction did not release the previous gesture before starting");
+	PollSwipeAt(1300);
+	PollSwipeAt(1308);
+	Check(!touches.back().down, "a replacement swipe never released");
+}
+
+void TestSwipeCleanupAndManualHandoff() {
+	Inputs inputs;
+	HostInputKey(SDLK_U, true);
+	pending_event.type = SDL_EVENT_WINDOW_FOCUS_LOST;
+	pending_event.window.windowID = 2;
+	PollSwipeAt(1000);
+	Check(touches.back().down, "another window's focus loss cancelled the swipe");
+	pending_event.type = SDL_EVENT_WINDOW_FOCUS_LOST;
+	pending_event.window.windowID = 1;
+	PollSwipeAt(1000);
+	Check(!touches.back().down, "focus loss left a swipe finger down");
+	const auto count = touches.size();
+	PollSwipeAt(1400);
+	Check(touches.size() == count, "a swipe continued after focus loss");
+	HostInputKey(SDLK_U, true);
+	Check(touches.back().down, "focus loss retained a held swipe key");
+	HostInputSetTouchPadMode(true);
+	Check(!touches.back().down, "mouse touchpad mode did not cancel a swipe");
+	HostInputMouseTouchPad(true, 0, 0);
+	HostInputKey(SDLK_M, true);
+	Check(!GetHostInputTouchPadVisualState().enabled && touches.back().down &&
+	          !touches[touches.size() - 2].down,
+	      "a keyboard swipe did not take over from mouse drawing");
+	HostInputToggleGamepadTouchPad(1);
+	Check(!touches.back().down, "gamepad touchpad mode did not cancel a swipe");
+	Check(HostInputGamepadDrawButton(1, true), "gamepad drawing did not start");
+	HostInputKey(SDLK_B, true);
+	Check(!GetHostInputTouchPadVisualState().enabled && !guest_touch && touches.back().down,
+	      "a keyboard swipe did not take over from gamepad drawing");
+	HostInputShutdown();
+	Check(!touches.back().down, "shutdown left a swipe finger down");
+	HostInputInit(nullptr);
+	HostInputKey(SDLK_B, true);
+	Check(touches.back().down, "shutdown retained a held swipe key");
+}
 } // namespace
 
 int main() {
 	Config::Initialize();
 	Config::ConfigOptions options;
-	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger"};
+	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger", "TouchPadMode=F6",
+	                  "TouchPadSwipeUp=U", "TouchPadSwipeDown=N", "TouchPadSwipeLeft=B",
+	                  "TouchPadSwipeRight=M"};
 	Config::Load(options);
 	TestTouchPadStickHandoff();
 	TestKeyboardSwitchesFromGamepadTouchPad();
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
+	TestSwipeDirections();
+	TestSwipeTapAndReplacement();
+	TestSwipeCleanupAndManualHandoff();
 	TestDisabledMappingTabs();
 	Config::Shutdown();
 	return 0;

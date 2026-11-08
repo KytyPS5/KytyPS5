@@ -80,7 +80,8 @@ void CycleKeyboardPlayer();
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
-void SetTouchPad(int id, int finger, bool down, float x, float y);
+// Host touch mappings normally also click the pad; swipe gestures only move a finger.
+void SetTouchPad(int id, int finger, bool down, float x, float y, bool emulate_click = true);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
 void ResetInputState();
@@ -104,7 +105,7 @@ constexpr int PAD_HANDLE_VR_LEFT = 0x10; // The right controller follows it.
 constexpr int PadVrHand(int handle) {
 	return handle == PAD_HANDLE_VR_LEFT || handle == PAD_HANDLE_VR_LEFT + 1
 	           ? handle - PAD_HANDLE_VR_LEFT
-			   : -1;
+	           : -1;
 }
 
 // Hand of a Sense controller port type, -1 for other types or without the virtual headset.

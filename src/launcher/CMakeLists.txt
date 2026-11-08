@@ -47,6 +47,22 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+add_executable(launcher_input_mapping_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherInputMappingTests.cpp"
+	include/controllerPreview.h
+	include/dualsenseWidget.h
+	src/inputMappingDialog.cpp
+	src/controllerPreview.cpp
+	src/dualsenseWidget.cpp
+)
+target_link_libraries(launcher_input_mapping_tests Qt6::Widgets SDL3::SDL3-static)
+target_include_directories(launcher_input_mapping_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_input_mapping_tests PROPERTIES AUTOMOC ON)
+if(BUILD_TESTING)
+	add_test(NAME launcher_input_mapping COMMAND $<TARGET_FILE:launcher_input_mapping_tests>)
+	add_dependencies(kyty_tests launcher_input_mapping_tests)
+endif()
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

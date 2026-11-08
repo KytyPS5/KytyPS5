@@ -17,6 +17,7 @@
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/benchScript.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
@@ -25,10 +26,14 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -512,9 +517,40 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 	}
 }
 
+// KYTY_INPUT_LOG=<file>: the player's key and gamepad button presses, one per line with the time
+// and the presented frame, to learn a route through a game from someone playing it.
+static void LogInput(const SDL_Event& event, uint64_t frame) {
+	static std::FILE* const file = [] {
+		const char* path = std::getenv("KYTY_INPUT_LOG");
+		return path != nullptr ? std::fopen(path, "a") : nullptr;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	const char* name = nullptr;
+	bool        down = false;
+	if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+	    event.key.repeat == 0) {
+		name = SDL_GetKeyName(event.key.key);
+		down = event.key.down;
+	} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+	           event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+		name = SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(event.gbutton.button));
+		down = event.gbutton.down;
+	}
+	if (name == nullptr) {
+		return;
+	}
+	std::fprintf(file, "%llu ms frame %llu %s %s\n",
+	             static_cast<unsigned long long>(SDL_GetTicks()),
+	             static_cast<unsigned long long>(frame), name, down ? "down" : "up");
+	std::fflush(file);
+}
+
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	LogInput(*event, game.presented_frames.load(std::memory_order_relaxed));
 	if (event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) {
 		const bool pressed = event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0;
 		switch (event->key.key) {
@@ -784,8 +820,53 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+// The benchmark script of --bench-script, or nullopt without one. Stops the emulator when the
+// file cannot be read or a step is wrong, so a measured run never goes on without its input.
+static std::optional<BenchScript> LoadBenchScript() {
+	const auto path = Config::GetBenchScript();
+	if (path.empty()) {
+		return std::nullopt;
+	}
+	std::ifstream file(path);
+	if (!file) {
+		EXIT("--bench-script %s: the file cannot be read\n", Common::PathToString(path).c_str());
+	}
+	std::stringstream text;
+	text << file.rdbuf();
+	std::string error;
+	auto        steps = ParseBenchScript(text.str(), error);
+	if (!steps) {
+		EXIT("--bench-script %s: %s\n", Common::PathToString(path).c_str(), error.c_str());
+	}
+	for (const auto& step: *steps) {
+		if (!step.quit && SDL_GetKeyFromName(step.key.c_str()) == SDLK_UNKNOWN) {
+			EXIT("--bench-script %s: unknown key \"%s\"\n", Common::PathToString(path).c_str(),
+			     step.key.c_str());
+		}
+	}
+	std::printf("Bench: %zu step(s) from %s\n", steps->size(), Common::PathToString(path).c_str());
+	return BenchScript(std::move(*steps));
+}
+
 void WindowContext::Run() {
 	Common::Timer timer;
+
+	auto bench = LoadBenchScript();
+	// A step that waits for a frame is checked this often.
+	constexpr int bench_frame_poll_ms = 4;
+	// KYTY_BENCH_LIVE=<file>: key names appended to the file, one per line, are tapped as they
+	// arrive, to steer a run from what its screenshots show.
+	const char* live_path = std::getenv("KYTY_BENCH_LIVE");
+	// KYTY_BENCH_LIVE_HOLD_MS: how long a tap holds the key (default 150): a game that draws a
+	// frame in half a second sees nothing of a shorter one.
+	const uint64_t live_hold_ms = [] {
+		const char* value = std::getenv("KYTY_BENCH_LIVE_HOLD_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {150};
+	}();
+	std::ifstream                                 live_file;
+	std::string                                   live_partial;
+	std::vector<std::pair<uint64_t, std::string>> live_releases; // key ups due at a time
+	uint64_t                                      live_next_ms = 0;
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -800,18 +881,90 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto fps =
+			    static_cast<double>(frames - title_frames) * 1000.0 / static_cast<double>(elapsed);
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				UpdateTitle(frames, fps);
+			}
+			if (bench) {
+				std::printf("Bench: %llu ms, frame %llu, fps %.1f\n",
+				            static_cast<unsigned long long>(now),
+				            static_cast<unsigned long long>(frames), fps);
+				std::fflush(stdout);
 			}
 			title_time   = now;
 			title_frames = frames;
 		}
-		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
-		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
-			continue;
+		auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		if (bench) {
+			bench->Advance(loop.presented_frames.load(std::memory_order_relaxed), now,
+			               [&](const BenchStep& step) {
+				               std::printf("Bench: %llu ms, step %s %s\n",
+				                           static_cast<unsigned long long>(now),
+				                           step.quit ? "quit" : step.key.c_str(),
+				                           step.quit ? "" : (step.down ? "down" : "up"));
+				               std::fflush(stdout);
+				               if (step.quit) {
+					               LOGF("Event: quit (bench script)\n");
+					               loop.need_exit = true;
+				               } else {
+					               HostInputKey(SDL_GetKeyFromName(step.key.c_str()), step.down);
+				               }
+			               });
+			wait_ms = bench->WaitMs(SDL_GetTicks(), bench_frame_poll_ms, wait_ms);
 		}
-		ProcessEvent(timer.GetTimeS());
+		if (live_path != nullptr) {
+			if (!live_file.is_open()) live_file.open(live_path);
+			const auto live_now = SDL_GetTicks();
+			for (auto it = live_releases.begin(); it != live_releases.end();) {
+				if (it->first <= live_now) {
+					HostInputKey(SDL_GetKeyFromName(it->second.c_str()), false);
+					it = live_releases.erase(it);
+				} else {
+					++it;
+				}
+			}
+			if (live_file.is_open() && live_releases.empty() && live_now >= live_next_ms) {
+				live_file.clear();
+				char c = 0;
+				while (live_file.get(c)) {
+					if (c != '\n') {
+						live_partial += c;
+						continue;
+					}
+					// "KEY:MS" holds this tap MS milliseconds: a fast menu repeats a long hold.
+					auto key  = live_partial;
+					auto hold = live_hold_ms;
+					live_partial.clear();
+					if (const auto colon = key.rfind(':');
+					    colon != std::string::npos && colon + 1 < key.size()) {
+						hold = std::strtoull(key.c_str() + colon + 1, nullptr, 10);
+						key.resize(colon);
+					}
+					if (key.empty() || SDL_GetKeyFromName(key.c_str()) == SDLK_UNKNOWN) continue;
+					std::printf("Bench: %llu ms, live tap %s\n",
+					            static_cast<unsigned long long>(live_now), key.c_str());
+					std::fflush(stdout);
+					if (SDL_GetKeyFromName(key.c_str()) == SDLK_F1) {
+						// As on the keyboard: F1 captures the next frame in RenderDoc.
+						RenderDocRequestCapture();
+						continue;
+					}
+					HostInputKey(SDL_GetKeyFromName(key.c_str()), true);
+					live_releases.emplace_back(live_now + hold, key);
+					live_next_ms = live_now + hold + 250; // one tap at a time, as a player would
+					break;
+				}
+			}
+			wait_ms = std::min(wait_ms, 20);
+		}
+		if (HostInputWaitEvent(&loop.event, wait_ms)) {
+			ProcessEvent(timer.GetTimeS());
+		}
+		if (HostInputQuitRequested()) {
+			LOGF("Event: quit (player 1 held the PS button or both triggers)\n");
+			loop.need_exit = true;
+		}
 	}
 }
 

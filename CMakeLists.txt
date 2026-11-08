@@ -445,6 +445,11 @@ add_executable(perf_counters_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(perf_counters_tests PRIVATE ${inc_headers})
 
+add_executable(bench_script_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BenchScriptTests.cpp"
+)
+target_include_directories(bench_script_tests PRIVATE ${inc_headers})
+
 add_executable(cache_folder_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/CacheFolderTests.cpp"
 )
@@ -753,6 +758,7 @@ if(BUILD_TESTING)
 	add_test(NAME ea_emulation_authentication COMMAND $<TARGET_FILE:ea_emulation_authentication_tests>)
 	add_test(NAME np_webapi2_entitlements COMMAND $<TARGET_FILE:np_webapi2_entitlements_tests>)
 	add_test(NAME ea_emulation_patch_plan COMMAND $<TARGET_FILE:ea_emulation_patch_plan_tests>)
+	add_test(NAME bench_script COMMAND $<TARGET_FILE:bench_script_tests>)
 	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -878,6 +884,7 @@ if(BUILD_TESTING)
 		ea_emulation_authentication_tests
 		ea_emulation_patch_plan_tests
 		np_webapi2_entitlements_tests
+		bench_script_tests
 		cache_folder_tests
 		image_page_table_tests
 		memory_tracker_tests

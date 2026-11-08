@@ -71,6 +71,11 @@ static void PrintUsage() {
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
+	::printf("  --pipeline-cache-folder <path>       Pipeline and program lists of each game.\n"
+	         "                                       Default: the user's cache folder.\n");
+	::printf(
+	    "  --bench-script <path>                Replay key presses at given frames and log the\n"
+	    "                                       frame rate each second, for measured runs.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
@@ -78,6 +83,16 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
+	::printf("  --perf-counters                      Print what a frame costs (faults, draws, "
+	         "passes) every 30 frames.\n");
+	::printf(
+	    "  --trace-dir <path>                   Write frame times, hotspots, errors, hangs and\n"
+	    "                                       screenshots of a measured run to a folder.\n");
+	::printf("  --trace-screenshot-seconds <num>     Seconds between trace screenshots; 0: none.\n"
+	         "                                       Default: 10.\n");
+	::printf(
+	    "  --trace-hang-seconds <num>           Seconds without a frame before a trace reports\n"
+	    "                                       a hang. Default: 30.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
@@ -205,6 +220,7 @@ static constexpr Flag FLAGS[] = {
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
+    {"--perf-counters", &ConfigOptions::perf_counters_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
@@ -389,6 +405,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--shader-log-direction") {
 			if (!ParseEnum(value, options.config.shader_log_direction)) {
 				::printf("invalid shader log direction: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--pipeline-cache-folder") {
+			options.config.pipeline_cache_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--bench-script") {
+			options.config.bench_script = Common::PathFromUtf8(value);
+		} else if (arg == "--trace-dir") {
+			options.config.trace_dir = Common::PathFromUtf8(value);
+		} else if (arg == "--trace-screenshot-seconds") {
+			if (!ParseUint32(value, options.config.trace_screenshot_seconds)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trace-hang-seconds") {
+			if (!ParseUint32(value, options.config.trace_hang_seconds)) {
+				::printf("invalid number for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-log-folder") {

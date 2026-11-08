@@ -128,6 +128,7 @@ public:
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
+	bool                   ea_emulation_enabled        = true;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -174,6 +175,7 @@ public:
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;
 		psn_emulation_enabled       = other.psn_emulation_enabled;
+		ea_emulation_enabled        = other.ea_emulation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;

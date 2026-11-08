@@ -61,6 +61,8 @@ static void PrintUsage() {
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
 	::printf("  --emulate-psn                        Simulate PSN sign-in for compatibility.\n");
+	::printf("  --no-emulate-ea                      Do not answer a game of EA with the built-in "
+	         "EA server.\n");
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
@@ -192,6 +194,7 @@ static constexpr Flag FLAGS[] = {
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
+    {"--no-emulate-ea", &ConfigOptions::ea_emulation_enabled, false},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},

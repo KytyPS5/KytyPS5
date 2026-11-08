@@ -18,11 +18,14 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/eaEmulation/eaPatchPlan.h"
+#include "libs/eaEmulation/eaServer.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -1271,6 +1274,20 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
 		                      m_programs)) {
 			EXIT("Failed to apply game cheat\n");
+		}
+	}
+	// Apart from any patch above: the EA plan changes only the bytes of EA's authority key.
+	if (GamePatch::ContainsBytes(m_programs, Libs::EaEmulation::AuthorityModulus())) {
+		// A game of EA: it holds EA's authority key, and needs the built-in server
+		// (libs/eaEmulation) and a patch that makes it trust that server's authority.
+		std::string title_id;
+		std::string version;
+		if (SystemContentParamSfoGetString("TITLE_ID", &title_id) &&
+		    SystemContentParamSfoGetString("APP_VER", &version) && !m_programs.empty() &&
+		    Libs::EaEmulation::StartForGame(title_id)) {
+			const auto process = m_programs.front()->file_name.filename().string();
+			GamePatch::ApplyBuiltIn(Libs::EaEmulation::PatchPlanJson(version, process),
+			                        m_programs.front(), m_programs);
 		}
 	}
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {

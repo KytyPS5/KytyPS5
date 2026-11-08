@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "kernel/eventQueue.h"
+#include "libs/eaEmulation/eaServer.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -1933,6 +1934,20 @@ static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 	return request->async ? 0 : request->result;
 }
 
+// A title whose servers the emulator answers itself (libs/eaEmulation): a request for an
+// authorization code or an id token succeeds with a placeholder, which only that stand-in server
+// accepts.
+static bool np_auth_ea_signed_in() {
+	static const bool enabled = EaEmulation::SignedInForTitle();
+	return enabled;
+}
+
+static int np_auth_complete_ok(NpAuthRequest* request) {
+	request->state  = NpAuthRequestState::Complete;
+	request->result = 0;
+	return 0;
+}
+
 static int KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
 	PRINT_NAME();
 
@@ -1981,6 +1996,19 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
 	if (request == nullptr) {
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
 	}
+	if (request->state == NpAuthRequestState::Aborted) {
+		request->result = NP_AUTH_ERROR_ABORTED;
+		return NP_AUTH_ERROR_ABORTED;
+	}
+	if (np_auth_ea_signed_in()) {
+		if (auth_code != nullptr) {
+			std::strncpy(static_cast<char*>(auth_code), "kyty0001", 127);
+		}
+		if (issuer_id != nullptr) {
+			*issuer_id = 256;
+		}
+		return np_auth_complete_ok(request);
+	}
 	return np_auth_complete_unavailable(request, param->user_id);
 }
 
@@ -2008,6 +2036,16 @@ static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenPa
 	auto*            request = np_auth_find_request(req_id);
 	if (request == nullptr) {
 		return NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+	}
+	if (request->state == NpAuthRequestState::Aborted) {
+		request->result = NP_AUTH_ERROR_ABORTED;
+		return NP_AUTH_ERROR_ABORTED;
+	}
+	if (np_auth_ea_signed_in()) {
+		if (id_token != nullptr) {
+			std::strncpy(static_cast<char*>(id_token), "kyty.emulated.idtoken", 4103);
+		}
+		return np_auth_complete_ok(request);
 	}
 	return np_auth_complete_unavailable(request, param->user_id);
 }
@@ -2138,6 +2176,13 @@ struct NpWebApi2ResponseInformationOption {
 	size_t  error_object_size;
 	size_t  response_data_size;
 };
+
+// A title whose servers the emulator answers itself (libs/eaEmulation): see the same switch in
+// NpAuth.
+static bool np_webapi2_ea_signed_in() {
+	static const bool enabled = EaEmulation::SignedInForTitle();
+	return enabled;
+}
 
 struct NpWebApi2Request {
 	std::string api_group;
@@ -2273,6 +2318,29 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 
 	request->second.response.clear();
 	request->second.read_offset = 0;
+
+	// A title with a stand-in server: the answers a signed-in account would get. The bodies follow
+	// the public shape of these calls; the game's own checks decide whether they are enough.
+	if (np_webapi2_ea_signed_in()) {
+		const auto& path = request->second.path;
+		if (path.find("/entitlements") != std::string::npos) {
+			request->second.response = Network::OwnedEntitlementsJson(path);
+		} else if (path.find("/communication/restriction/status") != std::string::npos) {
+			request->second.response =
+			    R"({"restricted":false,"restrictionStatus":"NOT_RESTRICTED"})";
+		} else {
+			request->second.response = "{}";
+		}
+		if (response_info_option != nullptr) {
+			response_info_option->http_status        = 200;
+			response_info_option->response_data_size = request->second.response.size();
+			if (response_info_option->error_object != nullptr &&
+			    response_info_option->error_object_size > 0) {
+				response_info_option->error_object[0] = '\0';
+			}
+		}
+		return 0;
+	}
 
 	if (response_info_option != nullptr) {
 		response_info_option->http_status        = 0;

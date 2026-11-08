@@ -579,8 +579,25 @@ add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
+add_executable(pad_input_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PadInputTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padInput.cpp"
+)
+target_include_directories(pad_input_tests PRIVATE ${inc_headers})
+
+add_executable(gamepad_quit_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GamepadQuitTests.cpp"
+)
+target_include_directories(gamepad_quit_tests PRIVATE ${inc_headers})
+
+add_executable(player_seats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayerSeatsTests.cpp"
+)
+target_include_directories(player_seats_tests PRIVATE ${inc_headers})
+
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padInput.cpp"
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
@@ -760,6 +777,9 @@ if(BUILD_TESTING)
 	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
+	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
+	add_test(NAME player_seats COMMAND $<TARGET_FILE:player_seats_tests>)
+	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
@@ -884,6 +904,9 @@ if(BUILD_TESTING)
 		ajm_resample_tests
 		pad_haptics_tests
 		controller_settings_tests
+		pad_input_tests
+		player_seats_tests
+		gamepad_quit_tests
 		host_input_tests
 		save_data_memory_tests
 		png_enc_tests

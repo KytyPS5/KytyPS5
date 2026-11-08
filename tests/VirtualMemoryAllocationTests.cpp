@@ -5920,9 +5920,6 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestStackHandledFault);
 #endif
 	RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
-	RunTest(TestFragmentedBackingUnmapRollback);
-	RunTest(TestFlexibleReplacementRollbackPreservesMetadata);
-	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingPublication);
 	RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);

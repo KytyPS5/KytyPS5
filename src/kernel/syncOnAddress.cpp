@@ -12,13 +12,6 @@
 #include <mutex>
 #include <unordered_map>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-#include <cerrno>
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-
 namespace Libs::LibKernel::SyncOnAddress {
 
 namespace {
@@ -81,60 +74,6 @@ void PollSignals(signal_poll_func_t signal_poll) {
 	}
 }
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-
-template <typename T>
-int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
-              signal_poll_func_t signal_poll) {
-	bool       first_wait = true;
-
-	for (;;) {
-		if (ReadWord(address) != expected) {
-			return OK;
-		}
-		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
-		if (slice_micros == UINT32_MAX) {
-			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
-		}
-		const timespec timeout = {
-		    .tv_sec  = static_cast<time_t>(slice_micros / 1000000u),
-		    .tv_nsec = static_cast<long>(slice_micros % 1000000u) * 1000L,
-		};
-
-		long result     = 0;
-		int  wait_error = 0;
-		result          = syscall(SYS_futex, const_cast<T*>(address), FUTEX_WAIT_PRIVATE,
-		                          static_cast<uint32_t>(expected), &timeout, nullptr, 0);
-		if (result != 0) {
-			wait_error = errno;
-		}
-		if (result == 0 || wait_error == EAGAIN) {
-			return OK;
-		}
-		if (wait_error != ETIMEDOUT && wait_error != EINTR) {
-			return KERNEL_ERROR_EINVAL;
-		}
-
-		PollSignals(signal_poll);
-		if (deadline.finite && Clock::now() >= deadline.end) {
-			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
-		}
-		first_wait = false;
-	}
-}
-
-int WakeLinux(volatile void* address, int32_t count) {
-	// The legacy FUTEX_WAKE path may wake one waiter when count is zero.
-	if (count == 0) {
-		return OK;
-	}
-
-	const auto result = syscall(SYS_futex, const_cast<void*>(address), FUTEX_WAKE_PRIVATE, count,
-	                            nullptr, nullptr, 0);
-	return result < 0 ? KERNEL_ERROR_EINVAL : OK;
-}
-
-#endif
 
 struct PortableWaiter {
 	Common::CondVar condition;
@@ -260,12 +199,7 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = OK;
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, deadline, signal_poll);
-#else
-	result = WaitPortable(address, expected, deadline, signal_poll);
-#endif
+	const int result = WaitPortable(address, expected, deadline, signal_poll);
 	PollSignals(signal_poll);
 	return result;
 }
@@ -292,9 +226,6 @@ int Wake(volatile void* address, int32_t count) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	return WakeLinux(address, count);
-#endif
 	return WakePortable(address, count);
 }
 

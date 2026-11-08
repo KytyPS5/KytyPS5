@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/signalDefer.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -21,8 +22,8 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
-#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -955,7 +956,7 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
                                       void* native_context) {
 	Pthread current = PthreadSelfOrNull();
-	if (current == nullptr) {
+	if (current == nullptr || Common::DeferSignalInSection()) {
 		return;
 	}
 
@@ -990,6 +991,10 @@ static bool EnsureHostSignalDispatchInstalled() {
 		sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
 		const int signal_number = Common::HostException::GuestSignalDispatchSignal();
+		// A signal deferred in a host section (signalDefer.h) is raised again when it ends.
+		Common::SetSignalRedelivery([] {
+			::pthread_kill(::pthread_self(), Common::HostException::GuestSignalDispatchSignal());
+		});
 		return ::sigaction(signal_number, &action, nullptr) == 0;
 	}();
 	return installed;

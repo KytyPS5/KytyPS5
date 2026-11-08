@@ -239,12 +239,14 @@ public:
 		auto inserted = m_ranges.emplace_hint(position, start, r);
 		UpdatePageTableEntries(inserted->second, true);
 		MergeAroundUnlocked(inserted);
+		m_generation.fetch_add(1, std::memory_order_release);
 		return true;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
+		m_generation.fetch_add(1, std::memory_order_release);
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
 			EraseUnlocked(position);
@@ -274,6 +276,7 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
+		m_generation.fetch_add(1, std::memory_order_release);
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size &&
 		    IsReservedRangeType(position->second.type)) {
@@ -321,6 +324,7 @@ public:
 		first->second = replacement;
 		UpdatePageTableEntries(first->second, true);
 		MergeAroundUnlocked(first);
+		m_generation.fetch_add(1, std::memory_order_release);
 		return true;
 	}
 
@@ -399,6 +403,10 @@ public:
 		return true;
 	}
 
+	// Changes whenever a range is added, removed or replaced: an answer of ClampRangeSize stays
+	// right while this does not change.
+	uint64_t Generation() const noexcept { return m_generation.load(std::memory_order_acquire); }
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
@@ -425,6 +433,26 @@ public:
 		}
 
 		return clamped_size;
+	}
+
+	// The committed stretch that holds `address`, from the start of its range to the first byte
+	// that is not committed; false when `address` is not in a committed range.
+	bool CommittedSpan(uint64_t address, uint64_t* begin, uint64_t* end) {
+		Common::LockGuard lock(m_mutex);
+
+		auto vma = FindContaining(address);
+		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
+			return false;
+		}
+		*begin           = vma->second.start;
+		uint64_t current = End(vma->second.start, vma->second.size);
+		for (++vma; vma != m_ranges.end() && vma->second.start == current &&
+		            IsCommittedRangeType(vma->second.type);
+		     ++vma) {
+			current = End(vma->second.start, vma->second.size);
+		}
+		*end = current;
+		return true;
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -605,6 +633,9 @@ private:
 
 	RangeMap      m_ranges;
 	Common::Mutex m_mutex;
+	// Starts apart from every other instance: a new table never matches an answer of an old one.
+	std::atomic<uint64_t>               m_generation {s_next_generation.fetch_add(1) << 40u};
+	static inline std::atomic<uint64_t> s_next_generation {1};
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
 };
@@ -817,12 +848,33 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+DirectMemoryFile GetDirectMemoryFile() {
+	if (g_guest_address_space == nullptr) {
+		return {};
+	}
+	return {g_guest_address_space->GetBackingFileDescriptor(),
+	        g_guest_address_space->GetBackingSize()};
+}
+
+bool TranslateDirectMemory(uint64_t vaddr, uint64_t size, uint64_t* file_offset) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryTranslateBacking(vaddr, size, file_offset);
+}
+
+bool ContiguousDirectMemory(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high,
+                            uint64_t* begin, uint64_t* end) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryContiguousBacking(vaddr, size, low, high, begin, end);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return g_guest_address_space->TryReadBacking(vaddr, data, size);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -841,7 +893,29 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
+	// The renderer asks for many ranges inside the same few mappings. A range inside a committed
+	// stretch seen before needs no clamp, until a virtual range changes.
+	struct Span {
+		uint64_t begin      = 0;
+		uint64_t end        = 0;
+		uint64_t generation = ~uint64_t {0};
+	};
+	static thread_local std::array<Span, 8> spans;
+	static thread_local uint32_t            next_span  = 0;
+	const auto                              generation = g_virtual_ranges->Generation();
+	for (const auto& span: spans) {
+		if (span.generation == generation && vaddr >= span.begin && vaddr < span.end &&
+		    size <= span.end - vaddr) {
+			return size;
+		}
+	}
+
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	if (clamped_size == size) {
+		if (uint64_t begin = 0, end = 0; g_virtual_ranges->CommittedSpan(vaddr, &begin, &end)) {
+			spans[next_span++ % spans.size()] = {begin, end, generation};
+		}
+	}
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
@@ -908,6 +982,23 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+uint64_t BackedPrefix(uint64_t vaddr, uint64_t size) {
+	constexpr uint64_t Page = 0x4000;
+	uint64_t           done = 0;
+	while (done < size) {
+		uint32_t value = 0;
+		if (!TryReadBacking(vaddr + done, &value, sizeof(value))) {
+			break;
+		}
+		done += std::min<uint64_t>(Page - ((vaddr + done) & (Page - 1u)), size - done);
+	}
+	return done;
+}
+
+uint64_t BackingGeneration() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->BackingGeneration() : 0;
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -2880,7 +2971,8 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

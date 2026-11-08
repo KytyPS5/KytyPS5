@@ -5,7 +5,6 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
-#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -34,13 +33,6 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
-
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
 
 namespace Libs::Graphics {
 
@@ -2528,19 +2520,19 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexGetSize() {
 	return 6u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
-                                                      const volatile void* index_addr,
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
                                                       const volatile void* object_ids,
-                                                      uint32_t instance_count, uint64_t modifier) {
+                                                      const volatile void* index_addr,
+                                                      uint32_t index_count, uint64_t modifier) {
 	PRINT_NAME();
 
-	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
-	     "\t index_addr     = 0x%016" PRIx64 "\n"
-	     "\t instance_count = 0x%" PRIx32 "\n"
+	AgcTrace("\t instance_count = 0x%" PRIx32 "\n"
 	     "\t object_ids     = 0x%016" PRIx64 "\n"
+	     "\t index_addr     = 0x%016" PRIx64 "\n"
+	     "\t index_count    = 0x%" PRIx32 "\n"
 	     "\t modifier       = 0x%016" PRIx64 "\n",
-	     index_count, reinterpret_cast<uint64_t>(index_addr), instance_count,
-	     reinterpret_cast<uint64_t>(object_ids), modifier);
+	     instance_count, reinterpret_cast<uint64_t>(object_ids),
+	     reinterpret_cast<uint64_t>(index_addr), index_count, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
@@ -2551,17 +2543,17 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
+	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 
-	cmd[0] = KYTY_PM4(9, Pm4::IT_DISPATCH_DRAW_PREAMBLE, 0u);
-	cmd[1] = index_count;
-	cmd[2] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
-	cmd[3] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
-	cmd[4] = (instance_count == 0 ? 1u : instance_count);
-	cmd[5] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
-	cmd[6] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
-	cmd[7] = instance_count;
+	cmd[0] = KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0u);
+	cmd[1] = instance_count;
+	cmd[2] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
+	cmd[3] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
+	cmd[4] = (index_count == 0 ? 1u : index_count);
+	cmd[5] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
+	cmd[6] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
+	cmd[7] = index_count;
 	cmd[8] = decode_draw_index_initiator(modifier) | 0x80u;
 
 	return cmd;

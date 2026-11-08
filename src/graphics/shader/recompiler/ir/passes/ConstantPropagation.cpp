@@ -33,20 +33,17 @@ class FoldWorklist {
 public:
 	struct Location {
 		Block::iterator instruction;
-		uint64_t visited = 0;
 		bool queued = false;
 	};
 
 	void Register(Block::iterator instruction) {
-		locations.emplace(&*instruction, Location {instruction});
-		Queue(&*instruction);
+		Queue(locations.emplace(&*instruction, Location {instruction}).first->second);
 	}
 
-	void Queue(Inst* inst) {
-		const auto found = locations.find(inst);
-		if (found != locations.end() && !found->second.queued) {
-			found->second.queued = true;
-			pending.push_back(inst);
+	void Queue(Location& location) {
+		if (!location.queued) {
+			location.queued = true;
+			pending.push_back(&location);
 		}
 	}
 
@@ -55,15 +52,14 @@ public:
 	}
 
 	void FlushUsers() {
-		++generation;
 		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit their union once per drain, including cyclic Phi edges.
+		// stay dynamic. Visit their union once per drain, including cyclic Phi edges;
+		// the drain left nothing queued, so a queued instruction was visited here.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
 			const auto found = locations.find(inst);
-			if (found == locations.end() || found->second.visited == generation) continue;
-			found->second.visited = generation;
-			Queue(inst);
+			if (found == locations.end() || found->second.queued) continue;
+			Queue(found->second);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
 		affected.clear();
@@ -77,12 +73,11 @@ public:
 	}
 
 	std::unordered_map<Inst*, Location> locations;
-	std::vector<Inst*> pending;
+	std::vector<Location*>              pending; // Map nodes keep their addresses across rehashes.
 	std::unordered_set<Inst*> lowered_ancillary;
 
 private:
 	std::vector<Inst*> affected;
-	uint64_t generation = 0;
 };
 
 // Reads an immediate operand of a fold function's parameter type.
@@ -950,23 +945,22 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	const auto drain = [&] {
 		do {
 			for (size_t i = 0; i < worklist.pending.size(); ++i) {
-				auto* inst = worklist.pending[i];
-				auto& location = worklist.locations.at(inst);
+				auto& location    = *worklist.pending[i];
 				location.queued = false;
+				auto*      inst   = &*location.instruction;
 				const auto opcode = inst->GetOpcode();
 				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
-				const auto where = location.instruction;
 				users.assign(inst->Uses().begin(), inst->Uses().end());
 				operands.clear();
 				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
 				mask_projection.Fold(*inst, wave_size);
-				FoldInstruction(*inst->Parent(), where, worklist);
+				FoldInstruction(*inst->Parent(), location.instruction, worklist);
 				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
 				for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
 					changed = operands[arg] != inst->Arg(arg);
 				if (changed) {
 					worklist.QueueUsers(users);
-					worklist.Queue(inst);
+					worklist.Queue(location);
 				}
 			}
 			worklist.pending.clear();

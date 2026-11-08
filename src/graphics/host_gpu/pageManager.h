@@ -18,7 +18,7 @@ public:
 
 	KYTY_CLASS_NO_COPY(PageManager);
 
-	template <bool track>
+	template <bool track, bool is_read = false>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);

@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 #include <xbyak/xbyak.h>
+#include <cstdlib>
 #include <map>
 #include <new>
 #include <unordered_map>

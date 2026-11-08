@@ -3,13 +3,8 @@
 
 namespace Loader::Timer {
 
-void   Start();
+// Since the process started.
 double GetTimeMs();
-
-struct Lifecycle {
-	static constexpr const char* name       = "Timer";
-	static constexpr auto        initialize = Loader::Timer::Start;
-};
 
 } // namespace Loader::Timer
 

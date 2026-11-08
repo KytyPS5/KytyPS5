@@ -151,17 +151,19 @@ struct DrawRenderState {
 // Writes the shader store on its own thread, running jobs in the order they were posted.
 class ShaderStoreWriter {
 public:
-	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`. The
-	// thread runs only if that succeeded.
+	ShaderStoreWriter();
+	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`.
 	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
-	explicit operator bool() const { return m_thread.joinable(); }
+	// Whether the store is open.
+	explicit operator bool() const { return !m_file.IsInvalid(); }
 	// Compresses `record` and appends it on the store thread, in call order.
 	void Append(std::vector<uint8_t>&& record);
+	void Post(Common::UniqueFunction<void>&& job);
+	// Runs the queued jobs and stops the thread; jobs posted later never run. Safe to call again.
+	void Finish() { m_thread = {}; }
 
 private:
 	friend struct PipelineCacheTestAccess;
-
-	void Post(Common::UniqueFunction<void>&& job);
 
 	Common::File                             m_file;
 	std::mutex                               m_mutex;
@@ -179,6 +181,8 @@ public:
 	              const std::filesystem::path& shader_store = {});
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
+	// changed.
 	void Save();
 
 	struct Pipeline {
@@ -251,7 +255,7 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
-	// Records everything first created; closed without a shader store.
+	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
 
 	template <typename InputInfo>
@@ -262,7 +266,9 @@ private:
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
 	void InitializeDriverCache();
+	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();
+	void WriteDriverCache() const;
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);

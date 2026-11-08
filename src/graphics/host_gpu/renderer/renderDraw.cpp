@@ -427,17 +427,6 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		dynamic_state.SetStencilWriteMasks(front.writeMask, back.writeMask);
 		dynamic_state.SetStencilReferences(front.reference, back.reference);
 	}
-
-#if defined(__APPLE__)
-	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
-	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
-#else
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
-		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
-	}
-	dynamic_state.SetColorWriteEnables(std::span {enable}.first(rendering.num_color_attachments));
-#endif
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -852,6 +841,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
+		return false;
+	}
+	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
+	// writes would remain (PPSA02110 ends mip reductions with a 0x0 pass past the last level).
+	const auto& vp = buffer.GetRegisters().GetScreenViewport();
+	if ((vp.screen_scissor_right <= vp.screen_scissor_left ||
+	     vp.screen_scissor_bottom <= vp.screen_scissor_top) &&
+	    std::ranges::none_of(state.VertexStages(), HasShaderBufferWrites,
+	                         &ShaderVertexInputInfo::stage)) {
 		return false;
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {

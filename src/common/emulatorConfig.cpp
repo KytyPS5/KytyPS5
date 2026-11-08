@@ -153,10 +153,6 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
-ShaderOptimizationType GetShaderOptimizationType() {
-	return g_config->shader_optimization_type;
-}
-
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
@@ -209,6 +205,10 @@ bool ReadbackTiledImagesEnabled() {
 	return g_config->readback_tiled_images;
 }
 
+bool ReadbackStorageImagesEnabled() {
+	return g_config->readback_storage_images;
+}
+
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
@@ -219,6 +219,14 @@ bool TessellationEnabled() {
 
 bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
+}
+
+bool RelaxedShaderFloatEnabled() {
+	return g_config->relaxed_shader_float;
+}
+
+bool LodStatsEnabled() {
+	return g_config->lod_stats_enabled;
 }
 
 bool TrophyEnabled() {

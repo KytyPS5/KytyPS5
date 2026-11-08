@@ -189,6 +189,7 @@ uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint3
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePhysicalU32BufferPointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
@@ -524,6 +525,8 @@ void DefineGetBdaPointer(EmitterState& state);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
+uint32_t BvhNode(EmitterState& state, uint32_t address);
+uint32_t BvhNodeWord(EmitterState& state, uint32_t block, uint32_t word);
 uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32_t, 3>, 3>& positions,
                          std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
                          uint32_t remap, uint32_t triangle_id, uint32_t bary);

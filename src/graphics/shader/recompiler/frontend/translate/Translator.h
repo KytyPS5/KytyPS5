@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -24,11 +25,15 @@ inline Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
 	return operand;
 }
 
+// Per VGPR, the pcs of its first V_WRITELANE_B32 and its last V_READLANE_B32.
+using LaneSpills = std::array<std::pair<uint32_t, uint32_t>, IR::NumVectorRegs>;
+inline constexpr LaneSpills NoLaneSpills {};
+
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs, bool graphics_compute)
-	    : program(program), ir(block), current_vector_limit(vector_limit),
+	           const LaneSpills& lane_spills, bool flush_f32_inputs, bool graphics_compute)
+	    : program(program), ir(block), current_vector_limit(vector_limit), lane_spills(lane_spills),
 	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
@@ -265,14 +270,15 @@ private:
 	void EmitMemory(const Decoder::Instruction& inst);
 	static void FailMissingTranslation(const Decoder::Instruction& inst);
 
-	IR::Program&    program;
-	IR::IREmitter   ir;
-	IR::U1          instruction_branch_condition;
-	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
-	uint32_t        current_pc           = 0;
-	uint32_t        current_vector_limit = 1;
-	bool            flush_f32_inputs;
-	bool            graphics_compute;
+	IR::Program&      program;
+	IR::IREmitter     ir;
+	IR::U1            instruction_branch_condition;
+	Decoder::Opcode   current_opcode       = Decoder::Opcode::UNKNOWN;
+	uint32_t          current_pc           = 0;
+	uint32_t          current_vector_limit = 1;
+	const LaneSpills& lane_spills;
+	bool              flush_f32_inputs;
+	bool              graphics_compute;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

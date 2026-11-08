@@ -57,6 +57,7 @@ public:
 	void Umount(const std::string& folder_or_point);
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	[[nodiscard]] bool                  IsMountPoint(const std::string& point);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
@@ -295,6 +296,22 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 	}
 }
 
+// Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
+static std::string NormalizeGuestPath(const std::string& mounted_name) {
+	std::string normalized = Common::FixFilenameSlash(mounted_name);
+	normalized.erase(std::unique(normalized.begin(), normalized.end(),
+	                             [](char a, char b) { return a == '/' && b == '/'; }),
+	                 normalized.end());
+	return normalized;
+}
+
+bool MountPoints::IsMountPoint(const std::string& point) {
+	Common::LockGuard lock(m_mutex);
+
+	return std::ranges::any_of(m_mount_pairs,
+	                           [&point](const MountPair& p) { return p.point == point; });
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Resolve guest paths case-insensitively on case-sensitive hosts.
 static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path& path) {
@@ -349,11 +366,7 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
-	// Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
-	std::string normalized = Common::FixFilenameSlash(mounted_name);
-	normalized.erase(std::unique(normalized.begin(), normalized.end(),
-	                             [](char a, char b) { return a == '/' && b == '/'; }),
-	                 normalized.end());
+	const std::string normalized = NormalizeGuestPath(mounted_name);
 
 	// Match the entire guest path so a mount root works with or without a trailing slash.
 	const auto mounted_path = Common::FixDirectorySlash(normalized);
@@ -1511,22 +1524,41 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (std::strlen(path) > 255) {
+		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
 	LOGF("\t path = %s\n", path);
 
-	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	const auto directory = Common::FixDirectorySlash(NormalizeGuestPath(path));
+	if (directory.ends_with("/./") || directory.ends_with("/../")) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (g_mount_points->IsMountPoint(directory)) {
+		return KERNEL_ERROR_EBUSY;
+	}
+
+	const auto real_name = g_mount_points->ResolvePath(path);
 	if (Common::IsArchivePath(real_name)) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (!Common::File::IsDirectoryExisting(real_name)) {
+	const auto info = Common::File::GetInfo(real_name);
+	if (!info) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	if (!Common::File::DeleteDirectory(real_name)) {
-		return KERNEL_ERROR_EIO;
+	if (info->is_file) {
+		return KERNEL_ERROR_ENOTDIR;
+	}
+
+	std::error_code error;
+	if (!std::filesystem::remove(real_name, error)) {
+		return error == std::errc::directory_not_empty ? KERNEL_ERROR_ENOTEMPTY : KERNEL_ERROR_EIO;
 	}
 
 	return OK;

@@ -259,6 +259,10 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
+  // Suspend points that collect nothing.
+  static void SkipFrames(TextureCache &cache, uint64_t frames) {
+    cache.m_gc_tick += frames;
+  }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -282,7 +286,7 @@ struct TextureCacheTestAccess {
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
-        image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.tick_accessed_last = tick;
         live.push_back(id);
       }
     });
@@ -3644,6 +3648,17 @@ public:
                 second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
             "a GDS release interrupt overtook an earlier interrupt");
 
+    // Repeats of the newest undelivered data count in its event instead of queuing.
+    for (const uint32_t data : {1u, 1u, 2u, 3u, 3u}) {
+      context.TriggerInterrupt(0, data);
+    }
+    const bool coalesced =
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.fflags == 2 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3;
+    Require("GpuCommandLane", "interrupt coalescing", coalesced,
+            "undelivered interrupts with the same data were not counted in one event");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -5915,6 +5930,34 @@ public:
                   ImageHeapTestAccess::TailPageDirty(heap),
               "a write fault next to a table left its page watched");
       draw();
+      // The last suspend point released texture 0's image from the smaller
+      // table. Images age in frames, not command buffers: an alias frees it
+      // only after 16 frames.
+      const auto released =
+          TextureCacheTestAccess::FindImages(textures, texture(0), 64u);
+      const auto alias = [&](Prospero::TileMode tile) {
+        auto desc = MakeLinearDesc(
+            texture(0), 64u, vk::Format::eR8G8B8A8Unorm, Format::k8_8_8_8UNorm,
+            Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+        desc.info.tile_mode = tile;
+        desc.info.UpdateSize();
+        return textures.FindImage(desc);
+      };
+      for (uint32_t submit = 0; submit <= 16u; ++submit)
+        scheduler.Flush();
+      const auto standard = alias(Prospero::TileMode::kStandard4KB);
+      Require(name, "frame lifetime",
+              released.size() == 1u && standard != released[0] &&
+                  TextureCacheTestAccess::Contains(textures, released[0]) &&
+                  textures.GetImage(standard).tick_accessed_last ==
+                      TextureCacheTestAccess::GcTick(textures),
+              "one frame's command buffers aged a released heap image out, or "
+              "an alias missed its frame");
+      TextureCacheTestAccess::SkipFrames(textures, 17u);
+      (void)alias(Prospero::TileMode::kStandard256B);
+      Require(name, "frame aging",
+              !TextureCacheTestAccess::Contains(textures, released[0]),
+              "an alias kept a heap image unused for 17 frames");
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
@@ -20455,6 +20498,48 @@ public:
               "the draw's cull mode or front face did not reach the host GPU");
       registers.SetModeControl({});
 
+      // DRAW_INDEX_MULTI_INST draws the packet's instance count, not NUM_INSTANCES; only
+      // instance 1 covers the target, and zero instances draw nothing.
+      {
+        static const auto second_instance_vertex = [] {
+          auto code = native_vertex;
+          code.insert(std::ranges::find(code, EncodeExp0(0x0c, 0xf)),
+                      {EncodeVopc(0xc2, InlineU32(1), 8), EncodeVop2(0x01, 3, Vgpr(1), 3),
+                       EncodeVop2(0x01, 4, Vgpr(1), 4)});
+          return code;
+        }();
+        const auto second_instance_vs = reinterpret_cast<uint64_t>(second_instance_vertex.data());
+        ShaderMapUserData(second_instance_vs,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+             .code_size_bytes =
+                 static_cast<uint32_t>(second_instance_vertex.size() * sizeof(u32))});
+        shaders.SetEsShaderBase(second_instance_vs);
+        CommandProcessor processor(context, 0);
+        processor.SetIndexType(1);
+        // Zeroed guest memory: read as indices, the table draws no triangle.
+        constexpr uint64_t object_ids_address = index_address + 0x100;
+        for (const auto [instances, num_instances] : {std::pair{2u, 1u}, std::pair{0u, 2u}}) {
+          processor.SetNumInstances(num_instances);
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const std::array<uint32_t, 9> packet{
+              KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0), instances,
+              static_cast<uint32_t>(object_ids_address),
+              static_cast<uint32_t>(object_ids_address >> 32u), 3,
+              static_cast<uint32_t>(index_address), static_cast<uint32_t>(index_address >> 32u),
+              3, 0x80};
+          Pm4Execution execution;
+          const bool complete =
+              processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          const bool drawn = std::ranges::any_of(pixels, [](u32 word) { return word != 0; });
+          Require("DrawIndexMultiInst", instances != 0 ? "instances" : "no instances",
+                  complete && drawn == (instances != 0),
+                  "the packet's instance count, index buffer or index count was misread");
+        }
+      }
+
       // Indirect records come from the GPU copy; the CPU backing holds zeros. Embedded
       // fetches use vertex offset 7. Native shaders receive raw vertex/instance IDs when
       // the packet does not patch either offset SGPR, even with nonzero record offsets.
@@ -30353,6 +30438,44 @@ TestCase Vop1MoveRelDestination() {
   test.opcodes = {O::V_MOV_B32,          O::S_MOV_B32,     O::V_CMP_EQ_U32,
                   O::S_MOV_B64,          O::V_MOVRELD_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop1MoveRelDestinationSkipsLaneSpill() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  // Spill the output V# s[48:51] to v10 lanes 0..3, then clobber the SGPRs.
+  for (u32 lane = 0; lane < 4; lane++) {
+    AppendVop3(&code, 0x361, 10, 48 + lane, InlineU32(lane));
+    code.push_back(EncodeSMovB32(48 + lane, InlineU32(0)));
+  }
+  AppendVMovLiteral(&code, 1, 0x12345678u);
+  AppendVMovLiteral(&code, 2, 0x9abcdef0u);
+  // A runtime M0 of 0 writes v5 while v10 holds the spill.
+  code.push_back(EncodeVop1(0x02, 124, Vgpr(0)));
+  code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
+  for (u32 lane = 0; lane < 4; lane++)
+    AppendVop3(&code, 0x360, 48 + lane, Vgpr(10), InlineU32(lane));
+  // After the last lane read, M0 = 5 writes v10.
+  code.push_back(EncodeSMovB32(124, InlineU32(5)));
+  code.push_back(EncodeVop1(0x42, 5, Vgpr(2)));
+  AppendStoreVgpr(&code, 5, 0);
+  AppendStoreVgpr(&code, 10, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1MoveRelDestinationSkipsLaneSpill";
+  test.code = code;
+  test.expected = {0x12345678u, 0x9abcdef0u};
+  test.opcodes = {O::V_WRITELANE_B32,     O::S_MOV_B32,     O::V_MOV_B32,
+                  O::V_READFIRSTLANE_B32, O::V_MOVRELD_B32, O::V_READLANE_B32,
+                  O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -47703,6 +47826,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
+  AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -49097,6 +49221,61 @@ void CheckTessellationPatchConstants() {
 #endif
 }
 
+// With one output control point, each HS lane is one patch: control point outputs grow up
+// from the patch ordinal (v1 low byte) and patch constants grow down from the ring end.
+void CheckTessellationSingleControlPoint() {
+  using namespace ShaderRecompiler;
+  constexpr const char *name = "TessellationSingleControlPoint";
+  constexpr u32 ls_stride = 120, hs_stride = 128, patch_stride = 0x60;
+  std::vector<u32> local, control;
+  local.push_back(EncodeVop2(0x0b, 16, 255u, 3)); // v_mul_u32_u24 v16, ls_stride, v3
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0x0e, 29u << 8u)); // ds_write2_b32 v16, v2, v5 offset1:29
+  local.push_back(EncodeDs1Ex(0, 5, 2, 16));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+
+  // SDWA takes no literal: s_movk_i32 vcc_lo, hs_stride
+  control.push_back(EncodeSopk(0x00, 106, hs_stride));
+  // v_mul_u32_u24_sdwa v33, vcc_lo, v1 src1_sel:BYTE_0
+  control.push_back(EncodeVop2(0x0b, 33, 249u, 1));
+  control.push_back(EncodeVop2Sdwa(106, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
+  control.push_back(EncodeMubuf0(0x1d)); // buffer_store_dwordx2 v[10:11], v33, s[8:11], s2 offen
+  control.push_back(EncodeMubuf1(10, 2, 33, 2));
+  control.push_back(EncodeVop2(0x1b, 32, 255u, 1)); // v_and_b32 v32, 0xff, v1
+  control.push_back(0xffu);
+  // v_lshlrev_b32 v34, 7, v32; buffer_store_dword v11, v34, s[8:11], s2 offen offset:116
+  control.push_back(EncodeVop2(0x1a, 34, InlineU32(7), 32));
+  control.push_back(EncodeMubuf0(0x1c, 116));
+  control.push_back(EncodeMubuf1(11, 2, 34, 2));
+  control.push_back(EncodeVop2(0x25, 0, InlineU32(1), 32)); // v_add_nc_u32 v0, 1, v32
+  control.push_back(EncodeVop2(0x0b, 0, 255u, 0));          // v_mul_u32_u24 v0, 0x60, v0
+  control.push_back(patch_stride);
+  control.push_back(EncodeVop2(0x26, 0, 255u, 0)); // v_sub_nc_u32 v0, 0x8000, v0
+  control.push_back(0x8000u);
+  control.push_back(EncodeMubuf0(0x1c)); // buffer_store_dword v2, v0, s[8:11], s2 offen
+  control.push_back(EncodeMubuf1(2, 2, 0, 2));
+  control.push_back(EncodeMubuf0(0x1c, 80));
+  control.push_back(EncodeMubuf1(3, 2, 0, 2));
+  AppendEnd(&control);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 1, .output_control_points = 1};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require(name, "reflected interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
+              tess.patch_base == 0x8000u - patch_stride && tess.patch_size == 84u,
+          "patch-ordinal control point stores and descending patch constants must reflect "
+          "the layout");
+  std::printf("[host]    %-32s ok\n", name);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // v_cmp_lt_f32 vcc, 0, v10 after s_movk_i32 replaces the staged stride.
+  control.insert(control.begin() + 1, EncodeVopc(0x01, InlineU32(0), 10));
+  ExpectFatal("TessellationClobberedScalar", [&] {
+    ShaderTessellationInputInfo info{.input_control_points = 1, .output_control_points = 1};
+    AnalyzeTessellationPrograms(local, control, info);
+  });
+#endif
+}
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
@@ -49105,6 +49284,7 @@ void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationFractionalEvenQuads", 36, 128, 2, 2, 3);
   CheckTessellationProgram("TessellationMaskedControlPoint", 32, 256, 2);
   CheckTessellationPatchConstants();
+  CheckTessellationSingleControlPoint();
 }
 
 void CheckEmbeddedFetchVertexOffset() {
@@ -50162,9 +50342,12 @@ void CheckDepthTextureEncoding() {
   }};
   auto retained_metadata_address = compressed_descriptor;
   retained_metadata_address.fields[6] &= 0xff000000u;
+  auto pipe_aligned_metadata = disabled_metadata;
+  pipe_aligned_metadata.fields[6] = 1u << 19u; // META_PIPE_ALIGNED without COMPRESSION_EN
   Require("DepthTextureEncoding", "disabled metadata with retained address",
           IsSupportedDepthTextureEncoding(disabled_metadata) &&
-              IsSupportedDepthTextureEncoding(retained_metadata_address),
+              IsSupportedDepthTextureEncoding(retained_metadata_address) &&
+              IsSupportedDepthTextureEncoding(pipe_aligned_metadata),
           "uncompressed depth rejected inactive metadata address bits");
 
   const ShaderTextureResource first_use_depth{{
@@ -50186,13 +50369,16 @@ void CheckDepthTextureEncoding() {
   dcc_only_control.fields[6] |= 1u << 22u;
   auto non_msaa_iterate_256 = compressed_descriptor;
   non_msaa_iterate_256.fields[6] |= 1u << 10u;
+  auto uncompressed_dcc_control = pipe_aligned_metadata;
+  uncompressed_dcc_control.fields[6] |= 1u << 22u;
   Require(
       "DepthTextureEncoding", "invalid HTILE encoding",
       !IsSupportedDepthTextureEncoding(missing_metadata) &&
           !IsSupportedDepthTextureEncoding(out_of_range_metadata) &&
           !IsSupportedDepthTextureEncoding(unaligned_metadata) &&
           !IsSupportedDepthTextureEncoding(dcc_only_control) &&
-          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256),
+          !IsSupportedDepthTextureEncoding(non_msaa_iterate_256) &&
+          !IsSupportedDepthTextureEncoding(uncompressed_dcc_control),
       "compressed sampled depth accepted an unsupported address or control");
 
   std::printf("[host]    %-32s ok\n", "DepthTextureEncoding");
@@ -53942,6 +54128,17 @@ void CheckPm4Flip() {
               VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
               flipped_arg == flip_arg,
           "R_FLIP did not publish the occlusion counters or flip");
+
+  // Vblanks while the event is undelivered count in that one event.
+  Require(name, "vblank event",
+          VideoOut::VideoOutAddVblankEvent(flips, handle, nullptr) == 0,
+          "vblank event registration failed");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  timeout = 0;
+  Require(name, "vblank count",
+          EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
+              VideoOut::VideoOutGetEventCount(&event) >= 2,
+          "undelivered vblanks were queued as separate events");
 
   gpu.WaitForIdle();
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0,

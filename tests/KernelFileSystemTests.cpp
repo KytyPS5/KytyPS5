@@ -52,6 +52,10 @@ namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibKernel {
+void KernelDispatchPendingSignalForCurrentThread();
+}
+
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
 void InitSysmodule_1(Loader::SymbolDatabase *symbols);
@@ -245,6 +249,33 @@ void TestMutexHandoff() {
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
         "mutex remains usable after waiter cancellation");
+}
+
+int dispatched_signals = 0;
+
+void KYTY_SYSV_ABI CountDispatchedSignal(int, void *) { dispatched_signals++; }
+
+void TestPendingSignalDispatch() {
+  using namespace Libs::LibKernel;
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
+  Check(install_symbol != nullptr && remove_symbol != nullptr, "signal handler exports resolve");
+  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
+  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
+  Check(install(30, reinterpret_cast<void *>(CountDispatchedSignal)) == OK,
+        "install signal handler");
+
+  PthreadQueuePendingSignal(PthreadSelf(), 30);
+  const auto start = std::chrono::steady_clock::now();
+  for (int call = 0; call < 1000000; ++call) {
+    KernelDispatchPendingSignalForCurrentThread();
+  }
+  Check(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50) &&
+            dispatched_signals == 1,
+        "a pending signal dispatches once and idle dispatches skip the signal scan");
+  Check(remove(30) == OK, "remove signal handler");
 }
 
 class TempDirectory {
@@ -2793,6 +2824,7 @@ int main(int argc, char** argv) {
 
   TestMutexHandoff();
   TestStaticRwlockDestroy();
+  TestPendingSignalDispatch();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");

@@ -1880,6 +1880,71 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       targets = FindImagesInRegion(address, size);
+	if (targets.size() != 1) {
+		return false;
+	}
+	auto&       image   = m_slot_images[targets.front()];
+	const auto& info    = image.info;
+	const auto  sources = FindImagesInRegion(source, size);
+	if (image.depth_id || !image.SafeToDownload() || !CanDownload(image) || !info.IsTiled() ||
+	    info.IsVolume() || info.IsDepth() || info.HasMetadata() || address < info.data.address ||
+	    std::any_of(sources.begin(), sources.end(),
+	                [&](ImageId id) { return m_slot_images[id].IsGpuModified(); })) {
+		return false;
+	}
+	// Each layer holds its levels from the smallest up, and the tail levels share one block.
+	const auto layers  = info.resources.layers;
+	const auto stride  = info.data.size / layers;
+	const auto offset  = address - info.data.address;
+	const auto begin   = offset % stride;
+	const auto end     = begin + size;
+	uint64_t   covered = begin;
+	uint32_t   first   = 0;
+	uint32_t   count   = 0;
+	for (uint32_t level = info.resources.levels; level-- > 0;) {
+		const auto& mip     = info.mip_layout[level];
+		const auto  mip_end = mip.offset + mip.size / layers;
+		if (mip_end <= begin || mip.offset >= end) {
+			continue;
+		}
+		if (mip.offset < begin) {
+			return false;
+		}
+		covered = mip_end;
+		first   = level;
+		count++;
+	}
+	if (covered != end) {
+		return false;
+	}
+	ImageInfo  part   = info;
+	const auto extent = info.MipExtent(first);
+	part.data.size    = size;
+	part.extent       = {extent.width, extent.height, 1};
+	part.resources    = {count, 1};
+	part.first_tail_level -= std::min(first, info.first_tail_level);
+	uint64_t linear = 0;
+	for (uint32_t level = 0; level < count; level++) {
+		auto& mip = part.mip_layout[level] = info.mip_layout[first + level];
+		mip.offset -= begin;
+		mip.size /= layers;
+		mip.linear_offset = Common::AlignUp<uint64_t>(linear, std::max(info.bytes_per_block, 4u));
+		linear            = mip.linear_offset + mip.linear_size;
+	}
+	const auto [buffer, source_offset] = m_buffer_cache.ObtainBuffer(source, size, false);
+	const auto texels = m_tiler.Detile(buffer->Handle(), source_offset, part);
+	auto       copies = part.BufferCopies(texels.offset);
+	for (auto& copy: copies) {
+		copy.imageSubresource.mipLevel += first;
+		copy.imageSubresource.baseArrayLayer = static_cast<uint32_t>(offset / stride);
+	}
+	image.Upload(copies, texels.buffer, texels.offset, texels.size);
+	return true;
+}
+
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);

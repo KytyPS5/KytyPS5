@@ -15959,6 +15959,117 @@ public:
                              block_words + 0x10000 / sizeof(uint32_t) - 4),
               "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
 
+      // A CP copy of a mip-tail block into one layer of a GPU-written array writes that layer's
+      // tail levels on the GPU and keeps every other texel.
+      {
+        auto &buffer_cache = resources.GetBufferCache();
+        constexpr uint64_t atlas_address = base + 0xe40000;
+        constexpr uint64_t source_address = base + 0xe80000;
+        constexpr uint64_t slice_size = 0x6000;
+        constexpr uint64_t slice_words = slice_size / sizeof(uint32_t);
+        constexpr uint64_t tail_words = 0x1000 / sizeof(uint32_t);
+        constexpr uint32_t guest_value = 0x5e5e5e5eu;
+        constexpr uint32_t gpu_value = 0x600d600du;
+        auto *source_words = reinterpret_cast<uint32_t *>(source_address);
+        std::fill_n(reinterpret_cast<uint32_t *>(atlas_address), 2 * slice_words, guest_value);
+        std::iota(source_words, source_words + tail_words, 0x10000000u);
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        value.dwords = {static_cast<uint32_t>(atlas_address >> 8u),
+                        (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt) << 20u) |
+                            (3u << 30u),
+                        (31u >> 2u) | (31u << 14u), 0xd0550facu, 1, 0x00700050u, 0, 0};
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+        resource.numeric_class = Prospero::TextureNumericClass::Uint;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+        resource.written = true;
+        auto atlas = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        (void)texture_cache.FindTexture(atlas.image_id, atlas.desc);
+        auto &atlas_native = texture_cache.GetImage(atlas.image_id);
+        Require(name, "mip-tail atlas layout",
+                atlas_native.info.resources.levels == 6 &&
+                    atlas_native.info.resources.layers == 2 &&
+                    atlas_native.info.data.size == 2 * slice_size &&
+                    atlas_native.info.first_tail_level == 2,
+                "the mip-tail atlas descriptor resolved an unexpected layout");
+        atlas_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             scheduler.Current().Handle());
+        vk::ClearColorValue atlas_clear{};
+        atlas_clear.uint32.fill(gpu_value);
+        const vk::ImageSubresourceRange atlas_range{vk::ImageAspectFlagBits::eColor, 0, 6, 0, 2};
+        scheduler.Current().Handle().clearColorImage(atlas_native.backing.image,
+                                                     vk::ImageLayout::eTransferDstOptimal,
+                                                     &atlas_clear, 1, &atlas_range);
+        texture_cache.MarkGpuWritten(atlas.image_id);
+        LibKernel::Memory::InstallGpuResources(&resources);
+        buffer_cache.CopyBuffer(atlas_address + slice_size, source_address, 0x1000, false, false);
+        // A stencil plane has no native image, so a copy into all of it stays on the CPU.
+        auto depth = MakeLinearDesc(
+            base + 0xd00000, 0, vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
+            Prospero::ImageType::kColor2D, {32, 32, 1}, 1, 4, 1);
+        depth.info.tile_mode = Prospero::TileMode::kDepth;
+        depth.info.pitch = 0;
+        depth.info.stencil = {base + 0xd40000, 0x10000};
+        depth.info.UpdateSize();
+        depth.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        const auto depth_id = texture_cache.FindImage(depth);
+        texture_cache.MarkGpuWritten(depth_id);
+        const auto stencil =
+            texture_cache.GetImage(texture_cache.GetImage(depth_id).stencil_ids.front()).info.data;
+        buffer_cache.CopyBuffer(stencil.address, source_address, stencil.size, false, false);
+        Require(name, "mip-tail atlas download",
+                TextureCacheTestAccess::TryDownload(texture_cache, atlas.image_id),
+                "the mip-tail atlas could not publish its native contents");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        LibKernel::Memory::InstallGpuResources(nullptr);
+        std::vector<uint32_t> words(2 * slice_words);
+        bool tail = LibKernel::Memory::TryReadBacking(atlas_address, words.data(), 2 * slice_size);
+        uint64_t texel_words = 0;
+        for (uint32_t word = 0; word < tail_words; ++word) {
+          const bool texel = words[word] == gpu_value;
+          const auto copied = words[slice_words + word];
+          tail &= (texel || words[word] == guest_value) &&
+                  copied == (texel ? source_words[word] : guest_value);
+          texel_words += texel;
+        }
+        for (uint64_t word = tail_words; word < slice_words; ++word) {
+          tail &= words[word] == gpu_value && words[slice_words + word] == gpu_value;
+        }
+        // Levels 2 to 5 hold 8x8, 4x4, 2x2 and 1x1 texels of four words each.
+        Require(name, "mip-tail copy into one layer", tail && texel_words == 85 * 4,
+                "a mip-tail copy missed the layer's tail texels or changed other texels");
+        std::vector<uint32_t> stencil_words(stencil.size / sizeof(uint32_t));
+        Require(name, "copy into a GPU-written stencil plane",
+                LibKernel::Memory::TryReadBacking(stencil.address, stencil_words.data(),
+                                                  stencil.size) &&
+                    std::equal(stencil_words.begin(), stencil_words.end(), source_words),
+                "a copy into a stencil plane lost its bytes");
+        // Copies that end or start inside a level, or land in a CPU-dirty image or in a range a
+        // buffer holds, keep the CPU path.
+        LibKernel::Memory::InstallGpuResources(&resources);
+        texture_cache.MarkGpuWritten(atlas.image_id);
+        buffer_cache.CopyBuffer(atlas_address, source_address, 0x1800, false, false);
+        texture_cache.MarkGpuWritten(atlas.image_id);
+        buffer_cache.CopyBuffer(atlas_address + 0x1800, source_address + 0x1800, 0x800, false,
+                                false);
+        buffer_cache.CopyBuffer(atlas_address + slice_size, source_address, 0x1000, false, false);
+        (void)buffer_cache.ObtainBuffer(atlas_address, 2 * slice_size, false);
+        texture_cache.MarkGpuWritten(atlas.image_id);
+        buffer_cache.CopyBuffer(atlas_address + slice_size + 0x1000, source_address + 0x1000,
+                                0x1000, false, false);
+        LibKernel::Memory::InstallGpuResources(nullptr);
+        Require(name, "copies the image cannot take",
+                LibKernel::Memory::TryReadBacking(atlas_address, words.data(), 2 * slice_size) &&
+                    std::equal(words.begin(), words.begin() + 0x800, source_words) &&
+                    std::equal(words.begin() + slice_words, words.begin() + slice_words + 0x800,
+                               source_words),
+                "a copy the image cannot take whole skipped guest memory");
+      }
+
       const auto set_image_bindings = [](ShaderRecompiler::IR::Program &program) {
         for (auto &image : program.info.images) {
           const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);

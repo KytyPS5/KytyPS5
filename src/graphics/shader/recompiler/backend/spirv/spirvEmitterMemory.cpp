@@ -1356,6 +1356,61 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	    });
 }
 
+static uint32_t ExtractU32(EmitterState& state, uint32_t composite, uint32_t component) {
+	const auto data = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite, component);
+	return data;
+}
+
+// A GLC/DLC DWORD pair store is one 64-bit write on the guest GPU: a reader of the pair (a single-pass
+// scan's look-back reads {flag, value} with one coherent load, see LoadRawBuffer()) never sees the new
+// flag with the old value. Two DWORD stores would let it, so an aligned pair inside the buffer is
+// stored at once through the 64-bit alias; anything else keeps the DWORD stores.
+template <typename Scalar>
+static void StoreRawBufferPair(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                               const MemoryResourceAccess& resource, uint32_t composite, Scalar&& scalar) {
+	auto&      state  = ctx.state;
+	const auto first  = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto second = ByteAddress(ctx, inst, RebaseRawComponent(mem, 1), resource.byte_offset);
+	const auto wide   = PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3],
+	                                                       resource.non_uniform ? resource.descriptor_index : 0u);
+	const auto index  = Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, ConstantU32(state, 3));
+	auto       atomic = Binary(state, spv::OpIEqual, TypeBool(state),
+	                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 7)),
+	                           ConstantU32(state, 0));
+	atomic = AndCondition(state, atomic,
+	                      Binary(state, spv::OpIEqual, TypeBool(state), second,
+	                             EmitAddU32(state, first, ConstantU32(state, 4))));
+	atomic = AndCondition(state, atomic, EmitMemoryElementInBounds(state, wide, index));
+	// The DWORD stores check each DWORD against the V#: the pair is stored at once only when both pass.
+	for (uint32_t component = 0; component < 2u; component++) {
+		const auto word  = RebaseRawComponent(mem, component);
+		const auto dword = DwordIndex(ctx, inst, word, resource.byte_offset);
+		atomic = AndCondition(state, atomic,
+		                      BufferIndexInBounds(ctx, inst, word, resource,
+		                                          EmitStorageElementInBounds(state, resource, dword)));
+	}
+	const auto atomic_label = state.builder.AllocateId(), scalar_label = state.builder.AllocateId();
+	const auto merge        = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, atomic, atomic_label, scalar_label);
+	EmitLabel(state, atomic_label);
+	const auto pointer = EmitStorageBufferElementPointer(state, wide, index, TypeStorageBufferElementPointer(state, 64));
+	const auto low     = Unary(state, spv::OpUConvert, TypeU64(state), ExtractU32(state, composite, 0u));
+	const auto high    = Unary(state, spv::OpUConvert, TypeU64(state), ExtractU32(state, composite, 1u));
+	const auto value   = Binary(state, spv::OpBitwiseOr, TypeU64(state), low,
+	                            Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU32(state, 32)));
+	state.builder.AddFunction(spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsReleaseMask |
+	                                                 spv::MemorySemanticsUniformMemoryMask),
+	                          value);
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, scalar_label);
+	scalar();
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, merge);
+}
+
 void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -1366,6 +1421,15 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 			    selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
 			if (info.type != Format::ComponentType::Unknown) {
 				StoreFormattedPrepared(ctx, inst, selected, resource, info, composite, components);
+				return;
+			}
+			if (selected.IsCoherentBufferPairStore(inst.GetOpcode()) && resource.object_pointer != 0u) {
+				StoreRawBufferPair(ctx, inst, selected, resource, composite, [&]() {
+					for (uint32_t component = 0; component < components; component++) {
+						const auto data = ExtractU32(state, composite, component);
+						StoreWordPrepared(ctx, inst, RebaseRawComponent(selected, component), resource, data);
+					}
+				});
 				return;
 			}
 			for (uint32_t component = 0; component < components; component++) {

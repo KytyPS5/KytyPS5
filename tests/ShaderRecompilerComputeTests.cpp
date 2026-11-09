@@ -37661,6 +37661,45 @@ TestCase CoherentBufferLoadDwordx2Bounds(u32 wave, u32 prefix) {
   return test;
 }
 
+// A GLC/DLC pair store is one 64-bit write when the pair is aligned and in bounds; an unaligned
+// pair and a pair whose second DWORD is past the buffer keep the DWORD stores (and their bounds).
+TestCase CoherentBufferStoreDwordx2Bounds(u32 wave, u32 prefix) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave == 64 ? (prefix ? "CoherentBufferPairStoreBoundsOffsetWave64"
+                                   : "CoherentBufferPairStoreBoundsWave64")
+                         : (prefix ? "CoherentBufferPairStoreBoundsOffsetWave32"
+                                   : "CoherentBufferPairStoreBoundsWave32");
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u, 0x55555555u};
+  test.expected = test.initial;
+  const u32 addresses[] = {0u, 4u, 8u};
+  const u32 values[][2] = {{0xa0a0a0a0u, 0xa1a1a1a1u},
+                           {0xb0b0b0b0u, 0xb1b1b1b1u},
+                           {0xc0c0c0c0u, 0xc1c1c1c1u}};
+  for (u32 i = 0; i < std::size(addresses); ++i) {
+    AppendVMovLiteral(&test.code, 20, addresses[i]);
+    AppendVMovLiteral(&test.code, 2, values[i][0]);
+    AppendVMovLiteral(&test.code, 3, values[i][1]);
+    test.code.push_back(EncodeMubuf0(0x1d, 0, false, true, true) | (1u << 15u));
+    test.code.push_back(EncodeMubuf1(2, 0, 20));
+  }
+  AppendEnd(&test.code);
+  // The buffer holds three DWORDs: the last pair writes only its first one.
+  const u32 base = prefix / 4;
+  test.expected[base + 0] = values[0][0];
+  test.expected[base + 1] = values[1][0];
+  test.expected[base + 2] = values[2][0];
+  test.user_data = MakeStructuredStorageBufferData(0, 12);
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {prefix};
+  test.storage_buffer_ranges = {{0u, 12u + prefix}};
+  test.required_spirv = {"OpAtomicStore", "Int64Atomics", "ArrayStride 8"};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORDX2, O::S_ENDPGM};
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase CoherentBufferLoadDwordx2Swizzled() {
   using O = ShaderOpcode;
   TestCase test;
@@ -50873,6 +50912,8 @@ std::vector<TestCase> MakeCases() {
   for (const u32 wave : {32u, 64u}) {
     for (const u32 prefix : {0u, 4u})
       cases.push_back(CoherentBufferLoadDwordx2Bounds(wave, prefix));
+    for (const u32 prefix : {0u, 4u})
+      cases.push_back(CoherentBufferStoreDwordx2Bounds(wave, prefix));
     cases.push_back(CoherentBufferPairContention(wave));
   }
   AddCase(CoherentBufferLoadDwordx2Swizzled);
@@ -58608,6 +58649,8 @@ int main(int argc, char **argv) {
     for (const u32 wave : {32u, 64u}) {
       for (const u32 prefix : {0u, 4u})
         RunCase(&vulkan, CoherentBufferLoadDwordx2Bounds(wave, prefix));
+      for (const u32 prefix : {0u, 4u})
+        RunCase(&vulkan, CoherentBufferStoreDwordx2Bounds(wave, prefix));
       RunCase(&vulkan, CoherentBufferPairContention(wave));
     }
     RunCase(&vulkan, CoherentBufferLoadDwordx2Swizzled());

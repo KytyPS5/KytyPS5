@@ -302,7 +302,7 @@
             <item>
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-              <property name="text"><string>AMD CPU patch (experimental)</string></property>
+              <property name="text"><string>Intel CPU compatibility (experimental)</string></property>
              </widget>
             </item>
             <item>

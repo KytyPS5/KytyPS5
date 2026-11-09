@@ -1093,7 +1093,9 @@ bool FlipQueue::Flip() {
 	}
 	m_mutex.Unlock();
 
-	// Lock each port in bus order, then present and complete the whole group at one Vblank.
+	// Present and complete the whole group at one Vblank, taking the port locks in bus order. The
+	// present runs without them: Cancel waits for Presenting requests, so their frames and ports
+	// stay valid.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
 	bool due = true;
@@ -1101,8 +1103,8 @@ bool FlipQueue::Flip() {
 	size_t                      layer_count = 0;
 	Graphics::Presenter::Frame* hidden      = nullptr; // The main port behind the headset image.
 	for (size_t i = 0; i < count; i++) {
-		auto& r = requests[i];
-		r.cfg->mutex.Lock();
+		auto&             r = requests[i];
+		Common::LockGuard lock(r.cfg->mutex);
 		due &= r.cfg->generation == r.generation;
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg);
@@ -1128,6 +1130,9 @@ bool FlipQueue::Flip() {
 		}
 	}
 
+	for (size_t i = 0; i < count; i++) {
+		requests[i].cfg->mutex.Lock();
+	}
 	m_mutex.Lock();
 	for (auto it = m_requests.begin(); it != m_requests.end();) {
 		if (it->group != group) {

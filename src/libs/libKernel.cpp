@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -2295,19 +2296,20 @@ struct FiberOptParam {
 };
 
 struct FiberCpuContext {
-	uint64_t rbx;
-	uint64_t rbp;
-	uint64_t rdi;
-	uint64_t rsi;
-	uint64_t r12;
-	uint64_t r13;
-	uint64_t r14;
-	uint64_t r15;
-	uint64_t rsp;
-	uint64_t rip;
+	uint64_t      rbx;
+	uint64_t      rbp;
+	uint64_t      rdi;
+	uint64_t      rsi;
+	uint64_t      r12;
+	uint64_t      r13;
+	uint64_t      r14;
+	uint64_t      r15;
+	uint64_t      rsp;
+	uint64_t      rip;
+	Common::FpEnv fp_env;
 };
 
-static_assert(sizeof(FiberCpuContext) == 80);
+static_assert(sizeof(FiberCpuContext) == 88);
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2437,6 +2439,8 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	             "movq %r11, 64(%r10)\n\t"
 	             "movq (%rsp), %r11\n\t"
 	             "movq %r11, 72(%r10)\n\t"
+	             "stmxcsr 80(%r10)\n\t"
+	             "fnstcw 84(%r10)\n\t"
 	             "xorl %eax, %eax\n\t"
 	             "retq\n");
 }
@@ -2454,6 +2458,16 @@ FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
 	             "movq 40(%r10), %r13\n\t"
 	             "movq 48(%r10), %r14\n\t"
 	             "movq 56(%r10), %r15\n\t"
+	             "subq $8, %rsp\n\t"
+	             "stmxcsr (%rsp)\n\t"
+	             "movl (%rsp), %ecx\n\t"
+	             "andl $0x3f, %ecx\n\t"
+	             "movl 80(%r10), %edx\n\t"
+	             "andl $0xffffffc0, %edx\n\t"
+	             "orl %ecx, %edx\n\t"
+	             "movl %edx, (%rsp)\n\t"
+	             "ldmxcsr (%rsp)\n\t"
+	             "fldcw 84(%r10)\n\t"
 	             "movq 64(%r10), %rsp\n\t"
 	             "jmp *%r11\n");
 }
@@ -2483,6 +2497,10 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 	ctx.rsp = rsp;
 	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 	ctx.rdi = reinterpret_cast<uint64_t>(fiber);
+	if ((fiber->flags & FIBER_FLAG_SET_FPU_REGS) != 0) {
+		Common::WriteFpEnv(Common::GuestFpEnv);
+	}
+	ctx.fp_env = Common::ReadFpEnv();
 
 	FiberRestoreContext(&ctx, 1);
 }

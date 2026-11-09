@@ -752,6 +752,17 @@ void TestUnreadPressSurvivesStickBurst() {
 	      "a stick move after a read did not add a sample");
 }
 
+void TestTouchWithoutClick() {
+	Controller controller;
+	PadData    data {};
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, true, 0.2f, 0.5f, false);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 && data.buttons == 0,
+	      "a touch without a click pressed the touch pad button");
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, true, 0.25f, 0.5f);
+	Check(PadReadState(1, &data) == 0 && data.buttons == PAD_BUTTON_TOUCH_PAD,
+	      "a host input touch did not press the touch pad button");
+}
+
 } // namespace
 
 int main() {
@@ -768,6 +779,7 @@ int main() {
 	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestUnreadPressSurvivesStickBurst();
+	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();

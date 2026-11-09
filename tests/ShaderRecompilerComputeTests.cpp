@@ -16827,7 +16827,8 @@ public:
                     store.desc.info.extent.height == 1080 &&
                     store.desc.info.resources.levels == 7 &&
                     address + store.desc.info.data.size <= base + allocation_size &&
-                    store.desc.view_info.base_level == 6,
+                    store.desc.view_info.base_level == 6 &&
+                    texture_cache.FindTexture(store.image_id, store.desc) != nullptr,
                 "ASTRO BOT's mip 6 of a six-level 1920x1080 chain left the chain");
       }
       auto plain_mipped_storage_binding =

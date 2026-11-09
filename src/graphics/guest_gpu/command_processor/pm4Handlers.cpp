@@ -751,21 +751,32 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP, Pm4::SH_NOP};
 
-	// Following packets with the same other words, each drawing the record after the previous one,
-	// draw the records of a multi-draw without a draw index.
+	// Following packets with the same other words whose data offsets step a constant stride (the
+	// next record, or every second or third record) draw the records of a multi-draw without a draw
+	// index.
 	constexpr uint32_t packet_dw = 5;
 	const uint32_t     record_size =
 	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-	uint32_t count = 1;
-	for (uint32_t at = 4; at + packet_dw < dw; at += packet_dw, count++) {
+	uint32_t count  = 1;
+	uint32_t stride = record_size;
+	for (uint32_t at = 4; at + packet_dw < dw; at += packet_dw) {
 		const auto* next = buffer + at;
-		if (next[0] != cmd_id || next[1] != uint64_t {next[-4]} + record_size ||
-		    next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) {
+		if (next[0] != cmd_id || next[2] != buffer[1] || next[3] != buffer[2] ||
+		    next[4] != buffer[3] || next[1] <= next[-4]) {
 			break;
 		}
+		const uint32_t step = next[1] - next[-4];
+		if (count == 1) {
+			if (step < record_size || (step & 3u) != 0) {
+				break;
+			}
+			stride = step;
+		} else if (step != stride) {
+			break;
+		}
+		count++;
 	}
-	cp.DrawIndirectMulti(data_offset, count, nullptr, record_size, registers, draw_initiator,
-	                     indexed);
+	cp.DrawIndirectMulti(data_offset, count, nullptr, stride, registers, draw_initiator, indexed);
 
 	return 4 + packet_dw * (count - 1);
 }

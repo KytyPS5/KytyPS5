@@ -1623,6 +1623,21 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	           }));
 }
 
+uint32_t EmitLoadDeviceAddressU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+		const auto address = Binary(
+		    state, spv::OpIAdd, TypeU64(state), PackU64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)),
+		    Unary(state, spv::OpUConvert, TypeU64(state), ctx.Arg(inst, 2)));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpLoad, TypeU32(state), value,
+		    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address),
+		    spv::MemoryAccessAlignedMask, 4u);
+		return value;
+	});
+}
+
 uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& buffer = ctx.state.program.info.buffers.at(inst.Flags<uint32_t>());
 	if (buffer.indirect_resources.empty()) return ConstantU32(ctx.state, 0u);

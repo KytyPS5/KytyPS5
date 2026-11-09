@@ -7691,6 +7691,8 @@ void TestMeshExportStorage() {
     Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
               layout.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
           "mesh shader did not retain its user-data placement and buffer offset");
+    Check(!result.program.info.uses_dma && result.program.info.uses_device_address,
+          "mesh index fetch used the guest address domain");
     const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
     Check(reg != result.program.info.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
@@ -8290,24 +8292,20 @@ void TestMeshInputAssembly() {
                                    ? test.lane
                                    : inst.Arg(1).U32() == 0 ? test.group : 2;
         inst.ReplaceUsesWith(Value(value));
-      } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
+      } else if (inst.GetOpcode() == ValueOpcode::LoadDeviceAddressU32) {
         Check(load == nullptr, "mesh index fetch emitted duplicate loads");
         load = &inst;
       }
     }
     ConstantPropagationPass(program.blocks);
     if (test.fast_launch) {
-      Check(load == nullptr && program.memory_info.empty(),
-            "fast launch emitted an ordinary input-assembly index resource");
+      Check(load == nullptr, "fast launch emitted an ordinary input-assembly index fetch");
     } else {
-      Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&
+      Check(load != nullptr && load->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+                load->Arg(1).Resolve().U32() == 0x12 &&
+                load->Arg(2).Resolve().U32() == test.byte_offset &&
                 load->Arg(3).Resolve().U1() == test.fetch,
             "mesh index fetch address or active-lane predicate is wrong");
-      const auto *resource = load->Arg(0).ResolveInstruction();
-      Check(resource != nullptr && resource->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-                resource->Arg(1).Resolve().U32() == 0x12 &&
-                program.memory_info[load->Flags<MemoryFlags>().index].kind == ResourceKind::Global,
-            "mesh index fetch lost its aligned guest address resource");
       load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
       ConstantPropagationPass(program.blocks);
     }

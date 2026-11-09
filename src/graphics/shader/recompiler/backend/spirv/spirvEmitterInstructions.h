@@ -267,6 +267,7 @@ uint32_t              EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst
 uint32_t              EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitLoadDeviceAddressU32(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitLoadAddressU8         = EmitLoadMemory;
 inline constexpr auto EmitLoadAddressU16        = EmitLoadMemory;
 inline constexpr auto EmitLoadAddressU32        = EmitLoadMemory;

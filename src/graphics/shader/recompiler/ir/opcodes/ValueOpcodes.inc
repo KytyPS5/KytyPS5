@@ -247,6 +247,8 @@ VALUE_OPCODE(ReadConstBuffer, U32, BufferResource, U32)
 VALUE_OPCODE(LoadAddressU8, U8, AddressResource, U32, U32, U1)
 VALUE_OPCODE(LoadAddressU16, U16, AddressResource, U32, U32, U1)
 VALUE_OPCODE(LoadAddressU32, U32, AddressResource, U32, U32, U1)
+// The DWORD at host device address (high:low) + offset, both 4-byte aligned; 0 when inactive.
+VALUE_OPCODE(LoadDeviceAddressU32, U32, U32, U32, U32, U1)
 VALUE_OPCODE(StoreAddressU8, Void, AddressResource, U32, U32, U8, U1)
 VALUE_OPCODE(StoreAddressU16, Void, AddressResource, U32, U32, U16, U1)
 VALUE_OPCODE(StoreAddressU32, Void, AddressResource, U32, U32, U32, U1)

@@ -19,6 +19,10 @@
 #include <type_traits>
 #include <vector>
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <pthread.h>
+#endif
+
 namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -8218,6 +8222,60 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void TestDescriptorBehindLongPhiChain() {
+  // The descriptor word passes through far more loop phis than a 64 KiB stack
+  // holds frames of a recursive walk.
+  constexpr uint32_t depth = 4096;
+  Fixture fixture;
+  auto word = fixture.UserData(0);
+  for (uint32_t i = 0; i < depth; ++i) {
+    auto *loop = fixture.AddBlock();
+    fixture.block->AddBranch(loop);
+    loop->AddBranch(loop);
+    auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                    static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(fixture.block, word);
+    phi.AddPhiOperand(loop, Value(&phi));
+    fixture.block = loop;
+    word = Value(&phi);
+  }
+  const auto handle =
+      fixture.Buffer({word, Value(0u), Value(64u), Value(0u)}, 4);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 4));
+
+  pthread_attr_t attributes;
+  Check(pthread_attr_init(&attributes) == 0 &&
+            pthread_attr_setstacksize(&attributes, 64 * 1024) == 0,
+        "configure a small translation stack");
+  pthread_t thread;
+  Check(pthread_create(
+            &thread, &attributes,
+            [](void *opaque) -> void * {
+              static_cast<Fixture *>(opaque)->PlanAndTrack();
+              return nullptr;
+            },
+            &fixture) == 0 &&
+            pthread_join(thread, nullptr) == 0,
+        "track resources on a 64 KiB stack");
+  pthread_attr_destroy(&attributes);
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  const std::array<uint32_t, 1> user_data{0x12345678u};
+  DescriptorValue descriptor;
+  Check(fixture.program.info.buffers.size() == 1u &&
+            EvaluateSrtDescriptor(plan, {.user_data = user_data},
+                                  fixture.program.info.buffers[0].source,
+                                  descriptor) &&
+            descriptor.dwords[0] == user_data[0],
+        "descriptor behind a long phi chain lost its user-data source");
+}
+#endif
+
 void TestBufferStoreUsesItsOwnActiveValue() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
@@ -9132,6 +9190,9 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    Run("descriptor behind a long phi chain", TestDescriptorBehindLongPhiChain);
+#endif
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);

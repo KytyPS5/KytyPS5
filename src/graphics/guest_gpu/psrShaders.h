@@ -51,6 +51,9 @@ enum class Shader : uint8_t {
 	QbvhFanRefitAsync,
 	QbvhFanRefitRecoverAabbs,
 	QbvhRefitBottomLevel,
+	// The refit of the vertices of a geometry whose vertices a function of the game computes
+	// (generation Base515, in place of QbvhFanRefitAsync).
+	QbvhFanRefitAsyncShaderMesh,
 
 	// Bottom level build of triangle geometry (kBase format): the bounds of a geometry's vertices
 	// and the Morton codes of its triangles (once per geometry; the codes in any index format and
@@ -85,6 +88,9 @@ enum class Generation : uint8_t {
 	Base460,
 	// 252 shaders, named without the psr_ prefix: GTA V 01.005 (build J02232310).
 	Base252,
+	// 515 shaders: Marvel's Wolverine (build J03837228). Only its BLAS refits are known (the shaders
+	// of the refit recognized by their code, see IdentifyShader()); its other passes are Other.
+	Base515,
 };
 
 // The generation of the library the game registered (Unknown until it registered its shaders,

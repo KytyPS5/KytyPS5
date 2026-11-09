@@ -128,6 +128,7 @@ public:
 	// is dropped.
 	bool HleBlasDispatch(uint64_t data_addr);
 	void EmitHleRefit();
+	void EmitHleRefitArgs();
 	void EmitHleTlas();
 	// sce::Psr's BLAS builds, seen (not replaced) so the native ray tracing follows them (see
 	// graphicsRun.cpp).
@@ -300,6 +301,9 @@ private:
 	std::vector<HleRefitGeometryRef> m_hle_refit_geometries;
 	uint32_t                         m_hle_refit_finished = 0;
 	bool                             m_hle_refit_window   = false;
+	// Generation Base515: the BLASes whose dispatch arguments the window wrote (from
+	// m_hle_refit_blases[0]).
+	size_t                           m_hle_refit_args     = 0;
 	// The sce::Psr BLAS builds in progress (see PsrBlasDispatch()), by the address of their scratch
 	// memory: the geometry table and the geometries whose Morton codes the build computed.
 	struct PsrBlasBuildState {

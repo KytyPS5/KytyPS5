@@ -1748,16 +1748,30 @@ static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) 
 // with the last box pass, one host command refits every BLAS (with the vertices other work wrote
 // meanwhile). GTA V 01.005 (Base252) runs the same passes on BLASes whose header has the same
 // fields at other offsets. True when the dispatch is dropped.
+//
+// Marvel's Wolverine (generation Base515) refits some 550 BLASes a frame the same way, but its
+// geometries take their vertices from functions of the game (psr_qbvh_fan_refit_async_shader_mesh_*,
+// which call them): those passes run as the game dispatches them, and the others are replaced.
+// psr_qbvh_fan_refit_copy_dispatch_args writes the indirect arguments of the vertex passes over
+// boxes of the BLAS's first box nodes (keeping the signs of the four floats it overwrites) and
+// psr_qbvh_fan_refit_recover_aabbs makes those boxes infinite again: one host command writes the
+// arguments of every BLAS of the window before anything else the window runs, and the refit of
+// the boxes, which also writes the BLAS's bounds in its header, makes them infinite again.
 bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
 		return false;
 	}
 	using Psr::Shader;
 	const auto shader       = ComputePsrShader(data_addr);
+	const bool base515      = Psr::LibraryGeneration() == Psr::Generation::Base515;
 	const bool refit_shader = shader == Shader::QbvhFanRefitCopyDispatchArgs ||
 	                          shader == Shader::QbvhFanRefitAsync ||
 	                          shader == Shader::QbvhFanRefitRecoverAabbs ||
-	                          shader == Shader::QbvhRefitBottomLevel;
+	                          shader == Shader::QbvhRefitBottomLevel ||
+	                          (base515 && shader == Shader::QbvhFanRefitAsyncShaderMesh);
+	if (base515 && m_hle_refit_window && shader != Shader::QbvhFanRefitCopyDispatchArgs) {
+		EmitHleRefitArgs();
+	}
 	// Shaders of the game run meanwhile; another pass of the library inside a window is a refit
 	// the replacement does not know (GTA V runs none there).
 	if (!refit_shader) {
@@ -1781,11 +1795,15 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 		m_hle_refit_blases.clear();
 		m_hle_refit_geometries.clear();
 		m_hle_refit_finished = 0;
+		m_hle_refit_args     = 0;
 	}
 	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
 	if (shader == Shader::QbvhFanRefitCopyDispatchArgs) {
 		m_hle_refit_blases.push_back((uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) &
 		                             0xffffffffffffull);
+	} else if (shader == Shader::QbvhFanRefitAsyncShaderMesh) {
+		// It reads the arguments EmitHleRefitArgs() wrote.
+		return false;
 	} else if (shader == Shader::QbvhFanRefitAsync) {
 		m_hle_refit_geometries.push_back(
 		    {.blas     = uint64_t {user[4]} | (uint64_t {user[5] & 0xffffu} << 32u),
@@ -1799,8 +1817,40 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 	return true;
 }
 
+// Generation Base515: writes the dispatch arguments of the vertex passes of the window's BLASes
+// that do not have them yet (see HleBlasDispatch()).
+void CommandProcessor::EmitHleRefitArgs() {
+	if (m_hle_refit_args >= m_hle_refit_blases.size()) {
+		return;
+	}
+	std::vector<uint64_t> blases(m_hle_refit_blases.begin() + static_cast<ptrdiff_t>(m_hle_refit_args),
+	                             m_hle_refit_blases.end());
+	m_hle_refit_args = m_hle_refit_blases.size();
+	EmitHostCommand([this, blases = std::move(blases)] {
+		auto& context = m_renderer;
+		auto& cache   = context.GetBufferCache();
+		for (const auto blas: blases) {
+			uint32_t size = 0;
+			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
+			if (blas != 0 && size > 256u) {
+				(void)cache.ObtainBuffer(blas, size, true);
+			}
+		}
+		context.PrepareBda(true, false);
+		auto& command = context.GetCommandScheduler().Current();
+		command.EndRendering();
+		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, {}, 2, true);
+	});
+}
+
 void CommandProcessor::EmitHleRefit() {
-	const uint32_t header_layout = Psr::LibraryGeneration() == Psr::Generation::Base252 ? 1u : 0u;
+	const auto     generation    = Psr::LibraryGeneration();
+	const uint32_t header_layout = generation == Psr::Generation::Base252   ? 1u
+	                               : generation == Psr::Generation::Base515 ? 2u
+	                                                                        : 0u;
+	if (header_layout == 2) {
+		EmitHleRefitArgs();
+	}
 	EmitHostCommand([this, blases = m_hle_refit_blases, refs = m_hle_refit_geometries, header_layout] {
 		auto&                                          context = m_renderer;
 		auto&                                          cache   = context.GetBufferCache();
@@ -1828,11 +1878,14 @@ void CommandProcessor::EmitHleRefit() {
 			}
 			geometries.push_back(geometry);
 		}
-		// The refit reads the header (first 256 bytes), which stays, and writes the nodes.
+		// The refit reads the header (first 256 bytes), which stays (generation Base515: where
+		// the refit writes the BLAS's bounds), and writes the nodes.
 		for (const auto blas: blases) {
 			uint32_t size = 0;
 			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
-			if (blas != 0 && size > 256u) {
+			if (blas != 0 && size > 256u && header_layout == 2) {
+				(void)cache.ObtainBuffer(blas, size, true);
+			} else if (blas != 0 && size > 256u) {
 				cache.PrepareDeviceAddressRead(blas, 256u);
 				(void)cache.ObtainBuffer(blas + 256u, size - 256u, true);
 			}

@@ -15,6 +15,16 @@
 // (type 0-3 = one of its 4 triangles, 7 = an AABB of the geometry entry pointer >> 3) and a
 // primitive word (bit 31: last entry).
 //
+// Generation Base515 (Marvel's Wolverine, Push::header_layout 2) has the fields at the offsets of
+// Base460; its vertices are refit by the game's own passes (they call functions of the game).
+// Before them, MODE_ARGUMENTS writes their indirect dispatch arguments where the game's pass
+// writes them: over the second half of the first box of the box node 4 + geometry and the first
+// half of its second box (16 bytes at +32), with the signs of the four floats it overwrites in its
+// last word; MODE_BOXES makes those floats infinite again with their signs before the refit (the
+// box of an invalid child stays so), and writes the bounds of the BLAS (the root's four boxes) at
+// +152 of its header. Base515 header: +24 flags, +108 geometry count, +80 u64 offset of the first
+// triangle node of each geometry, +120 triangle node count, +252 BVH version (10).
+//
 // MODE_VERTICES: one workgroup per geometry job (a geometry of a BLAS, as dispatched by the
 // game, with its vertex buffer V# and object matrix): rewrites its triangle nodes' vertices.
 // MODE_BOXES: one workgroup per BLAS: lists its box nodes level by level from the root, then
@@ -32,17 +42,20 @@ layout(push_constant, std430) uniform Push {
 	uint     mode;
 	uint     job_count;
 	uint     pool_capacity;
-	// The BLAS header: 0 for generation Base460, 1 for Base252.
+	// The BLAS header: 0 for generation Base460, 1 for Base252, 2 for Base515.
 	uint     header_layout;
 } pc;
 
 // The offsets of the BLAS header fields the refit reads, by Push::header_layout: the vertex index table,
 // the first triangle node of each geometry, the geometry count, the triangle node count, the
 // first triangle node and the node limit.
-const uint kHeaderOffsets[2][6] = {{64u, 80u, 108u, 120u, 124u, 88u}, {56u, 72u, 112u, 124u, 128u, 80u}};
+const uint kHeaderOffsets[3][6] = {{64u, 80u, 108u, 120u, 124u, 88u},
+                                   {56u, 72u, 112u, 124u, 128u, 80u},
+                                   {64u, 80u, 108u, 120u, 124u, 88u}};
 
 const uint MODE_VERTICES = 0u;
 const uint MODE_BOXES    = 1u;
+const uint MODE_ARGUMENTS = 2u;
 
 // A geometry job (96 bytes).
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer GeometryJob {
@@ -158,7 +171,7 @@ void VertexJob(uint job_index) {
 	if (blas == 0) {
 		return;
 	}
-	const uint     hl          = min(pc.header_layout, 1u);
+	const uint     hl          = min(pc.header_layout, 2u);
 	const uint64_t index_table = blas + LoadGuestU64(blas + kHeaderOffsets[hl][0]);
 	const uint64_t first_table = blas + LoadGuestU64(blas + kHeaderOffsets[hl][1]);
 	const uint     geometries  = LoadGuestU32(blas + kHeaderOffsets[hl][2]);
@@ -236,17 +249,70 @@ bool Finite(vec3 v) {
 	return !any(isnan(v)) && !any(isinf(v));
 }
 
+// Generation Base515: whether the BLAS has the header its refit passes expect (else the game's
+// pass would stop the GPU, and the replacement leaves the BLAS as it is).
+bool Base515Header(uint64_t blas) {
+	const uint flags = LoadGuestU32(blas + 24);
+	return blas != 0 && LoadGuestU32(blas + 252) == 10u && (flags & 0x10u) != 0 && (flags & 0x40000u) == 0 &&
+	       (flags & 0x20000000u) == 0;
+}
+
+// Generation Base515: the 16 bytes where the arguments of the vertex pass of geometry `g` go.
+uint64_t ArgumentSlot(uint64_t blas, uint g) {
+	return blas + 0x120u + uint64_t(g) * 64u;
+}
+
+// Generation Base515: the indirect arguments of the game's vertex passes of a BLAS, one per
+// geometry (its triangle node count, 1, 1 and the signs of the floats they overwrite).
+void ArgumentsJob(uint job_index) {
+	BlasJob        job  = BlasJob(pc.jobs + uint64_t(job_index) * 16);
+	const uint64_t blas = job.blas;
+	if (!Base515Header(blas)) {
+		return;
+	}
+	const uint     geometries  = min(LoadGuestU32(blas + kHeaderOffsets[2][2]), 1u << 16);
+	const uint64_t first_table = blas + LoadGuestU64(blas + kHeaderOffsets[2][1]);
+	const uint     node_count  = LoadGuestU32(blas + kHeaderOffsets[2][3]);
+	for (uint g = gl_LocalInvocationID.x; g < geometries; g += gl_WorkGroupSize.x) {
+		const uint     first = LoadGuestU32(first_table + uint64_t(g) * 4);
+		const uint     end   = g + 1u < geometries ? LoadGuestU32(first_table + uint64_t(g + 1u) * 4) : node_count;
+		const uint64_t host  = HostAddress(ArgumentSlot(blas, g));
+		if (host != 0) {
+			const uvec4 old   = U32x4Ref(host).v;
+			const uint  signs = (old.x >> 31) | ((old.y >> 31) << 1) | ((old.z >> 31) << 2) | ((old.w >> 31) << 3);
+			U32x4Ref(host).v  = uvec4(end - first, 1u, 1u, signs);
+		}
+	}
+}
+
 void BoxJob(uint job_index) {
 	const uint     lid  = gl_LocalInvocationID.x;
 	BlasJob        job   = BlasJob(pc.jobs + uint64_t(job_index) * 16);
 	const uint64_t blas  = job.blas;
 	State          state = State(pc.state);
+	const bool     base515 = pc.header_layout == 2u;
+	if (base515) {
+		if (!Base515Header(blas)) {
+			return;
+		}
+		// The floats under the arguments are infinite again, with their signs.
+		const uint geometries = min(LoadGuestU32(blas + kHeaderOffsets[2][2]), 1u << 16);
+		for (uint g = lid; g < geometries; g += gl_WorkGroupSize.x) {
+			const uint64_t host = HostAddress(ArgumentSlot(blas, g));
+			if (host != 0) {
+				const uint signs     = CoherentU32(host + 12).v;
+				CoherentU32x4(host).v = uvec4(0x7f800000u) | (uvec4(signs, signs >> 1, signs >> 2, signs >> 3) << 31);
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
 	if (lid == 0) {
 		s_levels   = 0;
 		s_overflow = 0;
 		s_tail     = 0;
 		// Box nodes never outnumber the node limit of the BLAS.
-		s_size = min(LoadGuestU32(blas + kHeaderOffsets[min(pc.header_layout, 1u)][5]) + 1u, 1u << 20);
+		s_size = min(LoadGuestU32(blas + kHeaderOffsets[min(pc.header_layout, 2u)][5]) + 1u, 1u << 20);
 		s_base = atomicAdd(state.pool_cursor, s_size);
 		if (blas == 0 || s_base + s_size > pc.pool_capacity || s_base + s_size < s_base) {
 			s_overflow = 1;
@@ -344,6 +410,13 @@ void BoxJob(uint job_index) {
 				if (!Finite(lo[c]) || !Finite(hi[c])) {
 					lo[c] = vec3(uintBitsToFloat(0x7f800000u));
 					hi[c] = vec3(uintBitsToFloat(0xff800000u));
+				} else if (base515 && node == 0x25u) {
+					// The root's boxes (and the bounds of the BLAS, their union) grow by 1/256 of
+					// their size: in animated BLASes they were seen up to 1e-3 of it behind their
+					// children, and no ray may miss the geometry at their edges.
+					const vec3 margin = (hi[c] - lo[c]) * (1.0 / 256.0) + vec3(1e-6);
+					lo[c] -= margin;
+					hi[c] += margin;
 				}
 			}
 			for (uint c = 0; c < 4; c++) {
@@ -365,6 +438,22 @@ void BoxJob(uint job_index) {
 		memoryBarrierBuffer();
 		barrier();
 	}
+	// Generation Base515: the bounds of the BLAS, the root's four boxes.
+	if (base515 && lid == 0) {
+		vec3 lo[4], hi[4];
+		LoadBoxes(HostAddress(blas + (uint64_t(0x25u >> 3) << 6)), lo, hi);
+		const vec3     box_lo = min(min(lo[0], lo[1]), min(lo[2], lo[3]));
+		const vec3     box_hi = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
+		const uint64_t header = HostAddress(blas + 152);
+		if (header != 0) {
+			CoherentU32(header).v      = floatBitsToUint(box_lo.x);
+			CoherentU32(header + 4).v  = floatBitsToUint(box_lo.y);
+			CoherentU32(header + 8).v  = floatBitsToUint(box_lo.z);
+			CoherentU32(header + 12).v = floatBitsToUint(box_hi.x);
+			CoherentU32(header + 16).v = floatBitsToUint(box_hi.y);
+			CoherentU32(header + 20).v = floatBitsToUint(box_hi.z);
+		}
+	}
 }
 
 void main() {
@@ -373,6 +462,8 @@ void main() {
 	}
 	if (pc.mode == MODE_VERTICES) {
 		VertexJob(gl_WorkGroupID.x);
+	} else if (pc.mode == MODE_ARGUMENTS) {
+		ArgumentsJob(gl_WorkGroupID.x);
 	} else {
 		BoxJob(gl_WorkGroupID.x);
 	}

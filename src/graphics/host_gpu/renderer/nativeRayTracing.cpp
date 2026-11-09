@@ -2205,12 +2205,13 @@ void NativeRayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memo
 }
 
 void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
-                                      std::span<const HleRefitGeometry> geometries, uint32_t header_layout) {
+                                      std::span<const HleRefitGeometry> geometries, uint32_t header_layout,
+                                      bool arguments) {
 	if (!m_enabled || blases.empty()) {
 		return;
 	}
 	static_assert(sizeof(HleRefitGeometry) == HleRefitGeometryStride);
-	{
+	if (!arguments) {
 		Common::LockGuard lock(m_mutex);
 		m_refit_seq++;
 		for (const auto blas: blases) {
@@ -2288,7 +2289,7 @@ void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<
 		}
 		if (!batch_blases.empty()) {
 			push.jobs      = jobs + blas_offset;
-			push.mode      = 1;
+			push.mode      = arguments ? 2 : 1;
 			push.job_count = static_cast<uint32_t>(batch_blases.size());
 			command.pushConstants(m_hle_refit_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 			command.dispatch(static_cast<uint32_t>(batch_blases.size()), 1, 1);

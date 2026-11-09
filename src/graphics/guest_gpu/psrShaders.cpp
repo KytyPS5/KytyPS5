@@ -102,6 +102,7 @@ const char* GenerationName(Generation generation) {
 	switch (generation) {
 		case Generation::Base460: return "Base460";
 		case Generation::Base252: return "Base252";
+		case Generation::Base515: return "Base515";
 		default: return "unknown";
 	}
 }
@@ -217,13 +218,54 @@ uint64_t InstructionKey(const ShaderRecompiler::Decoder::Instruction& inst, bool
 
 // The generation of a library that registered its shaders. Generation Base460 has shaders the
 // next one removed (the vertex bounds of the Morton build, the rebraiding instance copies) and
-// none of the ones it added (nested BVH counts, flattening).
+// none of the ones it added (nested BVH counts, flattening); generation Base515 the other way
+// round.
 Generation DetectGeneration() {
-	const bool base460 = ShaderNameRegistered("psr_morton_compute_bounding_box_for_vertices") &&
-	                     ShaderNameRegistered("psr_rebraiding_copy_srt_instance") &&
-	                     !ShaderNameRegistered("psr_count_nested_bvh") &&
-	                     !ShaderNameRegistered("psr_create_flattened_header");
-	return base460 ? Generation::Base460 : Generation::Unknown;
+	const bool older = ShaderNameRegistered("psr_morton_compute_bounding_box_for_vertices") &&
+	                   ShaderNameRegistered("psr_rebraiding_copy_srt_instance");
+	const bool newer = ShaderNameRegistered("psr_count_nested_bvh") &&
+	                   ShaderNameRegistered("psr_create_flattened_header");
+	if (older && !newer) {
+		return Generation::Base460;
+	}
+	return newer && !older ? Generation::Base515 : Generation::Unknown;
+}
+
+// The shaders of generation Base515 the emulator replaces or watches (its BLAS refits), known by
+// their name and their code (CodeFingerprint() and compiler revision of Marvel's Wolverine's
+// build J03837228): a shader of another build under the same name is a pass the replacement
+// does not know.
+constexpr uint32_t Base515Revision = 0x5371c534u;
+struct Base515Code {
+	std::string_view name;
+	uint64_t         fingerprint;
+	Shader           shader;
+};
+constexpr Base515Code Base515Codes[] = {
+    {"psr_qbvh_fan_refit_copy_dispatch_args", 0xa2d5a06017eb9c03ull, Shader::QbvhFanRefitCopyDispatchArgs},
+    {"psr_qbvh_fan_refit_async_shader_mesh_0", 0xc416e109a7bbc897ull, Shader::QbvhFanRefitAsyncShaderMesh},
+    {"psr_qbvh_fan_refit_async_shader_mesh_1", 0xc416e109a7bbc897ull, Shader::QbvhFanRefitAsyncShaderMesh},
+    {"psr_qbvh_fan_refit_async_shader_mesh_2", 0xc416e109a7bbc897ull, Shader::QbvhFanRefitAsyncShaderMesh},
+    {"psr_qbvh_fan_refit_async_shader_mesh_3", 0xc416e109a7bbc897ull, Shader::QbvhFanRefitAsyncShaderMesh},
+    {"psr_qbvh_fan_refit_recover_aabbs", 0xba9376f980d9e6c6ull, Shader::QbvhFanRefitRecoverAabbs},
+    {"psr_qbvh_refit_bottom_level", 0x688fc60a8000d2edull, Shader::QbvhRefitBottomLevel},
+};
+
+// The Base515 shader named `name` whose code starts at `code_address`: one of Base515Codes, or
+// Other.
+Shader IdentifyBase515(uint64_t code_address, std::string_view name) {
+	for (const auto& code: Base515Codes) {
+		if (code.name != name) {
+			continue;
+		}
+		const auto binary = ShaderMappedBinary(code_address);
+		if (CompilerRevision(binary) == Base515Revision && CodeFingerprint(binary) == code.fingerprint) {
+			return code.shader;
+		}
+		LOGF("Psr: %s is not the code the emulator knows: it is emulated\n", code.name.data());
+		return Shader::Other;
+	}
+	return Shader::Other;
 }
 
 } // namespace
@@ -357,9 +399,15 @@ Shader IdentifyShader(uint64_t code_address) {
 		g_generation.store(generation, std::memory_order_release);
 		g_generation_known.store(true, std::memory_order_release);
 		LOGF("Psr: library generation %s\n",
-		     generation == Generation::Base460 ? "Base460" : "unknown (its shaders are emulated)");
+		     generation == Generation::Base460   ? "Base460"
+		     : generation == Generation::Base515 ? "Base515 (its BLAS refits are replaced)"
+		                                         : "unknown (its shaders are emulated)");
 	}
-	if (g_generation.load(std::memory_order_acquire) != Generation::Base460) {
+	const auto generation = g_generation.load(std::memory_order_acquire);
+	if (generation == Generation::Base515) {
+		return IdentifyBase515(code_address, name);
+	}
+	if (generation != Generation::Base460) {
 		return Shader::None;
 	}
 	for (const auto& entry: Names) {

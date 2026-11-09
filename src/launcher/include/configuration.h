@@ -84,6 +84,9 @@ public:
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
+	enum class PssrUpscaler { Linear, DLSS };
+	Q_ENUM(PssrUpscaler)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -142,6 +145,8 @@ public:
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   pro_enabled                 = false;
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	QString                dlss_folder;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
@@ -189,6 +194,8 @@ public:
 		profiler_enabled            = other.profiler_enabled;
 		renderdoc_enabled           = other.renderdoc_enabled;
 		pro_enabled                 = other.pro_enabled;
+		pssr_upscaler               = other.pssr_upscaler;
+		dlss_folder                 = other.dlss_folder;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
 		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)

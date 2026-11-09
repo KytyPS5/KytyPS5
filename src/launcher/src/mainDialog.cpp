@@ -294,6 +294,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.pro_enabled, "--trinity");
+	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
+		args << "--dlss" << info.dlss_folder;
+	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)

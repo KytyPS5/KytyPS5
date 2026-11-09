@@ -1089,10 +1089,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 
 	if (mesh_active && draw.indexed) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		// synchronizes registered BDA ranges before any draw commands are committed. Shaders read
+		// them only through BDA, so the lookup counts as a use and keeps the buffer resident.
+		(void)m_context.GetBufferCache().FindBufferForShaderRead(
+		    index_source.address,
+		    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
 	}
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};

@@ -6141,16 +6141,18 @@ void TestSmallFiberStacksAndMigration() {
 		const int main_self_result = Libs::Fiber::FiberGetSelf(&main_self);
 		const int busy_run = running ? Libs::Fiber::FiberRun(data.first, 30, nullptr) : 0;
 		const int busy_finalize = running ? Libs::Fiber::FiberFinalize(data.first) : 0;
-		if (running) {
-			Libs::Fiber::FiberInitialize(
-			    data.first, "busy", FirstFiberEntry, reinterpret_cast<uint64_t>(&data),
-			    first_stack.data() + GuardSize, stack_size, nullptr, FiberTestBuildVersion);
-		}
+		const int busy_initialize =
+		    running ? Libs::Fiber::FiberInitialize(data.first, "busy", FirstFiberEntry,
+		                                           reinterpret_cast<uint64_t>(&data),
+		                                           first_stack.data() + GuardSize, stack_size,
+		                                           nullptr, FiberTestBuildVersion)
+		            : 0;
 		data.release.store(true, std::memory_order_release);
 		worker.join();
 		Check(test, thread_context_is_clear() && main_self_result == OK && main_self == nullptr,
 		      "migrated fiber changed the original thread's current fiber");
-		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState,
+		Check(test, running && busy_run == FiberErrorState && busy_finalize == FiberErrorState &&
+		          busy_initialize == FiberErrorState,
 		      "running fiber was not exclusively owned");
 		CheckOk(test, worker_result, "resume fiber on another thread");
 		CheckOk(test, worker_repeat_result, "repeat run on another thread");

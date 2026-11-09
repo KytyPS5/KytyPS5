@@ -126,7 +126,7 @@ public:
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
-	void TouchPad(int id, int finger, bool down, float x, float y);
+	void TouchPad(int id, int finger, bool down, float x, float y, bool click);
 	void Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
 	void SetMotionSensorState(bool enable);
 	void ResetOrientation();
@@ -626,7 +626,7 @@ void GameController::RightStick(int id, int x, int y) {
 	}
 }
 
-void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
+void GameController::TouchPad(int id, int finger, bool down, float x, float y, bool click) {
 	if (finger < 0 || finger >= 2) {
 		return;
 	}
@@ -642,7 +642,7 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 		touch.down = down;
 		touch.x    = static_cast<uint16_t>(std::clamp(x, 0.0f, 1.0f) * 1920.0f);
 		touch.y    = static_cast<uint16_t>(std::clamp(y, 0.0f, 1.0f) * 943.0f);
-		if (id == HOST_INPUT_CONTROLLER_ID) {
+		if (id == HOST_INPUT_CONTROLLER_ID && click) {
 			m_state.buttons = down ? m_state.buttons | PAD_BUTTON_TOUCH_PAD
 			                       : m_state.buttons & ~PAD_BUTTON_TOUCH_PAD;
 		}
@@ -1132,10 +1132,10 @@ void SetRightStick(int id, int x, int y) {
 	}
 }
 
-void SetTouchPad(int id, int finger, bool down, float x, float y) {
+void SetTouchPad(int id, int finger, bool down, float x, float y, bool click) {
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
-		player->TouchPad(id, finger, down, x, y);
+		player->TouchPad(id, finger, down, x, y, click);
 	}
 }
 

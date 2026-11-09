@@ -32,6 +32,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
+class ParameterKeyCache;
 
 namespace ShaderRecompiler {
 struct CompileOptions;
@@ -182,7 +183,8 @@ class PipelineCache {
 public:
 	// Without a shader store path nothing is kept across runs.
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
-	              const std::filesystem::path& shader_store = {});
+	              ParameterKeyCache*           parameter_keys = nullptr,
+	              const std::filesystem::path& shader_store   = {});
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
@@ -236,6 +238,22 @@ private:
 		bool operator==(const ProgramKey&) const = default;
 	};
 
+	// The values a draw's vertex stage can export to the pixel inputs that key its descriptors.
+	struct DrawParameterKeys final: ShaderRecompiler::IR::ParameterKeySource {
+		DrawParameterKeys(PipelineCache& cache, const ShaderPixelInputInfo& pixel,
+		                  const ShaderParams& vertex, ShaderVertexInputInfo& vertex_info,
+		                  bool linked)
+		    : cache(cache), pixel(pixel), vertex(vertex), vertex_info(vertex_info), linked(linked) {
+		}
+		bool Keys(uint32_t parameter, std::vector<uint32_t>& keys) override;
+
+		PipelineCache&              cache;
+		const ShaderPixelInputInfo& pixel;
+		const ShaderParams&         vertex;
+		ShaderVertexInputInfo&      vertex_info;
+		bool linked; // The vertex stage exports straight to the pixel inputs.
+	};
+
 	// Variants of one source share a bucket; ProgramKey equality compares the state.
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const { return key.hash; }
@@ -249,6 +267,12 @@ private:
 
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	ParameterKeyCache*                     m_parameter_keys;
+	// Set while the pixel program of a draw is obtained.
+	ShaderRecompiler::IR::ParameterKeySource* m_pixel_parameter_keys = nullptr;
+	// Plans of vertex stages translated to list their exports before their module is compiled.
+	std::unordered_map<ProgramKey, ShaderRecompiler::IR::ResourcePlan, ProgramKeyHash>
+	                                                        m_vertex_plans;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
@@ -266,6 +290,9 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor);
+	// The resource plan of a vertex stage without calls, translating it if need be.
+	const ShaderRecompiler::IR::ResourcePlan* VertexPlan(const ShaderParams&    params,
+	                                                     ShaderVertexInputInfo& input_info);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,

@@ -382,6 +382,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 		options.stage            = ShaderType::Pixel;
 		options.input_info.pixel = &input_info;
+		runtime.parameter_keys   = m_pixel_parameter_keys;
 	} else {
 		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 		options.stage              = ShaderType::Compute;
@@ -465,10 +466,59 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
-PipelineCache::PipelineCache(GraphicContext&                         graphics,
+const ShaderRecompiler::IR::ResourcePlan*
+PipelineCache::VertexPlan(const ShaderParams& params, ShaderVertexInputInfo& input_info) {
+	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
+	options.stage             = input_info.logical_stage;
+	options.input_info.vertex = &input_info;
+	options.user_data_base    = 8;
+	if (options.stage != ShaderType::Vertex) return nullptr;
+	ProgramKey key {
+	    .stage = options.stage, .hash = params.hash, .user_data_count = params.user_data_count};
+	BuildStageStaticKey(input_info, key.static_state);
+	// A call source re-extracts its plan, so only plans that stay put are evaluated.
+	if (const auto found = m_program_cache.find(key); found != m_program_cache.end()) {
+		return found->second.call_source || found->second.skip_dispatch
+		           ? nullptr
+		           : &found->second.resource_plan;
+	}
+	if (const auto found = m_vertex_plans.find(key); found != m_vertex_plans.end())
+		return &found->second;
+	options.shader_hash = params.hash;
+	options.user_data   = std::span(params.user_data).first(params.user_data_count);
+	options.back_code   = params.back_code;
+	options.dump_ir     = false;
+	const auto source   = ShaderRecompiler::PrepareShaderSource(params.code, options);
+	if (source.unsupported_call_pc != UINT32_MAX || !source.calls.empty()) return nullptr;
+	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	return &m_vertex_plans
+	            .emplace(std::move(key),
+	                     ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+	            .first->second;
+}
+
+bool PipelineCache::DrawParameterKeys::Keys(uint32_t parameter, std::vector<uint32_t>& keys) {
+	const auto location = parameter / 4u;
+	if (!linked || cache.m_parameter_keys == nullptr || location >= pixel.input_num) return false;
+	// OFFSET[5] selects DEFAULT_VAL; FP16 and point-sprite inputs are not the exported word.
+	constexpr uint32_t NotExported = 0x20u | (1u << 17u) | (1u << 19u) | (1u << 20u);
+	if ((pixel.interpolator_settings[location] & NotExported) != 0u) return false;
+	const auto* plan = cache.VertexPlan(vertex, vertex_info);
+	if (plan == nullptr) return false;
+	const ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = std::span(vertex.user_data).first(vertex.user_data_count),
+	    .shader_base                = vertex.Base(),
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	};
+	const auto exported = ShaderPixelParameterMappedLocation(pixel, location) * 4u + parameter % 4u;
+	return cache.m_parameter_keys->Keys(*plan, runtime, exported, keys);
+}
+
+PipelineCache::PipelineCache(GraphicContext&                        graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
+                             ParameterKeyCache*                     parameter_keys,
                              const std::filesystem::path&           shader_store)
-    : m_graphics(graphics), m_image_heap(image_heap),
+    : m_graphics(graphics), m_image_heap(image_heap), m_parameter_keys(parameter_keys),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
@@ -865,7 +915,15 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		// Pixel inputs reach the fragment shader straight from the vertex stage's exports.
+		DrawParameterKeys parameter_keys(
+		    *this, pixel_info, vertex_params[0], vertex_info[0],
+		    !tess_active && !mesh_active && vertex_info[0].logical_stage == ShaderType::Vertex &&
+		        pixel_info.parameter_mode != ShaderPixelParameterMode::Rectangle);
+		m_pixel_parameter_keys    = &parameter_keys;
+		const auto* pixel_program = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		m_pixel_parameter_keys    = nullptr;
+		const auto& pixel_module  = *pixel_program;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {

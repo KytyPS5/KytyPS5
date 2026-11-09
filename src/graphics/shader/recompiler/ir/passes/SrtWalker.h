@@ -37,6 +37,16 @@ protected:
 	~ImageHeapSource() = default;
 };
 
+// The values a draw's vertex stage can export to a pixel input (location * 4 + channel).
+class ParameterKeySource {
+public:
+	// Sorted and unique; false when the values are not known exactly.
+	virtual bool Keys(uint32_t parameter, std::vector<uint32_t>& keys) = 0;
+
+protected:
+	~ParameterKeySource() = default;
+};
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -45,6 +55,7 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	ParameterKeySource*       parameter_keys        = nullptr;
 };
 
 class SrtReadCapture {

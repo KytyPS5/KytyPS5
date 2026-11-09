@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ParameterKeys.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -778,7 +779,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			return true;
 		}
-		if (selector == nullptr) {
+		if (selector == nullptr && indirect.parameter != UINT32_MAX) {
+			if (runtime.parameter_keys == nullptr || indirect.table_stride == 0u ||
+			    !runtime.parameter_keys->Keys(indirect.parameter, keys))
+				return failed("pixel input keys");
+		} else if (selector == nullptr) {
 			uint32_t key_count = 0;
 			uint32_t first_key = 0;
 			if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
@@ -1584,6 +1589,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (capture_indirect_reads || !plan.source_reads.empty())
 		plan.resource_tracking_complete &= !program.has_address_writes;
+	BuildParameterKeys(program, plan);
 	DerivePlanState(plan);
 	return plan;
 }
@@ -2135,15 +2141,17 @@ void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
 
 // Binds every plan field: one added later fails to compile here until it is stored or derived.
 template <class S, class P> void IoPlan(S& io, P& plan) {
-	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info, descriptor_sources,
-	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
-	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
+	auto& [stage, shader_hash, user_data_base, user_data_count, values, memory_info,
+	       descriptor_sources, selector_groups, control_flow, control_phis, srt_reads, source_reads,
+	       parameter_keys, capture_specialization_reads, srt_plan_complete,
+	       resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
 	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
-	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,
-	      srt_plan_complete, resource_tracking_complete, info, uniform_fill);
+	      selector_groups, control_flow, srt_reads, source_reads, parameter_keys,
+	      capture_specialization_reads, srt_plan_complete, resource_tracking_complete, info,
+	      uniform_fill);
 }
 
 } // namespace

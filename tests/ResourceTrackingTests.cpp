@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ParameterKeys.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -9327,6 +9328,250 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+// Host evaluation of parameter key ops agrees with constant propagation wherever that folds.
+void TestParameterKeyOpSemantics() {
+  constexpr std::array<uint32_t, 9> samples{0u, 1u, 7u, 31u, 32u, 255u, 0x7fffffffu, 0x80000000u, 0xfffffff0u};
+  constexpr std::array binary{
+      ValueOpcode::IAdd32, ValueOpcode::ISub32, ValueOpcode::IMul32, ValueOpcode::UMulHi,
+      ValueOpcode::SMulHi, ValueOpcode::ShiftLeftLogical32, ValueOpcode::ShiftRightLogical32,
+      ValueOpcode::ShiftRightArithmetic32, ValueOpcode::BitwiseAnd32, ValueOpcode::BitwiseOr32,
+      ValueOpcode::BitwiseXor32, ValueOpcode::UMin32, ValueOpcode::UMax32, ValueOpcode::SMin32,
+      ValueOpcode::SMax32, ValueOpcode::IEqual32, ValueOpcode::INotEqual32, ValueOpcode::ULessThan32,
+      ValueOpcode::ULessThanEqual32, ValueOpcode::UGreaterThan32, ValueOpcode::UGreaterThanEqual32,
+      ValueOpcode::SLessThan32, ValueOpcode::SLessThanEqual32, ValueOpcode::SGreaterThan32,
+      ValueOpcode::SGreaterThanEqual32};
+  uint32_t compared = 0;
+  for (const auto opcode : binary) {
+    Check(IsParameterKeyOpcode(opcode), "parameter key op is not accepted");
+    for (const auto a : samples) {
+      for (const auto b : samples) {
+        Fixture f(ShaderType::Vertex);
+        const auto value = f.Emit(opcode, {Value(a), Value(b)});
+        const auto reference = f.Emit(TypeOf(opcode) == Type::U1 ? ValueOpcode::Reference
+                                                                : ValueOpcode::ReferenceU32,
+                                      {value});
+        ConstantPropagationPass(f.program.blocks);
+        const auto folded = reference.Instruction()->Arg(0).Resolve();
+        if (!folded.IsImmediate()) continue;
+        uint32_t result = 0;
+        const std::array<uint32_t, 2> args{a, b};
+        Check(EvaluateParameterKeyOp(opcode, args, result), "parameter key op did not evaluate");
+        Check(result == (folded.GetType() == Type::U1 ? uint32_t{folded.U1()} : folded.U32()),
+              (std::string("parameter key op disagrees with constant propagation: ") +
+                  std::string(ValueOpcodeName(opcode))).c_str());
+        ++compared;
+      }
+    }
+  }
+  Check(compared > 500u, "constant propagation folded too few parameter key ops to compare");
+  uint32_t field = 0;
+  Check(EvaluateParameterKeyOp(ValueOpcode::BitFieldUExtract, std::array{0xabcd1234u, 8u, 8u}, field) &&
+            field == 0x12u, "unsigned field extract");
+  Check(EvaluateParameterKeyOp(ValueOpcode::BitFieldSExtract, std::array{0x00008000u, 8u, 8u}, field) &&
+            field == 0xffffff80u, "signed field extract");
+  Check(!EvaluateParameterKeyOp(ValueOpcode::BitFieldUExtract, std::array{1u, 30u, 8u}, field),
+        "field extract past the word was evaluated");
+}
+
+struct ParameterKeyMemory {
+  std::vector<std::pair<uint64_t, uint32_t>> words;
+
+  static bool Read(void *userdata, uint64_t address, std::span<uint32_t> values) {
+    const auto &memory = *static_cast<ParameterKeyMemory *>(userdata);
+    for (size_t index = 0; index < values.size(); ++index) {
+      values[index] = 0u;
+      for (const auto &[at, word] : memory.words)
+        if (at == address + index * 4u) values[index] = word;
+    }
+    return true;
+  }
+};
+
+// A vertex stage exports x mod 255 of a vertex-indexed record; the host lists every record's
+// value and the out-of-range one, and refuses functions it cannot evaluate exactly.
+void TestParameterKeyFunction() {
+  enum class Variant { ModRecord, Packed16, Normalized, VertexIndex, LaneValue };
+  const auto build = [](Variant variant) {
+    auto f = std::make_unique<Fixture>(ShaderType::Vertex);
+    const auto exec = f->Emit(ValueOpcode::INotEqual32, {f->Emit(ValueOpcode::LaneId), Value(UINT32_MAX)});
+    const auto srt = f->Address(f->UserData(0), f->UserData(1));
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word)
+      words[word] = f->Emit(ValueOpcode::LoadAddressU32, {srt, Value(0u), Value(0u), Value(true)},
+                            f->AddMemory({.kind = ResourceKind::ScalarAddress, .offset = 80u + word * 4u}, 0x4cu));
+    const auto vertices = f->Buffer(words);
+    const auto index = f->Emit(ValueOpcode::GetBuiltin,
+                               {Value(static_cast<uint32_t>(StageInputKind::VertexIndex)), Value(0u)});
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    load.idxen = true;
+    load.formatted = true;
+    const auto record = f->Emit(ValueOpcode::LoadBufferU32x2, {vertices, index, Value(0u), Value(0u), exec},
+                                f->AddMemory(load, 0x74u));
+    const auto x = f->Emit(ValueOpcode::SelectU32,
+                           {exec, f->Emit(ValueOpcode::CompositeExtractU32x2, {record, Value(0u)}), Value(0u)});
+    const auto quotient = f->Emit(ValueOpcode::ShiftRightLogical32,
+                                  {f->Emit(ValueOpcode::UMulHi, {Value(0x80808081u), x}), Value(7u)});
+    auto value = f->Emit(ValueOpcode::SelectU32,
+                         {exec, f->Emit(ValueOpcode::ISub32, {x, f->Emit(ValueOpcode::IMul32, {quotient, Value(255u)})}), x});
+    if (variant == Variant::VertexIndex) value = f->Emit(ValueOpcode::IAdd32, {value, index});
+    if (variant == Variant::LaneValue) value = f->Emit(ValueOpcode::IAdd32, {value, f->Emit(ValueOpcode::LaneId)});
+    f->program.export_info.push_back({.kind = ExportTargetKind::Parameter, .index = 5u, .en = 0xfu});
+    f->Emit(ValueOpcode::SetAttribute,
+            {f->Emit(ValueOpcode::CompositeConstructU32x4, {value, Value(0u), Value(0u), Value(0u)}), exec},
+            ExportFlags{.index = 0u, .pc = 0x1c4u});
+    return f;
+  };
+  for (const auto variant : {Variant::ModRecord, Variant::Packed16, Variant::Normalized,
+                             Variant::VertexIndex, Variant::LaneValue}) {
+    auto f = build(variant);
+    f->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(f->program);
+    const auto format = variant == Variant::Packed16     ? Libs::Graphics::Prospero::BufferFormat::k16_16UInt
+                        : variant == Variant::Normalized ? Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                                                         : Libs::Graphics::Prospero::BufferFormat::k32_32UInt;
+    const uint32_t stride = variant == Variant::Packed16 ? 4u : 8u;
+    ParameterKeyMemory memory;
+    memory.words = {{0x10050u, 0x20000u}, {0x10054u, stride << 16u}, {0x10058u, 5u},
+                    {0x1005cu, Libs::Graphics::DstSel(4, 5, 0, 0) | (static_cast<uint32_t>(format) << 12u)}};
+    const std::array<uint32_t, 5> xs{3u, 258u, 600u, 255u, 1000u};
+    for (uint32_t vertex = 0; vertex < xs.size(); ++vertex) {
+      if (variant == Variant::Packed16) {
+        memory.words.emplace_back(0x20000u + vertex * 4u, xs[vertex] | (0x7777u << 16u));
+      } else {
+        memory.words.emplace_back(0x20000u + vertex * 8u, xs[vertex]);
+        memory.words.emplace_back(0x20004u + vertex * 8u, 0x12345678u);
+      }
+    }
+    const std::array<uint32_t, 2> user_data{0x10000u, 0u};
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                             .read_specialization_memory = ParameterKeyMemory::Read};
+    std::vector<uint32_t> keys;
+    std::vector<std::pair<uint64_t, uint64_t>> reads;
+    const bool evaluated = EvaluateParameterKeys(plan, runtime, 5u * 4u, keys, reads);
+    if (variant == Variant::ModRecord || variant == Variant::Packed16) {
+      Check(evaluated && keys == std::vector<uint32_t>{0u, 3u, 90u, 235u},
+            "vertex records did not give every exported key and the out-of-range one");
+      Check(reads.size() == 1u && reads[0].first == 0x20000u && reads[0].second == stride * 5u,
+            "parameter keys did not report the record buffer they read");
+      std::vector<uint32_t> signature;
+      Check(ParameterKeySignature(plan, runtime, 5u * 4u, signature) && !signature.empty(),
+            "parameter key signature is missing its uniform inputs");
+      Check(!EvaluateParameterKeys(plan, runtime, 6u * 4u, keys, reads),
+            "a parameter the vertex stage does not export was evaluated");
+    } else {
+      Check(!evaluated, "parameter keys accepted a normalized format, a raw vertex index or a lane value");
+    }
+  }
+}
+
+// A drained waterfall over a flat pixel input keys its table by that input, as long as every
+// loop write to the input's register reaches only lanes the mask drops and the loop repeats
+// only while the mask has a lane.
+void TestPixelInputWaterfallKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Waterfall, Direct, Difference, UnguardedWrite, KeptMask, UnguardedRepeat };
+  for (const auto variant : {Variant::Waterfall, Variant::Direct, Variant::Difference,
+                             Variant::UnguardedWrite, Variant::KeptMask, Variant::UnguardedRepeat}) {
+    Fixture f(ShaderType::Pixel);
+    auto *entry = f.block;
+    auto *header = f.AddBlock();
+    auto *body = f.AddBlock();
+    auto *latch = f.AddBlock();
+    auto *exit = f.AddBlock();
+    const auto live = f.Emit(ValueOpcode::LiveMask, {}, 0, entry);
+    const auto live0 = f.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(0u)}, 0, entry);
+    const auto live1 = f.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(1u)}, 0, entry);
+    const auto input = f.Emit(ValueOpcode::GetInterpolationParameter,
+                              {Value(5u), Value(0u), Value(variant == Variant::Difference ? 0u : 2u)}, 0, entry);
+    const auto wqm = f.Emit(ValueOpcode::WqmU64, {f.Emit(ValueOpcode::CompositeConstructU64, {live0, live1}, 0, entry)},
+                            0, entry);
+    const auto wqm0 = f.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(0u)}, 0, entry);
+    const auto wqm1 = f.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(1u)}, 0, entry);
+    const auto other = f.Emit(ValueOpcode::IEqual32, {f.UserData(3), Value(7u)}, 0, entry);
+    const auto unrelated = f.Emit(ValueOpcode::IEqual32, {f.UserData(4), Value(9u)}, 0, entry);
+    entry->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    auto &value = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &mask0 = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &mask1 = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    f.block = header;
+    const auto lane = f.Emit(ValueOpcode::BitwiseAnd32,
+        {f.Emit(ValueOpcode::UMin32, {f.Emit(ValueOpcode::FindILsb32, {Value(&mask0)}),
+                                      f.Emit(ValueOpcode::BitwiseOr32,
+                                             {f.Emit(ValueOpcode::FindILsb32, {Value(&mask1)}), Value(32u)})}),
+         Value(63u)});
+    const auto key = variant == Variant::Direct
+                         ? f.Emit(ValueOpcode::ReadFirstLane, {input, Value(true)})
+                         : f.Emit(ValueOpcode::ReadLane, {Value(&value), lane});
+    const auto processed = f.Emit(ValueOpcode::IEqual32, {key, Value(&value)});
+    const auto ballot = f.Emit(ValueOpcode::Ballot, {variant == Variant::KeptMask ? unrelated : processed});
+    const auto drop = [&](uint32_t word, Value launched) {
+      return f.Emit(ValueOpcode::BitwiseNot32,
+          {f.Emit(ValueOpcode::BitwiseAnd32, {f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(word)}),
+                                              launched})});
+    };
+    const auto next0 = f.Emit(ValueOpcode::BitwiseAnd32, {Value(&mask0), drop(0u, wqm0)});
+    const auto next1 = f.Emit(ValueOpcode::BitwiseAnd32, {Value(&mask1), drop(1u, wqm1)});
+    header->AddBranch(body);
+    header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body};
+    f.block = body;
+    const auto table = f.Address(f.UserData(0), f.UserData(1));
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                           f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = word * 4u}, 0x244u));
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto texel = f.Emit(ValueOpcode::ImageSampleRaw,
+        {f.Image(words, 0x260u), f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}), f.ImageAddress(),
+         processed},
+        f.AddMemory(sample, 0x260u));
+    f.Emit(ValueOpcode::ReferenceU32, {f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)})});
+    // The sample's result lands in the input's register on the lanes it processed.
+    const auto written = f.Emit(ValueOpcode::SelectU32,
+        {variant == Variant::UnguardedWrite ? other : f.Emit(ValueOpcode::LogicalAnd, {processed, other}),
+         f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(3u)}), Value(&value)});
+    body->AddBranch(latch);
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    f.block = latch;
+    const auto repeat = variant == Variant::UnguardedRepeat
+                            ? other
+                            : f.Emit(ValueOpcode::INotEqual32, {f.Emit(ValueOpcode::BitwiseOr32, {next0, next1}),
+                                                                Value(0u)});
+    latch->condition = f.Emit(ValueOpcode::ConditionRef, {repeat}, CFG::BranchCondition::SccNonZero);
+    latch->AddBranch(header);
+    latch->AddBranch(exit);
+    latch->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header, .false_block = exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    value.AddPhiOperand(entry, input);
+    value.AddPhiOperand(latch, written);
+    mask0.AddPhiOperand(entry, live0);
+    mask0.AddPhiOperand(latch, next0);
+    mask1.AddPhiOperand(entry, live1);
+    mask1.AddPhiOperand(latch, next1);
+    if (variant != Variant::Waterfall && variant != Variant::Direct) {
+      std::string refusal = "accepted";
+      try {
+        f.PlanAndTrack();
+      } catch (const std::runtime_error &error) {
+        refusal = error.what();
+      }
+      Check(refusal.find("not a valid runtime value") != std::string::npos,
+            ("pixel input key accepted a difference, an unguarded write, a kept mask or an unguarded repeat: " +
+             std::to_string(static_cast<int>(variant)) + " " + refusal).c_str());
+      continue;
+    }
+    f.PlanAndTrack();
+    const auto &source = f.program.descriptor_sources[f.program.info.images[0].source];
+    Check(source.indirect_descriptor && source.indirect_descriptor->parameter == 5u * 4u &&
+              source.indirect_descriptor->table_stride == 32u,
+          "drained waterfall over a flat pixel input lost its parameter key");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -9338,6 +9583,9 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("parameter key ops", TestParameterKeyOpSemantics);
+    Run("parameter key function", TestParameterKeyFunction);
+    Run("pixel input waterfall key", TestPixelInputWaterfallKey);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

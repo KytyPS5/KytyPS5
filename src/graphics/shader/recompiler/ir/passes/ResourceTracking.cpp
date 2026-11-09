@@ -1973,6 +1973,219 @@ private:
 		});
 	}
 
+	// The pixel input a P0 interpolation reads, as location * 4 + channel.
+	static bool PixelInputParameter(Value value, uint32_t& parameter) {
+		const auto* input    = value.Resolve().TryInstruction();
+		uint32_t    location = 0;
+		uint32_t    channel  = 0;
+		uint32_t    vertex   = 0;
+		// P0 is a vertex's exported value; P10 and P20 are differences of two.
+		if (input == nullptr || input->GetOpcode() != ValueOpcode::GetInterpolationParameter ||
+		    !ImmediateU32(input->Arg(0), location) || !ImmediateU32(input->Arg(1), channel) ||
+		    !ImmediateU32(input->Arg(2), vertex) || vertex != 2u || channel >= 4u ||
+		    location >= 32u)
+			return false;
+		parameter = location * 4u + channel;
+		return true;
+	}
+
+	// Whether value equals the loop value phi on every lane processed leaves false: a Phi of such
+	// values, or a select that only writes processed lanes. A cycle keeps the invariant it assumes.
+	bool KeepsUnprocessed(Value value, const Inst& phi, Value processed,
+	                      std::vector<const Inst*>& visited, uint32_t depth = 0) const {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == &phi) return true;
+		if (inst == nullptr || depth > 256u) return false;
+		if (std::ranges::find(visited, inst) != visited.end()) return true;
+		visited.push_back(inst);
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			for (size_t index = 0; index < inst->NumArgs(); ++index)
+				if (!KeepsUnprocessed(inst->Arg(index), phi, processed, visited, depth + 1u))
+					return false;
+			return true;
+		}
+		if (inst->GetOpcode() != ValueOpcode::SelectU32) return false;
+		if (!KeepsUnprocessed(inst->Arg(2), phi, processed, visited, depth + 1u)) return false;
+		return Implies(inst->Arg(0), processed) ||
+		       KeepsUnprocessed(inst->Arg(1), phi, processed, visited, depth + 1u);
+	}
+
+	// Word word of the lanes a pixel wave launched: its live mask, or WQM of it.
+	static bool LaunchedWord(Value value, uint32_t word, bool wqm) {
+		const auto* extract = value.Resolve().TryInstruction();
+		uint32_t    index   = 0;
+		if (extract == nullptr || extract->NumArgs() != 2u ||
+		    !ImmediateU32(extract->Arg(1), index) || index != word)
+			return false;
+		const auto* source = extract->Arg(0).Resolve().TryInstruction();
+		if (source == nullptr) return false;
+		if (extract->GetOpcode() == ValueOpcode::CompositeExtractU32x4)
+			return source->GetOpcode() == ValueOpcode::LiveMask;
+		if (!wqm || extract->GetOpcode() != ValueOpcode::CompositeExtractU64 ||
+		    source->GetOpcode() != ValueOpcode::WqmU64)
+			return false;
+		const auto* wide = source->Arg(0).Resolve().TryInstruction();
+		return wide != nullptr && wide->GetOpcode() == ValueOpcode::CompositeConstructU64 &&
+		       LaunchedWord(wide->Arg(0), 0u, false) && LaunchedWord(wide->Arg(1), 1u, false);
+	}
+
+	// The mask word value a FindILsb32 scans, or null.
+	static const Inst* ScannedWord(Value value) {
+		const auto* find = value.Resolve().TryInstruction();
+		return find != nullptr && find->GetOpcode() == ValueOpcode::FindILsb32
+		           ? find->Arg(0).Resolve().TryInstruction()
+		           : nullptr;
+	}
+
+	// The mask words whose first set lane a ReadLane index names, low word first.
+	static std::vector<const Inst*> FirstLaneWords(Value index) {
+		const auto* masked = index.Resolve().TryInstruction();
+		uint32_t    lanes  = 0;
+		if (masked == nullptr || masked->GetOpcode() != ValueOpcode::BitwiseAnd32) return {};
+		Value scan;
+		for (uint32_t arg = 0; arg < 2u; ++arg)
+			if (ImmediateU32(masked->Arg(arg), lanes) && (lanes == 31u || lanes == 63u))
+				scan = masked->Arg(arg ^ 1u);
+		if (scan.IsEmpty()) return {};
+		if (const auto* low = ScannedWord(scan)) return {low};
+		const auto* both = scan.Resolve().TryInstruction();
+		if (both == nullptr || both->GetOpcode() != ValueOpcode::UMin32 || lanes != 63u) return {};
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
+			const auto* high = both->Arg(arg ^ 1u).Resolve().TryInstruction();
+			uint32_t    half = 0;
+			if (high == nullptr || high->GetOpcode() != ValueOpcode::BitwiseOr32) continue;
+			for (uint32_t side = 0; side < 2u; ++side) {
+				const auto* low_word  = ScannedWord(both->Arg(arg));
+				const auto* high_word = ScannedWord(high->Arg(side ^ 1u));
+				if (ImmediateU32(high->Arg(side), half) && half == 32u && low_word != nullptr &&
+				    high_word != nullptr)
+					return {low_word, high_word};
+			}
+		}
+		return {};
+	}
+
+	// The predicate whose ballot word word value is, optionally masked by the launched lanes;
+	// those are never in a waterfall mask, so the masked ballot drops the same lanes.
+	static Value DroppedLanes(const Inst* value, uint32_t word, bool masked = true) {
+		uint32_t component = 0;
+		if (value == nullptr) return {};
+		if (value->GetOpcode() == ValueOpcode::CompositeExtractU32x4 &&
+		    ImmediateU32(value->Arg(1), component) && component == word) {
+			const auto* ballot = value->Arg(0).Resolve().TryInstruction();
+			return ballot != nullptr && ballot->GetOpcode() == ValueOpcode::Ballot
+			           ? ballot->Arg(0).Resolve()
+			           : Value {};
+		}
+		if (!masked || value->GetOpcode() != ValueOpcode::BitwiseAnd32) return {};
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
+			if (!LaunchedWord(value->Arg(arg ^ 1u), word, true)) continue;
+			const auto dropped =
+			    DroppedLanes(value->Arg(arg).Resolve().TryInstruction(), word, false);
+			if (!dropped.IsEmpty()) return dropped;
+		}
+		return {};
+	}
+
+	// A drained waterfall: phi starts as input on the live lanes, and its lane index is the first
+	// lane of a mask that starts live and drops each lane processed is true for. Each loop write
+	// to phi only reaches processed lanes, so every lane left in the mask still holds input.
+	bool WaterfallKeepsInput(const Inst& read, const Inst& phi, uint32_t& parameter) const {
+		if (phi.GetOpcode() != ValueOpcode::Phi || phi.NumArgs() != 2u || phi.Parent() == nullptr)
+			return false;
+		uint32_t carried = 2u;
+		for (uint32_t arm = 0; arm < 2u; ++arm)
+			if (Dominates(phi.Parent(), phi.PhiBlock(arm))) carried = arm;
+		if (carried == 2u || Dominates(phi.Parent(), phi.PhiBlock(carried ^ 1u))) return false;
+		auto initial = phi.Arg(carried ^ 1u).Resolve();
+		if (const auto invariant = ResolveInvariantPhi(m_program, initial); !invariant.IsEmpty())
+			initial = invariant;
+		if (!PixelInputParameter(initial, parameter)) return false;
+		const auto words = FirstLaneWords(read.Arg(1));
+		if (words.empty()) return false;
+		Value              processed;
+		std::vector<Value> next_words;
+		for (uint32_t word = 0; word < words.size(); ++word) {
+			const auto* mask = words[word];
+			if (mask->GetOpcode() != ValueOpcode::Phi || mask->Parent() != phi.Parent() ||
+			    mask->NumArgs() != 2u || mask->PhiBlock(carried) != phi.PhiBlock(carried) ||
+			    !LaunchedWord(mask->Arg(carried ^ 1u), word, false))
+				return false;
+			// The next mask is mask & ~dropped lanes.
+			const auto  next = mask->Arg(carried).Resolve();
+			const auto* drop = next.TryInstruction();
+			if (drop == nullptr || drop->GetOpcode() != ValueOpcode::BitwiseAnd32) return false;
+			Value dropped;
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				const auto* inverse = drop->Arg(arg ^ 1u).Resolve().TryInstruction();
+				if (drop->Arg(arg).Resolve().TryInstruction() == mask && inverse != nullptr &&
+				    inverse->GetOpcode() == ValueOpcode::BitwiseNot32)
+					dropped = DroppedLanes(inverse->Arg(0).Resolve().TryInstruction(), word);
+			}
+			if (dropped.IsEmpty() ||
+			    (!processed.IsEmpty() && !EquivalentValue(m_program, dropped, processed)))
+				return false;
+			processed = dropped;
+			next_words.push_back(next);
+		}
+		// The loop repeats only while the mask still has a lane, so the index names a mask lane.
+		const auto  edge = ConditionalEdge(phi.PhiBlock(carried), phi.Parent());
+		const auto* repeat =
+		    edge && edge->positive ? SimplifyGuard(edge->condition).TryInstruction() : nullptr;
+		if (repeat == nullptr || repeat->GetOpcode() != ValueOpcode::INotEqual32) return false;
+		Value tested;
+		for (uint32_t arg = 0; arg < 2u; ++arg)
+			if (repeat->Arg(arg).Resolve() == Value(0u)) tested = repeat->Arg(arg ^ 1u);
+		if (tested.IsEmpty()) return false;
+		std::vector<Value> terms;
+		std::vector<Value> pending {tested};
+		while (!pending.empty() && terms.size() < 8u) {
+			const auto  term = pending.back().Resolve();
+			const auto* inst = term.TryInstruction();
+			pending.pop_back();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseOr32) {
+				pending.push_back(inst->Arg(0));
+				pending.push_back(inst->Arg(1));
+			} else {
+				terms.push_back(term);
+			}
+		}
+		const auto is_next = [&](Value term) {
+			return std::ranges::find(next_words, term) != next_words.end();
+		};
+		if (!pending.empty() ||
+		    !std::ranges::all_of(
+		        next_words,
+		        [&](Value next) { return std::ranges::find(terms, next) != terms.end(); }) ||
+		    !std::ranges::all_of(terms,
+		                         [&](Value term) { return term == Value(0u) || is_next(term); }))
+			return false;
+		std::vector<const Inst*> visited;
+		return KeepsUnprocessed(phi.Arg(carried), phi, processed, visited);
+	}
+
+	// A lane's copy of a pixel input's vertex value: the keys are the values the draw's vertex
+	// stage can export to it, which the renderer lists.
+	bool PixelParameterKey(Value key, DescriptorSource::IndirectDescriptor& indirect) const {
+		if (m_program.stage != ShaderType::Pixel) return false;
+		const auto* read = key.Resolve().TryInstruction();
+		if (read == nullptr || (read->GetOpcode() != ValueOpcode::ReadLane &&
+		                        read->GetOpcode() != ValueOpcode::ReadFirstLane))
+			return false;
+		auto source = read->Arg(0).Resolve();
+		if (const auto invariant = ResolveInvariantPhi(m_program, source); !invariant.IsEmpty())
+			source = invariant.Resolve();
+		uint32_t    parameter = 0;
+		const auto* phi       = source.TryInstruction();
+		if (!PixelInputParameter(source, parameter) &&
+		    (read->GetOpcode() != ValueOpcode::ReadLane || phi == nullptr ||
+		     !WaterfallKeepsInput(*read, *phi, parameter)))
+			return false;
+		indirect.parameter = parameter;
+		return true;
+	}
+
 	// A zero-based key that only per-lane data bounds takes the count all uniform zero-based
 	// loops in the program share, assuming each lane's count stays within it.
 	bool ProgramLoopCount(Value key, DescriptorSource::IndirectDescriptor& indirect) const {
@@ -3442,7 +3655,7 @@ private:
 					plan.retain_reads = true;
 				} else if (maximum < MaxIndirectDescriptorProbes)
 					indirect.key_count = Value(maximum + 1u);
-				else if (!ProgramLoopCount(key, indirect))
+				else if (!PixelParameterKey(key, indirect) && !ProgramLoopCount(key, indirect))
 					return false;
 			}
 			if ((table_offset & 3u) != 0u) return false;

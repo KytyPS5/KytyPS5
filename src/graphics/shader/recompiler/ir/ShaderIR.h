@@ -633,6 +633,8 @@ struct DescriptorSource {
 		// Nonzero shift: workgroup keys are (selector_first + ID) * multiplier >> shift.
 		uint32_t workgroup_multiplier = 0;
 		uint32_t workgroup_shift      = 0;
+		// Pixel input (location * 4 + channel) whose vertex values the draw lists as keys.
+		uint32_t parameter = UINT32_MAX;
 		Value    key_count;
 		// First selector index, workgroup key base, or first descriptor key for a direct or bitmap
 		// range.
@@ -685,6 +687,15 @@ struct UniformFillPlan {
 	Value                element_count;
 };
 
+// A vertex stage's exported parameter component (location * 4 + channel) as a function of
+// user data, scalar memory and buffer records indexed by the vertex index.
+struct ParameterKey {
+	uint32_t parameter = 0;
+	Value    value;
+
+	bool operator==(const ParameterKey& other) const = default;
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -713,6 +724,7 @@ struct ResourcePlan {
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
+	std::vector<ParameterKey>                              parameter_keys;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

@@ -80,7 +80,8 @@ void CycleKeyboardPlayer();
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
-void SetTouchPad(int id, int finger, bool down, float x, float y);
+// A host input controller touch also presses the touch pad button unless click is false.
+void SetTouchPad(int id, int finger, bool down, float x, float y, bool click = true);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
 void ResetInputState();

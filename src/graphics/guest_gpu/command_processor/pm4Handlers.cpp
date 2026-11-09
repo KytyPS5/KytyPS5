@@ -764,9 +764,23 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP, Pm4::SH_NOP};
 
-	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
+	// Following packets with the same other words, each drawing the record after the previous one,
+	// draw the records of a multi-draw without a draw index.
+	constexpr uint32_t packet_dw = 5;
+	const uint32_t     record_size =
+	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+	uint32_t count = 1;
+	for (uint32_t at = 4; at + packet_dw < dw; at += packet_dw, count++) {
+		const auto* next = buffer + at;
+		if (next[0] != cmd_id || next[1] != uint64_t {next[-4]} + record_size ||
+		    next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) {
+			break;
+		}
+	}
+	cp.DrawIndirectMulti(data_offset, count, nullptr, record_size, registers, draw_initiator,
+	                     indexed);
 
-	return 4;
+	return 4 + packet_dw * (count - 1);
 }
 
 KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {

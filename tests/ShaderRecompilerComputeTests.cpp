@@ -15970,7 +15970,7 @@ public:
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t allocation_size = 0x2000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -16826,6 +16826,7 @@ public:
                 store.desc.info.extent.width == 1920 &&
                     store.desc.info.extent.height == 1080 &&
                     store.desc.info.resources.levels == 7 &&
+                    address + store.desc.info.data.size <= base + allocation_size &&
                     store.desc.view_info.base_level == 6,
                 "ASTRO BOT's mip 6 of a six-level 1920x1080 chain left the chain");
       }

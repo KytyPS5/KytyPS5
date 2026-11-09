@@ -55177,6 +55177,21 @@ void CheckPm4Flip() {
     processor.BufferFlush();
   });
 
+  // A present stalled on the graphics queue leaves the port readable.
+  std::binary_semaphore queried{0};
+  int pending = -1;
+  window.graphic_ctx.queue_mutex.Lock();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  std::thread reader([&] {
+    pending = VideoOut::VideoOutIsFlipPending(handle);
+    queried.release();
+  });
+  const bool readable = queried.try_acquire_for(std::chrono::seconds(1));
+  window.graphic_ctx.queue_mutex.Unlock();
+  reader.join();
+  Require(name, "flip pending during present", readable && pending == 1,
+          "the present held the port lock");
+
   EventQueue::KernelEvent event{};
   int count = 0;
   LibKernel::KernelUseconds timeout = 2'000'000;

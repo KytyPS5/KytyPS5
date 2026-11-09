@@ -54605,6 +54605,44 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   check_offsets(auto_packet, gs, {41, 7, 8}, "GPU records");
   indexed_packet[3] |= 1u << 28u;
   check_offsets(indexed_packet, gs, {17, 19, 61}, "first-index destination");
+
+  // Packets that differ only in data offsets, each drawing the record after the
+  // previous one, draw as one multi-draw; the SGPRs end as the last record's.
+  arguments = {0, 1, 2, 3, 4, 0, 1, 5, 6, 7, 0, 1, 8, 9, 10, 0, 1, 11, 12, 13};
+  std::array<uint32_t, 20> run{};
+  for (uint32_t i = 0; i < 4; i++) {
+    std::copy(indexed_packet.begin(), indexed_packet.end(),
+              run.begin() + i * 5);
+    run[i * 5 + 1] = i * 20;
+  }
+  const auto drawn = [&](std::array<uint32_t, 20> commands, uint32_t dw = 20) {
+    const auto payload_dw =
+        CpOpDrawIndirect(processor, commands[0], commands.data() + 1, dw, dw);
+    return payload_dw / 5 + 1;
+  };
+  Require("Pm4DrawIndirectMulti", "contiguous run",
+          drawn(run) == 4 &&
+              std::equal(gs + 9, gs + 12, std::array{12u, 13u, 11u}.begin()) &&
+              drawn(run, 19) == 3,
+          "a run of indirect draws was not drawn as one multi-draw");
+  auto predicated = run;
+  predicated[10] |= 1u;
+  auto other_initiator = run;
+  other_initiator[9] = 0x20;
+  auto overlapping = run;
+  overlapping[6] = 16;
+  auto gap = run;
+  gap[11] = 44;
+  // The next record past a 32-bit data offset of 0xffffffec is not at offset 0.
+  auto wrapped = run;
+  wrapped[1] = 0xffffffecu;
+  wrapped[6] = 0;
+  const bool ended = drawn(predicated) == 2 && drawn(other_initiator) == 1 &&
+                     drawn(overlapping) == 1 && drawn(gap) == 2;
+  processor.SetDrawIndirectArgsBaseAddress(
+      reinterpret_cast<uint64_t>(arguments.data()) - 0xffffffecu);
+  Require("Pm4DrawIndirectMulti", "run end", ended && drawn(wrapped) == 1,
+          "an indirect draw run took a packet that draws differently");
   processor.BufferFlush();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }

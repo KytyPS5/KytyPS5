@@ -108,7 +108,6 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   AddValueBlock(program);
-  program.info.uses_dma = true;
   return Extract(program);
 }
 

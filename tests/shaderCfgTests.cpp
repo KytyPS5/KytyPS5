@@ -3464,6 +3464,40 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
             ShaderRecompiler::IR::ResourceKind::ScalarBuffer) == 1u,
         "descriptor scalar load did not remain a live typed buffer operation");
   CheckSpirvBinaryValidates(buffer.spirv);
+
+  // A V# read at a dynamic SRT offset is evaluated on the host and leaves no
+  // GPU address load behind.
+  const uint32_t dynamic_shader[] = {
+      EncodeSmem0(0x02, 12, 4),
+      0u, // s_load_dwordx4 s[12:15], s[8:9], s0
+      EncodeSmem0(0x08, 16, 6),
+      125u << 25u, // s_buffer_load_dword s16, s[12:15], 0x0
+      EncodeVop1(0x01, 0, 16),
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 8> table{};
+  table[4] = 0x2000u;
+  table[6] = 4u;
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 12> dynamic_user_data{};
+  dynamic_user_data[0] = 16u;
+  dynamic_user_data[8] = static_cast<uint32_t>(table_address);
+  dynamic_user_data[9] = static_cast<uint32_t>(table_address >> 32u);
+
+  auto dynamic_options = MakeCompileOptions(ShaderType::Pixel);
+  dynamic_options.user_data = dynamic_user_data;
+
+  auto dynamic = RecompileForTest(dynamic_shader, dynamic_options);
+  const auto& dynamic_counts = dynamic.program.bindings.descriptor_counts;
+  Check(dynamic.program.info.buffers.size() == 1u &&
+            dynamic.program.info.buffers[0].live &&
+            !dynamic.program.info.uses_dma &&
+            dynamic_counts[static_cast<size_t>(BindingKind::Buffers)] == 1 &&
+            dynamic_counts[static_cast<size_t>(BindingKind::BdaPagetable)] == 0,
+        "host-evaluated dynamic V# read kept the DMA domain");
+  CheckSpirvBinaryValidates(dynamic.spirv);
 }
 
 void TestImageAddressOperands() {

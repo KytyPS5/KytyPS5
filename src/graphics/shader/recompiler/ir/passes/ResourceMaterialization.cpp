@@ -1290,7 +1290,7 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 }
 
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}

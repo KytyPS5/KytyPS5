@@ -173,8 +173,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
-	// META_PIPE_ALIGNED only affects metadata addressing, which a clear COMPRESSION_EN disables.
-	const auto         metadata_control = descriptor.fields[6] & 0x00ffffffu;
+	// Bits 0-7 name the mip-stats counter. META_PIPE_ALIGNED only affects metadata addressing,
+	// which a clear COMPRESSION_EN disables.
+	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
 	if ((metadata_control & ~pipe_aligned) == 0) {
 		return true;

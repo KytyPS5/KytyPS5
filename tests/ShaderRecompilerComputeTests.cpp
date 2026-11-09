@@ -51354,6 +51354,25 @@ void CheckDepthTextureEncoding() {
               IsSupportedDepthTextureEncoding(pipe_aligned_metadata),
           "uncompressed depth rejected inactive metadata address bits");
 
+  // Demon's Souls samples an uncompressed depth target whose T# names mip-stats
+  // counter 8 with the counter disabled.
+  const ShaderTextureResource mip_stats_counter{{
+      0x02766800u,
+      0xc1600000u,
+      0x0167c27fu,
+      0x91800924u,
+      0x00000000u,
+      0x00700000u,
+      0x00000008u,
+      0x00000002u,
+  }};
+  auto compressed_mip_stats_counter = compressed_descriptor;
+  compressed_mip_stats_counter.fields[6] |= 0xffu;
+  Require("DepthTextureEncoding", "mip-stats counter id",
+          IsSupportedDepthTextureEncoding(mip_stats_counter) &&
+              IsSupportedDepthTextureEncoding(compressed_mip_stats_counter),
+          "depth descriptor rejected its mip-stats counter id");
+
   const ShaderTextureResource first_use_depth{{
       0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
       0x00000000u, 0x00700000u, 0x80280000u, 0x000225fdu,

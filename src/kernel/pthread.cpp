@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -3190,6 +3191,7 @@ static void CleanupThread(void* arg) {
 }
 
 static void* RunThread(void* arg) {
+	Common::WriteFpEnv(Common::GuestFpEnv);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {

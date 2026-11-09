@@ -138,9 +138,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
-// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state.
+// Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state and the
+// mip-stats counter only counts sampling.
 static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
-	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
+	constexpr uint32_t field1_reserved_mask = 1u << 29u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	const uint32_t     field3_expected = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
@@ -149,6 +150,7 @@ static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, 
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	const uint32_t     field4_expected = descriptor.Depth() | (descriptor.BaseArray5() << 16u);
 	const uint32_t     field5_expected = (static_cast<uint32_t>(descriptor.PerfMod5()) << 20u) |
+	                                     (uint32_t {descriptor.MipStatsCntEn()} << 25u) |
 	                                     (static_cast<uint32_t>(descriptor.MaxMip()) << 4u);
 	if ((descriptor.fields[1] & field1_reserved_mask) != 0 ||
 	    (descriptor.fields[2] & field2_reserved_mask) != 0 || descriptor.fields[3] != field3_expected) {
@@ -171,10 +173,11 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	if (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type())) {
 		return false;
 	}
-	// META_PIPE_ALIGNED only affects metadata addressing, which a clear COMPRESSION_EN disables.
-	const auto         metadata_control = descriptor.fields[6] & 0x00ffffffu;
+	// Bits 0-7 name the mip-stats counter. A clear COMPRESSION_EN disables the metadata and its
+	// settings.
+	const auto         metadata_control = descriptor.fields[6] & 0x00ffff00u;
 	constexpr uint32_t pipe_aligned     = 1u << 19u;
-	if ((metadata_control & ~pipe_aligned) == 0) {
+	if (!descriptor.MetaCompress()) {
 		return true;
 	}
 	constexpr uint32_t htile_control = pipe_aligned | 1u << 21u;
@@ -285,10 +288,11 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	// A 4.8 fixed-point MIN_LOD at or below BASE_LEVEL clamps no level of the view.
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d || is_2d_msaa) &&
 	       supported_tile && descriptor.BaseLevel() <= descriptor.LastLevel() &&
-	       descriptor.MinLod() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
-	       !descriptor.MsaaDepth();
+	       descriptor.MinLod() <= descriptor.BaseLevel() * 256u && supported_swizzle &&
+	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -419,7 +423,14 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	if (!info.IsTiled()) {
 		return false;
 	}
-	ImageInfo physical        = info;
+	ImageInfo physical = info;
+	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
+	// compresses mip 1 through a T# that declares one level).
+	if (base_level >= physical_levels) {
+		const auto mip  = info.MipExtent(base_level);
+		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
+		physical_levels = view_levels;
+	}
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
 	info.UpdateSize();
@@ -484,8 +495,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (descriptor.IsNull()) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
-	// Image heap resolves do not follow the draws that sample them: they report no samples.
-	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap) {
+	// Image heap resolves do not follow the draws that sample them and storage access is not
+	// sampling: neither reports samples.
+	if (m_lod_stats && descriptor.MipStatsCntEn() && !resource.heap && !storage) {
 		auto&         counter = m_mip_stats[descriptor.MipStatsCntId()];
 		const uint8_t base    = descriptor.BaseLevel();
 		counter.finest_level  = std::min(counter.finest_level, base);

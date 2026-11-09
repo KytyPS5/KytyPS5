@@ -233,9 +233,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual64, false);
 			return;
 		case O::V_CMP_O_F64:
-		case O::V_CMPX_O_F64: EmitFloatOrderedCompare(inst, true, true); return;
+		case O::V_CMPX_O_F64: EmitFloatOrderedCompare(inst, true, IR::Type::F64); return;
 		case O::V_CMP_U_F64:
-		case O::V_CMPX_U_F64: EmitFloatOrderedCompare(inst, false, true); return;
+		case O::V_CMPX_U_F64: EmitFloatOrderedCompare(inst, false, IR::Type::F64); return;
 		case O::V_CMP_LG_F32:
 		case O::V_CMPX_LG_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdNotEqual32, false);
@@ -325,6 +325,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_O_F32: EmitFloatOrderedCompare(inst, true); return;
 		case O::V_CMP_U_F32:
 		case O::V_CMPX_U_F32: EmitFloatOrderedCompare(inst, false); return;
+		case O::V_CMP_U_F16: EmitFloatOrderedCompare(inst, false, IR::Type::F16); return;
 		case O::V_CMP_CLASS_F32:
 		case O::V_CMPX_CLASS_F32: EmitFloatClassCompare(inst); return;
 		case O::V_CMP_CLASS_F16:

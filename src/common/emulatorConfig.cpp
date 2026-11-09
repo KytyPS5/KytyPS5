@@ -221,6 +221,10 @@ bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
 }
 
+bool RelaxedShaderFloatEnabled() {
+	return g_config->relaxed_shader_float;
+}
+
 bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }

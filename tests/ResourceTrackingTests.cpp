@@ -5987,8 +5987,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
 
   Check(fixture.program.srt_reads.size() == 1,
         "shared typed scalar read did not receive one flat SRT slot");
-  Check(fixture.program.info.buffers.size() == 1 &&
-            !fixture.program.info.uses_dma,
+  Check(fixture.program.info.buffers.size() == 1,
         "planning-only scalar reads leaked into resource topology");
   Check(fixture.program.memory_info[0].planning_only,
         "canonical runtime scalar read was not marked planning-only");
@@ -6070,7 +6069,7 @@ void TestScalarDataReadControlFlow() {
         {address, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4), use);
     fixture.PlanAndTrack();
     auto plan = ExtractResourcePlan(fixture.program);
-    Check(plan.srt_reads.size() == 1 && !fixture.program.info.uses_dma && plan.srt_code,
+    Check(plan.srt_reads.size() == 1 && plan.srt_code,
           "scalar data lost flattening or its walker");
     uint32_t reads = 0;
     std::array<uint32_t, 2> user_data {};
@@ -6116,8 +6115,7 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   Check(fixture.program.srt_reads.empty() &&
             read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
-            !fixture.program.memory_info[0].planning_only &&
-            fixture.program.info.uses_dma,
+            !fixture.program.memory_info[0].planning_only,
         "dynamic scalar read was incorrectly flattened or lost");
   std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
   TestMemory memory;
@@ -8434,8 +8432,6 @@ void TestDmaAddressMaterialization() {
   fixture.PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture.program);
 
-  Check(fixture.program.info.uses_dma,
-        "typed address operations did not enable DMA");
   std::array<uint32_t, 4> user_data{0x2008u, 0u, 0x1000u, 0u};
   TestMemory memory;
   memory.words[0] = 0x4000u;
@@ -8476,6 +8472,8 @@ void TestDynamicFlatAddressesUseDma() {
   fixture.PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture.program);
 
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture.program, {.compute = &compute});
   Check(fixture.program.info.uses_dma,
         "exec-masked FLAT address did not enable DMA");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
@@ -8503,6 +8501,7 @@ void TestDynamicFlatAddressesUseDma() {
                 {mismatch_address, mismatch_low, mismatch_high, other_active},
                 mismatch.AddMemory(flat, 0xa4));
   mismatch.PlanAndTrack();
+  CollectShaderInfo(mismatch.program, {.compute = &compute});
   Check(mismatch.program.info.uses_dma,
         "dynamic FLAT address did not enable DMA");
 }

@@ -2174,9 +2174,19 @@ u32 EncodeD16AsD32(uint16_t value) {
   return std::bit_cast<u32>(static_cast<float>(value) / 65535.0f);
 }
 
+// The depth-feedback selectors use fully initialized descriptors and do not
+// need the byte-granular robust-buffer capabilities required by the full suite.
+enum class VulkanHarnessProfile {
+  kStrict,
+  kDepthFeedback,
+};
+
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  explicit VulkanHarness(VulkanHarnessProfile profile = VulkanHarnessProfile::kStrict)
+      : m_profile(profile) {
+    Init();
+  }
   ~VulkanHarness() { Destroy(); }
   // Host float min/max is used on AMD GPUs, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
@@ -23553,6 +23563,11 @@ public:
 #include "BvhMirrorGpuTests.inc"
 
 private:
+  [[nodiscard]] bool RequiresRobustAccess() const {
+    return m_profile == VulkanHarnessProfile::kStrict;
+  }
+
+  VulkanHarnessProfile m_profile = VulkanHarnessProfile::kStrict;
   bool m_rasterization_supported = true;
   bool m_feedback_dynamic_supported = false;
   u32   m_skipped_cases          = 0;
@@ -23773,13 +23788,15 @@ private:
     vk::PhysicalDeviceProperties2 properties2{};
     properties2.pNext = &robustness2_properties;
     m_physical_device.getProperties2(&properties2);
-    Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
-            "null descriptors are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_robustness2.robustBufferAccess2 == true &&
-                available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
-            "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    if (RequiresRobustAccess()) {
+      Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
+              "null descriptors are not supported");
+      Require("VulkanHarness", "dispatch",
+              available_robustness2.robustBufferAccess2 == true &&
+                  available_pipeline_robustness.pipelineRobustness == true &&
+                  robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+              "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -23922,14 +23939,18 @@ private:
     shader_clock.pNext = &min_lod;
     maintenance8.pNext = &shader_clock;
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness{};
-    pipeline_robustness.pipelineRobustness = true;
-    pipeline_robustness.pNext = &maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
-    robustness2.nullDescriptor = true;
-    robustness2.pNext = &pipeline_robustness;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
-    conditional_rendering.pNext = &robustness2;
+    if (RequiresRobustAccess()) {
+      pipeline_robustness.pipelineRobustness = true;
+      pipeline_robustness.pNext = &maintenance8;
+      robustness2.nullDescriptor = true;
+      robustness2.pNext = &pipeline_robustness;
+      conditional_rendering.pNext = &robustness2;
+    } else {
+      conditional_rendering.pNext = &maintenance8;
+    }
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     mesh.meshShader = mesh.taskShader = true;
     mesh.pNext = &conditional_rendering;
@@ -23961,8 +23982,6 @@ private:
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -56980,6 +56999,24 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-static-only") == 0) {
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
+    if (!vulkan.RasterizationSupported()) {
+      std::fprintf(stderr, "[gpu] rasterization feedback is unavailable\n");
+      return 1;
+    }
+    auto &graphics = vulkan.RuntimeContext();
+    if (!graphics.attachment_feedback_loop_enabled) {
+      std::fprintf(stderr, "[gpu] attachment feedback layout is unavailable\n");
+      return 1;
+    }
+    const bool dynamic = graphics.attachment_feedback_loop_dynamic_state_enabled;
+    graphics.attachment_feedback_loop_dynamic_state_enabled = false;
+    vulkan.CheckRasterization(true, Prospero::BufferFormat::k32_32_32_32Float,
+                               "DepthAttachmentFeedbackStatic");
+    graphics.attachment_feedback_loop_dynamic_state_enabled = dynamic;
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {

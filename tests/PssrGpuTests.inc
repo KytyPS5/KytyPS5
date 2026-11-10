@@ -138,6 +138,16 @@
       Require(name, "float16 input", run(input, output, 2, 1) ==
           std::vector<u32>{red, green}, "float16 input conversion failed");
 
+      constexpr u32 half_red = 0x380;
+      input = descriptor(base + 0xec000, 2, 1,
+          Prospero::BufferFormat::k16_16_16_16Float, linear);
+      output = descriptor(base + 0xee000, 2, 1, packed, tiled, DstSel(7, 5, 6, 4));
+      write_linear(input, std::array<u32, 4>{0x00003c00, 0x38000000,
+                                            0x3c000000, 0x38000000});
+      Require(name, "legacy alpha selection", run(input, output, 2, 1) ==
+          std::vector<u32>{half_red, half_red | green},
+          "a legacy request lost the source alpha its output swizzle stores in red");
+
       ImageDesc parent{};
       parent.type = BindingType::Texture;
       parent.info = MakeTilingImage(packed, 4, 2, 1, 2, tiled, 0, false);

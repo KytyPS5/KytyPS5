@@ -542,6 +542,7 @@ struct ShaderInfo {
 	bool                            uses_gds                      = false;
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
+	bool                            uses_device_address           = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;

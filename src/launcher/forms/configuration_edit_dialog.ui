@@ -256,9 +256,34 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. Disabled by default.</string></property>
               <property name="text"><string>PS5 Pro mode (experimental)</string></property>
              </widget>
+            </item>
+            <item>
+             <layout class="QFormLayout" name="pssrLayout">
+              <item row="0" column="0">
+               <widget class="QLabel" name="label_pssr_upscaler">
+                <property name="text"><string>PSSR upscaler:</string></property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QComboBox" name="comboBox_pssr_upscaler">
+                <property name="toolTip"><string>DLSS needs an NVIDIA RTX GPU</string></property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QLabel" name="label_dlss_folder">
+                <property name="text"><string>DLSS model folder:</string></property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_dlss_folder">
+                <property name="toolTip"><string>Folder with nvngx_dlss.dll (Windows) or libnvidia-ngx-dlss.so.* (Linux)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+             </layout>
             </item>
             <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
@@ -302,7 +327,7 @@
             <item>
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-              <property name="text"><string>AMD CPU patch (experimental)</string></property>
+              <property name="text"><string>Intel CPU compatibility (experimental)</string></property>
              </widget>
             </item>
             <item>

@@ -1960,12 +1960,13 @@ void TestVertexEntryMaskCoversRunningLanes() {
         0x906a8803u,
         0x81ea6a80u,
         0x90fe6ac1u,
+        EncodeVop1(v_mov_b32, 1, one_float),
         EncodeSop2(s_sub_i32, vcc_lo, count_base, packed_vertex_count),
         EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo)};
     shader.insert(shader.end(), later_exec);
     shader.insert(shader.end(),
                   {EncodeVop1(v_mov_b32, 0, value), EncodeExp0(0x0c, 0xf),
-                   EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)});
+                   EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01)});
     auto options = MakeCompileOptions(ShaderType::Vertex);
     options.wave_size = wave_size;
     const auto result = RecompileForTest(shader, options);
@@ -9577,6 +9578,11 @@ void TestLaneMaskProjection() {
     };
     const auto negated_bound = e.ISub(zero, bound);
     const auto bounded = bound_bit(UINT64_MAX, negated_bound);
+    const auto packed_bound = e.BitwiseOr(bound, U32(Value(1u << 28u)));
+    const auto second_count = U32(e.Emit(ValueOpcode::BitFieldUExtract,
+                                         {packed_bound, Value(8u), Value(8u)}));
+    const auto second_count_bounded =
+        bound_bit(UINT64_MAX, e.ISub(U32(Value(64u)), second_count));
     const auto first_bound_uncovered =
         bound_bit(UINT64_MAX >> 1u, e.ISub(bound, U32(Value(2u))));
     const auto last_bound_uncovered = wave_size == 64u
@@ -9622,7 +9628,8 @@ void TestLaneMaskProjection() {
           "constant EXEC mask retained lane extraction or register predication");
     Check(partial.Resolve().TryInstruction() != nullptr,
           "partial mask was incorrectly folded to a constant predicate");
-    Check(bounded.Resolve() == Value(true),
+    Check(bounded.Resolve() == Value(true) &&
+              second_count_bounded.Resolve() == Value(true),
           "a prefix mask of the lane bound still predicated a running lane");
     Check(
         first_bound_uncovered.Resolve().TryInstruction() != nullptr &&

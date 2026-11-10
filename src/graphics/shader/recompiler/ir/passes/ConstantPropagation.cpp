@@ -870,39 +870,46 @@ private:
 		return IsImmediate(value, Type::U32) && value.U32() == expected;
 	}
 
-	using BoundOperation = uint64_t (*)(uint64_t, uint64_t);
-
-	static BoundOperation OperationAtLaneBound(ValueOpcode opcode) {
-		switch (opcode) {
-			case ValueOpcode::BitwiseAnd32: return [](uint64_t a, uint64_t b) { return a & b; };
-			case ValueOpcode::BitwiseOr32: return [](uint64_t a, uint64_t b) { return a | b; };
-			case ValueOpcode::ISub32:
-				return
-				    [](uint64_t a, uint64_t b) -> uint64_t { return static_cast<uint32_t>(a - b); };
-			case ValueOpcode::ShiftRightLogical64:
-				return [](uint64_t a, uint64_t b) { return a >> (b & 63u); };
-			case ValueOpcode::CompositeExtractU64:
-				return [](uint64_t a, uint64_t b) -> uint64_t {
-					return static_cast<uint32_t>(b == 0u ? a : a >> 32u);
-				};
-			default: return nullptr;
-		}
-	}
-
 	std::optional<uint64_t> AtLaneBound(Value value, uint32_t bound) {
 		if (IsImmediate(value, Type::U32)) return value.U32();
 		if (IsImmediate(value, Type::U64)) return value.U64();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return std::nullopt;
 		if (inst->GetOpcode() == ValueOpcode::LaneBound) return bound;
-		if (const auto known = m_at_bound.find(inst); known != m_at_bound.end())
-			return known->second;
-		const auto operation = OperationAtLaneBound(inst->GetOpcode());
-		if (operation == nullptr) return std::nullopt;
-		const auto lhs = AtLaneBound(Arg(*inst, 0), bound);
-		const auto rhs = lhs ? AtLaneBound(Arg(*inst, 1), bound) : std::nullopt;
-		if (!rhs) return std::nullopt;
-		return m_at_bound.emplace(inst, operation(*lhs, *rhs)).first->second;
+		if (const auto found = m_at_bound.find(inst); found != m_at_bound.end())
+			return found->second;
+		bool       defined = true;
+		const auto arg     = [&](size_t index) {
+            const auto operand = defined ? AtLaneBound(Arg(*inst, index), bound) : std::nullopt;
+            defined            = operand.has_value();
+            return operand.value_or(0u);
+		};
+		uint64_t result = 0;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32: result = arg(0) & arg(1); break;
+			case ValueOpcode::BitwiseOr32: result = arg(0) | arg(1); break;
+			case ValueOpcode::ISub32: result = static_cast<uint32_t>(arg(0) - arg(1)); break;
+			case ValueOpcode::ShiftRightLogical64: result = arg(0) >> (arg(1) & 63u); break;
+			case ValueOpcode::CompositeExtractU64:
+				result = static_cast<uint32_t>(arg(0) >> (arg(1) == 0u ? 0u : 32u));
+				break;
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = arg(1);
+				defined          = defined && shift < 32u;
+				result           = arg(0) >> (shift & 31u);
+				break;
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = arg(1);
+				const auto count  = arg(2);
+				defined           = defined && offset + count <= 32u;
+				result = defined ? (arg(0) >> offset) & ((uint64_t {1} << count) - 1u) : 0u;
+				break;
+			}
+			default: return std::nullopt;
+		}
+		if (!defined) return std::nullopt;
+		return m_at_bound.emplace(inst, result).first->second;
 	}
 
 	static bool SelectsWordByLaneHalf(const Inst& select) {

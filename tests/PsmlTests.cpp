@@ -27,8 +27,11 @@ bool SystemContentIsTrinityMode() { return g_trinity; }
 
 namespace {
 
+namespace Gpu = Libs::Graphics::Prospero;
 namespace Pm4 = Libs::Graphics::Pm4;
 namespace Pssr = Libs::Graphics::Pssr;
+
+constexpr uint32_t MFSR2_REQUEST = 1u << 4;
 
 constexpr int ERROR_ALREADY_INITIALIZED = static_cast<int>(0x8a810002u);
 constexpr int ERROR_TOO_MANY_CONTEXTS = static_cast<int>(0x8a810004u);
@@ -158,6 +161,13 @@ std::array<uint32_t, 8> Texture(uint32_t width, uint32_t height,
   result[2] = ((width - 1) >> 2) | ((height - 1) << 14);
   result[3] = (9u << 28) | (1u << 20) | 0xfacu;
   return result;
+}
+
+std::array<uint32_t, 8> WithFormat(std::array<uint32_t, 8> texture,
+                                   Gpu::BufferFormat format) {
+  texture[1] =
+      (texture[1] & ~(0x1ffu << 20)) | (static_cast<uint32_t>(format) << 20);
+  return texture;
 }
 
 class PsmlTest : public testing::Test {
@@ -478,6 +488,32 @@ TEST_F(PsmlTest, DispatchChecksDescriptorContractAndSelectedMip) {
             ERROR_OUTPUT_TEXTURE);
   EXPECT_TRUE(std::all_of(command.begin(), command.end(),
                           [](uint32_t value) { return value == 0xdeadbeef; }));
+}
+
+TEST_F(PsmlTest, DispatchRejectsOutputsOnlyMfsr2Takes) {
+  auto output = Texture(960, 540, 0x10000);
+  const auto input = Texture(960, 540, 0x20000);
+  DispatchParameters params{.output = output.data(),
+                            .input = input.data(),
+                            .width = 960,
+                            .height = 540};
+  std::array<uint32_t, Pssr::RequestDwords + 1> command{};
+  const CommandSpace space{command.data(), command.size()};
+  ASSERT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params), 0);
+  Pssr::Request request;
+  std::memcpy(&request, command.data() + 1, sizeof(request));
+  EXPECT_EQ(request.flags & MFSR2_REQUEST, 0u);
+  for (const auto format : {Gpu::BufferFormat::k16_16_16_16Float,
+                            Gpu::BufferFormat::k10_11_11Float}) {
+    output = WithFormat(Texture(960, 540, 0x10000), format);
+    EXPECT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params),
+              ERROR_OUTPUT_TEXTURE)
+        << static_cast<uint32_t>(format);
+  }
+  output = Texture(960, 540, 0x10000);
+  output[5] |= 1u << 4;
+  EXPECT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params),
+            ERROR_OUTPUT_TEXTURE);
 }
 
 constexpr int MFSR2_NOT_INITIALIZED = static_cast<int>(0x8a8a0001u);
@@ -818,6 +854,40 @@ TEST_F(PsmlMfsr2Test, DispatchChecksParametersAndResetsANewContext) {
   context = NewContext(1920, 1080, 8);
   EXPECT_EQ(dispatch(0), Pssr::kReset);
   EXPECT_EQ(dispatch(0), 0u);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+}
+
+TEST_F(PsmlMfsr2Test, DispatchMarksItsRequestAndTakesEveryUpscalerOutput) {
+  void *context = NewContext(1920, 1080, 8);
+  auto output = WithFormat(Texture(1920, 1080, 0x10000),
+                           Gpu::BufferFormat::k16_16_16_16Float);
+  const auto color = Texture(1280, 720, 0x20000);
+  Mfsr2DispatchParameters params{.output = output.data(),
+                                 .color = color.data(),
+                                 .width = 1280,
+                                 .height = 720,
+                                 .encoding = 2,
+                                 .flags = 9};
+  std::vector<uint32_t> command(0x800);
+  const CommandSpace space{command.data(), 0x800};
+  const auto dispatch = [&] {
+    EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, &space, &params), 0);
+    Pssr::Request request;
+    std::memcpy(&request, command.data() + 1, sizeof(request));
+    return request;
+  };
+  const uint32_t game_flags =
+      MFSR2_REQUEST | Pssr::kReverseDepth | Pssr::kSpatialOnly;
+  EXPECT_EQ(dispatch().flags, game_flags | Pssr::kReset);
+  output = WithFormat(output, Gpu::BufferFormat::k10_11_11Float);
+  output[3] &= ~(0x1fu << 20);
+  output[5] |= 3u << 4;
+  const auto request = dispatch();
+  EXPECT_EQ(std::to_array(request.output), output);
+  EXPECT_EQ(request.flags, game_flags);
+  output = WithFormat(output, Gpu::BufferFormat::k8_8_8_8UNorm);
+  EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, &space, &params),
+            MFSR2_INVALID_TEXTURE);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
 }
 

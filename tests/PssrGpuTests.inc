@@ -69,12 +69,14 @@
         LibKernel::Memory::WriteBacking(texture.Base40(), words.data(), info.data.size);
       };
       const auto run = [&](const ShaderTextureResource &input,
-                            const ShaderTextureResource &output, u32 width, u32 height) {
+                            const ShaderTextureResource &output, u32 width, u32 height,
+                            u32 flags = 0) {
         Pssr::Request request{};
         std::copy_n(input.fields, 8, request.input);
         std::copy_n(output.fields, 8, request.output);
         request.width = width;
         request.height = height;
+        request.flags = flags;
         // The reserved packet includes trailing words that the parser must consume.
         constexpr u32 reserved_words = Pssr::RequestDwords + 9;
         std::vector<u32> packet(reserved_words, 0xdeadbeef);
@@ -216,6 +218,36 @@
       Require(name, "resolved source mip", run(input, output, 64, 32) ==
           std::vector<u32>(64 * 32, green),
           "upscaling read mip zero instead of the resolved mip");
+
+      constexpr u32 mfsr2 = 1u << 4;
+      constexpr auto half4 = Prospero::BufferFormat::k16_16_16_16Float;
+      constexpr auto reversed = Prospero::BufferFormat::k10_11_11Float;
+      input = descriptor(base + 0xb0000, 2, 1, packed, linear);
+      output = descriptor(base + 0xb8000, 4, 1, half4, tiled);
+      write_linear(input, std::array<u32, 2>{red, green});
+      Require(name, "mfsr2 float16 output", run(input, output, 2, 1, mfsr2) ==
+          std::vector<u32>{0x00003c00, 0x3c000000, 0x34003a00, 0x3c000000,
+                           0x3a003400, 0x3c000000, 0x3c000000, 0x3c000000},
+          "an mfsr2 float16 output was rejected, missed pixels or lost its opaque alpha");
+
+      input = descriptor(base + 0xf4000, 2, 1, half4, linear);
+      output = descriptor(base + 0xf6000, 2, 1, half4, linear);
+      write_linear(input, std::array<u32, 4>{0x00003c00, 0x00000000,
+                                            0x3c000000, 0x38000000});
+      Require(name, "mfsr2 opaque alpha", run(input, output, 2, 1, mfsr2) ==
+          std::vector<u32>{0x00003c00, 0x3c000000, 0x3c000000, 0x3c000000},
+          "the upscaled output kept the source alpha instead of an opaque one");
+
+      input = descriptor(base + 0xf8000, 2, 1, packed, linear);
+      output = descriptor(base + 0xfa000, 2, 1, reversed, tiled);
+      write_linear(input, std::array<u32, 2>{red, green});
+      Require(name, "mfsr2 10_11_11 output", run(input, output, 2, 1, mfsr2) ==
+          std::vector<u32>{blue, green},
+          "the 10_11_11 output stored red outside the guest X channel");
+      const auto readback = descriptor(base + 0xfc000, 2, 1, packed, tiled);
+      Require(name, "mfsr2 10_11_11 readback", run(output, readback, 2, 1) ==
+          std::vector<u32>{red, green},
+          "sampling the 10_11_11 output did not return the upscaled colors");
       context.UnmapMemory(base, size);
       scheduler.Finish();
     });

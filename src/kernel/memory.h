@@ -132,6 +132,10 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Reads one byte from each of count addresses spaced stride apart under one lock. Returns
+// false if any address is unmapped, in which case out is unspecified.
+bool                   TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count,
+                                             uint8_t* out);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);

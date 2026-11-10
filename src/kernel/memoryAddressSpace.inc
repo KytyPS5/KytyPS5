@@ -216,6 +216,51 @@ public:
 		return true;
 	}
 
+	// Reads one byte from each of count addresses spaced stride apart under a single shared
+	// lock. The result matches count separate one-byte TryReadBacking calls. The contents of
+	// out are unspecified when this returns false.
+	bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out) {
+		if (out == nullptr || count == 0) {
+			return false;
+		}
+		// The last address must stay below UINT64_MAX, as a one-byte TryReadBacking requires.
+		// Dividing back detects a wrapped multiplication.
+		const uint64_t last_index  = static_cast<uint64_t>(count) - 1;
+		const uint64_t last_offset = stride * last_index;
+		if ((stride != 0 && last_offset / stride != last_index) ||
+		    UINT64_MAX - first <= last_offset) {
+			return false;
+		}
+
+		std::shared_lock lock(m_mutex);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			g_test_backing_read(first, last_offset + 1);
+		}
+#endif
+		// Map entries are not coalesced, so a stride that leaves the current entry needs a
+		// fresh lookup even when the next page is mapped.
+		const MapEntry* entry = nullptr;
+		for (uint32_t index = 0; index < count; ++index) {
+			const auto address = first + stride * index;
+			// Addresses never decrease so the lower bound check is only a cheap safety net.
+			if (entry == nullptr || address < entry->vaddr ||
+			    address - entry->vaddr >= entry->size) {
+				auto found = m_maps.upper_bound(address);
+				if (found == m_maps.begin()) {
+					return false;
+				}
+				--found;
+				if (address - found->second.vaddr >= found->second.size) {
+					return false;
+				}
+				entry = &found->second;
+			}
+			out[index] = m_backing_base[entry->backing_offset + address - entry->vaddr];
+		}
+		return true;
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		std::shared_lock lock(m_mutex);
@@ -567,6 +612,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out) {
+		return m_backing->TryReadBackingStrided(first, stride, count, out);
 	}
 
 	template <bool copy_private>

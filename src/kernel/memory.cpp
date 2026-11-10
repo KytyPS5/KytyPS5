@@ -825,6 +825,10 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out) {
+	return g_guest_address_space->TryReadBackingStrided(first, stride, count, out);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {

@@ -146,6 +146,15 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
+	// Whether every viewed metadata slice is already checked for the keys. The slices are one
+	// range lookup when they touch, and otherwise are looked up one by one.
+	[[nodiscard]] bool          IsColorClearChecked(uint64_t address, uint64_t slice_size,
+	                                                uint64_t mip_size, uint32_t count,
+	                                                uint32_t keys) const;
+	// Marks every viewed metadata slice checked for the keys, as one range when the slices touch.
+	void                        MarkColorClearChecked(uint64_t address, uint64_t slice_size,
+	                                                  uint64_t mip_size, uint32_t count,
+	                                                  uint32_t keys);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -205,6 +214,19 @@ private:
 	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
+
+// Decodes a color metadata code into its clear color. Exposed so tests can compare it with the
+// key mask.
+[[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
+                                    vk::ClearColorValue& clear);
+// Bit key is set when the clear code key << ColorClearKeyShift selects a clear for the image.
+[[nodiscard]] uint32_t ColorClearKeys(const TextureCache::ImageDesc& desc);
+// Whether the viewed metadata slices tile one range. A partial mip leaves gaps between slices
+// that are never marked, and fewer than two slices gain nothing from a combined lookup.
+[[nodiscard]] constexpr bool ColorClearSlicesContiguous(uint64_t mip_size, uint64_t slice_size,
+                                                        uint32_t count) noexcept {
+	return count >= 2 && mip_size == slice_size;
+}
 
 } // namespace Libs::Graphics
 

@@ -36,9 +36,47 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+// A clear code is key << ColorClearKeyShift, so the code bits below the shift are always clear
+// in the DCC (0x00, 0x20, 0x40, 0x80 and 0xc0) and CMask (0x00) codes DecodeColorClear accepts.
+// The steady state code 0xff has them set, so it skips the decode.
+constexpr uint32_t ColorClearKeyShift   = 5;
+constexpr uint8_t  ColorClearCodeLowBits = (1u << ColorClearKeyShift) - 1u;
+// Slice counts up to this read their codes into the stack. Larger views fall back to the heap.
+constexpr uint32_t ColorClearCodesOnStack = 128;
 
-[[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
-                                  vk::ClearColorValue& clear) {
+// Reads the first byte of each of count metadata slices in one locked pass, so a clear applied
+// later cannot change a code that is still to be read. Slice counts up to
+// ColorClearCodesOnStack stay on the stack so the common case allocates nothing, and larger
+// views fall back to the heap. It exits on an unreadable slice.
+class ColorClearCodes {
+public:
+	ColorClearCodes(uint64_t first, uint64_t stride, uint32_t count) {
+		m_codes = m_stack.data();
+		if (count > m_stack.size()) {
+			m_heap.resize(count);
+			m_codes = m_heap.data();
+		}
+		if (!LibKernel::Memory::TryReadBackingStrided(first, stride, count, m_codes)) {
+			EXIT("TextureCache: failed to read color metadata backing\n");
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(ColorClearCodes);
+
+	[[nodiscard]] uint8_t operator[](uint32_t slice) const { return m_codes[slice]; }
+
+private:
+	std::array<uint8_t, ColorClearCodesOnStack> m_stack;
+	std::vector<uint8_t>                        m_heap;
+	uint8_t*                                    m_codes = nullptr;
+};
+
+} // namespace
+
+// Decodes one DCC or CMask clear code into the color it clears to. Returns false when the code
+// selects no clear for this image.
+bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
+                      vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
 	const auto  format   = desc.info.IsDepth()
 	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
@@ -114,6 +152,34 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	}
 	clear.float32 = channels;
 	return true;
+}
+
+// Bit key is set when code key << ColorClearKeyShift selects a clear. The check kernel reports
+// one bit per key because every accepted code has its low ColorClearKeyShift bits clear.
+uint32_t ColorClearKeys(const TextureCache::ImageDesc& desc) {
+	uint32_t            keys = 0;
+	vk::ClearColorValue unused {};
+	for (uint32_t key = 0; key < TileManager::ColorClearSlots; key++) {
+		if (DecodeColorClear(desc, static_cast<uint8_t>(key << ColorClearKeyShift), unused)) {
+			keys |= 1u << key;
+		}
+	}
+	return keys;
+}
+
+namespace {
+
+// One clear attachment per key slot, decoded for the conditional clear path only. Slots with no
+// clear keep a zero value because the predicate never selects them.
+std::array<vk::ClearAttachment, TileManager::ColorClearSlots> BuildColorClears(
+    const TextureCache::ImageDesc& desc) {
+	std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
+	for (uint32_t key = 0; key < clears.size(); key++) {
+		clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
+		(void)DecodeColorClear(desc, static_cast<uint8_t>(key << ColorClearKeyShift),
+		                       clears[key].clearValue.color);
+	}
+	return clears;
 }
 
 } // namespace
@@ -993,6 +1059,34 @@ void TextureCache::InitializeImage(ImageId id) {
 	image.RefreshComplete();
 }
 
+// Whether every viewed metadata slice is already checked for the keys, as one range lookup when
+// the slices touch.
+bool TextureCache::IsColorClearChecked(uint64_t address, uint64_t slice_size, uint64_t mip_size,
+                                       uint32_t count, uint32_t keys) const {
+	// Touching checked ranges merge, so one range lookup equals checking every slice.
+	if (ColorClearSlicesContiguous(mip_size, slice_size, count)) {
+		return m_buffer_cache.IsColorMetadataChecked(address, slice_size * count, keys);
+	}
+	for (uint32_t slice = 0; slice < count; slice++) {
+		if (!m_buffer_cache.IsColorMetadataChecked(address + slice_size * slice, mip_size, keys)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Marks every viewed metadata slice checked for the keys, as one range when the slices touch.
+void TextureCache::MarkColorClearChecked(uint64_t address, uint64_t slice_size,
+                                         uint64_t mip_size, uint32_t count, uint32_t keys) {
+	if (ColorClearSlicesContiguous(mip_size, slice_size, count)) {
+		m_buffer_cache.MarkColorMetadataChecked(address, slice_size * count, keys);
+		return;
+	}
+	for (uint32_t slice = 0; slice < count; slice++) {
+		m_buffer_cache.MarkColorMetadataChecked(address + slice_size * slice, mip_size, keys);
+	}
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
@@ -1045,21 +1139,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                         slice_size * (count - 1) + mip.size};
 	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
-		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
-		uint32_t keys = 0;
-		for (uint32_t key = 0; key < clears.size(); key++) {
-			clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
-			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 5u),
-			                     clears[key].clearValue.color)) {
-				keys |= 1u << key;
-			}
-		}
+		const auto keys = ColorClearKeys(desc);
 		// No selected key to clear, or none left since the last check.
-		bool checked = true;
-		for (uint32_t slice = 0; slice < count && checked; slice++) {
-			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
-		}
-		if (checked) {
+		if (IsColorClearChecked(viewed.address, slice_size, mip.size, count, keys)) {
 			return;
 		}
 		{
@@ -1084,9 +1166,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
 				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
-				for (uint32_t slice = 0; slice < count && expand; slice++) {
-					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
+				if (expand) {
+					MarkColorClearChecked(viewed.address, slice_size, mip.size, count, keys);
 				}
+				const auto clears = BuildColorClears(desc);
 				const auto command = m_scheduler.Current().Handle();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
 				                                         image_first, count, nullptr, command);
@@ -1117,11 +1200,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
+	const ColorClearCodes codes(run(0), slice_size, count);
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
-		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+		const auto code    = codes[slice];
+		if ((code & ColorClearCodeLowBits) != 0) {
+			continue;
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {

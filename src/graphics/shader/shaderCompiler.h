@@ -30,6 +30,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<ui
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
 
+// The preparers below fill an input info the caller value-initializes.
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
 // Each stage's tess holds the VGT fields; the caller adds the layout reflected from the programs.

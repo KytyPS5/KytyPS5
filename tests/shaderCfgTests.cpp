@@ -9581,8 +9581,19 @@ void TestLaneMaskProjection() {
     const auto packed_bound = e.BitwiseOr(bound, U32(Value(1u << 28u)));
     const auto second_count = U32(e.Emit(ValueOpcode::BitFieldUExtract,
                                          {packed_bound, Value(8u), Value(8u)}));
-    const auto second_count_bounded =
-        bound_bit(UINT64_MAX, e.ISub(U32(Value(64u)), second_count));
+    const auto prefix_of = [&](U32 count) {
+      return bound_bit(UINT64_MAX, e.ISub(U32(Value(64u)), count));
+    };
+    const auto extract_bound = [&](uint32_t offset, uint32_t count = 8u) {
+      return U32(e.Emit(ValueOpcode::BitFieldUExtract,
+                        {bound, Value(offset), Value(count)}));
+    };
+    const auto second_count_bounded = prefix_of(second_count);
+    const auto extracted_bounded = prefix_of(extract_bound(0u));
+    const auto extracted_half_bounded = prefix_of(extract_bound(1u));
+    const auto extracted_bit_bounded = prefix_of(extract_bound(0u, 1u));
+    const auto shifted_half_bounded = prefix_of(
+        U32(e.Emit(ValueOpcode::ShiftRightLogical32, {bound, Value(1u)})));
     const auto first_bound_uncovered =
         bound_bit(UINT64_MAX >> 1u, e.ISub(bound, U32(Value(2u))));
     const auto last_bound_uncovered = wave_size == 64u
@@ -9629,8 +9640,15 @@ void TestLaneMaskProjection() {
     Check(partial.Resolve().TryInstruction() != nullptr,
           "partial mask was incorrectly folded to a constant predicate");
     Check(bounded.Resolve() == Value(true) &&
-              second_count_bounded.Resolve() == Value(true),
+              second_count_bounded.Resolve() == Value(true) &&
+              extracted_bounded.Resolve() == Value(true),
           "a prefix mask of the lane bound still predicated a running lane");
+    Check(extracted_half_bounded.Resolve().TryInstruction() != nullptr &&
+              shifted_half_bounded.Resolve().TryInstruction() != nullptr,
+          "a prefix mask of half the lane bound was taken as covering it");
+    Check(extracted_bit_bounded.Resolve().TryInstruction() != nullptr,
+          "a prefix mask of the lane bound's lowest bit was taken as covering "
+          "it");
     Check(
         first_bound_uncovered.Resolve().TryInstruction() != nullptr &&
             last_bound_uncovered.Resolve().TryInstruction() != nullptr,

@@ -2,9 +2,11 @@
 
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderBindings.h"
+#include "common/logging/log.h"
 
 #include <fmt/format.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <array>
 #include <cstddef>
@@ -880,14 +882,36 @@ bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
 			return false;
 		}
 		Call call {site.source_reg, site.return_reg, site.dynamic, {}};
+		std::string unreadable;
+		size_t      left_out = 0;
 		for (const auto address: site.addresses) {
 			CallTarget target {address, {}};
-			if ((address & 3u) != 0 ||
-			    !ReadFunction(address, site.return_reg, read, target.function, reason, wave_size)) {
-				if (reason.empty()) reason = "shader call target is not DWORD aligned";
-				return false;
+			std::string why;
+			if ((address & 3u) != 0 || !ReadFunction(address, site.return_reg, read, target.function, why, wave_size)) {
+				if (why.empty()) why = "shader call target is not DWORD aligned";
+				// A table also holds addresses that are not functions (Marvel's Wolverine's lists the
+				// code of pixel shaders, which end the wave): of a call through a table they are left
+				// out of the expansion, like a function that overwrites a dependency (its rows, if one
+				// were reached, end at the miss trap). A call through an immutable pointer fails.
+				if (!site.dynamic) {
+					reason = why;
+					return false;
+				}
+				if (left_out++ == 0) unreadable = fmt::format("{} (function at 0x{:x})", why, address);
+				continue;
 			}
 			call.targets.push_back(std::move(target));
+		}
+		if (call.targets.empty()) {
+			reason = unreadable.empty() ? "shader call table has no target" : unreadable;
+			return false;
+		}
+		if (left_out != 0) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 8) {
+				LOGF("Shader call table at pc 0x%x: %zu of %zu targets are not functions and are left out; first: %s\n",
+				     site.pc, left_out, site.addresses.size(), unreadable.c_str());
+			}
 		}
 		calls.emplace(site.pc, std::move(call));
 	}

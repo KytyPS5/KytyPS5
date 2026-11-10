@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -854,6 +855,10 @@ public:
 			Replace(inst, Value(mask.U32() != 0u));
 			return;
 		}
+		if (CoversLaneBound(mask, wave_size)) {
+			Replace(inst, Value(true));
+			return;
+		}
 		if (wave_size != 32u) return;
 		m_visited.clear();
 		m_grounded = false;
@@ -863,6 +868,71 @@ public:
 private:
 	static bool Immediate(Value value, uint32_t expected) {
 		return IsImmediate(value, Type::U32) && value.U32() == expected;
+	}
+
+	using BoundOperation = uint64_t (*)(uint64_t, uint64_t);
+
+	static BoundOperation OperationAtLaneBound(ValueOpcode opcode) {
+		switch (opcode) {
+			case ValueOpcode::BitwiseAnd32: return [](uint64_t a, uint64_t b) { return a & b; };
+			case ValueOpcode::BitwiseOr32: return [](uint64_t a, uint64_t b) { return a | b; };
+			case ValueOpcode::ISub32:
+				return
+				    [](uint64_t a, uint64_t b) -> uint64_t { return static_cast<uint32_t>(a - b); };
+			case ValueOpcode::ShiftRightLogical64:
+				return [](uint64_t a, uint64_t b) { return a >> (b & 63u); };
+			case ValueOpcode::CompositeExtractU64:
+				return [](uint64_t a, uint64_t b) -> uint64_t {
+					return static_cast<uint32_t>(b == 0u ? a : a >> 32u);
+				};
+			default: return nullptr;
+		}
+	}
+
+	std::optional<uint64_t> AtLaneBound(Value value, uint32_t bound) {
+		if (IsImmediate(value, Type::U32)) return value.U32();
+		if (IsImmediate(value, Type::U64)) return value.U64();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return std::nullopt;
+		if (inst->GetOpcode() == ValueOpcode::LaneBound) return bound;
+		if (const auto known = m_at_bound.find(inst); known != m_at_bound.end())
+			return known->second;
+		const auto operation = OperationAtLaneBound(inst->GetOpcode());
+		if (operation == nullptr) return std::nullopt;
+		const auto lhs = AtLaneBound(Arg(*inst, 0), bound);
+		const auto rhs = lhs ? AtLaneBound(Arg(*inst, 1), bound) : std::nullopt;
+		if (!rhs) return std::nullopt;
+		return m_at_bound.emplace(inst, operation(*lhs, *rhs)).first->second;
+	}
+
+	static bool SelectsWordByLaneHalf(const Inst& select) {
+		if (select.GetOpcode() != ValueOpcode::SelectU32) return false;
+		const auto* low_half = Arg(select, 0).TryInstruction();
+		if (low_half == nullptr || low_half->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    !Immediate(Arg(*low_half, 1), 32u))
+			return false;
+		const auto* lane = Arg(*low_half, 0).TryInstruction();
+		return lane != nullptr && lane->GetOpcode() == ValueOpcode::LaneId;
+	}
+
+	bool CoversLaneBound(Value mask, uint32_t wave_size) {
+		auto low  = mask;
+		auto high = Value(0u);
+		if (wave_size == 64u) {
+			const auto* select = mask.TryInstruction();
+			if (select == nullptr || !SelectsWordByLaneHalf(*select)) return false;
+			low  = Arg(*select, 1);
+			high = Arg(*select, 2);
+		}
+		for (uint32_t bound = 1; bound <= wave_size; ++bound) {
+			m_at_bound.clear();
+			const auto low_word  = AtLaneBound(low, bound);
+			const auto high_word = low_word ? AtLaneBound(high, bound) : std::nullopt;
+			if (!high_word) return false;
+			const auto lanes = UINT64_MAX >> (64u - bound);
+			if (((*high_word << 32u | *low_word) & lanes) != lanes) return false;
+		}
+		return true;
 	}
 
 	static Value BallotPredicate(const Inst& inst) {
@@ -930,6 +1000,7 @@ private:
 	FoldWorklist& m_worklist;
 	std::unordered_set<const Inst*> m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
+	std::unordered_map<const Inst*, uint64_t> m_at_bound;
 	bool m_grounded = false;
 };
 

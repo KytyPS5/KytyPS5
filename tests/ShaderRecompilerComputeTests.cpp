@@ -20062,6 +20062,9 @@ public:
     constexpr uint64_t part_read_image = base + 0x40000;
     constexpr uint64_t part_copy_image = base + 0x50000;
     constexpr uint64_t part_copy_target = base + 0x60000;
+    constexpr uint64_t stencil_plane = base + 0x70000;
+    constexpr uint64_t stencil_size = 0x1000;
+    constexpr uint64_t depth_image = base + 0x78000;
     constexpr u32 stale = 0xdeadbeefu;
     static_assert(page == 0x4000);
 
@@ -20200,6 +20203,37 @@ public:
                                                 page),
               "partial copy target was unreadable");
       const auto part_copy = Mismatch(copied, native_page);
+
+      auto depth_desc = MakeLinearDesc(
+          depth_image, page, vk::Format::eD32SfloatS8Uint,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {64, 64, 1}, 1, sizeof(u32), 1);
+      depth_desc.type = BindingType::DepthTarget;
+      depth_desc.info.stencil = {stencil_plane, stencil_size};
+      depth_desc.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      depth_desc.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = textures.FindImage(depth_desc);
+      (void)textures.FindDepthTarget(depth_id, depth_desc);
+      textures.MarkGpuWritten(depth_id);
+      const auto stencil_record =
+          textures.FindImageFromRange(stencil_plane, stencil_size, false);
+      Require(
+          name, "stencil plane before its depth image",
+          depth_id && textures.GetImage(depth_id).SafeToDownload() &&
+              stencil_record &&
+              textures.GetImage(stencil_record).depth_id == depth_id &&
+              textures.FindImageFromRange(stencil_plane, stencil_size) ==
+                  depth_id,
+          "the stencil read did not resolve to its GPU-written depth image");
+      const auto stencil_read =
+          cache.ObtainBuffer(stencil_plane, stencil_size, false, true);
+      Require(name, "stencil read stays at the stencil plane",
+              stencil_read.first != nullptr &&
+                  stencil_read.first->IsInBounds(stencil_plane, stencil_size) &&
+                  !stencil_read.first->IsInBounds(depth_image, 1),
+              "a small stencil read grew its buffer to the depth image");
 
       Require(name, "large formatted read", large_read == "ok", large_read);
       Require(name, "small formatted read and copy",

@@ -753,6 +753,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_draw_storage_join
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-storage-join-only)
+	set_tests_properties(graphics_draw_storage_join PROPERTIES SKIP_RETURN_CODE 77)
+	add_test(NAME graphics_draw_index_storage_join
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-index-storage-join-only)
+	set_tests_properties(graphics_draw_index_storage_join PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode

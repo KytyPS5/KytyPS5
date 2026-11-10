@@ -875,9 +875,13 @@ private:
 		if (IsImmediate(value, Type::U64)) return value.U64();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return std::nullopt;
-		if (inst->GetOpcode() == ValueOpcode::LaneBound) return bound;
+		if (inst->GetOpcode() == ValueOpcode::LaneBound) {
+			if (m_lane_bound == nullptr) m_lane_bound = inst;
+			return m_lane_bound == inst ? std::optional<uint64_t>(bound) : std::nullopt;
+		}
 		if (const auto found = m_at_bound.find(inst); found != m_at_bound.end())
 			return found->second;
+		if (++m_mask_nodes > MaxMaskNodes) return std::nullopt;
 		bool       defined = true;
 		const auto arg     = [&](size_t index) {
             const auto operand = defined ? AtLaneBound(Arg(*inst, index), bound) : std::nullopt;
@@ -890,9 +894,12 @@ private:
 			case ValueOpcode::BitwiseOr32: result = arg(0) | arg(1); break;
 			case ValueOpcode::ISub32: result = static_cast<uint32_t>(arg(0) - arg(1)); break;
 			case ValueOpcode::ShiftRightLogical64: result = arg(0) >> (arg(1) & 63u); break;
-			case ValueOpcode::CompositeExtractU64:
-				result = static_cast<uint32_t>(arg(0) >> (arg(1) == 0u ? 0u : 32u));
+			case ValueOpcode::CompositeExtractU64: {
+				const auto word = arg(1);
+				defined         = defined && word < 2u;
+				result          = static_cast<uint32_t>(arg(0) >> ((word & 1u) * 32u));
 				break;
+			}
 			case ValueOpcode::ShiftRightLogical32: {
 				const auto shift = arg(1);
 				defined          = defined && shift < 32u;
@@ -931,8 +938,10 @@ private:
 			low  = Arg(*select, 1);
 			high = Arg(*select, 2);
 		}
+		m_lane_bound = nullptr;
 		for (uint32_t bound = 1; bound <= wave_size; ++bound) {
 			m_at_bound.clear();
+			m_mask_nodes         = 0;
 			const auto low_word  = AtLaneBound(low, bound);
 			const auto high_word = low_word ? AtLaneBound(high, bound) : std::nullopt;
 			if (!high_word) return false;
@@ -1008,6 +1017,9 @@ private:
 	std::unordered_set<const Inst*> m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
 	std::unordered_map<const Inst*, uint64_t> m_at_bound;
+	const Inst*                               m_lane_bound = nullptr;
+	uint32_t                                  m_mask_nodes = 0;
+	static constexpr uint32_t                 MaxMaskNodes = 64;
 	bool m_grounded = false;
 };
 

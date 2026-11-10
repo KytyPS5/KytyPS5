@@ -9592,6 +9592,14 @@ void TestLaneMaskProjection() {
     const auto extracted_bounded = prefix_of(extract_bound(0u));
     const auto extracted_half_bounded = prefix_of(extract_bound(1u));
     const auto extracted_bit_bounded = prefix_of(extract_bound(0u, 1u));
+    const auto other_bound = U32(e.Emit(ValueOpcode::LaneBound));
+    const auto two_bounds =
+        bound_bit(UINT64_MAX, e.ISub(zero, e.ISub(bound, other_bound)));
+    auto deep_shift = negated_bound;
+    for (uint32_t step = 0; step < 80u; step++) {
+      deep_shift = e.ISub(deep_shift, U32(Value(64u)));
+    }
+    const auto deep_bounded = bound_bit(UINT64_MAX, deep_shift);
     const auto shifted_half_bounded = prefix_of(
         U32(e.Emit(ValueOpcode::ShiftRightLogical32, {bound, Value(1u)})));
     const auto first_bound_uncovered =
@@ -9649,6 +9657,11 @@ void TestLaneMaskProjection() {
     Check(extracted_bit_bounded.Resolve().TryInstruction() != nullptr,
           "a prefix mask of the lane bound's lowest bit was taken as covering "
           "it");
+    Check(two_bounds.Resolve().TryInstruction() != nullptr,
+          "a mask of two different lane bounds was evaluated as one bound");
+    Check(deep_bounded.Resolve().TryInstruction() != nullptr,
+          "a lane bound mask behind a long chain was evaluated without a "
+          "bound on the work");
     Check(
         first_bound_uncovered.Resolve().TryInstruction() != nullptr &&
             last_bound_uncovered.Resolve().TryInstruction() != nullptr,

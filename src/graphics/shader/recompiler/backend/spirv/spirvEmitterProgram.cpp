@@ -1380,6 +1380,8 @@ void EmitProgram(EmitterState& state) {
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		high.dispatcher_spills      = &dispatch.spills[1];
 	}
+	state.converged_calls = program.stage == ShaderType::Compute && !program.inlined_call_entries.empty() &&
+	                        !program.dispatcher_fallback && !FindOutlinedRegions(program).empty();
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineBvhIntersect(state);
@@ -1484,6 +1486,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+	DefineBdaLoads(state);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

@@ -118,6 +118,11 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	// A compute program with outlined call targets: no function call sits under a lane guard.
+	bool                                             converged_calls         = false;
+	uint32_t                                         bda_masked_function     = 0;
+	// bda_load_u32 and its variants by {coherent, guarded}: see DefineBdaLoads.
+	std::map<std::array<uint32_t, 2>, uint32_t>      bda_load_functions;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
@@ -592,6 +597,7 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineBdaLoads(EmitterState& state);
 // Marks the entry of the program's shader hash and adds `count` (an id) to its guest rays
 // (BufferCache::HACK_MARK_GUEST_RAYS).
 void EmitGuestRayCount(EmitterState& state, uint32_t count);
@@ -608,6 +614,7 @@ void DeclareRayQueryVariables(EmitterState& state);
 // After every function variable is declared.
 void InitializeRayQueryVariables(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active);
 // Guest memory reads of the native ray tracing alpha test (spirvEmitterRayQuery.cpp), with the
 // semantics of the guest instructions it stands for: a dword at a guest address (S_LOAD_DWORD),
 // a dword of a buffer through a V# (S_BUFFER_LOAD_DWORD) and an element through a V#

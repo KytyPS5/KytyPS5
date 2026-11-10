@@ -38219,14 +38219,15 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           ++profile.uses;
         }
       std::map<u32, std::string> functions;
-      u32 function = 0, bda = 0, inline_reads = 0;
+      u32 function = 0, inline_reads = 0;
+      std::set<u32> bda;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpName) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
-          if (name == "get_bda_pointer") bda = words[1];
+          if (name == "get_bda_pointer" || name.starts_with("bda_load_u32")) bda.insert(words[1]);
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
@@ -38234,7 +38235,7 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
         }
         if (opcode == spv::OpFunctionCall) {
           if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
-          if (words[3] == bda) {
+          if (bda.contains(words[3])) {
             if (functions.contains(function)) ++profiles[functions.at(function)].reads;
             else ++inline_reads;
           }
@@ -45694,14 +45695,17 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       else
         test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
       CheckSpirvEmission(test, compiled.spirv);
-      u32 bda_function = 0, bda_calls = 0;
+      std::vector<u32> bda_functions;
+      u32 bda_calls = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
-        if (opcode == spv::OpName &&
-            std::string_view(reinterpret_cast<const char *>(words.data() + 2)) == "get_bda_pointer")
-          bda_function = words[1];
-        if (opcode == spv::OpFunctionCall && words[3] == bda_function) ++bda_calls;
+        if (opcode == spv::OpName) {
+          const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
+          if (name == "get_bda_pointer" || name.starts_with("bda_load_u32")) bda_functions.push_back(words[1]);
+        }
+        if (opcode == spv::OpFunctionCall &&
+            std::ranges::find(bda_functions, words[3]) != bda_functions.end()) ++bda_calls;
         offset += words.size();
       }
       Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u || components != 0u),

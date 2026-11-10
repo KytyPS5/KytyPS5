@@ -316,20 +316,17 @@ struct TextureCacheTestAccess {
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
                                          uint64_t size) {
     std::lock_guard lock(cache.m_lock);
-    const auto found = cache.FindImagesInRegion(address, size);
     std::vector<ImageId> result;
-    result.reserve(found.size());
-    for (const auto id : found) {
-      result.push_back(id);
-    }
+    cache.ForEachImageInRegion(
+        address, size, [&](ImageId id, Image &) { result.push_back(id); });
     return result;
   }
 
   static size_t PageOwnerCount(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
-    const auto *owners = cache.m_image_page_table.Find(static_cast<size_t>(
+    const auto *bucket = cache.m_image_page_table.Find(static_cast<size_t>(
         address >> TextureCache::ImagePageTable::kPageBits));
-    return owners == nullptr ? 0 : owners->size();
+    return bucket == nullptr ? 0 : bucket->entries.size();
   }
 
   static size_t OwnedPageCount(TextureCache &cache, uint64_t address,
@@ -341,9 +338,11 @@ struct TextureCacheTestAccess {
     }
     size_t count = 0;
     for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-      const auto *owners = cache.m_image_page_table.Find(page);
-      count += owners != nullptr &&
-               std::find(owners->begin(), owners->end(), id) != owners->end();
+      const auto *bucket = cache.m_image_page_table.Find(page);
+      count += bucket != nullptr &&
+               std::ranges::find(bucket->entries, id,
+                                 &TextureCache::BucketEntry::id) !=
+                   bucket->entries.end();
     }
     return count;
   }
@@ -6946,8 +6945,15 @@ public:
           TextureCacheTestAccess::InsertImage(texture_cache, spanning_info);
       const auto spanning_results = TextureCacheTestAccess::FindImages(
           texture_cache, spanning_info.data.address, spanning_info.data.size);
+      // Regions starting in the image's second page and before its first.
+      const auto spanning_tail = TextureCacheTestAccess::FindImages(
+          texture_cache, spanning_info.data.End() - 1, 1);
+      const auto spanning_cover = TextureCacheTestAccess::FindImages(
+          texture_cache, spanning_info.data.address - 0x100000, 0x300000);
       Require(name, "one-MiB cross-page deduplication",
               spanning && IsOnlyImage(spanning_results, spanning) &&
+                  IsOnlyImage(spanning_tail, spanning) &&
+                  IsOnlyImage(spanning_cover, spanning) &&
                   TextureCacheTestAccess::PageOwnerCount(
                       texture_cache, spanning_info.data.address) == 1 &&
                   TextureCacheTestAccess::PageOwnerCount(
@@ -7011,7 +7017,6 @@ public:
                   texture_cache, large_info.data.address, large_info.data.size,
                   large_owner) == 0,
               "large image unregister left coarse memberships behind");
-
 
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;

@@ -133,11 +133,23 @@ public:
 		    [](uint64_t, uint64_t) {});
 	}
 
-	// Needs no lock: page entries are atomic, buckets live as long as the store, and the alias
-	// stays mapped. A read racing an unmap copies the backing's current bytes, or zeros for a page
-	// unmapped between the check and the copy.
+	// Needs no lock: page entries are atomic and buckets live as long as the store.
+	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+			if (LoadPage(page) == 0) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
+	// current bytes, or zeros for a page unmapped between the check and the copy.
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
-		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size || !IsBacked(vaddr, size)) {
+		if (data == nullptr || !IsBacked(vaddr, size)) {
 			return false;
 		}
 		ReadSparseBacking(vaddr, data, size, [](uint64_t, uint8_t* destination, uint64_t bytes) {
@@ -218,15 +230,6 @@ private:
 		}
 		const auto* entries = m_pages[page / BucketPages].load(std::memory_order_acquire);
 		return entries != nullptr ? entries[page % BucketPages].load(std::memory_order_relaxed) : 0;
-	}
-
-	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
-		for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
-			if (LoadPage(page) == 0) {
-				return false;
-			}
-		}
-		return true;
 	}
 
 	// Walks the span in runs of contiguous backing, as (backing offset, start, bytes), and runs of
@@ -534,6 +537,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
+		return m_backing->IsBacked(vaddr, size);
 	}
 
 	template <bool copy_private>

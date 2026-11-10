@@ -818,7 +818,11 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(g_virtual_ranges == nullptr);
+	// Backed pages lie in committed ranges, so a fully backed buffer needs no range walk. Up to
+	// 16 MiB (1024 pages) the page walk costs about as much as the locked range walk.
+	if (size <= (uint64_t {1} << 24u) && g_guest_address_space->IsBacked(vaddr, size)) {
+		return size;
+	}
 
 	std::shared_lock state(g_memory_state_mutex);
 	const auto       clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);

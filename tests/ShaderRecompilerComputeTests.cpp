@@ -196,7 +196,8 @@ struct BufferCacheTestAccess {
 
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
-    return cache.SynchronizeBufferFromImage(buffer, address, size);
+    const auto image = cache.m_texture_cache.FindImageFromRange(address, size);
+    return image && cache.SynchronizeBufferFromImage(buffer, image);
   }
 
   static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_bda_sync_mutex; }

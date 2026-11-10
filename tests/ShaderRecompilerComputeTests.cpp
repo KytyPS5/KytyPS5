@@ -425,6 +425,10 @@ struct RenderExecutorTestAccess {
     return executor.DrawAuto(command, args);
   }
 
+  static uint32_t ColorTargetCount(const RenderExecutor &executor) {
+    return executor.m_targets.color_count;
+  }
+
   static bool TryConsumeComputeFill(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -17446,12 +17450,13 @@ public:
       phased_depth_control.z_write_enable = true;
       registers.SetDepthControl(phased_depth_control);
       registers.SetRenderControl({});
-      RenderDepthInfo disabled_depth{};
+      // The executor reuses one depth slot, so a draw without depth state must clear it.
+      RenderDepthInfo disabled_depth{.depth_test_enable = true, .image_id = disjoint_depth_id};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), disabled_depth);
       Require(name, "disabled tests with stale depth write enable",
-              !disabled_depth.image_id,
-              "a dormant depth write bit bound a depth attachment");
+              !disabled_depth.image_id && !disabled_depth.depth_test_enable,
+              "a dormant depth write bit bound an attachment or kept the old slot");
       phased_depth_control.z_enable = true;
       registers.SetDepthControl(phased_depth_control);
       HW::RenderControl phased_render_control{};
@@ -20247,10 +20252,10 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
-                            .topology = topology, .ps_active = true,
+      DrawRenderState state{.topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      const DrawTargets targets{.depth = depth, .colors = {color}, .color_count = 1};
+      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -21228,6 +21233,9 @@ public:
                   "native vertex or instance offset was applied twice");
         }
       }
+      Require("NativeIndirectDrawOffsets", "color slots per draw",
+              RenderExecutorTestAccess::ColorTargetCount(executor) == 1,
+              "a draw kept the previous draw's color targets");
       // With back faces culled, the triangle draws for exactly one winding.
       const auto draws_with_back_cull = [&](bool clockwise) {
         registers.SetModeControl({.cull_back = true, .face = clockwise});
@@ -49498,7 +49506,7 @@ void CheckShaderStore(VulkanHarness &vulkan) {
       auto &scheduler = context.GetCommandScheduler();
       DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
       pipelines.GetGraphicsPrograms(scheduler.Current(), state);
-      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state);
+      (void)pipelines.GetGraphicsPipeline(scheduler.Current(), state, {});
       context.GetBufferCache().ReadMemory(base, sizeof(u32));
       (void)LibKernel::Memory::TryReadBacking(base, &session.output, sizeof(u32));
       context.UnmapMemory(base, allocation_size);

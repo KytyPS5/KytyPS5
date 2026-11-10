@@ -880,9 +880,10 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
-	const auto* colors        = state.color_info;
-	const auto& depth         = state.depth_info;
+                                                            const DrawRenderState& state,
+                                                            const DrawTargets&     targets) {
+	const auto* colors        = targets.colors;
+	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
@@ -898,7 +899,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		stages[3] = ps_input_info.stage.module;
 	}
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
-	const auto color_count = state.color_count;
+	const auto color_count = targets.color_count;
 
 	auto&             ctx = command.GetRegisters();
 

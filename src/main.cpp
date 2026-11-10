@@ -85,6 +85,8 @@ static void PrintUsage() {
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
 	::printf("  --readback-storage-images            Read back storage images on GL2 writeback.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf(
+	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
@@ -384,6 +386,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--vblank-frequency") {
 			if (!ParseUint32(value, options.config.vblank_frequency)) {
 				::printf("invalid vblank frequency: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--flush-draws") {
+			if (!ParseUint32(value, options.config.flush_draws)) {
+				::printf("invalid draw count: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--trophy-duration") {

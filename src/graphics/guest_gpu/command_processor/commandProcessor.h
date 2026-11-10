@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -118,6 +119,7 @@ public:
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void                CountDraw();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
@@ -138,9 +140,11 @@ private:
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
 
-	const int m_interrupt_event_id;
-	uint64_t  m_synthetic_occlusion_counter = 0;
-	bool      m_predicate_skip              = false;
+	const int      m_interrupt_event_id;
+	const uint32_t m_flush_draws                 = Config::GetFlushDraws();
+	uint32_t       m_draws                       = 0; // Since the buffer start or CountDraw's flush
+	uint64_t       m_synthetic_occlusion_counter = 0;
+	bool           m_predicate_skip              = false;
 };
 
 } // namespace Libs::Graphics

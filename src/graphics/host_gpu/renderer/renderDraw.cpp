@@ -1129,10 +1129,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
+	// The render targets decide whether this draw is a depth feedback loop, which hosts without
+	// per-draw feedback state must bake into the pipeline.
+	const bool depth_feedback_loop =
+	    rendering.depth_stencil_attachment.image_layout ==
+	    vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+	auto& pipeline =
+	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
+	                                                      depth_feedback_loop);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {

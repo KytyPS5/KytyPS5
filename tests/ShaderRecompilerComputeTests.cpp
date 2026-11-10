@@ -20173,10 +20173,25 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  void CheckRasterizationLayoutOnly() {
+    if (!m_runtime_context.attachment_feedback_loop_enabled ||
+        !m_runtime_context.attachment_feedback_loop_dynamic_state_enabled) {
+      return;
+    }
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = false;
+    CheckRasterization(true, Prospero::BufferFormat::k32_32_32_32Float,
+                       "DepthAttachmentFeedbackStatic");
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = true;
+  }
+
   void CheckRasterization(
       bool depth_feedback,
-      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
-    const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
+      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float,
+      const char *name_override = nullptr) {
+    const char *name = name_override != nullptr
+                           ? name_override
+                           : (depth_feedback ? "DepthAttachmentFeedback"
+                                             : "PolygonModeRasterization");
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
     switch (color_format) {
@@ -20375,7 +20390,11 @@ public:
       DrawRenderState state{.topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
       const DrawTargets targets{.depth = depth, .colors = {color}, .color_count = 1};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
+      const bool static_feedback =
+          depth_feedback &&
+          !m_runtime_context.attachment_feedback_loop_dynamic_state_enabled;
+      return context.GetPipelineCache().GetGraphicsPipeline(
+          scheduler.Current(), state, targets, static_feedback);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -20448,7 +20467,9 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_runtime_context.attachment_feedback_loop_dynamic_state_enabled) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23533,6 +23554,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_feedback_dynamic_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -23580,6 +23602,8 @@ private:
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled =
+        m_feedback_dynamic_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
@@ -23818,8 +23842,10 @@ private:
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
+    m_feedback_dynamic_supported =
+        m_rasterization_supported &&
+        available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -23875,9 +23901,13 @@ private:
       clip_control.depthClipControl = true;
       feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
-      feedback_dynamic.pNext = &feedback_layout;
-      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      if (m_feedback_dynamic_supported) {
+        feedback_dynamic.pNext = &feedback_layout;
+        feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+        provoking_vertex.pNext = &feedback_dynamic;
+      } else {
+        provoking_vertex.pNext = &feedback_layout;
+      }
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -23945,8 +23975,10 @@ private:
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_dynamic_supported) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -55272,6 +55304,15 @@ void CheckDeviceCreation() {
   const bool feedback =
       has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
       has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+  const bool feedback_layout =
+      has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+      features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
+          .attachmentFeedbackLoopLayout;
+  const bool feedback_dynamic =
+      feedback_layout &&
+      has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) &&
+      features.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
+          .attachmentFeedbackLoopDynamicState;
   const auto properties = graphics.physical_device.getProperties2<
       vk::PhysicalDeviceProperties2, vk::PhysicalDevicePushDescriptorProperties,
       vk::PhysicalDeviceMeshShaderPropertiesEXT>();
@@ -55306,12 +55347,8 @@ void CheckDeviceCreation() {
                       features.get<vk::PhysicalDeviceShaderClockFeaturesKHR>().shaderDeviceClock) &&
               matches(graphics.mesh_shader_enabled, VK_EXT_MESH_SHADER_EXTENSION_NAME,
                       mesh.meshShader && mesh.taskShader) &&
-              graphics.attachment_feedback_loop_enabled ==
-                  (feedback &&
-                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
-                       .attachmentFeedbackLoopLayout &&
-                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
-                       .attachmentFeedbackLoopDynamicState),
+              graphics.attachment_feedback_loop_enabled == feedback_layout &&
+              graphics.attachment_feedback_loop_dynamic_state_enabled == feedback_dynamic,
           "an enabled feature disagrees with the GPU");
   Require(name, "limits",
           graphics.max_push_descriptors ==
@@ -57161,6 +57198,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationLayoutOnly();
   } else {
     skipped_device_checks = true;
   }

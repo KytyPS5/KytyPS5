@@ -881,7 +881,8 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
-                                                            const DrawTargets&     targets) {
+	                                                            const DrawTargets& targets,
+	                                                            bool depth_feedback_loop) {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -989,6 +990,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;
+		const bool static_depth_feedback =
+		    depth_feedback_loop && !m_graphics.attachment_feedback_loop_dynamic_state_enabled;
+		rendering.depth_stencil_feedback_loop = static_depth_feedback ? 1u : 0u;
+		EXIT_IF(static_depth_feedback && !m_graphics.attachment_feedback_loop_enabled);
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {

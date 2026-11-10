@@ -322,7 +322,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
 	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 #endif
-	if (graphics.attachment_feedback_loop_enabled) {
+	if (graphics.attachment_feedback_loop_dynamic_state_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
 
@@ -352,6 +352,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pColorBlendState    = &color_blending;
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
+	if (rendering.depth_stencil_feedback_loop != 0) {
+		EXIT_IF(!graphics.attachment_feedback_loop_enabled || !with_depth);
+		pipeline_info.flags |=
+		    vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
+	}
 
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);

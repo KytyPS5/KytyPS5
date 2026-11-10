@@ -77,6 +77,10 @@ struct PipelineRenderingState {
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+	// Static VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT, used when
+	// the host cannot enable attachment feedback loops per draw. A uint32_t keeps the packed
+	// key aligned for its raw-byte hash.
+	uint32_t                                             depth_stencil_feedback_loop = 0;
 };
 
 struct PipelineVertexInputState {
@@ -206,7 +210,8 @@ public:
 	                                      ShaderComputeInputInfo&      input_info);
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              const DrawTargets& targets);
+	                              const DrawTargets& targets,
+	                              bool depth_feedback_loop = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:

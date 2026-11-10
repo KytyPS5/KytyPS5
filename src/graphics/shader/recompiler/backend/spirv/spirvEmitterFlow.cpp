@@ -820,11 +820,27 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
-	                              TypeBool(ctx.state), result,
-	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
-	return result;
+	// Any(p) is Ballot(p) != 0 and All(p) is Ballot(!p) == 0 (the invocations that do not execute the
+	// instruction are in neither). NVIDIA's compiler spends ~45 ms on each OpGroupNonUniformAny/All of
+	// a program and little on a ballot: Wolverine's 0x1a04c58a9fbc2052 has hundreds of them.
+	auto&      state  = ctx.state;
+	const auto u32    = TypeU32(state);
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup),
+	                          zero ? Unary(state, spv::OpLogicalNot, TypeBool(state), predicate) : predicate);
+	const auto word = [&](uint32_t index) {
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, bits, ballot, index);
+		return bits;
+	};
+	// A wave of 64 lanes on a subgroup of 64 has its upper half in the second word.
+	auto lanes = word(0);
+	if (ctx.other_half == nullptr && state.lane_count == 1u && state.program.wave_size == 64u) {
+		lanes = Binary(state, spv::OpBitwiseOr, u32, lanes, word(1));
+	}
+	return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), lanes,
+	              ConstantU32(state, 0));
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {

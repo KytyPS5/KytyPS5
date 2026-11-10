@@ -579,7 +579,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
 			break;
 		case ValueOpcode::ConditionRef:
-			info.subgroup_vote |=
+			info.subgroup_ballot |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
@@ -639,6 +639,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
+	info.ray_query_mirror = false;
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
@@ -646,7 +647,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.ray_query              = false;
 	info.ray_query_sites        = 0;
 	info.ray_query_header_slots = {UnsetRayQuerySlot, UnsetRayQuerySlot};
-	info.bvh = info.ray_query_mirror = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	info.bvh = info.subgroup_ballot = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =

@@ -13799,12 +13799,12 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
-    Check(compiled.program.info.subgroup_vote && !compiled.program.info.subgroup_ballot &&
-              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 0,
-          "condition votes used ballots, duplicated halves, or lost their capability");
+    Check(compiled.program.info.subgroup_ballot &&
+              !SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 0 &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == 0 &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 6,
+          "condition votes did not become one ballot each, or duplicated halves");
     Check(scalar.TryInstruction()->Definition(0) == predicate.TryInstruction()->Definition(0),
           "scalar instruction condition acquired a subgroup vote");
     if (wave != host) {
@@ -13821,9 +13821,9 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto scalar_only = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(scalar_only);
-    Check(!compiled.program.info.subgroup_vote &&
-              !SpirvContainsCapability(scalar_only, spv::CapabilityGroupNonUniformVote),
-          "recollection retained the removed condition vote capability");
+    Check(!compiled.program.info.subgroup_ballot &&
+              SpirvInstructionOpcodeCount(scalar_only, spv::OpGroupNonUniformBallot) == 0,
+          "recollection retained the removed condition ballot");
   }
 }
 

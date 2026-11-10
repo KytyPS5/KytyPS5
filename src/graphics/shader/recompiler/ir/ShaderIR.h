@@ -698,7 +698,6 @@ struct ShaderInfo {
 	// high, when it loads it from its user data (NoRayQuerySlot otherwise).
 	std::array<uint32_t, 2>         ray_query_header_slots {NoRayQuerySlot, NoRayQuerySlot};
 	bool                            subgroup_ballot               = false;
-	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;
 	bool                            subgroup_shuffle              = false;
 	bool                            subgroup_arithmetic           = false;

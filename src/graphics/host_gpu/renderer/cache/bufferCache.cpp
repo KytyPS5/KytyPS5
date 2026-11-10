@@ -501,7 +501,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto end = vaddr + size;
 	if (image) {
 		std::scoped_lock lock {m_texture_cache.m_lock};
-		end = std::max(end, m_texture_cache.m_slot_images[image].info.data.End());
+		const auto&      range = m_texture_cache.m_slot_images[image].info.data;
+		if (range.address == vaddr) {
+			end = std::max(end, range.End());
+		}
 	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
 		id = FindBuffer(vaddr, end - vaddr);

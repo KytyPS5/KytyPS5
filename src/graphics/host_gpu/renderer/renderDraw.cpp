@@ -1106,6 +1106,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	{
 		AddressRangeExtents extents;
+		if (state.ps_active && state.parameters_linked) {
+			extents.exporter     = bindings.vertex[0].runtime;
+			extents.pixel_inputs = &state.ps_input_info;
+		}
 		if (emit.indirect.address == 0) {
 			extents.instance_end = uint64_t {emit.first_instance} + draw.instance_count;
 		}

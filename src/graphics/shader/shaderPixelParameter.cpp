@@ -72,4 +72,10 @@ bool ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t inp
 	return input < 32u && (info.custom_interpolation_mask & (1u << input)) != 0;
 }
 
+bool ShaderPixelParameterIsExported(const ShaderPixelInputInfo& info, uint32_t input) {
+	// OFFSET[5] selects DEFAULT_VAL; FP16 and point-sprite inputs are not the exported word.
+	constexpr uint32_t NotExported = 0x20u | (1u << 17u) | (1u << 19u) | (1u << 20u);
+	return input < info.input_num && (info.interpolator_settings[input] & NotExported) == 0u;
+}
+
 } // namespace Libs::Graphics

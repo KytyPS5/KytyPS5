@@ -499,10 +499,9 @@ PipelineCache::VertexPlan(const ShaderParams& params, ShaderVertexInputInfo& inp
 
 bool PipelineCache::DrawParameterKeys::Keys(uint32_t parameter, std::vector<uint32_t>& keys) {
 	const auto location = parameter / 4u;
-	if (!linked || cache.m_parameter_keys == nullptr || location >= pixel.input_num) return false;
-	// OFFSET[5] selects DEFAULT_VAL; FP16 and point-sprite inputs are not the exported word.
-	constexpr uint32_t NotExported = 0x20u | (1u << 17u) | (1u << 19u) | (1u << 20u);
-	if ((pixel.interpolator_settings[location] & NotExported) != 0u) return false;
+	if (!linked || cache.m_parameter_keys == nullptr ||
+	    !ShaderPixelParameterIsExported(pixel, location))
+		return false;
 	const auto* plan = cache.VertexPlan(vertex, vertex_info);
 	if (plan == nullptr) return false;
 	const ShaderRecompiler::IR::SrtRuntime runtime {
@@ -916,10 +915,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
 		// Pixel inputs reach the fragment shader straight from the vertex stage's exports.
-		DrawParameterKeys parameter_keys(
-		    *this, pixel_info, vertex_params[0], vertex_info[0],
-		    !tess_active && !mesh_active && vertex_info[0].logical_stage == ShaderType::Vertex &&
-		        pixel_info.parameter_mode != ShaderPixelParameterMode::Rectangle);
+		state.parameters_linked = !tess_active && !mesh_active &&
+		                          vertex_info[0].logical_stage == ShaderType::Vertex &&
+		                          pixel_info.parameter_mode != ShaderPixelParameterMode::Rectangle;
+		DrawParameterKeys parameter_keys(*this, pixel_info, vertex_params[0], vertex_info[0],
+		                                 state.parameters_linked);
 		m_pixel_parameter_keys    = &parameter_keys;
 		const auto* pixel_program = GetProgram(pixel_params, pixel_info, push_data_cursor);
 		m_pixel_parameter_keys    = nullptr;

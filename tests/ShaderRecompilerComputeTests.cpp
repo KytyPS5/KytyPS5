@@ -6873,7 +6873,6 @@ public:
     const auto hi = [](uint64_t value) { return static_cast<uint32_t>(value >> 32u); };
     ShaderModule module;
     auto &ranges = module.info.info.address_ranges;
-    // Instance-indexed records from a user-data base.
     // Instance-indexed records from a user-data base; the stage's user data starts at s8.
     module.info.user_data_base = 8;
     ranges.push_back({.base_source = Range::Source::UserData, .base_words = {10, 11}, .begin = 16,
@@ -6892,12 +6891,41 @@ public:
     ranges.push_back({.base_source = Range::Source::Constant, .base = base + 0xa0000, .begin = 0,
                       .end = 4, .value_source = Range::Source::Srt, .value_word = 4,
                       .value_scale = 0x100, .value_exact = true});
+    // Records indexed by pixel inputs, bounded by what the vertex stage exports to them: an
+    // interpolated float of the instance, a flat word, an interpolated float that differs
+    // between vertices, and a float read of an exported word.
+    const auto pixel_range = [&](uint64_t offset, uint32_t parameter, bool from_float) {
+      ranges.push_back({.base_source = Range::Source::Constant, .base = base + offset,
+                        .begin = 0, .end = 4, .term = Range::Term::PixelParameter,
+                        .scale = 0x40, .parameter = parameter, .parameter_float = from_float});
+    };
+    pixel_range(0x60000, 1 * 4 + 3, true);
+    pixel_range(0x70000, 2 * 4 + 0, false);
+    pixel_range(0xe0000, 3 * 4 + 3, true);
+    pixel_range(0xf0000, 4 * 4 + 0, true);
+    using Bound = ShaderRecompiler::IR::ExportBound;
+    ShaderModule vertex;
+    vertex.info.info.export_bounds = {
+        Bound{.parameter = 3 * 4 + 3, .as_float = true, .per_primitive = true,
+              .term = Range::Term::InstanceIndex, .scale = 1},
+        Bound{.parameter = 4 * 4 + 0, .term = Range::Term::InstanceIndex, .scale = 1},
+        Bound{.parameter = 5 * 4 + 3, .as_float = true, .hi = 7}};
+    ShaderPixelInputInfo pixel{};
+    pixel.input_num = 5;
+    pixel.interpolator_settings[1] = 3u;
+    pixel.interpolator_settings[2] = 0x400u | 4u;
+    pixel.interpolator_settings[3] = 5u;
+    pixel.interpolator_settings[4] = 0x400u | 4u;
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
     snapshot.user_data = {0, 0, lo(base), hi(base)};
     snapshot.flattened_srt = {0, 0, lo(base + 0x40000), hi(base + 0x40000), 0x100};
     const ShaderStageRuntime runtime{&module, &snapshot};
+    ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
+    const ShaderStageRuntime vertex_runtime{&vertex, &vertex_snapshot};
     AddressRangeExtents extents;
     extents.instance_end = 10;
+    extents.exporter = &vertex_runtime;
+    extents.pixel_inputs = &pixel;
     context.BackAddressRanges(runtime, extents);
 
     Require(name, "instance records",
@@ -6914,6 +6942,15 @@ public:
             cache.IsRegionRegistered(base + 0xa0000 + 0x10000, 4) &&
                 !cache.IsRegionRegistered(base + 0xa0000, 4),
             "a range at a CPU-known offset was not backed at exactly that offset");
+    Require(name, "interpolated instance",
+            cache.IsRegionRegistered(base + 0x60000, 0x40 * 10 + 4),
+            "records indexed by an interpolated per-instance float were not backed");
+    Require(name, "flat word", cache.IsRegionRegistered(base + 0x70000, 0x40 * 9 + 4),
+            "records indexed by a flat exported word were not backed");
+    Require(name, "varying float", !cache.IsRegionRegistered(base + 0xe0000, 4),
+            "records indexed by an interpolated float that differs between vertices were backed");
+    Require(name, "word read as float", !cache.IsRegionRegistered(base + 0xf0000, 4),
+            "records indexed by an exported word read as a float were backed");
     context.UnmapMemory(base, size);
     scheduler.Finish();
     Require(name, "release",

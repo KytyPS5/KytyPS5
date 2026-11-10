@@ -119,32 +119,98 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+namespace {
+
+using AddressRange            = ShaderRecompiler::IR::AddressRange;
+constexpr uint64_t ValueLimit = uint64_t {1} << 32u;
+
+// A word of the stage's user data or flattened SRT, as recorded for this draw.
+std::optional<uint64_t> StageWord(const ShaderStageRuntime& stage, AddressRange::Source source,
+                                  uint32_t index) {
+	const auto& resources      = *stage.resources;
+	const auto  user_data_base = stage.module->info.user_data_base;
+	if (source == AddressRange::Source::UserData) {
+		if (index < user_data_base || index - user_data_base >= resources.user_data.size()) {
+			return std::nullopt;
+		}
+		return resources.user_data[index - user_data_base];
+	}
+	return index < resources.flattened_srt.size()
+	           ? std::optional<uint64_t>(resources.flattened_srt[index])
+	           : std::nullopt;
+}
+
+// One past the largest index a pixel input gives the range; 0 when unknown.
+uint64_t PixelParameterExtent(const AddressRange& range, const AddressRangeExtents& extents) {
+	if (extents.exporter == nullptr || !*extents.exporter || extents.pixel_inputs == nullptr) {
+		return 0;
+	}
+	const auto& pixel = *extents.pixel_inputs;
+	const auto  input = range.parameter / 4u;
+	if (!ShaderPixelParameterIsExported(pixel, input) ||
+	    ShaderPixelParameterIsCustom(pixel, input)) {
+		return 0;
+	}
+	const auto exported =
+	    ShaderPixelParameterMappedLocation(pixel, input) * 4u + range.parameter % 4u;
+	const auto& bounds = extents.exporter->module->info.info.export_bounds;
+	const auto  bound  = std::ranges::find_if(
+	    bounds, [&](const auto& known) { return known.parameter == exported; });
+	if (bound == bounds.end() || bound->as_float != range.parameter_float) {
+		return 0;
+	}
+	// Flat inputs and P0 are one vertex's word; interpolation keeps only a per-primitive float.
+	const bool exact = range.parameter_vertex || ShaderPixelParameterIsFlat(pixel, input);
+	if (!exact && (!range.parameter_float || !bound->per_primitive)) {
+		return 0;
+	}
+	uint64_t count = 0;
+	if (bound->term == AddressRange::Term::InstanceIndex) {
+		if (extents.instance_end == 0) {
+			return 0;
+		}
+		count = extents.instance_end - 1;
+	}
+	uint64_t value = 0;
+	if (bound->value_source != AddressRange::Source::None) {
+		const auto known = StageWord(*extents.exporter, bound->value_source, bound->value_word);
+		if (!known) {
+			return 0;
+		}
+		value = *known;
+	}
+	if ((bound->scale != 0 && count >= ValueLimit / bound->scale) ||
+	    (bound->value_scale != 0 && value >= ValueLimit / bound->value_scale)) {
+		return 0;
+	}
+	const auto largest = bound->hi + bound->scale * count + bound->value_scale * value;
+	// The float of an integer below 2^24 is exact; above, rounding could pass the bound.
+	if (largest >= (bound->as_float ? uint64_t {1} << 24u : ValueLimit)) {
+		return 0;
+	}
+	// Host interpolation of equal values is only near exact: allow one more.
+	return largest + (exact ? 1u : 2u);
+}
+
+} // namespace
+
 void RenderContext::BackAddressRanges(const ShaderStageRuntime&  stage,
                                       const AddressRangeExtents& extents) {
-	using Range                   = ShaderRecompiler::IR::AddressRange;
-	using Source                  = Range::Source;
-	using Term                    = Range::Term;
-	constexpr uint64_t MaxBytes   = 512ull * 1024 * 1024;
-	constexpr uint64_t ValueLimit = uint64_t {1} << 32u;
+	using Range                 = AddressRange;
+	using Source                = Range::Source;
+	using Term                  = Range::Term;
+	constexpr uint64_t MaxBytes = 512ull * 1024 * 1024;
 	if (!stage) {
 		return;
 	}
-	const auto& resources      = *stage.resources;
-	const auto  user_data_base = stage.module->info.user_data_base;
-	const auto  word           = [&](Source source, uint32_t index) -> std::optional<uint64_t> {
-		if (source == Source::UserData) {
-			if (index < user_data_base || index - user_data_base >= resources.user_data.size()) {
-				return std::nullopt;
-			}
-			return resources.user_data[index - user_data_base];
-		}
-		return index < resources.flattened_srt.size()
-		           ? std::optional<uint64_t>(resources.flattened_srt[index])
-		           : std::nullopt;
+	const auto word = [&](Source source, uint32_t index) {
+		return StageWord(stage, source, index);
 	};
-	const auto extent = [&](Term term) -> uint64_t {
+	const auto extent = [&](const Range& range) -> uint64_t {
+		const auto term = range.term;
 		switch (term) {
 			case Term::None: return 1;
+			case Term::PixelParameter: return PixelParameterExtent(range, extents);
 			case Term::InstanceIndex: return extents.instance_end;
 			case Term::GlobalInvocationX:
 			case Term::GlobalInvocationY:
@@ -172,7 +238,7 @@ void RenderContext::BackAddressRanges(const ShaderStageRuntime&  stage,
 		if (range.align_base) {
 			base &= ~uint64_t {3};
 		}
-		const auto count = extent(range.term);
+		const auto count = extent(range);
 		if (count == 0) {
 			continue;
 		}

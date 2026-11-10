@@ -36,6 +36,9 @@ struct AddressRangeExtents {
 	uint64_t                instance_end = 0; // first instance + instance count
 	std::array<uint64_t, 3> invocations {};
 	std::array<uint64_t, 3> workgroups {};
+	// A draw's vertex stage, when it exports straight to these pixel inputs.
+	const ShaderStageRuntime*   exporter     = nullptr;
+	const ShaderPixelInputInfo* pixel_inputs = nullptr;
 };
 
 class RenderContext {

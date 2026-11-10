@@ -147,6 +147,8 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// Output: the vertex stage exports straight to the pixel inputs.
+	bool parameters_linked = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};

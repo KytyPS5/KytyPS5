@@ -20048,6 +20048,155 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  void CheckSmallFormattedImageSync() {
+    constexpr const char *name = "SmallFormattedImageSync";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x40000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t large = 2 * page;
+    constexpr uint64_t read_image = base;
+    constexpr uint64_t copy_image = base + 0x10000;
+    constexpr uint64_t large_image = base + 0x20000;
+    constexpr uint64_t copy_target = base + 0x30000;
+    constexpr u32 stale = 0xdeadbeefu;
+    static_assert(page == 0x4000);
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &physical) == 0,
+            "guest allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "guest mapping failed");
+    std::vector<u32> native(large / sizeof(u32));
+    std::iota(native.begin(), native.end(), 0x71000000u);
+    const std::vector<u32> native_page(native.begin(),
+                                       native.begin() + page / sizeof(u32));
+    std::memset(mapped, 0, size);
+    std::memcpy(reinterpret_cast<void *>(read_image), native.data(), page);
+    std::memcpy(reinterpret_cast<void *>(copy_image), native.data(), page);
+    std::memcpy(reinterpret_cast<void *>(large_image), native.data(), large);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+
+      const auto WriteGpuImage = [&](uint64_t address, uint64_t bytes) {
+        const auto words = static_cast<u32>(bytes / sizeof(u32));
+        auto desc = MakeLinearDesc(address, bytes, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {words, 1, 1},
+                                   1, sizeof(u32), 1);
+        const auto id = textures.FindImage(desc);
+        (void)textures.FindTexture(id, desc);
+        textures.MarkGpuWritten(id);
+        const std::vector<u32> poison(words, stale);
+        LibKernel::Memory::WriteBacking(address, poison.data(), bytes);
+        std::vector<u32> backing(words);
+        Require(name, "GPU-only image",
+                id && textures.GetImage(id).SafeToDownload() &&
+                    textures.FindImageFromRange(address, bytes) == id &&
+                    LibKernel::Memory::TryReadBacking(address, backing.data(),
+                                                      bytes) &&
+                    backing == poison,
+                "image was not the only GPU-current copy over stale guest "
+                "backing");
+        Require(name, "streamable range",
+                !cache.IsRegionRegistered(address, bytes) &&
+                    !cache.IsRegionGpuModified(address, bytes) &&
+                    cache.IsRegionCpuModified(address, bytes),
+                "range was cached, GPU-modified or CPU-clean before the read");
+      };
+      const auto ReadRange =
+          [&](const std::pair<Libs::Graphics::Buffer *, uint64_t> &binding,
+              uint64_t bytes) {
+            auto readback = CreateHostBuffer(
+                name, bytes, vk::BufferUsageFlagBits::eTransferDst, {});
+            auto &command = scheduler.Current();
+            command.EndRendering();
+            vk::MemoryBarrier before{};
+            before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+            before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+            command.Handle().pipelineBarrier(
+                vk::PipelineStageFlagBits::eAllCommands,
+                vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0,
+                nullptr, 0, nullptr);
+            const vk::BufferCopy copy{binding.second, 0, bytes};
+            command.Handle().copyBuffer(binding.first->Handle(),
+                                        readback.buffer, 1, &copy);
+            vk::MemoryBarrier after{};
+            after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+            after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+            command.Handle().pipelineBarrier(
+                vk::PipelineStageFlagBits::eTransfer,
+                vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0, nullptr, 0,
+                nullptr);
+            scheduler.Finish();
+            auto words = ReadBuffer(name, readback, bytes / sizeof(u32));
+            DestroyBuffer(&readback);
+            return words;
+          };
+      const auto Mismatch = [](const std::vector<u32> &actual,
+                               const std::vector<u32> &expected) {
+        for (size_t i = 0; i < expected.size(); ++i) {
+          if (i >= actual.size() || actual[i] != expected[i]) {
+            return "word " + std::to_string(i) + " expected " +
+                   Hex(expected[i]) + ", got " +
+                   (i < actual.size() ? Hex(actual[i]) : "nothing");
+          }
+        }
+        return std::string("ok");
+      };
+
+      WriteGpuImage(read_image, page);
+      WriteGpuImage(copy_image, page);
+      WriteGpuImage(large_image, large);
+
+      const auto large_read = Mismatch(
+          ReadRange(cache.ObtainBuffer(large_image, large, false, true), large),
+          native);
+      const auto small_read = Mismatch(
+          ReadRange(cache.ObtainBuffer(read_image, page, false, true), page),
+          native_page);
+      cache.CopyBuffer(copy_target, copy_image, page, false, false);
+      cache.ReadMemory(copy_target, page);
+      std::vector<u32> copied(page / sizeof(u32));
+      Require(name, "copy readback",
+              LibKernel::Memory::TryReadBacking(copy_target, copied.data(),
+                                                page),
+              "copy target was unreadable");
+      const auto small_copy = Mismatch(copied, native_page);
+
+      Require(name, "large formatted read", large_read == "ok", large_read);
+      Require(name, "small formatted read and copy",
+              small_read == "ok" && small_copy == "ok",
+              "read " + small_read + "; copy " + small_copy);
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "guest mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
@@ -56697,6 +56846,12 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--small-formatted-image-sync-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSmallFormattedImageSync();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
     return 0;
@@ -57044,6 +57199,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckSmallFormattedImageSync();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();

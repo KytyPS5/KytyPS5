@@ -4,6 +4,7 @@
 #include <map>
 #include <optional>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -108,7 +109,9 @@ constexpr uint32_t MaxDepth   = 64;
 
 class Analyzer {
 public:
-	explicit Analyzer(bool pixel): m_pixel(pixel) {}
+	explicit Analyzer(const Program& program): m_pixel(program.stage == ShaderType::Pixel) {
+		ComputeDominators(program.blocks);
+	}
 
 	// Lanes without the load's active flag do not load, so a select on it needs only its true arm.
 	void SetContext(const Value& active, const Block* block) {
@@ -237,7 +240,65 @@ private:
 		return std::nullopt;
 	}
 
-	// Tests on the edge from -> to and on every path into `from`, up single predecessors.
+	// Cooper, Harvey and Kennedy's iteration over reverse postorder from the entry block.
+	void ComputeDominators(const std::vector<Block*>& blocks) {
+		if (blocks.empty()) {
+			return;
+		}
+		const Block*                                 entry = blocks.front();
+		std::vector<const Block*>                    postorder;
+		std::unordered_map<const Block*, uint32_t>   number;
+		std::unordered_set<const Block*>             seen {entry};
+		std::vector<std::pair<const Block*, size_t>> stack {{entry, 0}};
+		while (!stack.empty()) {
+			const auto* block      = stack.back().first;
+			const auto  successors = block->ImmSuccessors();
+			if (stack.back().second < successors.size()) {
+				const Block* successor = successors[stack.back().second++];
+				if (seen.insert(successor).second) {
+					stack.emplace_back(successor, 0);
+				}
+				continue;
+			}
+			number[block] = static_cast<uint32_t>(postorder.size());
+			postorder.push_back(block);
+			stack.pop_back();
+		}
+		m_idom[entry]        = entry;
+		const auto intersect = [&](const Block* a, const Block* b) {
+			while (a != b) {
+				while (number.at(a) < number.at(b)) {
+					a = m_idom.at(a);
+				}
+				while (number.at(b) < number.at(a)) {
+					b = m_idom.at(b);
+				}
+			}
+			return a;
+		};
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (auto it = postorder.rbegin(); it != postorder.rend(); ++it) {
+				if (*it == entry) {
+					continue;
+				}
+				const Block* idom = nullptr;
+				for (const auto* predecessor: (*it)->ImmPredecessors()) {
+					if (m_idom.contains(predecessor)) {
+						idom = idom == nullptr ? predecessor : intersect(predecessor, idom);
+					}
+				}
+				const auto found = m_idom.find(*it);
+				if (idom != nullptr && (found == m_idom.end() || found->second != idom)) {
+					m_idom[*it] = idom;
+					changed     = true;
+				}
+			}
+		}
+	}
+
+	// Tests on the edge from -> to and on every path into `from`: the edges into single-predecessor
+	// blocks on its dominator chain.
 	[[nodiscard]] std::optional<uint64_t> GuardBound(const Block* from, const Block* to,
 	                                                 const Inst* var, const Inst* next,
 	                                                 uint64_t step, bool allow_signed) const {
@@ -259,13 +320,18 @@ private:
 			take(from, to);
 		}
 		const auto* current = from;
-		for (uint32_t steps = 0; steps < MaxDepth && current != nullptr; ++steps) {
+		for (uint32_t steps = 0; steps < MaxDepth * 4u && current != nullptr; ++steps) {
 			const auto predecessors = current->ImmPredecessors();
-			if (predecessors.size() != 1) {
+			if (predecessors.size() == 1) {
+				take(predecessors[0], current);
+				current = predecessors[0];
+				continue;
+			}
+			const auto idom = m_idom.find(current);
+			if (idom == m_idom.end() || idom->second == current) {
 				break;
 			}
-			take(predecessors[0], current);
-			current = predecessors[0];
+			current = idom->second;
 		}
 		return result;
 	}
@@ -524,6 +590,7 @@ private:
 	std::map<std::tuple<const Inst*, const Inst*, const Block*>, std::optional<Offset>> m_memo;
 	std::map<std::pair<const Inst*, const Inst*>, Spread>                               m_spread;
 	std::unordered_set<const Inst*>                                                     m_visiting;
+	std::unordered_map<const Block*, const Block*>                                      m_idom;
 	bool         m_pixel  = false;
 	const Inst*  m_active = nullptr;
 	const Block* m_block  = nullptr;
@@ -695,7 +762,7 @@ void CollectExportBounds(Program& program, Analyzer& analyzer) {
 void CollectAddressRanges(Program& program) {
 	auto& ranges = program.info.address_ranges;
 	ranges.clear();
-	Analyzer analyzer(program.stage == ShaderType::Pixel);
+	Analyzer analyzer(program);
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto bytes = LoadBytes(inst.GetOpcode());

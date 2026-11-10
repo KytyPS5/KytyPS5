@@ -8767,15 +8767,20 @@ void TestAddressRangesProveReads() {
 }
 
 // Loop counters are bounded by the tests on their back edge and on the path to the read: a
-// post-tested loop, a pre-tested one, and nothing for a loop that never tests its counter.
+// post-tested loop, a pre-tested one, one whose body skips ahead to the latch, and nothing for a
+// loop that never tests its counter.
 void TestAddressRangesBoundLoops() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Shape { PostTested, PreTested, Untested };
+  enum class Shape { PostTested, PreTested, Skipping, Untested };
   const auto run = [](Shape shape) {
     Fixture fixture;
+    const bool pre_tested = shape == Shape::PreTested || shape == Shape::Skipping;
     auto *entry = fixture.block;
     auto *header = fixture.AddBlock();
-    auto *body = shape == Shape::PreTested ? fixture.AddBlock() : header;
+    auto *body = pre_tested ? fixture.AddBlock() : header;
+    // Skipping: the body branches either to a side block or straight to the latch.
+    auto *side = shape == Shape::Skipping ? fixture.AddBlock() : nullptr;
+    auto *latch = shape == Shape::Skipping ? fixture.AddBlock() : body;
     auto *exit = fixture.AddBlock();
     entry->AddBranch(header);
     entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
@@ -8784,7 +8789,7 @@ void TestAddressRangesBoundLoops() {
     const Value i(&counter);
     fixture.block = header;
     Value test;
-    if (shape == Shape::PreTested) {
+    if (pre_tested) {
       test = fixture.Emit(ValueOpcode::SLessThan32, {i, Value(20u)});
       header->condition = test;
       header->AddBranch(body);
@@ -8794,7 +8799,7 @@ void TestAddressRangesBoundLoops() {
       fixture.block = body;
     }
     const auto offset =
-        shape == Shape::PreTested
+        pre_tested
             ? fixture.Emit(ValueOpcode::IAdd32,
                            {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {i, Value(4u)}), Value(0x60u)})
             : fixture.Emit(ValueOpcode::ShiftLeftLogical32, {i, Value(4u)});
@@ -8804,12 +8809,22 @@ void TestAddressRangesBoundLoops() {
                  {fixture.Address(fixture.UserData(0), fixture.UserData(1), 4), offset, Value(0u),
                   Value(true)},
                  fixture.AddMemory(memory, 4));
+    if (shape == Shape::Skipping) {
+      body->condition = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(3), Value(0u)});
+      body->AddBranch(side);
+      body->AddBranch(latch);
+      body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = side,
+                          .false_block = latch};
+      side->AddBranch(latch);
+      side->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+      fixture.block = latch;
+    }
     const auto next = fixture.Emit(ValueOpcode::IAdd32, {i, Value(1u)});
     counter.AddPhiOperand(entry, Value(0u));
-    counter.AddPhiOperand(body, next);
-    if (shape == Shape::PreTested) {
-      body->AddBranch(header);
-      body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    counter.AddPhiOperand(latch, next);
+    if (pre_tested) {
+      latch->AddBranch(header);
+      latch->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
     } else {
       // Post-tested: the back edge is taken while the counter is below 15, or always.
       header->condition = shape == Shape::PostTested
@@ -8832,6 +8847,10 @@ void TestAddressRangesBoundLoops() {
   const auto pre = run(Shape::PreTested);
   Check(pre.size() == 1 && pre[0].begin == 0x60 && pre[0].end == 19 * 16 + 0x60 + 4,
         "a pre-tested loop counter was not bounded by its guard");
+  const auto skipping = run(Shape::Skipping);
+  Check(skipping.size() == 1 && skipping[0].begin == 0x60 &&
+            skipping[0].end == 19 * 16 + 0x60 + 4,
+        "a signed loop test was not trusted when the body skips ahead to the latch");
   Check(run(Shape::Untested).empty(), "a counter no test bounds was given a range");
 }
 

@@ -84,6 +84,13 @@ static void InterruptEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* 
 	triggered_event.fflags++;
 	triggered_event.data = reinterpret_cast<intptr_t>(trigger_data);
 	if (event->triggered) {
+		// Repeats coalesce: a trigger with the newest undelivered data bumps its count, or a
+		// guest that waits less often than the GPU interrupts would queue without bound.
+		auto& newest = event->pending_events.empty() ? event->event : event->pending_events.back();
+		if (newest.data == triggered_event.data) {
+			newest.fflags++;
+			return;
+		}
 		event->pending_events.push_back(triggered_event);
 	} else {
 		event->event     = triggered_event;

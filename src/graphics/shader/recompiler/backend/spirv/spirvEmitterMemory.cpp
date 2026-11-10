@@ -185,7 +185,11 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
-	return EmitValueOrZeroIfCondition(state, present, [&]() {
+	// A page that no buffer backs yet reads as zero, except in BVH traversal shaders: there it
+	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
+	// on negative links and would advance over zero entries forever.
+	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
+	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
 		auto pointer = state.builder.AllocateId();
 		if (coherent) {
 			const auto block = state.builder.DecoratedType(
@@ -1617,6 +1621,21 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
 		               state, EmitMemoryElementPointer(state, access, element));
 	           }));
+}
+
+uint32_t EmitLoadDeviceAddressU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+		const auto address = Binary(
+		    state, spv::OpIAdd, TypeU64(state), PackU64(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)),
+		    Unary(state, spv::OpUConvert, TypeU64(state), ctx.Arg(inst, 2)));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpLoad, TypeU32(state), value,
+		    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address),
+		    spv::MemoryAccessAlignedMask, 4u);
+		return value;
+	});
 }
 
 uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst) {

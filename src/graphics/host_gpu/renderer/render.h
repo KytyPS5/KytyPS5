@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -194,6 +195,15 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                                  Dlss::Inputs& inputs);
+
+	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
+	struct DlssContext {
+		uint64_t       context;
+		Dlss::Creation creation;
+		Dlss::Feature* feature;
+	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
 	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
@@ -213,6 +223,7 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<DlssContext>              m_dlss_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;

@@ -151,13 +151,6 @@ bool SysFileCreateDirectory(const std::filesystem::path& path) {
 	return true;
 }
 
-bool SysFileDeleteDirectory(const std::filesystem::path& path) {
-	auto real_name     = get_internal_name(path);
-	auto real_name_str = real_name.string();
-
-	return 0 == remove(real_name_str.c_str());
-}
-
 bool SysFileDeleteFile(const std::filesystem::path& name) {
 	auto real_name     = get_internal_name(name);
 	auto real_name_str = real_name.string();

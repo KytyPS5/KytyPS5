@@ -465,6 +465,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_U_F16,
 	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
@@ -878,6 +879,7 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;

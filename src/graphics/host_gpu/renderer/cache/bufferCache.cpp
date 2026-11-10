@@ -173,18 +173,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
-	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
-	} else {
-		m_download_buffer.Commit();
-	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
+	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
-		copy.dstOffset += offset;
+		copy.dstOffset += download.offset;
 	}
 
 	auto& command = m_scheduler.Current();
@@ -201,25 +192,26 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
-	native.copyBuffer(buffer.Handle(), download.Handle(),
+	native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = download.Handle();
-	after.offset        = offset;
+	after.buffer        = download.buffer->Handle();
+	after.offset        = download.offset;
 	after.size          = total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+	auto publish = [total_size, buffer_address, copies = std::move(copies),
+	                download = std::move(download)] {
+		download.buffer->Invalidate(download.offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			Libs::LibKernel::Memory::WriteBacking(
+			    buffer_address + copy.srcOffset,
+			    download.mapped + (copy.dstOffset - download.offset), copy.size);
 		}
 	};
 	if constexpr (async) {
@@ -579,6 +571,12 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		     " size=0x%016" PRIx64 " src_gds=%d dst_gds=%d\n",
 		     src_vaddr, dst_vaddr, size, static_cast<int>(src_gds), static_cast<int>(dst_gds));
 	}
+	// A copy into whole levels of a GPU-written image lands on its GPU contents, not stale guest
+	// bytes, while no buffer holds the range.
+	if (src_memory && dst_memory && !IsRegionRegistered(dst_vaddr, size) &&
+	    m_texture_cache.CopyToImage(dst_vaddr, src_vaddr, size)) {
+		return;
+	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
@@ -642,6 +640,10 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	return m_gpu_modified_ranges.Contains(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

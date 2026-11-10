@@ -22,7 +22,8 @@ LIB_VERSION("Psml", 1, "Psml", 1, 1);
 
 namespace {
 
-namespace Pm4 = Graphics::Pm4;
+namespace Pm4  = Graphics::Pm4;
+namespace Pssr = Graphics::Pssr;
 
 constexpr int      NOT_INITIALIZED           = static_cast<int>(0x8a810001u);
 constexpr int      ALREADY_INITIALIZED       = static_cast<int>(0x8a810002u);
@@ -42,7 +43,7 @@ constexpr int      UNSUPPORTED_OUTPUT_SIZE   = static_cast<int>(0x8a810013u);
 constexpr int      INVALID_SHARED_RESOURCES  = static_cast<int>(0x8a810014u);
 constexpr int      TOO_MANY_SHARED_RESOURCES = static_cast<int>(0x8a810015u);
 constexpr uint64_t MEMORY_BLOCK_SIZE         = 0x200000;
-constexpr uint32_t PACKET_DWORDS             = 1 + Graphics::Pssr::RequestDwords;
+constexpr uint32_t PACKET_DWORDS             = 1 + Pssr::RequestDwords;
 
 struct MemoryRequirements {
 	uint64_t block_size;
@@ -80,6 +81,44 @@ struct ContextParameters {
 static_assert(offsetof(ContextParameters, width) == 0x18);
 static_assert(offsetof(ContextParameters, shared) == 0x38);
 
+struct DispatchParameters {
+	const uint32_t* output;
+	const uint32_t* color;
+	const uint32_t* motion;
+	const uint32_t* previous_depth;
+	const uint32_t* depth;
+	const uint32_t* exposure;
+	uint8_t         unused0[0x34];
+	float           pre_exposure;
+	uint8_t         unused1[0x88];
+	uint32_t        width;
+	uint32_t        height;
+	uint32_t        x;
+	uint32_t        y;
+	float           jitter[2];
+	float           motion_scale[2];
+	float           motion_offset[2];
+	float           motion_gamma;
+	uint8_t         reset;
+	uint32_t        flags;
+	const void*     vr_lookup;
+};
+static_assert(offsetof(DispatchParameters, pre_exposure) == 0x64);
+static_assert(offsetof(DispatchParameters, width) == 0xf0);
+static_assert(offsetof(DispatchParameters, vr_lookup) == 0x128);
+
+// The older layout: no render offset or VR lookup, and only two flags.
+struct LegacyDispatchParameters {
+	uint8_t  render[offsetof(DispatchParameters, x)];
+	uint8_t  motion[offsetof(DispatchParameters, flags) - offsetof(DispatchParameters, jitter)];
+	uint32_t flags;
+};
+static_assert(offsetof(LegacyDispatchParameters, flags) == 0x118);
+
+constexpr uint32_t VIEW_DEPTH    = 1u << 14;
+constexpr uint32_t REVERSE_DEPTH = 1u << 15;
+constexpr uint32_t PASS_THROUGH  = 1u << 31;
+
 struct SharedResources {
 	uint32_t contexts = 0;
 };
@@ -112,7 +151,40 @@ int CheckContext(const void* context) {
 	return g_contexts.contains(context) ? OK : INVALID_CONTEXT;
 }
 
-void WritePacket(const CommandSpace& space, const Graphics::Pssr::Request& request) {
+void CopyDescriptor(uint32_t (&out)[8], const uint32_t* descriptor) {
+	if (descriptor != nullptr) {
+		std::memcpy(out, descriptor, sizeof(out));
+	}
+}
+
+// Both dispatch parameter structs name their common fields alike.
+template <typename Parameters>
+Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_t flags,
+                          float pre_exposure) {
+	Pssr::Request request {.width        = params.width,
+	                       .height       = params.height,
+	                       .context      = reinterpret_cast<uintptr_t>(context),
+	                       .x            = params.x,
+	                       .y            = params.y,
+	                       .jitter       = {params.jitter[0], params.jitter[1]},
+	                       .motion_scale = {params.motion_scale[0], params.motion_scale[1]},
+	                       .pre_exposure = pre_exposure};
+	CopyDescriptor(request.output, params.output);
+	CopyDescriptor(request.input, params.color);
+	CopyDescriptor(request.depth, params.depth);
+	CopyDescriptor(request.motion, params.motion);
+	CopyDescriptor(request.exposure, params.exposure);
+	if (params.reset != 0) {
+		flags |= Pssr::kReset;
+	}
+	if (params.motion_offset[0] != 0.0f || params.motion_offset[1] != 0.0f) {
+		flags |= Pssr::kSpatialOnly;
+	}
+	request.flags = flags;
+	return request;
+}
+
+void WritePacket(const CommandSpace& space, const Pssr::Request& request) {
 	space.cmd[0] = KYTY_PM4(space.dwords, Pm4::IT_NOP, Pm4::R_PSSR);
 	std::memcpy(space.cmd + 1, &request, sizeof(request));
 	std::memset(space.cmd + PACKET_DWORDS, 0, (space.dwords - PACKET_DWORDS) * sizeof(uint32_t));
@@ -273,7 +345,8 @@ int KYTY_SYSV_ABI GetPacketSize(const void* context, uint32_t* out_size) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space, const void* params) {
+int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
+                           const DispatchParameters* params) {
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -287,18 +360,12 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space, const
 	if (space->dwords > 0x4001) {
 		return COMMAND_BUFFER_BAD;
 	}
-	const uint32_t* descriptors[2];
-	std::memcpy(descriptors, params, sizeof(descriptors));
-	if (descriptors[0] == nullptr || descriptors[1] == nullptr) {
+	if (params->output == nullptr || params->color == nullptr) {
 		return TEXTURE_NULL;
 	}
-	Graphics::Pssr::Request request {};
-	std::memcpy(request.output, descriptors[0], sizeof(request.output));
-	std::memcpy(request.input, descriptors[1], sizeof(request.input));
-	std::memcpy(&request.width, static_cast<const uint8_t*>(params) + 0xf0, sizeof(uint32_t) * 2);
 	Graphics::ShaderTextureResource input, output;
-	std::memcpy(input.fields, request.input, sizeof(input.fields));
-	std::memcpy(output.fields, request.output, sizeof(output.fields));
+	std::memcpy(input.fields, params->color, sizeof(input.fields));
+	std::memcpy(output.fields, params->output, sizeof(output.fields));
 	namespace Gpu    = Graphics::Prospero;
 	const auto is_2d = [](const Graphics::ShaderTextureResource& descriptor) {
 		return !descriptor.IsNull() &&
@@ -309,7 +376,7 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space, const
 		       descriptor.LastLevel() <= descriptor.MaxMip() &&
 		       descriptor.BaseArray5() <= descriptor.Depth();
 	};
-	if (!is_2d(input) || !Graphics::Pssr::IsColorFormat(input.Format())) {
+	if (!is_2d(input) || !Pssr::IsColorFormat(input.Format())) {
 		return INVALID_TEXTURE;
 	}
 	if (!is_2d(output) || output.Format() != Gpu::BufferFormat::k11_11_10Float ||
@@ -320,8 +387,8 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space, const
 	}
 	const uint32_t input_width  = std::max(1u, (input.Width5() + 1u) >> input.BaseLevel());
 	const uint32_t input_height = std::max(1u, (input.Height5() + 1u) >> input.BaseLevel());
-	if (request.width == 0 || request.height == 0 || request.width > input_width ||
-	    request.height > input_height) {
+	if (params->width == 0 || params->height == 0 || params->width > input_width ||
+	    params->height > input_height) {
 		return UNSUPPORTED_RENDER_SIZE;
 	}
 	const auto& record = *g_contexts.at(context);
@@ -329,8 +396,29 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space, const
 	    uint32_t(output.Height5()) + 1 != record.height) {
 		return INVALID_OUTPUT_TEXTURE;
 	}
-	WritePacket(*space, request);
+	// Reverse depth and auto exposure are bits 15 and 16.
+	uint32_t flags = (params->flags >> 15) & (Pssr::kReverseDepth | Pssr::kAutoExposure);
+	if ((params->flags & (VIEW_DEPTH | PASS_THROUGH)) != 0 || params->vr_lookup != nullptr ||
+	    (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f)) {
+		flags |= Pssr::kSpatialOnly;
+	}
+	WritePacket(*space, MakeRequest(context, *params, flags,
+	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
+}
+
+int KYTY_SYSV_ABI LegacyDispatch(const void* context, const CommandSpace* space,
+                                 const LegacyDispatchParameters* legacy) {
+	if (legacy == nullptr) {
+		return Dispatch(context, space, nullptr);
+	}
+	DispatchParameters params {};
+	auto*              bytes = reinterpret_cast<uint8_t*>(&params);
+	std::memcpy(bytes, legacy->render, sizeof(legacy->render));
+	std::memcpy(bytes + offsetof(DispatchParameters, jitter), legacy->motion,
+	            sizeof(legacy->motion));
+	params.flags = legacy->flags & (REVERSE_DEPTH | PASS_THROUGH);
+	return Dispatch(context, space, &params);
 }
 
 int KYTY_SYSV_ABI GetMipmapBias(const void* context, float* bias, uint32_t width, uint32_t height) {
@@ -399,14 +487,27 @@ static_assert(offsetof(ContextParameters, width) == 0x28);
 struct DispatchParameters {
 	const uint32_t* output;
 	const uint32_t* color;
-	const uint32_t* unused[4];
+	const uint32_t* motion;
+	const uint32_t* depth;
+	const uint32_t* exposure;
+	const uint32_t* particle_mask;
 	float           pre_exposure;
 	uint32_t        x;
 	uint32_t        y;
 	uint32_t        width;
 	uint32_t        height;
+	float           jitter[2];
+	float           motion_scale[2];
+	float           motion_offset[2];
+	float           depth_range[2];
+	uint8_t         reset;
+	uint8_t         reserved;
+	uint8_t         encoding; // 0 is linear
+	uint8_t         particle_bits;
+	uint32_t        flags;
 };
 static_assert(offsetof(DispatchParameters, x) == 0x34);
+static_assert(offsetof(DispatchParameters, flags) == 0x68);
 
 struct Context {
 	bool     used;
@@ -472,7 +573,7 @@ int CheckDispatch(const Context* context, const DispatchParameters* params) {
 		return INVALID_TEXTURE;
 	}
 	const auto is_valid = [](const Graphics::ShaderTextureResource& descriptor) {
-		return Graphics::Pssr::IsColorFormat(descriptor.Format()) &&
+		return Pssr::IsColorFormat(descriptor.Format()) &&
 		       descriptor.Type() == Graphics::Prospero::ImageType::kColor2D &&
 		       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
 		       descriptor.BaseArray5() == 0 && descriptor.Depth() == 0;
@@ -602,10 +703,13 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 		space->cmd[0] = KYTY_PM4(space->dwords, Pm4::IT_NOP, Pm4::R_ZERO);
 		return error;
 	}
-	Graphics::Pssr::Request request {{}, {}, params->width, params->height};
-	std::memcpy(request.output, params->output, sizeof(request.output));
-	std::memcpy(request.input, params->color, sizeof(request.input));
-	WritePacket(*space, request);
+	constexpr uint32_t DILATED_MOTION = 1u << 2;
+	// Reverse depth and auto exposure are bits 0 and 1.
+	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
+	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
+		flags |= Pssr::kSpatialOnly;
+	}
+	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;
 }
 
@@ -641,7 +745,7 @@ LIB_DEFINE(InitPsml_1) {
 	LIB_FUNC("fccGInHrj8A", CreateSharedContext);
 	LIB_FUNC("JaLBe0P3jSU", ReleaseContext);
 	LIB_FUNC("AHalTX9wFZY", GetPacketSize);
-	LIB_FUNC("RUNLFro+qok", Dispatch);
+	LIB_FUNC("RUNLFro+qok", LegacyDispatch);
 	LIB_FUNC("94iBp3KvIuI", Dispatch);
 	LIB_FUNC("GHna9-DvnUk", GetMipmapBias);
 	LIB_FUNC("GJY0MvuTcs8", ValidateContext);

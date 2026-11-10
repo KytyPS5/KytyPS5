@@ -242,7 +242,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
-	        .r8g8_srgb_views        = graphics.r8g8_srgb_views};
+	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -373,8 +374,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (options.stage == ShaderType::Mesh ||
 		    options.stage == ShaderType::TessellationControl) {
 			options.user_data_base = 0;
-			options.wave_size =
-			    options.stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+		}
+		if (options.stage == ShaderType::Mesh) {
+			options.wave_size = input_info.mesh.wave_size;
 		}
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 		options.stage            = ShaderType::Pixel;

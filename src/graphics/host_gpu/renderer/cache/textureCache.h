@@ -14,6 +14,7 @@
 
 #include <bitset>
 #include <map>
+#include <mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -68,6 +69,9 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
+	// returns false for any other copy.
+	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -77,18 +81,31 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// With storage readback, a GL2 writeback makes GPU-written images visible to the CPU; returns
+	// whether a download was recorded.
+	[[nodiscard]] bool WriteBackImages();
+	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
+	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 
 private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// The depth image that last acquired this HTile range.
+		ImageId owner;
 	};
 
 	struct OverlapResult {
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+	};
+
+	// A recorded image download whose guest pages stay inaccessible until it lands.
+	struct WriteBack {
+		GuestRange range;
+		uint64_t   tick;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -155,6 +172,7 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	[[nodiscard]] bool DownloadQueuedImages();
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -167,14 +185,17 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::mutex                                        m_write_back_mutex;
+	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
-	bool             m_readback_linear_images = false;
-	bool             m_readback_tiled_images  = false;
+	uint64_t m_critical_gc_memory      = 3ull * 1024 * 1024 * 1024;
+	uint64_t m_gc_tick                 = 0;
+	bool     m_readback_linear_images  = false;
+	bool     m_readback_tiled_images   = false;
+	bool     m_readback_storage_images = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

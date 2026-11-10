@@ -19,6 +19,10 @@
 #include <type_traits>
 #include <vector>
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <pthread.h>
+#endif
+
 namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -5754,6 +5758,15 @@ void TestFmaskLoadSpecialization() {
         "rebinding FMASK as a texture reused the metadata specialization");
 }
 
+// An image operation folded away before tracking leaves its memory entry with its T#'s SGPR
+// quad index, here 2 for s[8:15], in a shader with no image.
+void TestFoldedImageOperationMemory() {
+  Fixture fixture;
+  fixture.AddMemory({.kind = ResourceKind::Image, .resource = 2}, 0);
+  fixture.PlanAndTrack();
+  ApplyResourceSpecialization(fixture.program, {});
+}
+
 void TestGatherLodSamplerValidation() {
   for (const bool explicit_lod : {false, true}) {
     for (const bool reverse : {false, true}) {
@@ -5974,8 +5987,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
 
   Check(fixture.program.srt_reads.size() == 1,
         "shared typed scalar read did not receive one flat SRT slot");
-  Check(fixture.program.info.buffers.size() == 1 &&
-            !fixture.program.info.uses_dma,
+  Check(fixture.program.info.buffers.size() == 1,
         "planning-only scalar reads leaked into resource topology");
   Check(fixture.program.memory_info[0].planning_only,
         "canonical runtime scalar read was not marked planning-only");
@@ -6057,7 +6069,7 @@ void TestScalarDataReadControlFlow() {
         {address, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4), use);
     fixture.PlanAndTrack();
     auto plan = ExtractResourcePlan(fixture.program);
-    Check(plan.srt_reads.size() == 1 && !fixture.program.info.uses_dma && plan.srt_code,
+    Check(plan.srt_reads.size() == 1 && plan.srt_code,
           "scalar data lost flattening or its walker");
     uint32_t reads = 0;
     std::array<uint32_t, 2> user_data {};
@@ -6103,8 +6115,7 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   Check(fixture.program.srt_reads.empty() &&
             read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
-            !fixture.program.memory_info[0].planning_only &&
-            fixture.program.info.uses_dma,
+            !fixture.program.memory_info[0].planning_only,
         "dynamic scalar read was incorrectly flattened or lost");
   std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
   TestMemory memory;
@@ -8209,6 +8220,60 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void TestDescriptorBehindLongPhiChain() {
+  // The descriptor word passes through far more loop phis than a 64 KiB stack
+  // holds frames of a recursive walk.
+  constexpr uint32_t depth = 4096;
+  Fixture fixture;
+  auto word = fixture.UserData(0);
+  for (uint32_t i = 0; i < depth; ++i) {
+    auto *loop = fixture.AddBlock();
+    fixture.block->AddBranch(loop);
+    loop->AddBranch(loop);
+    auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                    static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(fixture.block, word);
+    phi.AddPhiOperand(loop, Value(&phi));
+    fixture.block = loop;
+    word = Value(&phi);
+  }
+  const auto handle =
+      fixture.Buffer({word, Value(0u), Value(64u), Value(0u)}, 4);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 4));
+
+  pthread_attr_t attributes;
+  Check(pthread_attr_init(&attributes) == 0 &&
+            pthread_attr_setstacksize(&attributes, 64 * 1024) == 0,
+        "configure a small translation stack");
+  pthread_t thread;
+  Check(pthread_create(
+            &thread, &attributes,
+            [](void *opaque) -> void * {
+              static_cast<Fixture *>(opaque)->PlanAndTrack();
+              return nullptr;
+            },
+            &fixture) == 0 &&
+            pthread_join(thread, nullptr) == 0,
+        "track resources on a 64 KiB stack");
+  pthread_attr_destroy(&attributes);
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  const std::array<uint32_t, 1> user_data{0x12345678u};
+  DescriptorValue descriptor;
+  Check(fixture.program.info.buffers.size() == 1u &&
+            EvaluateSrtDescriptor(plan, {.user_data = user_data},
+                                  fixture.program.info.buffers[0].source,
+                                  descriptor) &&
+            descriptor.dwords[0] == user_data[0],
+        "descriptor behind a long phi chain lost its user-data source");
+}
+#endif
+
 void TestBufferStoreUsesItsOwnActiveValue() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
@@ -8367,8 +8432,6 @@ void TestDmaAddressMaterialization() {
   fixture.PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture.program);
 
-  Check(fixture.program.info.uses_dma,
-        "typed address operations did not enable DMA");
   std::array<uint32_t, 4> user_data{0x2008u, 0u, 0x1000u, 0u};
   TestMemory memory;
   memory.words[0] = 0x4000u;
@@ -8409,6 +8472,8 @@ void TestDynamicFlatAddressesUseDma() {
   fixture.PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture.program);
 
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture.program, {.compute = &compute});
   Check(fixture.program.info.uses_dma,
         "exec-masked FLAT address did not enable DMA");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
@@ -8436,6 +8501,7 @@ void TestDynamicFlatAddressesUseDma() {
                 {mismatch_address, mismatch_low, mismatch_high, other_active},
                 mismatch.AddMemory(flat, 0xa4));
   mismatch.PlanAndTrack();
+  CollectShaderInfo(mismatch.program, {.compute = &compute});
   Check(mismatch.program.info.uses_dma,
         "dynamic FLAT address did not enable DMA");
 }
@@ -9076,6 +9142,7 @@ int main() {
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
+    Run("folded image operation memory", TestFoldedImageOperationMemory);
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
@@ -9122,6 +9189,9 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    Run("descriptor behind a long phi chain", TestDescriptorBehindLongPhiChain);
+#endif
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);

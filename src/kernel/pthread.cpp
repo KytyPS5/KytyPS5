@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -3115,6 +3116,10 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 	return (thread->pending_signal_mask.load(std::memory_order_acquire) & mask) != 0;
 }
 
+bool PthreadHasAnyPendingSignal(Pthread thread) {
+	return thread != nullptr && thread->pending_signal_mask.load(std::memory_order_acquire) != 0;
+}
+
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
 		return false;
@@ -3186,6 +3191,7 @@ static void CleanupThread(void* arg) {
 }
 
 static void* RunThread(void* arg) {
+	Common::WriteFpEnv(Common::GuestFpEnv);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {

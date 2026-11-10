@@ -81,13 +81,12 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
-	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
-	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
-	                uint32_t interrupt_context_id);
+	                uint32_t interrupt_context_id, bool gl2_writeback);
+	void WriteBackImages();
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,

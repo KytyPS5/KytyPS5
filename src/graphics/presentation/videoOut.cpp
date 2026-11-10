@@ -338,16 +338,10 @@ static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
 static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    triggered_event.fflags < 0xfu ? triggered_event.fflags + 1u : triggered_event.fflags;
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-		return;
-	}
-	event->event     = triggered_event;
-	event->triggered = true;
+	// One event counts every occurrence until it is delivered.
+	event->event.fflags = std::min(event->event.fflags + 1u, 0xfu);
+	event->event.data   = MakeVideoOutEventData(event->event.data, trigger_data);
+	event->triggered    = true;
 }
 
 static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
@@ -1099,7 +1093,9 @@ bool FlipQueue::Flip() {
 	}
 	m_mutex.Unlock();
 
-	// Lock each port in bus order, then present and complete the whole group at one Vblank.
+	// Present and complete the whole group at one Vblank, taking the port locks in bus order. The
+	// present runs without them: Cancel waits for Presenting requests, so their frames and ports
+	// stay valid.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
 	bool due = true;
@@ -1107,8 +1103,8 @@ bool FlipQueue::Flip() {
 	size_t                      layer_count = 0;
 	Graphics::Presenter::Frame* hidden      = nullptr; // The main port behind the headset image.
 	for (size_t i = 0; i < count; i++) {
-		auto& r = requests[i];
-		r.cfg->mutex.Lock();
+		auto&             r = requests[i];
+		Common::LockGuard lock(r.cfg->mutex);
 		due &= r.cfg->generation == r.generation;
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg);
@@ -1134,6 +1130,9 @@ bool FlipQueue::Flip() {
 		}
 	}
 
+	for (size_t i = 0; i < count; i++) {
+		requests[i].cfg->mutex.Lock();
+	}
 	m_mutex.Lock();
 	for (auto it = m_requests.begin(); it != m_requests.end();) {
 		if (it->group != group) {

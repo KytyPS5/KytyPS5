@@ -605,7 +605,7 @@ struct DrawIndexBufferSource {
 // The task shader's inputs for an indirect mesh draw: Params in gpu_mesh_indirect.task.
 struct MeshTaskParams {
 	vk::DeviceAddress records        = 0;
-	uint64_t          index_address  = 0;
+	vk::DeviceAddress index_address  = 0;
 	uint32_t          stride         = 0;
 	uint32_t          index_size     = 0;
 	uint32_t          index_limit    = 0;
@@ -843,6 +843,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
+	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
+	// writes would remain (PPSA02110 ends mip reductions with a 0x0 pass past the last level).
+	const auto& vp = buffer.GetRegisters().GetScreenViewport();
+	if ((vp.screen_scissor_right <= vp.screen_scissor_left ||
+	     vp.screen_scissor_bottom <= vp.screen_scissor_top) &&
+	    std::ranges::none_of(state.VertexStages(), HasShaderBufferWrites,
+	                         &ShaderVertexInputInfo::stage)) {
+		return false;
+	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
@@ -1078,12 +1087,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 
+	// Mesh shaders read the original guest indices in whole DWORDs by device address. Their buffer
+	// exists before the descriptors bind, so creating it merges no buffer this draw binds.
+	uint64_t index_begin = 0;
+	uint64_t index_end   = 0;
 	if (mesh_active && draw.indexed) {
-		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		const auto size = static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
+		index_begin     = index_source.address & ~uint64_t {3};
+		index_end       = (index_source.address + size + 3u) & ~uint64_t {3};
+		(void)m_context.GetBufferCache().FindBuffer(index_begin, index_end - index_begin);
 	}
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1100,9 +1112,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	vk::DeviceAddress     mesh_indices = 0;
 	if (!mesh_active) {
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+	} else if (draw.indexed) {
+		const auto [indices, offset] =
+		    m_context.GetBufferCache().ObtainBuffer(index_begin, index_end - index_begin, false);
+		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
@@ -1121,7 +1138,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (mesh_task) {
 		const MeshTaskParams params {
 		    .records        = args_buffer.first->BufferDeviceAddress() + args_buffer.second,
-		    .index_address  = index_source.address,
+		    .index_address  = mesh_indices,
 		    .stride         = emit.indirect.stride,
 		    .index_size     = index_source.guest_element_size,
 		    .index_limit    = draw.index_count,
@@ -1158,8 +1175,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             index_source.guest_element_size,
-			             static_cast<uint32_t>(index_source.address),
-			             static_cast<uint32_t>(index_source.address >> 32u)};
+			             static_cast<uint32_t>(mesh_indices),
+			             static_cast<uint32_t>(mesh_indices >> 32u)};
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}

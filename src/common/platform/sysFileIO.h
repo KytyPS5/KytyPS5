@@ -35,7 +35,6 @@ bool        SysFileUnlink(sys_file_t&                  f,
                           const std::filesystem::path& name); // NOLINT(google-runtime-references)
 bool        SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size);
 bool        SysFileCreateDirectory(const std::filesystem::path& path);
-bool        SysFileDeleteDirectory(const std::filesystem::path& path);
 bool        SysFileDeleteFile(const std::filesystem::path& name);
 bool        SysFileFlush(sys_file_t& f); // NOLINT(google-runtime-references)
 SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name);

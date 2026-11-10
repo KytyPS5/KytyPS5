@@ -37,8 +37,9 @@ public:
 			return result;
 		}
 		const auto& params = *static_cast<const AjmDecOpusInitializeParameters*>(parameters);
+		// Families 0 and 1 code 1-2 channels identically; 255 codes each channel independently.
 		if (params.channel_num == 0 || params.channel_num > 2 || params.sample_rate != 48000 ||
-		    params.mapping_family != 0) {
+		    (params.mapping_family > 1 && params.mapping_family != 255)) {
 			result.result = AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL;
 			return result;
 		}
@@ -52,7 +53,15 @@ public:
 		if (m_context != nullptr) {
 			av_channel_layout_default(&m_context->ch_layout, static_cast<int>(params.channel_num));
 			m_context->sample_rate = static_cast<int>(params.sample_rate);
-			if (avcodec_open2(m_context, codec, nullptr) < 0) {
+
+			bool ready = true;
+			if (params.mapping_family == 255) {
+				ready = SetIndependentStreams(m_context, params.channel_num);
+			}
+			if (ready) {
+				ready = avcodec_open2(m_context, codec, nullptr) >= 0;
+			}
+			if (!ready) {
 				avcodec_free_context(&m_context);
 			}
 		}
@@ -181,6 +190,27 @@ public:
 	}
 
 private:
+	// One uncoupled mono stream per channel, in channel order. Marked family 1, the OpusHead block
+	// decodes 1-2 channels as 255 would but orders them for sample conversion.
+	static bool SetIndependentStreams(AVCodecContext* context, uint32_t channels) {
+		const auto size = 21 + channels;
+		auto*      head = static_cast<uint8_t*>(av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE));
+		if (head == nullptr) {
+			return false;
+		}
+		std::memcpy(head, "OpusHead", 8);
+		head[8]  = 1;
+		head[9]  = static_cast<uint8_t>(channels);
+		head[18] = 1;
+		head[19] = static_cast<uint8_t>(channels);
+		for (uint32_t channel = 0; channel < channels; channel++) {
+			head[21 + channel] = static_cast<uint8_t>(channel);
+		}
+		context->extradata      = head;
+		context->extradata_size = static_cast<int>(size);
+		return true;
+	}
+
 	AVFrame* DecodePacket(const uint8_t* data, uint32_t size, AjmDecodeResult* result) {
 		AVPacket* packet = av_packet_alloc();
 		AVFrame*  frame  = av_frame_alloc();

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <opus.h>
+#include <opus_multistream.h>
 
 using namespace Libs::Audio::Ajm;
 
@@ -26,6 +27,7 @@ struct DecodeResult {
 struct Fixture {
 	uint32_t                  instance = 0;
 	uint32_t                  channels;
+	uint32_t                  mapping_family = 0;
 	std::array<uint8_t, 4096> batch_data {};
 	AjmBatchInfo              batch {};
 
@@ -44,11 +46,11 @@ struct Fixture {
 		return &batch;
 	}
 
-	void Initialize() {
-		AjmDecOpusInitializeParameters params {channels, 48000, 0};
+	void Initialize(int32_t expected = OK) {
+		AjmDecOpusInitializeParameters params {channels, 48000, mapping_family};
 		AjmSidebandResult              result {};
 		AjmBatchJobInitialize(Batch(), instance, &params, sizeof(params), &result);
-		Check(result.result == OK, "initialize Opus instance");
+		Check(result.result == expected, "initialize Opus instance");
 	}
 
 	void Parameters(float ratio, uint32_t flags, float change = 0, bool extended = false) {
@@ -326,6 +328,54 @@ void EndPersistsUntilReset(const std::vector<uint8_t>& packet) {
 	Check(f.Info().num_samples == 0, "RESET clears end-of-stream state");
 }
 
+void MappingFamilies() {
+	// Family 1 codes stereo as family 0 does.
+	const auto           stereo = Encode(2, 1);
+	std::vector<uint8_t> expected(3840), actual(3840);
+	Fixture              f(2, AjmSampleEncoding::S16, 0);
+	f.Decode(stereo.data(), stereo.size(), expected.data(), expected.size());
+	f.mapping_family = 1;
+	f.Initialize();
+	f.Decode(stereo.data(), stereo.size(), actual.data(), actual.size());
+	Check(actual == expected, "family 1 decodes stereo as family 0");
+
+	// Family 255: two uncoupled mono streams, a loud tone in the first, a quiet one in the second.
+	int                 error = 0;
+	const unsigned char mapping[] {0, 1};
+	auto* encoder = opus_multistream_encoder_create(48000, 2, 2, 0, mapping, OPUS_APPLICATION_AUDIO,
+	                                                &error);
+	Check(encoder != nullptr && error == OPUS_OK, "create multistream test encoder");
+	std::vector<int16_t> pcm(960 * 2);
+	for (size_t i = 0; i < 960; ++i) {
+		pcm[i * 2]     = static_cast<int16_t>(12000 * std::sin(i * 0.041));
+		pcm[i * 2 + 1] = static_cast<int16_t>(3000 * std::sin(i * 0.11));
+	}
+	std::vector<uint8_t> packet(4096);
+	const int size = opus_multistream_encode(encoder, pcm.data(), 960, packet.data() + 2, 4094);
+	opus_multistream_encoder_destroy(encoder);
+	Check(size > 0, "encode multistream test packet");
+	packet.resize(size + 2);
+	packet[0] = static_cast<uint8_t>(size);
+	packet[1] = static_cast<uint8_t>(size >> 8);
+
+	f.mapping_family = 255;
+	f.Initialize();
+	std::vector<int16_t> out(960 * 2);
+	const auto decoded = f.Decode(packet.data(), packet.size(), out.data(), out.size() * 2);
+	Check(decoded.stream.size_consumed == static_cast<int>(packet.size()) &&
+	          decoded.stream.size_produced == 960 * 2 * 2,
+	      "family 255 decodes the whole multistream packet");
+	double left = 0, right = 0;
+	for (size_t i = 0; i < 960; ++i) {
+		left += std::abs(out[i * 2]);
+		right += std::abs(out[i * 2 + 1]);
+	}
+	Check(2 * right < left && left < 8 * right, "family 255 keeps each stream in its own channel");
+
+	f.mapping_family = 2;
+	f.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -344,6 +394,7 @@ int main(int argc, char** argv) {
 	LoopBoundaries();
 	FormatChangeRequiresReset();
 	EndPersistsUntilReset(packet);
+	MappingFamilies();
 	if (argc >= 2) {
 		std::ifstream        file(argv[1], std::ios::binary);
 		std::vector<uint8_t> real_packet((std::istreambuf_iterator<char>(file)), {});

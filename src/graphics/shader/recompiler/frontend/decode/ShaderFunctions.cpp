@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
 #include <array>
@@ -213,7 +214,13 @@ bool ReadFunction(uint64_t address, uint32_t return_reg, const ShaderCodeReader&
 		if (IsCall(inst.raw[0]) || inst.opcode == Opcode::S_ENDPGM ||
 		    inst.opcode == Opcode::UNSUPPORTED || Writes(inst, return_reg, wave_size) ||
 		    Writes(inst, return_reg + 1u, wave_size)) {
-			reason = "shader function needs nested calls or unsupported instructions";
+			reason = fmt::format("shader function needs nested calls or unsupported instructions (instruction word "
+			                     "0x{:08x} at 0x{:x}, offset {} words; {})",
+			                     inst.raw[0], address, next,
+			                     IsCall(inst.raw[0])                    ? "a call"
+			                     : inst.opcode == Opcode::S_ENDPGM      ? "S_ENDPGM"
+			                     : inst.opcode == Opcode::UNSUPPORTED   ? "an instruction the decoder does not support"
+			                                                            : "a write to the return address");
 			return false;
 		}
 		function.instructions.push_back(inst);

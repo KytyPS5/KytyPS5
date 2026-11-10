@@ -20173,6 +20173,15 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  // Hosts without attachment feedback loops: the same depth read/write draws through a copy.
+  void CheckRasterizationWithoutFeedbackLoops() {
+    auto &graphics = RuntimeContext();
+    const bool enabled = graphics.attachment_feedback_loop_enabled;
+    graphics.attachment_feedback_loop_enabled = false;
+    CheckRasterization(true);
+    graphics.attachment_feedback_loop_enabled = enabled;
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
@@ -20194,6 +20203,7 @@ public:
     }
     const bool packed_vertex_color = color_format != Prospero::BufferFormat::k32_32_32_32Float;
     const uint32_t extent = depth_feedback ? 8 : 32;
+    const bool feedback_loops = m_runtime_context.attachment_feedback_loop_enabled;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
@@ -20404,12 +20414,22 @@ public:
           executor, command, &color, 1, depth, stages, &feedback_aspects);
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+      const bool depth_read_write = depth_feedback && depth.depth_write_enable;
+      const ImageId sampled_id = bindings.pixel.images[0].image_id;
+      const bool copied = depth_read_write && !feedback_loops;
       Require(name, "per-draw depth feedback",
-              feedback_enabled == (depth_feedback && depth.depth_write_enable) &&
+              feedback_enabled == (feedback_loops && depth_read_write) &&
                   feedback_aspects == (feedback_enabled
                                           ? vk::ImageAspectFlagBits::eDepth
-                                          : vk::ImageAspectFlags{}),
+                                          : vk::ImageAspectFlags{}) &&
+                  (!copied || sampled_id != depth.image_id),
               "feedback was not selected only for an overlapping fragment depth read/write");
+      Require(name, "host-only depth feedback copy",
+              !copied ||
+                  (!cache.GetImage(sampled_id).registered &&
+                   cache.GetImage(sampled_id).info.data.Empty() &&
+                   cache.GetImage(sampled_id).info.IsDepth()),
+              "the unsupported feedback path did not sample a host-only depth copy");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], bindings.pixel);
       command.BeginRendering(rendering);
@@ -20448,7 +20468,13 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_feedback_dynamic_supported) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      } else {
+        Require(name, "attachment feedback dynamic state",
+                feedback_aspects == vk::ImageAspectFlags{},
+                "the host cannot select attachment feedback aspects without the dynamic state extension");
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23533,6 +23559,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_feedback_dynamic_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -23579,7 +23606,10 @@ private:
     m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
-    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    // Attachment feedback needs both the layout and the dynamic-state command; the
+    // copy fallback covers hosts that only expose the layout.
+    m_runtime_context.attachment_feedback_loop_enabled =
+        m_rasterization_supported && m_feedback_dynamic_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
@@ -23809,6 +23839,8 @@ private:
             available_acceleration_structure.accelerationStructure == true &&
                 available_ray_query.rayQuery == true,
             "acceleration structures and ray queries are not supported");
+    m_feedback_dynamic_supported =
+        available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.drawIndirectFirstInstance &&
@@ -23818,7 +23850,6 @@ private:
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
     if (!m_rasterization_supported) {
       std::printf(
@@ -23875,9 +23906,13 @@ private:
       clip_control.depthClipControl = true;
       feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
-      feedback_dynamic.pNext = &feedback_layout;
-      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      if (m_feedback_dynamic_supported) {
+        feedback_dynamic.pNext = &feedback_layout;
+        feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+        provoking_vertex.pNext = &feedback_dynamic;
+      } else {
+        provoking_vertex.pNext = &feedback_layout;
+      }
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -23945,8 +23980,10 @@ private:
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_dynamic_supported) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -57034,6 +57071,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSamplerFilterMode();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-copy-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -57041,6 +57083,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
@@ -57161,6 +57204,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
   } else {
     skipped_device_checks = true;
   }

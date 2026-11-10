@@ -492,23 +492,95 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
-		auto& image = cache.GetImage(depth.image_id);
-		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
-		const auto draw_writes = depth.AttachmentWriteAspects();
+		EXIT_IF(image_view == nullptr ||
+		        cache.GetImage(depth.image_id).backing.samples != depth.desc.info.samples);
+		const auto draw_writes   = depth.AttachmentWriteAspects();
+		const bool feedback_loops = m_context.GetGraphics().attachment_feedback_loop_enabled;
 		vk::ImageAspectFlags sampled_aspects;
-		for (const auto* stage: stages) {
-			for (const auto& binding: stage->images) {
+		ImageId              copy_id {};
+		if (!feedback_loops) {
+			// Copy the sampled subresources before the draw so the shader reads the depth values
+			// from before this draw instead of sampling a written attachment.
+			ImageSubresourceRange copy_range;
+			bool                  copy_range_set = false;
+			vk::ImageAspectFlags  copy_aspects;
+			for (const auto* stage: stages) {
+				for (const auto& binding: stage->images) {
+					if (binding.image_id != depth.image_id ||
+					    binding.desc.type != TextureCache::BindingType::Texture) {
+						continue;
+					}
+					const auto& views = cache.GetImage(depth.image_id).views;
+					const auto  native =
+					    std::ranges::find(views, binding.image_view, &CachedImageView::view);
+					EXIT_IF(native == views.end());
+					if (!DepthFeedbackAspects(draw_writes, depth.desc.view_info, native->info)) {
+						continue;
+					}
+					const auto include = [&](const ImageViewInfo& info) {
+						copy_aspects |= info.aspect;
+						if (!copy_range_set) {
+							copy_range     = {info.base_level, info.level_count, info.base_layer,
+							                  info.layer_count};
+							copy_range_set = true;
+							return;
+						}
+						const auto level_end =
+						    std::max(copy_range.base_level + copy_range.level_count,
+						             info.base_level + info.level_count);
+						copy_range.base_level =
+						    std::min(copy_range.base_level, info.base_level);
+						copy_range.level_count = level_end - copy_range.base_level;
+						const auto layer_end =
+						    std::max(copy_range.base_layer + copy_range.layer_count,
+						             info.base_layer + info.layer_count);
+						copy_range.base_layer =
+						    std::min(copy_range.base_layer, info.base_layer);
+						copy_range.layer_count = layer_end - copy_range.base_layer;
+					};
+					include(native->info);
+					for (const auto mip_view: binding.mip_views) {
+						const auto mip =
+						    std::ranges::find(views, mip_view, &CachedImageView::view);
+						EXIT_IF(mip == views.end());
+						include(mip->info);
+					}
+				}
+			}
+			if (copy_range_set) {
+				copy_id = cache.CopyDepthForFeedback(depth.image_id, copy_range, copy_aspects);
+			}
+		}
+		auto& image = cache.GetImage(depth.image_id);
+		for (auto* stage: stages) {
+			for (auto& binding: stage->images) {
 				if (binding.image_id != depth.image_id ||
-				    binding.desc.type != TextureCache::BindingType::Texture) continue;
+				    binding.desc.type != TextureCache::BindingType::Texture) {
+					continue;
+				}
 				const auto native =
 				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 				EXIT_IF(native == image.views.end());
+				const auto feedback =
+				    DepthFeedbackAspects(draw_writes, depth.desc.view_info, native->info);
+				if (copy_id && feedback) {
+					const auto info    = native->info;
+					binding.image_id   = copy_id;
+					binding.image_view = cache.GetImage(copy_id).FindView(info);
+					for (auto& mip_view: binding.mip_views) {
+						const auto mip =
+						    std::ranges::find(image.views, mip_view, &CachedImageView::view);
+						EXIT_IF(mip == image.views.end());
+						const auto mip_info = mip->info;
+						mip_view = cache.GetImage(copy_id).FindView(mip_info);
+					}
+					continue;
+				}
 				sampled_aspects |= native->info.aspect;
-				feedback_aspects |= DepthFeedbackAspects(draw_writes, depth.desc.view_info,
-				                                         native->info);
+				feedback_aspects |= feedback;
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		if (feedback_aspects && !feedback_loops) {
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				std::printf("depth attachment feedback loop is not supported by the host\n");

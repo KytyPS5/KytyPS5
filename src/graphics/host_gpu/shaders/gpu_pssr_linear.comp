@@ -21,11 +21,12 @@ void main() {
 	                        vec2(parameters.input_size) / vec2(parameters.output_size) - 0.5;
 	ivec2 lower = ivec2(floor(input_coordinate));
 	vec2 weight = fract(input_coordinate);
-	vec4 color = mix(mix(fetch_color(lower), fetch_color(lower + ivec2(1, 0)), weight.x),
-	                 mix(fetch_color(lower + ivec2(0, 1)), fetch_color(lower + ivec2(1, 1)), weight.x),
-	                 weight.y);
+	vec3 rgb = mix(mix(fetch_color(lower), fetch_color(lower + ivec2(1, 0)), weight.x),
+	               mix(fetch_color(lower + ivec2(0, 1)), fetch_color(lower + ivec2(1, 1)), weight.x),
+	               weight.y).rgb;
+	vec4 color = vec4(rgb, 1.0);
 	vec4 stored = vec4(0.0);
-	for (uint channel = 0; channel < 3; ++channel) {
+	for (uint channel = 0; channel < 4; ++channel) {
 		uint selected = parameters.output_channels[channel];
 		if (selected < 4) stored[channel] = color[selected];
 	}

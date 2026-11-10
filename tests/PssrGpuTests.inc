@@ -219,7 +219,7 @@
           std::vector<u32>(64 * 32, green),
           "upscaling read mip zero instead of the resolved mip");
 
-      constexpr u32 mfsr2 = 1u << 4;
+      constexpr u32 mfsr2 = Pssr::kFromMfsr2;
       constexpr auto half4 = Prospero::BufferFormat::k16_16_16_16Float;
       constexpr auto reversed = Prospero::BufferFormat::k10_11_11Float;
       input = descriptor(base + 0xb0000, 2, 1, packed, linear);

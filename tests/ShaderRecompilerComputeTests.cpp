@@ -4938,15 +4938,18 @@ public:
               "unpublished read-hot ranges were dropped");
 
       constexpr uint64_t image_offset = 0x600000;
+      constexpr uint64_t image_neighbor_offset = 0x620000;
       constexpr uint32_t image_first = 0x0a1b2c3du;
       constexpr uint32_t image_second = 0x4d5e6f70u;
-      GpuWrite(image_offset, image_first);
-      scheduler.Flush();
-      cache.ReadMemory(base + image_offset, sizeof(uint32_t));
-      Require(name, "image page read-hot setup",
-              Backing(image_offset) == image_first && Clean(image_offset),
-              "the image page was not downloaded before queuing a publish");
-      GpuWrite(image_offset, image_second);
+      for (const auto offset : {image_offset, image_neighbor_offset}) {
+        GpuWrite(offset, image_first);
+        scheduler.Flush();
+        cache.ReadMemory(base + offset, sizeof(uint32_t));
+        Require(name, "image page read-hot setup",
+                Backing(offset) == image_first && Clean(offset),
+                "the image page was not downloaded before queuing a publish");
+        GpuWrite(offset, image_second);
+      }
       cache.PublishReadHot();
       auto &texture_cache = context.GetTextureCache();
       auto image_desc =
@@ -4959,6 +4962,10 @@ public:
       Require(name, "image write supersedes queued publish",
               Backing(image_offset) == image_second && Dirty(image_offset),
               "an image GPU write did not supersede a queued publish");
+      Require(name, "image write keeps other queued publishes",
+              Backing(image_neighbor_offset) == image_second &&
+                  Clean(image_neighbor_offset),
+              "an image GPU write superseded a publish outside its range");
 
       constexpr std::array<uint64_t, 3> supersede_offsets = {0x700000, 0x720000,
                                                              0x740000};

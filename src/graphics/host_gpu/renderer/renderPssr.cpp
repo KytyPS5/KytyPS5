@@ -22,6 +22,7 @@ struct PssrParameters {
 	uint32_t input_size[2];
 	uint32_t output_size[2];
 	uint32_t output_channels[4];
+	uint32_t opaque_alpha;
 };
 
 // Upscalers read and write with stages and accesses of their own.
@@ -106,10 +107,10 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
 		       descriptor.MaxMip() == 0 && descriptor.BaseArray5() == 0 && descriptor.Depth() == 0;
 	};
-	const bool contract_met =
-	    (request.flags & Pssr::kFromMfsr2) != 0
-	        ? Pssr::IsMfsr2Texture(input_descriptor) && Pssr::IsMfsr2Texture(output_descriptor)
-	        : is_legacy_output(output_descriptor);
+	const bool from_mfsr2   = (request.flags & Pssr::kFromMfsr2) != 0;
+	const bool contract_met = from_mfsr2 ? Pssr::IsMfsr2Texture(input_descriptor) &&
+	                                           Pssr::IsMfsr2Texture(output_descriptor)
+	                                     : is_legacy_output(output_descriptor);
 	EXIT_IF(!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
 	        !Pssr::IsColorFormat(input_descriptor.Format()) || !contract_met ||
 	        request.width == 0 || request.height == 0);
@@ -120,7 +121,8 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	EXIT_IF(request.width > input_width || request.height > input_height);
 	PssrParameters parameters {{request.width, request.height},
 	                           {output_descriptor.Width5() + 1u, output_descriptor.Height5() + 1u},
-	                           {4, 4, 4, 4}};
+	                           {4, 4, 4, 4},
+	                           from_mfsr2};
 	const auto     host_to_storage =
 	    TextureGetSurfaceFormatInfo(output_descriptor.Format()).host_to_storage;
 	for (uint32_t component = 0; component < 4; ++component) {

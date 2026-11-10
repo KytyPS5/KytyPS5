@@ -482,7 +482,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) &&
+	    !(is_texel_buffer && m_texture_cache.FindImageFromRange(vaddr, size))) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);

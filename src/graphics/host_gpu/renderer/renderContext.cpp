@@ -119,6 +119,90 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+void RenderContext::BackAddressRanges(const ShaderStageRuntime&  stage,
+                                      const AddressRangeExtents& extents) {
+	using Range                   = ShaderRecompiler::IR::AddressRange;
+	using Source                  = Range::Source;
+	using Term                    = Range::Term;
+	constexpr uint64_t MaxBytes   = 512ull * 1024 * 1024;
+	constexpr uint64_t ValueLimit = uint64_t {1} << 32u;
+	if (!stage) {
+		return;
+	}
+	const auto& resources      = *stage.resources;
+	const auto  user_data_base = stage.module->info.user_data_base;
+	const auto  word           = [&](Source source, uint32_t index) -> std::optional<uint64_t> {
+		if (source == Source::UserData) {
+			if (index < user_data_base || index - user_data_base >= resources.user_data.size()) {
+				return std::nullopt;
+			}
+			return resources.user_data[index - user_data_base];
+		}
+		return index < resources.flattened_srt.size()
+		           ? std::optional<uint64_t>(resources.flattened_srt[index])
+		           : std::nullopt;
+	};
+	const auto extent = [&](Term term) -> uint64_t {
+		switch (term) {
+			case Term::None: return 1;
+			case Term::InstanceIndex: return extents.instance_end;
+			case Term::GlobalInvocationX:
+			case Term::GlobalInvocationY:
+			case Term::GlobalInvocationZ:
+				return extents.invocations[static_cast<uint32_t>(term) -
+				                           static_cast<uint32_t>(Term::GlobalInvocationX)];
+			case Term::WorkgroupX:
+			case Term::WorkgroupY:
+			case Term::WorkgroupZ:
+				return extents.workgroups[static_cast<uint32_t>(term) -
+				                          static_cast<uint32_t>(Term::WorkgroupX)];
+		}
+		return 0;
+	};
+	for (const auto& range: stage.module->info.info.address_ranges) {
+		uint64_t base = range.base;
+		if (range.base_source != Source::Constant) {
+			const auto low  = word(range.base_source, range.base_words[0]);
+			const auto high = word(range.base_source, range.base_words[1]);
+			if (!low || !high) {
+				continue;
+			}
+			base = *low | (*high << 32u);
+		}
+		if (range.align_base) {
+			base &= ~uint64_t {3};
+		}
+		const auto count = extent(range.term);
+		if (count == 0) {
+			continue;
+		}
+		uint64_t value = 0;
+		if (range.value_source != Source::None) {
+			const auto known = word(range.value_source, range.value_word);
+			if (!known) {
+				continue;
+			}
+			value = *known;
+		}
+		// A 32-bit offset that could pass 2^32 wraps and proves nothing.
+		const auto growth = range.scale * (count - 1) + range.value_scale * value;
+		if (range.end < 0 || growth >= ValueLimit || range.offset_max + growth >= ValueLimit) {
+			continue;
+		}
+		const auto first = base + static_cast<uint64_t>(range.begin) +
+		                   (range.value_exact ? range.value_scale * value : 0);
+		const auto last  = base + static_cast<uint64_t>(range.end) + growth;
+		if (last <= first || last - first > MaxBytes) {
+			continue;
+		}
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEachInRange(first, last - first,
+		                               [this](uint64_t start, uint64_t finish) {
+			                               (void)m_buffer_cache.FindBuffer(start, finish - start);
+		                               });
+	}
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);

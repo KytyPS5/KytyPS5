@@ -31,6 +31,13 @@ namespace Libs::Graphics {
 
 class GuestGpu;
 
+// Term extents of a draw or dispatch for its shaders' address ranges; 0 when unknown.
+struct AddressRangeExtents {
+	uint64_t                instance_end = 0; // first instance + instance count
+	std::array<uint64_t, 3> invocations {};
+	std::array<uint64_t, 3> workgroups {};
+};
+
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext&              graphics,
@@ -52,6 +59,8 @@ public:
 	ParameterKeyCache&  GetParameterKeys() { return m_parameter_keys; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
+	// Before recording, so the stage's first device-address read already finds its memory.
+	void BackAddressRanges(const ShaderStageRuntime& stage, const AddressRangeExtents& extents);
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }

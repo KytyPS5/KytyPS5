@@ -6844,6 +6844,85 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A draw's proven address ranges get buffers before it records; a range whose term the draw
+  // does not give, or whose 32-bit offset could wrap, does not.
+  void CheckAddressRangeBacking() {
+    constexpr const char *name = "AddressRangeBacking";
+    constexpr uint64_t size = 1024 * 1024;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, 64 * 1024, 0, &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0, direct, 64 * 1024) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, size);
+
+    using Range = ShaderRecompiler::IR::AddressRange;
+    const auto lo = [](uint64_t value) { return static_cast<uint32_t>(value); };
+    const auto hi = [](uint64_t value) { return static_cast<uint32_t>(value >> 32u); };
+    ShaderModule module;
+    auto &ranges = module.info.info.address_ranges;
+    // Instance-indexed records from a user-data base.
+    // Instance-indexed records from a user-data base; the stage's user data starts at s8.
+    module.info.user_data_base = 8;
+    ranges.push_back({.base_source = Range::Source::UserData, .base_words = {10, 11}, .begin = 16,
+                      .end = 32, .term = Range::Term::InstanceIndex, .scale = 64});
+    // A table read at constant offsets from a flattened SRT base.
+    ranges.push_back({.base_source = Range::Source::Srt, .base_words = {2, 3}, .align_base = true,
+                      .begin = 8, .end = 0x80});
+    // A dispatch term the draw does not give.
+    ranges.push_back({.base_source = Range::Source::Constant, .base = base + 0x80000, .begin = 0,
+                      .end = 4, .term = Range::Term::GlobalInvocationX, .scale = 4});
+    // An offset that could wrap past 2^32 proves nothing.
+    ranges.push_back({.base_source = Range::Source::Constant, .base = base + 0xc0000, .begin = 0,
+                      .end = 4, .term = Range::Term::InstanceIndex, .scale = 0x40000000u,
+                      .offset_max = 0});
+    // An offset the CPU knows exactly: the range starts at base + value.
+    ranges.push_back({.base_source = Range::Source::Constant, .base = base + 0xa0000, .begin = 0,
+                      .end = 4, .value_source = Range::Source::Srt, .value_word = 4,
+                      .value_scale = 0x100, .value_exact = true});
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.user_data = {0, 0, lo(base), hi(base)};
+    snapshot.flattened_srt = {0, 0, lo(base + 0x40000), hi(base + 0x40000), 0x100};
+    const ShaderStageRuntime runtime{&module, &snapshot};
+    AddressRangeExtents extents;
+    extents.instance_end = 10;
+    context.BackAddressRanges(runtime, extents);
+
+    Require(name, "instance records",
+            cache.IsRegionRegistered(base + 16, 32 + 64 * 9 - 16) &&
+                !cache.IsRegionRegistered(base + BufferCache::CACHING_PAGESIZE, 4),
+            "instance-indexed records were not backed exactly");
+    Require(name, "table", cache.IsRegionRegistered(base + 0x40000 + 8, 0x78),
+            "a constant-offset table range was not backed");
+    Require(name, "unknown term", !cache.IsRegionRegistered(base + 0x80000, 4),
+            "a range whose term the draw does not give was backed");
+    Require(name, "wrapping offset", !cache.IsRegionRegistered(base + 0xc0000, 4),
+            "a range whose offset could wrap was backed");
+    Require(name, "known value",
+            cache.IsRegionRegistered(base + 0xa0000 + 0x10000, 4) &&
+                !cache.IsRegionRegistered(base + 0xa0000, 4),
+            "a range at a CPU-known offset was not backed at exactly that offset");
+    context.UnmapMemory(base, size);
+    scheduler.Finish();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, size) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBdaSyncUploads() {
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
@@ -57861,6 +57940,7 @@ int main(int argc, char **argv) {
     vulkan.CheckFaultBufferScan();
     vulkan.CheckFaultRecordsOverflow();
     vulkan.CheckBdaUseKeepsBuffers();
+    vulkan.CheckAddressRangeBacking();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -58130,6 +58210,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckBdaUseKeepsBuffers();
+  vulkan.CheckAddressRangeBacking();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

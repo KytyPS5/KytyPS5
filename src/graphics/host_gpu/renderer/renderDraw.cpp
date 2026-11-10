@@ -1104,6 +1104,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	{
+		AddressRangeExtents extents;
+		if (emit.indirect.address == 0) {
+			extents.instance_end = uint64_t {emit.first_instance} + draw.instance_count;
+		}
+		for (auto* stage: stages) {
+			m_context.BackAddressRanges(*stage->runtime, extents);
+		}
+	}
 	PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;

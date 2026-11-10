@@ -379,6 +379,15 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	CacheDmaBases(m_context, input_info.stage);
+	{
+		AddressRangeExtents extents;
+		const std::array    groups {thread_group_x, thread_group_y, thread_group_z};
+		for (uint32_t axis = 0; axis < 3; ++axis) {
+			extents.workgroups[axis]  = groups[axis];
+			extents.invocations[axis] = uint64_t {groups[axis]} * input_info.threads_num[axis];
+		}
+		m_context.BackAddressRanges(input_info.stage, extents);
+	}
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -517,6 +526,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	CacheDmaBases(m_context, input_info.stage);
+	m_context.BackAddressRanges(input_info.stage, AddressRangeExtents {});
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {

@@ -4937,6 +4937,54 @@ public:
                   Clean(over_budget_offset),
               "unpublished read-hot ranges were dropped");
 
+      constexpr uint64_t image_offset = 0x600000;
+      constexpr uint32_t image_first = 0x0a1b2c3du;
+      constexpr uint32_t image_second = 0x4d5e6f70u;
+      GpuWrite(image_offset, image_first);
+      scheduler.Flush();
+      cache.ReadMemory(base + image_offset, sizeof(uint32_t));
+      Require(name, "image page read-hot setup",
+              Backing(image_offset) == image_first && Clean(image_offset),
+              "the image page was not downloaded before queuing a publish");
+      GpuWrite(image_offset, image_second);
+      cache.PublishReadHot();
+      auto &texture_cache = context.GetTextureCache();
+      auto image_desc =
+          MakeLinearDesc(base + image_offset, sizeof(uint32_t),
+                         vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                         Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      const auto image_write = texture_cache.FindImage(image_desc);
+      texture_cache.MarkGpuWritten(image_write);
+      scheduler.Finish();
+      Require(name, "image write supersedes queued publish",
+              Backing(image_offset) == image_second && Dirty(image_offset),
+              "an image GPU write did not supersede a queued publish");
+
+      constexpr std::array<uint64_t, 3> supersede_offsets = {0x700000, 0x720000,
+                                                             0x740000};
+      constexpr uint32_t supersede_first = 0x6e6e6e6eu;
+      constexpr uint32_t supersede_second = 0x7f7f7f7fu;
+      for (const auto offset : supersede_offsets) {
+        GpuWrite(offset, supersede_first);
+        scheduler.Flush();
+        cache.ReadMemory(base + offset, sizeof(uint32_t));
+        Require(name, "global supersede read-hot setup",
+                Backing(offset) == supersede_first && Clean(offset),
+                "a page was not downloaded before queuing a global supersede");
+      }
+      GpuWrite(supersede_offsets[0], supersede_second);
+      GpuWrite(supersede_offsets[1], supersede_second);
+      cache.PublishReadHot();
+      GpuWrite(supersede_offsets[2], supersede_second);
+      cache.PublishReadHot();
+      cache.SupersedeAllPublishes();
+      scheduler.Finish();
+      for (const auto offset : supersede_offsets) {
+        Require(name, "supersede all queued publishes",
+                Backing(offset) == supersede_second && Dirty(offset),
+                "SupersedeAllPublishes missed a queued publish");
+      }
+
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }

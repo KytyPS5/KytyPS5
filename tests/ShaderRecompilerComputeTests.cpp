@@ -484,8 +484,10 @@ struct RenderExecutorTestAccess {
     if (pixel_active) {
       executor.PrepareBindings(pixel, result.pixel);
     }
-    executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u}, {});
+    const auto active = std::span{stages.data(), pixel_active ? 2u : 1u};
+    executor.PrepareGraphicsBindings(active, {});
+    for (auto *stage : active)
+      executor.RebindBuffers(*stage);
     return result;
   }
 
@@ -493,6 +495,8 @@ struct RenderExecutorTestAccess {
                                       std::span<PreparedBindings *const> stages,
                                       std::span<RenderColorInfo> colors) {
     executor.PrepareGraphicsBindings(stages, colors);
+    for (auto *stage : stages)
+      executor.RebindBuffers(*stage);
   }
 
   static PipelineCache::Pipeline

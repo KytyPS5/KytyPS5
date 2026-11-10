@@ -715,6 +715,46 @@ static int CreateGuestStack(PthreadAttr attr) {
 	return OK;
 }
 
+uint64_t AllocateEmulatorGuestStack(size_t size, size_t* allocated) {
+	const auto map_size = RoundStackSize(size);
+	uint64_t   address  = 0;
+	{
+		Common::LockGuard lock(g_guest_stack_mutex);
+		auto              cached = std::find_if(g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
+		                                        [map_size](const auto& stack) {
+                                       return stack.map_size == map_size && stack.guard_size == 0;
+		                                        });
+		if (cached != g_guest_stack_cache.end()) {
+			address = cached->address;
+			g_guest_stack_cache.erase(cached);
+		} else {
+			if (g_guest_stack_last == 0) {
+				g_guest_stack_last = PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE;
+			}
+			if (map_size > g_guest_stack_last - PTHREAD_STACK_BOTTOM) {
+				return 0;
+			}
+			address = g_guest_stack_last - map_size;
+			g_guest_stack_last -= map_size;
+			address = Memory::AllocateGuestStackMemory(address, map_size, Common::VirtualMemory::Mode::ReadWrite,
+			                                           "fiber stack");
+			if (address == 0) {
+				return 0;
+			}
+		}
+	}
+	*allocated = map_size;
+	return address;
+}
+
+void FreeEmulatorGuestStack(uint64_t address, size_t size) {
+	if (address == 0) {
+		return;
+	}
+	Common::LockGuard lock(g_guest_stack_mutex);
+	g_guest_stack_cache.push_back({address, size, 0});
+}
+
 static void FreeGuestStack(PthreadAttr attr) {
 	if (attr == nullptr || attr->stack_user || attr->stack_map_addr == 0 ||
 	    attr->stack_map_size == 0) {

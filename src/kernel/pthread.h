@@ -91,6 +91,10 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
+// A guest stack of at least `size` bytes the emulator gives code whose own stack is too small
+// (see Fiber::FiberStartOnGuestStack); its size in `allocated`, 0 when there is no room.
+uint64_t              AllocateEmulatorGuestStack(size_t size, size_t* allocated);
+void                  FreeEmulatorGuestStack(uint64_t address, size_t size);
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);

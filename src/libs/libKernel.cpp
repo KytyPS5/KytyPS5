@@ -37,6 +37,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2486,10 +2487,72 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber);
 
+// A fiber runs host code on its stack too: the HLE functions it calls and, on Windows, the
+// dispatch of the exceptions the emulator handles in guest memory (the pages it protects to track
+// writes for the GPU), which pushes the thread context with its extended state and runs the
+// handlers there (Linux and macOS take signals on an alternate stack). A context sized for the
+// guest code alone overflows into the memory below it: Resident Evil Village runs the jobs of
+// Psr::buildManyBottomLevelBvh on fibers with 4 KB contexts right above their fiber objects, and
+// such a fault overwrote the fiber object next to it and the stack of a suspended fiber (whose
+// resume then jumped to address 0). On Windows a fiber runs on a stack of the emulator in guest
+// memory, the size of its context plus 64 KB for that host code (a fault dispatch measured under
+// 8 KB), assigned to the fiber object until it is initialized again, finalized or its entry
+// returns. The fiber object keeps the guest's context (sceFiberGetInfo, the magic at its base).
+// Without room for one it runs on its context.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+constexpr uint64_t FIBER_HOST_STACK_HEADROOM = 64u * 1024u;
+
+struct FiberStack {
+	uint64_t address = 0;
+	size_t   size    = 0;
+};
+static Common::Mutex                                      g_fiber_stacks_mutex;
+static std::unordered_map<const FiberObject*, FiberStack> g_fiber_stacks;
+
+static FiberStack FiberAcquireStack(const FiberObject* fiber, size_t size) {
+	Common::LockGuard lock(g_fiber_stacks_mutex);
+	auto&             stack = g_fiber_stacks[fiber];
+	if (stack.address != 0 && stack.size < size) {
+		LibKernel::FreeEmulatorGuestStack(stack.address, stack.size);
+		stack = {};
+	}
+	if (stack.address == 0) {
+		stack.address = LibKernel::AllocateEmulatorGuestStack(size, &stack.size);
+		if (stack.address == 0) {
+			g_fiber_stacks.erase(fiber);
+			static std::atomic_flag warned;
+			if (!warned.test_and_set()) {
+				::printf("Fiber: no room for an emulator stack; fibers run on their own contexts (%" PRIu64
+				         " bytes for %s)\n",
+				         static_cast<uint64_t>(fiber->size_context), fiber->name);
+			}
+			return {};
+		}
+	}
+	return stack;
+}
+
+static void FiberReleaseStack(const FiberObject* fiber) {
+	Common::LockGuard lock(g_fiber_stacks_mutex);
+	if (const auto it = g_fiber_stacks.find(fiber); it != g_fiber_stacks.end()) {
+		LibKernel::FreeEmulatorGuestStack(it->second.address, it->second.size);
+		g_fiber_stacks.erase(it);
+	}
+}
+#else
+static void FiberReleaseStack(const FiberObject* /*fiber*/) {}
+#endif
+
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
+	auto            stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
 	                            static_cast<uintptr_t>(fiber->size_context);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const auto stack = FiberAcquireStack(fiber, fiber->size_context + FIBER_HOST_STACK_HEADROOM);
+	    stack.address != 0) {
+		stack_top = stack.address + stack.size;
+	}
+#endif
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
@@ -2546,6 +2609,7 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 		return FIBER_ERROR_INVALID;
 	}
 
+	FiberReleaseStack(fiber);
 	std::memset(fiber, 0, sizeof(*fiber));
 	std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
 	fiber->name[FIBER_MAX_NAME_LENGTH] = '\0';
@@ -2617,6 +2681,7 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
 		return FIBER_ERROR_STATE;
 	}
+	FiberReleaseStack(fiber);
 
 	return OK;
 }
@@ -2651,6 +2716,10 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	const auto return_value = returned_fiber->arg_on_return;
 	const auto return_code =
 	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
+	// Its entry returned: nothing runs on its stack any more.
+	if (return_code != OK) {
+		FiberReleaseStack(returned_fiber);
+	}
 	// Copy results before another thread can acquire and resume the fiber.
 	FiberCompleteSwitch(nullptr);
 	FiberSetThreadContext(nullptr);

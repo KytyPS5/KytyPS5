@@ -55307,6 +55307,79 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A flip rate is the shortest flip interval, counted from the last flip.
+void CheckFlipRate() {
+  namespace EventQueue = LibKernel::EventQueue;
+  using Common::DebugCounters::Counter;
+  constexpr const char *name = "FlipRate";
+  constexpr std::chrono::duration<double> period{1.0 / 30};
+  Config::Load({.vblank_frequency = 30,
+                .printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
+          "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window =
+      SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr,
+          "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+
+  const int handle = VideoOut::VideoOutOpen(255, 0, 0, nullptr);
+  EventQueue::KernelEqueue flips = EventQueue::KERNEL_EQUEUE_INVALID;
+  Require(name, "setup",
+          handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
+              VideoOut::VideoOutAddFlipEvent(flips, handle, nullptr) == 0 &&
+              VideoOut::VideoOutSetFlipRate(handle, 1) == 0,
+          "video-out setup failed");
+  const auto flip = [&] {
+    EventQueue::KernelEvent event{};
+    int count = 0;
+    LibKernel::KernelUseconds timeout = 2'000'000;
+    Require(name, "flip",
+            VideoOut::VideoOutSubmitFlip(handle, -1, 1, 0) == 0 &&
+                EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                             &timeout) == 0 &&
+                count == 1,
+            "the flip did not complete");
+    return std::chrono::steady_clock::now();
+  };
+
+  // At rate 1 a frame submitted after its slot flips at the next vblank, 3
+  // vblanks after the last flip, and the frame after it waits 2 vblanks again.
+  // The first present of the port is slow, so the timed flips follow a warm-up
+  // and one idle vblank that settles its lateness count.
+  Common::DebugCounters::SetEnabled(true);
+  flip();
+  std::this_thread::sleep_for(period);
+  const auto late_vblanks = Common::DebugCounters::Get(Counter::LateVblanks);
+  const auto first = flip();
+  std::this_thread::sleep_until(first + period * 2.4);
+  const auto late = flip();
+  const auto next = flip();
+  Require(name, "pacing",
+          Common::DebugCounters::Get(Counter::LateVblanks) == late_vblanks,
+          "the present thread fell behind the vblank rate");
+  Common::DebugCounters::SetEnabled(false);
+  const double next_gap = (next - late) / period;
+  Require(name, "late flip", (late - first) / period < 3.5,
+          "a late frame did not flip at the next vblank");
+  Require(name, "interval", next_gap > 1.5 && next_gap < 2.5,
+          "the frame after a late flip did not wait 2 vblanks");
+
+  renderer.GetGpu().WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+          "video-out close failed");
+  EventQueue::KernelDeleteEqueue(flips);
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
 
@@ -56487,6 +56560,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
+    CheckFlipRate();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {

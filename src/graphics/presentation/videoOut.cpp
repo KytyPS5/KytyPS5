@@ -194,6 +194,7 @@ struct VideoOutConfig {
 	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	uint64_t                            pre_vblanks = 0;
+	uint64_t                            flip_vblank = 0; // vblank_status.count at the last flip.
 	VideoOutFlipStatus                  flip_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
@@ -480,10 +481,12 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// A flip is due once flip_rate + 1 vblanks have passed since the last flip, so a late frame flips
+// at the next vblank.
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
-	const int interval = cfg.flip_rate + 1;
+	const auto interval = static_cast<uint64_t>(cfg.flip_rate) + 1;
 
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	return interval <= 1 || cfg.vblank_status.count - cfg.flip_vblank >= interval;
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -659,6 +662,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.pre_vblanks               = 0;
+	config.flip_vblank               = 0;
 	config.vblank_status             = VideoOutVblankStatus();
 
 	return handle;
@@ -1144,6 +1148,7 @@ bool FlipQueue::Flip() {
 			continue;
 		}
 		auto& r = *it;
+		r.cfg->flip_vblank = r.cfg->vblank_status.count;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();

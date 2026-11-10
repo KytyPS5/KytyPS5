@@ -757,6 +757,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME video_out_flip_rate
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-rate-only)
 	add_test(NAME video_out_hdr10_to_sdr
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --video-out-only)
 	add_test(NAME depth_bits

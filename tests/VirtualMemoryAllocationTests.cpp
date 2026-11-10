@@ -655,112 +655,119 @@ void ParkBackingRead(uintptr_t, size_t) {
 	g_continue_backing_reads->acquire();
 }
 
+// A backed page before an unbacked one: reads across the edge take the locked sparse path.
+uint64_t MapPageBeforeHole(const char* test, const char* name) {
+	const auto base = MapNamedFlexible(test, SceKernelPageSize * 2, SceKernelProtCpuRw, name);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(hole)");
+	return base;
+}
+
 void TestConcurrentBackingReads() {
 	using namespace Libs::LibKernel::Memory;
+	using Span                  = std::array<uint64_t, 2>;
 	const char*        test     = "ConcurrentBackingReads";
 	constexpr uint64_t original = 0x123456789abcdef0ull;
-	for (const auto& readers: {std::pair {&TryReadBacking, &TryReadBacking},
-	                           std::pair {&TryReadBacking, &TryReadSparseBacking},
-	                           std::pair {&TryReadSparseBacking, &TryReadSparseBacking},
-	                           std::pair {&CopySparseMemory, &CopySparseMemory}}) {
-		const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
-		                                   "concurrent_backing_reads");
-		std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
-		std::counting_semaphore<2> entered {0};
-		std::counting_semaphore<2> resume {0};
-		g_backing_reads_entered  = &entered;
-		g_continue_backing_reads = &resume;
-		TestSetBackingReadCallback(ParkBackingRead);
-		std::array<uint64_t, 2> values {};
-		std::array<bool, 2>     results {};
-		std::thread first([&] { results[0] = readers.first(base, &values[0], sizeof(values[0])); });
-		std::thread second(
-		    [&] { results[1] = readers.second(base, &values[1], sizeof(values[1])); });
-		const bool concurrent = entered.try_acquire_for(std::chrono::seconds(5)) &&
-		                        entered.try_acquire_for(std::chrono::seconds(5));
-		// Release both threads even if an exclusive read lock prevents the second
-		// entry.
-		resume.release(2);
-		first.join();
-		second.join();
-		TestSetBackingReadCallback(nullptr);
-		CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
-		Check(test, concurrent, "backing reads could not hold their locks concurrently");
-		Check(test, results[0] && results[1] && values[0] == original && values[1] == original,
-		      "concurrent backing reads returned different contents");
-	}
+	const auto         base     = MapPageBeforeHole(test, "concurrent_backing_reads");
+	const auto         edge     = base + SceKernelPageSize - sizeof(original);
+	std::memcpy(reinterpret_cast<void*>(edge), &original, sizeof(original));
+	std::counting_semaphore<2> entered {0};
+	std::counting_semaphore<2> resume {0};
+	g_backing_reads_entered  = &entered;
+	g_continue_backing_reads = &resume;
+	TestSetBackingReadCallback(ParkBackingRead);
+	std::array<Span, 2> values {};
+	std::array<bool, 2> results {};
+	std::thread first(
+	    [&] { results[0] = TryReadSparseBacking(edge, values[0].data(), sizeof(Span)); });
+	std::thread second(
+	    [&] { results[1] = CopySparseMemory(edge, values[1].data(), sizeof(Span)); });
+	const bool concurrent = entered.try_acquire_for(std::chrono::seconds(5)) &&
+	                        entered.try_acquire_for(std::chrono::seconds(5));
+	// Release both threads even if an exclusive lock prevents the second entry.
+	resume.release(2);
+	first.join();
+	second.join();
+	TestSetBackingReadCallback(nullptr);
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	Check(test, concurrent, "sparse backing reads could not share the address-space lock");
+	Check(test,
+	      results == std::array {true, true} && values[0] == Span {original, 0} &&
+	          values[1] == Span {original, 0},
+	      "concurrent sparse backing reads returned different contents");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestBackingReadExcludesWritesAndUnmap() {
+std::binary_semaphore* g_backing_map_entered  = nullptr;
+std::binary_semaphore* g_continue_backing_map = nullptr;
+
+void ParkBackingMap(uintptr_t, size_t) {
+	g_backing_map_entered->release();
+	g_continue_backing_map->acquire();
+}
+
+void TestBackingReadsSkipMappingLock() {
 	using namespace Libs::LibKernel::Memory;
-	const char*        test        = "BackingReadExcludesWritesAndUnmap";
-	constexpr uint64_t original    = 0x123456789abcdef0ull;
-	constexpr uint64_t replacement = 0xfedcba9876543210ull;
-	for (const auto read: {TryReadBacking, TryReadSparseBacking, CopySparseMemory}) {
-		for (const bool unmap: {false, true}) {
-			const auto base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
-			                                   "backing_read_exclusion");
-			std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
-			std::counting_semaphore<2> entered {0};
-			std::counting_semaphore<2> resume {0};
-			g_backing_reads_entered  = &entered;
-			g_continue_backing_reads = &resume;
-			TestSetBackingReadCallback(ParkBackingRead);
-			uint64_t    snapshot = 0;
-			bool        read_ok  = false;
-			std::thread reader([&] { read_ok = read(base, &snapshot, sizeof(snapshot)); });
-			const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
-			std::binary_semaphore started {0};
-			std::binary_semaphore finished {0};
-			bool                  write_ok     = false;
-			int                   unmap_result = OK;
-			std::thread           mutation([&] {
-				started.release();
-				if (unmap) {
-					unmap_result = KernelMunmap(base, SceKernelPageSize);
-				} else {
-					write_ok = TryWriteBacking(base, &replacement, sizeof(replacement));
-				}
-				finished.release();
-			});
-			started.acquire();
-			const bool excluded = !finished.try_acquire_for(std::chrono::milliseconds(100));
-			resume.release();
-			reader.join();
-			mutation.join();
-			TestSetBackingReadCallback(nullptr);
-			uint64_t   after        = 0;
-			const bool still_backed = TryReadBacking(base, &after, sizeof(after));
-			if (!unmap) {
-				CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
-			}
-			Check(test, reader_parked && excluded,
-			      "backing write or unmap completed while a backing read held its "
-			      "lock");
-			Check(test, read_ok && snapshot == original,
-			      "backing mutation changed an in-progress read");
-			Check(test,
-			      unmap ? unmap_result == OK && !still_backed
-			            : write_ok && still_backed && after == replacement,
-			      "backing mutation failed after the reader released its lock");
-		}
-	}
+	const char*        test     = "BackingReadsSkipMappingLock";
+	constexpr uint64_t original = 0x123456789abcdef0ull;
+	const auto         base =
+	    MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw, "backing_reads_skip_lock");
+	std::memcpy(reinterpret_cast<void*>(base), &original, sizeof(original));
+	std::binary_semaphore entered {0};
+	std::binary_semaphore resume {0};
+	g_backing_map_entered  = &entered;
+	g_continue_backing_map = &resume;
+	TestBeforeNextBackingMap(ParkBackingMap);
+	void*       mapped     = nullptr;
+	int         map_result = OK;
+	std::thread mapper([&] {
+		map_result = KernelMapNamedFlexibleMemory(&mapped, SceKernelPageSize, SceKernelProtCpuRw, 0,
+		                                          "backing_map_in_progress");
+	});
+	const bool              mapper_parked = entered.try_acquire_for(std::chrono::seconds(5));
+	std::array<uint64_t, 3> values {};
+	std::array<bool, 3>     results {};
+	std::binary_semaphore   done {0};
+	std::thread             reader([&] {
+		results[0] = TryReadBacking(base, &values[0], sizeof(values[0]));
+		results[1] = TryReadSparseBacking(base, &values[1], sizeof(values[1]));
+		results[2] = CopySparseMemory(base, &values[2], sizeof(values[2]));
+		done.release();
+	});
+	// The reads run while the mapping holds the address-space lock exclusively.
+	const bool unblocked = done.try_acquire_for(std::chrono::seconds(5));
+	TestBeforeNextBackingMap(nullptr);
+	resume.release();
+	reader.join();
+	mapper.join();
+	CheckOk(test, map_result, "KernelMapNamedFlexibleMemory(in progress)");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(mapped), SceKernelPageSize),
+	        "KernelMunmap(in progress)");
+	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
+	Check(test, mapper_parked, "mapping did not reach the backing map");
+	Check(test, unblocked, "dense backing reads waited for a mapping in progress");
+	Check(test,
+	      results == std::array {true, true, true} &&
+	          values == std::array {original, original, original},
+	      "dense backing reads returned wrong contents during a mapping");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
 void TestTrackerProtectSharesBackingReads() {
 	using namespace Libs::LibKernel::Memory;
 	const char* test = "TrackerProtectSharesBackingReads";
-	const auto  base = MapNamedFlexible(test, SceKernelPageSize, SceKernelProtCpuRw,
-	                                    "tracker_protect_shares_reads");
+	const auto  base = MapPageBeforeHole(test, "tracker_protect_shares_reads");
 	std::counting_semaphore<2> entered {0};
 	std::counting_semaphore<2> resume {0};
 	g_backing_reads_entered  = &entered;
 	g_continue_backing_reads = &resume;
 	TestSetBackingReadCallback(ParkBackingRead);
-	uint64_t    value = 0;
-	std::thread reader([&] { CopySparseMemory(base, &value, sizeof(value)); });
+	std::array<uint64_t, 2> values {};
+	std::thread             reader([&] {
+		CopySparseMemory(base + SceKernelPageSize - sizeof(uint64_t), values.data(),
+		                 sizeof(values));
+	});
 	const bool  reader_parked = entered.try_acquire_for(std::chrono::seconds(5));
 	std::counting_semaphore<2> done {0};
 	bool                       tracker_ok   = false;
@@ -781,9 +788,9 @@ void TestTrackerProtectSharesBackingReads() {
 	TestSetBackingReadCallback(nullptr);
 	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "KernelMunmap");
 	Check(test, reader_parked && shared && tracker_ok,
-	      "tracker protection waited for a backing read");
+	      "tracker protection waited for a sparse backing read");
 	Check(test, excluded && guest_result == OK,
-	      "guest mprotect completed while a backing read held its lock");
+	      "guest mprotect completed while a sparse backing read held its lock");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5794,7 +5801,7 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestConcurrentBackingReads);
-		RunTest(TestBackingReadExcludesWritesAndUnmap);
+		RunTest(TestBackingReadsSkipMappingLock);
 		RunTest(TestTrackerProtectSharesBackingReads);
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
@@ -5857,7 +5864,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCopySparseMemoryMappings);
 	RunTest(TestSparseReadDuringDirectCommit);
 	RunTest(TestConcurrentBackingReads);
-	RunTest(TestBackingReadExcludesWritesAndUnmap);
+	RunTest(TestBackingReadsSkipMappingLock);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);

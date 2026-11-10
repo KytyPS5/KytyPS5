@@ -2628,9 +2628,12 @@ bool TestWindowsBackingViewModes() {
 			break;
 		}
 		MEMORY_BASIC_INFORMATION info {};
-		valid = VirtualQuery(placeholder, &info, sizeof(info)) != 0 &&
-		        info.Type == MEM_MAPPED && info.Protect == protection && valid;
-		EXIT_IF(!backing.Unmap(address, size));
+		// A no-access view is mapped read-write and then protected.
+		const DWORD map_protection =
+		    protection == PAGE_NOACCESS ? DWORD {PAGE_READWRITE} : protection;
+		valid = VirtualQuery(placeholder, &info, sizeof(info)) != 0 && info.Type == MEM_MAPPED &&
+		        info.Protect == protection && info.AllocationProtect == map_protection && valid;
+		backing.Unmap(address, size);
 	}
 	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
 }

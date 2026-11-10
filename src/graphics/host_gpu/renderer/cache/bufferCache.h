@@ -34,6 +34,17 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Shaders mark the regions they reach through device addresses, after the fault bitmap.
+	static constexpr uint32_t BDA_USE_REGIONBITS = 21;
+	static constexpr uint64_t BDA_USE_REGIONSIZE = uint64_t {1} << BDA_USE_REGIONBITS;
+	static constexpr uint64_t BDA_USE_NUMREGIONS =
+	    (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> BDA_USE_REGIONBITS;
+	static constexpr uint64_t FAULT_BITMAP_SIZE   = CACHING_NUMPAGES / 8;
+	static constexpr uint64_t BDA_USE_BITMAP_SIZE = BDA_USE_NUMREGIONS / 8;
+	static constexpr uint64_t FAULT_BUFFER_SIZE   = FAULT_BITMAP_SIZE + BDA_USE_BITMAP_SIZE;
+	static_assert(BDA_USE_REGIONBITS >= CACHING_PAGEBITS &&
+	              LOWER_ADDRESS_SIZE % BDA_USE_REGIONSIZE == 0);
+	static_assert(FAULT_BITMAP_SIZE % 16 == 0 && BDA_USE_BITMAP_SIZE % 4 == 0);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -89,6 +100,7 @@ public:
 	void               ProcessFaultBuffer();
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
+	void MarkGpuUse(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();

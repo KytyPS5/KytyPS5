@@ -707,6 +707,21 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+void BufferCache::MarkGpuUse(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	// Buffers never overlap, so only the one before vaddr can reach into the range.
+	auto it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > vaddr) {
+			TouchBuffer(buffer);
+		}
+	}
+}
+
 void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);

@@ -1395,7 +1395,35 @@ void DefineGetBdaPointer(EmitterState& state) {
 	EmitLabel(state, merge_label);
 	const auto offset = Binary(state, spv::OpBitwiseAnd, type, address,
 	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-	state.builder.AddFunction(spv::OpReturnValue, Binary(state, spv::OpIAdd, type, entry, offset));
+	const auto pointer = Binary(state, spv::OpIAdd, type, entry, offset);
+	// The buffer GC sees BDA-only use through these marks.
+	const auto region =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page,
+	           ConstantU32(state, BufferCache::BDA_USE_REGIONBITS - BufferCache::CACHING_PAGEBITS));
+	const auto use_pointer = FaultElementPointer(
+	    state, Binary(state, spv::OpIAdd, TypeU32(state),
+	                  Binary(state, spv::OpShiftRightLogical, TypeU32(state), region,
+	                         ConstantU32(state, 5)),
+	                  ConstantU32(state, BufferCache::FAULT_BITMAP_SIZE / sizeof(uint32_t))));
+	const auto use_bit =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), region, ConstantU32(state, 31)));
+	const auto use_word = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), use_word, use_pointer);
+	const auto unmarked = Binary(
+	    state, spv::OpIEqual, TypeBool(state),
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), use_word, use_bit), ConstantU32(state, 0));
+	const auto mark_label   = state.builder.AllocateId();
+	const auto marked_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, marked_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, unmarked, mark_label, marked_label);
+	EmitLabel(state, mark_label);
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+	                          use_pointer, ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), use_bit);
+	state.builder.AddFunction(spv::OpBranch, marked_label);
+	EmitLabel(state, marked_label);
+	state.builder.AddFunction(spv::OpReturnValue, pointer);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 

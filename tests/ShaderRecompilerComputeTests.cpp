@@ -1550,6 +1550,8 @@ struct TestCase {
   std::optional<uint64_t> fault_free_address;
   // A BDA load from this unbacked address must record its page.
   std::optional<uint64_t> fault_address;
+  // Guest addresses whose use regions, and no others, the dispatch must mark.
+  std::optional<std::vector<uint64_t>> bda_used_addresses;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -6772,6 +6774,72 @@ public:
     Require(name, "release",
             LibKernel::Memory::KernelMunmap(base, pages * page) == 0 &&
                 LibKernel::Memory::KernelReleaseDirectMemory(direct, pages * page) == 0,
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A buffer reached only through device addresses outlives the GC age while its region is marked.
+  void CheckBdaUseKeepsBuffers() {
+    constexpr const char *name = "BdaUseKeepsBuffers";
+    constexpr auto region = BufferCache::BDA_USE_REGIONSIZE;
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    void *mapped = nullptr;
+    Require(name, "allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), 2 * region, region, 0,
+                &direct) == 0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, 2 * region, 0x3, 0, direct,
+                                                         region) == 0,
+            "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, 2 * region);
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(
+        cache, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+    // `used` starts a page before the marked region; `idle` shares it; `unmarked` ages out.
+    const auto used = cache.FindBuffer(base + region - page, 2 * page);
+    const auto idle = cache.FindBuffer(base + region + 4 * page, page);
+    const auto unmarked = cache.FindBuffer(base, page);
+    const auto marked = BufferCache::PageIndex(base + region) >>
+                        (BufferCache::BDA_USE_REGIONBITS - BufferCache::CACHING_PAGEBITS);
+    const uint32_t bit = 1u << (marked % 32);
+    for (uint32_t tick = 0; tick <= 160; tick++) {
+      const auto command = scheduler.Current().Handle();
+      command.updateBuffer(cache.GetFaultBuffer()->Handle(),
+                           BufferCache::FAULT_BITMAP_SIZE + marked / 32 * sizeof(u32),
+                           sizeof(bit), &bit);
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0, nullptr,
+                              0, nullptr);
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+      cache.RunGarbageCollector();
+    }
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(
+        cache, 0, std::numeric_limits<uint64_t>::max());
+    cache.RunGarbageCollector();
+    Require(name, "eviction",
+            BufferCacheTestAccess::PageOwner(cache, base + region - page) == used &&
+                BufferCacheTestAccess::PageOwner(cache, base + region + 4 * page) == idle &&
+                !cache.IsRegionRegistered(base, page) && static_cast<bool>(unmarked),
+            "GC evicted a buffer marked used through BDA, or kept an unmarked one");
+    context.UnmapMemory(base, 2 * region);
+    scheduler.Finish();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, 2 * region) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * region) == 0,
             "guest allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
@@ -20324,7 +20392,43 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
+    Buffer use_result;
+    if (test.bda_used_addresses) {
+      Require(test.name, "use check", uses_bda, "use check requires BDA");
+      use_result = CreateHostBuffer(test.name, BufferCache::BDA_USE_BITMAP_SIZE,
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::MemoryBarrier ready{.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+                                    .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0,
+                          nullptr);
+      const vk::BufferCopy region{BufferCache::FAULT_BITMAP_SIZE, 0,
+                                  BufferCache::BDA_USE_BITMAP_SIZE};
+      cmd.copyBuffer(m_fault_buffer.buffer, use_result.buffer, 1, &region);
+      const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                       .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                          {}, 1, &readable, 0, nullptr, 0, nullptr);
+    }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (test.bda_used_addresses) {
+      constexpr auto shift = BufferCache::BDA_USE_REGIONBITS - BufferCache::CACHING_PAGEBITS;
+      std::set<uint64_t> expected;
+      for (const auto address : *test.bda_used_addresses) {
+        expected.insert(BufferCache::PageIndex(address) >> shift);
+      }
+      std::set<uint64_t> marked;
+      const auto words = ReadBuffer(test.name, use_result,
+                                    BufferCache::BDA_USE_BITMAP_SIZE / sizeof(u32));
+      for (uint64_t index = 0; index < words.size(); index++) {
+        for (auto word = words[index]; word != 0; word &= word - 1) {
+          marked.insert(index * 32 + std::countr_zero(word));
+        }
+      }
+      Require(test.name, "use check", marked == expected,
+              "BDA accesses marked other regions than the ones they reached");
+      DestroyBuffer(&use_result);
+    }
     if (fault_address) {
       const u32 expected_fault =
           test.fault_address
@@ -24470,7 +24574,7 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage | vk::BufferUsageFlagBits::eTransferSrc);
+        shader_name, BufferCache::FAULT_BUFFER_SIZE, usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -39478,6 +39582,8 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   test.initial = {0xfeedfaceu, 0xcafebabeu, 0, 0x12345678u};
   test.expected = {0x12345678u, 0x12345678u, 0, 0xcafebabeu};
   test.bda_mappings = {{GuestBase, 8}, {ExtendedBase, 0}};
+  // The load one 4 GiB step up faults, so it marks nothing.
+  test.bda_used_addresses = std::vector<uint64_t>{GuestBase, ExtendedBase};
   test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -57754,6 +57860,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBdaSyncUploads();
     vulkan.CheckFaultBufferScan();
     vulkan.CheckFaultRecordsOverflow();
+    vulkan.CheckBdaUseKeepsBuffers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -58022,6 +58129,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRayQueryTraversal();
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
+  vulkan.CheckBdaUseKeepsBuffers();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();

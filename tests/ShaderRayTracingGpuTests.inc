@@ -677,6 +677,6 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.required_spirv = {"get_bda_pointer"};
-  test.max_spirv_words = 6350;
+  test.max_spirv_words = 6425;
   return test;
 }

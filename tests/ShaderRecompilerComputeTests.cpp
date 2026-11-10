@@ -20051,13 +20051,16 @@ public:
   void CheckSmallFormattedImageSync() {
     constexpr const char *name = "SmallFormattedImageSync";
     constexpr uintptr_t base = 0x0000000204b00000ull;
-    constexpr uint64_t size = 0x40000;
+    constexpr uint64_t size = 0x80000;
     constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
     constexpr uint64_t large = 2 * page;
     constexpr uint64_t read_image = base;
     constexpr uint64_t copy_image = base + 0x10000;
     constexpr uint64_t large_image = base + 0x20000;
     constexpr uint64_t copy_target = base + 0x30000;
+    constexpr uint64_t part_read_image = base + 0x40000;
+    constexpr uint64_t part_copy_image = base + 0x50000;
+    constexpr uint64_t part_copy_target = base + 0x60000;
     constexpr u32 stale = 0xdeadbeefu;
     static_assert(page == 0x4000);
 
@@ -20082,6 +20085,10 @@ public:
     std::memcpy(reinterpret_cast<void *>(read_image), native.data(), page);
     std::memcpy(reinterpret_cast<void *>(copy_image), native.data(), page);
     std::memcpy(reinterpret_cast<void *>(large_image), native.data(), large);
+    std::memcpy(reinterpret_cast<void *>(part_read_image), native.data(),
+                large);
+    std::memcpy(reinterpret_cast<void *>(part_copy_image), native.data(),
+                large);
 
     RenderContext context(m_runtime_context);
     context.InitializeGpu(nullptr);
@@ -20164,6 +20171,8 @@ public:
       WriteGpuImage(read_image, page);
       WriteGpuImage(copy_image, page);
       WriteGpuImage(large_image, large);
+      WriteGpuImage(part_read_image, large);
+      WriteGpuImage(part_copy_image, large);
 
       const auto large_read = Mismatch(
           ReadRange(cache.ObtainBuffer(large_image, large, false, true), large),
@@ -20179,11 +20188,25 @@ public:
                                                 page),
               "copy target was unreadable");
       const auto small_copy = Mismatch(copied, native_page);
+      const auto part_read = Mismatch(
+          ReadRange(cache.ObtainBuffer(part_read_image, page, false, true),
+                    page),
+          native_page);
+      cache.CopyBuffer(part_copy_target, part_copy_image, page, false, false);
+      cache.ReadMemory(part_copy_target, page);
+      Require(name, "partial copy readback",
+              LibKernel::Memory::TryReadBacking(part_copy_target, copied.data(),
+                                                page),
+              "partial copy target was unreadable");
+      const auto part_copy = Mismatch(copied, native_page);
 
       Require(name, "large formatted read", large_read == "ok", large_read);
       Require(name, "small formatted read and copy",
               small_read == "ok" && small_copy == "ok",
               "read " + small_read + "; copy " + small_copy);
+      Require(name, "partial formatted read and copy",
+              part_read == "ok" && part_copy == "ok",
+              "read " + part_read + "; copy " + part_copy);
 
       context.UnmapMemory(base, size);
       scheduler.Finish();

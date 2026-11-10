@@ -1642,9 +1642,17 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 		// (NoteTlasInstances()) when larger: the first walks of a new one got a host TLAS of the
 		// size of the source's previous one (ASTRO BOT's island in Go-Go Archipelago: 1024 of its
 		// 4242 instances, in a pass of 64 dispatches in one frame).
-		const auto last = std::max(m_last_instance_counts[source_key], std::exchange(m_next_instances, 0u));
-		tlas_count      = std::min(m_tlas_capacity, std::max(1024u, (last + last / 4 + 255u) &
-		                                                           ~255u));
+		const auto counted = std::exchange(m_next_instances, 0u);
+		// A source the CPU never counted holds a TLAS the game builds on the GPU within the frame
+		// (Marvel's Wolverine: 224 to 2868 instances within seconds, a size no earlier walk
+		// predicts): it starts with room for 4096.
+		if (counted != 0) {
+			m_cpu_counted_sources.insert(source_key);
+		}
+		const auto last = std::max(m_last_instance_counts[source_key], counted);
+		tlas_count      = std::min(m_tlas_capacity,
+		                           std::max({m_cpu_counted_sources.contains(source_key) ? 1024u : 4096u,
+		                                     m_instance_floors[source_key], (last + last / 4 + 255u) & ~255u}));
 	}
 	m_prepare_id++;
 
@@ -1882,6 +1890,10 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	if ((state.overflow & StateFull) != 0) {
 		g_rt_stats.walks_overflow.Add();
 		g_rt_stats.last_overflow.store(readback.shader_hash, std::memory_order_relaxed);
+		// The TLAS outgrew the host's before the CPU could count it: the next walks of this source
+		// start with room for the count the GPU found.
+		auto& floor = m_instance_floors[readback.source_key];
+		floor       = std::max(floor, (state.instance_count + 255u) & ~255u);
 	}
 	SummarizeRayTracing();
 	for (uint32_t i = 0; i < missing_count; i++) {

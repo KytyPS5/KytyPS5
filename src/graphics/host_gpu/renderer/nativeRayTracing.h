@@ -16,6 +16,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -464,6 +465,10 @@ private:
 	uint64_t                  m_last_scan_prepare = 0;
 	// The instance count of the last walk of each TLAS source (shaders trace different TLASes).
 	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
+	// The host TLAS size below which the walks of a source do not start (the count of its overflows).
+	std::unordered_map<uint32_t, uint32_t> m_instance_floors;
+	// The sources whose TLAS the CPU has counted (NoteTlasInstances()).
+	std::unordered_set<uint32_t>           m_cpu_counted_sources;
 	// ReadGuestTlas(): the last TLASes it read (by header), replaced in turn; NoteTlasInstances().
 	std::array<std::pair<uint64_t, GuestTlas>, 8> m_guest_tlases {};
 	uint32_t                                      m_guest_tlas_next = 0;

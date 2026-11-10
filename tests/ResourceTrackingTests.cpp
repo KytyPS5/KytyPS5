@@ -8835,6 +8835,137 @@ void TestAddressRangesBoundLoops() {
   Check(run(Shape::Untested).empty(), "a counter no test bounds was given a range");
 }
 
+// Pixel inputs index reads by the values the vertex stage exports: a flat input read as a
+// word, one converted from float, and one vertex's word (P0). A vertex stage's attribute is a
+// fetched vertex input, not an export, so it bounds nothing.
+void TestAddressRangesPixelParameters() {
+  const auto run = [](ShaderType stage) {
+    Fixture fixture(stage);
+    const auto load = [&](uint32_t base_reg, Value offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Global;
+      fixture.Emit(ValueOpcode::LoadAddressU32,
+                   {fixture.Address(fixture.UserData(base_reg), fixture.UserData(base_reg + 1), pc),
+                    offset, Value(0u), Value(true)},
+                   fixture.AddMemory(memory, pc));
+    };
+    const auto converted = fixture.Emit(
+        ValueOpcode::ConvertU32F32,
+        {fixture.Emit(ValueOpcode::BitCastF32U32,
+                      {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(2u)})})});
+    load(0, fixture.Emit(ValueOpcode::IMul32, {converted, Value(48u)}), 100);
+    const auto word = fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)});
+    load(2, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {word, Value(4u)}), 200);
+    const auto vertex =
+        fixture.Emit(ValueOpcode::GetInterpolationParameter, {Value(3u), Value(1u), Value(2u)});
+    load(4, fixture.Emit(ValueOpcode::IAdd32, {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                                            {vertex, Value(3u)}),
+                                               Value(0x20u)}),
+         300);
+    fixture.PlanAndTrack();
+    CollectAddressRanges(fixture.program);
+    return fixture.program.info.address_ranges;
+  };
+  const auto ranges = run(ShaderType::Pixel);
+  const auto find = [&](uint32_t reg) -> const AddressRange * {
+    for (const auto &range : ranges) {
+      if (range.base_source == AddressRange::Source::UserData && range.base_words[0] == reg)
+        return &range;
+    }
+    return nullptr;
+  };
+  const auto *converted = find(0);
+  const auto *word = find(2);
+  const auto *vertex = find(4);
+  Check(converted != nullptr && converted->term == AddressRange::Term::PixelParameter &&
+            converted->parameter == 6 && converted->parameter_float &&
+            !converted->parameter_vertex && converted->scale == 48 && converted->end == 4,
+        "a read indexed by a converted float pixel input was not proven");
+  Check(word != nullptr && word->term == AddressRange::Term::PixelParameter &&
+            word->parameter == 8 && !word->parameter_float && !word->parameter_vertex &&
+            word->scale == 16,
+        "a read indexed by a pixel input word was not proven");
+  Check(vertex != nullptr && vertex->term == AddressRange::Term::PixelParameter &&
+            vertex->parameter == 13 && vertex->parameter_vertex && vertex->scale == 8 &&
+            vertex->begin == 0x20 && vertex->end == 0x24,
+        "a read indexed by one vertex's word of a pixel input was not proven");
+  Check(std::ranges::none_of(run(ShaderType::Vertex),
+                             [](const AddressRange &range) {
+                               return range.term == AddressRange::Term::PixelParameter;
+                             }),
+        "a vertex stage's fetched attribute was taken for a pixel input");
+}
+
+// A vertex stage's parameter exports are bounded by the same analysis, and marked when every
+// vertex of a primitive exports the same value: from the instance, user data and constants,
+// not the vertex index or another lane's value.
+void TestExportBounds() {
+  Fixture fixture(ShaderType::Vertex);
+  const auto builtin = [&](StageInputKind kind) {
+    return fixture.Emit(ValueOpcode::GetBuiltin, {Value(static_cast<uint32_t>(kind)), Value(0u)});
+  };
+  const auto as_float = [&](Value integer) {
+    return fixture.Emit(ValueOpcode::BitCastU32F32,
+                        {fixture.Emit(ValueOpcode::ConvertF32U32, {integer})});
+  };
+  const auto instance = builtin(StageInputKind::InstanceIndex);
+  const auto vertex = builtin(StageInputKind::VertexIndex);
+  // The wave emulation selects each exported value on the export's active flag.
+  const auto exec = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(9), Value(0u)});
+  const auto active = [&](Value value) {
+    return fixture.Emit(ValueOpcode::SelectU32, {exec, value, Value(0u)});
+  };
+  const auto set = [&](uint32_t index, Value x, Value y, Value z, Value w, uint32_t en) {
+    fixture.program.export_info.push_back(
+        {.kind = ExportTargetKind::Parameter, .index = index, .en = en});
+    fixture.Emit(ValueOpcode::SetAttribute,
+                 {fixture.Emit(ValueOpcode::CompositeConstructU32x4, {x, y, z, w}), exec},
+                 ExportFlags{.index = static_cast<uint32_t>(fixture.program.export_info.size() - 1),
+                             .pc = 0x100u});
+  };
+  set(3, active(as_float(fixture.Emit(ValueOpcode::IAdd32, {instance, fixture.UserData(4)}))),
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {instance, Value(2u)}),
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {vertex, Value(7u)}),
+      fixture.Emit(ValueOpcode::ReadFirstLane, {instance, Value(true)}), 0xfu);
+  // Two exports of one channel: the bound covers both; a float and a word bound nothing.
+  set(4, as_float(instance), as_float(instance), Value(0u), Value(0u), 0x3u);
+  set(4, as_float(Value(3u)), instance, Value(0u), Value(0u), 0x3u);
+  fixture.PlanAndTrack();
+  CollectAddressRanges(fixture.program);
+  const auto &bounds = fixture.program.info.export_bounds;
+  const auto find = [&](uint32_t parameter) -> const ExportBound * {
+    for (const auto &bound : bounds) {
+      if (bound.parameter == parameter) return &bound;
+    }
+    return nullptr;
+  };
+  const auto *instanced = find(12);
+  Check(instanced != nullptr && instanced->as_float && instanced->per_primitive &&
+            instanced->term == AddressRange::Term::InstanceIndex && instanced->scale == 1 &&
+            instanced->value_source == AddressRange::Source::UserData &&
+            instanced->value_word == 4 && instanced->value_scale == 1,
+        "the float of the instance plus user data was not bounded per primitive");
+  const auto *word = find(13);
+  Check(word != nullptr && !word->as_float && word->per_primitive && word->scale == 4,
+        "an instance-scaled word was not bounded per primitive");
+  const auto *masked = find(14);
+  Check(masked != nullptr && !masked->per_primitive && masked->hi == 7 &&
+            masked->term == AddressRange::Term::None,
+        "a masked vertex index was not bounded, or was taken as the same on every vertex");
+  const auto *first_lane = find(15);
+  Check(first_lane == nullptr || !first_lane->per_primitive,
+        "another lane's instance was taken as the same on every vertex of a primitive");
+  const auto *merged = find(16);
+  Check(merged != nullptr && merged->as_float && merged->per_primitive && merged->hi == 3 &&
+            merged->scale == 1,
+        "two exports of one channel were not bounded together");
+  Check(find(17) == nullptr, "a channel exported as both a float and a word was bounded");
+  Fixture pixel(ShaderType::Pixel);
+  pixel.PlanAndTrack();
+  CollectAddressRanges(pixel.program);
+  Check(pixel.program.info.export_bounds.empty(), "a pixel stage was given export bounds");
+}
+
 void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
@@ -9829,6 +9960,8 @@ int main() {
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("address ranges prove reads", TestAddressRangesProveReads);
     Run("address ranges bound loops", TestAddressRangesBoundLoops);
+    Run("address ranges index by pixel inputs", TestAddressRangesPixelParameters);
+    Run("export bounds", TestExportBounds);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);

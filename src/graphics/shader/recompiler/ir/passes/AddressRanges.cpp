@@ -26,6 +26,9 @@ struct Offset {
 	uint64_t hi          = 0;
 	Term     term        = Term::None;
 	uint64_t scale       = 0;
+	uint32_t parameter        = 0;
+	bool     parameter_vertex = false;
+	bool     parameter_float  = false;
 	Known    value       = {};
 	uint64_t value_scale = 0;
 	bool     exact       = true;
@@ -33,7 +36,20 @@ struct Offset {
 	[[nodiscard]] bool HasTerms() const {
 		return term != Term::None || value.source != Source::None;
 	}
+	// Whether both terms can add up or bound each other: none, or the same one.
+	[[nodiscard]] bool TermFits(const Offset& other) const {
+		return term == Term::None || other.term == Term::None ||
+		       (term == other.term && parameter == other.parameter &&
+		        parameter_vertex == other.parameter_vertex &&
+		        parameter_float == other.parameter_float);
+	}
+	[[nodiscard]] const Offset& Termed(const Offset& other) const {
+		return term != Term::None ? *this : other;
+	}
 };
+
+// Whether a value differs between the invocations of a draw: never, per instance, or per vertex.
+enum class Spread : uint8_t { Draw, Instance, Varying };
 
 constexpr uint64_t ValueLimit = uint64_t {1} << 32u;
 constexpr uint32_t MaxDepth   = 64;
@@ -58,20 +74,24 @@ constexpr uint32_t MaxDepth   = 64;
 
 // Terms are never negative, so the larger multiple bounds both arms.
 [[nodiscard]] std::optional<Offset> Union(const Offset& a, const Offset& b) {
-	if (a.term != Term::None && b.term != Term::None && a.term != b.term) {
+	if (!a.TermFits(b)) {
 		return std::nullopt;
 	}
 	if (a.value.source != Source::None && b.value.source != Source::None && a.value != b.value) {
 		return std::nullopt;
 	}
+	const auto& termed = a.Termed(b);
 	return Offset {
-	    .lo          = std::min(a.lo, b.lo),
-	    .hi          = std::max(a.hi, b.hi),
-	    .term        = a.term != Term::None ? a.term : b.term,
-	    .scale       = std::max(a.scale, b.scale),
-	    .value       = a.value.source != Source::None ? a.value : b.value,
-	    .value_scale = std::max(a.value_scale, b.value_scale),
-	    .exact       = a.exact && b.exact && a.value == b.value && a.value_scale == b.value_scale,
+	    .lo               = std::min(a.lo, b.lo),
+	    .hi               = std::max(a.hi, b.hi),
+	    .term             = termed.term,
+	    .scale            = std::max(a.scale, b.scale),
+	    .parameter        = termed.parameter,
+	    .parameter_vertex = termed.parameter_vertex,
+	    .parameter_float  = termed.parameter_float,
+	    .value            = a.value.source != Source::None ? a.value : b.value,
+	    .value_scale      = std::max(a.value_scale, b.value_scale),
+	    .exact = a.exact && b.exact && a.value == b.value && a.value_scale == b.value_scale,
 	};
 }
 
@@ -88,6 +108,8 @@ constexpr uint32_t MaxDepth   = 64;
 
 class Analyzer {
 public:
+	explicit Analyzer(bool pixel): m_pixel(pixel) {}
+
 	// Lanes without the load's active flag do not load, so a select on it needs only its true arm.
 	void SetContext(const Value& active, const Block* block) {
 		const auto resolved = active.Resolve();
@@ -114,6 +136,24 @@ public:
 		const auto result = Compute(*inst, depth + 1);
 		m_visiting.erase(inst);
 		m_memo.emplace(key, result);
+		return result;
+	}
+
+	[[nodiscard]] Spread SpreadOf(const Value& value, uint32_t depth = 0) {
+		const auto resolved = value.Resolve();
+		if (resolved.IsImmediate()) {
+			return Spread::Draw;
+		}
+		const auto* inst = resolved.TryInstruction();
+		if (inst == nullptr || depth > MaxDepth) {
+			return Spread::Varying;
+		}
+		const auto key = std::pair {inst, m_active};
+		if (const auto found = m_spread.find(key); found != m_spread.end()) {
+			return found->second;
+		}
+		const auto result = ComputeSpread(*inst, depth + 1);
+		m_spread.emplace(key, result);
 		return result;
 	}
 
@@ -280,6 +320,18 @@ private:
 				const auto term = kind && component ? BuiltinTerm(*kind, *component) : std::nullopt;
 				return term ? std::optional(Offset {.term = *term, .scale = 1}) : std::nullopt;
 			}
+			case ValueOpcode::GetAttribute:
+			case ValueOpcode::GetInterpolationParameter:
+				return m_pixel ? PixelParameter(inst, false) : std::nullopt;
+			case ValueOpcode::ConvertU32F32: {
+				// GCN saturates and takes NaN to 0, so the converted vertex values bound it.
+				const auto* bits = inst.Arg(0).Resolve().TryInstruction();
+				const auto* input =
+				    bits != nullptr && bits->GetOpcode() == ValueOpcode::BitCastF32U32
+				        ? bits->Arg(0).Resolve().TryInstruction()
+				        : nullptr;
+				return m_pixel && input != nullptr ? PixelParameter(*input, true) : std::nullopt;
+			}
 			case ValueOpcode::ReadConst: {
 				const auto slot = Immediate(inst.Arg(1));
 				return slot
@@ -296,22 +348,25 @@ private:
 			case ValueOpcode::IAdd32: {
 				const auto a = Of(inst.Arg(0), depth);
 				const auto b = Of(inst.Arg(1), depth);
-				if (!a || !b ||
-				    (a->term != Term::None && b->term != Term::None && a->term != b->term) ||
+				if (!a || !b || !a->TermFits(*b) ||
 				    (a->value.source != Source::None && b->value.source != Source::None &&
 				     a->value != b->value) ||
 				    a->hi + b->hi >= ValueLimit || a->scale + b->scale >= ValueLimit ||
 				    a->value_scale + b->value_scale >= ValueLimit) {
 					return std::nullopt;
 				}
+				const auto& termed = a->Termed(*b);
 				return Offset {
-				    .lo          = a->lo + b->lo,
-				    .hi          = a->hi + b->hi,
-				    .term        = a->term != Term::None ? a->term : b->term,
-				    .scale       = a->scale + b->scale,
-				    .value       = a->value.source != Source::None ? a->value : b->value,
-				    .value_scale = a->value_scale + b->value_scale,
-				    .exact       = a->exact && b->exact,
+				    .lo               = a->lo + b->lo,
+				    .hi               = a->hi + b->hi,
+				    .term             = termed.term,
+				    .scale            = a->scale + b->scale,
+				    .parameter        = termed.parameter,
+				    .parameter_vertex = termed.parameter_vertex,
+				    .parameter_float  = termed.parameter_float,
+				    .value            = a->value.source != Source::None ? a->value : b->value,
+				    .value_scale      = a->value_scale + b->value_scale,
+				    .exact            = a->exact && b->exact,
 				};
 			}
 			case ValueOpcode::IMul32: {
@@ -393,8 +448,83 @@ private:
 		}
 	}
 
+	// One vertex's word (P0), or the input itself: that word when the input is flat.
+	[[nodiscard]] static std::optional<Offset> PixelParameter(const Inst& input, bool from_float) {
+		const bool vertex = input.GetOpcode() == ValueOpcode::GetInterpolationParameter;
+		if (!vertex && input.GetOpcode() != ValueOpcode::GetAttribute) {
+			return std::nullopt;
+		}
+		const auto location = Immediate(input.Arg(0));
+		const auto channel  = Immediate(input.Arg(1));
+		if (!location || !channel || *location >= 32u || *channel >= 4u ||
+		    (vertex && Immediate(input.Arg(2)) != 2u)) {
+			return std::nullopt;
+		}
+		return Offset {.term             = Term::PixelParameter,
+		               .scale            = 1,
+		               .parameter        = *location * 4u + *channel,
+		               .parameter_vertex = vertex,
+		               .parameter_float  = from_float};
+	}
+
+	[[nodiscard]] Spread ComputeSpread(const Inst& inst, uint32_t depth) {
+		const auto all = [&](size_t first) {
+			auto spread = Spread::Draw;
+			for (size_t i = first; i < inst.NumArgs(); ++i) {
+				spread = std::max(spread, SpreadOf(inst.Arg(i), depth));
+			}
+			return spread;
+		};
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::ReadConst: return Spread::Draw;
+			case ValueOpcode::GetBuiltin: {
+				const auto kind = Immediate(inst.Arg(0));
+				return kind && static_cast<StageInputKind>(*kind) == StageInputKind::InstanceIndex
+				           ? Spread::Instance
+				           : Spread::Varying;
+			}
+			// The first lane can be another primitive's vertex.
+			case ValueOpcode::ReadFirstLane:
+				return SpreadOf(inst.Arg(0), depth) == Spread::Draw ? Spread::Draw
+				                                                    : Spread::Varying;
+			case ValueOpcode::SelectU32:
+				if (m_active != nullptr && inst.Arg(0).Resolve().TryInstruction() == m_active) {
+					return SpreadOf(inst.Arg(1), depth);
+				}
+				return all(0);
+			case ValueOpcode::Identity:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitFieldUExtract:
+			case ValueOpcode::UMin32:
+			case ValueOpcode::UMax32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::UGreaterThan32:
+			case ValueOpcode::UGreaterThanEqual32:
+			case ValueOpcode::SLessThan32:
+			case ValueOpcode::SLessThanEqual32:
+			case ValueOpcode::SGreaterThan32:
+			case ValueOpcode::SGreaterThanEqual32:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::LogicalNot: return all(0);
+			default: return Spread::Varying;
+		}
+	}
+
 	std::map<std::tuple<const Inst*, const Inst*, const Block*>, std::optional<Offset>> m_memo;
+	std::map<std::pair<const Inst*, const Inst*>, Spread>                               m_spread;
 	std::unordered_set<const Inst*>                                                     m_visiting;
+	bool         m_pixel  = false;
 	const Inst*  m_active = nullptr;
 	const Block* m_block  = nullptr;
 };
@@ -451,12 +581,121 @@ private:
 	}
 }
 
+// The value lanes with the export's active flag give: the others export nothing.
+[[nodiscard]] Value ActiveArm(Value value, const Value& active) {
+	const auto* flag = active.Resolve().TryInstruction();
+	for (uint32_t depth = 0; flag != nullptr && depth < MaxDepth; ++depth) {
+		const auto* select = value.Resolve().TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
+		    select->Arg(0).Resolve().TryInstruction() != flag) {
+			break;
+		}
+		value = select->Arg(1);
+	}
+	return value;
+}
+
+// The integer a parameter channel exports, as the float of an integer or as the word itself.
+[[nodiscard]] std::pair<Value, bool> ExportedInteger(const Value& component) {
+	const auto* bits = component.Resolve().TryInstruction();
+	if (bits != nullptr && bits->GetOpcode() == ValueOpcode::BitCastU32F32) {
+		const auto* converted = bits->Arg(0).Resolve().TryInstruction();
+		if (converted != nullptr && converted->GetOpcode() == ValueOpcode::ConvertF32U32) {
+			return {converted->Arg(0), true};
+		}
+	}
+	return {component, false};
+}
+
+void CollectExportBounds(Program& program, Analyzer& analyzer) {
+	auto& bounds = program.info.export_bounds;
+	bounds.clear();
+	if (program.stage != ShaderType::Vertex) {
+		return;
+	}
+	struct Pending {
+		Offset offset;
+		bool   as_float = false;
+		Spread spread   = Spread::Draw;
+		bool   bounded  = true;
+	};
+	std::map<uint32_t, Pending> exported;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
+				continue;
+			}
+			const auto index = inst.Flags<ExportFlags>().index;
+			if (index >= program.export_info.size()) {
+				continue;
+			}
+			const auto& exp = program.export_info[index];
+			if (exp.kind != ExportTargetKind::Parameter || exp.index >= 32u) {
+				continue;
+			}
+			const auto* data     = inst.Arg(0).Resolve().TryInstruction();
+			const bool  composed = !exp.compr && data != nullptr &&
+			                       data->GetOpcode() == ValueOpcode::CompositeConstructU32x4;
+			analyzer.SetContext(inst.Arg(1), block);
+			for (uint32_t channel = 0; channel < 4u; ++channel) {
+				if ((exp.en & (1u << channel)) == 0u && !exp.compr) {
+					continue;
+				}
+				const auto            parameter = exp.index * 4u + channel;
+				std::optional<Offset> offset;
+				bool                  as_float = false;
+				auto                  spread   = Spread::Varying;
+				if (composed) {
+					const auto [integer, is_float] =
+					    ExportedInteger(ActiveArm(data->Arg(channel), inst.Arg(1)));
+					offset   = analyzer.Of(integer);
+					as_float = is_float;
+					spread   = analyzer.SpreadOf(integer);
+				}
+				// Only draw and instance terms are known when a draw is recorded.
+				const bool known =
+				    offset && (offset->term == Term::None || offset->term == Term::InstanceIndex);
+				auto [entry, first] = exported.try_emplace(parameter);
+				auto& pending       = entry->second;
+				if (!known || (!first && pending.as_float != as_float)) {
+					pending.bounded = false;
+					continue;
+				}
+				if (first) {
+					pending = {.offset = *offset, .as_float = as_float, .spread = spread};
+					continue;
+				}
+				const auto merged = Union(pending.offset, *offset);
+				pending.bounded   = pending.bounded && merged.has_value();
+				if (merged) {
+					pending.offset = *merged;
+				}
+				pending.spread = std::max(pending.spread, spread);
+			}
+		}
+	}
+	for (const auto& [parameter, pending]: exported) {
+		if (!pending.bounded) {
+			continue;
+		}
+		bounds.push_back({.parameter     = parameter,
+		                  .as_float      = pending.as_float,
+		                  .per_primitive = pending.spread != Spread::Varying,
+		                  .hi            = pending.offset.hi,
+		                  .term          = pending.offset.term,
+		                  .scale         = pending.offset.scale,
+		                  .value_source  = pending.offset.value.source,
+		                  .value_word    = pending.offset.value.word,
+		                  .value_scale   = pending.offset.value_scale});
+	}
+}
+
 } // namespace
 
 void CollectAddressRanges(Program& program) {
 	auto& ranges = program.info.address_ranges;
 	ranges.clear();
-	Analyzer analyzer;
+	Analyzer analyzer(program.stage == ShaderType::Pixel);
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto bytes = LoadBytes(inst.GetOpcode());
@@ -494,16 +733,22 @@ void CollectAddressRanges(Program& program) {
 			range.end          = static_cast<int64_t>(offset->hi) + immediate + bytes;
 			range.term         = offset->term;
 			range.scale        = offset->scale;
+			range.parameter        = offset->parameter;
+			range.parameter_vertex = offset->parameter_vertex;
+			range.parameter_float  = offset->parameter_float;
 			range.offset_max   = offset->hi;
 			range.value_source = offset->value.source;
 			range.value_word   = offset->value.word;
 			range.value_scale  = offset->value_scale;
 			range.value_exact  = offset->exact && offset->value.source != Source::None;
-			const auto same    = std::ranges::find_if(ranges, [&](const AddressRange& other) {
+			const auto same        = std::ranges::find_if(ranges, [&](const AddressRange& other) {
 				return other.base_source == range.base_source &&
 				       other.base_words == range.base_words && other.base == range.base &&
 				       other.align_base == range.align_base && other.term == range.term &&
-				       other.scale == range.scale && other.value_source == range.value_source &&
+				       other.scale == range.scale && other.parameter == range.parameter &&
+				       other.parameter_vertex == range.parameter_vertex &&
+				       other.parameter_float == range.parameter_float &&
+				       other.value_source == range.value_source &&
 				       other.value_word == range.value_word &&
 				       other.value_scale == range.value_scale;
 			});
@@ -517,6 +762,7 @@ void CollectAddressRanges(Program& program) {
 			}
 		}
 	}
+	CollectExportBounds(program, analyzer);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

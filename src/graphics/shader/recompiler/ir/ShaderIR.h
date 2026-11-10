@@ -533,6 +533,7 @@ struct AddressRange {
 		WorkgroupX,
 		WorkgroupY,
 		WorkgroupZ,
+		PixelParameter, // a pixel input's vertex values, `parameter` = location * 4 + channel
 	};
 	enum class Source : uint8_t { None, Constant, Srt, UserData };
 
@@ -544,6 +545,9 @@ struct AddressRange {
 	int64_t                 end        = 0;
 	Term                    term       = Term::None;
 	uint64_t                scale      = 0;
+	uint32_t                parameter  = 0;
+	bool     parameter_vertex = false; // one vertex's word (P0), not the interpolated input
+	bool     parameter_float  = false; // converted from float to an integer
 	uint64_t offset_max   = 0; // with the terms, must stay below 2^32 or the offset wraps
 	Source   value_source = Source::None;
 	uint32_t value_word   = 0;
@@ -551,6 +555,21 @@ struct AddressRange {
 	bool     value_exact  = false;
 
 	bool operator==(const AddressRange& other) const = default;
+};
+
+// A bound on what a vertex stage exports to a parameter channel, in AddressRange terms.
+struct ExportBound {
+	uint32_t             parameter     = 0;     // export index * 4 + channel
+	bool                 as_float      = false; // the float of the bounded integer
+	bool                 per_primitive = false; // the same on every vertex of a primitive
+	uint64_t             hi            = 0;
+	AddressRange::Term   term          = AddressRange::Term::None;
+	uint64_t             scale         = 0;
+	AddressRange::Source value_source  = AddressRange::Source::None;
+	uint32_t             value_word    = 0;
+	uint64_t             value_scale   = 0;
+
+	bool operator==(const ExportBound& other) const = default;
 };
 
 struct ShaderInfo {
@@ -566,6 +585,7 @@ struct ShaderInfo {
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
 	std::vector<AddressRange>            address_ranges;
+	std::vector<ExportBound>             export_bounds;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;

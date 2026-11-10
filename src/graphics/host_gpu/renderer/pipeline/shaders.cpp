@@ -20,10 +20,55 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <fmt/format.h>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// The guest pipeline the driver is creating on this thread (DescribeDriverPipelineCreation).
+struct DriverCreation {
+	bool        active = false;
+	const char* names[4] {};
+	uint64_t    hashes[4] {};
+};
+
+thread_local DriverCreation t_driver_creation;
+
+class ScopedDriverCreation {
+public:
+	ScopedDriverCreation(const std::array<const char*, 4>& names,
+	                     const std::array<uint64_t, 4>&    hashes) {
+		t_driver_creation.active = true;
+		for (size_t i = 0; i < 4; i++) {
+			t_driver_creation.names[i]  = names[i];
+			t_driver_creation.hashes[i] = hashes[i];
+		}
+	}
+	~ScopedDriverCreation() { t_driver_creation = {}; }
+
+	ScopedDriverCreation(const ScopedDriverCreation&)            = delete;
+	ScopedDriverCreation& operator=(const ScopedDriverCreation&) = delete;
+};
+
+} // namespace
+
+void DescribeDriverPipelineCreation(std::string& report) {
+	const auto& creation = t_driver_creation;
+	if (!creation.active) {
+		return;
+	}
+	report += "pipeline being created by the driver:";
+	for (size_t i = 0; i < 4; i++) {
+		if (creation.names[i] != nullptr) {
+			report += fmt::format(" {} 0x{:016x}", creation.names[i], creation.hashes[i]);
+		}
+	}
+	report += "\n";
+}
 
 static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -377,12 +422,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
 
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
+	const auto hash = [&](size_t stage) {
+		return stages[stage] != nullptr ? stages[stage]->info.shader_hash : uint64_t {0};
+	};
+	const auto name = [&](size_t stage, const char* stage_name) {
+		return stages[stage] != nullptr ? stage_name : nullptr;
+	};
+	vk::Result result = vk::Result::eSuccess;
+	{
+		const ScopedDriverCreation creation(
+		    {name(0, mesh ? "ms" : "vs"), name(1, "hs"), name(2, "ds"), name(3, "ps")},
+		    {hash(0), hash(1), hash(2), hash(3)});
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+	}
 	if (result != vk::Result::eSuccess) {
-		const auto hash = [&](size_t stage) {
-			return stages[stage] != nullptr ? stages[stage]->info.shader_hash : uint64_t {0};
-		};
 		EXIT("vkCreateGraphicsPipelines failed: %s, %s 0x%016" PRIx64 ", hs 0x%016" PRIx64
 		     ", ds 0x%016" PRIx64 ", ps 0x%016" PRIx64 "\n",
 		     vk::to_string(result).c_str(), mesh ? "ms" : "vs", hash(0), hash(1), hash(2), hash(3));
@@ -425,6 +479,8 @@ static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache:
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
+	const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
+	                                    {module.info.shader_hash, 0, 0, 0});
 	return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 }
 

@@ -707,6 +707,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // GraphicContext::pipeline_cache_lookup_enabled); false, with nothing created, otherwise.
 bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                          const ShaderModule& module, vk::PipelineCache cache);
+// Appends "pipeline being created by the driver: <stage> 0x<hash> ...\n" when this thread is inside
+// the driver's creation of a guest pipeline, for the report of a host fault in the driver.
+void DescribeDriverPipelineCreation(std::string& report);
 
 // A compute module and its SPIR-V for a pipeline helper (PipelineHelpers); the decoded module has
 // no Vulkan module yet.

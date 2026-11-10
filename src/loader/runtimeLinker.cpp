@@ -15,6 +15,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/presentation/frameStepHack.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
@@ -28,6 +29,7 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -36,6 +38,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -688,6 +691,38 @@ static bool ReadWalkerGuestMemory(uint64_t address, uint32_t& value, bool ahead,
 	             : Libs::LibKernel::Memory::TryReadAroundGpuWrites(address, &value, sizeof(value));
 }
 
+// "<module file name>+0x<offset>" for an address in a module of the host process (a driver DLL),
+// else empty.
+static std::string HostModuleAddress(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HMODULE module = nullptr;
+	if (address == 0 ||
+	    ::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                         reinterpret_cast<LPCWSTR>(static_cast<uintptr_t>(address)), &module) == 0 ||
+	    module == nullptr) {
+		return {};
+	}
+	std::array<wchar_t, MAX_PATH> path {};
+	const auto length = ::GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+	if (length == 0 || length >= path.size()) {
+		return {};
+	}
+	std::string name;
+	for (DWORD i = 0; i < length; i++) {
+		const auto c = path[i];
+		if (c == L'\\' || c == L'/') {
+			name.clear();
+		} else {
+			name.push_back(c >= 0x20 && c < 0x7f ? static_cast<char>(c) : '?');
+		}
+	}
+	return fmt::format("{}+0x{:x}", name, address - reinterpret_cast<uintptr_t>(module));
+#else
+	(void)address;
+	return {};
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -759,6 +794,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		// One message, so that the session log keeps it too.
 		std::string report = fmt::format("--- Guest fault context ---\nthread: {}\n", thread_name);
+		// A fault in a driver: where, and the pipeline it was creating.
+		if (const auto where = HostModuleAddress(info->exception_address); !where.empty()) {
+			report += fmt::format("pc: {:016x} ({})\n", info->exception_address, where);
+		}
+		Libs::Graphics::DescribeDriverPipelineCreation(report);
 		report += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 		                      "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
 		                      "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
@@ -781,6 +821,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				report += fmt::format("{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			report += "\n";
+			for (int i = 0; i < 32; i++) {
+				if (const auto where = HostModuleAddress(stack[i]); !where.empty()) {
+					report += fmt::format(" [rsp+0x{:02x}] {:016x} ({})\n", i * 8, stack[i], where);
+				}
+			}
 		}
 		Log::WriteToConsoleAndLog(report);
 	}

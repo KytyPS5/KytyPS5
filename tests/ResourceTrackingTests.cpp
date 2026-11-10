@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/AddressRanges.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ParameterKeys.h"
@@ -8656,6 +8657,184 @@ void TestDmaAddressMaterialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
 }
 
+// The ranges a shader reads through device addresses are proven from its code: a table read at a
+// thread-selected offset, records indexed by the instance, and a read at an offset the CPU knows.
+void TestAddressRangesProveReads() {
+  Fixture fixture;
+  const auto load = [&](Value handle, Value low, ResourceKind kind, uint32_t offset, uint32_t pc) {
+    MemoryInfo memory;
+    memory.kind = kind;
+    memory.offset = offset;
+    return fixture.Emit(ValueOpcode::LoadAddressU32, {handle, low, Value(0u), Value(true)},
+                        fixture.AddMemory(memory, pc));
+  };
+  // Scalar reads of a table at a thread-selected, uniform offset.
+  const auto thread = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto row = fixture.Emit(
+      ValueOpcode::ReadFirstLane,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {thread, Value(5u)}), Value(true)});
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  load(table, row, ResourceKind::ScalarAddress, 8, 4);
+  load(table, row, ResourceKind::ScalarAddress, 24, 8);
+  // Records indexed by the instance, behind the per-lane select the wave emulation inserts.
+  const auto instance = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::InstanceIndex)), Value(0u)});
+  // instance * 576, as compiled: a = instance << 6, then (a << 3) + a.
+  const auto active = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(8), Value(0u)});
+  const auto scaled = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {active, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {instance, Value(6u)}), Value(0u)});
+  const auto record = fixture.Emit(
+      ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {scaled, Value(3u)}), scaled});
+  // The other arm keeps instance * 64: the larger multiple bounds both.
+  const auto lane = fixture.Emit(ValueOpcode::SelectU32, {active, record, scaled});
+  const auto records = fixture.Address(fixture.UserData(2), fixture.UserData(3), 200);
+  load(records, lane, ResourceKind::Global, 16, 200);
+  load(records, lane, ResourceKind::Global, 28, 208);
+  // A select on the load's own active flag: inactive lanes do not load, so their arm (here a
+  // float's bit pattern) does not bound anything.
+  {
+    const auto strided = fixture.Emit(ValueOpcode::IMul32, {Value(28u), instance});
+    const auto leftover = fixture.Emit(
+        ValueOpcode::BitCastU32F32, {fixture.Emit(ValueOpcode::ConvertF32S32, {Value(20u)})});
+    const auto offset = fixture.Emit(ValueOpcode::SelectU32, {active, strided, leftover});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Global;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {fixture.Address(fixture.UserData(10), fixture.UserData(11), 500), offset,
+                  Value(0u), active},
+                 fixture.AddMemory(memory, 500));
+  }
+  // An offset loaded from a table the CPU reads when the draw is recorded.
+  const auto counts = fixture.Address(fixture.UserData(4), fixture.UserData(5), 300);
+  const auto loaded = load(counts, Value(0u), ResourceKind::ScalarAddress, 0x08, 300);
+  load(fixture.Address(fixture.UserData(6), fixture.UserData(7), 400), loaded,
+       ResourceKind::Global, 0, 400);
+  fixture.PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  std::array<uint32_t, 12> user_data{0x9000u, 0u, 0x2000u, 0u, 0x1000u, 0u, 0x4000u, 0u, 1u,
+                                     0u, 0x5000u, 0u};
+  TestMemory memory;
+  memory.words[2] = 0x80u;
+  FakeGuestMemory fake(ReadTestMemory, &memory);
+  SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "address range shader resources did not materialize");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  CollectAddressRanges(fixture.program);
+
+  using Source = AddressRange::Source;
+  const auto &srt = snapshot.flattened_srt;
+  const auto word = [&](Source source, uint32_t index) -> uint64_t {
+    return source == Source::UserData ? user_data[index] : srt[index];
+  };
+  const auto base_of = [&](const AddressRange &range) {
+    return range.base_source == Source::Constant
+               ? range.base
+               : word(range.base_source, range.base_words[0]) |
+                     (word(range.base_source, range.base_words[1]) << 32u);
+  };
+  const auto find = [&](uint64_t base) -> const AddressRange * {
+    for (const auto &range : fixture.program.info.address_ranges) {
+      if (base_of(range) == base) return &range;
+    }
+    return nullptr;
+  };
+  const auto *rows = find(0x9000u);
+  const auto *instanced = find(0x2000u);
+  const auto *known = find(0x4000u);
+  Check(rows != nullptr && rows->align_base && rows->begin == 8 && rows->end == 28 &&
+            rows->term == AddressRange::Term::GlobalInvocationX && rows->scale == 32,
+        "thread-selected table reads were not proven");
+  Check(instanced != nullptr && instanced->begin == 16 && instanced->end == 32 &&
+            instanced->term == AddressRange::Term::InstanceIndex && instanced->scale == 576,
+        "instance-indexed records were not proven");
+  Check(known != nullptr && known->begin == 0 && known->end == 4 && known->value_exact &&
+            known->value_scale == 1 && word(known->value_source, known->value_word) == 0x80u,
+        "a read at an offset known when the draw is recorded was not proven");
+  const auto *guarded = find(0x5000u);
+  Check(guarded != nullptr && guarded->begin == 0 && guarded->end == 4 &&
+            guarded->term == AddressRange::Term::InstanceIndex && guarded->scale == 28,
+        "a select on the load's active flag was not narrowed to its active arm");
+  Check(find(0x1000u) == nullptr && fixture.program.info.address_ranges.size() == 4,
+        "a read the CPU flattens was also given a range");
+}
+
+// Loop counters are bounded by the tests on their back edge and on the path to the read: a
+// post-tested loop, a pre-tested one, and nothing for a loop that never tests its counter.
+void TestAddressRangesBoundLoops() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Shape { PostTested, PreTested, Untested };
+  const auto run = [](Shape shape) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = shape == Shape::PreTested ? fixture.AddBlock() : header;
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    auto &counter = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    const Value i(&counter);
+    fixture.block = header;
+    Value test;
+    if (shape == Shape::PreTested) {
+      test = fixture.Emit(ValueOpcode::SLessThan32, {i, Value(20u)});
+      header->condition = test;
+      header->AddBranch(body);
+      header->AddBranch(exit);
+      header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = body,
+                            .false_block = exit};
+      fixture.block = body;
+    }
+    const auto offset =
+        shape == Shape::PreTested
+            ? fixture.Emit(ValueOpcode::IAdd32,
+                           {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {i, Value(4u)}), Value(0x60u)})
+            : fixture.Emit(ValueOpcode::ShiftLeftLogical32, {i, Value(4u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Global;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {fixture.Address(fixture.UserData(0), fixture.UserData(1), 4), offset, Value(0u),
+                  Value(true)},
+                 fixture.AddMemory(memory, 4));
+    const auto next = fixture.Emit(ValueOpcode::IAdd32, {i, Value(1u)});
+    counter.AddPhiOperand(entry, Value(0u));
+    counter.AddPhiOperand(body, next);
+    if (shape == Shape::PreTested) {
+      body->AddBranch(header);
+      body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    } else {
+      // Post-tested: the back edge is taken while the counter is below 15, or always.
+      header->condition = shape == Shape::PostTested
+                              ? fixture.Emit(ValueOpcode::SLessThan32, {i, Value(15u)})
+                              : fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
+      header->AddBranch(header);
+      header->AddBranch(exit);
+      header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header,
+                            .false_block = exit};
+    }
+    fixture.block = exit;
+    fixture.PlanAndTrack();
+    CollectAddressRanges(fixture.program);
+    return fixture.program.info.address_ranges;
+  };
+  const auto post = run(Shape::PostTested);
+  Check(post.size() == 1 && post[0].begin == 0 && post[0].end == 15 * 16 + 4 &&
+            post[0].term == AddressRange::Term::None,
+        "a post-tested loop counter was not bounded by its back edge");
+  const auto pre = run(Shape::PreTested);
+  Check(pre.size() == 1 && pre[0].begin == 0x60 && pre[0].end == 19 * 16 + 0x60 + 4,
+        "a pre-tested loop counter was not bounded by its guard");
+  Check(run(Shape::Untested).empty(), "a counter no test bounds was given a range");
+}
+
 void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
@@ -9648,6 +9827,8 @@ int main() {
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("address ranges prove reads", TestAddressRangesProveReads);
+    Run("address ranges bound loops", TestAddressRangesBoundLoops);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
@@ -9697,3 +9878,4 @@ void DbgNotImplementedHandler(const char *expression, const char *file,
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
+#include "graphics/shader/recompiler/ir/passes/AddressRanges.cpp"

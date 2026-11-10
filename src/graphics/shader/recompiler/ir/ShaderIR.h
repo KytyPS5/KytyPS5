@@ -521,6 +521,38 @@ struct Bindings {
 	bool operator==(const Bindings& other) const = default;
 };
 
+// Guest bytes a shader reads through device addresses: [base + begin, base + end + scale * term +
+// value_scale * value), term bounded by the draw or dispatch, value known when it is recorded.
+struct AddressRange {
+	enum class Term : uint8_t {
+		None,
+		InstanceIndex,
+		GlobalInvocationX,
+		GlobalInvocationY,
+		GlobalInvocationZ,
+		WorkgroupX,
+		WorkgroupY,
+		WorkgroupZ,
+	};
+	enum class Source : uint8_t { None, Constant, Srt, UserData };
+
+	Source                  base_source = Source::None;
+	std::array<uint32_t, 2> base_words {};
+	uint64_t                base       = 0;
+	bool                    align_base = false; // scalar reads drop the base's two low bits
+	int64_t                 begin      = 0;
+	int64_t                 end        = 0;
+	Term                    term       = Term::None;
+	uint64_t                scale      = 0;
+	uint64_t offset_max   = 0; // with the terms, must stay below 2^32 or the offset wraps
+	Source   value_source = Source::None;
+	uint32_t value_word   = 0;
+	uint64_t value_scale  = 0;
+	bool     value_exact  = false;
+
+	bool operator==(const AddressRange& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	static constexpr uint32_t MaxImages       = 64;
@@ -533,6 +565,7 @@ struct ShaderInfo {
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
+	std::vector<AddressRange>            address_ranges;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;

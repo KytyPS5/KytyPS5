@@ -8386,6 +8386,17 @@ public:
               "CPU invalidation left a reused stencil image write-protected");
       memory[second_stencil_offset] = 0x5a;
 
+      // Another image at the plane's range is not adopted while the depth
+      // keeps its own plane record.
+      const auto other_image = TextureCacheTestAccess::InsertImage(
+          texture_cache, stencil_storage_desc.info);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, switched_ms_depth_id, switched_ms_depth.info.stencil);
+      Require(name, "stencil re-association keeps its plane record",
+              !texture_cache.GetImage(other_image).depth_id,
+              "re-association adopted another image at the stencil range");
+      TextureCacheTestAccess::DeleteImage(texture_cache, other_image);
+
       constexpr uint64_t added_stencil_depth_offset = 0x60000;
       constexpr uint64_t added_stencil_offset = 0x70000;
       constexpr uint64_t added_stencil_size = 0x10000;

@@ -1166,6 +1166,15 @@ void TextureCache::RefreshImage(ImageId id) {
 	InitializeImage(id);
 }
 
+ImageId TextureCache::FindStencilPlane(const Image& depth, GuestRange range) const {
+	for (const auto id: depth.stencil_ids) {
+		if (m_slot_images[id].info.data == range) {
+			return id;
+		}
+	}
+	return {};
+}
+
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
@@ -1175,12 +1184,14 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
 
-	ImageId association {};
-	ForEachImageWithAddress(stencil.address, [&](ImageId id, Image& owner) {
-		if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
-			association = id;
-		}
-	});
+	ImageId association = FindStencilPlane(depth, stencil);
+	if (!association) {
+		ForEachImageWithAddress(stencil.address, [&](ImageId id, Image& owner) {
+			if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
+				association = id;
+			}
+		});
+	}
 	if (!association) {
 		ImageInfo info {};
 		info.data   = stencil;
@@ -1389,14 +1400,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
-		const auto& range = image.info.stencil;
-		ImageId     stencil_id {};
-		ForEachImageWithAddress(range.address, [&](ImageId candidate, Image& stencil) {
-			if (!stencil_id && stencil.depth_id == id && stencil.info.data == range) {
-				stencil_id = candidate;
-			}
-		});
-		if (stencil_id) {
+		if (const auto stencil_id = FindStencilPlane(image, image.info.stencil)) {
 			RefreshImage(stencil_id);
 		}
 	}

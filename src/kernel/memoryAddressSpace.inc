@@ -121,8 +121,8 @@ public:
 #endif
 	}
 
-	// Callers hold the address-space lock, so no view changes under the write. Unbacked gaps are
-	// skipped, mirroring sparse reads that zero-fill them.
+	// Callers hold the state lock, so no view changes under the write. Unbacked gaps are skipped,
+	// mirroring sparse reads that zero-fill them.
 	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		const auto* source = static_cast<const uint8_t*>(data);
 		ForEachRun(
@@ -159,7 +159,7 @@ public:
 		    });
 	}
 
-	// Mapping and unmapping hold the address-space lock exclusively.
+	// Mapping and unmapping hold the state lock exclusively.
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -440,6 +440,9 @@ private:
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_pages {};
 };
 
+// Callers change it with the state lock held exclusively and query it under the operation lock or
+// the state lock. TryWriteBacking, CopySparseMemory and ProtectTransient take the state lock shared
+// themselves.
 class GuestAddressSpace {
 public:
 	explicit GuestAddressSpace(uint64_t backing_size) {
@@ -521,7 +524,7 @@ public:
 		if (!Owns(vaddr, size)) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		std::shared_lock state(g_memory_state_mutex);
 		if (OverlapsPrivateUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -541,7 +544,7 @@ public:
 		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		std::shared_lock state(g_memory_state_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_read != nullptr) {
 			g_test_backing_read(vaddr, size);
@@ -565,20 +568,18 @@ public:
 	}
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	// Tracker protections only read m_mapped; the page tracker orders them per page.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::shared_lock lock(m_mutex);
+		std::shared_lock state(g_memory_state_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
-		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
@@ -606,7 +607,6 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
 		}
@@ -619,17 +619,14 @@ public:
 	uint64_t FindFreeAligned(uint64_t search_start, uint64_t search_end, uint64_t size,
 	                         uint64_t alignment) {
 		alignment = std::max<uint64_t>(alignment, PageSize());
-		std::shared_lock lock(m_mutex);
 		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
 	}
 
 	bool ContainsFree(uint64_t vaddr, uint64_t size) {
-		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -664,7 +661,6 @@ public:
 		if (!IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
@@ -1135,7 +1131,6 @@ private:
 #endif
 	}
 
-	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

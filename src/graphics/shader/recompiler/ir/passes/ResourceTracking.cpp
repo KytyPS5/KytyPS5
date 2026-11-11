@@ -1372,8 +1372,10 @@ private:
 	bool HasActiveLane(Value mask, const Block* use) const {
 		mask = SimplifyGuard(mask);
 		if (mask.IsImmediate()) return mask.GetType() == Type::U1 && mask.U1();
-		const auto incoming_is_nonempty = [&](const Block* from, const Block* to,
-		                                     Value incoming, const Block* header) {
+		const auto incoming_is_nonempty = [&](const Block* from, const Block* to, Value incoming,
+		                                      const Block* header) {
+			// Every invocation of a running wave is active, and a wave has one.
+			if (incoming.Resolve() == Value(true)) return true;
 			const auto accepts = [&](const EdgePredicate& edge) {
 				return edge.positive && Implies(edge.condition, incoming);
 			};
@@ -1647,6 +1649,7 @@ private:
 		    (test->GetOpcode() != ValueOpcode::INotEqual32 &&
 		     test->GetOpcode() != ValueOpcode::IEqual32))
 			return false;
+		for (uint32_t arg = 0; arg < 2u; ++arg) {
 			if (test->Arg(arg).Resolve() != Value(0u)) continue;
 			tested  = test->Arg(arg ^ 1u).Resolve();
 			nonzero = (test->GetOpcode() == ValueOpcode::INotEqual32) == edge.positive;
@@ -1720,6 +1723,10 @@ private:
 			case ValueOpcode::IMul32:
 			case ValueOpcode::ShiftLeftLogical32:
 			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::BitFieldUExtract:
 			case ValueOpcode::SelectU32:
 			case ValueOpcode::ULessThan32:
 			case ValueOpcode::ULessThanEqual32:
@@ -1731,6 +1738,11 @@ private:
 			case ValueOpcode::LogicalOr:
 			case ValueOpcode::LogicalNot:
 				for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+			default: return false;
+		}
+	}
+
+	// Under `within`, within && x is x.
 		return predicate;
 	}
 
@@ -1747,6 +1759,16 @@ private:
 				const auto left  = operand(inst->Arg(0));
 				const auto right = operand(inst->Arg(1));
 				if (left.IsEmpty() || right.IsEmpty()) return {};
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
+					const auto* cleared = inst->Arg(arg ^ 1u).Resolve().TryInstruction();
+					if (cleared == nullptr || cleared->GetOpcode() != ValueOpcode::BitwiseNot32)
+						continue;
+					// Lanes removed from the kept ones are named relative to them.
+					const auto kept = operand(inst->Arg(arg));
+					if (kept.IsEmpty()) return {};
+					const auto removed =
+					    operand(cleared->Arg(0), kept == Value(true) ? within : kept);
+					if (removed.IsEmpty()) return {};
 			case ValueOpcode::SelectU32: {
 				// A uniform choice of whole words: S_CSELECT of EXEC and zero.
 				const auto condition = inst->Arg(0).Resolve();
@@ -1756,6 +1778,7 @@ private:
 		// A set bit's index is already inside the wave the lane index is masked to.
 		if (const auto* mask = index.TryInstruction();
 		    mask != nullptr && mask->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
 				if (ImmediateU32(mask->Arg(arg), immediate) &&
 				    immediate == m_program.wave_size - 1u) {
 					index = mask->Arg(arg ^ 1u).Resolve();
@@ -1776,6 +1799,7 @@ private:
 			bool        matched = false;
 			for (uint32_t arg = 0; both != nullptr && both->GetOpcode() == ValueOpcode::UMin32 &&
 			                       arg < 2u && !matched;
+			     ++arg) {
 				const auto* high = both->Arg(arg ^ 1u).Resolve().TryInstruction();
 				if (high == nullptr || high->GetOpcode() != ValueOpcode::BitwiseOr32) continue;
 				for (uint32_t bit = 0; bit < 2u && !matched; ++bit)
@@ -1801,6 +1825,8 @@ private:
 			    (word != 0u && (mask->PhiBlock(0) != scanned[0]->PhiBlock(0) ||
 			                    mask->PhiBlock(1) != scanned[0]->PhiBlock(1))))
 				return {};
+			initial_arm = initial;
+			auto start  = BallotWordPredicate(mask->Arg(initial), word);
 			if (start.IsEmpty() ||
 			    (!predicate.IsEmpty() && !EquivalentValue(m_program, predicate, start)))
 				return {};
@@ -2061,6 +2087,9 @@ private:
 				const auto* ballot = extract->Arg(0).Resolve().TryInstruction();
 				if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
 				    start.IsEmpty() ||
+				    (!removed.IsEmpty() && !EquivalentValue(m_program, removed, ballot->Arg(0))) ||
+				    (!initial.IsEmpty() && !EquivalentValue(m_program, initial, start)))
+					continue;
 				removed    = ballot->Arg(0).Resolve();
 				initial    = start;
 				seen[word] = matched = true;
@@ -2166,7 +2195,42 @@ private:
 	struct AffineWords {
 		std::vector<Value> addends {Value(0u)};
 		uint32_t           scale = 1u;
+		// The low bits of each word that the key keeps: addend + scale * (w & mask).
+		uint32_t                 mask = UINT32_MAX;
 		std::vector<const Inst*> reads;
+	// value = word & mask for a mask of the word's low bits.
+	static bool MatchLowBits(const Inst& inst, Value& word, uint32_t& mask) {
+		uint32_t offset = 0;
+		uint32_t count  = 0;
+		uint32_t insert = 1u;
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32:
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
+					if (!ImmediateU32(inst.Arg(arg), mask) || (mask & (mask + 1u)) != 0u) continue;
+					word = inst.Arg(arg ^ 1u);
+					return true;
+				}
+				return false;
+			case ValueOpcode::BitFieldInsert:
+				// Inserting zero into bits [offset, 32) clears the word above its low bits.
+				if (!ImmediateU32(inst.Arg(1), insert) || insert != 0u ||
+				    !ImmediateU32(inst.Arg(2), offset) || !ImmediateU32(inst.Arg(3), count) ||
+				    offset == 0u || offset >= 32u || count != 32u - offset)
+					return false;
+				word = inst.Arg(0);
+				mask = (1u << offset) - 1u;
+				return true;
+			case ValueOpcode::BitFieldUExtract:
+				if (!ImmediateU32(inst.Arg(1), offset) || offset != 0u ||
+				    !ImmediateU32(inst.Arg(2), count) || count == 0u || count > 32u)
+					return false;
+				word = inst.Arg(0);
+				mask = count == 32u ? UINT32_MAX : (1u << count) - 1u;
+				return true;
+			default: return false;
+		}
+	}
+
 	Value AddendTerm(ValueOpcode op, Value left, Value right) {
 		uint32_t   a              = 0;
 		uint32_t   b              = 0;
@@ -2189,6 +2253,7 @@ private:
 			into = from;
 			return true;
 		}
+		if (into.scale != from.scale || into.mask != from.mask) return false;
 		for (const auto addend: from.addends)
 			if (std::ranges::none_of(
 			        into.addends, [&](Value at) { return EquivalentValue(program, at, addend); }))
@@ -2203,20 +2268,30 @@ private:
 		if (inst == nullptr) return false;
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::IAdd32:
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
 					const auto  term = inst->Arg(arg).Resolve();
+					AffineWords inner;
 					if (!ValidateRuntimeValue(m_program, term, RuntimeValueType::Integer) ||
 					for (auto& addend: inner.addends)
 						addend = AddendTerm(ValueOpcode::IAdd32, term, addend);
+					return MergeAffineWords(out, inner, m_program);
+				}
+				return false;
 			case ValueOpcode::IMul32:
 			case ValueOpcode::ShiftLeftLogical32:
+				for (uint32_t arg = 0; arg < 2u; ++arg) {
 					const bool  shift  = inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32;
 					uint32_t    factor = 0;
+					AffineWords inner;
 					if ((shift && arg == 0u) || !ImmediateU32(inst->Arg(arg), factor) ||
 					    (shift && factor >= 32u) ||
 					if (shift) factor = 1u << factor;
 					inner.scale *= factor;
 					for (auto& addend: inner.addends)
 						addend = AddendTerm(ValueOpcode::IMul32, addend, Value(factor));
+					return MergeAffineWords(out, inner, m_program);
+				}
+				return false;
 			case ValueOpcode::SelectU32:
 			case ValueOpcode::Phi:
 				// The assembled value is used after its waterfall's mask drains.
@@ -2224,6 +2299,21 @@ private:
 				if (inst->NumArgs() == 0u || inst->Parent() == nullptr || InCycle(inst->Parent()))
 					return false;
 				for (uint32_t arm = 0; arm < inst->NumArgs(); ++arm)
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitFieldInsert:
+			case ValueOpcode::BitFieldUExtract: {
+				// Masking applies to the loaded words themselves, before any scale or addend.
+				Value       word;
+				uint32_t    mask = 0;
+				AffineWords inner;
+				if (!MatchLowBits(*inst, word, mask) ||
+				inner.mask &= mask;
+				return MergeAffineWords(out, inner, m_program);
+			}
+			case ValueOpcode::LoadAddressU32:
+				if (inst->NumArgs() != 4u || !Implies(lanes, inst->Arg(3))) return false;
+				[[fallthrough]];
+			case ValueOpcode::ReadConstBuffer: {
 				AffineWords read;
 				read.reads.push_back(inst);
 				return MergeAffineWords(out, read, m_program);
@@ -2231,8 +2321,23 @@ private:
 		}
 	}
 
+	// A DWORD of a record table: a scalar read, or a global load with SADDR.
+	const MemoryInfo* AffineWordMemory(const Inst& read, uint32_t& index) const {
+		if (const auto* scalar = ScalarReadMemory(read, index)) return scalar;
+		uint32_t high = 1u;
+		if (read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() != 4u ||
+		    !ImmediateU32(read.Arg(2), high) || high != 0u)
+			return nullptr;
+		index = read.Flags<MemoryFlags>().index;
+		if (index >= m_program.memory_info.size()) return nullptr;
+		const auto& memory = m_program.memory_info[index];
+		return memory.kind == ResourceKind::Global && !memory.address_is_full &&
+		               memory.data_bits == 32u && memory.data_dwords == 1u
+		           ? &memory
+		index             = guard.IsEmpty() ? index.Resolve() : ActiveValue(index, guard);
 		const auto* inst  = index.TryInstruction();
 		uint32_t    shift = 0;
+		if (inst == nullptr || depth > 8u) return SelectorMaximum(index, {}, 0u, guard);
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::ShiftRightLogical32:
 			case ValueOpcode::ShiftRightArithmetic32: {
@@ -2252,6 +2357,10 @@ private:
 				                SelectorMaximum(inst->Arg(0), {}, 0u, inst->Arg(1)));
 			default: break;
 		}
+		return SelectorMaximum(index, {}, 0u, guard);
+	}
+
+	// key = addend + scale * (w & mask) for a DWORD w of one raw-pointer or V# table.
 	bool MatchAffineWordKey(Value key, const Inst& handle,
 	                        DescriptorSource::IndirectDescriptor& indirect,
 	                        DescriptorSource&                     material_source) {
@@ -2266,6 +2375,17 @@ private:
 		Value lanes(true);
 		if (const auto* lane = value.TryInstruction();
 		    lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane) {
+			if (handle.Uses().empty() ||
+			    !std::ranges::all_of(handle.Uses(),
+			                         [&](const Use& use) {
+				                         return ImageOpcodeInfoOf(use.user->GetOpcode()).access !=
+				                                ImageAccess::None;
+			                         }) ||
+			    (!HasActiveLane(lane->Arg(1), lane->Parent()) &&
+			     !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+				     return Implies(use.user->Arg(use.user->NumArgs() - 1u), lane->Arg(1));
+			     })))
+				return false;
 			lanes = lane->Arg(1);
 			value = lane->Arg(0);
 		}
@@ -2274,11 +2394,20 @@ private:
 		// The reads' DWORD offsets must form one arithmetic progression in one table.
 		const auto*           first = words.reads.front();
 		std::vector<uint64_t> offsets;
+		auto                  kind = ResourceKind::None;
+		Value                 rows;
+			// Only the read's active lanes load a word; a scalar read's predicate is true.
+			const auto   active = read->NumArgs() == 4u ? read->Arg(3) : Value(true);
 			AffineOffset address;
+			if (memory == nullptr || (kind != ResourceKind::None && memory->kind != kind) ||
+			    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
 			    !MemoryIndexBelongsTo(memory_index, *read) ||
 			    !EquivalentValue(m_program, read->Arg(0), first->Arg(0)) ||
+			    !MatchAffineOffset(read->Arg(1), active, address) ||
 			    ((address.stride | address.offset) & 3u) != 0u)
 				return false;
+			kind                 = memory->kind;
+			const auto     guard = active == Value(true) ? Value {} : active;
 			const uint64_t maximum =
 			// The shader's U32 offset is exact on the whole domain; the immediate adds after it.
 			if (maximum >= MaxIndirectDescriptorProbes ||
@@ -2303,8 +2432,12 @@ private:
 		selector.offset   = static_cast<uint32_t>(offsets.front());
 		selector.bit_mask = words.mask;
 		selector.scale    = words.scale;
+		// Global loads address the table bytewise; scalar reads align each DWORD.
+		selector.global         = kind == ResourceKind::Global;
 		indirect.selector       = std::move(selector);
 		indirect.selector_first = Value(0u);
+		// A lone read's offsets are its rows, so a runtime row count shortens the same progression.
+		indirect.key_count = rows.IsEmpty() ? Value(static_cast<uint32_t>(offsets.size())) : rows;
 		if (words.addends.size() != 1u || words.addends.front() != Value(0u))
 			indirect.selector_addends = std::move(words.addends);
 		return true;

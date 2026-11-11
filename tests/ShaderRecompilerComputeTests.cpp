@@ -47089,6 +47089,243 @@ void CheckLoopSelectedPointerImageTable(VulkanHarness &vulkan) {
 }
 
 // DS2 cs 0x12db0180e6634d01.
+void CheckGlobalRecordWordImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table = 18960u, addend = 3u, spread = 151u;
+  constexpr u32 exec_lo = 126u;
+  for (const u32 wave : {32u, 64u}) {
+    const bool wide = wave == 64u;
+    TestCase test;
+    test.name = "GlobalRecordWordImageTable";
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table + 128u * 32u) / 4u);
+    for (u32 tile = 0; tile < 4096u; ++tile)
+      test.initial[(base + 16u) / 4u + tile] = tile % 5u;
+    for (u32 key = 0; key < 128u; ++key) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = key + 1u;
+      image[3] = DstSel(4, 0, 0, 1) |
+                 (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8,
+                  test.initial.begin() + (base + table + key * 32u) / 4u);
+    }
+    test.user_data[0] = base;
+    test.user_data[3] = 3u << 28u;
+    test.user_data[6] = addend;
+    test.user_data[7] = spread;
+    const auto output = MakeStructuredStorageBufferData(0u, wave * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    const u32 mov = wide ? 0x04u : 0x03u;
+    const u32 and_saveexec = wide ? 0x24u : 0x3cu, andn2 = wide ? 0x15u : 0x14u;
+    auto &code = test.code;
+    AppendVop3(&code, 361, 1, Vgpr(0), 7); // v_mul_lo_u32 v1, v0, s7
+    code.insert(code.end(), {EncodeVop2(0x13, 1, 255, 1),
+                             0xfffu}); // v_min_u32 v1, 0xfff, v1
+    code.push_back(
+        EncodeVop2(0x18, 2, InlineU32(2), 1)); // v_ashrrev_i32 v2, 2, v1
+    code.push_back(
+        EncodeVop2(0x1a, 2, InlineU32(4), 2)); // v_lshlrev_b32 v2, 4, v2
+    code.push_back(EncodeVop2(0x1b, 3, InlineU32(3), 1)); // v_and_b32 v3, 3, v1
+    code.push_back(EncodeFlat0(0x0e, 2, 16)); // global_load_dwordx4 v[10:13],
+    code.push_back(EncodeFlat1(10, 0, 0, 2)); //   v2, s[0:1] offset:16
+    code.push_back(EncodeSopp(0x0c));
+    for (u32 word = 1; word < 4u; ++word) {
+      code.push_back(
+          EncodeVopc(0xc2, InlineU32(word), 3)); // v_cmp_eq_u32 vcc, word, v3
+      code.push_back(EncodeVop2(0x01, 10, Vgpr(10),
+                                10 + word)); // v_cndmask_b32 v10, v10, v1x
+    }
+    AppendVop3(&code, 361, 5, InlineU32(31),
+               Vgpr(10));                      // v_mul_lo_u32 v5, 31, v10
+    code.push_back(EncodeVop2(0x25, 6, 6, 5)); // v_add_nc_u32 v6, s6, v5
+    AppendVMovLiteral(&code, 8, 0u);
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    code.push_back(EncodeSop1(mov, 64, exec_lo)); // s_mov s64, exec
+    const auto keys = code.size();
+    code.push_back(
+        EncodeVop1(0x02, 80, Vgpr(6)));       // v_readfirstlane_b32 s80, v6
+    AppendVop3(&code, 0xc2, 70, 80, Vgpr(6)); // v_cmp_eq_u32 s70, s80, v6
+    code.push_back(EncodeSop1(and_saveexec, 72, 70)); // s_and_saveexec s72, s70
+    code.insert(
+        code.end(),
+        {EncodeSop2(0x1e, 81, 80, InlineU32(5)), // s_lshl_b32 s81, s80, 5
+         EncodeSmem0(0x03, 84, 0),
+         EncodeSmem1(table, 81), // s_load_dwordx8 s[84:91]
+         EncodeSopp(0x0c), EncodeMimg0(0x00, 1),
+         EncodeMimg1(4, 20, 84 / 4u), // image_load v4, v[20:21]
+         EncodeSopp(0x0c), EncodeVop1(0x01, 8, Vgpr(4))}); // v_mov_b32 v8, v4
+    code.push_back(
+        EncodeSop2(andn2, exec_lo, 72, 70)); // s_andn2 exec, s72, s70
+    code.push_back(
+        EncodeSopp(0x09, keys - code.size() - 1u)); // s_cbranch_execnz keys
+    code.push_back(EncodeSop1(mov, exec_lo, 64));   // s_mov exec, s64
+    AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 0u);
+    AppendEnd(&code);
+    test.opcodes = {O::V_MUL_LO_U32,       O::V_MIN_U32,
+                    O::V_ASHRREV_I32,      O::V_LSHLREV_B32,
+                    O::V_AND_B32,          O::FLAT_LOAD_DWORDX4,
+                    O::V_CMP_EQ_U32,       O::V_CNDMASK_B32,
+                    O::V_ADD_NC_U32,       O::V_READFIRSTLANE_B32,
+                    O::S_LSHL_B32,         O::S_LOAD_DWORDX8,
+                    O::IMAGE_LOAD,         O::S_CBRANCH_EXECNZ,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.opcodes.push_back(wide ? O::S_AND_SAVEEXEC_B64
+                                : O::S_AND_SAVEEXEC_B32);
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    // T[tile] = tile % 5 selects the keys 3 + 31 * {0, ..., 4}.
+    Require(test.name, "record-word candidates",
+            compiled.resources.images.size() == 5u,
+            "global record-word key escaped the tile table's materials");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(
+          test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial,
+                                             test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                    vk::Sampler{}, images);
+    std::vector<u32> expected(wave);
+    for (u32 lane = 0; lane < wave; ++lane) {
+      const auto key = addend + 31u * (std::min(lane * spread, 0xfffu) % 5u);
+      expected[lane] = std::bit_cast<u32>(static_cast<float>(key + 1u));
+    }
+    CompareWords(test, "each lane loads the T# of its tile's material",
+                 expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    for (auto &image : images)
+      vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
+  }
+}
+
+// DS2 cs 0xc37f29edfa902037.
+void CheckMaterialWordImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table = 19216u, addend = 5u, material = 0u;
+  constexpr u32 exec_lo = 126u;
+  constexpr std::array<u32, 3> rows{0x00070001u, 2u, 0xffff0004u};
+  for (const u32 count : {3u, 2u})
+    for (const u32 wave : {32u, 64u}) {
+      const bool wide = wave == 64u;
+      TestCase test;
+      test.name = "MaterialWordImageTable";
+      test.bda_mappings = {{0u, 0u}};
+      test.initial.resize((base + table + 160u * 32u) / 4u);
+      std::copy(rows.begin(), rows.end(), test.initial.begin() + material / 4u);
+      for (u32 key = 0; key < 160u; ++key) {
+        auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+        image[0] = key + 1u;
+        image[3] = DstSel(4, 0, 0, 1) |
+                   (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+        std::copy_n(image.begin(), 8,
+                    test.initial.begin() + (base + table + key * 32u) / 4u);
+      }
+      test.user_data[0] = base;
+      test.user_data[3] = 3u << 28u;
+      test.user_data[6] = addend;
+      auto rows_descriptor = MakeStructuredStorageBufferData(0u, count * 4u);
+      rows_descriptor[0] = material;
+      std::copy_n(rows_descriptor.begin(), 4, test.user_data.begin() + 8);
+      test.user_data[12] = count;
+      const auto output = MakeStructuredStorageBufferData(0u, wave * 4u);
+      std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+      test.has_user_data = test.has_compute_info = true;
+      test.compute_info.wave_size = wave;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      const u32 mov = wide ? 0x04u : 0x03u;
+      const u32 and_saveexec = wide ? 0x24u : 0x3cu,
+                andn2 = wide ? 0x15u : 0x14u;
+      auto &code = test.code;
+      AppendVMovLiteral(&code, 8, 0u);
+      AppendVMovLiteral(&code, 20, 0u);
+      AppendVMovLiteral(&code, 21, 0u);
+      code.push_back(
+          EncodeVop2(0x1a, 1, InlineU32(26), 0)); // v_lshlrev_b32 v1, 26, v0
+      code.push_back(EncodeSop2(0x02, 13, 12, 193u)); // s_add_i32 s13, s12, -1
+      code.push_back(EncodeSop1(mov, 64, exec_lo));   // s_mov s64, exec
+      const auto keys = code.size();
+      code.push_back(
+          EncodeVop1(0x02, 14, Vgpr(1)));       // v_readfirstlane_b32 s14, v1
+      AppendVop3(&code, 0xc2, 70, 14, Vgpr(1)); // v_cmp_eq_u32 s70, s14, v1
+      code.push_back(
+          EncodeSop1(and_saveexec, 72, 70)); // s_and_saveexec s72, s70
+      code.insert(
+          code.end(),
+          {EncodeSop2(0x20, 14, 14, InlineU32(26)), // s_lshr_b32 s14, s14, 26
+           EncodeSop2(0x07, 14, 13, 14),            // s_min_u32 s14, s13, s14
+           EncodeSop2(0x1e, 14, 14, InlineU32(2)),  // s_lshl_b32 s14, s14, 2
+           EncodeSmem0(0x08, 15, 8 / 2u),
+           EncodeSmem1(0, 14), // s_buffer_load_dword s15, s[8:11], s14
+           EncodeSopp(0x0c),
+           EncodeSop2(0x32, 15, 15,
+                      InlineU32(0)), // s_pack_ll_b32_b16 s15, s15, 0
+           EncodeSop2(0x26, 15, 15, InlineU32(31)), // s_mul_i32 s15, s15, 31
+           EncodeSop2(0x02, 15, 6, 15),             // s_add_i32 s15, s6, s15
+           EncodeSop2(0x1e, 16, 15, InlineU32(5)),  // s_lshl_b32 s16, s15, 5
+           EncodeSmem0(0x03, 84, 0),
+           EncodeSmem1(table, 16), // s_load_dwordx8 s[84:91]
+           EncodeSopp(0x0c), EncodeMimg0(0x00, 1),
+           EncodeMimg1(4, 20, 84 / 4u), // image_load v4, v[20:21]
+           EncodeSopp(0x0c), EncodeVop1(0x01, 8, Vgpr(4))}); // v_mov_b32 v8, v4
+      code.push_back(
+          EncodeSop2(andn2, exec_lo, 72, 70)); // s_andn2 exec, s72, s70
+      code.push_back(
+          EncodeSopp(0x09, keys - code.size() - 1u)); // s_cbranch_execnz keys
+      code.push_back(EncodeSop1(mov, exec_lo, 64));   // s_mov exec, s64
+      AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 0u);
+      AppendEnd(&code);
+      test.opcodes = {
+          O::V_LSHLREV_B32,    O::V_READFIRSTLANE_B32, O::V_CMP_EQ_U32,
+          O::S_ADD_I32,        O::S_LSHR_B32,          O::S_MIN_U32,
+          O::S_LSHL_B32,       O::S_BUFFER_LOAD_DWORD, O::S_PACK_LL_B32_B16,
+          O::S_MUL_I32,        O::S_LOAD_DWORDX8,      O::IMAGE_LOAD,
+          O::S_CBRANCH_EXECNZ, O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+      test.opcodes.push_back(wide ? O::S_AND_SAVEEXEC_B64
+                                  : O::S_AND_SAVEEXEC_B32);
+      const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      // Rows 0 to count - 1 hold distinct materials (1, 2, 4).
+      Require(test.name, "material-word candidates",
+              compiled.resources.images.size() == count,
+              "material-word key escaped the clamped material rows");
+      std::vector<VulkanHarness::Image> images;
+      for (const auto &descriptor : compiled.resources.images)
+        images.push_back(vulkan.CreateImage2D(
+            test.name, 1, 1, vk::Format::eR32Sfloat,
+            vk::ImageUsageFlagBits::eSampled,
+            {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+            vk::ImageLayout::eShaderReadOnlyOptimal));
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial,
+                                               test.initial.size(), true);
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr,
+                      nullptr, vk::Sampler{}, images);
+      std::vector<u32> expected(wave);
+      for (u32 lane = 0; lane < wave; ++lane) {
+        // (lane << 26) >> 26 keeps the low six bits of the lane.
+        const auto row = std::min(count - 1u, lane & 63u);
+        expected[lane] = std::bit_cast<u32>(
+            static_cast<float>(addend + 31u * (rows[row] & 0xffffu) + 1u));
+      }
+      CompareWords(test, "each lane's clamped row selects its material's T#",
+                   expected,
+                   vulkan.ReadBuffer(test.name, buffer, expected.size()));
+      vulkan.DestroyBuffer(&buffer);
+      for (auto &image : images)
+        vulkan.DestroyImage(&image);
+      std::printf("[compute] %s count=%u wave=%u ok\n", test.name, count, wave);
+    }
+}
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -59035,6 +59272,8 @@ int main(int argc, char **argv) {
     CheckInclusiveGuardImageTable(vulkan);
     CheckRecordWordImageTable(vulkan);
     CheckLoopSelectedPointerImageTable(vulkan);
+    CheckGlobalRecordWordImageTable(vulkan);
+    CheckMaterialWordImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -59230,6 +59469,8 @@ int main(int argc, char **argv) {
   CheckInclusiveGuardImageTable(vulkan);
   CheckRecordWordImageTable(vulkan);
   CheckLoopSelectedPointerImageTable(vulkan);
+  CheckGlobalRecordWordImageTable(vulkan);
+  CheckMaterialWordImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);

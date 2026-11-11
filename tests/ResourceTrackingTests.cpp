@@ -7151,6 +7151,8 @@ void TestGpuSelectedFormattedRecordStore() {
   const auto saved_selector = memory.words[first + 3u];
   memory.words[first + 3u] = saved_selector | (3u << 28u);
   Check(materialize(), "UInt8 store rejected supported raw byte bounds");
+  const auto original_base = memory.words[first];
+  memory.words[first] &= ~3u;
   for (const auto format : {Prospero::BufferFormat::k8_8UInt, Prospero::BufferFormat::k32UInt}) {
     const auto format_bytes = format == Prospero::BufferFormat::k8_8UInt ? 2u : 4u;
     memory.words[first + 1u] =
@@ -7163,6 +7165,7 @@ void TestGpuSelectedFormattedRecordStore() {
               }),
           "raw-bounded formatted store rejected a supported indexed format");
   }
+  memory.words[first] = original_base;
   const auto saved_base0 = memory.words[first];
   const auto saved_base1 = memory.words[first + 1u];
   const auto saved_records = memory.words[first + 2u];

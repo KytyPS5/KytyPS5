@@ -47,7 +47,6 @@ class QWidget;
 
 #if defined(_WIN32)
 constexpr char  EMULATOR_EXE[] = "kyty_emulator.exe";
-constexpr char  CMD_EXE[]      = "cmd.exe";
 constexpr DWORD CMD_X_CHARS    = 175;
 constexpr DWORD CMD_Y_CHARS    = 1000;
 #else
@@ -431,15 +430,16 @@ bool MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	}
 #elif defined(_WIN32)
 	// Use nativeArguments so Qt does not re-quote the /K command string.
-	process->setProgram(CMD_EXE);
+	process->setProgram(CmdProgram);
 	process->setArguments({});
 	const auto launch = CmdCommand(QStringList {QDir::toNativeSeparators(interpreter)} + args,
 	                               close_terminal, QProcessEnvironment::systemEnvironment());
 	if (!launch) {
-		QMessageBox::critical(this, tr("Error"),
-		                      tr("The emulator arguments are longer than %1 characters or contain a "
-		                         "NUL character; cmd.exe cannot pass them on")
-		                          .arg(CmdArgumentsLimit));
+		QMessageBox::critical(
+		    this, tr("Error"),
+		    tr("The emulator arguments are longer than %1 characters or contain a "
+		       "NUL character; cmd.exe cannot pass them on")
+		        .arg(CmdArgumentsLimit));
 		return false;
 	}
 	process->setProcessEnvironment(launch->environment);

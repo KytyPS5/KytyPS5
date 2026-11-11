@@ -7171,7 +7171,7 @@ void TestGpuSelectedFormattedRecordStore() {
   const auto saved_records = memory.words[first + 2u];
   user_data[2] = 1u;
   constexpr uint32_t raw_records = 0x1000u;
-  constexpr uint32_t raw_stride = 0x3fffu;
+  constexpr uint32_t raw_stride = 0x3ffeu;
   constexpr uint64_t last_address = 0x0000ffffffffffffull;
   constexpr uint64_t raw_base = last_address - (raw_records - 1u);
   memory.words[first] = uint32_t(raw_base);

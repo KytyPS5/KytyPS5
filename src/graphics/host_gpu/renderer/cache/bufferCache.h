@@ -282,6 +282,12 @@ private:
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
+	// Records (or adds to the upload batch) the copies UploadCopies() staged in `source`.
+	void RecordBufferUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+	                        vk::Buffer source);
+	// SynchronizeBuffer() of read-only uses of ranges[i] of buffers[i], ordered by address.
+	void               SynchronizeBuffers(std::span<Buffer* const>                       buffers,
+	                                      std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -547,6 +553,11 @@ private:
 	std::vector<uint64_t>                      m_forced_region_bits;
 	std::vector<uint64_t>                      m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
+	// The buffers of a CPU-dirty span (see SynchronizeBuffersInRange()) and their copies.
+	std::vector<Buffer*>                       m_span_buffers;
+	std::vector<std::pair<uint64_t, uint64_t>> m_span_ranges;
+	std::vector<std::vector<vk::BufferCopy>>   m_span_copies;
+	std::vector<uint64_t>                      m_span_sizes;
 };
 
 } // namespace Libs::Graphics

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -220,6 +221,56 @@ public:
 				               manager->lock.unlock();
 			               });
 		}
+	}
+
+	// ForEachUploadRange() of read-only uses of several ranges, ordered and not overlapping:
+	// range_func(index, address, size) gets the runs of ranges[index]. The CPU-dirty pages of
+	// each region are taken with one protection update (RegionManager::ConsumeCpuDirtyRanges()).
+	template <typename RangeFunc, typename UploadFunc>
+	void ForEachUploadRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+	                         RangeFunc&& range_func, UploadFunc&& upload_func) {
+		static_assert(std::is_nothrow_invocable_v<RangeFunc&, size_t, uint64_t, uint64_t>);
+		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		struct Piece {
+			uint64_t region;
+			uint64_t offset;
+			uint64_t size;
+			size_t   range;
+		};
+		static thread_local std::vector<Piece>                         pieces;
+		static thread_local std::vector<std::pair<uint64_t, uint64_t>> offsets;
+		pieces.clear();
+		for (size_t index = 0; index < ranges.size(); index++) {
+			const auto [address, size] = ranges[index];
+			ValidateRange(address, size);
+			for (auto at = address; at < address + size;) {
+				const auto region = at / TRACKER_REGION_SIZE;
+				const auto end    = std::min(address + size, (region + 1) * TRACKER_REGION_SIZE);
+				pieces.push_back({region, at - region * TRACKER_REGION_SIZE, end - at, index});
+				at = end;
+			}
+		}
+		for (size_t first = 0; first < pieces.size();) {
+			auto last = first + 1;
+			while (last < pieces.size() && pieces[last].region == pieces[first].region) {
+				last++;
+			}
+			auto* manager = GetOrCreateRegion(pieces[first].region);
+			if (manager->HasCpuDirty()) {
+				offsets.clear();
+				for (auto piece = first; piece < last; piece++) {
+					offsets.emplace_back(pieces[piece].offset, pieces[piece].size);
+				}
+				std::scoped_lock lock(manager->lock);
+				manager->ConsumeCpuDirtyRanges(
+				    std::span<const std::pair<uint64_t, uint64_t>>(offsets),
+				    [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
+					    range_func(pieces[first + piece].range, address, bytes);
+				    });
+			}
+			first = last;
+		}
+		upload_func();
 	}
 
 private:

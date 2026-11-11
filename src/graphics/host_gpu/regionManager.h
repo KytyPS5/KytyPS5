@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <utility>
 
@@ -228,6 +229,37 @@ public:
 		}
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// ForEachModifiedRange<DirtySource::Cpu, true>() over several ranges of the region, ordered
+	// and not overlapping: one protection update covers them all, so the page manager protects
+	// runs of their pages with one call, through clean pages between them that are protected
+	// already. Calls func(index, address, size) for the runs of pages of ranges[index] (offsets
+	// in the region). Callers hold the lock.
+	template <typename Func>
+	void ConsumeCpuDirtyRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges, Func&& func) {
+		RegionBits mask;
+		for (const auto& [offset, size]: ranges) {
+			const auto [start, end] = GetPageRange(offset, size);
+			if (m_cpu_dirty.FirstRangeFrom(start).first < end) {
+				mask |= RegionBits(m_cpu_dirty, start, end);
+			}
+		}
+		if (mask.None()) {
+			return;
+		}
+		for (const auto [first, last]: mask) {
+			m_cpu_dirty.UnsetRange(first, last);
+		}
+		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
+		UpdateProtection<true, false>(mask);
+		for (size_t index = 0; index < ranges.size(); index++) {
+			const auto [start, end] = GetPageRange(ranges[index].first, ranges[index].second);
+			for (const auto [first, last]: RegionBits(mask, start, end)) {
+				func(index, m_cpu_addr + first * TRACKER_PAGE_SIZE,
+				     (last - first) * TRACKER_PAGE_SIZE);
+			}
 		}
 	}
 

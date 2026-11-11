@@ -355,7 +355,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("graphics pipeline creation failed: result=%s (%d) stages=0x%016" PRIx64
+		     ",0x%016" PRIx64 ",0x%016" PRIx64 ",0x%016" PRIx64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int32_t>(result), key.stage_ids[0],
+		     key.stage_ids[1], key.stage_ids[2], key.stage_ids[3]);
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -391,7 +396,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("compute pipeline creation failed: result=%s (%d) module=0x%016" PRIx64
+		     " shader=0x%016" PRIx64 " wave=%u bindings=0x%08x gds=%u image_heap=%u "
+		     "push_descriptors=%u\n",
+		     vk::to_string(result).c_str(), static_cast<int32_t>(result), module.id,
+		     module.info.shader_hash, module.info.wave_size, module.info.bindings.descriptor_mask,
+		     module.info.info.uses_gds ? 1u : 0u, module.info.info.uses_image_heap ? 1u : 0u,
+		     pipeline.uses_push_descriptors ? 1u : 0u);
+	}
 }
 
 } // namespace Libs::Graphics

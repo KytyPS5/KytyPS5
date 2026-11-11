@@ -238,15 +238,11 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		if (!indexed || format.type == Format::ComponentType::Unknown)
 			return SpecializationFail("indirect formatted buffers require a supported indexed format");
 		if (!formatted_read) {
-			const bool scalar = resource.max_byte_extent == 4u &&
-			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
-			     descriptor.Format() == Prospero::BufferFormat::k8SInt);
-			const bool rgba16 = resource.max_byte_extent == 16u &&
-			    descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
-			if ((!scalar && !rgba16) || descriptor.Stride() != format.byte_size ||
-			    descriptor.DstSelXYZW() != (rgba16 ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 0)))
+			const auto swizzle = descriptor.DstSelXYZW();
+			if (!IsValidImageSwizzle(swizzle, 4u) || resource.max_byte_extent == 0u ||
+			    resource.max_byte_extent > 16u || descriptor.Stride() < format.byte_size)
 				return SpecializationFail(fmt::format(
-				    "indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float "
+				    "indirect formatted stores require a supported selector and full-format "
 				    "records: format={} stride={} format_bytes={} max_extent={} dst_sel={:03x} "
 				    "records={} base={:#x}",
 				    static_cast<uint32_t>(descriptor.Format()), descriptor.Stride(), format.byte_size,
@@ -265,6 +261,10 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
 			return SpecializationFail("indirect formatted buffers require aligned full-format records");
+		const auto record_end = uint64_t {descriptor.NumRecords() - 1u} * descriptor.Stride() +
+		                        format.byte_size;
+		if (record_end != 0u && record_end - 1u > AddressMask - descriptor.Base48())
+			return SpecializationFail("indirect formatted buffers require an in-range record span");
 	} else if ((!indexed && descriptor.Stride() != 1u) ||
 	           (indexed && resource.max_byte_extent != 1u && descriptor.Stride() != 4u)) {
 		return SpecializationFail("indirect buffer stores require exact linear DWORD or byte bounds");

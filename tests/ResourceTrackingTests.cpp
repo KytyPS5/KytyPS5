@@ -7128,17 +7128,30 @@ void TestGpuSelectedFormattedRecordStore() {
   const auto original = specialization;
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,
-        "signed byte destination refresh required alignment or needless specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
-      {first + 1u, 2u << 16u}, {first + 1u, (1u << 16u) | (1u << 31u)},
-      {first + 3u, (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | 4u},
+        "byte destination refresh required a tight stride or needless specialization");
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+      {first + 1u, 0u}, {first + 1u, (1u << 16u) | (1u << 31u)},
       {first + 3u, memory.words[first + 3u] | (1u << 28u)},
-      {first + 3u, memory.words[first + 3u] | (4u << 3u)}}}) {
+      {first + 3u, memory.words[first + 3u] | (2u << 3u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;
-    Check(!materialize(), "signed byte candidate accepted an unproved format, stride or bounds");
+    Check(!materialize(), "byte candidate accepted an unproved stride, selector or bounds");
     memory.words[word] = saved;
   }
+  const auto saved_stride = memory.words[first + 1u];
+  const auto saved_selector = memory.words[first + 3u];
+  for (const uint32_t descriptor : {
+           (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | DstSel(4, 0, 0, 1),
+           uint32_t(Prospero::BufferFormat::k8UInt) << 12u}) {
+    memory.words[first + 3u] = descriptor;
+    Check(materialize() && specialization.buffers[root].descriptor_format ==
+                                Prospero::BufferFormat::k8UInt,
+          "UInt8 store descriptor was rejected or lost its runtime format");
+  }
+  memory.words[first + 3u] = saved_selector;
+  memory.words[first + 1u] = 1u << 16u;
+  Check(materialize(), "a stride larger than one-byte UInt8 records was rejected");
+  memory.words[first + 1u] = saved_stride;
   user_data[1] = 0u;
   user_data[2] = 5u * 592u + 448u + 12u;
   memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;

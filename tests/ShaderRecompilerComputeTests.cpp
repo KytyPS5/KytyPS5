@@ -37621,6 +37621,30 @@ TestCase BufferStoreFormatXyResource88UintWritesBytes() {
   return test;
 }
 
+TestCase BufferStoreFormatXyResource88UintUsesReverseSwizzle() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 0, 0x0000bbaau);
+  AppendVMovLiteral(&code, 1, 0x0000ddccu);
+  code.push_back(EncodeMubuf0(0x05u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyResource8_8UintUsesReverseSwizzle";
+  test.code = code;
+  test.initial = {0x11223344u, 0x55667788u};
+  test.expected = {0x112200aau, 0x55667788u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XY, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 8, false, BufferFormat(Prospero::BufferFormat::k8_8UInt));
+  test.user_data[3] = (test.user_data[3] & ~0xfffu) | DstSel(4, 4, 0, 1);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferStoreFormatXyResource32UintWritesOneDword() {
   using O = ShaderOpcode;
 
@@ -48980,6 +49004,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);
   AddCase(BufferStoreFormatXyResource88UintWritesBytes);
+  AddCase(BufferStoreFormatXyResource88UintUsesReverseSwizzle);
   AddCase(BufferStoreFormatXyzResource3232UintWritesTwoDwords);
   AddCase(BufferStoreFormatXyzwResource323232UintWritesThreeDwords);
   AddCase(BufferStoreFormatXyResource32UintWritesOneDword);

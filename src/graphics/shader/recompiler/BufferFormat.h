@@ -33,6 +33,15 @@ struct FormattedSource {
 	uint32_t            component = 0;
 };
 
+constexpr uint32_t ResolveFormattedStoreSource(uint32_t swizzle, uint32_t component) {
+	if (component >= 4u) return UINT32_MAX;
+	const auto selector = 4u + component;
+	for (uint32_t source = 0; source < 4u; source++) {
+		if (((swizzle >> (source * 3u)) & 7u) == selector) return source;
+	}
+	return UINT32_MAX;
+}
+
 constexpr FormattedSource ResolveFormattedSource(const BufferFormatInfo& info, uint32_t selector) {
 	if (selector == 0u) return {};
 	if (selector == 1u) return {FormattedSourceKind::One, 0};

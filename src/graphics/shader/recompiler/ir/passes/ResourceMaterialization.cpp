@@ -1815,15 +1815,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 		if (program.info.samplers[base_index].gather_lod) {
-			const auto control = snapshot.samplers[i].dwords[2];
-			const auto filter = (control >> 26u) & 3u;
-			const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
-			// MipNone always selects the base level. Point/linear selection requires zero
-			// primary/secondary bias; linear mip snapping is not implemented.
-			if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
+			const auto control        = snapshot.samplers[i].dwords[2];
+			const auto filter         = (control >> 26u) & 3u;
+			const auto secondary_bias = (control >> 14u) & 0x3fu;
+			const auto perf_mip       = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
+			// The T#.perf_mod scaling of the secondary bias and linear mip snapping is unspecified.
+			if (filter > 2u || (filter != 0u && secondary_bias != 0u) ||
 			    (filter == 2u && perf_mip != 0u)) {
 				return SpecializationFail(
-				    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
+				    "explicit-LOD gather requires None, or Point or Linear "
+				    "without secondary LOD bias, and Linear without mip snapping");
 			}
 		}
 	}

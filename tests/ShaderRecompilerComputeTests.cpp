@@ -44371,11 +44371,12 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
       "ImageGatherLodMipNone", "ImageGatherLodPointPostclampMaximum",
       "ImageGatherLodPointPreclampMaximum", "ImageGatherLodPointPostclampMinimum",
       "ImageGatherLodPointPreclampMinimum", "ImageGatherLodLinearPrimary",
-      "ImageGatherLodLinearIgnoresPreclamp"};
+      "ImageGatherLodLinearIgnoresPreclamp", "ImageGatherLodPointNegativeBias",
+      "ImageGatherLodLinearBiasBeforeClamp"};
   constexpr std::array lods = mode < 5
       ? std::array{-1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 9.0f}
       : std::array{-1.0f, 0.0f, 0.25f, 0.75f, 1.25f, 1.75f, 2.75f, 9.0f};
-  constexpr std::array<std::array<u32, 8>, 11> selected_mips{{
+  constexpr std::array<std::array<u32, 8>, 13> selected_mips{{
       {0, 0, 1, 2, 3, 4, 4, 4},
       {1, 1, 2, 3, 4, 4, 4, 4},
       {2, 2, 2, 3, 3, 3, 3, 3},
@@ -44387,11 +44388,13 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
       {1, 1, 1, 1, 1, 2, 3, 4},
       {0, 0, 0, 0, 1, 1, 2, 4},
       {0, 0, 0, 0, 1, 1, 2, 4},
+      {0, 0, 0, 0, 1, 1, 2, 4},
+      {0, 1, 1, 1, 1, 1, 1, 1},
   }};
   constexpr u32 lanes = lods.size();
   constexpr u32 sampler_min = mode == 2 ? 256 : mode == 7 || mode == 8 ? 448 : 0;
   constexpr u32 sampler_max = mode == 2 ? 512 : mode == 3 ? 256
-      : mode == 5 || mode == 6 ? 448 : 1024;
+      : mode == 5 || mode == 6 || mode == 12 ? 448 : 1024;
   TestCase test;
   test.name = names[mode];
   test.image_width = test.image_height = 16;
@@ -44434,7 +44437,12 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
   test.user_data[9] = sampler_min | (sampler_max << 12u);
   // Point preclamp selects whether the half-level rounding adjustment precedes
   // or follows the clamps. The streaming T# minimum follows the sampler bounds.
-  test.user_data[10] = mode == 4 ? 0x4001u : mode >= 9 ? 0x0a500000u : (1u << 26u);
+  // S# LOD_BIAS (s6.8, bits 13:0) offsets the shader LOD before the sampler clamps.
+  test.user_data[10] = mode == 4    ? 0x4001u
+                       : mode == 11 ? (1u << 26u) | 0x3f80u
+                       : mode == 12 ? 0x0a500000u | 256u
+                       : mode >= 9  ? 0x0a500000u
+                                    : (1u << 26u);
   if constexpr (mode == 6 || mode == 8 || mode == 10) {
     test.user_data[10] |= 1u << 28u;
   }
@@ -51629,6 +51637,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGatherLodPerLane<8>);
   AddCase(ImageGatherLodPerLane<9>);
   AddCase(ImageGatherLodPerLane<10>);
+  AddCase(ImageGatherLodPerLane<11>);
+  AddCase(ImageGatherLodPerLane<12>);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
@@ -59123,6 +59133,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageGatherLodPerLane<8>());
     RunCase(&vulkan, ImageGatherLodPerLane<9>());
     RunCase(&vulkan, ImageGatherLodPerLane<10>());
+    RunCase(&vulkan, ImageGatherLodPerLane<11>());
+    RunCase(&vulkan, ImageGatherLodPerLane<12>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<0>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<1>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<2>());

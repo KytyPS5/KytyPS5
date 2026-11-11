@@ -6976,9 +6976,10 @@ void TestGatherLodSamplerValidation() {
       user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
           (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
       constexpr std::array sampler_controls{
-          0u, 0x4001u, 1u << 26u, (1u << 26u) | 256u,
+          0u, 0x4001u, 1u << 26u, (1u << 26u) | 256u, (1u << 26u) | 0x3f80u,
           (1u << 26u) | (1u << 14u), 2u << 26u, (2u << 26u) | 256u,
-          (2u << 26u) | (1u << 14u), 0x0a500000u, 0x1a500000u, 3u << 26u};
+          (2u << 26u) | 0x2000u, (2u << 26u) | (1u << 14u), 0x0a500000u,
+          0x0a500000u | 0x3f80u, 0x1a500000u, 3u << 26u};
       for (const auto control : sampler_controls) {
         for (const uint32_t perf_mip : {0u, 1u}) {
           user_data[9] = 0xfff000u | (perf_mip << 24u);
@@ -6986,8 +6987,9 @@ void TestGatherLodSamplerValidation() {
           ResourceSnapshot snapshot;
           ResourceSpecialization specialization;
           const auto filter = (control >> 26u) & 3u;
+          // The primary bias is emulated; the secondary bias and linear snapping are not.
           const bool supported = !explicit_lod || filter == 0 ||
-              (filter <= 2 && (control & 0xfffffu) == 0 &&
+              (filter <= 2 && ((control >> 14u) & 0x3fu) == 0 &&
                (filter != 2 || perf_mip == 0));
           Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                      specialization) == supported,

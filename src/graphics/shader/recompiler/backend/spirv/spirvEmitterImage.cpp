@@ -103,6 +103,14 @@ uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memory
 	const auto mip_filter = Extract(sampler_control, 26, 2);
 	const auto preclamp = Binary(state, spv::OpINotEqual, TypeBool(state),
 	                            Extract(sampler_control, 28, 1), ConstantU32(state, 0));
+	// S# LOD_BIAS, s6.8 in bits 13:0, applies to a shader LOD as it does to a computed one.
+	const auto bias_fixed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), bias_fixed,
+	                          Unary(state, spv::OpBitcast, TypeI32(state), sampler_control),
+	                          ConstantU32(state, 0), ConstantU32(state, 14));
+	const auto bias = Binary(state, spv::OpFMul, TypeF32(state),
+	                         Unary(state, spv::OpConvertSToF, TypeF32(state), bias_fixed),
+	                         ConstantF32Value(state, 1.0f / 256.0f));
 	const auto zero = ZeroF32(state);
 	// Point selects the nearest mip; linear gathers return the lower, primary mip only.
 	const auto rounding = Select(state, TypeF32(state),
@@ -113,8 +121,9 @@ uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memory
 	const auto minimum = Binary(state, spv::OpFSub, TypeF32(state),
 	                            LodFixed(ctx.Arg(inst, 3), 8), base);
 	const auto last = ConstantF32Value(state, static_cast<float>(mip_count - 1u));
-	auto lod = Binary(state, spv::OpFAdd, TypeF32(state),
-	                  AddressF32(ctx, mem, address, layout.lod),
+	const auto biased =
+	    Binary(state, spv::OpFAdd, TypeF32(state), AddressF32(ctx, mem, address, layout.lod), bias);
+	auto lod = Binary(state, spv::OpFAdd, TypeF32(state), biased,
 	                  Select(state, TypeF32(state), preclamp, rounding, zero));
 	lod = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
 	    state, lod, LodFixed(ctx.Arg(inst, 5), 0), LodFixed(ctx.Arg(inst, 5), 12));

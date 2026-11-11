@@ -210,7 +210,7 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 }
 
 bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
-                             ShaderType stage) {
+                             ShaderType stage, bool probe_scan = false) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
@@ -228,9 +228,11 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		return true;
 	}
 	const bool raw_bounds = descriptor.OutOfBounds() == 3u;
+	const bool scanned_loose_store =
+	    probe_scan && resource.formatted && resource.written && descriptor.OutOfBounds() == 2u;
 	if (descriptor.SwizzleEnabled() || (descriptor.AddTid() && !add_tid_store) ||
 	    (descriptor.OutOfBounds() != (indexed ? 0u : 3u) &&
-	     !(resource.formatted && raw_bounds))) {
+	     !(resource.formatted && (raw_bounds || scanned_loose_store)))) {
 		return SpecializationFail(fmt::format(
 		    "indirect buffers require exact linear index or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} swizzle={} add_tid={} oob={} "
@@ -244,9 +246,22 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			return SpecializationFail("indirect formatted buffers require a supported indexed format");
 		if (!formatted_read) {
 			const auto swizzle = descriptor.DstSelXYZW();
-			if (!IsValidImageSwizzle(swizzle, 4u) ||
-			    resource.max_byte_extent < format.byte_size || resource.max_byte_extent > 16u ||
-			    descriptor.Stride() < format.byte_size)
+			const bool selector_valid = IsValidImageSwizzle(swizzle, 4u) &&
+			    resource.max_byte_extent >= format.byte_size && resource.max_byte_extent <= 16u;
+			if (scanned_loose_store) {
+				const auto alignment = std::min(4u, format.byte_size);
+				const bool addressable = descriptor.Stride() >= format.byte_size &&
+				    (descriptor.Stride() & (alignment - 1u)) == 0u &&
+				    (descriptor.Base48() & (alignment - 1u)) == 0u;
+				if (!selector_valid || !addressable) {
+					// A bounded sparse table can include padding or unrelated heap words.
+					// OOB_SELECT=2 has no useful span check, so malformed probes are null.
+					value.dwords.fill(0u);
+					return true;
+				}
+				return true;
+			}
+			if (!selector_valid || descriptor.Stride() < format.byte_size)
 				return SpecializationFail(fmt::format(
 				    "indirect formatted stores require a supported selector and full-format "
 				    "records: format={} stride={} format_bytes={} max_extent={} dst_sel={:03x} "
@@ -581,6 +596,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	bool       probe_scan = false;
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
 		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
@@ -686,6 +702,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
 				domain = std::min(domain, uint64_t {key_count});
 			}
+			probe_scan = selector == nullptr && byte_keys && !use_selector && domain > 1u;
 			if (indexed_pointer &&
 			    (!indirect.table_maximum || table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
 			     table.OutOfBounds() != 0u || (table_base & 3u) != 0u || (table.Stride() & 3u) != 0u ||
@@ -1685,7 +1702,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        snapshot.buffers, specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base, program.stage);
+						            value, source->indirect_descriptor->indexed, base, program.stage,
+						            probe_scan);
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}

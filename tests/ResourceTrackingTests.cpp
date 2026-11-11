@@ -7162,10 +7162,9 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,
         "byte destination refresh required a tight stride or needless specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
       {first + 1u, 0u}, {first + 1u, (1u << 16u) | (1u << 31u)},
       {first + 3u, memory.words[first + 3u] | (1u << 28u)},
-      {first + 3u, memory.words[first + 3u] | (2u << 28u)},
       {first + 3u, memory.words[first + 3u] | (2u << 3u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;
@@ -7174,6 +7173,26 @@ void TestGpuSelectedFormattedRecordStore() {
   }
   const auto saved_stride = memory.words[first + 1u];
   const auto saved_selector = memory.words[first + 3u];
+  const auto saved_sparse_base = memory.words[first];
+  const auto saved_sparse_records = memory.words[first + 2u];
+  memory.words[first] &= ~1u;
+  memory.words[first + 3u] =
+      (uint32_t(Prospero::BufferFormat::k16UNorm) << 12u) |
+      Libs::Graphics::DstSel(4, 0, 0, 1) | (2u << 28u);
+  Check(materialize(),
+        "sparse OOB_SELECT=2 formatted record ignored its valid unchecked address");
+  memory.words[first] |= 1u;
+  memory.words[first + 1u] =
+      (memory.words[first + 1u] & 0xffffu) | (3u << 16u);
+  Check(materialize(),
+        "malformed OOB_SELECT=2 scan probe terminated an otherwise valid sparse table");
+  const auto sparse_mapping = specialization.buffers[root].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[sparse_mapping] == 6u &&
+            snapshot.flattened_srt[sparse_mapping + 1u] == 0u,
+        "unaligned OOB_SELECT=2 scan probe was not retained as a null candidate");
+  memory.words[first] = saved_sparse_base;
+  memory.words[first + 1u] = saved_stride;
+  memory.words[first + 2u] = saved_sparse_records;
   memory.words[first + 3u] = saved_selector | (3u << 28u);
   Check(materialize(), "UInt8 store rejected supported raw byte bounds");
   const auto original_base = memory.words[first];

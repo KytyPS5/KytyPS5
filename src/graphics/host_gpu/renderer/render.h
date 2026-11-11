@@ -175,12 +175,12 @@ private:
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
-	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                              DrawRenderState& state, const DrawEmitInfo& emit,
-	                                              const DrawIndexBufferSource& index_source);
+	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
+	                                       const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -216,6 +216,8 @@ private:
 	RenderContext&                        m_context;
 	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
+	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.
+	DrawTargets                           m_targets;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

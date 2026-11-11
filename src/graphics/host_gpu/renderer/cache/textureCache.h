@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "common/smallVector.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -12,9 +13,11 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <algorithm>
 #include <bitset>
 #include <map>
 #include <mutex>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -108,15 +111,98 @@ private:
 		uint64_t   tick;
 	};
 
-	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
-	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+	// PS5: guest addresses span 44 bits, so an entry keeps the whole image address.
+	struct BucketEntry {
+		uint64_t address;
+		uint32_t size;
+		ImageId  id;
+
+		[[nodiscard]] bool Overlaps(uint64_t addr, size_t size) const noexcept {
+			return address < addr + size && addr < address + this->size;
+		}
+	};
+
+	struct alignas(64) Bucket {
+		Common::SmallVector<BucketEntry, 3, uint32_t> entries;
+	};
+	static_assert(sizeof(Bucket) == 64);
+
+	using ImagePageTable = MultiLevelPageTable<Bucket, 20, 44, 14>;
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
+		static constexpr bool RETURNS_BOOL =
+		    std::is_same_v<std::invoke_result_t<Func, uint64_t>, bool>;
 		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
-			func(page);
+			if constexpr (RETURNS_BOOL) {
+				if (func(page)) {
+					break;
+				}
+			} else {
+				func(page);
+			}
+		}
+	}
+
+	// The walks below iterate the page entries in place: func must not insert, register,
+	// unregister or free images. Caller holds m_lock.
+
+	// Calls func once per image overlapping the region, from the first page both share; a func
+	// returning true stops the walk.
+	template <typename Func>
+	void ForEachImageInRegion(uint64_t address, size_t size, Func&& func) {
+		static constexpr bool BOOL_BREAK =
+		    std::is_same_v<std::invoke_result_t<Func, ImageId, Image&>, bool>;
+		ImagePageTable::PageRange pages {};
+		if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+			return;
+		}
+		const uint64_t first_page = address >> ImagePageTable::kPageBits;
+		ForEachPage(address, size, [&](uint64_t page) {
+			const auto* bucket = m_image_page_table.Find(page);
+			if (bucket == nullptr) {
+				if constexpr (BOOL_BREAK) {
+					return false;
+				} else {
+					return;
+				}
+			}
+			for (const auto& entry: bucket->entries) {
+				const uint64_t base_page = entry.address >> ImagePageTable::kPageBits;
+				if (page != std::max(first_page, base_page)) {
+					continue;
+				}
+				if (!entry.Overlaps(address, size)) {
+					continue;
+				}
+				Image& image = m_slot_images[entry.id];
+				if constexpr (BOOL_BREAK) {
+					if (func(entry.id, image)) {
+						return true;
+					}
+				} else {
+					func(entry.id, image);
+				}
+			}
+			if constexpr (BOOL_BREAK) {
+				return false;
+			}
+		});
+	}
+
+	// Calls func for each image registered at address.
+	template <typename Func>
+	void ForEachImageWithAddress(uint64_t address, Func&& func) {
+		const auto* bucket = m_image_page_table.Find(address >> ImagePageTable::kPageBits);
+		if (bucket == nullptr) {
+			return;
+		}
+		for (const auto& entry: bucket->entries) {
+			if (entry.address == address) {
+				func(entry.id, m_slot_images[entry.id]);
+			}
 		}
 	}
 
@@ -138,8 +224,6 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
-	// Caller holds m_lock; it also serializes Image::picked.
-	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -167,6 +251,8 @@ private:
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
+	// The depth image's stencil plane record covering exactly range, or none.
+	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;

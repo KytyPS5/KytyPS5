@@ -575,6 +575,40 @@
         </widget>
        </item>
        <item>
+        <widget class="QGroupBox" name="performance_tweaks_group">
+         <property name="title"><string>Performance tweaks</string></property>
+         <layout class="QVBoxLayout" name="performanceTweaksLayout">
+          <item>
+           <widget class="QLabel" name="label_performance_tweaks">
+            <property name="styleSheet"><string>color: red;</string></property>
+            <property name="text"><string>Game-specific tweaks: they may or may not improve performance. Use with caution and prefer setting them per game rather than globally.</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="flushDrawsLayout">
+            <item>
+             <widget class="QLabel" name="label_flush_draws">
+              <property name="text"><string>Submit GPU work every N draws (0 = off):</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QSpinBox" name="spinBox_flush_draws">
+              <property name="toolTip"><string>Can lower frame time in games that send a whole frame as one command buffer, at some submit overhead.</string></property>
+              <property name="maximum"><number>99999</number></property>
+             </widget>
+            </item>
+            <item>
+             <spacer name="flushDrawsSpacer">
+              <property name="orientation"><enum>Qt::Horizontal</enum></property>
+             </spacer>
+            </item>
+           </layout>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
         <spacer name="debugSpacer">
          <property name="orientation"><enum>Qt::Vertical</enum></property>
          <property name="sizeHint" stdset="0"><size><width>20</width><height>40</height></size></property>

@@ -1,15 +1,10 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <iterator>
 #include <memory>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -84,145 +79,6 @@ private:
 	}
 
 	std::vector<std::unique_ptr<Bucket>> m_first_level;
-};
-
-// Inline owner storage for page-table entries. Texture pages normally have only a
-// handful of owners, so avoid a heap allocation on the first 16 registrations.
-//
-// Owners are packed into live uint64_t objects instead of being constructed in
-// raw storage. This keeps sparse bucket construction cheap without relying on
-// subtle implicit-lifetime or pointer-provenance rules.
-template <typename OwnerT, size_t InlineCapacity = 16>
-class InlinePageOwnerList final {
-public:
-	using value_type = OwnerT;
-	using size_type  = size_t;
-
-	class const_iterator final {
-	public:
-		// libstdc++'s algorithms need these. Input, not forward, because operator* returns a copy.
-		using iterator_category = std::input_iterator_tag;
-		using value_type        = OwnerT;
-		using difference_type   = std::ptrdiff_t;
-		using pointer           = void;
-		using reference         = OwnerT;
-
-		[[nodiscard]] OwnerT operator*() const noexcept { return m_owners->At(m_index); }
-		const_iterator&      operator++() noexcept {
-			++m_index;
-			return *this;
-		}
-		bool operator==(const const_iterator&) const = default;
-
-	private:
-		friend class InlinePageOwnerList;
-		const_iterator(const InlinePageOwnerList* owners, size_type index) noexcept
-		    : m_owners(owners), m_index(index) {}
-
-		const InlinePageOwnerList* m_owners = nullptr;
-		size_type                  m_index  = 0;
-	};
-
-	static_assert(InlineCapacity > 0);
-	static_assert(std::is_default_constructible_v<OwnerT>);
-	static_assert(std::is_trivially_copyable_v<OwnerT>);
-	static_assert(std::has_unique_object_representations_v<OwnerT>);
-	static_assert(sizeof(OwnerT) <= sizeof(uint64_t));
-
-	InlinePageOwnerList() noexcept {}
-	InlinePageOwnerList(const InlinePageOwnerList&)            = delete;
-	InlinePageOwnerList& operator=(const InlinePageOwnerList&) = delete;
-	InlinePageOwnerList(InlinePageOwnerList&& other) noexcept
-	    : m_overflow(std::move(other.m_overflow)),
-	      m_inline_size(std::exchange(other.m_inline_size, 0)) {
-		if (m_overflow == nullptr) {
-			std::copy_n(other.m_inline.begin(), m_inline_size, m_inline.begin());
-		}
-	}
-
-	[[nodiscard]] const_iterator begin() const noexcept { return {this, 0}; }
-	[[nodiscard]] const_iterator end() const noexcept { return {this, size()}; }
-
-	[[nodiscard]] bool      empty() const noexcept { return size() == 0; }
-	[[nodiscard]] size_type size() const noexcept {
-		return m_overflow == nullptr ? m_inline_size : m_overflow->size();
-	}
-	[[nodiscard]] OwnerT front() const noexcept { return At(0); }
-
-	void push_back(const OwnerT& owner) {
-		const uint64_t packed = Pack(owner);
-		if (m_overflow != nullptr) {
-			m_overflow->push_back(packed);
-			return;
-		}
-		if (m_inline_size < InlineCapacity) {
-			m_inline[m_inline_size] = packed;
-			++m_inline_size;
-			return;
-		}
-		auto overflow = std::make_unique<std::vector<uint64_t>>();
-		overflow->reserve(InlineCapacity * 2);
-		overflow->assign(m_inline.begin(), m_inline.end());
-		overflow->push_back(packed);
-		m_overflow = std::move(overflow);
-	}
-
-	[[nodiscard]] bool Erase(const OwnerT& owner) noexcept {
-		const uint64_t packed = Pack(owner);
-		if (m_overflow != nullptr) {
-			const auto found = std::find(m_overflow->begin(), m_overflow->end(), packed);
-			if (found == m_overflow->end()) {
-				return false;
-			}
-			m_overflow->erase(found);
-			if (m_overflow->size() == InlineCapacity) {
-				std::copy(m_overflow->begin(), m_overflow->end(), m_inline.begin());
-				m_inline_size = InlineCapacity;
-				m_overflow.reset();
-			}
-			return true;
-		}
-		const auto end   = m_inline.begin() + static_cast<ptrdiff_t>(m_inline_size);
-		const auto found = std::find(m_inline.begin(), end, packed);
-		if (found == end) {
-			return false;
-		}
-		std::move(found + 1, end, found);
-		--m_inline_size;
-		return true;
-	}
-
-	template <typename Func>
-	void ForEach(Func&& func) const {
-		if (m_overflow != nullptr) {
-			for (const uint64_t owner: *m_overflow) {
-				func(Unpack(owner));
-			}
-			return;
-		}
-		for (size_type index = 0; index < m_inline_size; ++index) {
-			func(Unpack(m_inline[index]));
-		}
-	}
-
-private:
-	[[nodiscard]] OwnerT At(size_type index) const noexcept {
-		return Unpack(m_overflow == nullptr ? m_inline[index] : (*m_overflow)[index]);
-	}
-	[[nodiscard]] static uint64_t Pack(const OwnerT& owner) noexcept {
-		uint64_t packed = 0;
-		std::memcpy(&packed, &owner, sizeof(owner));
-		return packed;
-	}
-	[[nodiscard]] static OwnerT Unpack(uint64_t packed) noexcept {
-		OwnerT owner {};
-		std::memcpy(&owner, &packed, sizeof(owner));
-		return owner;
-	}
-
-	std::array<uint64_t, InlineCapacity>   m_inline;
-	std::unique_ptr<std::vector<uint64_t>> m_overflow;
-	size_type                              m_inline_size = 0;
 };
 
 } // namespace Libs::Graphics

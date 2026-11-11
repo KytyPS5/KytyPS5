@@ -25,46 +25,6 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
-template <typename Regions, typename Region, typename Gap>
-static void ForEachSparseRange(const Regions& regions, uint64_t vaddr, uint64_t size,
-                               Region&& region, Gap&& gap) {
-	const auto end     = vaddr + size;
-	auto       mapping = regions.lower_bound(vaddr);
-	if (mapping != regions.begin()) {
-		auto previous = std::prev(mapping);
-		if (previous->second.vaddr + previous->second.size > vaddr) {
-			mapping = previous;
-		}
-	}
-
-	auto cursor = vaddr;
-	for (; mapping != regions.end() && mapping->second.vaddr < end; ++mapping) {
-		const auto& entry = mapping->second;
-		const auto  start = std::max(vaddr, entry.vaddr);
-		const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
-		if (cursor < start) {
-			gap(cursor, start - cursor);
-		}
-		region(entry, start, bytes);
-		cursor = start + bytes;
-	}
-	if (cursor < end) {
-		gap(cursor, end - cursor);
-	}
-}
-
-template <typename Regions, typename Source, typename Gap>
-static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, uint64_t size,
-                            Source&& source, Gap&& gap) {
-	auto* destination = static_cast<uint8_t*>(data);
-	ForEachSparseRange(
-	    regions, vaddr, size,
-	    [&](const auto& entry, uint64_t start, uint64_t bytes) {
-		    std::memcpy(destination + (start - vaddr), source(entry, start), bytes);
-	    },
-	    [&](uint64_t start, uint64_t bytes) { gap(start, destination + (start - vaddr), bytes); });
-}
-
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -121,18 +81,15 @@ public:
 #endif
 	}
 
+	// Guest views outlive the alias and the handle; the address-space owner releases them.
 	~GuestBackingStore() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& [_, entry]: m_maps) {
-			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
+		for (auto& bucket: m_pages) {
+			delete[] bucket.load(std::memory_order_relaxed);
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		UnmapViewOfFile(m_backing_base);
 		CloseHandle(m_handle);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-		for (const auto& [_, entry]: m_maps) {
-			EXIT_IF(
-			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
-		}
 		munmap(m_backing_base, m_size);
 		close(m_fd);
 #endif
@@ -158,205 +115,169 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
-		std::lock_guard lock(m_mutex);
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
 #endif
 	}
 
+	// Callers hold the state lock, so no view changes under the write. Unbacked gaps are skipped,
+	// mirroring sparse reads that zero-fill them.
 	void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-		// Skip unbacked gaps, mirroring sparse reads that zero-fill them.
-		std::lock_guard lock(m_mutex);
-		const auto*     source = static_cast<const uint8_t*>(data);
-		ForEachSparseRange(
-		    m_maps, vaddr, size,
-		    [&](const auto& entry, uint64_t start, uint64_t bytes) {
-			    std::memcpy(m_backing_base + (entry.backing_offset + start - entry.vaddr),
-			                source + (start - vaddr), bytes);
+		const auto* source = static_cast<const uint8_t*>(data);
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    std::memcpy(m_backing_base + offset, source + (start - vaddr), bytes);
 		    },
 		    [](uint64_t, uint64_t) {});
 	}
 
-	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-		if (data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+	// Needs no lock: page entries are atomic and buckets live as long as the store.
+	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-
-		std::shared_lock lock(m_mutex);
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (g_test_backing_read != nullptr) {
-			g_test_backing_read(vaddr, size);
-		}
-#endif
-		const auto end   = vaddr + size;
-		auto       first = m_maps.upper_bound(vaddr);
-		if (first == m_maps.begin()) {
-			return false;
-		}
-		--first;
-		auto current = vaddr;
-		for (auto mapping = first; current < end; ++mapping) {
-			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
-			    current >= mapping->second.vaddr + mapping->second.size) {
+		for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+			if (LoadPage(page) == 0) {
 				return false;
 			}
-			current = std::min(end, mapping->second.vaddr + mapping->second.size);
 		}
+		return true;
+	}
 
-		auto* destination = static_cast<uint8_t*>(data);
-		current = vaddr;
-		for (auto mapping = first; current < end; ++mapping) {
-			const auto& entry  = mapping->second;
-			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
-			const auto  offset = entry.backing_offset + current - entry.vaddr;
-			std::memcpy(destination + (current - vaddr), m_backing_base + offset, bytes);
-			current += bytes;
+	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
+	// current bytes, or zeros for a page unmapped between the check and the copy.
+	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
+		if (data == nullptr || !IsBacked(vaddr, size)) {
+			return false;
 		}
+		ReadSparseBacking(vaddr, data, size, [](uint64_t, uint8_t* destination, uint64_t bytes) {
+			std::memset(destination, 0, bytes);
+		});
 		return true;
 	}
 
 	template <typename Gap>
-	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
-		std::shared_lock lock(m_mutex);
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (g_test_backing_read != nullptr) {
-			g_test_backing_read(vaddr, size);
-		}
-#endif
-		CopySparseRange(m_maps, vaddr, data, size,
-		                [this](const auto& entry, uint64_t start) {
-			                return m_backing_base + (entry.backing_offset + start - entry.vaddr);
-		                },
-		                gap);
+	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) const {
+		auto* destination = static_cast<uint8_t*>(data);
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
+		    },
+		    [&](uint64_t start, uint64_t bytes) {
+			    gap(start, destination + (start - vaddr), bytes);
+		    });
 	}
 
+	// Mapping and unmapping hold the state lock exclusively.
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (const auto callback = g_test_before_backing_map) {
+			g_test_before_backing_map = nullptr;
+			callback(vaddr, size);
+		}
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (!ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
 #else
-		std::lock_guard lock(m_mutex);
 		if (!MapView(vaddr, size, backing_offset, mode, failure_reason)) {
 			return false;
 		}
-		RemoveMappingsUnlocked(vaddr, size);
 #endif
-		m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode});
+		StorePages(vaddr, size, backing_offset);
 		return true;
 	}
 
-	bool Unmap(uint64_t vaddr, uint64_t size) {
-		const auto            end = vaddr + size;
-		std::vector<MapEntry> targets;
-		{
-			std::lock_guard lock(m_mutex);
-			auto            current = vaddr;
-			while (current < end) {
-				const auto* entry = FindContainingUnlocked(current);
-				if (entry == nullptr) {
-					return false;
-				}
-				const auto part_size = std::min(end, entry->vaddr + entry->size) - current;
-				targets.push_back({current, part_size});
-				current += part_size;
-			}
-		}
-
-		// Collecting the views validated the span; failing after it is an emulator fault.
+	// The caller validated the span; failing here is an emulator fault.
+	void Unmap(uint64_t vaddr, uint64_t size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		for (const auto& entry: targets) {
-			UnmapOne(entry.vaddr, entry.size);
+		const auto end   = vaddr + size;
+		uint64_t   views = 0;
+		for (auto current = vaddr; current < end; ++views) {
+			const auto view     = QueryView(current);
+			const auto part_end = std::min(end, view.base + view.size);
+			UnmapOne(view, current, part_end - current);
+			current = part_end;
 		}
 		// Each unmapped file view becomes a separate Windows placeholder. The address-space owner
 		// records this contiguous guest span as one free range, so normalize fragmented backing
 		// views into one placeholder before publishing it there.
-		EXIT_IF(targets.size() > 1 && !CoalescePlaceholders(vaddr, size));
+		EXIT_IF(views > 1 && !CoalescePlaceholders(vaddr, size));
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
 		// protections on the surviving mappings remain intact.
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size));
-
-		std::lock_guard lock(m_mutex);
-		RemoveMappingsUnlocked(vaddr, size);
+		ClearPages(vaddr, size);
 #endif
-		return true;
 	}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	void UnmapOne(uint64_t vaddr, uint64_t size) {
-		MapEntry old {};
-		{
-			std::lock_guard lock(m_mutex);
-			old = m_maps.extract(std::prev(m_maps.upper_bound(vaddr))).mapped();
-		}
-		const uint64_t left_size  = vaddr - old.vaddr;
-		const uint64_t right_addr = vaddr + size;
-		const uint64_t right_size = old.vaddr + old.size - right_addr;
-		// Re-mapping resets the survivors to the view's mode, so the protections guest mprotect and
-		// write tracking set on them are re-applied afterwards.
-		std::vector<MEMORY_BASIC_INFORMATION> protections;
-		QueryProtections(old.vaddr, left_size, old.mode, &protections);
-		QueryProtections(right_addr, right_size, old.mode, &protections);
-
-		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size));
-		EXIT_IF(left_size != 0 && !SplitPlaceholder(old.vaddr, left_size));
-		EXIT_IF(right_size != 0 && !SplitPlaceholder(vaddr, size));
-		EXIT_IF(left_size != 0 && !MapFixed(old.vaddr, left_size, old.backing_offset, old.mode));
-		EXIT_IF(right_size != 0 &&
-		        !MapFixed(right_addr, right_size, old.backing_offset + (right_addr - old.vaddr),
-		                  old.mode));
-		for (const auto& info: protections) {
-			EXIT_IF(!ApplyProtection(info.BaseAddress, info.RegionSize, info.Protect));
-		}
-	}
-#endif
 
 private:
-	struct MapEntry {
-		uint64_t            vaddr          = 0;
-		uint64_t            size           = 0;
-		uint64_t            backing_offset = 0;
-		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
-	};
+	static constexpr uint64_t PageBits    = 14;
+	static constexpr uint64_t PageMask    = (uint64_t {1} << PageBits) - 1u;
+	static constexpr uint64_t BucketPages = uint64_t {1} << 16u;
+	static constexpr uint64_t BucketCount =
+	    ((kExtendedMemoryBase + kExtendedMemorySize) >> PageBits) / BucketPages;
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	void RemoveMappingsUnlocked(uint64_t vaddr, uint64_t size) {
-		const auto end = vaddr + size;
-		auto       it = m_maps.upper_bound(vaddr);
-		if (it != m_maps.begin()) {
-			--it;
+	// Zero for an unbacked page, otherwise the backing page index plus one.
+	[[nodiscard]] uint32_t LoadPage(uint64_t page) const {
+		if (page / BucketPages >= BucketCount) {
+			return 0;
 		}
-		while (it != m_maps.end() && it->first < end) {
-			const auto old     = it->second;
-			const auto old_end = old.vaddr + old.size;
-			if (old_end <= vaddr) {
-				++it;
-				continue;
+		const auto* entries = m_pages[page / BucketPages].load(std::memory_order_acquire);
+		return entries != nullptr ? entries[page % BucketPages].load(std::memory_order_relaxed) : 0;
+	}
+
+	// Walks the span in runs of contiguous backing, as (backing offset, start, bytes), and runs of
+	// unbacked pages, as (start, bytes).
+	template <typename Region, typename Gap>
+	void ForEachRun(uint64_t vaddr, uint64_t size, Region&& region, Gap&& gap) const {
+		const auto end = vaddr + size;
+		for (auto start = vaddr; start < end;) {
+			const auto     entry    = LoadPage(start >> PageBits);
+			const uint32_t step     = entry != 0 ? 1 : 0;
+			auto           expected = entry + step;
+			auto           stop     = (start | PageMask) + 1u;
+			while (stop < end && LoadPage(stop >> PageBits) == expected) {
+				stop += PageMask + 1u;
+				expected += step;
 			}
-			it = m_maps.erase(it);
-			if (old.vaddr < vaddr) {
-				m_maps.emplace(old.vaddr,
-				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
+			stop = std::min(stop, end);
+			if (entry != 0) {
+				region((uint64_t {entry - 1u} << PageBits) + (start & PageMask), start,
+				       stop - start);
+			} else {
+				gap(start, stop - start);
 			}
-			if (end < old_end) {
-				m_maps.emplace(end, MapEntry {end, old_end - end,
-				                             old.backing_offset + end - old.vaddr, old.mode});
-			}
+			start = stop;
 		}
 	}
-#endif
 
-	const MapEntry* FindContainingUnlocked(uint64_t vaddr) const {
-		auto next = m_maps.upper_bound(vaddr);
-		if (next == m_maps.begin()) {
-			return nullptr;
+	void StorePages(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
+		const auto end = vaddr + size;
+		EXIT_IF(((vaddr | size | backing_offset) & PageMask) != 0 ||
+		        (end >> PageBits) > BucketCount * BucketPages || backing_offset + size > m_size);
+		auto entry = static_cast<uint32_t>(backing_offset >> PageBits) + 1u;
+		for (auto page = vaddr >> PageBits; page < end >> PageBits; ++page, ++entry) {
+			auto& bucket  = m_pages[page / BucketPages];
+			auto* entries = bucket.load(std::memory_order_relaxed);
+			if (entries == nullptr) {
+				entries = new std::atomic<uint32_t>[BucketPages] {};
+				bucket.store(entries, std::memory_order_release);
+			}
+			entries[page % BucketPages].store(entry, std::memory_order_relaxed);
 		}
-		const auto& entry = std::prev(next)->second;
-		return vaddr < entry.vaddr + entry.size ? &entry : nullptr;
+	}
+
+	void ClearPages(uint64_t vaddr, uint64_t size) {
+		for (auto page = vaddr >> PageBits; page < (vaddr + size) >> PageBits; ++page) {
+			m_pages[page / BucketPages].load(std::memory_order_relaxed)[page % BucketPages].store(
+			    0, std::memory_order_relaxed);
+		}
 	}
 
 	static void SetFailure(FailureReason* out, FailureReason reason) {
@@ -405,6 +326,55 @@ private:
 		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
+	struct View {
+		uint64_t base    = 0;
+		uint64_t size    = 0;
+		DWORD    protect = 0;
+	};
+
+	// The OS records a view as the regions sharing its allocation base; guest and tracker
+	// protections split it into several.
+	static View QueryView(uint64_t vaddr) {
+		MEMORY_BASIC_INFORMATION info {};
+		EXIT_IF(VirtualQuery(reinterpret_cast<void*>(vaddr), &info, sizeof(info)) == 0 ||
+		        info.Type != MEM_MAPPED);
+		View view {reinterpret_cast<uint64_t>(info.AllocationBase), 0, info.AllocationProtect};
+		auto end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		while (VirtualQuery(reinterpret_cast<void*>(end), &info, sizeof(info)) != 0 &&
+		       reinterpret_cast<uint64_t>(info.AllocationBase) == view.base) {
+			end += info.RegionSize;
+		}
+		view.size = end - view.base;
+		return view;
+	}
+
+	void UnmapOne(const View& view, uint64_t vaddr, uint64_t size) {
+		const uint64_t offset     = uint64_t {LoadPage(view.base >> PageBits) - 1u} << PageBits;
+		const uint64_t left_size  = vaddr - view.base;
+		const uint64_t right_addr = vaddr + size;
+		const uint64_t right_size = view.base + view.size - right_addr;
+		// Survivors are re-mapped read-write, executable if the view was, and the protections guest
+		// mprotect and write tracking set on them are re-applied afterwards.
+		const auto mode =
+		    (view.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0
+		        ? VirtualMemory::Mode::ExecuteReadWrite
+		        : VirtualMemory::Mode::ReadWrite;
+		std::vector<MEMORY_BASIC_INFORMATION> protections;
+		QueryProtections(view.base, left_size, mode, &protections);
+		QueryProtections(right_addr, right_size, mode, &protections);
+
+		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view.base), view.size));
+		ClearPages(vaddr, size);
+		EXIT_IF(left_size != 0 && !SplitPlaceholder(view.base, left_size));
+		EXIT_IF(right_size != 0 && !SplitPlaceholder(vaddr, size));
+		EXIT_IF(left_size != 0 && !MapFixed(view.base, left_size, offset, mode));
+		EXIT_IF(right_size != 0 &&
+		        !MapFixed(right_addr, right_size, offset + (right_addr - view.base), mode));
+		for (const auto& info: protections) {
+			EXIT_IF(!ApplyProtection(info.BaseAddress, info.RegionSize, info.Protect));
+		}
+	}
+
 	bool ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                            VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
@@ -450,12 +420,6 @@ private:
 
 	bool MapView(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
 	             FailureReason* failure_reason) {
-#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-		if (const auto callback = g_test_before_backing_map) {
-			g_test_before_backing_map = nullptr;
-			callback(vaddr, size);
-		}
-#endif
 		if (mmap(reinterpret_cast<void*>(vaddr), size, GetProtect(mode), MAP_SHARED | MAP_FIXED,
 		         m_fd, static_cast<off_t>(backing_offset)) == MAP_FAILED) {
 			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
@@ -474,12 +438,14 @@ private:
 	int m_fd = -1;
 #endif
 
-	uint8_t*                     m_backing_base = nullptr;
-	uint64_t                     m_size         = 0;
-	std::shared_mutex            m_mutex;
-	std::map<uint64_t, MapEntry> m_maps;
+	uint8_t*                                                     m_backing_base = nullptr;
+	uint64_t                                                     m_size         = 0;
+	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_pages {};
 };
 
+// Callers change it with the state lock held exclusively and query it under the operation lock or
+// the state lock. TryWriteBacking, CopySparseMemory and ProtectTransient take the state lock shared
+// themselves.
 class GuestAddressSpace {
 public:
 	explicit GuestAddressSpace(uint64_t backing_size) {
@@ -505,6 +471,11 @@ public:
 				        0);
 				const auto region_start = reinterpret_cast<uint64_t>(info.BaseAddress);
 				const auto region_end   = region_start + static_cast<uint64_t>(info.RegionSize);
+				if (info.Type == MEM_MAPPED) {
+					EXIT_IF(UnmapViewOfFile2(GetCurrentProcess(), info.AllocationBase,
+					                         MEM_PRESERVE_PLACEHOLDER) == 0);
+					continue;
+				}
 				if (info.State == MEM_COMMIT) {
 					EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_start), info.RegionSize,
 					                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
@@ -533,19 +504,18 @@ public:
 		m_backing->ZeroRange(backing_offset, size);
 	}
 
-	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {
+	// The owned ranges are fixed at construction.
+	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		});
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
-		std::shared_lock lock(m_mutex);
+	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) const {
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
@@ -557,7 +527,7 @@ public:
 		if (!Owns(vaddr, size)) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		std::shared_lock state(g_memory_state_mutex);
 		if (OverlapsPrivateUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -569,12 +539,24 @@ public:
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
+	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
+		return m_backing->IsBacked(vaddr, size);
+	}
+
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
+		if (m_backing->TryReadBacking(vaddr, data, size)) {
+			return true;
+		}
 		if (data == nullptr || !Owns(vaddr, size)) {
 			return false;
 		}
-		std::shared_lock lock(m_mutex);
+		std::shared_lock state(g_memory_state_mutex);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			g_test_backing_read(vaddr, size);
+		}
+#endif
 		if constexpr (!copy_private) {
 			if (OverlapsPrivateUnlocked(vaddr, size)) {
 				return false;
@@ -582,39 +564,29 @@ public:
 		}
 		m_backing->ReadSparseBacking(
 		    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
-			    const auto zero = [](uint64_t, uint8_t* output, uint64_t length) {
-				    std::memset(output, 0, length);
-			    };
 			    if constexpr (copy_private) {
 				    // Backing gaps can contain private mappings or reservations only.
-				    CopySparseRange(
-				        m_mapped, start, destination, bytes,
-				        [](const auto&, uint64_t address) {
-					        return reinterpret_cast<const void*>(address);
-				        },
-				        zero);
+				    CopyPrivateUnlocked(start, destination, bytes);
 			    } else {
-				    zero(start, destination, bytes);
+				    std::memset(destination, 0, bytes);
 			    }
 		    });
 		return true;
 	}
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	// Tracker protections only read m_mapped; the page tracker orders them per page.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::shared_lock lock(m_mutex);
+		std::shared_lock state(g_memory_state_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
-		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
@@ -642,13 +614,10 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
-		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;
 		}
-		if (!m_backing->Unmap(vaddr, size)) {
-			return false;
-		}
+		m_backing->Unmap(vaddr, size);
 		RemoveMappedUnlocked(vaddr, size);
 		AddFreeUnlocked(vaddr, size);
 		return true;
@@ -657,17 +626,14 @@ public:
 	uint64_t FindFreeAligned(uint64_t search_start, uint64_t search_end, uint64_t size,
 	                         uint64_t alignment) {
 		alignment = std::max<uint64_t>(alignment, PageSize());
-		std::shared_lock lock(m_mutex);
 		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
 	}
 
 	bool ContainsFree(uint64_t vaddr, uint64_t size) {
-		std::shared_lock lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
 		}
@@ -702,7 +668,6 @@ public:
 		if (!IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
@@ -848,6 +813,27 @@ private:
 			}
 		}
 		return false;
+	}
+
+	// Copies the private mappings of a span and zero-fills the rest.
+	void CopyPrivateUnlocked(uint64_t vaddr, uint8_t* destination, uint64_t size) const {
+		const auto end    = vaddr + size;
+		auto       cursor = vaddr;
+		auto       it     = m_mapped.upper_bound(vaddr);
+		if (it != m_mapped.begin()) {
+			--it;
+		}
+		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+			const auto start = std::max(cursor, it->second.vaddr);
+			const auto stop  = std::min(end, it->second.vaddr + it->second.size);
+			if (start < stop) {
+				std::memset(destination + (cursor - vaddr), 0, start - cursor);
+				std::memcpy(destination + (start - vaddr), reinterpret_cast<const void*>(start),
+				            stop - start);
+				cursor = stop;
+			}
+		}
+		std::memset(destination + (cursor - vaddr), 0, end - cursor);
 	}
 
 	void AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
@@ -1152,7 +1138,6 @@ private:
 #endif
 	}
 
-	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

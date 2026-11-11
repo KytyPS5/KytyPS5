@@ -1818,6 +1818,7 @@ void TestVertexBufferGrouping() {
     descriptors[0].UpdateAddress48(base + 8);
     descriptors[1].UpdateAddress48(base + 4);
     descriptors[3].fields[1] = 0; // Constant attributes use their own buffer.
+    input = {};
     (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
     Check(input.resources_num == 4 && input.buffers_num == 3 &&
               input.resources_dst[0].buffer_index == 0 &&
@@ -1833,9 +1834,11 @@ void TestVertexBufferGrouping() {
   }
   // The vertex table metadata is parsed when the shader is mapped.
   user_data.direct_resource_count = 0;
+  input = {};
   (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
   Check(input.fetch_attrib_reg == 2, "a draw reread the vertex metadata of a mapped shader");
   ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  input = {};
   (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
   Check(!input.has_dynamic_vertex_fetch, "remapping a shader kept its previous vertex metadata");
 }
@@ -8116,7 +8119,6 @@ void TestEmbeddedVertexFormatSwizzle() {
     mapped.code_size_bytes = sizeof(code);
     ShaderMapUserData(regs.es_regs.data_addr, mapped);
     ShaderVertexInputInfo input{};
-    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     if (&test == cases) {
       for (const auto [word, flag] : {std::pair{1u, 1u << 31u}, std::pair{3u, 1u << 23u}}) {
@@ -8127,6 +8129,7 @@ void TestEmbeddedVertexFormatSwizzle() {
       }
     }
 #endif
+    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
     Frontend::EmbeddedFetchPlan fetch;
     fetch.loads.push_back({.pc = 0, .attrib_id = 0, .components = test.components});
     Frontend::TranslateOptions options{};
@@ -10692,12 +10695,14 @@ void TestRenderTargetReverseExportMapping() {
       "cache key");
   sh.target_output_mode[0] = 4;
   sh.m_cbShaderMask = 0xf;
+  compiled_info = {};
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
   const auto first_slot_key = MakeStageStaticKey(compiled_info);
   sh.m_cbShaderMask = 0xf000;
   mappings[3] = gr32.export_mapping;
+  compiled_info = {};
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_shader_mask == sh.m_cbShaderMask &&
             compiled_info.target_export_mapping[0] == gr32.export_mapping &&
@@ -10705,6 +10710,7 @@ void TestRenderTargetReverseExportMapping() {
         "compact MRT ordinal lost its physical export mapping or cache identity");
   const auto sparse_slot_key = MakeStageStaticKey(compiled_info);
   sh.m_cbShaderMask = 0x1000;
+  compiled_info = {};
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(sparse_slot_key == MakeStageStaticKey(compiled_info),
         "component-only shader mask changes introduced a duplicate shader variant");

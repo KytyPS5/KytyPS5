@@ -257,16 +257,9 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		RequireVulkanSuccess(graphics.device.createPipelineLayout(
 		                         &layout_info, nullptr, &m_pssr_pipeline_layout),
 		                     "create upscaling pipeline layout");
-		const auto shader = CompileSPV(GPU_PSSR_LINEAR_SPV, graphics.device);
-		vk::ComputePipelineCreateInfo create {};
-		create.stage.stage = vk::ShaderStageFlagBits::eCompute;
-		create.stage.module = shader;
-		create.stage.pName = "main";
-		create.layout = m_pssr_pipeline_layout;
-		const auto result = graphics.device.createComputePipelines(
-		    nullptr, 1, &create, nullptr, &m_pssr_pipeline);
-		graphics.device.destroyShaderModule(shader, nullptr);
-		RequireVulkanSuccess(result, "create upscaling pipeline");
+		m_pssr_pipeline =
+		    CreateComputePipeline(graphics.device, GPU_PSSR_LINEAR_SPV, m_pssr_pipeline_layout,
+			                      "create upscaling pipeline");
 	}
 	const std::array images {
 	    vk::DescriptorImageInfo {nullptr, input.image_view, vk::ImageLayout::eGeneral},

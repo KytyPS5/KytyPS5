@@ -127,16 +127,20 @@ struct ShaderModule {
 	bool                                         mesh_task = false;
 };
 
-// A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
+// A draw's depth target and its first color_count color targets.
+struct DrawTargets {
+	RenderDepthInfo depth;
+	RenderColorInfo colors[RENDER_COLOR_ATTACHMENTS_MAX];
+	uint32_t        color_count = 0;
+};
+
+// A draw's topology and shader stages (from PipelineCache::GetGraphicsPrograms).
 struct DrawRenderState {
-	RenderDepthInfo                      depth_info;
-	RenderColorInfo                      color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t                             color_count                              = 0;
 	// Color targets the pixel program writes.
-	uint32_t                             mrt_mask                                 = 0;
+	uint32_t                             mrt_mask = 0;
 	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
-	bool                                 primitive_restart_enable                 = false;
-	bool                                 ps_active                                = false;
+	bool                                 primitive_restart_enable = false;
+	bool                                 ps_active                = false;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
 	// Input: the user-data slots a GPU-read indirect draw patches.
@@ -201,7 +205,8 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state);
+	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                              const DrawTargets& targets);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:

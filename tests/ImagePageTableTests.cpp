@@ -1,30 +1,33 @@
+#include "common/smallVector.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <iterator>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 namespace {
 
 using Owners     = std::vector<uint32_t>;
 using Table      = Libs::Graphics::MultiLevelPageTable<Owners, 20, 44, 14>;
-using PageOwners = Libs::Graphics::InlinePageOwnerList<uint32_t, 16>;
+using PageOwners = Common::SmallVector<uint32_t, 3, uint32_t>;
 using OwnerTable = Libs::Graphics::MultiLevelPageTable<PageOwners, 20, 44, 14>;
-
-// MSVC's STL and libc++ don't need these traits for std::any_of, but libstdc++ does, so only a
-// Linux build would notice them missing.
-static_assert(std::is_same_v<std::iterator_traits<PageOwners::const_iterator>::iterator_category,
-                             std::input_iterator_tag>);
 
 void Check(bool value, const char* text) {
 	if (!value) {
 		std::fprintf(stderr, "ImagePageTableTests: failed: %s\n", text);
 		std::abort();
 	}
+}
+
+bool Erase(PageOwners& owners, uint32_t owner) {
+	const auto found = std::ranges::find(owners, owner);
+	if (found == owners.end()) {
+		return false;
+	}
+	owners.erase(found);
+	return true;
 }
 
 void TestMultiOwnerAndExactErase() {
@@ -35,9 +38,8 @@ void TestMultiOwnerAndExactErase() {
 
 	Check(table.Find(17) != nullptr && table.Find(17)->size() == 2,
 	      "both page owners are retained");
-	Check(owners.Erase(11U), "registered owner is erased");
+	Check(Erase(owners, 11), "registered owner is erased");
 	Check(owners.size() == 1 && owners.front() == 22, "erasing one owner preserves its neighbor");
-	Check(!owners.Erase(33U), "missing owner is reported without mutation");
 }
 
 void TestCrossBucketRange() {
@@ -89,36 +91,17 @@ void TestInlineOwnerStorageAndOverflow() {
 		owners.push_back(owner);
 	}
 	Check(owners.size() == 18 && owners.front() == 1,
-	      "inline owner storage grows past its 16-owner capacity");
+	      "inline owner storage grows past its 3-owner capacity");
 	uint32_t expected = 1;
 	for (const uint32_t owner: owners) {
 		Check(owner == expected++, "overflow preserves registration order");
 	}
-	Check(owners.Erase(5) && owners.size() == 17,
+	Check(Erase(owners, 5) && owners.size() == 17,
 	      "overflow erase removes only the requested owner");
-	Check(owners.Erase(18) && owners.size() == 16,
-	      "overflow storage shrinks back to inline capacity");
+	Check(Erase(owners, 18) && owners.size() == 16, "erasing the last owner keeps the rest");
 	const std::vector<uint32_t> remaining {1, 2, 3, 4, 6, 7, 8, 9,
 	                                       10, 11, 12, 13, 14, 15, 16, 17};
-	size_t                      remaining_index = 0;
-	for (const uint32_t owner: owners) {
-		Check(owner == remaining[remaining_index++],
-		      "overflow-to-inline shrink preserves every owner");
-	}
-	Check(!owners.Erase(99), "missing inline owner is reported without mutation");
-
-	PageOwners moved = std::move(owners);
-	Check(owners.empty() && moved.size() == remaining.size() && moved.front() == 1,
-	      "moving a full inline owner list leaves the source empty");
-	PageOwners partial;
-	partial.push_back(41);
-	partial.push_back(42);
-	PageOwners partial_moved = std::move(partial);
-	Check(partial.empty() && partial_moved.size() == 2 && *std::next(partial_moved.begin()) == 42,
-	      "moving a partially populated list copies only live owners");
-	PageOwners empty;
-	PageOwners empty_moved = std::move(empty);
-	Check(empty.empty() && empty_moved.empty(), "moving an empty owner list is safe");
+	Check(std::ranges::equal(owners, remaining), "erasing preserves every other owner in order");
 }
 
 void TestOneMiBRegistrationGranularity() {
@@ -138,7 +121,7 @@ void TestOneMiBRegistrationGranularity() {
 		auto* owners = table.Find(page);
 		Check(owners != nullptr && owners->size() == 1 && owners->front() == 7,
 		      "each touched one-MiB entry retains the owner once");
-		Check(owners->Erase(7), "large owner unregisters by coarse page");
+		Check(Erase(*owners, 7), "large owner unregisters by coarse page");
 	}
 }
 
@@ -148,10 +131,9 @@ void TestSharedCoarsePageLifecycle() {
 	owners.push_back(11);
 	owners.push_back(22);
 	Check(owners.size() == 2, "two images share one coarse page");
-	Check(owners.Erase(11) && owners.size() == 1 && owners.front() == 22,
+	Check(Erase(owners, 11) && owners.size() == 1 && owners.front() == 22,
 	      "unregistering one image preserves its coarse-page neighbor");
-	Check(!owners.Erase(11), "double unregister is rejected without mutation");
-	Check(owners.Erase(22) && owners.empty(), "final coarse-page owner unregisters");
+	Check(Erase(owners, 22) && owners.size() == 0, "final coarse-page owner unregisters");
 }
 
 void TestOneMiBBoundaries() {

@@ -35,6 +35,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(readback_tiled_images);
 	KYTY_CFG_SET(readback_storage_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
+	KYTY_CFG_SET(flush_draws);
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(relaxed_shader_float);
@@ -95,6 +96,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(readback_tiled_images);
 	KYTY_CFG_GET(readback_storage_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
+	KYTY_CFG_GET(flush_draws);
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);
@@ -187,6 +189,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
+	}
+	if (flush_draws < 0) {
+		return fail(tr("Draws per GPU submit must be 0 or greater."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
 		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));

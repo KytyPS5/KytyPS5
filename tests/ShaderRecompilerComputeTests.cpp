@@ -35918,13 +35918,14 @@ TestCase RobustBufferAtomicOutOfRange() {
   return test;
 }
 
-TestCase BufferAtomicOnPhiOfTwoDescriptors(bool second) {
+TestCase BufferAtomicOnPhiOfTwoDescriptors(bool second, bool equal_strides) {
   using O = ShaderOpcode;
   constexpr u32 no_offset_register = 125;
   constexpr u32 first_descriptor_offset = 16;
   constexpr u32 second_descriptor_offset = 32;
   constexpr u32 first_stride = 4;
-  constexpr u32 second_stride = 8;
+  constexpr u32 other_stride = 8;
+  const u32 second_stride = equal_strides ? first_stride : other_stride;
   constexpr u32 buffer_bytes = 32;
   constexpr u32 first_base = 256;
   constexpr u32 second_base = 512;
@@ -35934,8 +35935,12 @@ TestCase BufferAtomicOnPhiOfTwoDescriptors(bool second) {
   constexpr u32 old_value_dword = 1;
   constexpr u32 second_load_words = 2;
   TestCase test;
-  test.name = second ? "BufferAtomicOnPhiOfTwoDescriptorsSecond"
-                     : "BufferAtomicOnPhiOfTwoDescriptorsFirst";
+  test.name =
+      equal_strides
+          ? (second ? "BufferAtomicOnPhiOfTwoEqualStrideDescriptorsSecond"
+                    : "BufferAtomicOnPhiOfTwoEqualStrideDescriptorsFirst")
+          : (second ? "BufferAtomicOnPhiOfTwoDescriptorsSecond"
+                    : "BufferAtomicOnPhiOfTwoDescriptorsFirst");
   auto &code = test.code;
   code.insert(code.end(), {EncodeSmem0(0x02, 20),
                            EncodeSmem1(first_descriptor_offset, no_offset_register)});
@@ -49052,7 +49057,9 @@ std::vector<TestCase> MakeCases() {
   }
   for (const u32 prefix : {0u, 4u}) cases.push_back(RobustBufferWrappedAddresses(prefix));
   AddCase(RobustBufferAtomicOutOfRange);
-  for (const bool second : {false, true}) cases.push_back(BufferAtomicOnPhiOfTwoDescriptors(second));
+  for (const bool equal_strides : {false, true})
+    for (const bool second : {false, true})
+      cases.push_back(BufferAtomicOnPhiOfTwoDescriptors(second, equal_strides));
   cases.push_back(BufferOffsetsUsePackedWords(false));
   cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
@@ -56651,7 +56658,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-atomic-phi-only") == 0) {
     VulkanHarness vulkan;
-    for (const bool second : {false, true}) RunCase(&vulkan, BufferAtomicOnPhiOfTwoDescriptors(second));
+    for (const bool equal_strides : {false, true})
+      for (const bool second : {false, true})
+        RunCase(&vulkan,
+                BufferAtomicOnPhiOfTwoDescriptors(second, equal_strides));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-cmpswap-only") == 0) {

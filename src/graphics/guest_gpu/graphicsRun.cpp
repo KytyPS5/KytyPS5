@@ -56,6 +56,7 @@ void GuestGpu::Shutdown() {
 		m_accepting = false;
 		m_stopping  = true;
 		m_work_available.SignalAll();
+		m_suspend_point_progress.SignalAll();
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
@@ -149,6 +150,14 @@ void GuestGpu::SuspendPoint() {
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
+	// The guest may rewrite a buffer once this returns, so wait until the CP has read it.
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		const auto        point = ++m_suspend_points_queued;
+		while (m_suspend_points_reached < point && !m_graphics_stalled && !m_stopping) {
+			m_suspend_point_progress.Wait(&m_queue_mutex);
+		}
+	}
 	m_done_num++;
 }
 
@@ -483,6 +492,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (submission.queue_id == 0) {
+			gpu->m_graphics_stalled = !complete;
+			gpu->m_suspend_points_reached += submission.type == SubmissionType::SuspendPoint;
+			gpu->m_suspend_point_progress.SignalAll();
+		}
 		if (!complete) {
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));

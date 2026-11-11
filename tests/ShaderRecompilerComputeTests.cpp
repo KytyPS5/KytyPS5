@@ -3204,6 +3204,32 @@ public:
                                       initial_cache_ticks.second + 2},
             "asynchronous work aged the caches between frame boundaries");
 
+    // The point waits until the command processor has read an unstalled stream.
+    {
+      graphics_value = 0;
+      std::binary_semaphore busy_entered{0};
+      std::binary_semaphore release_busy{0};
+      gpu.SendCommand([&] {
+        busy_entered.release();
+        release_busy.acquire();
+      });
+      busy_entered.acquire();
+      gpu.Submit(graphics_list);
+      std::binary_semaphore read_returned{0};
+      std::jthread reader([&] {
+        gpu.SuspendPoint();
+        read_returned.release();
+      });
+      const bool returned_unread =
+          read_returned.try_acquire_for(std::chrono::milliseconds(100));
+      release_busy.release();
+      reader.join();
+      finish();
+      Require(name, "unread graphics", !returned_unread && graphics_value == 17,
+              "a suspend point returned before the command processor read "
+              "the graphics submitted before it");
+    }
+
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.
     alignas(16) uint64_t predicate = 0;
@@ -3241,10 +3267,10 @@ public:
       gpu.SuspendPoint();
       queued_returned.release();
     });
+    release_lane.release();
     const bool queued_nonblocking =
         queued_returned.try_acquire_for(std::chrono::seconds(2));
     if (!queued_nonblocking) {
-      release_lane.release();
       gpu.SendCommandSync([&] { label = 1; });
       queued.join();
       finish();
@@ -3253,7 +3279,6 @@ public:
     }
     queued.join();
     gpu.Submit(after);
-    release_lane.release();
     bool prefix_reached = false;
     bool graphics_ordered = false;
     const auto deadline = std::chrono::steady_clock::now() +

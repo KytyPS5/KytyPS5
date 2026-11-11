@@ -857,6 +857,61 @@ void TestSignedMinMaxDescriptorInputs() {
   }
 }
 
+// A pixel V_CMP writes Ballot(g) & EXEC. After S_WQM_B64 of the entry EXEC every lane that runs
+// is in EXEC, so the mask is the ballot word itself.
+void TestLaunchedLaneBallotFold() {
+  for (const uint32_t wave_size : {64u, 32u}) {
+    Fixture fixture;
+    fixture.program.stage = ShaderType::Pixel;
+    const auto live = fixture.Emit(ValueOpcode::LiveMask);
+    const auto live_low = fixture.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(0u)});
+    const auto live_high = wave_size == 64u
+        ? fixture.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(1u)})
+        : Value(0u);
+    const auto wqm = fixture.Emit(ValueOpcode::WqmU64,
+        {fixture.Emit(ValueOpcode::CompositeConstructU64, {live_low, live_high})});
+    const std::array exec{fixture.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(0u)}),
+                          fixture.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(1u)})};
+    const auto compare = fixture.Emit(ValueOpcode::IEqual32,
+        {fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))}), Value(3u)});
+    const auto ballot = fixture.Emit(ValueOpcode::Ballot, {compare});
+    const std::array word{fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)}),
+                          fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)})};
+    const auto other = fixture.Emit(ValueOpcode::Ballot, {Value(true)});
+    const auto other_wqm = fixture.Emit(ValueOpcode::CompositeExtractU64,
+        {fixture.Emit(ValueOpcode::WqmU64,
+             {fixture.Emit(ValueOpcode::CompositeConstructU64,
+                  {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {other, Value(0u)}),
+                   fixture.Emit(ValueOpcode::CompositeExtractU32x4, {other, Value(1u)})})}),
+         Value(0u)});
+    // Each consumer reads the folded value.
+    const auto masked = [&](Value lhs, Value rhs) {
+      const auto value = fixture.Emit(ValueOpcode::BitwiseAnd32, {lhs, rhs});
+      return fixture.Emit(ValueOpcode::ReferenceU32, {value}).TryInstruction();
+    };
+    const auto *low = masked(word[0], exec[0]);
+    const auto *high = masked(exec[1], word[1]);
+    // Live lanes alone leave out helpers, another word holds other lanes, and a whole-quad mask
+    // of another value need not hold every lane.
+    const auto *unexpanded = masked(word[0], live_low);
+    const auto *crossed = masked(word[0], exec[1]);
+    const auto *unrelated = masked(word[0], other_wqm);
+
+    ConstantPropagationPass(fixture.program.blocks, wave_size);
+
+    const auto read = [](const Inst *reference) { return reference->Arg(0).Resolve(); };
+    const auto kept = [&](const Inst *reference) {
+      const auto *mask = read(reference).TryInstruction();
+      return mask != nullptr && mask->GetOpcode() == ValueOpcode::BitwiseAnd32;
+    };
+    Check(read(low) == word[0], "a ballot word under the launched-lane EXEC kept its mask");
+    Check(wave_size == 32u ? kept(high) : read(high) == word[1],
+          "a wave32 launched-lane EXEC was taken to hold lanes 32-63");
+    Check(kept(unexpanded) && kept(crossed) && kept(unrelated),
+          "a ballot word lost a mask that may clear its lanes");
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -992,6 +1047,7 @@ int main() {
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestCompleteWaveReduction();
+    TestLaunchedLaneBallotFold();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();

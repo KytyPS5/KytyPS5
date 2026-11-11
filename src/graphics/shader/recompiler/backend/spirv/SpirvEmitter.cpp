@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvForwarding.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -83,7 +84,9 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto module = state.builder.Build();
+	ForwardMaskedSelects(module);
+	return module;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

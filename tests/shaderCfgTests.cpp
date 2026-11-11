@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvForwarding.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -9419,6 +9420,67 @@ void TestDeferredSpirvPhiPatching() {
   Check(phis == 2, "deferred phi instructions were lost");
 }
 
+void TestSpirvMaskedSelectForwarding() {
+  using ShaderRecompiler::Spirv::Builder;
+  Builder b;
+  const auto void_type = b.Type(spv::OpTypeVoid);
+  const auto fn_type = b.Type(spv::OpTypeFunction, void_type);
+  const auto u32 = b.Type(spv::OpTypeInt, 32u, 0u);
+  const auto f32 = b.Type(spv::OpTypeFloat, 32u);
+  const auto boolean = b.Type(spv::OpTypeBool);
+  const auto ptr = b.Type(spv::OpTypePointer, spv::StorageClassPrivate, u32);
+  const auto zero = b.Constant(spv::OpConstant, u32, 0u);
+  const auto one = b.Constant(spv::OpConstant, u32, 1u);
+  const auto var_a = b.DefineGlobalVariable(ptr, spv::StorageClassPrivate);
+  const auto var_b = b.DefineGlobalVariable(ptr, spv::StorageClassPrivate);
+  const auto var_out = b.DefineGlobalVariable(ptr, spv::StorageClassPrivate);
+  const auto var_out2 = b.DefineGlobalVariable(ptr, spv::StorageClassPrivate);
+  const auto main = b.AllocateId();
+  const auto label = b.AllocateId();
+  const auto x = b.AllocateId(), y = b.AllocateId(), q = b.AllocateId(),
+             r = b.AllocateId(), q2 = b.AllocateId(), fresh = b.AllocateId(),
+             v = b.AllocateId(), w = b.AllocateId(), res = b.AllocateId(),
+             as_float = b.AllocateId(), back = b.AllocateId();
+  b.AddFunction(spv::OpFunction, void_type, main, 0u, fn_type);
+  b.AddFunction(spv::OpLabel, label);
+  b.AddFunction(spv::OpLoad, u32, x, var_a);
+  b.AddFunction(spv::OpLoad, u32, y, var_b);
+  b.AddFunction(spv::OpINotEqual, boolean, q, x, zero);
+  b.AddFunction(spv::OpIEqual, boolean, r, x, one);
+  b.AddFunction(spv::OpLogicalAnd, boolean, q2, q, r);
+  b.AddFunction(spv::OpIAdd, u32, fresh, x, one);
+  // v = select(q, fresh, y) is only read through select(q2, ., y) and q2 implies q.
+  b.AddFunction(spv::OpSelect, u32, v, q, fresh, y);
+  b.AddFunction(spv::OpIAdd, u32, w, v, one);
+  b.AddFunction(spv::OpSelect, u32, res, q2, w, y);
+  b.AddFunction(spv::OpStore, var_out, res);
+  b.AddFunction(spv::OpBitcast, f32, as_float, x);
+  b.AddFunction(spv::OpBitcast, u32, back, as_float);
+  b.AddFunction(spv::OpStore, var_out2, back);
+  b.AddFunction(spv::OpReturn);
+  b.AddFunction(spv::OpFunctionEnd);
+  auto binary = b.Build();
+  ShaderRecompiler::Spirv::ForwardMaskedSelects(binary, 0);
+  uint32_t selects = 0, bitcasts = 0;
+  bool add_reads_fresh = false, store_reads_x = false;
+  for (size_t offset = 5; offset < binary.size();) {
+    const auto words = binary[offset] >> spv::WordCountShift;
+    const auto op = binary[offset] & spv::OpCodeMask;
+    selects += op == spv::OpSelect;
+    bitcasts += op == spv::OpBitcast;
+    if (op == spv::OpIAdd && binary[offset + 2] == w) {
+      add_reads_fresh = binary[offset + 3] == fresh;
+    }
+    if (op == spv::OpStore && binary[offset + 1] == var_out2) {
+      store_reads_x = binary[offset + 2] == x;
+    }
+    offset += words;
+  }
+  Check(selects == 1, "a select read only through a stricter mask was not removed");
+  Check(add_reads_fresh, "the masked consumer did not read the new value directly");
+  Check(bitcasts == 0 && store_reads_x, "a bitcast pair was not cancelled");
+}
+
 void TestDemandDrivenSpirvDeclarations() {
   using ShaderRecompiler::Spirv::Builder;
 
@@ -14327,6 +14389,7 @@ int main() {
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
+  TestSpirvMaskedSelectForwarding();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();

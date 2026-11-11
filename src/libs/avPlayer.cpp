@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -977,7 +978,30 @@ public:
 		if (!frame) {
 			return false;
 		}
-		if (current_video) {
+		// Skip frames that are already late to stay in sync (KYTY_AVPLAYER_DROP_LATE=0: off).
+		static const bool drop_late = [] {
+			const auto* v = std::getenv("KYTY_AVPLAYER_DROP_LATE");
+			return v == nullptr || v[0] == '\0' || std::strcmp(v, "0") != 0;
+		}();
+		if (drop_late && !deliver_seek_frame && sync_mode == 0) {
+			while (auto next = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+				const auto now = CurrentTimeNoLock();
+				return now != 0 && candidate.info.time_stamp + candidate.timestamp_offset <= now;
+			})) {
+				if (frame->buffer) {
+					video_buffers.Push(std::move(frame->buffer));
+				}
+				frame = std::move(next);
+			}
+		}
+		// Return the shown frame's buffer one frame later; the GPU may still read it (tearing).
+		if (previous_video) {
+			video_buffers.Push(std::move(previous_video));
+		}
+		// With only two buffers, holding one would leave the decoder none: return it at once.
+		if (current_video && max_video_buffers > 2) {
+			previous_video = std::move(current_video->buffer);
+		} else if (current_video) {
 			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
@@ -1056,6 +1080,7 @@ private:
 		video_buffers.Clear();
 		audio_buffers.Clear();
 		if (!retain_output_buffers) {
+			previous_video.reset();
 			current_video.reset();
 			current_audio.reset();
 		}
@@ -1129,8 +1154,19 @@ private:
 		if (c == nullptr) {
 			return false;
 		}
-		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
-		    avcodec_open2(c, dec, nullptr) < 0) {
+		const bool params_ok = avcodec_parameters_to_context(c, s->codecpar) >= 0;
+		// Decode video on all CPU threads (KYTY_AVPLAYER_THREADS=1: the old single thread).
+		if (params_ok && s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			static const int threads = [] {
+				const auto* v = std::getenv("KYTY_AVPLAYER_THREADS");
+				return v != nullptr && v[0] != '\0' ? std::max(0, std::atoi(v)) : 0;
+			}();
+			if (threads != 1) {
+				c->thread_count = threads; // 0: FFmpeg picks one thread per logical CPU
+				c->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+			}
+		}
+		if (!params_ok || avcodec_open2(c, dec, nullptr) < 0) {
 			avcodec_free_context(&c);
 			return false;
 		}
@@ -1149,7 +1185,7 @@ private:
 	bool AllocateBuffers() {
 		if (video_id) {
 			auto size     = VideoBufferSize(fmt->streams[video_id.value()]);
-			auto retained = current_video ? 1u : 0u;
+			auto retained = (previous_video ? 1u : 0u) + (current_video ? 1u : 0u);
 			for (size_t i = retained; i < static_cast<size_t>(max_video_buffers); i++) {
 				auto buffer = std::make_unique<GuestBuffer>(mem, 0x100, size, true);
 				if (!buffer->Valid()) {
@@ -1671,6 +1707,7 @@ private:
 	WorkQueue<ReadyFrame>                    audio_frames;
 	std::optional<ReadyFrame>                current_video;
 	std::optional<ReadyFrame>                current_audio;
+	std::unique_ptr<GuestBuffer>             previous_video;
 	LibKernel::Pthread                       demux_thread = nullptr;
 	LibKernel::Pthread                       video_thread = nullptr;
 	LibKernel::Pthread                       audio_thread = nullptr;

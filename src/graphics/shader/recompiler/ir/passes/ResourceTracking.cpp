@@ -1768,6 +1768,10 @@ private:
 		if (within.IsEmpty()) return predicate;
 		if (EquivalentValue(m_program, predicate, within)) return Value(true);
 		const auto* both = predicate.TryInstruction();
+		for (uint32_t arg = 0;
+		     both != nullptr && both->GetOpcode() == ValueOpcode::LogicalAnd && arg < 2u; ++arg)
+			if (EquivalentValue(m_program, both->Arg(arg), within))
+				return both->Arg(arg ^ 1u).Resolve();
 		return predicate;
 	}
 
@@ -1837,6 +1841,7 @@ private:
 			return id != nullptr && id->GetOpcode() == ValueOpcode::LaneId;
 		};
 		const auto with = [](const Inst& inst, ValueOpcode op, uint32_t constant) -> Value {
+			uint32_t immediate = 0;
 			if (inst.GetOpcode() != op) return {};
 			for (uint32_t arg = 0; arg < 2u; ++arg)
 				if (ImmediateU32(inst.Arg(arg), immediate) && immediate == constant)
@@ -1886,6 +1891,7 @@ private:
 	Value ReadLanePredicate(const Inst& read, const Block* drained = nullptr) const {
 		const auto words = m_program.wave_size / 32u;
 		if (read.GetOpcode() != ValueOpcode::ReadLane || (words != 1u && words != 2u)) return {};
+		uint32_t immediate = 0;
 		auto     index     = read.Arg(1).Resolve();
 		// A set bit's index is already inside the wave the lane index is masked to.
 		if (const auto* mask = index.TryInstruction();
@@ -2596,6 +2602,9 @@ private:
 			    address.offset + address.stride * maximum > UINT32_MAX ||
 			    offsets.size() + maximum >= uint64_t {MaxIndirectDescriptorProbes} * 4u)
 				return false;
+			// A lone read's offsets are the rows of its index.
+			if (!address.index.IsEmpty() && words.reads.size() == 1u)
+				rows = KeyRowCount(address.index, static_cast<uint32_t>(maximum), guard);
 			for (uint64_t index = 0; index <= maximum; ++index)
 				offsets.push_back(address.offset + address.stride * index + memory->offset);
 		}
@@ -2623,6 +2632,25 @@ private:
 		if (words.addends.size() != 1u || words.addends.front() != Value(0u))
 			indirect.selector_addends = std::move(words.addends);
 		return true;
+	}
+
+	// Rows 0..key a key reaches; a zero clamp count wraps to U32 max, as on the GPU.
+	Value KeyRowCount(Value key, uint32_t maximum, Value guard = {}) {
+		const auto* clamp =
+		    (guard.IsEmpty() ? key.Resolve() : ActiveValue(key, guard)).TryInstruction();
+		for (uint32_t arg = 0;
+		     clamp != nullptr && clamp->GetOpcode() == ValueOpcode::UMin32 && arg < 2u; ++arg) {
+			uint32_t immediate = 0;
+			// A literal clamp is already part of the static maximum.
+			if (ImmediateU32(clamp->Arg(arg), immediate) ||
+			    !ValidateRuntimeValue(m_program, clamp->Arg(arg), RuntimeValueType::Integer))
+				continue;
+			auto& last = m_program.value_storage.emplace_back(ValueOpcode::UMin32);
+			last.SetArg(0, Value(maximum));
+			last.SetArg(1, clamp->Arg(arg));
+			return AddendTerm(ValueOpcode::IAdd32, Value(&last), Value(1u));
+		}
+		return Value(maximum + 1u);
 	}
 
 	struct Induction {
@@ -4748,7 +4776,7 @@ private:
 			if (table_source.dword_count == 2u && !plan.split_offsets) {
 				const auto maximum = SelectorMaximum(key);
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
-				indirect.key_count = Value(maximum + 1u);
+				indirect.key_count = KeyRowCount(key, maximum);
 				return finish();
 			}
 			// A bounded V# supplies every reachable descriptor without reading the GPU key.

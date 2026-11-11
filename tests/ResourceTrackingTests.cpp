@@ -3001,6 +3001,7 @@ struct RecordWordBuilder {
                       {fixture.Emit(ValueOpcode::ShiftRightLogical32, {tile, Value(2u)}),
                        Value(4u)}),
          Value(16u)});
+    std::array<Value, 4> words;
     for (uint32_t word = 0; word < words.size(); ++word) {
       MemoryInfo memory;
       memory.kind = ResourceKind::ScalarAddress;
@@ -11083,6 +11084,88 @@ void TestTableSelectedDescriptorNamesItsRecords() {
         "an unbounded record selector named a finite list of table records");
 }
 
+// DS2 cs 0x9eead7b4c7642cff: a V# at row min(n - 1, x >> 26).
+void TestClampedPointerTableRows() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  constexpr uint32_t stride = 76u, immediate = 60u;
+  Fixture f;
+  f.program.wave_size = 64u;
+  const auto local =
+      f.Emit(ValueOpcode::GetBuiltin,
+             {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+              Value(0u)});
+  const auto lane = f.Emit(
+      ValueOpcode::ReadFirstLane,
+      {f.Emit(ValueOpcode::IMul32, {local, Value(0x01234567u)}), Value(true)});
+  const auto key =
+      f.Emit(ValueOpcode::UMin32,
+             {f.Emit(ValueOpcode::IAdd32, {f.UserData(2u), Value(0xffffffffu)}),
+              f.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)})});
+  const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+  const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < 4u; ++word)
+    words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+                         {table, offset, Value(0u), Value(true)},
+                         f.AddMemory({.kind = ResourceKind::ScalarAddress,
+                                      .offset = immediate + word * 4u,
+                                      .component_index = word,
+                                      .component_count = 4u},
+                                     0x10e0u));
+  const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x4,
+                             {f.Buffer(words), f.Emit(ValueOpcode::LaneId),
+                              Value(0u), Value(0u), Value(true)},
+                             f.AddMemory({.kind = ResourceKind::Buffer,
+                                          .data_dwords = 4u,
+                                          .component_count = 4u,
+                                          .formatted = true,
+                                          .idxen = true},
+                                         0x10f0u));
+  f.Emit(ValueOpcode::ReferenceU32,
+         {f.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value(0u)})});
+  f.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(f.program);
+  const auto root =
+      std::ranges::find_if(plan.info.buffers, [&](const auto &buffer) {
+        return plan.descriptor_sources[buffer.source]
+            .indirect_descriptor.has_value();
+      });
+  Check(root != plan.info.buffers.end(),
+        "clamped pointer table lost its indirect resource");
+  const auto &indirect =
+      *plan.descriptor_sources[root->source].indirect_descriptor;
+  Check(!indirect.key_count.IsEmpty() && !indirect.key_count.IsImmediate() &&
+            indirect.table_stride == stride &&
+            indirect.table_immediate == immediate,
+        "clamped pointer table lost its runtime row count");
+  LinearTestMemory memory;
+  const auto base = static_cast<uint32_t>(memory.base);
+  constexpr uint32_t records = 0x100u;
+  for (uint32_t row = 0; row < 64u; ++row) {
+    const bool live = row < 3u;
+    const std::array descriptor{
+        0x100000u + row * 0x1000u, (live ? 0u : 0x80000000u) | (16u << 16u),
+        32u,
+        (uint32_t(Prospero::BufferFormat::k32_32_32_32Float) << 12u) |
+            DstSel(4, 5, 6, 7)};
+    std::copy(descriptor.begin(), descriptor.end(),
+              memory.words.begin() + (records + row * stride + immediate) / 4u);
+  }
+  std::array<uint32_t, 3> user_data{base + records, 0u, 3u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "clamped pointer table enumerated rows past its count");
+  user_data[2] = 0u;
+  ResourceSnapshot unclamped;
+  Check(!MaterializeResources(plan, runtime, unclamped, specialization),
+        "an unclamped pointer table bound only its live rows");
+}
+
 } // namespace
 
 int main() {
@@ -11183,6 +11266,7 @@ int main() {
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
     Run("table-selected descriptor names its records", TestTableSelectedDescriptorNamesItsRecords);
+    Run("clamped pointer table rows", TestClampedPointerTableRows);
     Run("unbindable table row decodes in shader", TestUnbindableTableRowDecodesInShader);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';

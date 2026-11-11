@@ -20278,6 +20278,12 @@ public:
       const auto large_read = Mismatch(
           ReadRange(cache.ObtainBuffer(large_image, large, false, true), large),
           native);
+      const std::vector<u32> native_tail(native.begin() + page / sizeof(u32),
+                                         native.end());
+      const auto large_tail = Mismatch(
+          ReadRange(cache.ObtainBuffer(large_image + page, page, false, false),
+                    page),
+          native_tail);
       const auto small_read = Mismatch(
           ReadRange(cache.ObtainBuffer(read_image, page, false, true), page),
           native_page);
@@ -20293,6 +20299,11 @@ public:
           ReadRange(cache.ObtainBuffer(part_read_image, page, false, true),
                     page),
           native_page);
+      const auto part_tail = Mismatch(
+          ReadRange(
+              cache.ObtainBuffer(part_read_image + page, page, false, false),
+              page),
+          native_tail);
       cache.CopyBuffer(part_copy_target, part_copy_image, page, false, false);
       cache.ReadMemory(part_copy_target, page);
       Require(name, "partial copy readback",
@@ -20339,6 +20350,10 @@ public:
       Require(name, "partial formatted read and copy",
               part_read == "ok" && part_copy == "ok",
               "read " + part_read + "; copy " + part_copy);
+      Require(name, "read behind a whole formatted read", large_tail == "ok",
+              large_tail);
+      Require(name, "read behind a partial formatted read", part_tail == "ok",
+              part_tail);
 
       context.UnmapMemory(base, size);
       scheduler.Finish();

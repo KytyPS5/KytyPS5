@@ -13,6 +13,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/gameArgs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -608,7 +609,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
-			result = file->f.Open(file->real_name, rw_mode);
+			// The game's command-line file gets the console variables of loader/gameArgs.h.
+			auto open_name = file->real_name;
+			if (rw_mode == Common::File::Mode::Read) {
+				if (auto args = Loader::GameArgs::RedirectRead(file->real_name); !args.empty()) {
+					open_name = std::move(args);
+				}
+			}
+			result = file->f.Open(open_name, rw_mode);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
@@ -1209,8 +1217,12 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-	const uint64_t size =
-	    is_dir ? PackDirents(Common::File::GetDirEntries(real_file_name)).size() : info->size;
+	// The game's command-line file: a read gets a copy of another size (KernelOpen).
+	const auto redirected =
+	    is_dir ? std::optional<uint64_t>() : Loader::GameArgs::RedirectedSize(real_file_name);
+	const uint64_t size = is_dir ? PackDirents(Common::File::GetDirEntries(real_file_name)).size()
+	                      : redirected ? *redirected
+	                                   : info->size;
 	SetStatSize(&stat, size, is_dir);
 	SetStatTimes(&stat, is_dir ? std::nullopt : Common::File::GetTimes(real_file_name));
 	*sb = stat;

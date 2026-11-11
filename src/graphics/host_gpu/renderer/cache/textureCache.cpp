@@ -301,7 +301,10 @@ void TextureCache::ReleaseDepthFeedbackCopy(ImageId depth_id) {
 ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
                                            vk::ImageAspectFlags aspects,
                                            vk::ImageAspectFlags clear_aspects,
-                                           const vk::ClearDepthStencilValue& clear) {
+                                           const vk::ClearDepthStencilValue& clear,
+                                           const ImageViewInfo& attachment_view,
+                                           vk::Extent2D render_area, uint32_t render_layers) {
+	EXIT_IF(render_layers == 0);
 	if (const auto found = m_depth_feedback_copies.find(depth_id);
 	    found != m_depth_feedback_copies.end()) {
 		const auto& depth = m_slot_images[depth_id].backing;
@@ -358,15 +361,31 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 	}
 	// The draw's pending loadOp clear has not run yet, so apply it to the copy before the
 	// shader reads it; otherwise the first feedback draw samples the previous contents.
-	const auto cleared_aspects = clear_aspects & aspects;
-	if (cleared_aspects) {
-		copy.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
-		             range, command);
-		const vk::ImageSubresourceRange clear_range {cleared_aspects, range.base_level,
-		                                             range.level_count, range.base_layer,
-		                                             range.layer_count};
-		command.clearDepthStencilImage(copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                               &clear, 1, &clear_range);
+	// The clear uses the attachment view and render area, so copied samples outside the
+	// attachment subresources or render area keep their copied values.
+	const auto cleared_aspects = clear_aspects & aspects & attachment_view.aspect;
+	if (cleared_aspects && render_area.width != 0 && render_area.height != 0) {
+		copy.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		             vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command);
+		RenderState state {};
+		state.width              = render_area.width;
+		state.height             = render_area.height;
+		state.num_layers         = render_layers;
+		auto& attachment         = state.depth_stencil_attachment;
+		attachment.image_view   = copy.FindView(attachment_view);
+		attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+		attachment.has_depth    = static_cast<bool>(attachment_view.aspect & vk::ImageAspectFlagBits::eDepth);
+		attachment.has_stencil  = static_cast<bool>(attachment_view.aspect & vk::ImageAspectFlagBits::eStencil);
+		auto& clear_buffer      = m_scheduler.Current();
+		clear_buffer.BeginRendering(state);
+		vk::ClearAttachment clear_attachment {};
+		clear_attachment.aspectMask           = cleared_aspects;
+		clear_attachment.clearValue.depthStencil = clear;
+		vk::ClearRect clear_rect {};
+		clear_rect.rect        = vk::Rect2D {{0, 0}, render_area};
+		clear_rect.layerCount  = render_layers;
+		clear_buffer.Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+		clear_buffer.EndRendering();
 	}
 	copy.Transit(copy.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, command);
 	return entry->second;

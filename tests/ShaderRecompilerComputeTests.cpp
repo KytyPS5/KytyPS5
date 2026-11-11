@@ -17956,6 +17956,7 @@ public:
                     bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
                     vertex_depth.image_id == expected_image_id &&
                     pixel_depth.image_id == expected_image_id &&
+                    (!bounds_copied || expected_image_id != depth_only.image_id) &&
                     MakeImageInfo(vertex_depth).imageLayout == expected_binding_layout &&
                     MakeImageInfo(pixel_depth).imageLayout == expected_binding_layout,
                 "a deferred clear sampled by vertex and pixel stages missed depth feedback");
@@ -18413,6 +18414,7 @@ public:
                                             : vk::ImageAspectFlags{}) &&
                     vertex_image.image_id == expected_vertex_id &&
                     pixel_image.image_id == expected_pixel_id &&
+                    (!copied || expected_pixel_id != shared_depth.image_id) &&
                     pixel_image.image_view == expected_stencil_view &&
                     MakeImageInfo(vertex_image).imageLayout == expected_vertex_layout &&
                     MakeImageInfo(pixel_image).imageLayout == expected_pixel_layout &&
@@ -20231,6 +20233,10 @@ public:
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
+    if (!RasterizationSupported()) {
+      SkipRasterizationCases(1);
+      return;
+    }
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
@@ -24032,6 +24038,7 @@ private:
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
+        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -24040,6 +24047,9 @@ private:
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_QUERY_EXTENSION_NAME};
+    if (RequiresRobustAccess()) {
+      device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);

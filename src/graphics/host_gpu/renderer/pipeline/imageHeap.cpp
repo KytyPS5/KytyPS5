@@ -547,6 +547,68 @@ void ImageHeap::WriteDescriptors() {
 	m_writes.clear();
 }
 
+void ImageHeap::DepthViews(ImageId image_id, std::vector<ImageViewInfo>& views) const {
+	for (const auto* view: m_active) {
+		for (const auto& [value, index]: view->elements) {
+			const auto& binding = m_elements[index].binding;
+			if (binding.image_id != image_id) continue;
+			views.push_back(binding.desc.view_info);
+			for (uint32_t mip = 0; mip < binding.mip_views.size(); ++mip) {
+				auto info          = binding.desc.view_info;
+				info.base_level   += mip;
+				info.level_count   = 1;
+				info.min_lod       = 0;
+				views.push_back(info);
+			}
+		}
+	}
+}
+
+void ImageHeap::RedirectDepth(ImageId image_id, ImageId copy_id,
+                              const ImageSubresourceRange& range,
+                              vk::ImageAspectFlags aspects) {
+	auto& textures = m_context.GetTextureCache();
+	auto& copy     = textures.GetImage(copy_id);
+	for (auto* view: m_active) {
+		for (const auto& [value, index]: view->elements) {
+			auto&      element = m_elements[index];
+			auto&      binding = element.binding;
+			const auto& info   = binding.desc.view_info;
+			if (binding.image_id != image_id || !(aspects & info.aspect) ||
+			    info.base_level >= range.base_level + range.level_count ||
+			    range.base_level >= info.base_level + info.level_count ||
+			    info.base_layer >= range.base_layer + range.layer_count ||
+			    range.base_layer >= info.base_layer + info.layer_count) {
+				continue;
+			}
+			if (auto* old = ImageOf(element)) {
+				old->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
+			}
+			binding.image_id = copy_id;
+			binding.layout   = copy.ReadLayout();
+			if (!binding.mip_views.empty()) {
+				for (uint32_t mip = 0; mip < binding.mip_views.size(); ++mip) {
+					auto mip_info        = info;
+					mip_info.base_level += mip;
+					mip_info.level_count = 1;
+					mip_info.min_lod     = 0;
+					binding.mip_views[mip] = copy.FindView(mip_info);
+				}
+				binding.image_view = binding.mip_views.front();
+			} else {
+				binding.image_view = copy.FindView(info);
+			}
+			element.serial = copy.serial;
+			copy.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+			m_writes.push_back(index);
+		}
+	}
+	// The redirection is per draw. Invalidate the heap so the next draw rediscovers the original
+	// depth image instead of keeping the previous draw's copy forever.
+	copy.HeapChanged();
+	WriteDescriptors();
+}
+
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();

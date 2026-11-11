@@ -66,7 +66,9 @@ public:
 	[[nodiscard]] ImageId CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
 	                                           vk::ImageAspectFlags aspects,
 	                                           vk::ImageAspectFlags clear_aspects,
-	                                           const vk::ClearDepthStencilValue& clear);
+	                                           const vk::ClearDepthStencilValue& clear,
+	                                           const ImageViewInfo& attachment_view,
+	                                           vk::Extent2D render_area, uint32_t render_layers);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);

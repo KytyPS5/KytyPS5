@@ -2273,6 +2273,7 @@ public:
     u32 width = 0;
     u32 height = 0;
     u32 layers = 1;
+    u32 depth = 1;
     u32 mip_levels = 1;
   };
 
@@ -19868,7 +19869,10 @@ public:
     ret.format = format;
     ret.width = width;
     ret.height = height;
-    ret.layers = layers;
+    // A 3D fixture takes its depth from the layer count.
+    const bool volume = image_type == vk::ImageType::e3D;
+    ret.layers = volume ? 1u : layers;
+    ret.depth = volume ? layers : 1u;
     ret.mip_levels = std::max<u32>(static_cast<u32>(initial_mips.size()), 1u);
     Require(shader_name, "image format size", dwords_per_pixel == (vk::blockSize(format) + 3u) / 4u,
             "image fixture word size disagrees with its native format");
@@ -19879,9 +19883,9 @@ public:
     image_info.format = format;
     image_info.extent.width = width;
     image_info.extent.height = height;
-    image_info.extent.depth = 1;
+    image_info.extent.depth = ret.depth;
     image_info.mipLevels = ret.mip_levels;
-    image_info.arrayLayers = layers;
+    image_info.arrayLayers = ret.layers;
     image_info.samples = samples;
     image_info.tiling = vk::ImageTiling::eOptimal;
     image_info.usage = usage | vk::ImageUsageFlagBits::eTransferDst |
@@ -19927,12 +19931,12 @@ public:
             "image view base mip is out of bounds");
     view_info.subresourceRange.baseMipLevel = view_base_mip;
     view_info.subresourceRange.levelCount = ret.mip_levels - view_base_mip;
-    Require(shader_name, "dispatch", view_base_layer < layers,
+    Require(shader_name, "dispatch", view_base_layer < ret.layers,
             "image view base layer is out of bounds");
     if (view_layers == 0) {
-      view_layers = layers - view_base_layer;
+      view_layers = ret.layers - view_base_layer;
     }
-    Require(shader_name, "dispatch", view_layers <= layers - view_base_layer,
+    Require(shader_name, "dispatch", view_layers <= ret.layers - view_base_layer,
             "image view layer count is out of bounds");
     view_info.subresourceRange.baseArrayLayer = view_base_layer;
     view_info.subresourceRange.layerCount = view_layers;
@@ -24651,11 +24655,11 @@ private:
       copy.imageSubresource.layerCount = image->layers;
       copy.imageExtent.width = MipExtent(image->width, level);
       copy.imageExtent.height = MipExtent(image->height, level);
-      copy.imageExtent.depth = 1;
+      copy.imageExtent.depth = MipExtent(image->depth, level);
       copies.push_back(copy);
       offset += static_cast<vk::DeviceSize>(
-          ImageMipDwordCount(image->width, image->height,
-                             image->format, level, image->layers) *
+          ImageMipDwordCount(image->width, image->height, image->format,
+                             level, image->layers * MipExtent(image->depth, level)) *
           sizeof(u32));
     }
     cmd.copyBufferToImage(staging, image->image,
@@ -37113,6 +37117,7 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
   return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
 }
 
+
 TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
 }
@@ -42904,6 +42909,54 @@ TestCase ImageGather1DArrayUsesLayerCoordinate() {
                       << 28u;
   test.has_user_data = true;
   test.required_spirv = {"OpImageGather"};
+  return test;
+}
+
+// Guests gather from 3D images, which SPIR-V cannot gather.
+TestCase ImageGather3DUsesFootprintOfNearestSlice() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f000000u); // u = 0.5 -> texels 1 and 2
+  AppendVMovLiteral(&code, 21, 0x3f000000u); // v = 0.5 -> rows 1 and 2
+  AppendVMovLiteral(&code, 22, 0x3f400000u); // w = 0.75 -> slice 1 of 2
+  code.push_back(EncodeMimg0(0x47, 0x1, 0, false, 2));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  std::vector<u32> volume(4u * 4u * 2u);
+  for (u32 z = 0; z < 2u; z++) {
+    for (u32 y = 0; y < 4u; y++) {
+      for (u32 x = 0; x < 4u; x++) {
+        volume[(z * 4u + y) * 4u + x] = 0x100u * z + 0x10u * y + x;
+      }
+    }
+  }
+
+  TestCase test;
+  test.name = "ImageGather3DUsesFootprintOfNearestSlice";
+  test.code = code;
+  test.expected = {0x121u, 0x122u, 0x112u, 0x111u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.image_width = 4;
+  test.image_height = 4;
+  test.sampled_image_rgba = volume;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.sampled_image_type = vk::ImageType::e3D;
+  test.sampled_image_view_type = vk::ImageViewType::e3D;
+  test.sampled_image_layers = 2;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  test.user_data[3] = (test.user_data[3] & 0x0fffffffu) |
+                      (static_cast<uint32_t>(Prospero::ImageType::kColor3D) << 28u);
+  test.user_data[4] = 1u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageQuerySizeLod", "OpImageSampleExplicitLod", "Floor"};
+  test.forbidden_spirv = {"OpImageGather"};
   return test;
 }
 
@@ -50268,6 +50321,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
   AddCase(ImageGather1DArrayUsesLayerCoordinate);
+  AddCase(ImageGather3DUsesFootprintOfNearestSlice);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);

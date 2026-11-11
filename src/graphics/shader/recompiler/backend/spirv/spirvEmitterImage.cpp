@@ -602,6 +602,66 @@ uint32_t SamplePackedUnormLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, u
 	return result;
 }
 
+// SPIR-V gathers only 2D images: gather the 2x2 footprint in the nearest slice.
+uint32_t EmitThreeDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                      uint32_t coord, Prospero::TextureNumericClass numeric_class,
+                                      uint32_t sampler_id, bool sampler_dynamic, uint32_t mip) {
+	auto& state = ctx.state;
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto image = LoadImageDescriptor(state, mem.resource, mip);
+	const auto size  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 3), size, image,
+	                          ConstantU32(state, 0));
+	const auto size_f32 = Unary(state, spv::OpConvertUToF, TypeF32Vector(state, 3), size);
+	const auto half     = ConstantF32(state, 0x3f000000u);
+	uint32_t   centre[3][2] {};
+	for (uint32_t axis = 0; axis < 3u; axis++) {
+		const auto extent = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), extent, size_f32, axis);
+		const auto component = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, coord, axis);
+		auto position = Binary(state, spv::OpFMul, TypeF32(state), component, extent);
+		// The footprint starts left of the sample point; z keeps the slice it falls in.
+		if (axis < 2u) {
+			position = Binary(state, spv::OpFSub, TypeF32(state), position, half);
+		}
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), first, GlslStd450(state),
+		                          GLSLstd450Floor, position);
+		for (uint32_t step = 0; step < 2u; step++) {
+			centre[axis][step] =
+			    Binary(state, spv::OpFDiv, TypeF32(state),
+			           Binary(state, spv::OpFAdd, TypeF32(state), first,
+			                  ConstantF32(state, step == 0u ? 0x3f000000u : 0x3fc00000u)),
+			           extent);
+		}
+	}
+
+	const auto sampled =
+	    MakeSampledImage(state, mem.resource, sampler_id, mip, 0u, sampler_dynamic);
+	const auto vector_type = ImageVectorType(state, numeric_class, 4);
+	const auto scalar_type = ImageScalarType(state, numeric_class);
+	const auto component   = ImageGatherSource(state, mem);
+	constexpr std::array<std::array<uint32_t, 2>, 4> Footprint {{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+	std::array<uint32_t, 4>                          values {};
+	for (uint32_t index = 0; index < 4u; index++) {
+		const auto sample_coord = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), sample_coord,
+		                          centre[0][Footprint[index][0]], centre[1][Footprint[index][1]],
+		                          centre[2][0]);
+		const auto texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageSampleExplicitLod, vector_type, texel, sampled,
+		                          sample_coord, spv::ImageOperandsLodMask, ZeroF32(state));
+		values[index] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, scalar_type, values[index], texel,
+		                          component);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, values[0], values[1],
+	                          values[2], values[3]);
+	return result;
+}
+
 uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t data, bool integer) {
 	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
 	const auto info = ImageConversionFormat(ctx.state, mem);
@@ -986,6 +1046,34 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			if (dimension == ImageDimension::Dim3D) {
+				const auto numeric_class = image.numeric_class;
+				if (image.indirect_root == mem.resource || dref ||
+				    !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
+				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
+					ctx.Fail(inst, "has an unsupported 3D gather variant");
+					return;
+				}
+				const auto coord = CoordF32(ctx, mem, *address, layout.coord,
+				                            dimension_info.coordinate_components, image.cube);
+				// A 3D image may be integer, which needs the typed sampler 2D gathers use.
+				const auto typed = LoadImageSamplers(
+				    ctx, inst)[numeric_class != Prospero::TextureNumericClass::Float];
+				const auto gather = [&](uint32_t mip) {
+					return EmitThreeDimensionalGatherLz(ctx, mem, coord, numeric_class, typed.id,
+					                                    typed.dynamic, mip);
+				};
+				const auto sample =
+				    image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
+				        ? EmitIndexSwitch(
+				              state, GatherMip(ctx, inst, mem, *address, layout, image.mip_count),
+				              image.mip_count, ImageVectorType(state, numeric_class, 4), gather)
+				        : gather(0);
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+				                              numeric_class, false, mem, true));
+				return;
+			}
 			uint32_t component_or_dref;
 			if (dref) {
 				component_or_dref = layout.dref != NoImageComponent

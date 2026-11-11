@@ -6265,10 +6265,11 @@ void TestBoundedFormattedBufferStore() {
   Check(materialize() && specialization == original &&
             snapshot.buffers[0].dwords[0] == memory.words[32],
         "destination address refresh was frozen or caused needless specialization");
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 4>{
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
             {35u, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u | 4u},
-            {35u, memory.words[35] | (4u << 3u)}, {33u, 8u << 16u}}}) {
+            {35u, memory.words[35] | (4u << 3u)}, {33u, 8u << 16u},
+            {35u, memory.words[35] | (3u << 28u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
     Check(materialize(), "finite formatted store rejected a supported format, selector or stride");
@@ -6278,7 +6279,7 @@ void TestBoundedFormattedBufferStore() {
            {{35u, (memory.words[35] & ~7u) | 2u}, {35u, memory.words[35] | (3u << 3u)},
             {32u, memory.words[32] + 1u}, {33u, 2u << 16u},
             {33u, (4u << 16u) | (1u << 31u)}, {35u, memory.words[35] | (1u << 23u)},
-            {35u, memory.words[35] | (3u << 28u)}}}) {
+            {35u, memory.words[35] | (2u << 28u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
     Check(!materialize(), "formatted finite store accepted an invalid selector, stride or bounds mode");

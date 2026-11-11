@@ -395,7 +395,11 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program,
 	program.long_branches.assign(long_branches.begin(), long_branches.end());
 
 	std::vector<bool> branch_targets;
-	auto              long_branch = long_branches.begin();
+	// The farthest word a branch decoded so far targets.
+	size_t last_target = 0;
+	// Past an S_ENDPGM only to reach a farther target: a path may then end with an S_BRANCH too.
+	bool tail        = false;
+	auto long_branch = long_branches.begin();
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
@@ -415,10 +419,17 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program,
 				branch_targets.resize(code.size());
 			}
 			branch_targets[target_index] = true;
+			last_target                  = std::max<size_t>(last_target, target_index);
 		}
-		if (inst.opcode == Opcode::S_ENDPGM &&
+		const bool ends_path = inst.opcode == Opcode::S_ENDPGM || (tail && inst.opcode == Opcode::S_BRANCH);
+		if (ends_path &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
-			return;
+			// The code up to a farther target of a branch decoded so far is part of the program. A
+			// target past the code is left to the CFG, which reports it.
+			if (word_index >= code.size() || last_target < word_index || last_target >= code.size()) {
+				return;
+			}
+			tail = true;
 		}
 	}
 

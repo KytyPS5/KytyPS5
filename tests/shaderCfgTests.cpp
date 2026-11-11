@@ -3384,6 +3384,86 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   }
 }
 
+// DS2 material pixel shaders read 68-76 distinct T#s from one table.
+void TestManyDistinctImagesBindPerStage() {
+  using namespace ShaderRecompiler;
+  constexpr uint32_t ImageCount = 72;
+  std::vector<uint32_t> table(ImageCount * 8u);
+  for (uint32_t index = 0; index < ImageCount; ++index) {
+    table[index * 8u] = 0x10000u + index * 0x1000u;
+    table[index * 8u + 1u] = static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
+    table[index * 8u + 2u] = UINT32_MAX;
+    table[index * 8u + 3u] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
+  }
+  std::vector<uint32_t> shader;
+  for (uint32_t index = 0; index < ImageCount; ++index) {
+    shader.insert(shader.end(), {
+        EncodeSmem0(0x03, 8, 0), (125u << 25u) | (index * 32u), // s_load_dwordx8 s[8:15], s[0:1]
+        EncodeSopp(0x0c, 0xc07f),                                // s_waitcnt lgkmcnt(0)
+        EncodeMimg0(0x00, 0x1), EncodeMimg1(2, 2, 0, 0),         // image_load v2, v[0:1], s[8:15]
+        EncodeSopp(0x0c, 0x3f70),                                // s_waitcnt vmcnt(0)
+        EncodeVop2(0x25, 3, 256 + 2, 3)});                       // v_add_nc_u32 v3, v2, v3
+  }
+  shader.insert(shader.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(3, 1, 0), // buffer_store_dword v3
+                               EncodeSopp(0x01)});
+  std::array<uint32_t, 16> user_data{};
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  user_data[0] = static_cast<uint32_t>(table_address);
+  user_data[1] = static_cast<uint32_t>(table_address >> 32u);
+  user_data[4] = 0x12340000u;
+  user_data[6] = 64u;
+  user_data[7] = 0x00027000u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto compile = [&](const Spirv::Profile &profile) {
+    options.profile = &profile;
+    auto translated = TranslateProgram(shader, options);
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    IR::ResourceSnapshot resources;
+    IR::ResourceSpecialization specialization;
+    const IR::SrtRuntime runtime{.user_data = options.user_data,
+                                 .read_specialization_memory = ReadHostTestMemory};
+    Check(IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.images.size() == ImageCount,
+          "distinct T#s did not materialize one image each");
+    return CompileProgram(std::move(translated), options, specialization);
+  };
+  const auto image_descriptors = [](const IR::Program &program) {
+    uint32_t count = 0;
+    for (uint32_t index = 0; index < program.bindings.descriptor_counts.size(); ++index) {
+      if (IR::ImageBindingResourceClass(static_cast<IR::DescriptorBindingKind>(index)) !=
+          IR::ImageResourceClass::None) {
+        count += program.bindings.descriptor_counts[index];
+      }
+    }
+    return count;
+  };
+
+  const auto unbounded = compile(Spirv::DefaultProfile);
+  Check(unbounded.program.info.images.size() == ImageCount &&
+            image_descriptors(unbounded.program) == ImageCount,
+        "distinct T#s did not each bind their own descriptor");
+  CheckSpirvBinaryValidates(unbounded.spirv);
+
+  const auto limited = [](uint32_t images) {
+    Spirv::Profile profile;
+    profile.descriptor_limits.sampled_images = images;
+    profile.descriptor_limits.storage_images = images;
+    return profile;
+  };
+  const auto fits = limited(ImageCount);
+  CheckSpirvBinaryValidates(compile(fits).spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const auto over = limited(ImageCount - 1u);
+  ExpectFatal([&] { (void)compile(over); },
+              "a stage past the device's image limit did not terminate emission");
+  Spirv::Profile resources;
+  resources.descriptor_limits.resources = ImageCount;
+  ExpectFatal([&] { (void)compile(resources); },
+              "a stage past the device's per-stage resource limit did not terminate emission");
+#endif
+}
+
 void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   const auto count_live_memory_ops =
       [](const ShaderRecompiler::IR::Program &program,
@@ -13562,6 +13642,7 @@ int main() {
   TestNewShaderRecompilerVop1SdwaNotDestination();
   TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
+  TestManyDistinctImagesBindPerStage();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.

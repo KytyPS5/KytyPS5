@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -232,6 +233,23 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 	return formats;
 }
 
+ShaderRecompiler::Spirv::StageDescriptorLimits
+DeviceStageDescriptorLimits(const GraphicContext& graphics) {
+	// A stage's set also has to fit one descriptor pool when it is not pushed.
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	const auto  bound  = [](uint32_t device, vk::DescriptorType type) {
+		return std::min(device, DescriptorHeap::PoolCapacity(type));
+	};
+	return {.storage_buffers = bound(limits.maxPerStageDescriptorStorageBuffers,
+	                                 vk::DescriptorType::eStorageBuffer),
+	        .samplers = bound(limits.maxPerStageDescriptorSamplers, vk::DescriptorType::eSampler),
+	        .sampled_images =
+	            bound(limits.maxPerStageDescriptorSampledImages, vk::DescriptorType::eSampledImage),
+	        .storage_images =
+	            bound(limits.maxPerStageDescriptorStorageImages, vk::DescriptorType::eStorageImage),
+	        .resources = limits.maxPerStageResources};
+}
+
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
@@ -244,7 +262,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .ray_query              = graphics.ray_query_enabled};
+	        .ray_query              = graphics.ray_query_enabled,
+	        .descriptor_limits      = DeviceStageDescriptorLimits(graphics)};
 }
 
 std::filesystem::path ShaderStorePath() {

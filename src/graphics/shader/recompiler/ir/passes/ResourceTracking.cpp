@@ -5248,9 +5248,6 @@ private:
 				return i;
 			}
 		}
-		if (m_info.images.size() >= ShaderInfo::MaxImages) {
-			return UINT32_MAX;
-		}
 		ImageResource image;
 		image.source         = source;
 		image.first_use_pc   = pc;
@@ -5509,9 +5506,6 @@ private:
 			          memory.resource * 4u, handle, source);
 		}
 		resource = AddImage(source, memory, op, flags.pc);
-		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
-		}
 		AddHandlePatch(handle, resource, flags.pc);
 		uint32_t sampler = 0;
 		if (image_info.needs_sampler) {

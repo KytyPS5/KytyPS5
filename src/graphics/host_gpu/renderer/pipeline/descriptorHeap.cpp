@@ -31,6 +31,13 @@ DescriptorHeap::~DescriptorHeap() {
 	}
 }
 
+uint32_t DescriptorHeap::PoolCapacity(vk::DescriptorType type) {
+	for (const auto& size: DescriptorPoolSizes) {
+		if (size.type == type) return size.descriptorCount;
+	}
+	return 0;
+}
+
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	KYTY_PROFILER_FUNCTION();
 	auto& batch = m_sets[layout];

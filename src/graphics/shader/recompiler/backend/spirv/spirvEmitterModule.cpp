@@ -715,6 +715,34 @@ void DefineOutputs(EmitterState& state) {
 	}
 }
 
+// Counts the stage's own set as the host layout declares it; heap images are update-after-bind.
+void CheckDescriptorLimits(EmitterState& state) {
+	using Kind                  = IR::DescriptorBindingKind;
+	const auto& counts          = state.program.bindings.descriptor_counts;
+	uint64_t    storage_buffers = 0;
+	uint64_t    samplers        = 0;
+	uint64_t    sampled_images  = 0;
+	uint64_t    storage_images  = 0;
+	for (uint32_t index = 0; index < counts.size(); ++index) {
+		const auto kind = static_cast<Kind>(index);
+		switch (IR::ImageBindingResourceClass(kind)) {
+			case IR::ImageResourceClass::Sampled: sampled_images += counts[index]; break;
+			case IR::ImageResourceClass::Storage: storage_images += counts[index]; break;
+			case IR::ImageResourceClass::None:
+				(kind == Kind::Samplers ? samplers : storage_buffers) += counts[index];
+				break;
+		}
+	}
+	const auto& limits = state.profile.descriptor_limits;
+	if (storage_buffers > limits.storage_buffers || samplers > limits.samplers ||
+	    sampled_images > limits.sampled_images || storage_images > limits.storage_images ||
+	    storage_buffers + sampled_images + storage_images > limits.resources) {
+		EXIT("SPIR-V emission failed: hash=0x%016" PRIx64
+		     " reason=native descriptors exceed the device's per-stage limits\n",
+		     state.program.shader_hash);
+	}
+}
+
 } // namespace
 
 void DefineModule(EmitterState& state) {
@@ -724,6 +752,7 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
+	CheckDescriptorLimits(state);
 	if (state.program.info.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}

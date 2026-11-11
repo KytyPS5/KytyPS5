@@ -21,6 +21,9 @@ public:
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
 
+	// Descriptors of `type` one pool holds; a set that needs more can never be allocated.
+	[[nodiscard]] static uint32_t PoolCapacity(vk::DescriptorType type);
+
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
 

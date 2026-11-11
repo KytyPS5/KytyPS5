@@ -9,6 +9,15 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
+// Descriptors one stage may declare outside update-after-bind sets.
+struct StageDescriptorLimits {
+	uint32_t storage_buffers = UINT32_MAX;
+	uint32_t samplers        = UINT32_MAX;
+	uint32_t sampled_images  = UINT32_MAX;
+	uint32_t storage_images  = UINT32_MAX;
+	uint32_t resources       = UINT32_MAX;
+};
+
 // Host device capabilities and user options that change the emitted SPIR-V. Built once per device.
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
@@ -24,6 +33,7 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	StageDescriptorLimits descriptor_limits;
 };
 
 inline constexpr Profile DefaultProfile {};

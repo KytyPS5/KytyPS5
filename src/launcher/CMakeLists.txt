@@ -57,6 +57,14 @@ target_link_libraries(launcher_cheat_tests Qt6::Network FFmpeg::ffmpeg kyty_test
 target_include_directories(launcher_cheat_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_cheat_tests PROPERTIES AUTOMOC ON)
 
+if(WIN32)
+	add_executable(launcher_cmd_command_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/LauncherCmdCommandTests.cpp"
+	)
+	target_link_libraries(launcher_cmd_command_tests Qt6::Core)
+	target_include_directories(launcher_cmd_command_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+endif()
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

@@ -10437,6 +10437,77 @@ void TestPixelInputWaterfallKey() {
   }
 }
 
+void TestTableSelectedDescriptorNamesItsRecords() {
+  constexpr uint32_t list_pc = 0x48u;
+  constexpr uint32_t table_pc = 0x858u;
+  const auto make = [](bool bounded) {
+    auto fixture = std::make_unique<Fixture>();
+    auto &f = *fixture;
+    std::array<Value, 4> table_words, list_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = f.UserData(word);
+      list_words[word] = f.UserData(4u + word);
+    }
+    const auto group = f.Emit(ValueOpcode::GetBuiltin,
+                              {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto item = f.Emit(ValueOpcode::ReadConstBuffer,
+                             {f.Buffer(list_words), f.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(2u)})},
+                             f.AddMemory({.kind = ResourceKind::ScalarBuffer}, list_pc));
+    const auto record =
+        bounded ? f.Emit(ValueOpcode::BitFieldUExtract, {item, Value(1u), Value(11u)}) : item;
+    const auto offset = f.Emit(ValueOpcode::IMul32, {record, Value(0x70u)});
+    const auto table = f.Buffer(table_words);
+    std::array<std::array<Value, 4>, 2> descriptors;
+    for (uint32_t word = 0; word < 8u; ++word)
+      descriptors[word / 4u][word % 4u] = f.Emit(
+          ValueOpcode::ReadConstBuffer, {table, offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 64u + word * 4u,
+                       .component_index = word, .component_count = 8u},
+                      table_pc));
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    for (uint32_t use = 0; use < 2u; ++use)
+      f.Emit(ValueOpcode::LoadBufferU32x4,
+             {f.Buffer(descriptors[use], 0x864u + use * 4u), lane, Value(0u), Value(0u), Value(true)},
+             f.AddMemory({.kind = ResourceKind::Buffer, .offset = 16u * use, .data_dwords = 4u,
+                          .data_bits = 32u, .idxen = true},
+                         0x864u + use * 4u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  const auto decoded = [](const Program &program) {
+    return std::ranges::count_if(program.memory_info, [](const MemoryInfo &memory) {
+             return memory.kind == ResourceKind::IndirectBuffer;
+           }) == 2;
+  };
+
+  auto bounded = make(true);
+  const auto &program = bounded->program;
+  // uses_dma is derived after specialization, from the live IR.
+  Check(decoded(program),
+        "the table-selected V#s were not decoded in the shader");
+  Check(program.info.dma_tables.size() == 1u,
+        "the host was not told which table records the decoded V#s come from");
+  const auto &table = program.info.dma_tables[0];
+  Check(table.stride == 0x70u && table.count == 2048u &&
+            table.offsets == std::vector<uint32_t>{64u, 80u} && table.extent == 32u && !table.store,
+        "the table recipe does not name exactly the 2048 records and both V# offsets");
+  Check(table.table < program.info.buffers.size() &&
+            program.info.buffers[table.table].scalar,
+        "the table recipe does not name the bound table the shader reads");
+  const auto &source = program.descriptor_sources[program.info.buffers[table.table].source];
+  for (uint32_t word = 0; word < 4u; ++word) {
+    const auto *user = source.dwords[word].Resolve().TryInstruction();
+    Check(user != nullptr && user->GetOpcode() == ValueOpcode::GetUserData &&
+              RegIndex(user->Arg(0).ScalarRegister()) == word,
+          "the table recipe names a buffer other than the table V#");
+  }
+
+  // Without a proven record bound the candidates are not a finite list of records.
+  auto unbounded = make(false);
+  Check(decoded(unbounded->program) && unbounded->program.info.dma_tables.empty(),
+        "an unbounded record selector named a finite list of table records");
+}
+
 } // namespace
 
 int main() {
@@ -10532,6 +10603,7 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("table-selected descriptor names its records", TestTableSelectedDescriptorNamesItsRecords);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

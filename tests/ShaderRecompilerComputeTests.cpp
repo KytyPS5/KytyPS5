@@ -5988,6 +5988,113 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // DS2 culling shaders decode instance V#s from a 2048-record table.
+  void CheckDescriptorTablePrefetch() {
+    constexpr const char *name = "DescriptorTablePrefetch";
+    constexpr uintptr_t base = 0x0000000215000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint32_t stride = 0x70u;
+    constexpr uint32_t records = 2048u;
+    constexpr uint64_t first_instances = 0x80000u; // 1024 records of 48 bytes: three pages.
+    constexpr uint64_t last_instances = 0xc0000u;
+    constexpr uint64_t unnamed = 0xa0000u;
+    static_assert(page == 0x4000u && uint64_t{records} * stride < first_instances);
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "descriptor-table direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "descriptor-table fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto owner_of = [&](uint64_t offset) {
+        return BufferCacheTestAccess::PageOwner(cache, base + offset);
+      };
+      auto *bytes = reinterpret_cast<uint8_t *>(base);
+      std::memset(bytes, 0, uint64_t{records} * stride);
+      // Raw V#s with a 32-bit format, as the culling shaders' instance buffers use.
+      const auto write_descriptor = [&](uint64_t at, uint64_t address, uint32_t record_stride,
+                                        uint32_t count) {
+        const std::array<u32, 4> words{static_cast<u32>(address),
+                                       static_cast<u32>(address >> 32u) | (record_stride << 16u),
+                                       count, (4u << 12u) | DstSel(4, 5, 6, 7)};
+        std::memcpy(bytes + at, words.data(), sizeof(words));
+      };
+      write_descriptor(5u * stride + 64u, base + first_instances, 48u, 1024u);
+      write_descriptor(uint64_t{records - 1u} * stride + 80u, base + last_instances, 16u, 64u);
+
+      ShaderRecompiler::IR::ShaderInfo info;
+      info.dma_tables.push_back(
+          {.table = 0u, .stride = stride, .count = records, .offsets = {64u, 80u}, .extent = 0u});
+      ShaderRecompiler::IR::DescriptorValue table{.dword_count = 4u};
+      table.dwords = {static_cast<u32>(base), static_cast<u32>(base >> 32u), records * stride,
+                      DstSel(4, 5, 6, 7)};
+
+      const auto read_guest = [](uint64_t address, void *data, uint64_t size) {
+        std::memcpy(data, reinterpret_cast<const void *>(address), size);
+        return true;
+      };
+      const auto ranges = DescriptorTableRanges(
+          info.dma_tables[0], DecodeNativeDescriptor<ShaderBufferResource>(table), read_guest);
+      Require(name, "candidate ranges",
+              ranges == std::vector<std::pair<uint64_t, uint64_t>>{
+                            {base + first_instances, base + first_instances + 48u * 1024u},
+                            {base + last_instances, base + last_instances + 16u * 64u}},
+              "the table's records did not name exactly their two instance buffers");
+      // A scalar load past the table reads zero, so a shorter table drops its last record.
+      auto short_table = table;
+      short_table.dwords[2] = 6u * stride;
+      Require(name, "table bound",
+              DescriptorTableRanges(info.dma_tables[0],
+                                    DecodeNativeDescriptor<ShaderBufferResource>(short_table),
+                                    read_guest)
+                      .size() == 1u,
+              "a record past the table's size named a buffer");
+
+      Require(name, "unregistered before", !owner_of(first_instances) && !owner_of(last_instances),
+              "the instance pages were registered before the prefetch");
+      PrefetchDescriptorTables(context, info, std::span(&table, 1u));
+      Require(name, "every record registered",
+              owner_of(first_instances) && owner_of(first_instances + 2u * page) &&
+                  owner_of(last_instances),
+              "a buffer a table record names was not registered before the dispatch");
+      Require(name, "only named records", !owner_of(unnamed),
+              "the prefetch registered a page no record names");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "descriptor-table direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "descriptor-table direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
   void CheckResidentImageHeap() {
     constexpr const char *name = "ResidentImageHeap";
     constexpr uintptr_t base = 0x0000000206800000ull;
@@ -57776,6 +57883,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorFloatConversionOps());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--descriptor-table-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDescriptorTablePrefetch();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
@@ -58774,6 +58886,7 @@ int main(int argc, char **argv) {
     vulkan.CheckLargeSparseImageUpload();
     return 0;
   }
+    VulkanHarness vulkan;
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -58802,6 +58915,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eqaa-only") == 0) {
+    VulkanHarness vulkan;
     vulkan.CheckEqaa();
     return 0;
   }
@@ -59175,6 +59289,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckDescriptorTablePrefetch();
   } else {
     skipped_device_checks = true;
   }

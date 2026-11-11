@@ -11,7 +11,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -62,6 +64,17 @@ template <typename T>
 	std::memcpy(&result, value.dwords.data(), sizeof(result));
 	return result;
 }
+
+class RenderContext;
+
+// The merged [begin, end) guest ranges of every buffer a V# read from `table` can name.
+[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>>
+DescriptorTableRanges(const ShaderRecompiler::IR::DmaTable& recipe,
+                      const ShaderBufferResource&           table,
+                      bool (*read)(uint64_t address, void* data, uint64_t size));
+
+void PrefetchDescriptorTables(RenderContext& context, const ShaderRecompiler::IR::ShaderInfo& info,
+                              std::span<const ShaderRecompiler::IR::DescriptorValue> buffers);
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);

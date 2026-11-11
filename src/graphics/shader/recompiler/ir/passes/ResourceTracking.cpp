@@ -426,6 +426,7 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
 		m_info.user_address_bases.clear();
+		m_info.dma_tables.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -443,6 +444,7 @@ public:
 				Collect(inst);
 			}
 		}
+		ResolveDescriptorTables();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -5212,6 +5214,57 @@ private:
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
 	}
 
+	// A V# selected at run time names pages the host never registered.
+	void RecordDescriptorTable(Inst& handle, const MemoryInfo& access, uint32_t pc, bool store) {
+		DescriptorSource descriptor;
+		MakeSource(handle, 4u, false, false, access.resource * 4u, descriptor, pc);
+		IndirectDescriptorPlan plan;
+		plan.read_dwords = 4u;
+		Value    key;
+		uint32_t offset = 0, stride = 0, immediate = 0;
+		if (!MatchDescriptorReads(handle, descriptor, plan, key, offset, stride, immediate) ||
+		    plan.table_indexed ||
+		    m_program.memory_info[plan.memory[0]].kind != ResourceKind::ScalarBuffer)
+			return;
+		// No record offset below the bound wraps, so each DWORD is at record * stride + first.
+		const auto     maximum = SelectorMaximum(key);
+		const uint64_t first   = uint64_t {offset} + immediate;
+		if (maximum >= MaxIndirectDescriptorProbes || ((first | stride) & 3u) != 0u ||
+		    uint64_t {maximum} * stride + first + 16u > UINT32_MAX)
+			return;
+		DmaTable table {.stride  = stride,
+		                .count   = maximum + 1u,
+		                .offsets = {static_cast<uint32_t>(first)},
+		                .extent  = ByteExtent(access),
+		                .store   = store};
+		m_descriptor_tables.emplace_back(plan.memory[0], std::move(table));
+	}
+
+	// Names each recorded table by the buffer resource its reads were bound to.
+	void ResolveDescriptorTables() {
+		for (auto& [read, table]: m_descriptor_tables) {
+			const auto patch = std::ranges::find(m_memory_patches, read, &MemoryPatch::index);
+			if (patch == m_memory_patches.end() || patch->resource >= m_info.buffers.size())
+				continue;
+			const auto* source = Source(m_info.buffers[patch->resource].source);
+			if (source == nullptr || source->indirect_descriptor) continue;
+			table.table     = patch->resource;
+			const auto same = std::ranges::find_if(m_info.dma_tables, [&](const DmaTable& other) {
+				return other.table == table.table && other.stride == table.stride &&
+				       other.count == table.count;
+			});
+			if (same == m_info.dma_tables.end()) {
+				m_info.dma_tables.push_back(std::move(table));
+				continue;
+			}
+			const auto at = std::ranges::lower_bound(same->offsets, table.offsets[0]);
+			if (at == same->offsets.end() || *at != table.offsets[0])
+				same->offsets.insert(at, table.offsets[0]);
+			same->extent = std::max(same->extent, table.extent);
+			same->store  = same->store || table.store;
+		}
+	}
+
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
 		const auto buffer       = BufferAccessOf(op);
@@ -5247,6 +5300,8 @@ private:
 				                                                       : ResourceKind::Buffer) &&
 				    memory.SupportsIndirectBufferLoad(op)) {
 					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					if (handle != nullptr && handle->GetOpcode() == ValueOpcode::GetBufferResource)
+						RecordDescriptorTable(*handle, memory, flags.pc, false);
 					return;
 				}
 				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
@@ -5375,6 +5430,7 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+	std::vector<std::pair<uint32_t, DmaTable>>      m_descriptor_tables;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	mutable std::map<std::pair<const Inst*, bool>, bool>
 	    m_loop_proofs; // By loop-bound comparison and exit form.

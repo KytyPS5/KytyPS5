@@ -572,6 +572,17 @@ struct ExportBound {
 	bool operator==(const ExportBound& other) const = default;
 };
 
+// V#s the shader decodes from a bound table at a GPU-selected record below `count`.
+struct DmaTable {
+	uint32_t              table  = 0; // The buffer resource holding the records.
+	uint32_t              stride = 0;
+	uint32_t              count  = 0;
+	std::vector<uint32_t> offsets;    // Ascending byte offsets of the V#s within record 0.
+	uint32_t              extent = 0; // Bytes an access can reach beyond a V#'s size.
+	bool                  store  = false;
+
+	bool operator==(const DmaTable& other) const = default;
+};
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	static constexpr uint32_t MaxImages       = 64;
@@ -623,6 +634,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	std::vector<DmaTable>                dma_tables;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

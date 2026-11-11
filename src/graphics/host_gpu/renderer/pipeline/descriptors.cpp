@@ -43,7 +43,103 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
+bool ReadCleanTable(uint64_t address, void* data, uint64_t size) {
+	return LibKernel::Memory::TryReadBufferBacking(address, data, size);
+}
 } // namespace
+
+std::vector<std::pair<uint64_t, uint64_t>>
+DescriptorTableRanges(const ShaderRecompiler::IR::DmaTable& recipe,
+                      const ShaderBufferResource&           table,
+                      bool (*read)(uint64_t address, void* data, uint64_t size)) {
+	constexpr uint64_t DescriptorBytes = sizeof(ShaderBufferResource);
+	// Bounds one table read; a dense table takes few reads, a sparse one never reads its gaps.
+	constexpr uint64_t ChunkBytes = 64 * 1024;
+
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	if (recipe.offsets.empty() || recipe.count == 0u || recipe.stride == 0u || table.Type() != 0u ||
+	    table.Base48() == 0u) {
+		return ranges;
+	}
+	// A scalar load past the table's size reads zero, which names no buffer.
+	const auto size    = table.GetSize() & ~uint64_t {3};
+	const auto offsets = std::span(recipe.offsets);
+
+	static thread_local std::vector<uint32_t> words;
+	for (size_t group = 0; group < offsets.size();) {
+		// Offsets close enough to read together, as one span per record.
+		size_t next = group + 1u;
+		while (next < offsets.size() &&
+		       offsets[next] - offsets[group] + DescriptorBytes <= ChunkBytes) {
+			++next;
+		}
+		const uint64_t first = offsets[group];
+		const uint64_t span  = offsets[next - 1u] - first + DescriptorBytes;
+		const uint64_t batch = (ChunkBytes - span) / recipe.stride + 1u;
+		for (uint64_t record = 0; record < recipe.count; record += batch) {
+			const auto begin = record * recipe.stride + first;
+			if (begin + DescriptorBytes > size) {
+				break;
+			}
+			const auto last = std::min<uint64_t>(record + batch, recipe.count) - 1u;
+			const auto end  = std::min(size, last * recipe.stride + first + span);
+			words.resize((end - begin) / sizeof(uint32_t));
+			if (!read(table.Base48() + begin, words.data(), end - begin)) {
+				continue;
+			}
+			for (auto current = record; current <= last; ++current) {
+				for (auto offset = group; offset < next; ++offset) {
+					const auto at = current * recipe.stride + offsets[offset];
+					if (at + DescriptorBytes > end) {
+						break;
+					}
+					ShaderBufferResource descriptor;
+					std::memcpy(descriptor.fields, words.data() + (at - begin) / sizeof(uint32_t),
+					            DescriptorBytes);
+					if (descriptor.Type() != 0u || descriptor.RawFormat() == 0u ||
+					    descriptor.Base48() == 0u || descriptor.GetSize() == 0u) {
+						continue;
+					}
+					ranges.emplace_back(descriptor.Base48(),
+					                    descriptor.Base48() + descriptor.GetSize() + recipe.extent);
+				}
+			}
+		}
+		group = next;
+	}
+	std::ranges::sort(ranges);
+	size_t merged = 0;
+	for (const auto& range: ranges) {
+		if (merged != 0 && range.first <= ranges[merged - 1].second) {
+			ranges[merged - 1].second = std::max(ranges[merged - 1].second, range.second);
+		} else {
+			ranges[merged++] = range;
+		}
+	}
+	ranges.resize(merged);
+	return ranges;
+}
+
+void PrefetchDescriptorTables(RenderContext& context, const ShaderRecompiler::IR::ShaderInfo& info,
+                              std::span<const ShaderRecompiler::IR::DescriptorValue> buffers) {
+	for (const auto& recipe: info.dma_tables) {
+		if (recipe.table >= buffers.size() || buffers[recipe.table].dword_count < 4u) {
+			continue;
+		}
+		// A table the GPU still owns would need a drain to read; its misses still fault in.
+		const auto table = DecodeNativeDescriptor<ShaderBufferResource>(buffers[recipe.table]);
+		auto&      cache = context.GetBufferCache();
+		if (table.Base48() == 0u || table.GetSize() == 0u ||
+		    cache.IsRegionGpuModified(table.Base48(), table.GetSize())) {
+			continue;
+		}
+		for (const auto& [begin, end]: DescriptorTableRanges(recipe, table, ReadCleanTable)) {
+			if (end - begin <= UINT32_MAX) {
+				(void)cache.FindBuffer(begin, end - begin);
+			}
+		}
+	}
+}
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	const auto image_class = ShaderRecompiler::IR::ImageBindingResourceClass(kind);
@@ -762,6 +858,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
+		PrefetchDescriptorTables(m_context, program.info, snapshot.buffers);
 		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {

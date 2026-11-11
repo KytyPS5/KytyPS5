@@ -833,6 +833,30 @@ void TestCompleteWaveReduction() {
   }
 }
 
+// S_MIN_I32 / S_MAX_I32 of a runtime count, as DS2 bounds a light loop by min(count, 2).
+void TestSignedMinMaxDescriptorInputs() {
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto low = fixture.Emit(ValueOpcode::SMin32, {user, Value(2u)});
+  const auto high = fixture.Emit(ValueOpcode::SMax32, {user, Value(2u)});
+
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {low, high}, .dword_count = 2});
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  DescriptorValue result;
+  for (const uint32_t input : {7u, 0xfffffffdu}) {
+    const std::array user_data{input};
+    Check(EvaluateSource(plan, {.user_data = user_data}, 0, result),
+          "signed min/max descriptor evaluation failed");
+    const auto value = static_cast<int32_t>(input);
+    Check(result.dwords[0] == static_cast<uint32_t>(std::min(value, 2)) &&
+              result.dwords[1] == static_cast<uint32_t>(std::max(value, 2)),
+          "signed min/max runtime evaluation compared unsigned");
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -963,6 +987,7 @@ int main() {
     TestUniformFirstLaneSamplerLod();
     TestFloatComparisonDescriptorInputs();
     TestSignedConversionDescriptorInputs();
+    TestSignedMinMaxDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();

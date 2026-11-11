@@ -219,10 +219,8 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		return true;
 	}
 	const auto format = Format::GetFormatInfo(descriptor.Format());
-	if (resource.formatted && !formatted_read &&
-	    static_cast<uint32_t>(descriptor.Format()) == 0x7fu && descriptor.Stride() == 0u &&
-	    descriptor.DstSelXYZW() == 0u && descriptor.AddTid()) {
-		// The GPU-selected table can contain this unwritten sentinel instead of a destination.
+	if (resource.formatted && !formatted_read && descriptor.DstSelXYZW() == 0u) {
+		// GPU-selected tables use a zero destination swizzle for unused rows.
 		value.dwords.fill(0u);
 		return true;
 	}

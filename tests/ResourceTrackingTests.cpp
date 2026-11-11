@@ -6311,12 +6311,13 @@ void TestBoundedFormattedBufferStore() {
   Check(materialize() && snapshot.buffers.size() == 1u &&
             std::ranges::all_of(snapshot.buffers[0].dwords, [](uint32_t word) { return word == 0u; }),
         "uninitialized formatted store candidate did not become a null descriptor");
-  auto nonempty = invalid_descriptor;
-  nonempty[1] = 1u << 16u;
-  std::copy(nonempty.begin(), nonempty.end(), memory.words.begin() + 32u);
-  Check(!materialize(), "an invalid formatted store with a nonempty stride was silently ignored");
-  std::copy(invalid_descriptor.begin(), invalid_descriptor.end(), memory.words.begin() + 32u);
-  auto selected_swizzle = invalid_descriptor;
+  const std::array<uint32_t, 4> unused_row{
+      0x00000005u, 0x10050c00u, 0x000002afu, 0x00040000u};
+  std::copy(unused_row.begin(), unused_row.end(), memory.words.begin() + 32u);
+  Check(materialize() && snapshot.buffers.size() == 1u &&
+            std::ranges::all_of(snapshot.buffers[0].dwords, [](uint32_t word) { return word == 0u; }),
+        "unused formatted store row did not become a null descriptor");
+  auto selected_swizzle = unused_row;
   selected_swizzle[3] |= 1u;
   std::copy(selected_swizzle.begin(), selected_swizzle.end(), memory.words.begin() + 32u);
   Check(!materialize(), "an invalid formatted store with a destination swizzle was silently ignored");

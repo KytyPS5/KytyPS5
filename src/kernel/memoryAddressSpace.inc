@@ -11,6 +11,8 @@ static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+// Where host aliases of guest memory start (see GuestBackingStore).
+static constexpr uint64_t HOST_ALIAS_MIN = 0x10000000000ull;
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -127,8 +129,20 @@ public:
 			     "this up front, so the paging file is usually what needs to be larger.\n",
 			     m_size / (1024U * 1024U), static_cast<uint32_t>(GetLastError()));
 		}
-		m_backing_base = static_cast<uint8_t*>(
-		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		// The guest regions take the address space below HOST_USER_MAX, and the alias went to the
+		// lowest free range: the one left below 1 TiB. The NVIDIA driver reserves its CUDA address
+		// space there for VK_NVX_binary_import (DLSS), so the alias goes above it.
+		MEM_ADDRESS_REQUIREMENTS requirements {
+		    .LowestStartingAddress = reinterpret_cast<void*>(HOST_ALIAS_MIN)};
+		MEM_EXTENDED_PARAMETER above {};
+		above.Type    = MemExtendedParameterAddressRequirements;
+		above.Pointer = &requirements;
+		m_backing_base = static_cast<uint8_t*>(MapViewOfFile3(
+		    m_handle, GetCurrentProcess(), nullptr, 0, m_size, 0, PAGE_READWRITE, &above, 1));
+		if (m_backing_base == nullptr) {
+			m_backing_base = static_cast<uint8_t*>(
+			    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		}
 		if (m_backing_base == nullptr) {
 			EXIT("direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",
 			     static_cast<uint32_t>(GetLastError()));

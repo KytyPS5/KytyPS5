@@ -4935,18 +4935,23 @@ private:
 	// through the carry, from everything the low dword does). Record N so the host can cache the
 	// memory at the base before the shader runs; an access to memory without a cached buffer only
 	// records a fault and reads zero.
-	void CollectDmaBase(const Inst& handle) {
+	// Whether a user-data register pair is the base of the V#; it is recorded as a DMA base.
+	bool CollectDmaBase(const Inst& handle) {
 		const auto low      = AddressUserDataSources(handle.Arg(0));
 		const auto high     = AddressUserDataSources(handle.Arg(1));
 		const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
 			return std::ranges::find(registers, reg) != registers.end();
 		};
+		bool found = false;
 		for (const auto reg: low) {
-			if (contains(high, reg + 1u) && !contains(low, reg + 1u) &&
-			    !contains(m_info.dma_base_registers, reg)) {
-				m_info.dma_base_registers.push_back(reg);
+			if (contains(high, reg + 1u) && !contains(low, reg + 1u)) {
+				found = true;
+				if (!contains(m_info.dma_base_registers, reg)) {
+					m_info.dma_base_registers.push_back(reg);
+				}
 			}
 		}
+		return found;
 	}
 
 	static bool UserDataRegister(Value value, uint32_t& reg) {
@@ -5266,13 +5271,24 @@ private:
 				    MatchIndirectWriteTable(*handle, table_source, table_offset);
 				if (indirect_store) {
 					AddIndirectWriteTable(table_source, table_offset, flags.pc);
+				} else if (m_program.stage == ShaderType::Compute && handle != nullptr &&
+				           memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferStore(op) &&
+				           CollectDmaBase(*handle)) {
+					// A raw store through a V# whose fields the GPU computes from a base in user data:
+					// Gran Turismo 7's cs f0ff5e4576313e72 (PS5 Pro mode, loading a race) writes lists
+					// at its user-data base + 0x100 with a record count it sums from two counters it
+					// loads. Such a store writes guest memory by device address, like a FLAT store: the
+					// host caches the memory at the base before the shader runs, and the pages it really
+					// wrote come back through the write bitmap. Compute shaders only, as V# table
+					// stores: the host prepares them at dispatch.
+					m_program.has_address_writes = true;
 				} else if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                               : ResourceKind::Buffer) ||
 				           !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or 32-bit formatted load "
-					     "or a V# table store");
+					     "or a raw DWORD store");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;

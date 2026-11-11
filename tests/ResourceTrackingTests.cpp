@@ -3298,6 +3298,148 @@ void TestAssembledRecordWordImageTable() {
                "assembled record-word key accepted a lane the waterfall may not have written");
   CheckRecordWordMaterialization(plan);
 }
+void TestLoopSelectedImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  constexpr uint32_t table_offset = 12384u;
+  enum class Variant {
+    Guarded, Inverted, Unguarded, WrongPolarity, InductionGuard, UnboundedElse,
+    ScalarBranch, ScalarBranchWrongPolarity, ScalarBranchInduction
+  };
+  const auto make_plan = [&](Variant variant, uint32_t bound = 32u) {
+    Fixture fixture;
+    fixture.program.wave_size = 32u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *found = fixture.AddBlock();
+    auto *table = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto branch = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto pointer_low = fixture.UserData(0);
+    const auto pointer_high = fixture.UserData(1);
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    branch(entry, header);
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto bit = Value(&phi);
+    fixture.block = header;
+    const bool inverted = variant == Variant::Inverted;
+    const auto sentinel =
+        variant == Variant::UnboundedElse ? fixture.UserData(3) : Value(UINT32_MAX);
+    const auto compare = fixture.Emit(inverted ? ValueOpcode::SGreaterThanEqual32
+                                               : ValueOpcode::SLessThan32, {bit, Value(bound)});
+    const auto key = fixture.Emit(ValueOpcode::SelectU32,
+        inverted ? std::initializer_list<Value>{compare, sentinel, bit}
+                 : std::initializer_list<Value>{compare, bit, sentinel});
+    const auto set = fixture.Emit(ValueOpcode::INotEqual32, {fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::ShiftRightLogical32, {lane, bit}), Value(1u)}), Value(0u)});
+    const auto done = fixture.Emit(ValueOpcode::LogicalOr,
+        {inverted ? compare : fixture.Emit(ValueOpcode::LogicalNot, {compare}), set});
+    choose(header, found, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {done}, CFG::BranchCondition::VccNonZero));
+    fixture.block = latch;
+    const auto next = fixture.Emit(ValueOpcode::IAdd32, {bit, Value(1u)});
+    branch(latch, header);
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, next);
+
+    fixture.block = found;
+    // DS2 cs 0x819c4811bfbfd9bf skips the table with S_CMP_LT_I32 key, 0; S_CBRANCH_SCC1.
+    const bool scalar = variant >= Variant::ScalarBranch;
+    const auto negative = fixture.Emit(ValueOpcode::SLessThan32,
+        {variant == Variant::InductionGuard || variant == Variant::ScalarBranchInduction ? bit : key,
+         Value(0u)});
+    const auto active = variant == Variant::Unguarded || scalar ? Value(true)
+        : variant == Variant::WrongPolarity ? negative
+        : fixture.Emit(ValueOpcode::LogicalNot, {negative});
+    if (scalar) {
+      const bool wrong = variant == Variant::ScalarBranchWrongPolarity;
+      choose(found, wrong ? table : exit, wrong ? exit : table,
+             fixture.Emit(ValueOpcode::ConditionRef, {negative}, CFG::BranchCondition::SccNonZero));
+    } else {
+      choose(found, exit, table,
+             fixture.Emit(ValueOpcode::ConditionRef, {active}, CFG::BranchCondition::ExecZero));
+    }
+    fixture.block = table;
+    const auto pointer = fixture.Address(pointer_low, pointer_high);
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = table_offset + word * sizeof(uint32_t);
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0xa34));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {fixture.Image(words, 0xadc), fixture.ImageAddress(), active},
+                 fixture.AddMemory(load, 0xadc));
+    branch(table, exit);
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    fixture.PlanAndTrack();
+    const auto &indirect = fixture.program.descriptor_sources[
+        fixture.program.info.images[0].source].indirect_descriptor;
+    Check(indirect && indirect->key_count.Resolve() == Value(bound) &&
+              indirect->selector_first.IsEmpty() && indirect->table_stride == 32u &&
+              indirect->table_immediate == table_offset,
+          "loop-selected image table lost its compare-bounded key domain");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  const auto plan = make_plan(Variant::Guarded);
+  make_plan(Variant::Inverted);
+  make_plan(Variant::Guarded, 5u);
+  make_plan(Variant::ScalarBranch);
+  for (const auto variant : {Variant::Unguarded, Variant::WrongPolarity,
+                             Variant::InductionGuard, Variant::UnboundedElse,
+                             Variant::ScalarBranchWrongPolarity, Variant::ScalarBranchInduction})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "loop-selected image table accepted a key without a nonnegative guard");
+  CheckFatal([&] { make_plan(Variant::Guarded, MaxIndirectDescriptorProbes + 1u); },
+             "not a valid runtime value", "loop-selected image table exceeded the probe cap");
+
+  LinearTestMemory memory;
+  constexpr uint32_t pointer = 0x1000u;
+  memory.words.resize((table_offset + 33u * 32u) / 4u);
+  for (uint32_t key = 0; key < 33u; ++key) {
+    const auto word = (pointer + table_offset - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  memory.fail_address = pointer + table_offset + 32u * 32u;
+  std::array<uint32_t, 2> user_data{pointer, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.descriptor_reads == 32u && snapshot.images.size() == 32u,
+        "loop-selected image table did not enumerate exactly keys zero through 31");
+  for (uint32_t key = 0; key < 32u; ++key)
+    Check(std::ranges::any_of(snapshot.images, [&](const auto &image) {
+            return image.dwords[0] == 0x100u + key;
+          }),
+          "loop-selected image table lost a reachable descriptor");
+}
+
 void TestUniformizedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
@@ -10334,6 +10476,7 @@ int main() {
     Run("descending image range", TestDescendingImageRange);
     Run("affine record-word image table", TestAffineRecordWordImageTable);
     Run("assembled record-word image table", TestAssembledRecordWordImageTable);
+    Run("loop-selected image table", TestLoopSelectedImageTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

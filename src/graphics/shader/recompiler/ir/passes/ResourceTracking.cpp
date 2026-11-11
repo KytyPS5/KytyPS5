@@ -1745,6 +1745,9 @@ private:
 				const auto left  = operand(inst->Arg(0));
 				const auto right = operand(inst->Arg(1));
 				if (left.IsEmpty() || right.IsEmpty()) return {};
+			case ValueOpcode::SelectU32: {
+				// A uniform choice of whole words: S_CSELECT of EXEC and zero.
+				const auto condition = inst->Arg(0).Resolve();
 		const auto words = m_program.wave_size / 32u;
 		if (read.GetOpcode() != ValueOpcode::ReadLane || (words != 1u && words != 2u)) return {};
 		auto     index     = read.Arg(1).Resolve();
@@ -2234,6 +2237,7 @@ private:
 				if (!ImmediateU32(inst->Arg(1), shift) || shift >= 32u) break;
 				// A nonnegative value shifts arithmetically as it does logically.
 				if (inst->GetOpcode() == ValueOpcode::ShiftRightArithmetic32 && maximum > INT32_MAX)
+					return UINT32_MAX;
 				return maximum >> shift;
 			}
 			case ValueOpcode::ReadLane: {
@@ -3868,6 +3872,34 @@ private:
 		return true;
 	}
 
+	// The block where the descriptor reads of handle consume key as a scaled table offset.
+	const Block* KeyConsumerBlock(Value key, const Inst& handle) const {
+		key                 = key.Resolve();
+		const Block* result = nullptr;
+		for (size_t dword = 0; dword < handle.NumArgs(); ++dword) {
+			const auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr || read->NumArgs() < 2u) return nullptr;
+			const auto* offset = read->Arg(1).Resolve().TryInstruction();
+			uint32_t    immediate;
+			while (offset != nullptr && offset->GetOpcode() == ValueOpcode::IAdd32) {
+				if (ImmediateU32(offset->Arg(0), immediate))
+					offset = offset->Arg(1).Resolve().TryInstruction();
+				else if (ImmediateU32(offset->Arg(1), immediate))
+					offset = offset->Arg(0).Resolve().TryInstruction();
+				else
+					return nullptr;
+			}
+			if (offset == nullptr ||
+			    (offset->GetOpcode() != ValueOpcode::ShiftLeftLogical32 &&
+			     offset->GetOpcode() != ValueOpcode::IMul32) ||
+			    (offset->Arg(0).Resolve() != key && offset->Arg(1).Resolve() != key) ||
+			    (result != nullptr && result != offset->Parent()))
+				return nullptr;
+			result = offset->Parent();
+		}
+		return result;
+	}
+
 	bool SetExactTableMaximum(Value key, DescriptorSource::IndirectDescriptor& indirect,
 	                          const Inst* handle = nullptr) {
 		const auto* lane = key.Resolve().TryInstruction();
@@ -4150,14 +4182,15 @@ private:
 				auto maximum = SelectorMaximum(key);
 				if (maximum >= MaxIndirectDescriptorProbes) {
 					// Each image access bounds the key on the lanes it executes.
-					maximum = 0u;
+					const auto* consumer = KeyConsumerBlock(key, handle);
+					maximum              = 0u;
 					for (const auto& use: handle.Uses()) {
 						const auto active = AccessPredicate(use, false);
 						if (active.IsEmpty()) {
 							maximum = UINT32_MAX;
 							break;
 						}
-						maximum = std::max(maximum, SelectorMaximum(key, {}, 0, active));
+						maximum = std::max(maximum, SelectorMaximum(key, {}, 0, active, consumer));
 					}
 				}
 				if (maximum >= MaxIndirectDescriptorProbes)
@@ -4438,20 +4471,87 @@ private:
 		Value count;
 	};
 
-	SelectorDomain FiniteSelectorDomain(Value value, Value guard) const {
-		value = value.Resolve();
-		bool nonnegative = false;
-		if (const auto* root = value.TryInstruction()) {
+	// The guard proves value >= 0 (signed) through an existing comparison of value with zero.
+	// The guard, or a uniform branch on the way to consumer, proves value >= 0 (signed)
+	// through an existing comparison of value with zero.
+	bool GuardedNonnegative(Value value, Value guard, const Block* consumer = nullptr) const {
+		const auto* root = value.Resolve().TryInstruction();
+		if (root == nullptr || (guard.IsEmpty() && consumer == nullptr)) return false;
+		const auto proves = [&](Value condition, bool positive) {
 			for (const auto& use: root->Uses()) {
 				const auto& compare = *use.user;
-				const auto op = compare.GetOpcode();
-				if (((op == ValueOpcode::SLessThanEqual32 && use.operand == 1u &&
-				      compare.Arg(0).Resolve() == Value(0u)) ||
-				     (op == ValueOpcode::SGreaterThanEqual32 && use.operand == 0u &&
-				      compare.Arg(1).Resolve() == Value(0u))) &&
-				    Implies(guard, Value(use.user))) nonnegative = true;
+				const auto  op      = compare.GetOpcode();
+				if (compare.NumArgs() != 2u || compare.Arg(use.operand ^ 1u).Resolve() != Value(0u))
+					continue;
+				if (((op == ValueOpcode::SLessThanEqual32 && use.operand == 1u) ||
+				     (op == ValueOpcode::SGreaterThanEqual32 && use.operand == 0u)) &&
+				    positive && Implies(condition, Value(use.user)))
+					return true;
+				// S_CMP_LT_I32 value, 0 followed by an EXEC or branch negation.
+				if (((op == ValueOpcode::SLessThan32 && use.operand == 0u) ||
+				     (op == ValueOpcode::SGreaterThan32 && use.operand == 1u)) &&
+				    (positive ? Refutes(condition, Value(use.user))
+				              : Implies(Value(use.user), condition)))
+					return true;
 			}
+			return false;
+		};
+		if (!guard.IsEmpty() && proves(guard, true)) return true;
+		// A uniform branch on the comparison; the walk stops where value is redefined.
+		return consumer != nullptr && root->Parent() != nullptr &&
+		       GuardedOnEntry(
+		           consumer, [&](const Block* block) { return block == root->Parent(); },
+		           [&](const EdgePredicate& edge) {
+			           return edge.lanes == LaneQuantifier::All &&
+			                  proves(edge.condition, edge.positive);
+		           });
+	}
+
+	// Maximum of a nonnegative select arm while its select condition has the given value.
+	uint32_t NonnegativeArmMaximum(Value condition, Value arm, bool positive,
+		const auto* test = condition.Resolve().TryInstruction();
+		if (test == nullptr || depth > 8u) return UINT32_MAX;
+		const auto op = test->GetOpcode();
+		if (op == ValueOpcode::LogicalNot)
+			return NonnegativeArmMaximum(test->Arg(0), arm, !positive, depth + 1u);
+		if ((op == ValueOpcode::LogicalAnd && positive) ||
+		    (op == ValueOpcode::LogicalOr && !positive))
+			return std::min(NonnegativeArmMaximum(test->Arg(0), arm, positive, depth + 1u),
+			                NonnegativeArmMaximum(test->Arg(1), arm, positive, depth + 1u));
+		if (test->NumArgs() != 2u) return UINT32_MAX;
+		// Orient the comparison as arm < limit or arm <= limit.
+		bool     strict = false;
+		uint32_t limit  = 0;
+		if (EquivalentValue(m_program, test->Arg(0), arm) && ImmediateU32(test->Arg(1), limit)) {
+			if ((op == ValueOpcode::SLessThan32 && positive) ||
+			    (op == ValueOpcode::SGreaterThanEqual32 && !positive))
+				strict = true;
+			else if ((op == ValueOpcode::SLessThanEqual32 && positive) ||
+			         (op == ValueOpcode::SGreaterThan32 && !positive))
+				strict = false;
+			else
+				return UINT32_MAX;
+		} else if (EquivalentValue(m_program, test->Arg(1), arm) &&
+		           ImmediateU32(test->Arg(0), limit)) {
+			if ((op == ValueOpcode::SGreaterThan32 && positive) ||
+			    (op == ValueOpcode::SLessThanEqual32 && !positive))
+				strict = true;
+			else if ((op == ValueOpcode::SGreaterThanEqual32 && positive) ||
+			         (op == ValueOpcode::SLessThan32 && !positive))
+				strict = false;
+			else
+				return UINT32_MAX;
+			return UINT32_MAX;
 		}
+		// 0 <= arm and a signed upper limit bound the arm as an unsigned value.
+		const auto signed_limit = std::bit_cast<int32_t>(limit);
+		if (strict) return signed_limit <= 0 ? 0u : static_cast<uint32_t>(signed_limit - 1);
+		return signed_limit < 0 ? 0u : static_cast<uint32_t>(signed_limit);
+	}
+
+	SelectorDomain FiniteSelectorDomain(Value value, Value guard) const {
+		value                  = value.Resolve();
+		const bool nonnegative = GuardedNonnegative(value, guard);
 		struct Arm { Value value; const Inst* choice = nullptr; bool positive = true; };
 		std::vector<Arm> pending {{value}};
 		std::vector<const Inst*> visited;
@@ -4541,8 +4641,9 @@ private:
 		}
 	}
 
+	// consumer, when given, is the block of the instruction that consumes value itself.
 	uint32_t SelectorMaximum(Value value, SelectorBounds bounds = {}, uint32_t depth = 0,
-	                         Value guard = {}) const {
+	                         Value guard = {}, const Block* consumer = nullptr) const {
 		if (depth > 32u) return UINT32_MAX;
 		value = value.Resolve();
 		if (value.IsImmediate() && value.GetType() == Type::U32) return value.U32();
@@ -4601,10 +4702,25 @@ private:
 				if (low >= 0.0f && high < 0x1p31f) return static_cast<uint32_t>(high);
 				break;
 			}
-			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectU32: {
 				if (!guard.IsEmpty() && Implies(guard, inst->Arg(0))) return maximum(1);
-				return SelectorPredicateFalse(inst->Arg(0), bounds, depth + 1u, guard)
-				           ? maximum(2) : std::max(maximum(1), maximum(2));
+				const bool false_only =
+				    SelectorPredicateFalse(inst->Arg(0), bounds, depth + 1u, guard);
+				if (!GuardedNonnegative(value, guard, consumer))
+					return false_only ? maximum(2) : std::max(maximum(1), maximum(2));
+				uint32_t result = 0u;
+				for (uint32_t arm = false_only ? 2u : 1u; arm < 3u; ++arm) {
+					uint32_t literal;
+					if (ImmediateU32(inst->Arg(arm), literal) &&
+					    std::bit_cast<int32_t>(literal) < 0)
+						continue;
+					result = std::max(
+					    result,
+					    std::min({maximum(arm), uint32_t {INT32_MAX},
+					              NonnegativeArmMaximum(inst->Arg(0), inst->Arg(arm), arm == 1u)}));
+				}
+				return result;
+			}
 			case ValueOpcode::ISub32: {
 				uint32_t left;
 				if (ImmediateU32(inst->Arg(0), left) && maximum(1) <= left) return left;

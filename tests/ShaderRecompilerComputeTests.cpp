@@ -46375,6 +46375,92 @@ void CheckRecordWordImageTable(VulkanHarness &vulkan) {
 }
 
 // DS2 cs 0x98af2e853f33b143: key = bit < 32 ? bit : -1, EXEC skips key < 0.
+void CheckLoopSelectedPointerImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 12384u;
+  constexpr u32 vcc_lo = 106u, vcc_hi = 107u, exec_lo = 126u;
+  constexpr u32 zero = InlineU32(0), one = InlineU32(1), minus_one = 193u;
+  for (const u32 mask : {0u, 1u, 0x28u, 0x80000000u}) {
+    TestCase test;
+    test.name = "LoopSelectedPointerImageTable";
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table_offset + 32u * 32u) / 4u);
+    test.initial[0] = 0xdeadbeefu;
+    test.initial[(base + 492u) / 4u] = mask;
+    for (u32 row = 0; row < 32u; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = row + 1u;
+      image[3] = DstSel(4, 0, 0, 1) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8,
+          test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+    }
+    test.user_data[0] = base;
+    const auto output = MakeStructuredStorageBufferData(0u, 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = 32u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    AppendVMovLiteral(&code, 30, 0u);
+    code.insert(code.end(), {EncodeSmem0(0x00, 21), EncodeSmem1(492, 125),
+                            EncodeSopp(0x0c), EncodeSMovB32(vcc_hi, zero)});
+    const auto loop = code.size();
+    code.insert(code.end(), {
+        EncodeSop2(0x1e, vcc_lo, one, vcc_hi),        // s_lshl_b32 vcc_lo, 1, vcc_hi
+        EncodeSop2(0x0e, vcc_lo, vcc_lo, 21),         // s_and_b32 vcc_lo, vcc_lo, s21
+        EncodeSopc(0x04, vcc_hi, InlineU32(32)),      // s_cmp_lt_i32 vcc_hi, 32
+        EncodeSop2(0x0a, 22, zero, one),              // s_cselect_b32 s22, 0, 1
+        EncodeSop2(0x0a, 40, vcc_hi, minus_one),      // s_cselect_b32 s40, vcc_hi, -1
+        EncodeSop2(0x10, vcc_lo, vcc_lo, 22)});       // s_or_b32 vcc_lo, vcc_lo, s22
+    const auto found = code.size();
+    code.push_back(0u);                               // s_cbranch_scc1 found
+    code.push_back(EncodeSop2(0x02, vcc_hi, vcc_hi, one));
+    code.push_back(EncodeSopp(0x02, loop - code.size() - 1u));
+    code[found] = EncodeSopp(0x05, code.size() - found - 1u);
+    code.insert(code.end(), {
+        EncodeSopc(0x04, 40, zero),                   // s_cmp_lt_i32 s40, 0
+        EncodeSop2(0x0a, vcc_lo, exec_lo, zero),      // s_cselect_b32 vcc_lo, exec_lo, 0
+        EncodeSop2(0x14, exec_lo, exec_lo, vcc_lo)}); // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+    const auto skip = code.size();
+    code.push_back(0u);                               // s_cbranch_execz end
+    code.insert(code.end(), {EncodeSop2(0x1e, vcc_lo, 40, InlineU32(5)),
+        EncodeSmem0(0x03, 8), EncodeSmem1(table_offset, vcc_lo), EncodeSopp(0x0c),
+        EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 2), EncodeSopp(0x0c),
+        EncodeVop1(0x01, 0, Vgpr(4))});
+    AppendBufferStoreDword(&code, 0, 30);
+    code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+    AppendEnd(&code);
+    test.opcodes = {O::S_LOAD_DWORD, O::S_LOAD_DWORDX8, O::S_MOV_B32, O::S_LSHL_B32,
+        O::S_AND_B32, O::S_CMP_LT_I32, O::S_CSELECT_B32, O::S_OR_B32, O::S_ADD_I32,
+        O::S_ANDN2_B32, O::S_CBRANCH_SCC1, O::S_CBRANCH_EXECZ, O::S_BRANCH, O::IMAGE_LOAD,
+        O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "bounded image candidates", compiled.resources.images.size() == 32u,
+            "loop-selected key escaped its compare-bounded domain");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, vk::Sampler{},
+                    images);
+    const std::vector<u32> expected{mask == 0u ? 0xdeadbeefu
+        : std::bit_cast<u32>(static_cast<float>(std::countr_zero(mask) + 1))};
+    CompareWords(test, "first set bit selects its pointer-table image", expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s mask=0x%08x ok\n", test.name, mask);
+  }
+}
+
+// DS2 cs 0x12db0180e6634d01.
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -47683,6 +47769,138 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", name);
   for (const auto native_sampler : native_samplers) vulkan.Device().destroySampler(native_sampler);
   vulkan.DestroyImage(&textures[0]);
+}
+
+// Control skeleton of DS2 cs 0x98af2e853f33b143.
+TestCase ImageLoadLoopSelectedPointerTable() {
+  using O = ShaderOpcode;
+  constexpr u32 vcc_lo = 106u, vcc_hi = 107u, exec_lo = 126u, null_sgpr = 125u;
+  constexpr u32 zero = InlineU32(0), one = InlineU32(1), minus_one = 193u;
+  constexpr u32 root = 0x40u, table = 0x100u;
+  constexpr std::array<u32, 2> table_offsets{9184u, 12384u};
+  enum Label { Outer, Find, Found, Inner, Skip, Restore, Done, Count };
+  std::vector<u32> code;
+  std::array<size_t, Count> labels{};
+  std::vector<std::pair<size_t, Label>> fixups;
+  const auto mark = [&](Label label) { labels[label] = code.size(); };
+  const auto branch = [&](u32 opcode, Label label) {
+    fixups.emplace_back(code.size(), label);
+    code.push_back(EncodeSopp(opcode));
+  };
+  const auto buffer = [&](u32 opcode, u32 vdata, u32 srsrc, u32 offset) {
+    code.push_back(EncodeMubuf0(opcode, offset, true, false));
+    code.push_back(EncodeMubuf1(vdata, srsrc, 0));
+  };
+  const auto image_load = [&](u32 vdata, u32 srsrc) {
+    code.push_back(EncodeMimg0(0x00, 0x7, 0, false, 5));
+    code.push_back(EncodeMimg1(vdata, 80, srsrc / 4u));
+  };
+  code.push_back(EncodeSmem0(0x02, 80, 2));  // s_load_dwordx4 s[80:83], s[4:5]
+  code.push_back(EncodeSmem1(0, null_sgpr));
+  buffer(0x0c, 29, 0, 0);  // buffer_load_dword v29
+  buffer(0x0c, 38, 0, 4);  // buffer_load_dword v38
+  buffer(0x0c, 77, 0, 8);  // buffer_load_dword v77
+  code.push_back(EncodeSopp(0x0c));
+  code.push_back(EncodeVop1(0x01, 7, zero));  // v_mov_b32 v7, 0
+  code.push_back(EncodeSMovB32(92, zero));  // s_mov_b32 s92, 0
+  code.push_back(EncodeSMovB32(93, exec_lo));  // s_mov_b32 s93, exec_lo
+  mark(Outer);
+  branch(0x08, Done);  // s_cbranch_execz
+  code.push_back(EncodeVopc(0xc2, zero, 29));  // v_cmp_eq_u32 vcc, 0, v29
+  code.push_back(EncodeSopc(0x03, 92, InlineU32(2)));  // s_cmp_ge_i32 s92, 2
+  code.push_back(EncodeSop2(0x0a, vcc_hi, exec_lo, zero));  // s_cselect_b32 vcc_hi, exec_lo, 0
+  code.push_back(EncodeSop2(0x10, vcc_lo, vcc_lo, vcc_hi));  // s_or_b32 vcc_lo, vcc_lo, vcc_hi
+  code.push_back(EncodeSop2(0x14, exec_lo, exec_lo, vcc_lo));  // s_andn2_b32 exec, exec, vcc
+  branch(0x08, Done);
+  code.push_back(EncodeVop1(0x01, 4, zero));  // v_mov_b32 v4, 0
+  code.push_back(EncodeSMovB32(vcc_hi, zero));  // s_mov_b32 vcc_hi, 0
+  mark(Find);
+  code.push_back(EncodeSop2(0x1e, vcc_lo, one, vcc_hi));  // s_lshl_b32 vcc_lo, 1, vcc_hi
+  code.push_back(EncodeVop2(0x1b, 5, vcc_lo, 38));  // v_and_b32 v5, vcc_lo, v38
+  code.push_back(EncodeVopc(0xc2, zero, 5));  // v_cmp_eq_u32 vcc, 0, v5
+  code.push_back(EncodeSopc(0x04, vcc_hi, InlineU32(32)));  // s_cmp_lt_i32 vcc_hi, 32
+  code.push_back(EncodeVop2(0x01, 6, one, 7));  // v_cndmask_b32 v6, 1, v7
+  code.push_back(EncodeSop2(0x0a, vcc_lo, zero, one));  // s_cselect_b32 vcc_lo, 0, 1
+  code.push_back(EncodeSop2(0x0a, 40, vcc_hi, minus_one));  // s_cselect_b32 s40, vcc_hi, -1
+  code.push_back(EncodeVop2(0x1c, 6, vcc_lo, 6));  // v_or_b32 v6, vcc_lo, v6
+  code.push_back(EncodeVopc(0xc5, zero, 6));  // v_cmp_ne_u32 vcc, 0, v6
+  branch(0x07, Found);  // s_cbranch_vccnz
+  code.push_back(EncodeVopc(0xc5, zero, 5));  // v_cmp_ne_u32 vcc, 0, v5
+  code.push_back(EncodeVop2(0x25, 5, one, 4));  // v_add_nc_u32 v5, 1, v4
+  code.push_back(EncodeSop2(0x02, vcc_hi, vcc_hi, one));  // s_add_i32 vcc_hi, vcc_hi, 1
+  code.push_back(EncodeVop2(0x01, 4, Vgpr(4), 5));  // v_cndmask_b32 v4, v4, v5
+  branch(0x02, Find);  // s_branch
+  mark(Found);
+  code.push_back(EncodeSopc(0x04, 40, zero));  // s_cmp_lt_i32 s40, 0
+  code.push_back(EncodeSop2(0x0a, vcc_lo, exec_lo, zero));  // s_cselect_b32 vcc_lo, exec_lo, 0
+  code.push_back(EncodeSop2(0x14, exec_lo, exec_lo, vcc_lo));  // s_andn2_b32 exec, exec, vcc
+  branch(0x08, Done);
+  code.push_back(EncodeSMovB32(94, exec_lo));  // s_mov_b32 s94, exec_lo
+  code.push_back(EncodeVopc(0xd5, zero, 4));  // v_cmpx_ne_u32 exec, 0, v4
+  branch(0x08, Restore);
+  code.push_back(EncodeSMovB32(36, zero));  // s_mov_b32 s36, 0
+  code.push_back(EncodeSop2(0x1e, vcc_lo, 40, InlineU32(5)));  // s_lshl_b32 vcc_lo, s40, 5
+  code.push_back(EncodeSmem0(0x03, 40, 40));  // s_load_dwordx8 s[40:47], s[80:81], vcc_lo
+  code.push_back(EncodeSmem1(table_offsets[0], vcc_lo));
+  code.push_back(EncodeSmem0(0x03, 72, 40));  // s_load_dwordx8 s[72:79], s[80:81], vcc_lo
+  code.push_back(EncodeSmem1(table_offsets[1], vcc_lo));
+  code.push_back(EncodeSopp(0x0c));
+  mark(Inner);
+  code.push_back(EncodeSMovB32(vcc_hi, exec_lo));  // s_mov_b32 vcc_hi, exec_lo
+  image_load(4, 72);  // image_load v[4:6], v[80:82], s[72:79]
+  code.push_back(EncodeSopp(0x0c));
+  code.push_back(EncodeVopc(0xd4, Vgpr(4), 77));  // v_cmpx_gt_u32 exec, v4, v77
+  branch(0x08, Skip);
+  buffer(0x1c, 4, 12, 0);  // buffer_store_dword v4
+  mark(Skip);
+  code.push_back(EncodeSMovB32(exec_lo, vcc_hi));  // s_mov_b32 exec_lo, vcc_hi
+  image_load(8, 40);  // image_load v[8:10], v[80:82], s[40:47]
+  code.push_back(EncodeSopp(0x0c));
+  buffer(0x1c, 8, 12, 4);  // buffer_store_dword v8
+  code.push_back(EncodeSop2(0x02, 36, 36, one));  // s_add_i32 s36, s36, 1
+  code.push_back(EncodeSopc(0x04, 36, InlineU32(8)));  // s_cmp_lt_i32 s36, 8
+  branch(0x05, Inner);  // s_cbranch_scc1
+  mark(Restore);
+  code.push_back(EncodeSMovB32(exec_lo, 94));  // s_mov_b32 exec_lo, s94
+  code.push_back(EncodeSop2(0x02, 92, 92, one));  // s_add_i32 s92, s92, 1
+  branch(0x02, Outer);
+  mark(Done);
+  code.push_back(EncodeSMovB32(exec_lo, 93));  // s_mov_b32 exec_lo, s93
+  AppendEnd(&code);
+  for (const auto [at, label] : fixups)
+    code[at] |= static_cast<u32>(static_cast<int32_t>(labels[label]) -
+                                 static_cast<int32_t>(at) - 1) & 0xffffu;
+
+  TestCase test;
+  test.name = "ImageLoadLoopSelectedPointerTable";
+  test.code = std::move(code);
+  test.opcodes = {O::S_LOAD_DWORDX4, O::S_LOAD_DWORDX8, O::S_CSELECT_B32,
+                  O::S_ANDN2_B32, O::S_CBRANCH_VCCNZ, O::V_CMPX_NE_U32,
+                  O::V_CMPX_GT_U32, O::IMAGE_LOAD, O::S_ENDPGM};
+  test.initial.resize((table + table_offsets[1] + 32u * 32u) / 4u);
+  test.initial[root / 4u] = table;
+  for (const auto offset : table_offsets) {
+    for (u32 key = 0; key < 32u; ++key) {
+      auto *words = &test.initial[(table + offset) / 4u + key * 8u];
+      words[0] = 0x1000u + key * 0x100u;
+      words[1] = BufferFormat(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+      words[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::ImageType::kColor2DArray) << 28u);
+    }
+  }
+  test.user_data[3] = 3u << 28u;
+  test.user_data[4] = root;
+  test.user_data[50] = 1u << 20u;
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.compute_info.wave_size = 32u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.threads_num[0] = 32u;
+  test.compute_info.threads_num[1] = 1u;
+  test.compute_info.threads_num[2] = 1u;
+  test.has_compute_info = true;
+  test.compile_only = true;
+  return test;
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -50089,6 +50307,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreVariants);
   AddCase(ImageD16StoreUnpacksHalfPairs);
   AddCase(ImageStoreMipSelectsPpsa01340Descriptor);
+  AddCase(ImageLoadLoopSelectedPointerTable);
   AddCase(ImageStoreSingleMipBounds<0>);
   AddCase(ImageStoreSingleMipBounds<1>);
   AddCase(ImageStoreSingleMipBounds<2>);
@@ -58175,6 +58394,7 @@ int main(int argc, char **argv) {
     CheckGuardedSelectorImageTable(vulkan);
     CheckInclusiveGuardImageTable(vulkan);
     CheckRecordWordImageTable(vulkan);
+    CheckLoopSelectedPointerImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -58369,6 +58589,7 @@ int main(int argc, char **argv) {
   CheckGuardedSelectorImageTable(vulkan);
   CheckInclusiveGuardImageTable(vulkan);
   CheckRecordWordImageTable(vulkan);
+  CheckLoopSelectedPointerImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);

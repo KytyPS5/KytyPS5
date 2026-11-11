@@ -3338,6 +3338,136 @@ void TestAssembledRecordWordImageTable() {
                "assembled record-word key accepted a lane the waterfall may not have written");
   CheckRecordWordMaterialization(plan);
 }
+
+// DS2 vs 0x788243a6d8537c1f: the NGG prologue writes EXEC = ~0 >> (64 - n), so the first
+// waterfall drains a computed mask whose lanes only the translator's lane-bit predicate names.
+void TestLaneBitRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, UnguardedAccess, UndrainedUse };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture(ShaderType::Vertex);
+    fixture.program.wave_size = 64u;
+    RecordWordBuilder build{fixture};
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *after = fixture.AddBlock();
+    auto *second = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto jump = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto computed = fixture.Emit(ValueOpcode::ShiftRightLogical64,
+        {Value(~uint64_t{0}),
+         fixture.Emit(ValueOpcode::ISub32, {Value(64u), fixture.UserData(5)})});
+    const auto low = fixture.Emit(ValueOpcode::CompositeExtractU64, {computed, Value(0u)});
+    const auto upper = fixture.Emit(ValueOpcode::CompositeExtractU64, {computed, Value(1u)});
+    // The translator's ThreadBit of EXEC = {low, upper}.
+    const auto lane_id = fixture.Emit(ValueOpcode::LaneId);
+    const auto half = fixture.Emit(ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::ULessThan32, {lane_id, Value(32u)}), low, upper});
+    const auto shifted = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+        {half, fixture.Emit(ValueOpcode::BitwiseAnd32, {lane_id, Value(31u)})});
+    const auto exec = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
+    const auto varying = fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
+    // Only the EXEC lanes clamp their tile.
+    const auto tile = fixture.Emit(ValueOpcode::SelectU32,
+        {exec, fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), varying}), varying});
+    choose(entry, header, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {exec}, CFG::BranchCondition::ExecNonZero));
+    auto &carried = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    std::array<Inst *, 2> remaining;
+    for (auto &word : remaining)
+      word = &header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = header;
+    const auto first = fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[0])});
+    const auto high = fixture.Emit(ValueOpcode::BitwiseOr32,
+        {fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[1])}), Value(32u)});
+    const auto lane = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::UMin32, {first, high}), Value(63u)});
+    const auto key_tile = fixture.Emit(ValueOpcode::ReadLane, {tile, lane});
+    const auto match = fixture.Emit(ValueOpcode::LogicalAnd,
+        {exec, fixture.Emit(ValueOpcode::IEqual32, {key_tile, tile})});
+    choose(header, body, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {match}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = body;
+    const auto material = build.Material(key_tile);
+    const auto written = fixture.Emit(ValueOpcode::SelectU32, {match, material, Value(&carried)});
+    // A key formed inside the loop is used while the mask may still name absent lanes.
+    if (variant == Variant::UndrainedUse)
+      build.Access(fixture.Emit(ValueOpcode::IAdd32,
+                                {fixture.UserData(2),
+                                 fixture.Emit(ValueOpcode::IMul32, {Value(31u), material})}),
+                   match);
+    jump(body, latch);
+    auto &assembled = latch->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = latch;
+    const auto served = fixture.Emit(ValueOpcode::Ballot, {match});
+    std::array<Value, 2> left;
+    for (uint32_t word = 0; word < 2u; ++word)
+      left[word] = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {Value(remaining[word]),
+           fixture.Emit(ValueOpcode::BitwiseNot32,
+                        {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {served, Value(word)})})});
+    choose(latch, header, after,
+           fixture.Emit(ValueOpcode::ConditionRef,
+                        {fixture.Emit(ValueOpcode::INotEqual32,
+                                      {fixture.Emit(ValueOpcode::BitwiseOr32, {left[0], left[1]}),
+                                       Value(0u)})},
+                        CFG::BranchCondition::SccNonZero));
+    fixture.block = after;
+    const auto key_value = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.UserData(2), fixture.Emit(ValueOpcode::IMul32, {Value(31u), Value(&assembled)})});
+    jump(after, second);
+    auto &waiting = second->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixture.block = second;
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(second, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    if (variant != Variant::UndrainedUse) build.Access(key, selected);
+    jump(access, next_key);
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, second, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest}, CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    carried.AddPhiOperand(entry, varying);
+    carried.AddPhiOperand(latch, Value(&assembled));
+    remaining[0]->AddPhiOperand(entry, low);
+    remaining[0]->AddPhiOperand(latch, left[0]);
+    remaining[1]->AddPhiOperand(entry, upper);
+    remaining[1]->AddPhiOperand(latch, left[1]);
+    assembled.AddPhiOperand(header, Value(&carried));
+    assembled.AddPhiOperand(body, written);
+    waiting.AddPhiOperand(after, variant == Variant::UnguardedAccess ? Value(true) : exec);
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  for (const auto variant : {Variant::UnguardedAccess, Variant::UndrainedUse})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "lane-bit record-word key accepted a lane the drained mask does not name");
+  CheckRecordWordMaterialization(plan);
+}
+
 // DS2 vs 0x788243a6d8537c1f: a wave-uniform T[tile] read at the first lane of the EXEC
 // predicate, whose lanes no branch proves nonempty; its key is used only on those lanes.
 void TestUniformRecordWordImageTable() {
@@ -11004,6 +11134,7 @@ int main() {
     Run("affine record-word image table", TestAffineRecordWordImageTable);
     Run("assembled record-word image table", TestAssembledRecordWordImageTable);
     Run("loop-selected image table", TestLoopSelectedImageTable);
+    Run("lane-bit record-word image table", TestLaneBitRecordWordImageTable);
     Run("uniform record-word image table", TestUniformRecordWordImageTable);
     Run("global record-word image table", TestGlobalRecordWordImageTable);
     Run("material-word image table", TestMaterialWordImageTable);

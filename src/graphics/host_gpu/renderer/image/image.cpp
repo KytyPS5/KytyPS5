@@ -590,28 +590,33 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	// Each source level lands on the destination level as many steps below `mip`.
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
-	        layer >= backing.layers);
+	        source.backing.mip_levels > backing.mip_levels - mip || layer >= backing.layers);
 	m_scheduler.EndRendering();
-	const auto width  = std::max(backing.extent.width >> mip, 1u);
-	const auto height = std::max(backing.extent.height >> mip, 1u);
-	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
-	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
+	const auto depth = std::max(backing.extent.depth >> mip, 1u);
+	EXIT_IF(std::max(backing.extent.width >> mip, 1u) != source.backing.extent.width ||
+	        std::max(backing.extent.height >> mip, 1u) != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
-	std::array<vk::ImageCopy, 2> copies {};
-	uint32_t                     copy_count = 0;
-	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
-	                         vk::ImageAspectFlagBits::eStencil}) {
-		if (!static_cast<bool>(aspects & aspect)) {
-			continue;
+	std::vector<vk::ImageCopy> copies;
+	for (uint32_t level = 0; level < source.backing.mip_levels; ++level) {
+		const auto target = mip + level;
+		for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
+		                         vk::ImageAspectFlagBits::eStencil}) {
+			if (!static_cast<bool>(aspects & aspect)) {
+				continue;
+			}
+			auto& copy          = copies.emplace_back();
+			copy.srcSubresource = {aspect, level, 0, source_layers};
+			copy.dstSubresource = {aspect, target, layer, destination_layers};
+			copy.extent         = {std::max(backing.extent.width >> target, 1u),
+			                       std::max(backing.extent.height >> target, 1u),
+			                       std::max(backing.extent.depth >> target, 1u)};
 		}
-		auto& copy          = copies[copy_count++];
-		copy.srcSubresource = {aspect, 0, 0, source_layers};
-		copy.dstSubresource = {aspect, mip, layer, destination_layers};
-		copy.extent         = {width, height, depth};
 	}
+	const auto copy_count = static_cast<uint32_t>(copies.size());
 	auto command = m_scheduler.Current().Handle();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},

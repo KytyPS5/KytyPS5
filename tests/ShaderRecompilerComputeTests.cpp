@@ -6871,6 +6871,62 @@ public:
         RenderExecutorTestAccess::ResetBindings(executor);
       }
 
+      // A streamer's descriptor based at a texture's second mip: its levels are the texture's
+      // levels 1.., so either lookup order ends with one image the chain views from level 1.
+      {
+        const auto layout = [](uint64_t address, uint32_t size, uint32_t levels) {
+          ImageInfo info{};
+          info.data = {address, 0};
+          info.pixel_format = vk::Format::eBc1RgbaUnormBlock;
+          info.guest_format = Prospero::BufferFormat::kBc1UNorm;
+          info.type = Prospero::ImageType::kColor2D;
+          info.extent = {size, size, 1};
+          info.resources = {levels, 1};
+          info.bytes_per_block = 8;
+          info.tile_mode = Prospero::TileMode::kStandard256B;
+          info.UpdateSize();
+          return info;
+        };
+        const auto lower_address = [&](uint64_t texture) {
+          return texture + layout(texture, 64u, 7u).mip_layout[1].offset -
+                 layout(texture, 32u, 6u).mip_layout[0].offset;
+        };
+        const std::array<uint64_t, 2> mipped{base + 0x300000u, base + 0x340000u};
+        const auto full = layout(mipped[0], 64u, 7u);
+        const auto lower = layout(lower_address(mipped[0]), 32u, 6u);
+        Require(name, "mip chain layout",
+                lower.MipOf(full) == 1 && lower.SliceOf(full, 1) == 0 && full.MipOf(lower) < 0 &&
+                    (lower.data.address & 0xffu) == 0u,
+                "a chain based at a texture's second mip is not that texture's lower levels");
+        const auto desc_of = [](const ImageInfo &info, uint32_t base_level) {
+          TextureCache::ImageDesc desc{};
+          desc.info = info;
+          desc.view_info.format = info.pixel_format;
+          desc.view_info.base_level = base_level;
+          desc.view_info.level_count = info.resources.levels - base_level;
+          return desc;
+        };
+        for (uint32_t order = 0; order < 2u; ++order) {
+          auto texture = desc_of(layout(mipped[order], 64u, 7u), 0u);
+          // The chain's view starts at its own level 1, the texture's level 2.
+          auto chain = desc_of(layout(lower_address(mipped[order]), 32u, 6u), 1u);
+          if (order == 1u) {
+            (void)textures.FindImage(chain);
+            chain = desc_of(layout(lower_address(mipped[order]), 32u, 6u), 1u);
+          }
+          const auto texture_id = textures.FindImage(texture);
+          const auto chain_id = textures.FindImage(chain);
+          Require(name, "mip chain view",
+                  texture_id && chain_id == texture_id &&
+                      textures.GetImage(texture_id).info.resources.levels == 7u &&
+                      chain.view_info.base_level == 2u && chain.view_info.level_count == 5u &&
+                      textures.FindTexture(chain_id, chain),
+                  "a descriptor based at a texture's second mip did not view the texture's "
+                  "image from its own levels");
+          RenderExecutorTestAccess::ResetBindings(executor);
+        }
+      }
+
       // Sampling the larger levels needs a full image; a clamped request then shares it.
       const auto unclamped = resolve(clamped_address, 0u);
       Require(name, "replacement",

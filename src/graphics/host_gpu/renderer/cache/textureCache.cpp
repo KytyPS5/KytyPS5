@@ -1397,7 +1397,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+			// The request's own levels start at the container's level view_mip.
+			desc.view_info.base_level += static_cast<uint32_t>(view_mip);
 		}
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);

@@ -230,6 +230,32 @@ uint32_t ImageInfo::DataAlignment() const {
 	return tiling.block.block_size;
 }
 
+namespace {
+
+// A chain based at a lower mip of a texture: each of its levels is the container's level
+// `base + j`, at the same guest bytes, extent and tiling.
+[[nodiscard]] bool SameMipChain(const ImageInfo& chain, const ImageInfo& container,
+                                uint32_t base) noexcept {
+	if (chain.resources.layers != 1 || container.resources.layers != 1 ||
+	    chain.resources.levels > container.resources.levels - base ||
+	    chain.resources.levels > chain.mip_layout.size()) {
+		return false;
+	}
+	for (uint32_t level = 0; level < chain.resources.levels; ++level) {
+		const auto& mip   = chain.mip_layout[level];
+		const auto& outer = container.mip_layout[base + level];
+		if (chain.MipExtent(level) != container.MipExtent(base + level) ||
+		    mip.pitch != outer.pitch || mip.height != outer.height || mip.size != outer.size ||
+		    mip.size == 0 || mip.tail_x != outer.tail_x || mip.tail_y != outer.tail_y ||
+		    chain.data.address + mip.offset != container.data.address + outer.offset) {
+			return false;
+		}
+	}
+	return true;
+}
+
+} // namespace
+
 std::optional<ImageInfo> ImageInfo::MipChainFrom(uint32_t level) const {
 	// Single-slice tiled 2D chains only: their layout always exists for a smaller extent.
 	if (level == 0 || level >= resources.levels || resources.layers != 1 || IsVolume() ||
@@ -253,11 +279,11 @@ std::optional<ImageInfo> ImageInfo::MipChainFrom(uint32_t level) const {
 
 int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
 	if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
-	    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
+	    IsVolume() || resources.levels == 0 || resources.layers == 0 ||
 	    container.resources.layers == 0 || mip < 0 ||
 	    static_cast<uint32_t>(mip) >= container.resources.levels ||
-	    container.resources.levels > container.mip_layout.size() ||
-	    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
+	    container.resources.levels > container.mip_layout.size() || !data.Valid() ||
+	    !container.data.Valid() || data.address < container.data.address ||
 	    data.End() > container.data.End()) {
 		return -1;
 	}
@@ -267,7 +293,11 @@ int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexce
 		return -1;
 	}
 
-	const auto  level  = static_cast<uint32_t>(mip);
+	const auto level = static_cast<uint32_t>(mip);
+	// A descriptor based at a lower mip: its levels are the container's level `mip` + j.
+	if (resources.levels != 1) {
+		return level != 0 && SameMipChain(*this, container, level) ? 0 : -1;
+	}
 	const auto& layout = container.mip_layout[level];
 	if (extent.width != std::max(container.extent.width >> level, 1u) ||
 	    extent.height != std::max(container.extent.height >> level, 1u) ||

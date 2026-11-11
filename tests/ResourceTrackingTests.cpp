@@ -8190,6 +8190,39 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
         "runtime-rooted invariant loop lost its buffer source");
 }
 
+void TestLoopPhiBufferAtomicIAdd32() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  std::array<Inst *, 4> phis{};
+  for (uint32_t word = 0; word < 4u; ++word) {
+    phis[word] = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U32));
+  }
+  for (uint32_t word = 0; word < 4u; ++word) {
+    const auto next = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {Value(phis[word]), Value(word == 0u ? 1u : 0u)}, 0, loop);
+    phis[word]->AddPhiOperand(entry, fixture.UserData(word));
+    phis[word]->AddPhiOperand(loop, next);
+  }
+  const auto handle = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(phis[0]), Value(phis[1]), Value(phis[2]), Value(phis[3])},
+      MemoryFlags{0, 0x980}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+               {handle, Value(0u), Value(0u), Value(1u), Value(0u),
+                Value(true)},
+               fixture.AddMemory(memory, 0x980), loop);
+  fixture.PlanAndTrack();
+  Check(fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
+        "loop-Phi BufferAtomicIAdd32 was not planned as an indirect buffer");
+}
+
 void TestInvariantLoopPhi() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -9188,6 +9221,7 @@ int main() {
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
+    Run("loop-phi buffer atomic iadd32", TestLoopPhiBufferAtomicIAdd32);
     Run("invariant loop phi", TestInvariantLoopPhi);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     Run("descriptor behind a long phi chain", TestDescriptorBehindLongPhiChain);

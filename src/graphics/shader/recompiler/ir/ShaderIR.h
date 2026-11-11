@@ -92,6 +92,7 @@ struct MemoryInfo {
 		       (formatted ? opcode == ValueOpcode::LoadBufferU32
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
 		                        opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::BufferAtomicIAdd32 ||
 		                        opcode == ValueOpcode::LoadBufferU32x2 ||
 		                        opcode == ValueOpcode::LoadBufferU32x3 ||
 		                        opcode == ValueOpcode::LoadBufferU32x4);

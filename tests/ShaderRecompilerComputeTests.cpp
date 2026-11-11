@@ -716,6 +716,30 @@ struct PipelineCacheTestAccess {
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 
+  // The module a resource-free program whose accesses at `decoded` decode in the shader finds
+  // among modules compiled with the given decoded sets; -1 for none.
+  static int FindModuleIndex(std::vector<std::vector<uint32_t>> modules,
+                             std::vector<uint32_t> decoded) {
+    static ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &compute;
+    options.dump_ir = false;
+    static const std::vector<uint32_t> end_program{0xbf810000u}; // S_ENDPGM: no resources.
+    PipelineCache::Program program;
+    program.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(
+        ShaderRecompiler::TranslateProgram(end_program, options).program);
+    program.in_shader_buffer_pcs = std::move(decoded);
+    for (auto &pcs : modules)
+      program.modules.push_back(ShaderModule{.in_shader_buffer_pcs = std::move(pcs)});
+    const ShaderRecompiler::IR::SrtRuntime runtime{};
+    const auto *found = program.FindModule<false>(runtime, 0);
+    return found == nullptr ? -1 : static_cast<int>(found - program.modules.data());
+  }
+
   static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
                                         ShaderVertexInputInfo &input) {
     uint32_t push_data_cursor = 0;
@@ -37692,6 +37716,103 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
   return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
 }
 
+// BUFFER_LOAD_FORMAT_XYZW through a GPU-selected V#: each component reads the channel its
+// DST_SEL names (DS2 cs 0x1a054b815fefc8a5 decodes XYZ this way). A V# based past the guest's
+// GPU space reads as unmapped; its page index truncated to 32 bits is the mapped test page.
+TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave) {
+  using O = ShaderOpcode;
+  using F = Prospero::BufferFormat;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t BeyondSpace = 0x0000470110000000ull;
+  struct DescriptorCase {
+    F format;
+    std::array<u32, 4> selectors;
+    std::array<u32, 4> payload;
+    std::array<u32, 4> expected;
+    bool beyond_space = false;
+  };
+  const std::vector<DescriptorCase> cases = {
+      {F::k32_32_32_32UInt, {4, 5, 6, 7}, {11, 22, 33, 44}, {11, 22, 33, 44}},
+      {F::k32_32_32_32UInt, {6, 5, 4, 7}, {11, 22, 33, 44}, {33, 22, 11, 44}},
+      {F::k32_32_32_32UInt, {4, 0, 1, 7}, {11, 22, 33, 44}, {11, 0, 1, 44}},
+      {F::k16_16_16_16UInt, {4, 5, 6, 7}, {0x00020001u, 0x00040003u, 0u, 0u}, {1, 2, 3, 4}},
+      {F::k32_32_32Float, {4, 5, 6, 1}, {0x3f800000u, 0x40000000u, 0x40400000u, 0xdeadbeefu},
+       {0x3f800000u, 0x40000000u, 0x40400000u, 0x3f800000u}},
+      {F::k32_32_32_32UInt, {4, 5, 6, 1}, {11, 22, 33, 44}, {0, 0, 0, 1}, true},
+  };
+  TestCase test;
+  test.name = wave == 32u ? "BufferLoadFormatXyzwGpuSelectedDescriptors32"
+                          : "BufferLoadFormatXyzwGpuSelectedDescriptors64";
+  const auto align256 = [](u32 bytes) { return (bytes + 255u) & ~255u; };
+  const u32 count = static_cast<u32>(cases.size());
+  const auto selection_base = align256(count * 16u);
+  const auto descriptor_base = align256(selection_base + count * 4u);
+  const auto payload_base = align256(descriptor_base + count * 32u);
+  test.initial.resize((payload_base + count * 64u) / 4u);
+  test.expected.resize(count * 4u);
+  for (u32 i = 0; i < count; ++i) {
+    const auto &input = cases[i];
+    const u32 data_offset = payload_base + i * 64u;
+    const uint64_t address = (input.beyond_space ? BeyondSpace : GuestBase) + data_offset;
+    const u32 dst_sel = input.selectors[0] | (input.selectors[1] << 3u) |
+                        (input.selectors[2] << 6u) | (input.selectors[3] << 9u);
+    const std::array<u32, 8> row{static_cast<u32>(address),
+                                 static_cast<u32>(address >> 32u) | (16u << 16u), 1u,
+                                 dst_sel | (static_cast<u32>(input.format) << 12u), 0u, 0u, 0u, 0u};
+    std::copy(row.begin(), row.end(), test.initial.begin() + descriptor_base / 4u + i * 8u);
+    std::copy(input.payload.begin(), input.payload.end(), test.initial.begin() + data_offset / 4u);
+    // The GPU selects case count-1-i in iteration i.
+    test.initial[selection_base / 4u + i] = count - 1u - i;
+    std::copy(cases[count - 1u - i].expected.begin(), cases[count - 1u - i].expected.end(),
+              test.expected.begin() + i * 4u);
+  }
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 28, 0);
+  AppendSMovLiteral(&code, 29, count);
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeVop1(0x01, 30, 28));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 30));
+  code.push_back(EncodeMubuf0(0x0c, selection_base));
+  code.push_back(EncodeMubuf1(2, 0, 30));
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(2)));
+  code.push_back(EncodeSop2(0x1e, 20, 20, InlineU32(5)));
+  code.push_back(EncodeSmem0(0x0b, 8, 0));
+  code.push_back(EncodeSmem1(descriptor_base, 20));
+  code.push_back(EncodeVop1(0x01, 21, 12));
+  code.push_back(EncodeVop1(0x01, 22, 13));
+  code.push_back(EncodeMubuf0(0x03, 0, true, true, false)); // buffer_load_format_xyzw v[4:7]
+  code.push_back(EncodeMubuf1(4, 2, 21, 14));
+  code.push_back(EncodeVop1(0x01, 31, 28));
+  code.push_back(EncodeVop2(0x1a, 31, InlineU32(4), 31));
+  for (u32 component = 0; component < 4u; ++component) {
+    if (component != 0u) code.push_back(EncodeVop2(0x25, 31, InlineU32(4), 31));
+    AppendBufferStoreDword(&code, 4u + component, 31);
+  }
+  code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 28, 29));
+  code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge"};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
+                  O::S_BUFFER_LOAD_DWORDX8, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferLoadFormatXyzwGpuSelectedDescriptors32() {
+  return BufferLoadFormatXyzwGpuSelectedDescriptors(32u);
+}
+
+TestCase BufferLoadFormatXyzwGpuSelectedDescriptors64() {
+  return BufferLoadFormatXyzwGpuSelectedDescriptors(64u);
+}
 
 TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
@@ -50915,6 +51036,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
+  AddCase(BufferLoadFormatXyzwGpuSelectedDescriptors32);
+  AddCase(BufferLoadFormatXyzwGpuSelectedDescriptors64);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
   AddCase(BufferLoadUshortGpuSelectedDescriptors);
   AddCase(BufferLoadUshortGpuSelectedDescriptors64);
@@ -51424,6 +51547,19 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
 
 // With a shader store a restart compiles nothing and creates every pipeline before the first
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
+// A module decoding GPU-selected accesses in the shader has other bindings than one that binds
+// them: a program only reuses a module whose decoded set is its own.
+void CheckModuleIdentityDecodedAccesses() {
+  constexpr const char *name = "ModuleIdentityDecodedAccesses";
+  Require(name, "bound access", PipelineCacheTestAccess::FindModuleIndex({{0x40u}, {}}, {}) == 1,
+          "a program reused a module that decodes an access it binds");
+  Require(name, "decoded access",
+          PipelineCacheTestAccess::FindModuleIndex({{}, {0x40u}}, {0x40u}) == 1,
+          "a program reused a module that binds an access it decodes");
+  Require(name, "no module", PipelineCacheTestAccess::FindModuleIndex({{}}, {0x40u}) == -1,
+          "a program found a module for another decoded set");
+  std::printf("[host]    %-32s ok\n", name);
+}
 void CheckShaderStore(VulkanHarness &vulkan) {
   constexpr const char *name = "ShaderStore";
   constexpr uintptr_t base = 0x0000000205000000ull;
@@ -58169,6 +58305,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
     VulkanHarness vulkan;
+    CheckModuleIdentityDecodedAccesses();
     CheckShaderStore(vulkan);
     return 0;
   }
@@ -59493,6 +59630,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckModuleIdentityDecodedAccesses();
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();

@@ -88,13 +88,15 @@ struct MemoryInfo {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
-		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		return data_bits == 32u && (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x2 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x3 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x4
+		                                      : opcode == ValueOpcode::ReadConstBuffer ||
+		                                            opcode == ValueOpcode::LoadBufferU32 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x2 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x3 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -831,7 +833,8 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
-
+	// Buffer access pcs whose descriptor stays a GPU value: tracking plans no host table for them.
+	std::vector<uint32_t> in_shader_buffer_pcs;
 };
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);

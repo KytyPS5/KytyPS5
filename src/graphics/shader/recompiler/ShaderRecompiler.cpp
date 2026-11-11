@@ -619,6 +619,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
 		     MakeIrDump(cfg_dump, ir).c_str());
 	}
+	ir.in_shader_buffer_pcs.assign(options.in_shader_buffer_pcs.begin(),
+	                               options.in_shader_buffer_pcs.end());
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
 	TranslateResult result;
 	result.program = std::move(ir);

@@ -233,6 +233,13 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		const auto format = Format::GetFormatInfo(descriptor.Format());
 		if (!indexed || format.type == Format::ComponentType::Unknown)
 			return SpecializationFail("indirect formatted buffers require a supported indexed format");
+		// The emitter binds a formatted row only when every DST_SEL names a channel or constant.
+		for (uint32_t component = 0; component < 4u; ++component)
+			if (Format::ResolveFormattedSource(format,
+			                                   (descriptor.DstSelXYZW() >> (component * 3u)) & 7u)
+			        .kind == Format::FormattedSourceKind::Invalid)
+				return SpecializationFail(
+				    "indirect formatted buffers require defined DST_SEL selectors");
 		if (!formatted_read) {
 			const bool scalar = resource.max_byte_extent == 4u &&
 			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
@@ -1612,7 +1619,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* unbindable_pcs) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1689,14 +1697,19 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
+					bool unbindable = false;
 					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, snapshot,
-					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
+					        program, base.source, i, 4u, 4u, observed, snapshot, snapshot.buffers,
+					        specialization.buffers, [&](DescriptorValue& value) {
+						        unbindable = !NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
-					        }))
+						        return !unbindable;
+					        })) {
+						// A table row the host cannot bind: the access can decode it in the shader.
+						if (unbindable && unbindable_pcs != nullptr)
+							unbindable_pcs->push_back(base.first_use_pc);
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+					}
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i])) {
 				return false;

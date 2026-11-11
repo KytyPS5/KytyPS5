@@ -81,9 +81,10 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	auto& [id, handle, info, specialization, in_shader_buffer_pcs, function_code, vertex_formats,
+	       rect_parameters, mesh_task] = stage;
+	IoAll(io, id, info, specialization, in_shader_buffer_pcs, vertex_formats, rect_parameters,
+	      mesh_task);
 }
 
 } // namespace
@@ -242,6 +243,10 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
 				m_program_cache.erase(program);
 				return false;
+			}
+			// The plan was extracted with this module's accesses decoded in the shader.
+			if (inserted) {
+				program->second.in_shader_buffer_pcs = module.in_shader_buffer_pcs;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
 			program->second.modules.push_back(std::move(module));

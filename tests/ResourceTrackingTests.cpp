@@ -7285,9 +7285,11 @@ std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass
                                                   bool gpu_selected = false, uint32_t bias = 0u,
                                                   bool split_offsets = false,
                                                   bool workgroup_selected = false,
-                                                  uint32_t d32_components = 0u) {
+                                                  uint32_t d32_components = 0u,
+                                                  std::vector<uint32_t> in_shader_pcs = {}) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = std::make_unique<Fixture>();
+  fixture->program.in_shader_buffer_pcs = std::move(in_shader_pcs);
   auto& f = *fixture;
   std::array<Value, 4> table_words;
   for (uint32_t word = 0; word < 4u; ++word) table_words[word] = f.UserData(word);
@@ -7665,6 +7667,64 @@ void TestGuardedWaterfallBufferRecords() {
     Check(!materialize() && memory.reads == 0u, "waterfall accepted an excessive runtime bound");
     user_data[2] = 2u;
   }
+}
+
+// A GPU-selected table row the host cannot bind is reported by its access; rebuilt with that
+// access decoded in the shader, the plan materializes the same table (DS2 cs 0x1a054b815fefc8a5).
+void TestUnbindableTableRowDecodesInShader() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 256u;
+  memory.fail_address = memory.base + 0x2000u;
+  const auto fill = [&](bool swizzled_row) {
+    for (uint32_t slot = 0; slot < 4u; ++slot) {
+      for (uint32_t member = 0; member < 2u; ++member) {
+        const auto first = (table_offset + 160u + member * 16u + slot * 64u) / 4u;
+        memory.words[first] = 0x100000u + member * 0x10000u + slot * 0x1000u;
+        memory.words[first + 1u] = ((member == 0u ? 8u : 3u) << 16u) |
+                                   (swizzled_row && slot == 2u && member == 0u ? 1u << 31u : 0u);
+        memory.words[first + 2u] = 16u;
+        memory.words[first + 3u] = member == 0u
+            ? (static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+                  DstSel(4, 5, 6, 1) : 0x5204u;
+      }
+    }
+  };
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset + 3u, 0u, 384u, 0u,
+      uint32_t(memory.fail_address), 12u << 16u, 129600u, 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  // A 32-bit formatted XYZW load, the shape the shader can decode itself.
+  const auto table_fixture = MakeBufferRecordFixture(1u, false, true, 0u, false, false, 4u);
+  const auto plan = ExtractResourcePlan(table_fixture->program);
+  std::vector<uint32_t> roots;
+  for (const auto& buffer : plan.info.buffers)
+    if (plan.descriptor_sources[buffer.source].indirect_descriptor) roots.push_back(buffer.first_use_pc);
+  Check(roots.size() == 2u, "the fixture lost its two GPU-selected buffer tables");
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::vector<uint32_t> unbindable;
+  fill(false);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization, &unbindable) && unbindable.empty(),
+        "a bindable table reported an unbindable row");
+  fill(true);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization, &unbindable) &&
+            unbindable.size() == 1u && std::ranges::find(roots, unbindable[0]) != roots.end(),
+        "a swizzled table row was not reported by the access that selects it");
+  const auto decoded_fixture = MakeBufferRecordFixture(1u, false, true, 0u, false, false, 4u, unbindable);
+  const auto decoded = ExtractResourcePlan(decoded_fixture->program);
+  const bool table_left = std::ranges::any_of(decoded.info.buffers, [&](const auto& buffer) {
+    return buffer.first_use_pc == unbindable[0] &&
+           decoded.descriptor_sources[buffer.source].indirect_descriptor.has_value();
+  });
+  const auto in_shader = std::ranges::count_if(decoded_fixture->program.memory_info, [](const auto& memory) {
+    return memory.kind == ResourceKind::IndirectBuffer;
+  });
+  Check(!table_left && in_shader > 0, "the reported access kept a host table instead of decoding its V#");
+  std::vector<uint32_t> again;
+  Check(MaterializeResources(decoded, runtime, snapshot, specialization, &again) && again.empty(),
+        "the rebuilt plan still refused the table the shader now decodes");
 }
 
 void TestGpuSelectedBufferRecords() {
@@ -10912,6 +10972,7 @@ int main() {
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
     Run("table-selected descriptor names its records", TestTableSelectedDescriptorNamesItsRecords);
+    Run("unbindable table row decodes in shader", TestUnbindableTableRowDecodesInShader);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

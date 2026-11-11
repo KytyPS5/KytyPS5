@@ -26,6 +26,9 @@ struct CompileOptions {
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
+	// Buffer accesses (by pc) whose GPU-selected descriptor the shader decodes itself, because a
+	// table row the host enumerated cannot be bound.
+	std::span<const uint32_t>   in_shader_buffer_pcs;
 	ShaderStageInputInfo        input_info;
 };
 

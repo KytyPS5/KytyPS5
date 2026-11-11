@@ -903,6 +903,7 @@ struct IndirectBufferAccess {
 	uint32_t swizzle;
 	uint32_t format;
 	uint32_t selector;
+	uint32_t dst_sel; // DST_SEL_XYZW of a formatted read, three bits per component.
 	uint32_t mode;
 	uint32_t records;
 	uint32_t index_in_bounds;
@@ -951,6 +952,7 @@ IndirectBufferAccess PrepareIndirectBuffer(EmitterState& state,
 	    .swizzle          = swizzle,
 	    .format           = field(word3, 12, 7),
 	    .selector         = formatted ? field(word3, 0, 3) : 0u,
+	    .dst_sel          = formatted ? field(word3, 0, 12) : 0u,
 	    .mode             = field(word3, 28, 2),
 	    .records          = records,
 	    .index_in_bounds  = Binary(state, spv::OpULessThan, TypeBool(state), index, records),
@@ -1027,8 +1029,11 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
-	auto& state = ctx.state;
+// One component of a formatted read: `selector` is that component's DST_SEL.
+uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, IndirectBufferAccess buffer,
+                                        uint32_t selector) {
+	auto& state         = ctx.state;
+	buffer.selector     = selector;
 	const auto geometry = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
 	                          state.indirect_format_geometry_function, buffer.format);
@@ -1342,8 +1347,23 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			}
 			EmitLabel(state, state.builder.AllocateId());
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
-			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
+			uint32_t   result = 0u;
+			if (!memory.formatted) {
+				result =
+				    LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
+			} else if (components == 1u) {
+				result = LoadIndirectFormattedComponent(ctx, buffer, buffer.selector);
+			} else {
+				// Each component reads the channel its DST_SEL names from the same element.
+				std::array<uint32_t, 4> values {};
+				for (uint32_t component = 0; component < components; ++component)
+					values[component] = LoadIndirectFormattedComponent(
+					    ctx, buffer,
+					    EmitBitFieldUExtract(state, buffer.dst_sel,
+					                         ConstantU32(state, component * 3u),
+					                         ConstantU32(state, 3u)));
+				result = ConstructU32Composite(state, components, values);
+			}
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}
@@ -1374,13 +1394,20 @@ void DefineGetBdaPointer(EmitterState& state) {
 	    address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	// An address past the guest's GPU space has no page entry: it is never mapped, so it reads as
+	// missing without touching the page table or recording a fault the host could never back.
+	const auto in_space = Binary(state, spv::OpULessThan, TypeBool(state), page64,
+	                             ConstantU64(state, BufferCache::CACHING_NUMPAGES));
+	const auto page =
+	    Select(state, TypeU32(state), in_space,
+	           Unary(state, spv::OpUConvert, TypeU32(state), page64), ConstantU32(state, 0));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
-	const auto entry = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, entry, entry_pointer);
+	const auto loaded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, loaded, entry_pointer);
+	const auto entry = Select(state, type, in_space, loaded, ConstantU64(state, 0));
 	const auto unbacked =
 	    Binary(state, spv::OpIEqual, TypeBool(state), entry, ConstantU64(state, 0));
 	const auto fault_label = state.builder.AllocateId();
@@ -1389,7 +1416,14 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranchConditional, unbacked, fault_label, merge_label);
 
 	EmitLabel(state, fault_label);
+	const auto record_label   = state.builder.AllocateId();
+	const auto recorded_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, recorded_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, in_space, record_label, recorded_label);
+	EmitLabel(state, record_label);
 	RecordBdaFault(state, page);
+	state.builder.AddFunction(spv::OpBranch, recorded_label);
+	EmitLabel(state, recorded_label);
 	state.builder.AddFunction(spv::OpReturnValue, ConstantU64(state, 0));
 
 	EmitLabel(state, merge_label);

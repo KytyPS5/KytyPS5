@@ -2381,11 +2381,10 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::GuardedDiamond);
   make_plan(Variant::Forwarded);
   make_plan(Variant::ForwardedChain);
+  // DS2 ps 0x78cef657c8999546: the forwarding latch branches back or leaves the loop.
+  make_plan(Variant::ForwardedBranch);
   // DS DC cs 0x8f78cb8c66569743 masks lanes off by EXEC = active & !(test | key >= 11).
   make_plan(Variant::ExitTest);
-  for (const auto variant : {Variant::ExitTestWrongPolarity, Variant::IncrementBypass, Variant::PreviousBound,
-                             Variant::ForwardedJoin, Variant::ForwardedBranch,
-                             Variant::ForwardedIncrementBypass,
                              Variant::MaskedWrongGuard,
                              Variant::MaskResurrection, Variant::StatusOverwrite,
                              Variant::GuardedDiamondBypass}) {

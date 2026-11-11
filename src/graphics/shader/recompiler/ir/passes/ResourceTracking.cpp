@@ -2378,12 +2378,17 @@ private:
 		if (!induction) return {};
 		const auto [phi, step, initial_arm] = *induction;
 		const auto* increment_block = step->Parent();
-		// Structurization can forward the native increment through a synthetic continue block.
+		// Structurization can forward the native increment through synthetic continue blocks,
+		// including the latch that branches back or leaves the loop.
 		const auto* incoming = phi->PhiBlock(initial_arm ^ 1u);
 		const auto* next = phi->Parent();
 		for (size_t edges = 0; incoming != increment_block && edges < m_program.blocks.size(); ++edges) {
-			if (incoming == nullptr || incoming->terminator.kind != CFG::TerminatorKind::Branch ||
-			    incoming->terminator.true_block != next || incoming->ImmPredecessors().size() != 1u)
+			if (incoming == nullptr || incoming->ImmPredecessors().size() != 1u) break;
+			const auto& terminator = incoming->terminator;
+			if (!(terminator.kind == CFG::TerminatorKind::Branch &&
+			      terminator.true_block == next) &&
+			    !(terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			      (terminator.true_block == next || terminator.false_block == next)))
 				break;
 			next = incoming;
 			incoming = incoming->ImmPredecessors()[0];

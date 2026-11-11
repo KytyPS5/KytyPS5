@@ -1137,7 +1137,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.BlockExtent() == cached.info.BlockExtent() &&
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
-	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
+	// A BC image the CPU wrote after its upload is never written back, so it is retired like a
+	// clean one. As a view, the next GPU write of the request would mark its whole mip chain
+	// GPU-written, levels the request does not cover included. An image that may only be
+	// CPU-dirty can still hold GPU writes and stays.
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsMaybeCpuDirty()) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}

@@ -20153,6 +20153,7 @@ public:
     constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
     constexpr uint64_t large = 2 * page;
     constexpr uint64_t read_image = base;
+    constexpr uint64_t written_tail_image = base + 0x8000;
     constexpr uint64_t copy_image = base + 0x10000;
     constexpr uint64_t large_image = base + 0x20000;
     constexpr uint64_t copy_target = base + 0x30000;
@@ -20189,6 +20190,8 @@ public:
     std::memcpy(reinterpret_cast<void *>(part_read_image), native.data(),
                 large);
     std::memcpy(reinterpret_cast<void *>(part_copy_image), native.data(),
+                large);
+    std::memcpy(reinterpret_cast<void *>(written_tail_image), native.data(),
                 large);
 
     RenderContext context(m_runtime_context);
@@ -20274,6 +20277,7 @@ public:
       WriteGpuImage(large_image, large);
       WriteGpuImage(part_read_image, large);
       WriteGpuImage(part_copy_image, large);
+      WriteGpuImage(written_tail_image, large);
 
       const auto large_read = Mismatch(
           ReadRange(cache.ObtainBuffer(large_image, large, false, true), large),
@@ -20311,6 +20315,14 @@ public:
                                                 page),
               "partial copy target was unreadable");
       const auto part_copy = Mismatch(copied, native_page);
+      (void)cache.ObtainBuffer(written_tail_image + page, page, true, false);
+      textures.InvalidateMemoryFromGPU(written_tail_image + page, page);
+      (void)cache.ObtainBuffer(written_tail_image, page, false, true);
+      const auto written_tail = Mismatch(
+          ReadRange(
+              cache.ObtainBuffer(written_tail_image + page, page, false, false),
+              page),
+          std::vector<u32>(page / sizeof(u32), stale));
 
       auto depth_desc = MakeLinearDesc(
           depth_image, page, vk::Format::eD32SfloatS8Uint,
@@ -20354,6 +20366,8 @@ public:
               large_tail);
       Require(name, "read behind a partial formatted read", part_tail == "ok",
               part_tail);
+      Require(name, "buffer write behind a partial formatted read",
+              written_tail == "ok", written_tail);
 
       context.UnmapMemory(base, size);
       scheduler.Finish();

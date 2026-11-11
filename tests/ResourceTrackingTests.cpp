@@ -6268,7 +6268,7 @@ void TestBoundedFormattedBufferStore() {
   for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 9>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
             {35u, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u | 4u},
-            {35u, memory.words[35] & ~7u}, {35u, memory.words[35] | (4u << 3u)},
+             {35u, memory.words[35] ^ 1u}, {35u, memory.words[35] | (4u << 3u)},
             {32u, memory.words[32] + 1u},
             {33u, 8u << 16u}, {33u, (4u << 16u) | (1u << 31u)},
             {35u, memory.words[35] | (1u << 23u)}, {35u, memory.words[35] | (3u << 28u)}}}) {

@@ -786,7 +786,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
 						            candidate.dwords.begin());
 					}
-					if (!normalize(candidate))
+					if (!normalize(candidate, probe_scan))
 						return normalization_failed(table_offset, word, step,
 						                            indirect.table_maximum ? "key" : "probe");
 					const auto ordinal = intern_candidate(candidate);
@@ -877,7 +877,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!WalkedDescriptor(program, sources[entry], candidate)) {
 			return false;
 		}
-		if (!normalize(candidate))
+		if (!normalize(candidate, false))
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");
 		uint32_t ordinal = 0;
 		if (entry == 0 && !byte_keys) {
@@ -1700,7 +1700,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
 					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
+					        [&](DescriptorValue& value, bool probe_scan) {
 						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base, program.stage,
 						            probe_scan);
@@ -1764,7 +1764,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
+			        specialization.images, [&](DescriptorValue& value, bool) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
@@ -1800,7 +1800,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
 				        specialization.samplers,
-				        [](DescriptorValue&) { return true; }))
+				        [](DescriptorValue&, bool) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];

@@ -453,9 +453,15 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 
 // A shader whose call targets are GPU data runs the functions its call tables name: a table that
 // does not expand (not mapped, a target that is not a leaf function) leaves nothing to run.
-[[noreturn]] void ExitCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
-	EXIT("shader 0x%016" PRIx64 ": its call tables do not expand: %s\n", hash,
-	     source.refresh_failure.c_str());
+// [HACK] until those calls run: a dispatch whose call tables do not expand is skipped, and what it
+// computes is missing, instead of closing the emulator. Gran Turismo 7 in PS5 Pro mode closed so
+// while loading a race: its ray tracing passes (cs d73e95c5c9fcba1a and some 30 more) call the
+// hit functions of its materials through one table, 1380 distinct bodies for 1704 targets (an
+// expansion holds 256), and at the start of the race cs 4ee6a568a66fcc24 "may overwrite a
+// call-target dependency" in a loop.
+void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSource& source) {
+	Common::HackNotice::Report("dispatch whose call tables do not expand skipped",
+	                           "PipelineCache::GetProgram", hash, 0, source.refresh_failure);
 }
 
 } // namespace
@@ -1145,7 +1151,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
 			if (cached.call_source->refresh_failed) {
-				ExitCallExpansionFailure(params.hash, *cached.call_source);
+				SkipCallExpansionFailure(params.hash, *cached.call_source);
+				cached.skip_dispatch = true;
+				return nullptr;
 			}
 			runtime.call_words = cached.call_source->call_words;
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, failed);
@@ -1186,7 +1194,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (current->HasCalls()) {
 			if (entry == m_program_cache.end()) {
 				ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				if (current->refresh_failed) ExitCallExpansionFailure(params.hash, *current);
+				if (current->refresh_failed) {
+					SkipCallExpansionFailure(params.hash, *current);
+					m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+					return nullptr;
+				}
 				runtime.call_words = current->call_words;
 			}
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);

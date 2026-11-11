@@ -85,7 +85,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	                            "main", state.interface_variables);
 
 	auto module = state.builder.Build();
-	ForwardMaskedSelects(module);
+	ForwardMaskedSelects(module, ForwardingMinBodyWords, state.fault_buffer_variable);
 	return module;
 }
 

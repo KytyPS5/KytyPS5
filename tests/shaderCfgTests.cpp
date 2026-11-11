@@ -9481,6 +9481,69 @@ void TestSpirvMaskedSelectForwarding() {
   Check(bitcasts == 0 && store_reads_x, "a bitcast pair was not cancelled");
 }
 
+void TestSpirvValueNumbering() {
+  using ShaderRecompiler::Spirv::Builder;
+  Builder b;
+  const auto void_type = b.Type(spv::OpTypeVoid);
+  const auto fn_type = b.Type(spv::OpTypeFunction, void_type);
+  const auto u32 = b.Type(spv::OpTypeInt, 32u, 0u);
+  const auto one = b.Constant(spv::OpConstant, u32, 1u);
+  const auto private_ptr = b.Type(spv::OpTypePointer, spv::StorageClassPrivate, u32);
+  const auto push_ptr = b.Type(spv::OpTypePointer, spv::StorageClassPushConstant, u32);
+  const auto var_private = b.DefineGlobalVariable(private_ptr, spv::StorageClassPrivate);
+  const auto var_push = b.DefineGlobalVariable(push_ptr, spv::StorageClassPushConstant);
+  const auto var_out = b.DefineGlobalVariable(private_ptr, spv::StorageClassPrivate);
+  const auto main = b.AllocateId();
+  const auto label = b.AllocateId();
+  const auto x = b.AllocateId(), y = b.AllocateId(), p1 = b.AllocateId(),
+             p2 = b.AllocateId(), a = b.AllocateId(), c = b.AllocateId(),
+             d = b.AllocateId();
+  b.AddFunction(spv::OpFunction, void_type, main, 0u, fn_type);
+  b.AddFunction(spv::OpLabel, label);
+  // Loads of private memory may see a store in between; push constants never change.
+  b.AddFunction(spv::OpLoad, u32, x, var_private);
+  b.AddFunction(spv::OpLoad, u32, y, var_private);
+  b.AddFunction(spv::OpLoad, u32, p1, var_push);
+  b.AddFunction(spv::OpLoad, u32, p2, var_push);
+  b.AddFunction(spv::OpIAdd, u32, a, x, one);
+  b.AddFunction(spv::OpIAdd, u32, c, x, one);
+  b.AddFunction(spv::OpIAdd, u32, d, p1, p2);
+  b.AddFunction(spv::OpStore, var_out, a);
+  b.AddFunction(spv::OpStore, var_out, c);
+  b.AddFunction(spv::OpStore, var_out, d);
+  b.AddFunction(spv::OpStore, var_out, y);
+  b.AddFunction(spv::OpReturn);
+  b.AddFunction(spv::OpFunctionEnd);
+  auto binary = b.Build();
+  ShaderRecompiler::Spirv::ForwardMaskedSelects(binary, 0);
+  uint32_t adds = 0, private_loads = 0, push_loads = 0;
+  uint32_t d_first = 0, d_second = 0;
+  std::vector<uint32_t> stored;
+  for (size_t offset = 5; offset < binary.size();) {
+    const auto words = binary[offset] >> spv::WordCountShift;
+    const auto op = binary[offset] & spv::OpCodeMask;
+    adds += op == spv::OpIAdd;
+    if (op == spv::OpIAdd && binary[offset + 2] == d) {
+      d_first = binary[offset + 3];
+      d_second = binary[offset + 4];
+    }
+    if (op == spv::OpLoad) {
+      private_loads += binary[offset + 3] == var_private;
+      push_loads += binary[offset + 3] == var_push;
+    }
+    if (op == spv::OpStore) {
+      stored.push_back(binary[offset + 2]);
+    }
+    offset += words;
+  }
+  Check(adds == 2, "a repeated addition was not merged");
+  Check(stored.size() == 4 && stored[0] == a && stored[1] == a,
+        "a use of a merged value was not redirected");
+  Check(private_loads == 2, "loads of private memory were merged");
+  Check(push_loads == 1 && d_first == p1 && d_second == p1,
+        "loads of a push constant were not merged");
+}
+
 void TestDemandDrivenSpirvDeclarations() {
   using ShaderRecompiler::Spirv::Builder;
 
@@ -14390,6 +14453,7 @@ int main() {
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestSpirvMaskedSelectForwarding();
+  TestSpirvValueNumbering();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();

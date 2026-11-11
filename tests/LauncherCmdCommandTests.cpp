@@ -56,7 +56,7 @@ struct CmdRun {
 
 CmdRun RunThroughCmd(const CmdLaunch &launch) {
   QProcess cmd;
-  cmd.setProgram(QStringLiteral("cmd.exe"));
+  cmd.setProgram(QString::fromLatin1(CmdProgram));
   cmd.setNativeArguments(launch.native_arguments);
   cmd.setProcessEnvironment(launch.environment);
   cmd.start();
@@ -135,6 +135,23 @@ void CheckLongestCommandArrives() {
         QStringLiteral("a value with a NUL character was accepted"));
 }
 
+void CheckManyShortValuesArrive() {
+  const auto environment = QProcessEnvironment::systemEnvironment();
+  const QStringList one_more = {QStringLiteral("x")};
+  QStringList values;
+  while (values.size() < CmdArgumentsLimit &&
+         CmdCommand(OwnCommand() + values + one_more, true, environment)
+             .has_value()) {
+    values.append(one_more);
+  }
+  const auto launch = CmdCommand(OwnCommand() + values, true, environment);
+  Check(launch.has_value() && !values.isEmpty(),
+        QStringLiteral("no short value was accepted"));
+  Check(ReceivedArguments(RunThroughCmd(*launch).output) == values,
+        QStringLiteral("%1 short values were accepted but did not arrive")
+            .arg(values.size()));
+}
+
 }
 
 int main(int argc, char **argv) {
@@ -150,6 +167,7 @@ int main(int argc, char **argv) {
   CheckValuesArriveVerbatim(false);
   CheckValuesArriveVerbatim(true);
   CheckLongestCommandArrives();
+  CheckManyShortValuesArrive();
   std::printf("LauncherCmdCommandTests: ok\n");
   return 0;
 }

@@ -12,6 +12,7 @@ struct CmdLaunch {
 	QProcessEnvironment environment;
 };
 
+inline constexpr char      CmdProgram[]      = "cmd.exe";
 inline constexpr qsizetype CmdArgumentsLimit = 8191;
 
 inline QString CrtQuotedContent(const QString& value) {
@@ -50,12 +51,15 @@ inline std::optional<CmdLaunch> CmdCommand(const QStringList& tokens, bool close
 		environment.insert(name, content);
 		references.append(QStringLiteral("\"!%1!\"").arg(name));
 	}
-	if (expanded_arguments > CmdArgumentsLimit) {
+	const QString exit_on_success = close_on_clean_exit ? QStringLiteral(" && exit") : QString();
+	const QString native_arguments =
+	    QStringLiteral("/V:ON /K \"") + references.join(u' ') + exit_on_success + u'"';
+	constexpr qsizetype program_and_separator = sizeof(CmdProgram);
+	if (expanded_arguments > CmdArgumentsLimit ||
+	    program_and_separator + native_arguments.size() > CmdArgumentsLimit) {
 		return std::nullopt;
 	}
-	const QString exit_on_success = close_on_clean_exit ? QStringLiteral(" && exit") : QString();
-	return CmdLaunch {QStringLiteral("/V:ON /K \"") + references.join(u' ') + exit_on_success + u'"',
-	                  environment};
+	return CmdLaunch {native_arguments, environment};
 }
 
 #endif

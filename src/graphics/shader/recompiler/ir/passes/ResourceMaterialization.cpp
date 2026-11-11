@@ -213,14 +213,16 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
-	const auto format = Format::GetFormatInfo(descriptor.Format());
-	if (resource.formatted && !formatted_read && format.type == Format::ComponentType::Unknown) {
-		// A formatted write through an uninitialized candidate has no meaningful destination.
+	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
+	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
 		value.dwords.fill(0u);
 		return true;
 	}
-	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
-	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
+	const auto format = Format::GetFormatInfo(descriptor.Format());
+	if (resource.formatted && !formatted_read &&
+	    static_cast<uint32_t>(descriptor.Format()) == 0x7fu && descriptor.Stride() == 0u &&
+	    descriptor.DstSelXYZW() == 0u && descriptor.AddTid()) {
+		// The GPU-selected table can contain this unwritten sentinel instead of a destination.
 		value.dwords.fill(0u);
 		return true;
 	}

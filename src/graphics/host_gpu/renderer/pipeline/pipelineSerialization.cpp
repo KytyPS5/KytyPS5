@@ -68,7 +68,12 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 		return {};
 	}
 	Writer header;
+	// Stored pipeline records include the static depth/stencil feedback flag, which requires
+	// attachment feedback loop layout support. Keep records from a capable host from being
+	// replayed on one that cannot create the pipeline.
 	IoAll(header, stamp, SpirvProfile(graphics),
+	      graphics.attachment_feedback_loop_enabled,
+	      graphics.attachment_feedback_loop_dynamic_state_enabled,
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }

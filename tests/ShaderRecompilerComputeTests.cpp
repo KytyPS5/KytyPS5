@@ -21363,6 +21363,26 @@ public:
       registers.SetDepthRenderTarget(z);
       set_frame(odd_frame);
       draw(base + 0x60000, ramp, one);
+      if (!odd_frame) {
+        // Death Stranding DC: a sampled view names the depth plane by format, with the colour
+        // aspect every sampled view carries; reading it settles the depth shadow.
+        RenderDepthInfo target{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), target);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        auto &image = cache.GetImage(target.image_id);
+        Require(name, "depth dirty after the pass",
+                image.eqaa != nullptr && (image.eqaa->dirty & vk::ImageAspectFlagBits::eDepth),
+                "the pass did not leave its newest depth in the shadow");
+        auto sampled = target.desc;
+        sampled.type = BindingType::Texture;
+        sampled.view_info.format = vk::Format::eR32Sfloat;
+        sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        Require(name, "sampled depth settles",
+                cache.FindTexture(target.image_id, sampled) &&
+                    !(image.eqaa->dirty & vk::ImageAspectFlagBits::eDepth),
+                "sampling the depth target left its shadow unsettled");
+      }
       const auto id = depth_id(address);
       cache.UpdateImage(id);
       const auto words = ReadCachedTexel(name, context, id, {}, {width, height, 1});

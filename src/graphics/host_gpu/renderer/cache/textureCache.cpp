@@ -1474,6 +1474,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	// A sampled view names its plane by format; its read layout needs colour or depth settled.
+	RefreshImage(id, desc.type == BindingType::Storage
+	                     ? EqaaAllAspects
+	                     : image.NormalizeView(desc.view_info).aspect |
+	                           (OwnerAspects(image) & ~vk::ImageAspectFlagBits::eStencil));
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {

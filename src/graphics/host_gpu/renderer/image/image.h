@@ -74,6 +74,8 @@ public:
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
+	// A depth- or stencil-compatible view format selects that plane of a depth image.
+	[[nodiscard]] ImageViewInfo NormalizeView(const ImageViewInfo& view_info) const;
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,

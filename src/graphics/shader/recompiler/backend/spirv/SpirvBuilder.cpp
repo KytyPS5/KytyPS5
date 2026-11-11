@@ -105,6 +105,14 @@ void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
 	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class);
 }
 
+uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class,
+                                       uint32_t initializer) {
+	const auto id = AllocateId();
+	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class,
+	                  initializer);
+	return id;
+}
+
 void Builder::AppendString(std::vector<uint32_t>& words, const char* text) {
 	const auto len        = text != nullptr ? std::strlen(text) : 0;
 	const auto word_count = (len + 1u + 3u) / 4u;

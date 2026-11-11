@@ -1,11 +1,13 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <span>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -1231,35 +1233,131 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 	});
 }
 
+// A formatted indirect read takes its format's geometry and conversion from one table per module:
+// per format a row of what the read needs, so the shader's constant data does not grow with its
+// reads. Per-format switches did: a driver that inlines each call keeps a copy of their constants
+// per call, and past the hardware constant bank (64 KiB) the dispatch fails at launch
+// (PPSA02015, NVIDIA SKEDCHECK23_CONSTANT_BUFFER_SIZE, device lost).
+//
+// Row words: 0 = byte size | component count << 8 | packed << 12 | signed << 13 | unknown << 14 |
+// integer << 15; 1 and 2 = components 0-1 and 2-3, 16 bits each (bit offset, bit count << 5,
+// conversion kind << 11); 3 = first component bytes | read alignment mask << 8.
+struct IndirectFormatKind {
+	Format::ComponentType type = Format::ComponentType::Unknown;
+	uint32_t              bits = 0;
+	bool                  operator==(const IndirectFormatKind&) const = default;
+};
+
 void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	const auto type = TypeU32(state);
+	const auto     row_type = TypeU32Composite(state, 4);
 	constexpr auto format_count =
 	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+
+	// Each distinct conversion is emitted once; rows name it by index. Integers pass their bits
+	// through and scaled formats convert whole values, so only normalized and float components
+	// convert by their width.
+	std::vector<IndirectFormatKind> kinds;
+	const auto kind_of = [&](Format::ComponentType component_type, uint32_t bits) {
+		using Type          = Format::ComponentType;
+		const bool by_width = component_type == Type::Unorm || component_type == Type::Snorm ||
+		                      component_type == Type::Float;
+		const IndirectFormatKind kind {component_type == Type::Sint ? Type::Uint : component_type,
+		                               by_width ? bits : 0u};
+		auto                     found = std::ranges::find(kinds, kind);
+		if (found == kinds.end()) found = kinds.insert(kinds.end(), kind);
+		return static_cast<uint32_t>(found - kinds.begin());
+	};
+	std::vector<uint32_t> rows;
+	rows.reserve(format_count);
+	for (uint32_t format = 0; format < format_count; ++format) {
+		const auto info    = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
+		const bool unknown = info.type == Format::ComponentType::Unknown;
+		const bool integer =
+		    info.type == Format::ComponentType::Uint || info.type == Format::ComponentType::Sint;
+		EXIT_IF(info.byte_size > 0xffu || info.component_count > 4u);
+		std::array<uint32_t, 4> words {};
+		words[0] = info.byte_size | info.component_count << 8u |
+		           uint32_t {info.packed_bitfield} << 12u |
+		           uint32_t {IsSignedFormatComponent(info.type)} << 13u |
+		           uint32_t {unknown} << 14u | uint32_t {integer} << 15u;
+		for (uint32_t component = 0; !unknown && component < info.component_count; ++component) {
+			const auto bits   = info.component_bits[component];
+			const auto offset = info.packed_bitfield ? info.component_bit_offset[component] : 0u;
+			EXIT_IF(bits == 0u || bits > 32u || offset + bits > 32u);
+			const auto field = offset | bits << 5u | kind_of(info.type, bits) << 11u;
+			words[1u + component / 2u] |= field << (component % 2u * 16u);
+		}
+		words[3] = (info.packed_bitfield ? 0u : info.component_bits[0] / 8u) |
+		           (info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u) << 8u;
+		rows.push_back(
+		    state.builder.Constant(spv::OpConstantComposite, row_type, ConstantU32(state, words[0]),
+		                           ConstantU32(state, words[1]), ConstantU32(state, words[2]),
+		                           ConstantU32(state, words[3])));
+	}
+	EXIT_IF(kinds.empty() || kinds.size() > 32u);
+	const auto table_type =
+	    state.builder.Type(spv::OpTypeArray, row_type, ConstantU32(state, format_count));
+	const auto table = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassPrivate, table_type), spv::StorageClassPrivate,
+	    state.builder.Constant(spv::OpConstantComposite, table_type,
+	                           std::span<const uint32_t> {rows}));
+	state.builder.AddName(table, "indirect_buffer_formats");
+	// A format past the table reads as format 0, as the switches' default case did.
+	const auto load_row = [&](uint32_t format) {
+		const auto index   = Select(state, type,
+		                            Binary(state, spv::OpULessThan, TypeBool(state), format,
+		                                   ConstantU32(state, format_count)),
+		                            format, ConstantU32(state, 0));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassPrivate, row_type), pointer,
+		                          table, index);
+		const auto row = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, row_type, row, pointer);
+		return row;
+	};
+	const auto word_of = [&](uint32_t row, uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, type, value, row, index);
+		return value;
+	};
+	const auto bits_of = [&](uint32_t value, uint32_t offset, uint32_t count) {
+		const auto extracted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldUExtract, type, extracted, value,
+		                          ConstantU32(state, offset), ConstantU32(state, count));
+		return extracted;
+	};
+	const auto flag = [&](uint32_t value, uint32_t bit) {
+		return Binary(state, spv::OpINotEqual, TypeBool(state), bits_of(value, bit, 1u),
+		              ConstantU32(state, 0));
+	};
+
 	{
-		const auto result_type = TypeU32Composite(state, 4);
-		const auto function_type = state.builder.Type(spv::OpTypeFunction, result_type, type);
+		const auto function_type = state.builder.Type(spv::OpTypeFunction, row_type, type);
 		state.indirect_format_geometry_function = state.builder.AllocateId();
 		const auto format = state.builder.AllocateId();
 		state.builder.AddName(state.indirect_format_geometry_function,
 		                      "indirect_buffer_format_geometry");
-		state.builder.AddFunction(spv::OpFunction, result_type,
+		state.builder.AddFunction(spv::OpFunction, row_type,
 		                          state.indirect_format_geometry_function,
-		                          spv::FunctionControlMaskNone, function_type);
+		                          spv::FunctionControlDontInlineMask, function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
-		const auto result = EmitIndexSwitch(
-		    state, format, format_count, result_type, [&](uint32_t format) {
-			    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-			    return state.builder.Constant(
-			        spv::OpConstantComposite, result_type, ConstantU32(state, info.byte_size),
-			        ConstantU32(state, std::max(1u, info.component_count)),
-			        ConstantU32(state, info.packed_bitfield ? 0u : info.component_bits[0] / 8u),
-			        ConstantU32(state, info.byte_size == 0u ? 0u : std::min(4u, info.byte_size) - 1u));
-		    });
+		const auto row    = load_row(format);
+		const auto head   = word_of(row, 0u);
+		const auto tail   = word_of(row, 3u);
+		const auto count  = bits_of(head, 8u, 4u);
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, row_type, result,
+		                          bits_of(head, 0u, 8u),
+		                          EmitUMax32(state, count, ConstantU32(state, 1)),
+		                          bits_of(tail, 0u, 8u), bits_of(tail, 8u, 8u));
 		state.builder.AddFunction(spv::OpReturnValue, result);
 		state.builder.AddFunction(spv::OpFunctionEnd);
 	}
+
 	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type, type, type, type);
 	state.indirect_format_function = state.builder.AllocateId();
 	const auto format = state.builder.AllocateId();
@@ -1268,38 +1366,64 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          spv::FunctionControlDontInlineMask, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, raw);
 	EmitLabel(state, state.builder.AllocateId());
-	const auto result = EmitIndexSwitch(
-	    state, format, format_count, TypeU32(state), [&](uint32_t format) {
-		    const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
-		    if (info.type == Format::ComponentType::Unknown) return ConstantU32(state, 0);
-		    const auto constant = Select(
-		        state, TypeU32(state),
-		        Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
-		        FormattedConstant(ctx, info, FormattedSourceKind::One), ConstantU32(state, 0));
-		    return EmitValueOrDefaultIfCondition(
-		        state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
-		                      ConstantU32(state, 4)),
-		        TypeU32(state), constant, [&]() {
-			        const auto emit_component = [&](uint32_t component) {
-				        return LoadFormattedComponent(
-				            ctx, info, {FormattedSourceKind::Memory, component},
-				            [&](uint32_t) { return raw; },
-				            [&](uint32_t, uint32_t bits) {
-					            return Binary(state, spv::OpBitwiseAnd, TypeU32(state), raw,
-					                          ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
-				            });
-			        };
-			        if (!info.packed_bitfield) return emit_component(0u);
-			        return EmitIndexSwitch(state, component, info.component_count, TypeU32(state),
-			                               emit_component);
-		        });
+	const auto row       = load_row(format);
+	const auto head      = word_of(row, 0u);
+	const auto packed    = flag(head, 12u);
+	const auto is_signed = flag(head, 13u);
+	const auto count     = bits_of(head, 8u, 4u);
+	// DST_SEL 1 reads the format's one, 0 and the reserved 2-3 read zero.
+	const auto one      = Select(state, type, flag(head, 15u), ConstantU32(state, 1u),
+	                             ConstantU32(state, 0x3f800000u));
+	const auto constant = Select(
+	    state, type, Binary(state, spv::OpIEqual, TypeBool(state), selector, ConstantU32(state, 1)),
+	    one, ConstantU32(state, 0));
+	// A packed format's components each have their own bits in the word; any other reads its
+	// first component from the word the address selected.
+	const auto selected =
+	    Select(state, type,
+	           AndCondition(state, packed,
+	                        Binary(state, spv::OpULessThan, TypeBool(state), component, count)),
+	           component, ConstantU32(state, 0));
+	const auto pair =
+	    Select(state, type,
+	           Binary(state, spv::OpULessThan, TypeBool(state), selected, ConstantU32(state, 2)),
+	           word_of(row, 1u), word_of(row, 2u));
+	const auto field = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpBitFieldUExtract, type, field, pair,
+	    Binary(state, spv::OpShiftLeftLogical, type,
+	           Binary(state, spv::OpBitwiseAnd, type, selected, ConstantU32(state, 1)),
+	           ConstantU32(state, 4)),
+	    ConstantU32(state, 16));
+	const auto offset         = bits_of(field, 0u, 5u);
+	const auto bits           = bits_of(field, 5u, 6u);
+	const auto kind           = bits_of(field, 11u, 5u);
+	const auto unsigned_value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldUExtract, type, unsigned_value, raw, offset, bits);
+	const auto signed_value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), signed_value,
+	                          Unary(state, spv::OpBitcast, TypeI32(state), raw), offset, bits);
+	const auto extracted = Select(state, type, is_signed,
+	                              Unary(state, spv::OpBitcast, type, signed_value), unsigned_value);
+	const auto converted = EmitIndexSwitch(
+	    state, kind, static_cast<uint32_t>(kinds.size()), type, [&](uint32_t index) {
+		    Format::BufferFormatInfo info {};
+		    info.type              = kinds[index].type;
+		    info.component_count   = 1u;
+		    info.component_bits[0] = kinds[index].bits;
+		    return NormalizeFormatComponent(state, info, 0u, extracted);
 	    });
+	const auto value = Select(
+	    state, type,
+	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector, ConstantU32(state, 4)),
+	    converted, constant);
+	const auto result = Select(state, type, flag(head, 14u), ConstantU32(state, 0), value);
 	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }

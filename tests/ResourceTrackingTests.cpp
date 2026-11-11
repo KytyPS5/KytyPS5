@@ -3080,8 +3080,13 @@ void CheckRecordWordMaterialization(const ResourcePlan &plan) {
 // DS2 cs 0x228a640fcb11a26d: a waterfall over a clamped screen tile.
 void TestAffineRecordWordImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // RemovedLanes: the waterfall starts from EXEC with lanes removed by S_ANDN2 of a ballot and of
+  // an S_CSELECT of EXEC and zero (DS2 cs 0x851c2b3d9cf427fe); VaryingRemoval selects the words by
+  // a per-lane condition, which names no lanes.
   enum class Variant {
     Valid, TwoAddends, Unclamped, UnrelatedMask, StaleLane, UnguardedEntry, GappedWords,
+    RemovedLanes, VaryingRemoval
+  };
   const auto make_plan = [](Variant variant) {
     Fixture fixture;
     fixture.program.wave_size = 32u;
@@ -3114,6 +3119,15 @@ void TestAffineRecordWordImageTable() {
         : fixture.Emit(ValueOpcode::CompositeExtractU32x4,
                        {fixture.Emit(ValueOpcode::Ballot, {active}), Value(0u)});
     auto guard = active;
+    if (variant == Variant::RemovedLanes || variant == Variant::VaryingRemoval) {
+      const auto skip = fixture.Emit(ValueOpcode::IEqual32, {local, fixture.UserData(4)});
+      const auto uniform = variant == Variant::RemovedLanes
+          // False in the materialization runtime: the selected EXEC words remove no lanes.
+          ? fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(7), Value(3u)})
+          : fixture.Emit(ValueOpcode::IEqual32, {local, fixture.UserData(7)});
+      const auto skipped = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+          {fixture.Emit(ValueOpcode::Ballot,
+                        {fixture.Emit(ValueOpcode::LogicalAnd, {active, skip})}),
            Value(0u)});
       const auto selected = fixture.Emit(ValueOpcode::SelectU32, {uniform, lanes, Value(0u)});
       lanes = fixture.Emit(ValueOpcode::BitwiseAnd32,
@@ -3179,8 +3193,10 @@ void TestAffineRecordWordImageTable() {
   };
   const auto plan = make_plan(Variant::Valid);
   make_plan(Variant::TwoAddends);
+  CheckRecordWordMaterialization(make_plan(Variant::RemovedLanes));
   for (const auto variant : {Variant::Unclamped, Variant::UnrelatedMask, Variant::StaleLane,
                              Variant::UnguardedEntry, Variant::GappedWords,
+                             Variant::VaryingRemoval})
     CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
                "record-word key accepted a tile no proof bounds or a gapped record");
   CheckRecordWordMaterialization(plan);

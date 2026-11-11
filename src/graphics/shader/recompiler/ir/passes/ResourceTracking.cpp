@@ -1679,6 +1679,7 @@ private:
 	}
 
 	// g when value is 32-lane word `word` of Ballot(g).
+	Value BallotSourcePredicate(Value value, uint32_t word) const {
 		const auto* extract = value.Resolve().TryInstruction();
 		uint32_t    index   = 0;
 		if (extract == nullptr || extract->NumArgs() != 2u ||
@@ -1697,11 +1698,20 @@ private:
 		// WQM of every lane, or of the live lanes, holds every lane the wave launched.
 		for (uint32_t half = 0; half < 2u; ++half) {
 			if (LaunchedWord(wide->Arg(half), half, false)) continue;
+			const auto all = BallotSourcePredicate(wide->Arg(half), half);
 			if (all.IsEmpty() || all != Value(true)) return {};
 		}
 		return Value(true);
 	}
 
+	Value PredicateOp(ValueOpcode op, Value left, Value right = {}) const {
+		left  = left.Resolve();
+		right = right.Resolve();
+		if (op == ValueOpcode::LogicalNot) {
+			if (left.IsImmediate()) return Value(!left.U1());
+			const auto* inner = left.TryInstruction();
+			if (inner != nullptr && inner->GetOpcode() == ValueOpcode::LogicalNot)
+				return inner->Arg(0).Resolve();
 		auto& node = m_program.value_storage.emplace_back(op);
 		node.SetArg(0, left);
 		if (op != ValueOpcode::LogicalNot) node.SetArg(1, right);
@@ -1709,6 +1719,7 @@ private:
 	}
 
 	// Scalar loads, lane reads and their arithmetic are the same on every lane.
+	static bool WaveUniform(Value value, uint32_t depth = 0) {
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (value.IsImmediate()) return true;
@@ -1738,17 +1749,27 @@ private:
 			case ValueOpcode::LogicalOr:
 			case ValueOpcode::LogicalNot:
 				for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+					if (!WaveUniform(inst->Arg(arg), depth + 1u)) return false;
+				return true;
 			default: return false;
 		}
 	}
 
 	// Under `within`, within && x is x.
+	Value WithoutConjunct(Value predicate, Value within) const {
+		predicate = predicate.Resolve();
+		if (within.IsEmpty()) return predicate;
+		if (EquivalentValue(m_program, predicate, within)) return Value(true);
+		const auto* both = predicate.TryInstruction();
 		return predicate;
 	}
 
 	// g when value is 32-lane word `word` of Ballot(g), or scalar mask logic over such words: a
 	// waterfall's EXEC may start as EXEC with some ballots and uniformly selected words removed.
 	Value BallotWordPredicate(Value value, uint32_t word, Value within = {},
+		if (const auto leaf = BallotSourcePredicate(value, word); !leaf.IsEmpty())
+			return WithoutConjunct(leaf, within);
+		if (value == Value(0u)) return Value(false);
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || depth >= 8u) return {};
 		const auto operand = [&](Value arg, Value under = {}) {
@@ -1759,6 +1780,9 @@ private:
 				const auto left  = operand(inst->Arg(0));
 				const auto right = operand(inst->Arg(1));
 				if (left.IsEmpty() || right.IsEmpty()) return {};
+				return PredicateOp(ValueOpcode::LogicalOr, left, right);
+			}
+			case ValueOpcode::BitwiseAnd32: {
 				for (uint32_t arg = 0; arg < 2u; ++arg) {
 					const auto* cleared = inst->Arg(arg ^ 1u).Resolve().TryInstruction();
 					if (cleared == nullptr || cleared->GetOpcode() != ValueOpcode::BitwiseNot32)
@@ -1769,9 +1793,30 @@ private:
 					const auto removed =
 					    operand(cleared->Arg(0), kept == Value(true) ? within : kept);
 					if (removed.IsEmpty()) return {};
+					return PredicateOp(ValueOpcode::LogicalAnd, kept,
+					                   PredicateOp(ValueOpcode::LogicalNot, removed));
+				}
+				const auto left  = operand(inst->Arg(0));
+				const auto right = operand(inst->Arg(1));
+				if (left.IsEmpty() || right.IsEmpty()) return {};
+				return PredicateOp(ValueOpcode::LogicalAnd, left, right);
+			}
 			case ValueOpcode::SelectU32: {
 				// A uniform choice of whole words: S_CSELECT of EXEC and zero.
 				const auto condition = inst->Arg(0).Resolve();
+				if (!WaveUniform(condition)) return {};
+				const auto yes = operand(inst->Arg(1));
+				const auto no  = operand(inst->Arg(2));
+				if (yes.IsEmpty() || no.IsEmpty()) return {};
+				return PredicateOp(
+				    ValueOpcode::LogicalOr, PredicateOp(ValueOpcode::LogicalAnd, condition, yes),
+				    PredicateOp(ValueOpcode::LogicalAnd,
+				                PredicateOp(ValueOpcode::LogicalNot, condition), no));
+			}
+			default: return {};
+		}
+	}
+
 		const auto words = m_program.wave_size / 32u;
 		if (read.GetOpcode() != ValueOpcode::ReadLane || (words != 1u && words != 2u)) return {};
 		auto     index     = read.Arg(1).Resolve();

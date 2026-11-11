@@ -7136,9 +7136,10 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,
         "byte destination refresh required a tight stride or needless specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
       {first + 1u, 0u}, {first + 1u, (1u << 16u) | (1u << 31u)},
       {first + 3u, memory.words[first + 3u] | (1u << 28u)},
+      {first + 3u, memory.words[first + 3u] | (2u << 28u)},
       {first + 3u, memory.words[first + 3u] | (2u << 3u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;
@@ -7147,6 +7148,39 @@ void TestGpuSelectedFormattedRecordStore() {
   }
   const auto saved_stride = memory.words[first + 1u];
   const auto saved_selector = memory.words[first + 3u];
+  memory.words[first + 3u] = saved_selector | (3u << 28u);
+  Check(materialize(), "UInt8 store rejected supported raw byte bounds");
+  for (const auto format : {Prospero::BufferFormat::k8_8UInt, Prospero::BufferFormat::k32UInt}) {
+    memory.words[first + 3u] =
+        (uint32_t(format) << 12u) | Libs::Graphics::DstSel(4, 0, 0, 1) | (3u << 28u);
+    Check(materialize() &&
+              std::ranges::any_of(specialization.buffers, [format](const auto& buffer) {
+                return buffer.descriptor_format == format;
+              }),
+          "raw-bounded formatted store rejected a supported indexed format");
+  }
+  const auto saved_base0 = memory.words[first];
+  const auto saved_base1 = memory.words[first + 1u];
+  const auto saved_records = memory.words[first + 2u];
+  user_data[2] = 1u;
+  constexpr uint32_t raw_records = 0x1000u;
+  constexpr uint32_t raw_stride = 0x3fffu;
+  constexpr uint64_t last_address = 0x0000ffffffffffffull;
+  constexpr uint64_t raw_base = last_address - (raw_records - 1u);
+  memory.words[first] = uint32_t(raw_base);
+  memory.words[first + 1u] = uint32_t(raw_base >> 32u) | (raw_stride << 16u);
+  memory.words[first + 2u] = raw_records;
+  memory.words[first + 3u] =
+      (uint32_t(Prospero::BufferFormat::k8_8UInt) << 12u) |
+      Libs::Graphics::DstSel(4, 0, 0, 1) | (3u << 28u);
+  Check(materialize(),
+        "raw byte bounds incorrectly required stride times record count to fit the address");
+  memory.words[first + 2u] = raw_records + 1u;
+  Check(!materialize(), "raw byte bounds admitted the first byte beyond the address mask");
+  memory.words[first] = saved_base0;
+  memory.words[first + 1u] = saved_base1;
+  memory.words[first + 2u] = saved_records;
+  user_data[2] = 6u;
   memory.words[first + 3u] =
       (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) |
       Libs::Graphics::DstSel(4, 0, 0, 1);

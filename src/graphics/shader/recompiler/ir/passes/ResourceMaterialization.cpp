@@ -224,8 +224,10 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		value.dwords.fill(0u);
 		return true;
 	}
+	const bool raw_bounds = descriptor.OutOfBounds() == 3u;
 	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
-	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
+	    (descriptor.OutOfBounds() != (indexed ? 0u : 3u) &&
+	     !(resource.formatted && raw_bounds))) {
 		return SpecializationFail(fmt::format(
 		    "indirect buffers require exact linear index or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} swizzle={} add_tid={} oob={} "
@@ -262,8 +264,11 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
 			return SpecializationFail("indirect formatted buffers require aligned full-format records");
-		const auto record_end = uint64_t {descriptor.NumRecords() - 1u} * descriptor.Stride() +
-		                        format.byte_size;
+		// Without swizzling OOB_SELECT=3 treats NUM_RECORDS as a byte limit. SOFFSET is
+		// included in the same runtime bound, so the largest reachable end is NUM_RECORDS.
+		const auto record_end = raw_bounds
+		    ? uint64_t {descriptor.NumRecords()}
+		    : uint64_t {descriptor.NumRecords() - 1u} * descriptor.Stride() + format.byte_size;
 		if (record_end != 0u && record_end - 1u > AddressMask - descriptor.Base48())
 			return SpecializationFail("indirect formatted buffers require an in-range record span");
 	} else if ((!indexed && descriptor.Stride() != 1u) ||

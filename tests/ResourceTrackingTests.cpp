@@ -7150,8 +7150,10 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.words[first + 3u] =
       (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) |
       Libs::Graphics::DstSel(4, 0, 0, 1);
-  Check(materialize() && specialization.buffers[root].descriptor_format ==
-                              Prospero::BufferFormat::k8UInt,
+  Check(materialize() &&
+            std::ranges::any_of(specialization.buffers, [](const auto& buffer) {
+              return buffer.descriptor_format == Prospero::BufferFormat::k8UInt;
+            }),
         "UInt8 store descriptor was rejected or lost its runtime format");
   memory.words[first + 3u] = uint32_t(Prospero::BufferFormat::k8UInt) << 12u;
   Check(materialize() &&

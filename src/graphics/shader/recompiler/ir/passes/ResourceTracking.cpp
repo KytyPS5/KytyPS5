@@ -2350,28 +2350,53 @@ private:
 	}
 
 	// Whether guard proves test false.
+	// Whether guard proves test false. Within a conjunction, the other conjuncts hold too.
 	bool Refutes(Value guard, Value test, uint32_t depth = 0) const {
+		std::vector<Value> context;
+		return Refutes(guard, test, context, depth);
+	}
+
+	bool Refutes(Value guard, Value test, std::vector<Value>& context, uint32_t depth) const {
 		const auto* inst = SimplifyGuard(guard).TryInstruction();
 		if (inst == nullptr || depth >= 16u) return false;
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::LogicalAnd:
-				return Refutes(inst->Arg(0), test, depth + 1u) ||
-				       Refutes(inst->Arg(1), test, depth + 1u);
+				for (uint32_t arm = 0; arm < 2u; ++arm) {
+					context.push_back(inst->Arg(arm ^ 1u));
+					const bool refuted = Refutes(inst->Arg(arm), test, context, depth + 1u);
+					context.pop_back();
+					if (refuted) return true;
+				}
+				return false;
 			case ValueOpcode::LogicalOr:
-				return Refutes(inst->Arg(0), test, depth + 1u) &&
-				       Refutes(inst->Arg(1), test, depth + 1u);
-			case ValueOpcode::LogicalNot: return ImpliesAnyTerm(test, inst->Arg(0), depth + 1u);
+				return Refutes(inst->Arg(0), test, context, depth + 1u) &&
+				       Refutes(inst->Arg(1), test, context, depth + 1u);
+			case ValueOpcode::LogicalNot:
+				return ImpliesAnyTerm(test, inst->Arg(0), context, depth + 1u);
 			default: return false;
 		}
 	}
 
-	// Whether guard implies some term of a LogicalOr tree.
-	bool ImpliesAnyTerm(Value guard, Value terms, uint32_t depth) const {
+	// Whether guard, with every context value, implies some term of a LogicalOr tree.
+	bool ImpliesAnyTerm(Value guard, Value terms, const std::vector<Value>& context,
+	                    uint32_t depth) const {
 		const auto* inst = SimplifyGuard(terms).TryInstruction();
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalOr && depth < 16u)
-			return ImpliesAnyTerm(guard, inst->Arg(0), depth + 1u) ||
-			       ImpliesAnyTerm(guard, inst->Arg(1), depth + 1u);
-		return Implies(guard, terms);
+			return ImpliesAnyTerm(guard, inst->Arg(0), context, depth + 1u) ||
+			       ImpliesAnyTerm(guard, inst->Arg(1), context, depth + 1u);
+		return ImpliedWith(guard, terms, context, depth);
+	}
+
+	// Whether guard and the context values together imply term.
+	bool ImpliedWith(Value guard, Value term, const std::vector<Value>& context,
+	                 uint32_t depth) const {
+		if (Implies(guard, term) ||
+		    std::ranges::any_of(context, [&](Value known) { return Implies(known, term); }))
+			return true;
+		const auto* inst = SimplifyGuard(term).TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd && depth < 16u &&
+		       ImpliedWith(guard, inst->Arg(0), context, depth + 1u) &&
+		       ImpliedWith(guard, inst->Arg(1), context, depth + 1u);
 	}
 
 	const Inst* BoundedInduction(Value key, const Block* use, const auto& accepts_step,

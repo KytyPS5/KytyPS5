@@ -2021,7 +2021,7 @@ void TestBoundedComputeImageLoop() {
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
     WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
-    ExitTest, ExitTestWrongPolarity,
+    ExitTest, ExitTestWrongPolarity, ExitTestSelected, ExitTestSelectedUnknown,
     IncrementBypass, PreviousBound, Forwarded, ForwardedChain, ForwardedJoin,
     ForwardedBranch, ForwardedIncrementBypass,
     Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
@@ -2116,16 +2116,23 @@ void TestBoundedComputeImageLoop() {
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, compare);
-    if (variant == Variant::ExitTest || variant == Variant::ExitTestWrongPolarity) {
-      // The loop runs while !(other | key >= count).
-      const auto other = fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(3u), Value(7u)}, 0, compare);
-      const auto exit_test = fixture.Emit(ValueOpcode::LogicalOr,
-          {other, fixture.Emit(ValueOpcode::SGreaterThanEqual32, {key, count}, 0, compare)}, 0, compare);
-      in_range = variant == Variant::ExitTest
-                     ? fixture.Emit(ValueOpcode::LogicalNot, {exit_test}, 0, compare) : exit_test;
-    }
     const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
+    if (variant >= Variant::ExitTest && variant <= Variant::ExitTestSelectedUnknown) {
+      // The loop runs while !(other | key >= count). DS2 cs 0xad46d6b567788504 selects the exit
+      // test by S_CSELECT_B32 exec, 0, so its term is key >= count on the active lanes.
+      const auto other = fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(3u), Value(7u)}, 0, compare);
+      auto exhausted = fixture.Emit(ValueOpcode::SGreaterThanEqual32, {key, count}, 0, compare);
+      if (variant == Variant::ExitTestSelected || variant == Variant::ExitTestSelectedUnknown) {
+        const auto lanes = variant == Variant::ExitTestSelected
+            ? initial_active
+            : fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(4u), Value(5u)}, 0, compare);
+        exhausted = fixture.Emit(ValueOpcode::LogicalAnd, {exhausted, lanes}, 0, compare);
+      }
+      const auto exit_test = fixture.Emit(ValueOpcode::LogicalOr, {other, exhausted}, 0, compare);
+      in_range = variant == Variant::ExitTestWrongPolarity
+                     ? exit_test : fixture.Emit(ValueOpcode::LogicalNot, {exit_test}, 0, compare);
+    }
     if (forwarded && !post_test) {
       forward->AddBranch(incoming == forward ? header : incoming);
       forward->terminator = {.kind = CFG::TerminatorKind::Branch,
@@ -2385,6 +2392,10 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::ForwardedBranch);
   // DS DC cs 0x8f78cb8c66569743 masks lanes off by EXEC = active & !(test | key >= 11).
   make_plan(Variant::ExitTest);
+  make_plan(Variant::ExitTestSelected);
+  for (const auto variant : {Variant::ExitTestWrongPolarity, Variant::ExitTestSelectedUnknown,
+                             Variant::IncrementBypass, Variant::PreviousBound,
+                             Variant::ForwardedJoin, Variant::ForwardedIncrementBypass,
                              Variant::MaskedWrongGuard,
                              Variant::MaskResurrection, Variant::StatusOverwrite,
                              Variant::GuardedDiamondBypass}) {

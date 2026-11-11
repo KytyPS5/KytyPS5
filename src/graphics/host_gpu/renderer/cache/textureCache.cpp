@@ -33,6 +33,15 @@ namespace Libs::Graphics {
 
 namespace {
 
+// A partial image holds only what guest memory holds, which a copy destination has taken
+// already; its missing levels have nothing to copy.
+[[nodiscard]] bool PartialMirror(const Image& image) {
+	return image.info.first_level != 0 && !image.IsGpuModified();
+}
+
+// A tiled chain stores small mips first, so the level count moves mip 0: images at one address
+// with the same extent hold different guest bytes unless every level they share starts at the
+// same offset.
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
@@ -156,7 +165,10 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.data.address != requested.data.address) {
 		return false;
 	}
-	if (cached.data.size != requested.data.size) {
+	// A cached image serves a request that samples none of the levels it lacks.
+	if (cached.first_level > requested.first_level ||
+	    (cached.first_level == requested.first_level ? cached.data.size != requested.data.size
+	                                                 : cached.data.size < requested.data.size)) {
 		return false;
 	}
 	if (cached.extent != requested.extent) {
@@ -526,6 +538,9 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+	if (PartialMirror(m_slot_images[source_id])) {
+		return;
+	}
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -565,6 +580,9 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
+	if (PartialMirror(m_slot_images[source_id])) {
+		return;
+	}
 	RefreshCopySource(source_id);
 	SettleEqaa(m_slot_images[destination_id], EqaaAllAspects);
 	if (m_slot_images[destination_id].IsBufferModified()) {
@@ -741,6 +759,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	if (!cached.registered) {
 		return {merged_id};
 	}
+	// The same texture with levels this request needs and the cached image never held. Its pixels
+	// are guest memory's (no writer binds a partial image), so the full one replaces it.
+	if (cached.info.first_level > requested.first_level && !cached.IsGpuModified()) {
+		auto as_cached        = requested;
+		as_cached.first_level = cached.info.first_level;
+		as_cached.data.size   = cached.info.data.size;
+		if (SameBacking(cached.info, as_cached, false)) {
+			cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+			FreeImage(cached_id);
+			return {merged_id};
+		}
+	}
 	// PS5: image heaps keep BC images and raw block views of their layers resident together, so a
 	// raw read of a layer subset with the same levels views the BC image instead of evicting it.
 	const bool raw_view = binding == BindingType::Texture && !requested.IsBlock() &&
@@ -882,8 +912,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 
 bool TextureCache::CanDownload(const Image& image) const {
 	const auto& info = image.info;
-	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
-	    info.data.size % info.resources.layers != 0) {
+	// A partial image has no pixels for its larger levels to write back.
+	if (info.first_level != 0 || info.samples != 1 || image.backing.samples != 1 ||
+	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0) {
 		return false;
 	}
 	if (UploadBinding(image) == BindingType::DepthTarget) {
@@ -905,8 +936,16 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		     image.backing.samples != 1)) {
 			EXIT("TextureCache: invalid color-attachment upload\n");
 		}
-		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
-		const auto copies = info.BufferCopies(linear.offset);
+		// A partial image's levels form a chain of their own over the bytes it owns.
+		const auto chain = info.first_level != 0 ? info.MipChainFrom(info.first_level)
+		                                         : std::optional<ImageInfo> {};
+		EXIT_IF(info.first_level != 0 && !chain.has_value());
+		const auto& layout = chain.has_value() ? *chain : info;
+		const auto  linear = m_tiler.Detile(source.Handle(), source_offset, layout);
+		auto        copies = layout.BufferCopies(linear.offset);
+		for (auto& copy: copies) {
+			copy.imageSubresource.mipLevel += info.first_level;
+		}
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;

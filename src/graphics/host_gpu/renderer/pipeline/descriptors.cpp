@@ -708,6 +708,20 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 	} else {
 		desc.info.UpdateSize();
+		// A streamer clamps a texture to its resident mips with the T# MIN_LOD and packs the next
+		// texture over the bytes its larger mips would take. A sampler never reaches those levels
+		// (the view carries the clamp), so the image keeps neither pixels nor memory for them and
+		// owns only the guest bytes of the rest.
+		const uint32_t clamp_level = descriptor.MinLod() >> 8u;
+		if (!storage && !multisampled && clamp_level > view_base &&
+		    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+		    !desc.info.IsDepth() && m_context.GetGraphics().sparse_binding != nullptr) {
+			if (const auto chain = desc.info.MipChainFrom(clamp_level)) {
+				desc.info.first_level = clamp_level;
+				desc.info.data.size   = chain->data.size;
+			}
+		}
 	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
 	// their layout.

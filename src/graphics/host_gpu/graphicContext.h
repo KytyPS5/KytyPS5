@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/sparseBinding.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <array>
@@ -34,6 +35,10 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// Sparse 2D images: textures the T# MIN_LOD clamps leave their unsampled levels unbound.
+	bool sparse_residency_image2d_enabled = false;
+	// Null without sparse 2D images; created with the allocator.
+	SparseBinding*                            sparse_binding                         = nullptr;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;
 	bool                               r8_srgb_views                         = false;
@@ -115,6 +120,8 @@ struct GraphicContext {
 	void QuerySampleLocations(bool extension_enabled);
 
 	[[nodiscard]] bool CreateAllocator();
+	// Called by CreateAllocator; a caller creating the VMA allocator itself calls it next.
+	void                   CreateSparseBinding();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
@@ -128,13 +135,21 @@ struct GraphicContext {
 		bool     device_local = false;
 	};
 	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
-	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
+	// Levels below `first_bound_level` are never accessed and need no memory, where the device
+	// can leave them unbound (a sparse image).
+	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
+	                                   uint32_t first_bound_level = 0);
 	void                   DeleteImage(VulkanImage& image);
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	// A sparse image whose levels from `first_level` on (and its mip tail) have device-local
+	// memory; false, with nothing created, where the device or format cannot do it.
+	[[nodiscard]] bool CreatePartialImage(const vk::ImageCreateInfo& info, uint32_t first_level,
+	                                      VulkanImage& image);
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -166,6 +181,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Created by CreatePartialImage: `allocation` backs only its bound levels.
+	bool sparse = false;
 };
 
 

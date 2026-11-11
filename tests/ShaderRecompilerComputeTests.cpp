@@ -6666,6 +6666,175 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A streamer clamps a texture to its resident mips with the T# MIN_LOD and packs other data
+  // over the bytes its larger mips would take (PPSA02015: BC 1024^2, tile 1, MIN_LOD 1-4). The
+  // image is a sparse one holding only the levels from the clamp on, over only their guest bytes,
+  // with exactly the pixels a full image of the same bytes has there. A request that needs the
+  // larger levels replaces it with a full image, which a clamped request then shares.
+  void CheckPartialResidency() {
+    constexpr const char *name = "PartialResidency";
+    EnsureRuntimeContext();
+    // Single-slice tiled chains: a chain from level 2 lies at the same bytes as the texture's.
+    {
+      ImageInfo full{};
+      full.guest_format = Prospero::BufferFormat::kBc1UNorm;
+      full.pixel_format = vk::Format::eBc1RgbaUnormBlock;
+      full.type = Prospero::ImageType::kColor2D;
+      full.extent = {1024u, 1024u, 1u};
+      full.resources = {11u, 1u};
+      full.tile_mode = Prospero::TileMode::kStandard256B;
+      full.data = {0x10000u, 0};
+      full.UpdateSize();
+      const auto chain = full.MipChainFrom(2u);
+      Require(name, "chain", chain.has_value(), "no chain from level 2 of a BC1 1024^2 texture");
+      bool same = chain->resources.levels == 9u && chain->extent.width == 256u &&
+                  chain->data.address == full.data.address && chain->data.size < full.data.size;
+      for (uint32_t level = 0; same && level < chain->resources.levels; ++level) {
+        same = chain->mip_layout[level].offset == full.mip_layout[level + 2u].offset &&
+               chain->mip_layout[level].size == full.mip_layout[level + 2u].size;
+      }
+      Require(name, "chain layout", same,
+              "the chain from level 2 does not lie at the texture's own level bytes");
+      auto layered = full;
+      layered.resources.layers = 2u;
+      layered.data.size = 0;
+      layered.UpdateSize();
+      Require(name, "single slice", !full.MipChainFrom(0u) && !layered.MipChainFrom(2u),
+              "a level-0 or layered texture claimed a chain of its own");
+    }
+    if (!m_sparse_image2d_supported) {
+      std::printf("[gpu]     %-32s skipped (no sparse 2D images)\n", name);
+      return;
+    }
+
+    constexpr uintptr_t base = 0x0000000207400000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t clamped_address = base;
+    constexpr uint64_t full_address = base + 0x200000;
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "partial residency allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "partial residency mapping failed");
+    // Distinct block words, the same at both addresses.
+    auto *words = static_cast<u32 *>(mapped);
+    for (u32 index = 0; index < 0x200000u / 4u; ++index) {
+      words[index] = index * 0x9e3779b9u ^ (index >> 7u);
+    }
+    std::memcpy(reinterpret_cast<void *>(full_address), mapped, 0x200000u);
+    // BC1 1024^2 with 11 levels, tile 1, clamped to `min_lod` (U4.8).
+    const auto texture = [](uint64_t address, u32 min_lod) {
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      constexpr u32 last = 1023u;
+      value.dwords[0] = static_cast<u32>(address >> 8u);
+      value.dwords[1] = static_cast<u32>(address >> 40u) | (min_lod << 8u) |
+                        (static_cast<u32>(Prospero::BufferFormat::kBc1UNorm) << 20u) |
+                        ((last & 3u) << 30u);
+      value.dwords[2] = (last >> 2u) | (last << 14u);
+      value.dwords[3] = DstSel(4, 5, 6, 7) | (10u << 16u) |
+                        (static_cast<u32>(Prospero::TileMode::kStandard256B) << 20u) |
+                        (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      value.dwords[5] = 10u << 4u;
+      return value;
+    };
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto resolve = [&](uint64_t address, u32 min_lod) {
+        auto binding = executor.ResolveTexture(resource, texture(address, min_lod));
+        Require(name, "resolve",
+                binding.image_id && textures.FindTexture(binding.image_id, binding.desc),
+                "a sampled BC1 texture did not resolve");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        return binding.image_id;
+      };
+      // Level 2 (256^2 BC1: 64x64 blocks) as the device holds it.
+      const auto read_level = [&](ImageId id) {
+        constexpr u32 bytes = 64u * 64u * 8u;
+        auto readback = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst,
+                                         std::vector<u32>(bytes / 4u, 0));
+        auto &image = textures.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+                      {}, scheduler.Current().Handle());
+        const vk::BufferImageCopy copy{0, 0, 0, {vk::ImageAspectFlagBits::eColor, 2, 0, 1},
+                                       {}, {256, 256, 1}};
+        scheduler.Current().Handle().copyImageToBuffer(
+            image.backing.image, vk::ImageLayout::eTransferSrcOptimal, readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier host{};
+        host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        host.buffer = readback.buffer;
+        host.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eHost, {}, 0,
+                                                     nullptr, 1, &host, 0, nullptr);
+        scheduler.Finish();
+        auto read = ReadBuffer(name, readback, bytes / 4u);
+        DestroyBuffer(&readback);
+        return read;
+      };
+
+      const auto clamped = resolve(clamped_address, 2u << 8u);
+      {
+        const auto &image = textures.GetImage(clamped);
+        Require(name, "partial image",
+                image.info.first_level == 2u && image.backing.sparse &&
+                    image.backing.mip_levels == 11u &&
+                    image.info.data.size == image.info.MipChainFrom(2u)->data.size,
+                "a texture clamped to level 2 got a full image, or one over the larger levels' "
+                "bytes");
+      }
+      const auto reference = resolve(full_address, 0u);
+      Require(name, "full reference",
+              textures.GetImage(reference).info.first_level == 0u &&
+                  !textures.GetImage(reference).backing.sparse,
+              "an unclamped texture got a partial image");
+      Require(name, "partial pixels", read_level(clamped) == read_level(reference),
+              "the partial image's level 2 differs from a full image of the same bytes");
+
+      // Sampling the larger levels needs a full image; a clamped request then shares it.
+      const auto unclamped = resolve(clamped_address, 0u);
+      Require(name, "replacement",
+              unclamped != clamped && textures.GetImage(unclamped).info.first_level == 0u &&
+                  !textures.GetImage(unclamped).backing.sparse &&
+                  !TextureCacheTestAccess::Contains(textures, clamped),
+              "a request for the larger levels kept the partial image");
+      Require(name, "shared full image", resolve(clamped_address, 2u << 8u) == unclamped,
+              "a clamped request did not reuse the full image");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "partial residency mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "partial residency allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -24634,6 +24803,8 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  // Sparse 2D images, for textures the T# MIN_LOD clamps.
+  bool m_sparse_image2d_supported = false;
   bool m_sample_locations_supported = false;
   u32   m_skipped_cases          = 0;
 
@@ -24684,6 +24855,7 @@ private:
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
+    m_runtime_context.sparse_residency_image2d_enabled = m_sparse_image2d_supported;
     m_runtime_context.subgroup_size = SubgroupSize();
     m_runtime_context.QuerySampleLocations(m_sample_locations_supported);
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -24715,6 +24887,7 @@ private:
               static_cast<vk::Result>(vmaCreateAllocator(
                   &allocator_info, &m_runtime_context.allocator)),
               "vmaCreateAllocator");
+    m_runtime_context.CreateSparseBinding();
     m_renderer = std::make_unique<RenderContext>(m_runtime_context);
   }
 
@@ -25042,6 +25215,13 @@ private:
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
+    m_sparse_image2d_supported =
+        available_features.sparseBinding == VK_TRUE &&
+        available_features.sparseResidencyImage2D == VK_TRUE &&
+        static_cast<bool>(m_physical_device.getQueueFamilyProperties()[m_queue_family].queueFlags &
+                          vk::QueueFlagBits::eSparseBinding);
+    device_features.sparseBinding = m_sparse_image2d_supported;
+    device_features.sparseResidencyImage2D = m_sparse_image2d_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -25095,6 +25275,8 @@ private:
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
+        delete m_runtime_context.sparse_binding;
+        m_runtime_context.sparse_binding = nullptr;
         vmaDestroyAllocator(m_runtime_context.allocator);
         m_runtime_context.allocator = nullptr;
       }
@@ -59260,7 +59442,11 @@ int main(int argc, char **argv) {
     vulkan.CheckLargeSparseImageUpload();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--memory-residency-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckPartialResidency();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -59612,6 +59798,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckPartialResidency();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

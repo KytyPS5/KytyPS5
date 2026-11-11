@@ -600,6 +600,21 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	{
+		// Textures the T# MIN_LOD clamps become sparse 2D images with their unsampled levels
+		// unbound; the binds go on the one queue, so its family must take them.
+		const auto families = graphics.physical_device.getQueueFamilyProperties();
+		const bool queue_sparse =
+		    queue_family < families.size() && static_cast<bool>(families[queue_family].queueFlags &
+		                                                        vk::QueueFlagBits::eSparseBinding);
+		graphics.sparse_residency_image2d_enabled =
+		    queue_sparse && supported2.features.sparseBinding == VK_TRUE &&
+		    supported2.features.sparseResidencyImage2D == VK_TRUE;
+		device_features.sparseBinding          = graphics.sparse_residency_image2d_enabled;
+		device_features.sparseResidencyImage2D = graphics.sparse_residency_image2d_enabled;
+		LOGF("Vulkan sparse 2D images: %s\n",
+		     graphics.sparse_residency_image2d_enabled ? "true" : "false");
+	}
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =

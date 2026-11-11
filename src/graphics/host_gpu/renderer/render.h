@@ -65,7 +65,8 @@ struct DrawAutoArgs {
 };
 
 struct SubmitInfo {
-	static constexpr uint32_t MaxSemaphores = 3;
+	// One wait and one signal are kept for CommandScheduler::Submit: sparse binds and the master.
+	static constexpr uint32_t MaxSemaphores = 4;
 
 	std::array<vk::Semaphore, MaxSemaphores>          wait_semaphores {};
 	std::array<uint64_t, MaxSemaphores>               wait_ticks {};

@@ -49,13 +49,23 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	CreateSparseBinding();
 	return true;
+}
+
+void GraphicContext::CreateSparseBinding() {
+	EXIT_IF(allocator == nullptr || sparse_binding != nullptr);
+	if (sparse_residency_image2d_enabled) {
+		sparse_binding = new SparseBinding(*this);
+	}
 }
 
 void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	delete sparse_binding;
+	sparse_binding = nullptr;
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -146,9 +156,13 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	return std::max(local, available > system_reserve ? available - system_reserve : uint64_t {0});
 }
 
-bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image) {
+bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanImage& image,
+                                 uint32_t first_bound_level) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
+	if (first_bound_level != 0 && CreatePartialImage(image_info, first_bound_level, image)) {
+		return true;
+	}
 
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
@@ -182,9 +196,146 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	if (image.sparse) {
+		// Binds still queued would name a destroyed image.
+		sparse_binding->Forget(image.image);
+		device.destroyImage(image.image, nullptr);
+		vmaFreeMemory(allocator, image.allocation);
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
+	image.sparse     = false;
+}
+
+bool GraphicContext::CreatePartialImage(const vk::ImageCreateInfo& base, uint32_t first_level,
+                                        VulkanImage& image) {
+	if (sparse_binding == nullptr || base.imageType != vk::ImageType::e2D ||
+	    base.samples != vk::SampleCountFlagBits::e1 || base.tiling != vk::ImageTiling::eOptimal ||
+	    first_level == 0 || first_level >= base.mipLevels) {
+		return false;
+	}
+	auto info = base;
+	info.flags |=
+	    vk::ImageCreateFlagBits::eSparseBinding | vk::ImageCreateFlagBits::eSparseResidency;
+	if (GetImageFormatProperties(info.format, info.imageType, info.tiling, info.usage, info.flags,
+	                             nullptr) != vk::Result::eSuccess ||
+	    physical_device
+	        .getSparseImageFormatProperties(info.format, info.imageType, info.samples, info.usage,
+	                                        info.tiling)
+	        .empty()) {
+		return false;
+	}
+	vk::Image native = nullptr;
+	if (device.createImage(&info, nullptr, &native) != vk::Result::eSuccess) {
+		return false;
+	}
+	const auto requirements = device.getImageMemoryRequirements(native);
+	const auto sparse       = device.getImageSparseMemoryRequirements(native);
+	const auto color        = std::ranges::find_if(sparse, [](const auto& entry) {
+		return static_cast<bool>(entry.formatProperties.aspectMask &
+		                         vk::ImageAspectFlagBits::eColor);
+	});
+	if (color == sparse.end() || requirements.alignment == 0) {
+		device.destroyImage(native, nullptr);
+		return false;
+	}
+	const auto block = requirements.alignment;
+	const auto align = [block](uint64_t size) { return (size + block - 1u) / block * block; };
+
+	// Lay the bound levels and the mip tails out in one allocation.
+	SparseImageBinds binds {.image = native};
+	uint64_t         size        = 0;
+	const auto&      granularity = color->formatProperties.imageGranularity;
+	const auto       tail_first  = std::min(color->imageMipTailFirstLod, info.mipLevels);
+	for (uint32_t level = first_level; level < tail_first; ++level) {
+		const vk::Extent3D extent {std::max(info.extent.width >> level, 1u),
+		                           std::max(info.extent.height >> level, 1u), 1u};
+		const uint64_t     blocks =
+		    uint64_t {(extent.width + granularity.width - 1u) / granularity.width} *
+		    ((extent.height + granularity.height - 1u) / granularity.height);
+		for (uint32_t layer = 0; layer < info.arrayLayers; ++layer) {
+			vk::SparseImageMemoryBind bind {};
+			bind.subresource  = {vk::ImageAspectFlagBits::eColor, level, layer};
+			bind.extent       = extent;
+			bind.memoryOffset = size;
+			binds.levels.push_back(bind);
+			size += blocks * block;
+		}
+	}
+	const auto add_tails = [&](const vk::SparseImageMemoryRequirements& entry,
+	                           vk::SparseMemoryBindFlags                flags) {
+		if (entry.imageMipTailFirstLod >= info.mipLevels || entry.imageMipTailSize == 0) {
+			return;
+		}
+		const bool     single = static_cast<bool>(entry.formatProperties.flags &
+		                                          vk::SparseImageFormatFlagBits::eSingleMiptail);
+		const uint32_t tails  = single ? 1u : info.arrayLayers;
+		for (uint32_t tail = 0; tail < tails; ++tail) {
+			vk::SparseMemoryBind bind {};
+			bind.resourceOffset = entry.imageMipTailOffset + tail * entry.imageMipTailStride;
+			bind.size           = entry.imageMipTailSize;
+			bind.memoryOffset   = size;
+			bind.flags          = flags;
+			binds.opaque.push_back(bind);
+			size += align(entry.imageMipTailSize);
+		}
+	};
+	add_tails(*color, {});
+	for (const auto& entry: sparse) {
+		if (static_cast<bool>(entry.formatProperties.aspectMask &
+		                      vk::ImageAspectFlagBits::eMetadata)) {
+			add_tails(entry, vk::SparseMemoryBindFlagBits::eMetadata);
+		}
+	}
+
+	// A sparse image is bound to device-local memory only. Where the device-local heaps cannot
+	// take it, a full image follows.
+	uint32_t device_types = 0;
+	for (uint32_t type = 0; type < physical_device_memory_properties.memoryTypeCount; ++type) {
+		if (physical_device_memory_properties.memoryTypes[type].propertyFlags &
+		    vk::MemoryPropertyFlagBits::eDeviceLocal) {
+			device_types |= 1u << type;
+		}
+	}
+	const VkMemoryRequirements memory {size, block, requirements.memoryTypeBits & device_types};
+	VmaAllocationCreateInfo    create {};
+	create.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	const auto result = memory.memoryTypeBits == 0 ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+	                                               : vmaAllocateMemory(allocator, &memory, &create,
+	                                                                   &image.allocation, nullptr);
+	if (result != VK_SUCCESS) {
+		image.allocation = nullptr;
+		device.destroyImage(native, nullptr);
+		return false;
+	}
+	VmaAllocationInfo allocation_info {};
+	vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+	for (auto& bind: binds.levels) {
+		bind.memory = allocation_info.deviceMemory;
+		bind.memoryOffset += allocation_info.offset;
+	}
+	for (auto& bind: binds.opaque) {
+		bind.memory = allocation_info.deviceMemory;
+		bind.memoryOffset += allocation_info.offset;
+	}
+	sparse_binding->BindImage(std::move(binds));
+
+	image.image      = native;
+	image.format     = info.format;
+	image.image_type = info.imageType;
+	image.extent     = info.extent;
+	image.layers     = info.arrayLayers;
+	image.mip_levels = info.mipLevels;
+	image.samples    = static_cast<uint32_t>(info.samples);
+	image.usage      = info.usage;
+	image.flags      = info.flags;
+	image.state      = {.layout = info.initialLayout};
+	image.subresource_states.clear();
+	image.sparse = true;
+	return true;
 }
 
 } // namespace Libs::Graphics

@@ -230,6 +230,27 @@ uint32_t ImageInfo::DataAlignment() const {
 	return tiling.block.block_size;
 }
 
+std::optional<ImageInfo> ImageInfo::MipChainFrom(uint32_t level) const {
+	// Single-slice tiled 2D chains only: their layout always exists for a smaller extent.
+	if (level == 0 || level >= resources.levels || resources.layers != 1 || IsVolume() ||
+	    samples != 1 || !IsTiled() || HasStencil() || HasMetadata() || !data.Valid()) {
+		return std::nullopt;
+	}
+	ImageInfo chain        = *this;
+	chain.data             = {data.address, 0};
+	chain.extent           = MipExtent(level);
+	chain.extent.depth     = 1;
+	chain.resources.levels = resources.levels - level;
+	chain.pitch            = 0;
+	chain.mip_layout       = {};
+	chain.first_level      = 0;
+	chain.UpdateSize();
+	if (chain.data.size > data.size || !SameMipChain(chain, *this, level)) {
+		return std::nullopt;
+	}
+	return chain;
+}
+
 int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
 	if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
 	    IsVolume() || resources.levels != 1 || resources.layers == 0 ||

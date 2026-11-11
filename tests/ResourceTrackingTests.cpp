@@ -7133,6 +7133,30 @@ void TestGpuSelectedFormattedRecordStore() {
                   std::pair{memory.base + table_offset + row * 592u + 448u, uint64_t{16u}}) !=
                   snapshot.specialization_reads.end(),
           "exact row descriptor escaped selection mapping or writable-alias capture");
+  std::array<uint32_t, 6> saved_add_tid;
+  for (uint32_t row = 0; row < saved_add_tid.size(); ++row) {
+    auto& selector = memory.words[first + row * 592u / 4u + 3u];
+    saved_add_tid[row] = selector;
+    selector |= 1u << 23u;
+  }
+  Check(materialize() &&
+            std::ranges::any_of(specialization.buffers, [root](const auto& buffer) {
+              return buffer.indirect_root == root &&
+                     buffer.descriptor_format == Prospero::BufferFormat::k8SInt &&
+                     (buffer.packed_stride & (1u << 20u)) != 0u;
+            }),
+        "ADD_TID formatted store was rejected or lost its lane-index specialization");
+  memory.words[first + 1u] |= 1u << 31u;
+  Check(!materialize(), "ADD_TID formatted store accepted hardware swizzling");
+  memory.words[first + 1u] &= ~(1u << 31u);
+  memory.words[first + 3u] = (memory.words[first + 3u] & ~(3u << 28u)) | (1u << 28u);
+  Check(!materialize(), "ADD_TID formatted store accepted a partial-record bounds mode");
+  memory.words[first + 3u] =
+      (memory.words[first + 3u] & ~(0x7fu << 12u)) | (uint32_t {0x7fu} << 12u);
+  Check(!materialize(), "ADD_TID formatted store accepted an unsupported format");
+  for (uint32_t row = 0; row < saved_add_tid.size(); ++row)
+    memory.words[first + row * 592u / 4u + 3u] = saved_add_tid[row];
+  Check(materialize(), "ADD_TID formatted store did not recover after invalid candidates");
   const auto original = specialization;
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,

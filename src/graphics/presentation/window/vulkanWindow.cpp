@@ -441,6 +441,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
 	}
+	// Custom sample locations place EQAA's guest samples natively.
+	add(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
@@ -554,6 +556,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	graphics.QuerySampleLocations(
+	    HasExtension(device_extensions, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME));
+	LOGF("Vulkan sample locations: %s counts=0x%x range=[%g, %g] sub_pixel_bits=%u\n",
+	     graphics.sample_locations_enabled ? "true" : "false",
+	     static_cast<vk::SampleCountFlags::MaskType>(graphics.sample_location_counts),
+	     graphics.sample_location_range[0], graphics.sample_location_range[1],
+	     graphics.sample_location_sub_pixel_bits);
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,

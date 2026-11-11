@@ -500,17 +500,41 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	auto& textures = m_context.GetTextureCache();
 	// A changed image refreshes; one that changed identity needs new elements.
 	TakeChanges();
+	const auto refresh = [&](uint64_t serial, ImageId id) {
+		textures.UpdateImage(id);
+		const auto& image = textures.m_slot_images[id];
+		if (const auto stencil = textures.FindStencilPlane(image, image.info.stencil)) {
+			textures.UpdateImage(stencil);
+		}
+		m_away.emplace_back(serial, id);
+	};
+	// A pass draws into its targets' EQAA shadows; refreshing one between its draws would write
+	// the shadow back each time, so it waits until the image is no longer a target.
+	const auto shadowed_target = [](const Image& image) {
+		return image.eqaa != nullptr && image.eqaa->dirty && image.binding.is_target;
+	};
 	std::erase_if(m_changes, [&](const Image::HeapChange& change) {
 		const auto id = CurrentImage(change);
-		if (id) {
-			textures.UpdateImage(id);
-			const auto& image = textures.m_slot_images[id];
-			if (const auto stencil = textures.FindStencilPlane(image, image.info.stencil)) {
-				textures.UpdateImage(stencil);
-			}
-			m_away.emplace_back(change.serial, id);
+		if (id && shadowed_target(textures.m_slot_images[id])) {
+			m_unsettled.emplace_back(change.serial, id);
+		} else if (id) {
+			refresh(change.serial, id);
 		}
 		return static_cast<bool>(id);
+	});
+	std::ranges::sort(m_unsettled);
+	m_unsettled.erase(std::ranges::unique(m_unsettled).begin(), m_unsettled.end());
+	std::erase_if(m_unsettled, [&](const std::pair<uint64_t, ImageId>& unsettled) {
+		const auto* image = textures.m_slot_images.try_get(unsettled.second);
+		if (image == nullptr || image->serial != unsettled.first || !image->registered ||
+		    image->depth_id || image->heap_refs.load(std::memory_order_relaxed) == 0u) {
+			return true;
+		}
+		if (shadowed_target(*image)) {
+			return false;
+		}
+		refresh(unsettled.first, unsettled.second);
+		return true;
 	});
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
 	const auto resolve = [&](const Element& element) {

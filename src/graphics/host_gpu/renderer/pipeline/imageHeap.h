@@ -143,6 +143,8 @@ private:
 	std::vector<uint32_t>                             m_held; // Another extent holds the address.
 	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
+	// Serial, image: targets whose newest pixels are in an EQAA shadow.
+	std::vector<std::pair<uint64_t, ImageId>>         m_unsettled;
 	uint64_t                                          m_held_serial = 0; // Image::serials.
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
 	std::vector<std::pair<size_t, size_t>>            m_runs;

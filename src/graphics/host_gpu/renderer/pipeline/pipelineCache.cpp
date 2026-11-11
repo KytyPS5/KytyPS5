@@ -955,6 +955,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
+	const auto& sample_pattern = targets.eqaa.pattern;
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	const bool ps_active    = state.ps_active;
@@ -994,10 +995,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
-			attachment_samples = colors[i].desc.info.samples;
-		} else if (attachment_samples != colors[i].desc.info.samples) {
+			attachment_samples = colors[i].AttachmentSamples();
+		} else if (attachment_samples != colors[i].AttachmentSamples()) {
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].desc.info.samples);
+			     attachment_samples, colors[i].AttachmentSamples());
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
@@ -1058,10 +1059,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;
 		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
+			attachment_samples = depth.AttachmentSamples();
+		} else if (attachment_samples != depth.AttachmentSamples()) {
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+			     depth.AttachmentSamples());
 		}
 	}
 	if (color_count == 0 && !with_depth) {
@@ -1079,6 +1080,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.topology                 = state.topology;
 	static_params.primitive_restart_enable = state.primitive_restart_enable;
 	static_params.samples                  = attachment_samples;
+	EXIT_IF(sample_pattern.count != 0 && sample_pattern.count != attachment_samples);
+	static_params.sample_pattern = sample_pattern;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();

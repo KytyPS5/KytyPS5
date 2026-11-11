@@ -28,8 +28,13 @@ struct RenderDepthInfo {
 	vk::StencilOpState          stencil_front;
 	vk::StencilOpState          stencil_back;
 	ImageId                     image_id;
+	// The host attachment's sample count when it differs from the guest image's (0: same).
+	uint32_t attachment_samples = 0;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
+	[[nodiscard]] uint32_t             AttachmentSamples() const {
+		return attachment_samples != 0 ? attachment_samples : desc.info.samples;
+	}
 };
 
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,

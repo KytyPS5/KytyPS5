@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <array>
 #include <map>
 #include <mutex>
 #include <span>
@@ -45,6 +46,11 @@ struct GraphicContext {
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
+	// VK_EXT_sample_locations: the sample counts that take custom locations on a 1x1 grid.
+	bool                               sample_locations_enabled              = false;
+	vk::SampleCountFlags               sample_location_counts                = {};
+	std::array<float, 2>               sample_location_range                 = {};
+	uint32_t                           sample_location_sub_pixel_bits        = 0;
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
@@ -104,6 +110,9 @@ struct GraphicContext {
 		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
 		return alignment != 0 ? alignment : 1;
 	}
+
+	// Fills the sample_location_* fields from the physical device.
+	void QuerySampleLocations(bool extension_enabled);
 
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();

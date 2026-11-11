@@ -93,6 +93,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -20601,6 +20602,453 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  // RE2's checkerboard: 2 raster samples, one colour fragment and one Z sample.
+  void CheckEqaa() {
+    constexpr const char *name = "EqaaAnchorShadow";
+    EnsureRuntimeContext();
+    if (!m_rasterization_supported || !m_runtime_context.sample_locations_enabled ||
+        !(m_runtime_context.sample_location_counts & vk::SampleCountFlagBits::e2)) {
+      std::printf("[host]    %-32s SKIP (no 2x custom sample locations)\n", name);
+      return;
+    }
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint32_t width = 32;
+    constexpr uint32_t height = 8;
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    context.MapMemory(base, allocation_size);
+
+    registers.Reset();
+    registers.SetViewportTransformControl(0x300);
+    registers.SetViewportScaleOffset(0, width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f,
+                                     1, 0);
+    registers.SetViewportZMax(0, 1);
+    registers.SetScreenScissor(0, 0, width, height);
+    registers.SetWindowScissor(0, 0, width, height, false);
+    registers.SetGenericScissor(0, 0, width, height, false);
+    registers.SetViewportScissorTL(0, 0, 0, false);
+    registers.SetViewportScissorBR(0, width, height);
+    registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
+    registers.SetPsInControl(0x8000);
+    registers.SetTargetOutputMode(0, 4);
+    registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                               .channel_type = Prospero::ChannelType::kFloat,
+                               .channel_order = Prospero::ChannelOrder::kStandard});
+    registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+    registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    HW::AaConfig aa{};
+    aa.msaa_num_samples = 1;
+    aa.max_sample_dist = 4;
+    aa.msaa_exposed_samples = 1;
+    registers.SetAaConfig(aa);
+    auto scan = registers.GetScanModeControl();
+    scan.msaa_enable = true;
+    registers.SetScanModeControl(scan);
+    // Frame N: rows 0 mod 2 put sample 0 at +4/16 px, rows 1 mod 2 at -4/16 px.
+    const auto set_frame = [&](bool odd) {
+      HW::AaSampleControl locations{};
+      const uint32_t plus = 0x0c04u;
+      const uint32_t minus = 0x040cu;
+      locations.locations[0] = locations.locations[4] = odd ? minus : plus;
+      locations.locations[8] = locations.locations[12] = odd ? plus : minus;
+      registers.SetAaSampleControl(locations);
+    };
+
+    static ShaderUserData user_data{};
+    static std::deque<std::vector<u32>> programs;
+    const auto literal = [](float value) { return std::bit_cast<u32>(value); };
+    // One triangle; vertex i is (x[i], y[i], z[i]) in clip space with w = 1.
+    const auto vertex_shader = [&](std::array<float, 3> x, std::array<float, 3> y,
+                                   std::array<float, 3> z) {
+      auto &code = programs.emplace_back();
+      const std::array<std::array<float, 3>, 3> axes{x, y, z};
+      constexpr std::array<u32, 3> registers_of{3, 4, 7};
+      for (u32 axis = 0; axis < 3; axis++) {
+        const auto destination = registers_of[axis];
+        AppendVMovLiteral(&code, 1, literal(axes[axis][0]));
+        AppendVMovLiteral(&code, 2, literal(axes[axis][1]));
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+        code.push_back(EncodeVop2(0x01, destination, Vgpr(1), 2));
+        AppendVMovLiteral(&code, 2, literal(axes[axis][2]));
+        code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+        code.push_back(EncodeVop2(0x01, destination, Vgpr(destination), 2));
+      }
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, literal(1.0f));
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(3, 4, 7, 6));
+      for (u32 parameter = 0; parameter < 8; parameter++) {
+        code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+        code.push_back(EncodeExp1(0, 0, 0, 0));
+      }
+      AppendEnd(&code);
+      const auto address = reinterpret_cast<uint64_t>(code.data());
+      ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kGs, .user_data = &user_data,
+                                  .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return address;
+    };
+    const auto pixel_shader = [&](float value) {
+      auto &code = programs.emplace_back();
+      for (u32 component = 0; component < 4; component++) {
+        AppendVMovLiteral(&code, component, literal(value));
+      }
+      code.push_back(EncodeExp0(0, 0xf));
+      code.push_back(EncodeExp1(0, 1, 2, 3));
+      AppendEnd(&code);
+      const auto address = reinterpret_cast<uint64_t>(code.data());
+      ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kPs,
+                                  .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return address;
+    };
+    // Vertical edges at 10.4 and 10.6 px: pixel 10's host samples sit at 10.25 and 10.75.
+    const auto edge = [](float pixels) { return pixels / (width / 2.0f) - 1.0f; };
+    const auto left_of = [&](float pixels, float z = 0.5f) {
+      return vertex_shader({edge(pixels), edge(pixels), -3.0f}, {-1.0f, 7.0f, -1.0f}, {z, z, z});
+    };
+    const auto right_of = [&](float pixels, float z = 0.5f) {
+      return vertex_shader({edge(pixels), edge(pixels), 5.0f}, {-1.0f, 7.0f, -1.0f}, {z, z, z});
+    };
+    const auto nothing = vertex_shader({2.0f, 3.0f, 2.0f}, {2.0f, 2.0f, 3.0f}, {0.5f, 0.5f, 0.5f});
+    // Depth varies along x only.
+    const auto ramp = vertex_shader({-3.0f, 5.0f, -3.0f}, {-1.0f, -1.0f, 7.0f}, {0.2f, 0.6f, 0.2f});
+    const auto one = pixel_shader(1.0f);
+    const auto two = pixel_shader(2.0f);
+
+    const auto draw = [&](uint64_t color_address, uint64_t vs, uint64_t ps) {
+      registers.SetColorBase(0, {.addr = color_address});
+      shaders.SetEsShaderBase(vs);
+      shaders.SetPsShaderBase(ps);
+      Require(name, "draw",
+              RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                 {.vertex_count = 3, .instance_count = 1}),
+              "the EQAA draw was refused");
+    };
+    const auto color_id = [&](uint64_t color_address) {
+      registers.SetColorBase(0, {.addr = color_address});
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      return color;
+    };
+    const auto read_red = [&](ImageId id) {
+      cache.UpdateImage(id);
+      const auto texels = ReadCachedTexel(name, context, id, {}, {width, height, 1});
+      std::vector<u32> red(width * height);
+      for (uint32_t i = 0; i < red.size(); i++) {
+        red[i] = texels[i * 4];
+      }
+      return red;
+    };
+    const auto at = [&](const std::vector<u32> &pixels, uint32_t x, uint32_t y) {
+      return pixels[y * width + x];
+    };
+    const auto check_columns = [&](const char *label, const std::vector<u32> &pixels,
+                                   u32 col9, u32 col10_even, u32 col10_odd, u32 col11) {
+      for (uint32_t y = 0; y < height; y++) {
+        const bool odd = (y & 1u) != 0;
+        if (at(pixels, 9, y) != col9 || at(pixels, 10, y) != (odd ? col10_odd : col10_even) ||
+            at(pixels, 11, y) != col11) {
+          std::fprintf(stderr, "%s: row %u: %08x %08x %08x\n", label, y, at(pixels, 9, y),
+                       at(pixels, 10, y), at(pixels, 11, y));
+          Require(name, label, false, "the anchor sample did not follow the row's sample 0");
+        }
+      }
+    };
+    const u32 f1 = literal(1.0f);
+    const u32 f2 = literal(2.0f);
+
+    // Per-row edge coverage, both frame parities.
+    set_frame(false);
+    draw(base + 0x00000, left_of(10.4f), one);
+    {
+      const auto color = color_id(base + 0x00000);
+      const auto &shadow = cache.GetImage(color.image_id).eqaa;
+      Require(name, "anchor shadow plan",
+              shadow != nullptr && shadow->pattern.count == 2 && shadow->pattern.xy[0] == 0x84 &&
+                  shadow->pattern.xy[1] == 0x8c && shadow->anchor_select == 0x0011 &&
+                  shadow->image->backing.samples == 2,
+              "the checkerboard draw did not render into a 2x shadow with the row anchors");
+      check_columns("frame N coverage", read_red(color.image_id), f1, 0, f1, 0);
+    }
+    set_frame(true);
+    draw(base + 0x10000, left_of(10.4f), one);
+    check_columns("frame N+1 coverage", read_red(color_id(base + 0x10000).image_id), f1, f1, 0, 0);
+
+    // Coverage at sample 1 alone writes no colour.
+    set_frame(false);
+    draw(base + 0x20000, right_of(10.6f), one);
+    check_columns("sample 1 coverage tossed", read_red(color_id(base + 0x20000).image_id), 0,
+                  f1, 0, f1);
+
+    // A frame flip without a clear: the old anchors are written back, then re-expanded.
+    set_frame(false);
+    draw(base + 0x30000, left_of(10.4f), one);
+    set_frame(true);
+    draw(base + 0x30000, right_of(10.4f), two);
+    {
+      const auto color = color_id(base + 0x30000);
+      Require(name, "flipped anchor select",
+              cache.GetImage(color.image_id).eqaa->anchor_select == 0x1100,
+              "the frame flip did not change the anchor select");
+      check_columns("flip without clear", read_red(color.image_id), f1, 0, f2, f2);
+    }
+
+    // An empty draw round-trips every bit through the shadow: NaN payloads and denormals.
+    {
+      const auto color = color_id(base + 0x40000);
+      const auto &info = cache.GetImage(color.image_id).info;
+      std::vector<u32> expected(width * height);
+      for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+          constexpr std::array<u32, 6> specials{0x7f800001u, 0xffc12345u, 0x00000001u,
+                                                0x80000003u, 0x7fbfffffu, 0xdeadbeefu};
+          const auto texel = (y * width + x) * 0x9e3779b9u;
+          for (uint32_t component = 0; component < 4; component++) {
+            const auto value = specials[(texel + component) % specials.size()] ^
+                               (texel & 0x0000ff00u);
+            reinterpret_cast<u32 *>(base + 0x40000)[(y * info.pitch + x) * 4 + component] = value;
+            if (component == 0) {
+              expected[y * width + x] = value;
+            }
+          }
+        }
+      }
+      set_frame(false);
+      draw(base + 0x40000, nothing, one);
+      Require(name, "bit-exact round trip", read_red(color.image_id) == expected,
+              "the expand or select changed bits of an untouched pixel");
+    }
+
+    // A sampled consumer settles the shadow; a full clear reaches both images.
+    {
+      set_frame(false);
+      draw(base + 0x50000, left_of(10.4f), one);
+      auto color = color_id(base + 0x50000);
+      auto &image = cache.GetImage(color.image_id);
+      Require(name, "dirty after the pass",
+              image.eqaa != nullptr && (image.eqaa->dirty & vk::ImageAspectFlagBits::eColor),
+              "the pass did not leave its newest colour in the shadow");
+      auto sampled = color.desc;
+      sampled.type = BindingType::Texture;
+      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      (void)cache.FindTexture(color.image_id, sampled);
+      Require(name, "texture consumer settles", !image.eqaa->dirty,
+              "sampling the target left the shadow unsettled");
+      check_columns("sampled consumer", read_red(color.image_id), f1, 0, f1, 0);
+      vk::ClearValue clear{};
+      clear.color.float32 = std::array{2.0f, 2.0f, 2.0f, 2.0f};
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      Require(name, "mirrored clear",
+              (image.eqaa->samples_equal & vk::ImageAspectFlagBits::eColor) &&
+                  image.eqaa->synced == image.content_stamp,
+              "a full clear did not leave the shadow equal to its owner");
+      set_frame(true);
+      draw(base + 0x50000, right_of(10.4f), one);
+      check_columns("after mirrored clear", read_red(color.image_id), f2, f2, f1, f1);
+    }
+
+    // RE2's scene colour is packed float, which has no integer view.
+    registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k11_11_10,
+                               .channel_type = Prospero::ChannelType::kFloat,
+                               .channel_order = Prospero::ChannelOrder::kStandard});
+    set_frame(false);
+    draw(base + 0x160000, left_of(10.4f), one);
+    {
+      const auto color = color_id(base + 0x160000);
+      const auto &image = cache.GetImage(color.image_id);
+      Require(name, "packed float shadow",
+              image.backing.format == vk::Format::eB10G11R11UfloatPack32 && image.eqaa != nullptr &&
+                  image.eqaa->image->backing.samples == 2,
+              "the packed float target did not render into a 2x shadow");
+      cache.UpdateImage(color.image_id);
+      // 1.0 in each of the 11, 11 and 10 bit floats.
+      constexpr u32 packed_one = 0x3c0u | (0x3c0u << 11u) | (0x1e0u << 22u);
+      check_columns("packed float coverage",
+                    ReadCachedTexel(name, context, color.image_id, {}, {width, height, 1}),
+                    packed_one, 0, packed_one, 0);
+    }
+    registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                               .channel_type = Prospero::ChannelType::kFloat,
+                               .channel_order = Prospero::ChannelOrder::kStandard});
+
+    // Death Stranding 2: 4 raster samples tracked in FMASK over one stored fragment.
+    {
+      HW::AaConfig four = aa;
+      four.msaa_num_samples = 2;
+      four.msaa_exposed_samples = 2;
+      registers.SetAaConfig(four);
+      HW::AaSampleControl locations{};
+      locations.locations[0] = locations.locations[4] = 0x66aa0c04u;
+      locations.locations[8] = locations.locations[12] = 0x66aa040cu;
+      registers.SetAaSampleControl(locations);
+      registers.SetColorAttrib(0, {.num_samples = 2, .num_fragments = 0});
+      draw(base + 0x170000, left_of(10.4f), one);
+      const auto color = color_id(base + 0x170000);
+      const auto &image = cache.GetImage(color.image_id);
+      Require(name, "one-fragment shadow",
+              image.backing.samples == 1 && image.eqaa != nullptr &&
+                  image.eqaa->image->backing.samples == 4 && image.eqaa->pattern.count == 4 &&
+                  image.eqaa->pattern.xy[0] == 0x22 && image.eqaa->pattern.xy[3] == 0xee &&
+                  image.eqaa->anchor_select == 0x1122,
+              "the 4-coverage/1-fragment target did not render into a 4x shadow");
+      check_columns("one-fragment coverage", read_red(color.image_id), f1, 0, f1, 0);
+      registers.SetColorAttrib(0, {});
+      registers.SetAaConfig(aa);
+    }
+
+    // Depth is interpolated, tested and stored at each row's sample 0.
+    HW::DepthRenderTarget z{};
+    z.z_info.format = Prospero::DepthFormat::kZ32F;
+    z.stencil_info.format = Prospero::StencilFormat::kInvalid;
+    z.size = {static_cast<uint16_t>(width - 1), static_cast<uint16_t>(height - 1), true};
+    const auto depth_id = [&](uint64_t address) {
+      z.z_read_base_addr = z.z_write_base_addr = address;
+      registers.SetDepthRenderTarget(z);
+      RenderDepthInfo depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      return depth.image_id;
+    };
+    registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                               .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+    for (const bool odd_frame : {false, true}) {
+      const uint64_t address = base + (odd_frame ? 0x110000 : 0x100000);
+      z.z_read_base_addr = z.z_write_base_addr = address;
+      registers.SetDepthRenderTarget(z);
+      set_frame(odd_frame);
+      draw(base + 0x60000, ramp, one);
+      const auto id = depth_id(address);
+      cache.UpdateImage(id);
+      const auto words = ReadCachedTexel(name, context, id, {}, {width, height, 1});
+      const auto d = [&](uint32_t x, uint32_t y) {
+        return static_cast<double>(std::bit_cast<float>(words[y * width + x]));
+      };
+      for (uint32_t x = 1; x + 2 < width; x++) {
+        const double slope = d(x + 1, 1) - d(x, 1);
+        const double offset = d(x, 0) - d(x, 1);
+        Require(name, "per-row depth sample",
+                slope > 0.0 && std::abs(offset - (odd_frame ? -0.5 : 0.5) * slope) < 1e-6,
+                "stored depth is not interpolated at the row's sample 0");
+      }
+    }
+
+    // The host has no stencil export, so select and expand replay it bit by bit.
+    z.stencil_info.format = Prospero::StencilFormat::k8UInt;
+    z.stencil_info.htile_stencil_disabled = true;
+    z.stencil_read_base_addr = z.stencil_write_base_addr = base + 0x140000;
+    z.z_read_base_addr = z.z_write_base_addr = base + 0x120000;
+    registers.SetDepthRenderTarget(z);
+    registers.SetDepthControl({.stencil_enable = true, .z_enable = true,
+                               .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways),
+                               .stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+    registers.SetStencilControl({0, static_cast<uint8_t>(Prospero::StencilOp::kReplaceTest), 0,
+                                 0, static_cast<uint8_t>(Prospero::StencilOp::kReplaceTest), 0});
+    registers.SetStencilMask({0x5a, 0xff, 0xff, 0, 0x5a, 0xff, 0xff, 0});
+    auto stencil_readback =
+        CreateHostBuffer(name, width * height, vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto read_stencil = [&](ImageId id) {
+      cache.UpdateImage(id);
+      const vk::BufferImageCopy copy{
+          0, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {width, height, 1}};
+      cache.GetImage(id).Download(std::span{&copy, 1}, stencil_readback.buffer, 0,
+                                  stencil_readback.size);
+      const vk::MemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                                       .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                       .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                                       .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+      vk::DependencyInfo dependency{};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &barrier;
+      scheduler.Current().Handle().pipelineBarrier2(dependency);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, stencil_readback, width * height / 4);
+      std::vector<u32> bytes(width * height);
+      for (uint32_t i = 0; i < bytes.size(); i++) {
+        bytes[i] = (words[i / 4] >> (8u * (i % 4))) & 0xffu;
+      }
+      return bytes;
+    };
+    set_frame(false);
+    draw(base + 0x70000, left_of(10.4f), one);
+    {
+      RenderDepthInfo depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      check_columns("stencil select", read_stencil(depth.image_id), 0x5a, 0, 0x5a, 0);
+      set_frame(true);
+      draw(base + 0x70000, nothing, one);
+      check_columns("stencil expand", read_stencil(depth.image_id), 0x5a, 0, 0x5a, 0);
+    }
+    DestroyBuffer(&stencil_readback);
+    registers.SetDepthRenderTarget({});
+    registers.SetDepthControl({});
+
+    // Native 2x MSAA with uniform custom locations at +-6/16 px.
+    {
+      registers.SetColorAttrib(0, {.num_samples = 1, .num_fragments = 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1});
+      HW::AaSampleControl locations{};
+      for (uint32_t quad = 0; quad < 4; quad++) {
+        locations.locations[quad * 4] = 0x0a06u;
+      }
+      registers.SetAaSampleControl(locations);
+      const auto color = color_id(base + 0x80000);
+      Require(name, "native target", cache.GetImage(color.image_id).backing.samples == 2,
+              "the 2x colour target is not multisampled");
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      draw(base + 0x80000, left_of(10.2f), one);
+      Require(name, "native custom locations", cache.GetImage(color.image_id).eqaa == nullptr,
+              "native MSAA rendered through a shadow");
+      const auto texels = ReadCachedTexel(name, context, color.image_id, {}, {width, height, 1});
+      for (uint32_t y = 0; y < height; y++) {
+        Require(name, "native custom locations",
+                texels[(y * width + 9) * 4] == f1 &&
+                    texels[(y * width + 10) * 4] == literal(0.5f) &&
+                    texels[(y * width + 11) * 4] == 0,
+                "the pipeline did not rasterize at the guest's uniform sample locations");
+      }
+      registers.SetColorAttrib(0, {});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    }
+
+    // The pipeline key carries the host sample locations.
+    GraphicsPipelineKey plain{};
+    GraphicsPipelineKey custom{};
+    custom.static_params.sample_pattern.count = 2;
+    custom.static_params.sample_pattern.xy = {0x84, 0x8c};
+    Require(name, "pipeline key", !(plain == custom),
+            "custom sample locations shared a pipeline with the standard ones");
+
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
@@ -24055,6 +24503,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_sample_locations_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -24105,6 +24554,7 @@ private:
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
+    m_runtime_context.QuerySampleLocations(m_sample_locations_supported);
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -24271,6 +24721,21 @@ private:
     vk::PhysicalDeviceProperties2 properties2{};
     properties2.pNext = &robustness2_properties;
     m_physical_device.getProperties2(&properties2);
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> device_extension_list(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   device_extension_list.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    m_sample_locations_supported =
+        std::ranges::any_of(device_extension_list, [](const vk::ExtensionProperties &extension) {
+          return std::string_view(extension.extensionName.data()) ==
+                 VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME;
+        });
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
     Require("VulkanHarness", "dispatch",
@@ -24470,6 +24935,9 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (m_sample_locations_supported) {
+      device_extensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
@@ -58331,6 +58799,10 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--eqaa-only") == 0) {
+    vulkan.CheckEqaa();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {

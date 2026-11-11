@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_set>
@@ -59,8 +60,19 @@ public:
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// With `eqaa` the pass draws into the image's EQAA shadow: the shadow is left unsettled.
+	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc,
+	                                             bool eqaa = false);
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            bool eqaa = false);
+	// Whether a target of this view can carry an EQAA shadow of `samples` samples.
+	[[nodiscard]] bool EqaaShadowSupported(ImageId id, uint32_t samples);
+	// The shadow view an AnchorShadow pass draws through.
+	[[nodiscard]] vk::ImageView AcquireEqaaShadow(ImageId id, const ImageDesc& desc,
+	                                              const EqaaPlan& plan, vk::ImageAspectFlags writes,
+	                                              vk::ImageAspectFlags cleared);
+	// The shadow's backing, for the pass's barriers.
+	[[nodiscard]] Image& EqaaShadowImage(ImageId id) { return *m_slot_images[id].eqaa->image; }
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -229,7 +241,7 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	void RefreshImage(ImageId id, vk::ImageAspectFlags settle = EqaaAllAspects);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -248,7 +260,20 @@ private:
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
-	void RefreshCopySource(ImageId id);
+	void       RefreshCopySource(ImageId id, vk::ImageAspectFlags settle = EqaaAllAspects);
+
+	static constexpr vk::ImageAspectFlags EqaaAllAspects = vk::ImageAspectFlagBits::eColor |
+	                                                       vk::ImageAspectFlagBits::eDepth |
+	                                                       vk::ImageAspectFlagBits::eStencil;
+	// Writes the shadow's newest `aspects` back into its owner.
+	void SettleEqaa(Image& image, vk::ImageAspectFlags aspects);
+	// Forgets the shadow's newest `aspects`: the owner's are about to be replaced wholesale.
+	static void DiscardEqaa(Image& image, vk::ImageAspectFlags aspects);
+	void        ExpandEqaa(Image& image, vk::ImageAspectFlags aspects);
+	void        DropShadow(Image& image);
+	void        DropIdleShadows(uint64_t tick);
+	[[nodiscard]] const vk::SampleLocationsInfoEXT*
+	                      InternSampleLocations(const HostSamplePattern& pattern);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	// The depth image's stencil plane record covering exactly range, or none.
@@ -282,6 +307,14 @@ private:
 	bool     m_readback_linear_images  = false;
 	bool     m_readback_tiled_images   = false;
 	bool     m_readback_storage_images = false;
+	// Owners of an EQAA shadow, and the never-freed sample-location tables barriers point at.
+	std::vector<ImageId> m_eqaa_images;
+	struct InternedSampleLocations {
+		HostSamplePattern                     pattern;
+		std::array<vk::SampleLocationEXT, 16> locations {};
+		vk::SampleLocationsInfoEXT            info;
+	};
+	std::vector<std::unique_ptr<InternedSampleLocations>> m_sample_locations;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

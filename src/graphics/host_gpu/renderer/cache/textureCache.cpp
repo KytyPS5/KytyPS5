@@ -116,6 +116,10 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	return true;
 }
 
+[[nodiscard]] vk::ImageAspectFlags OwnerAspects(const Image& image) {
+	return image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
+	                            : vk::ImageAspectFlags {vk::ImageAspectFlagBits::eColor};
+}
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -249,6 +253,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 
 void TextureCache::DeleteImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	DropShadow(image);
 	if (!image.registered) {
 		return;
 	}
@@ -437,9 +442,9 @@ void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	}
 }
 
-void TextureCache::RefreshCopySource(ImageId id) {
+void TextureCache::RefreshCopySource(ImageId id, vk::ImageAspectFlags settle) {
 	auto& image = m_slot_images[id];
-	RefreshImage(id);
+	RefreshImage(id, settle);
 	if (image.IsDefinitelyCpuDirty()) {
 		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
 	}
@@ -528,6 +533,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
+	SettleEqaa(destination, EqaaAllAspects);
 	destination.RefreshComplete();
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
@@ -560,6 +566,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
+	SettleEqaa(m_slot_images[destination_id], EqaaAllAspects);
 	if (m_slot_images[destination_id].IsBufferModified()) {
 		RefreshImage(destination_id);
 	}
@@ -667,6 +674,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		if (cached.IsBufferModified() || cached.IsDefinitelyCpuDirty()) {
 			EXIT("TextureCache: multisample depth conversion source is not native-current\n");
 		}
+		SettleEqaa(replacement, EqaaAllAspects);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
 		CommitGpuWrite(replacement);
 	} else {
@@ -961,6 +969,12 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		// Guest memory replaces this plane, so the shadow's newer copy of it is dropped.
+		auto&      owner = image.depth_id ? m_slot_images[image.depth_id] : image;
+		const auto plane = image.depth_id ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+		                                  : EqaaAllAspects & ~vk::ImageAspectFlagBits::eStencil;
+		DiscardEqaa(owner, plane);
+		owner.eqaa_settling = owner.eqaa != nullptr;
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -968,6 +982,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		owner.eqaa_settling = false;
 	}
 	image.RefreshComplete();
 }
@@ -1057,6 +1072,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			     native_current)) {
 				// The GPU selects each slice's clear, so the CPU never waits for the metadata.
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorMetadataChecks);
+				SettleEqaa(image, EqaaAllAspects);
 				InitializeImage(id);
 				const bool expand = desc.type != BindingType::VideoOut;
 				const auto [buffer, offset] =
@@ -1136,11 +1152,16 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id) {
+void TextureCache::RefreshImage(ImageId id, vk::ImageAspectFlags settle) {
 	auto& image = m_slot_images[id];
+	// A stencil association's consumer reads its depth owner's stencil aspect.
+	if (image.depth_id) {
+		settle &= vk::ImageAspectFlagBits::eStencil;
+	}
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
+		SettleEqaa(m_slot_images[image.depth_id], settle);
 		return;
 	}
 	TrackImage(id);
@@ -1148,6 +1169,12 @@ void TextureCache::RefreshImage(ImageId id) {
 		image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
+	// An upload replaces its own plane; any other requested aspect is written back first.
+	const auto uploaded = !cpu_dirty ? vk::ImageAspectFlags {}
+	                      : image.depth_id
+	                          ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	                          : EqaaAllAspects & ~vk::ImageAspectFlagBits::eStencil;
+	SettleEqaa(image.depth_id ? m_slot_images[image.depth_id] : image, settle & ~uploaded);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (cpu_dirty) {
 			EXIT("TextureCache: compressed guest image refresh is unsupported\n");
@@ -1390,7 +1417,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
-	RefreshImage(id);
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
@@ -1412,7 +1438,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
-vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc, bool eqaa) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1420,13 +1446,13 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	image.usage.render_target = true;
-	RefreshImage(id);
+	RefreshImage(id, eqaa ? vk::ImageAspectFlags {} : EqaaAllAspects);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
 	return image.FindView(desc.view_info);
 }
 
-vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, bool eqaa) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1454,10 +1480,12 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		}
 		metadata->second.owner = id;
 	}
-	RefreshImage(id);
+	// A single-sample pass loads and stores every aspect of the attachment.
+	const auto settle = eqaa ? vk::ImageAspectFlags {} : EqaaAllAspects;
+	RefreshImage(id, settle);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+		RefreshImage(AssociateStencil(id, desc.info.stencil), settle);
 	}
 	return image.FindView(desc.view_info);
 }
@@ -1484,6 +1512,209 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
+}
+
+bool TextureCache::EqaaShadowSupported(ImageId id, uint32_t samples) {
+	std::scoped_lock lock {m_lock};
+	const auto&      owner  = m_slot_images[id];
+	const auto&      limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const auto       count  = vulkan_sample_count(samples);
+	if (count == vk::SampleCountFlagBits {} || owner.backing.image == nullptr ||
+	    owner.backing.samples != 1 || owner.backing.image_type != vk::ImageType::e2D) {
+		return false;
+	}
+	const bool depth = owner.info.IsDepth();
+	if (depth) {
+		const bool stencil = static_cast<bool>(ImageViewOps::DepthAspectMask(owner.backing.format) &
+		                                       vk::ImageAspectFlagBits::eStencil);
+		if (!(limits.sampledImageDepthSampleCounts & count) ||
+		    (stencil && !(limits.sampledImageStencilSampleCounts & count))) {
+			return false;
+		}
+	} else if (BlitHelper::EqaaColorFormat(owner.backing.format) == vk::Format::eUndefined ||
+	           !((BlitHelper::EqaaColorIsFloat(owner.backing.format)
+	                  ? limits.sampledImageColorSampleCounts
+	                  : limits.sampledImageIntegerSampleCounts) &
+	             count)) {
+		return false;
+	}
+	ImageInfo info {};
+	info.pixel_format    = owner.backing.format;
+	info.guest_format    = owner.info.guest_format;
+	info.bytes_per_block = owner.info.bytes_per_block;
+	info.samples         = samples;
+	return Image::Creatable(m_graphics, info,
+	                        depth ? vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT
+	                              : vk::ImageCreateFlags {},
+	                        vk::ImageUsageFlagBits::eSampled |
+	                            (depth ? vk::ImageUsageFlagBits::eDepthStencilAttachment
+	                                   : vk::ImageUsageFlagBits::eColorAttachment));
+}
+
+const vk::SampleLocationsInfoEXT*
+TextureCache::InternSampleLocations(const HostSamplePattern& pattern) {
+	for (const auto& entry: m_sample_locations) {
+		if (entry->pattern == pattern) {
+			return &entry->info;
+		}
+	}
+	auto entry     = std::make_unique<InternedSampleLocations>();
+	entry->pattern = pattern;
+	for (uint32_t index = 0; index < pattern.count; index++) {
+		entry->locations[index] = {static_cast<float>(pattern.xy[index] & 0xfu) / 16.0f,
+		                           static_cast<float>(pattern.xy[index] >> 4u) / 16.0f};
+	}
+	entry->info.sampleLocationsPerPixel = vulkan_sample_count(pattern.count);
+	entry->info.sampleLocationGridSize  = vk::Extent2D {1, 1};
+	entry->info.sampleLocationsCount    = pattern.count;
+	entry->info.pSampleLocations        = entry->locations.data();
+	m_sample_locations.push_back(std::move(entry));
+	return &m_sample_locations.back()->info;
+}
+
+vk::ImageView TextureCache::AcquireEqaaShadow(ImageId id, const ImageDesc& desc,
+                                              const EqaaPlan& plan, vk::ImageAspectFlags writes,
+                                              vk::ImageAspectFlags cleared) {
+	std::scoped_lock lock {m_lock};
+	auto&            image   = m_slot_images[id];
+	const auto&      view    = desc.view_info;
+	const auto       aspects = OwnerAspects(image);
+	EXIT_IF(plan.mode != EqaaMode::AnchorShadow || plan.pattern.count != plan.host_samples ||
+	        view.level_count != 1 || image.backing.samples != 1 || !image.registered);
+	if (image.eqaa != nullptr &&
+	    (image.eqaa->pattern != plan.pattern || image.eqaa->mip != view.base_level ||
+	     image.eqaa->base_layer != view.base_layer || image.eqaa->layers != view.layer_count ||
+	     image.eqaa->image->backing.format != image.backing.format)) {
+		SettleEqaa(image, EqaaAllAspects);
+		DropShadow(image);
+	}
+	const bool fresh = image.eqaa == nullptr;
+	if (fresh) {
+		const bool depth = image.info.IsDepth();
+		ImageInfo  info {};
+		info.pixel_format    = image.backing.format;
+		info.guest_format    = image.info.guest_format;
+		info.extent          = {std::max(image.backing.extent.width >> view.base_level, 1u),
+		                        std::max(image.backing.extent.height >> view.base_level, 1u), 1};
+		info.resources       = {1, view.layer_count};
+		info.bytes_per_block = image.info.bytes_per_block;
+		info.samples         = plan.host_samples;
+		auto shadow          = std::make_unique<EqaaShadow>();
+		shadow->image        = std::make_unique<Image>(
+		    m_graphics, m_scheduler, info,
+		    depth ? vk::ImageCreateFlagBits::eSampleLocationsCompatibleDepthEXT
+		          : vk::ImageCreateFlags {});
+		shadow->locations = InternSampleLocations(plan.pattern);
+		if (depth) {
+			shadow->image->barrier_sample_locations = shadow->locations;
+		}
+		shadow->pattern       = plan.pattern;
+		shadow->mip           = view.base_level;
+		shadow->base_layer    = view.base_layer;
+		shadow->layers        = view.layer_count;
+		shadow->anchor_select = plan.anchor_select;
+		shadow->bytes = uint64_t {info.extent.width} * info.extent.height * view.layer_count *
+		                plan.host_samples * vk::blockSize(info.pixel_format);
+		m_total_used_memory += shadow->bytes;
+		image.eqaa = std::move(shadow);
+		m_eqaa_images.push_back(id);
+	}
+	auto& shadow = *image.eqaa;
+	shadow.dirty &= ~cleared;
+	const bool select_changed = plan.anchor_select != shadow.anchor_select;
+	if (select_changed) {
+		// The other samples become anchors: their history must first be the guest's.
+		SettleEqaa(image, shadow.dirty & ~shadow.samples_equal);
+	}
+	const bool owner_changed = shadow.synced != image.content_stamp;
+	auto       expand        = owner_changed    ? aspects
+	                           : select_changed ? aspects & ~shadow.samples_equal
+	                                            : vk::ImageAspectFlags {};
+	expand &= ~(shadow.dirty | cleared);
+	if (expand) {
+		ExpandEqaa(image, expand);
+	}
+	shadow.synced        = image.content_stamp;
+	shadow.anchor_select = plan.anchor_select;
+	if (writes & aspects & ~shadow.dirty) {
+		// Resident heaps read the owner, so their readers must settle it from now on.
+		image.HeapChanged();
+	}
+	shadow.dirty |= writes & aspects;
+	shadow.samples_equal &= ~writes;
+	shadow.last_tick       = m_scheduler.CurrentTick();
+	auto shadow_view       = view;
+	shadow_view.base_level = 0;
+	shadow_view.base_layer = 0;
+	return shadow.image->FindView(shadow_view);
+}
+
+void TextureCache::SettleEqaa(Image& image, vk::ImageAspectFlags aspects) {
+	if (image.eqaa == nullptr) {
+		return;
+	}
+	auto&      shadow = *image.eqaa;
+	const auto settle = shadow.dirty & aspects;
+	if (!settle) {
+		return;
+	}
+	const bool in_sync  = shadow.synced == image.content_stamp;
+	image.eqaa_settling = true;
+	m_blit_helper.EqaaSelect(image, shadow, settle);
+	image.eqaa_settling = false;
+	shadow.dirty &= ~settle;
+	if (in_sync) {
+		shadow.synced = image.content_stamp;
+	}
+}
+
+void TextureCache::DiscardEqaa(Image& image, vk::ImageAspectFlags aspects) {
+	if (image.eqaa != nullptr) {
+		image.eqaa->dirty &= ~aspects;
+	}
+}
+
+void TextureCache::ExpandEqaa(Image& image, vk::ImageAspectFlags aspects) {
+	auto& shadow = *image.eqaa;
+	EXIT_IF(static_cast<bool>(shadow.dirty & aspects));
+	// Only clean aspects are read, so the owner may be reached while other aspects are dirty.
+	image.eqaa_settling = true;
+	m_blit_helper.EqaaExpand(image, shadow, aspects);
+	image.eqaa_settling = false;
+	shadow.samples_equal |= aspects;
+}
+
+void TextureCache::DropShadow(Image& image) {
+	if (image.eqaa == nullptr) {
+		return;
+	}
+	if (image.registered) {
+		EXIT_IF(m_total_used_memory < image.eqaa->bytes);
+		m_total_used_memory -= image.eqaa->bytes;
+	}
+	std::erase_if(m_eqaa_images, [&](ImageId id) {
+		const auto* owner = m_slot_images.try_get(id);
+		return owner == nullptr || owner == &image;
+	});
+	auto shadow         = std::move(image.eqaa);
+	image.eqaa_settling = false;
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation([shadow = std::move(shadow)]() mutable { shadow.reset(); });
+	}
+}
+
+void TextureCache::DropIdleShadows(uint64_t tick) {
+	std::erase_if(m_eqaa_images, [&](ImageId id) {
+		const auto* owner = m_slot_images.try_get(id);
+		return owner == nullptr || owner->eqaa == nullptr;
+	});
+	for (const auto id: std::vector<ImageId>(m_eqaa_images)) {
+		auto& image = m_slot_images[id];
+		if (!image.eqaa->dirty &&
+		    tick - std::min(tick, image.eqaa->last_tick) > NumFramesBeforeRemoval) {
+			DropShadow(image);
+		}
+	}
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1576,6 +1807,20 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	                               range.levelCount == image.info.resources.levels &&
 	                               range.baseArrayLayer == 0 && range.layerCount == layers;
 	const bool full_image = range.aspectMask == aspects && full_subresources;
+	vk::ImageAspectFlags mirror {};
+	if (image.eqaa != nullptr) {
+		const auto& shadow = *image.eqaa;
+		const bool  covers =
+		    format == image.backing.format && !image.info.IsVolume() &&
+		    range.baseMipLevel <= shadow.mip &&
+		    shadow.mip - range.baseMipLevel < range.levelCount &&
+		    range.baseArrayLayer <= shadow.base_layer &&
+		    shadow.base_layer + shadow.layers <= range.baseArrayLayer + range.layerCount;
+		mirror = covers ? range.aspectMask : vk::ImageAspectFlags {};
+		SettleEqaa(image, EqaaAllAspects & ~mirror);
+		// The clear supersedes the shadow's newest copy of the aspects it covers.
+		DiscardEqaa(image, mirror);
+	}
 	TrackImage(id);
 	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
 		InitializeImage(id);
@@ -1593,6 +1838,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		}
 	}
 	command.EndRendering();
+	const bool eqaa_in_sync = image.eqaa != nullptr && image.eqaa->synced == image.content_stamp;
 	// Transfer clears use the backing format; aliased clears must encode through their view.
 	if (format != image.backing.format || (image.info.IsVolume() && !full_image)) {
 		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
@@ -1619,6 +1865,26 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
+	if (mirror) {
+		auto& shadow = *image.eqaa;
+		auto& target = *shadow.image;
+		target.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		               {}, command.Handle());
+		const vk::ImageSubresourceRange shadow_range {mirror, 0, 1, 0, shadow.layers};
+		if (mirror == vk::ImageAspectFlagBits::eColor) {
+			command.Handle().clearColorImage(target.backing.image,
+			                                 vk::ImageLayout::eTransferDstOptimal, &clear.color, 1,
+			                                 &shadow_range);
+		} else {
+			command.Handle().clearDepthStencilImage(target.backing.image,
+			                                        vk::ImageLayout::eTransferDstOptimal,
+			                                        &clear.depthStencil, 1, &shadow_range);
+		}
+		shadow.samples_equal |= mirror;
+		if (eqaa_in_sync) {
+			shadow.synced = image.content_stamp;
+		}
+	}
 }
 
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
@@ -1656,6 +1922,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	SettleEqaa(image, vk::ImageAspectFlagBits::eDepth);
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.LinearLayout().slice_stride;
@@ -1711,6 +1978,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
+	SettleEqaa(image, EqaaAllAspects & ~vk::ImageAspectFlagBits::eStencil);
 	if (UploadBinding(image) == BindingType::DepthTarget) {
 		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
 		DownloadDepth(image, destination, destination_offset);
@@ -2020,6 +2288,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	DropIdleShadows(m_scheduler.CurrentTick());
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

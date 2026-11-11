@@ -178,13 +178,15 @@ private:
 	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
+	void               PlanDrawEqaa(CommandBuffer& buffer, const DrawRenderState& state);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
-	                                               std::span<PreparedBindings* const> stages = {});
+	                                               std::span<PreparedBindings* const> stages = {},
+	                                               const EqaaPlan* eqaa = nullptr);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);

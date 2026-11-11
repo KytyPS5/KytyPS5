@@ -8,6 +8,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/eqaaPlan.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -71,6 +72,9 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	HostSamplePattern          sample_pattern;
+	// Keys are hashed as bytes, so the key's tail must hold no padding.
+	uint8_t sample_pattern_padding[3] = {};
 };
 
 struct PipelineRenderingState {
@@ -133,6 +137,8 @@ struct DrawTargets {
 	RenderDepthInfo depth;
 	RenderColorInfo colors[RENDER_COLOR_ATTACHMENTS_MAX];
 	uint32_t        color_count = 0;
+	// How the targets emulate EQAA's fragment/sample split.
+	EqaaPlan        eqaa;
 };
 
 // A draw's topology and shader stages (from PipelineCache::GetGraphicsPrograms).

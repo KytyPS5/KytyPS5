@@ -404,27 +404,17 @@ static void EqaaPrint(const char* func, const HW::EqaaControl& c) {
 	     "\t high_quality_intersections = %s\n"
 	     "\t incoherent_eqaa_reads      = %s\n"
 	     "\t interpolate_comp_z         = %s\n"
-	     "\t static_anchor_associations = %s\n",
+	     "\t interpolate_src_z          = %s\n"
+	     "\t static_anchor_associations = %s\n"
+	     "\t alpha_to_mask_eqaa_disable = %s\n"
+	     "\t overrasterization_amount   = %" PRIu8 "\n"
+	     "\t enable_postz_overraster    = %s\n",
 	     c.max_anchor_samples, c.ps_iter_samples, c.mask_export_num_samples,
 	     c.alpha_to_mask_num_samples, c.high_quality_intersections ? "true" : "false",
 	     c.incoherent_eqaa_reads ? "true" : "false", c.interpolate_comp_z ? "true" : "false",
-	     c.static_anchor_associations ? "true" : "false");
-}
-
-static void EqaaCheck(const HW::EqaaControl& c, const HW::AaConfig& cf) {
-	// The EQAA controls only take effect while multisampling is on, so a single-sample
-	// target leaves them inert and has nothing to warn about.
-	if (cf.msaa_num_samples == 0) {
-		return;
-	}
-	if (c.max_anchor_samples != 0 || c.ps_iter_samples != 0 || c.mask_export_num_samples != 0 ||
-	    c.alpha_to_mask_num_samples != 0 || c.high_quality_intersections ||
-	    c.incoherent_eqaa_reads || c.interpolate_comp_z || c.static_anchor_associations) {
-		static uint32_t log_count = 0;
-		if (log_count++ < 16) {
-			LOGF("\t warning: unsupported PS5 EQAA controls use native Vulkan MSAA defaults\n");
-		}
-	}
+	     c.interpolate_src_z ? "true" : "false", c.static_anchor_associations ? "true" : "false",
+	     c.alpha_to_mask_eqaa_disable ? "true" : "false", c.overrasterization_amount,
+	     c.enable_postz_overrasterization ? "true" : "false");
 }
 
 static void AaPrint(const char* func, const HW::AaSampleControl& c, const HW::AaConfig& cf) {
@@ -437,26 +427,10 @@ static void AaPrint(const char* func, const HW::AaSampleControl& c, const HW::Aa
 	LOGF("\t msaa_num_samples      = %" PRIu8 "\n"
 	     "\t aa_mask_centroid_dtmn = %s\n"
 	     "\t max_sample_dist       = %" PRIu8 "\n"
-	     "\t msaa_exposed_samples  = %" PRIu8 "\n",
+	     "\t msaa_exposed_samples  = %" PRIu8 "\n"
+	     "\t coverage_to_shader    = %" PRIu8 "\n",
 	     cf.msaa_num_samples, cf.aa_mask_centroid_dtmn ? "true" : "false", cf.max_sample_dist,
-	     cf.msaa_exposed_samples);
-}
-
-static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
-	bool non_default_locations = (c.centroid_priority != 0);
-	for (uint32_t l: c.locations) {
-		non_default_locations |= (l != 0);
-	}
-
-	if (non_default_locations || cf.msaa_num_samples != 0 || cf.aa_mask_centroid_dtmn ||
-	    cf.max_sample_dist != 0 || cf.msaa_exposed_samples != 0) {
-		static uint32_t log_count = 0;
-		if (log_count++ < 16) {
-			LOGF("\t warning: unsupported PS5 sample locations use native Vulkan locations: "
-			     "samples=%" PRIu8 ", exposed=%" PRIu8 ", max_dist=%" PRIu8 "\n",
-			     cf.msaa_num_samples, cf.msaa_exposed_samples, cf.max_sample_dist);
-		}
-	}
+	     cf.msaa_exposed_samples, cf.coverage_to_shader_select);
 }
 
 static void VpPrint(const char* func, const HW::ScreenViewport& vp,
@@ -663,19 +637,14 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& vp      = hw.GetScreenViewport();
 	const auto& c       = hw.GetClipControl();
 	const auto& mc      = hw.GetModeControl();
-	const auto& eqaa    = hw.GetEqaaControl();
 	const auto& cc      = hw.GetColorControl();
 	const auto& smc     = hw.GetScanModeControl();
-	const auto& aa      = hw.GetAaSampleControl();
-	const auto& ac      = hw.GetAaConfig();
 
 	RtCheck(rt);
 	VpCheck(vp, smc);
 	ClipCheck(c);
 	McCheck(mc);
 	BcCheck(cc);
-	EqaaCheck(eqaa, ac);
-	AaCheck(aa, ac);
 }
 
 void hw_print(const CommandBuffer& buffer) {

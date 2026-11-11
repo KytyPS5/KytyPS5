@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/eqaaPlan.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -38,6 +39,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -442,10 +444,12 @@ struct DrawCallInfo {
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
-                                                 std::span<PreparedBindings* const> stages) {
+                                                 std::span<PreparedBindings* const> stages,
+                                                 const EqaaPlan*                    eqaa_plan) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
+	const bool  eqaa  = eqaa_plan != nullptr && eqaa_plan->mode == EqaaMode::AnchorShadow;
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
@@ -454,7 +458,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
-		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
+		auto       image_view = cache.FindRenderTarget(target.image_id, target.desc, eqaa);
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
@@ -463,10 +467,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
-		image.Transit(layout, image.binding.attachment_access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		if (eqaa) {
+			// The pass draws into the shadow; the guest image is settled on its next use.
+			image_view = cache.AcquireEqaaShadow(target.image_id, target.desc, *eqaa_plan,
+			                                     vk::ImageAspectFlagBits::eColor, {});
+			cache.EqaaShadowImage(target.image_id)
+			    .Transit(layout, image.binding.attachment_access,
+			             ImageSubresourceRange {0, 1, 0, view.layer_count}, buffer.Handle());
+		} else {
+			image.Transit(layout, image.binding.attachment_access,
+			              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                                     view.layer_count},
+			              buffer.Handle());
+		}
 		const auto extent       = target.Extent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
@@ -477,7 +490,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
-		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		auto        image_view = cache.FindDepthTarget(depth.image_id, depth.desc, eqaa);
 		const auto& metadata   = depth.desc.info.metadata;
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
@@ -526,10 +539,24 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access = access;
 		const auto& view                = depth.desc.view_info;
-		image.Transit(layout, access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		if (eqaa) {
+			// A load clear makes the shadow's old contents dead only where it covers all of them.
+			const bool whole = std::min(state.width, depth.desc.info.extent.width) >=
+			                       std::max(image.backing.extent.width >> view.base_level, 1u) &&
+			                   std::min(state.height, depth.desc.info.extent.height) >=
+			                       std::max(image.backing.extent.height >> view.base_level, 1u);
+			image_view =
+			    cache.AcquireEqaaShadow(depth.image_id, depth.desc, *eqaa_plan, draw_writes,
+			                            whole ? depth.load_clear_aspects : vk::ImageAspectFlags {});
+			cache.EqaaShadowImage(depth.image_id)
+			    .Transit(layout, access, ImageSubresourceRange {0, 1, 0, view.layer_count},
+			             buffer.Handle());
+		} else {
+			image.Transit(layout, access,
+			              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                                     view.layer_count},
+			              buffer.Handle());
+		}
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -826,6 +853,79 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+static void DisableEqaaShadow(DrawTargets& targets, EqaaFallbackReason reason) {
+	targets.eqaa.mode    = EqaaMode::Fallback;
+	targets.eqaa.reason  = reason;
+	targets.eqaa.pattern = {};
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		targets.colors[i].attachment_samples = 0;
+	}
+	targets.depth.attachment_samples = 0;
+}
+
+void RenderExecutor::PlanDrawEqaa(CommandBuffer& buffer, const DrawRenderState& state) {
+	const auto& ctx     = buffer.GetRegisters();
+	auto&       targets = m_targets;
+	targets.eqaa        = {};
+	if (ctx.GetAaConfig().msaa_num_samples == 0 || ctx.GetRenderControl().copy_depth_to_color) {
+		return;
+	}
+	const auto& ac     = ctx.GetAaConfig();
+	const auto& eq     = ctx.GetEqaaControl();
+	const auto& sh     = ctx.GetShaderRegisters();
+	const auto  active = sh.ps_input_ena & sh.ps_input_addr;
+	EqaaInputs  inputs;
+	inputs.msaa_num_samples          = ac.msaa_num_samples;
+	inputs.msaa_exposed_samples      = ac.msaa_exposed_samples;
+	inputs.coverage_to_shader_select = ac.coverage_to_shader_select;
+	inputs.msaa_enable               = ctx.GetScanModeControl().msaa_enable;
+	std::copy(std::begin(ctx.GetAaSampleControl().locations),
+	          std::end(ctx.GetAaSampleControl().locations), inputs.locations.begin());
+	inputs.aa_mask                        = {ctx.GetAaMask().x0y0_x1y0, ctx.GetAaMask().x0y1_x1y1};
+	inputs.max_anchor_samples             = eq.max_anchor_samples;
+	inputs.overrasterization_amount       = eq.overrasterization_amount;
+	inputs.enable_postz_overrasterization = eq.enable_postz_overrasterization;
+	if (state.ps_active) {
+		// SPI_PS_INPUT_ENA: SAMPLE_COVERAGE is bit 14; PERSP_/LINEAR_CENTROID are bits 2 and 6.
+		inputs.ps_reads_coverage = (active & 0x4000u) != 0;
+		inputs.ps_centroid       = (active & 0x44u) != 0;
+		inputs.ps_sample_rate    = state.ps_input_info.ps_sample_shading;
+		inputs.mask_export       = sh.db_shader_control.shader_mask_export_enable;
+		inputs.alpha_to_mask     = sh.AlphaToMask();
+	}
+	inputs.color_count = targets.color_count;
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		const auto& rt   = ctx.GetRenderTarget(targets.colors[i].target_slot);
+		inputs.colors[i] = {static_cast<uint8_t>(rt.attrib.num_samples),
+		                    static_cast<uint8_t>(rt.attrib.num_fragments)};
+	}
+	inputs.has_depth     = static_cast<bool>(targets.depth.image_id);
+	inputs.depth_samples = static_cast<uint8_t>(ctx.GetDepthRenderTarget().z_info.num_samples);
+	const auto&        graphics = m_context.GetGraphics();
+	const EqaaHostCaps caps {.sample_locations = graphics.sample_locations_enabled,
+	                         .sample_counts    = static_cast<vk::SampleCountFlags::MaskType>(
+	                             graphics.sample_location_counts),
+	                         .coord_min      = graphics.sample_location_range[0],
+	                         .coord_max      = graphics.sample_location_range[1],
+	                         .sub_pixel_bits = graphics.sample_location_sub_pixel_bits};
+	targets.eqaa = PlanEqaa(inputs, caps);
+	if (targets.eqaa.mode == EqaaMode::AnchorShadow) {
+		auto&      cache   = m_context.GetTextureCache();
+		const auto samples = targets.eqaa.host_samples;
+		bool       ok      = !targets.depth.image_id ||
+		                     cache.EqaaShadowSupported(targets.depth.image_id, samples);
+		for (uint32_t i = 0; i < targets.color_count; i++) {
+			ok = ok && cache.EqaaShadowSupported(targets.colors[i].image_id, samples);
+			targets.colors[i].attachment_samples = samples;
+		}
+		targets.depth.attachment_samples = targets.depth.image_id ? samples : 0u;
+		if (!ok) {
+			DisableEqaaShadow(targets, EqaaFallbackReason::ShadowFormat);
+			return;
+		}
+	}
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
@@ -854,12 +954,14 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	ResolveRenderDepthTarget(buffer, targets.depth);
+	PlanDrawEqaa(buffer, state);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {targets.colors, targets.color_count};
 	const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
 	                                                 : targets.colors[0].desc.info.samples;
-	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+	if (targets.eqaa.mode != EqaaMode::AnchorShadow &&
+	    std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
 		    return color.desc.info.samples != pass_samples;
 	    })) {
 		const auto raster =
@@ -1137,10 +1239,24 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
+	if (m_targets.eqaa.mode == EqaaMode::AnchorShadow &&
+	    std::ranges::any_of(stages, [&](const PreparedBindings* stage) {
+		    return std::ranges::any_of(stage->images, [&](const auto& binding) {
+			    return binding.image_id &&
+			           (binding.image_id == m_targets.depth.image_id ||
+			            std::ranges::any_of(std::span {m_targets.colors, m_targets.color_count},
+			                                [&](const RenderColorInfo& color) {
+				                                return color.image_id == binding.image_id;
+			                                }));
+		    });
+	    })) {
+		DisableEqaaShadow(m_targets, EqaaFallbackReason::TargetSampled);
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
-	                                            m_targets.depth, feedback_aspects, stages);
+	                                            m_targets.depth, feedback_aspects, stages,
+	                                            &m_targets.eqaa);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
@@ -1470,6 +1586,8 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer) {
 	}
 
 	auto& cache = m_context.GetTextureCache();
+	cache.UpdateImage(src.image_id);
+	cache.UpdateImage(dst.image_id);
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);

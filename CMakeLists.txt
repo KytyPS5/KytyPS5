@@ -316,6 +316,14 @@ function(add_gpu_blit_shader shader_name shader_file)
 endfunction()
 add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
+add_gpu_blit_shader(gpu_eqaa_color_select gpu_eqaa.frag -DEQAA_COLOR -DEQAA_SELECT)
+add_gpu_blit_shader(gpu_eqaa_color_expand gpu_eqaa.frag -DEQAA_COLOR)
+add_gpu_blit_shader(gpu_eqaa_float_select gpu_eqaa.frag -DEQAA_COLOR -DEQAA_FLOAT -DEQAA_SELECT)
+add_gpu_blit_shader(gpu_eqaa_float_expand gpu_eqaa.frag -DEQAA_COLOR -DEQAA_FLOAT)
+add_gpu_blit_shader(gpu_eqaa_depth_select gpu_eqaa.frag -DEQAA_DEPTH -DEQAA_SELECT)
+add_gpu_blit_shader(gpu_eqaa_depth_expand gpu_eqaa.frag -DEQAA_DEPTH)
+add_gpu_blit_shader(gpu_eqaa_stencil_select gpu_eqaa.frag -DEQAA_STENCIL -DEQAA_SELECT)
+add_gpu_blit_shader(gpu_eqaa_stencil_expand gpu_eqaa.frag -DEQAA_STENCIL)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
@@ -634,6 +642,13 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(eqaa_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EqaaPlanTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/eqaaPlan.cpp"
+)
+target_link_libraries(eqaa_plan_tests common fmt::fmt)
+target_include_directories(eqaa_plan_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -719,6 +734,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME eqaa_plan COMMAND $<TARGET_FILE:eqaa_plan_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
@@ -774,6 +790,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
+	add_test(NAME graphics_eqaa
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --eqaa-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
@@ -840,6 +858,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests
+		eqaa_plan_tests
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests

@@ -364,6 +364,14 @@ constexpr uint32_t DB_EQAA_INTERPOLATE_COMP_Z_SHIFT         = 18;
 constexpr uint32_t DB_EQAA_INTERPOLATE_COMP_Z_MASK          = 0x1;
 constexpr uint32_t DB_EQAA_STATIC_ANCHOR_ASSOCIATIONS_SHIFT = 20;
 constexpr uint32_t DB_EQAA_STATIC_ANCHOR_ASSOCIATIONS_MASK  = 0x1;
+constexpr uint32_t DB_EQAA_INTERPOLATE_SRC_Z_SHIFT                           = 19;
+constexpr uint32_t DB_EQAA_INTERPOLATE_SRC_Z_MASK                            = 0x1;
+constexpr uint32_t DB_EQAA_ALPHA_TO_MASK_EQAA_DISABLE_SHIFT                  = 21;
+constexpr uint32_t DB_EQAA_ALPHA_TO_MASK_EQAA_DISABLE_MASK                   = 0x1;
+constexpr uint32_t DB_EQAA_OVERRASTERIZATION_AMOUNT_SHIFT                    = 24;
+constexpr uint32_t DB_EQAA_OVERRASTERIZATION_AMOUNT_MASK                     = 0x7;
+constexpr uint32_t DB_EQAA_ENABLE_POSTZ_OVERRASTERIZATION_SHIFT              = 27;
+constexpr uint32_t DB_EQAA_ENABLE_POSTZ_OVERRASTERIZATION_MASK               = 0x1;
 
 constexpr uint32_t DB_SHADER_CONTROL                             = 0x203;
 constexpr uint32_t DB_SHADER_CONTROL_Z_EXPORT_ENABLE_SHIFT       = 0;
@@ -460,6 +468,8 @@ constexpr uint32_t PA_SC_MODE_CNTL_0_LINE_STIPPLE_ENABLE_SHIFT  = 2;
 constexpr uint32_t PA_SC_MODE_CNTL_0_LINE_STIPPLE_ENABLE_MASK   = 0x1;
 
 constexpr uint32_t PA_SC_MODE_CNTL_1      = 0x293;
+constexpr uint32_t PA_SC_MODE_CNTL_1_PS_ITER_SAMPLE_SHIFT = 16;
+constexpr uint32_t PA_SC_MODE_CNTL_1_PS_ITER_SAMPLE_MASK  = 0x1;
 constexpr uint32_t VGT_GS_OUT_PRIM_TYPE   = 0x29B;
 constexpr uint32_t VGT_PRIMITIVEID_EN     = 0x2A1;
 constexpr uint32_t VGT_PRIMITIVEID_RESET  = 0x2A3;
@@ -505,6 +515,8 @@ constexpr uint32_t PA_SC_AA_CONFIG_MAX_SAMPLE_DIST_SHIFT       = 13;
 constexpr uint32_t PA_SC_AA_CONFIG_MAX_SAMPLE_DIST_MASK        = 0xF;
 constexpr uint32_t PA_SC_AA_CONFIG_MSAA_EXPOSED_SAMPLES_SHIFT  = 20;
 constexpr uint32_t PA_SC_AA_CONFIG_MSAA_EXPOSED_SAMPLES_MASK   = 0x7;
+constexpr uint32_t PA_SC_AA_CONFIG_COVERAGE_TO_SHADER_SELECT_SHIFT = 26;
+constexpr uint32_t PA_SC_AA_CONFIG_COVERAGE_TO_SHADER_SELECT_MASK  = 0x3;
 
 constexpr uint32_t PA_SU_VTX_CNTL                        = 0x2F9;
 constexpr uint32_t PA_CL_GB_VERT_CLIP_ADJ                = 0x2FA;

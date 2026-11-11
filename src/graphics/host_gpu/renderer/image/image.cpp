@@ -120,6 +120,18 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+bool Image::Creatable(GraphicContext& graphics, const ImageInfo& info,
+                      vk::ImageCreateFlags extra_flags, vk::ImageUsageFlags required) {
+	const auto                usage = ImageUsageFlags(graphics, info);
+	const auto                flags = ImageCreateFlags(graphics, info, usage) | extra_flags;
+	vk::ImageFormatProperties properties {};
+	return (usage & required) == required &&
+	       graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+	                                         vk::ImageTiling::eOptimal, usage, flags,
+	                                         &properties) == vk::Result::eSuccess &&
+	       static_cast<bool>(properties.sampleCounts & vulkan_sample_count(info.samples));
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -129,6 +141,20 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
+	}
+	constexpr auto any_write =
+	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	    vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eMemoryWrite |
+	    vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	if (destination_access & any_write) {
+		++content_stamp;
+	}
+	if (eqaa != nullptr && !eqaa_settling &&
+	    (eqaa->dirty & (vk::ImageAspectFlagBits::eColor | vk::ImageAspectFlagBits::eDepth))) {
+		EXIT("EQAA shadow not settled: image=0x%016" PRIx64 " layout=%s access=0x%" PRIx64 "\n",
+		     info.data.address, vk::to_string(destination_layout).c_str(),
+		     static_cast<uint64_t>(static_cast<vk::AccessFlags2::MaskType>(destination_access)));
 	}
 
 	const bool partial =
@@ -160,6 +186,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
+					barrier.pNext                           = barrier_sample_locations;
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
 					barrier.dstStageMask                    = destination_stage;
@@ -194,6 +221,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		}
 
 		vk::ImageMemoryBarrier2 barrier {};
+		barrier.pNext                           = barrier_sample_locations;
 		barrier.srcStageMask                    = state.pl_stage;
 		barrier.srcAccessMask                   = state.access_mask;
 		barrier.dstStageMask                    = destination_stage;
@@ -678,7 +706,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             vk::ImageCreateFlags extra_flags)
     : info(image_info),
       stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
       m_graphics(graphics), m_scheduler(scheduler) {
@@ -692,7 +721,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 
 	vk::ImageCreateInfo create {};
 	create.usage         = ImageUsageFlags(graphics, info);
-	create.flags         = ImageCreateFlags(graphics, info, create.usage);
+	create.flags         = ImageCreateFlags(graphics, info, create.usage) | extra_flags;
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
 	create.mipLevels     = info.resources.levels;

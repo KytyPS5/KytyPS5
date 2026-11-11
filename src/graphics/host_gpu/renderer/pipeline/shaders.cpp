@@ -254,6 +254,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	multisampling.minSampleShading     = 1.0f;
 	multisampling.alphaToCoverageEnable =
 	    static_params.alpha_to_coverage_enable ? VK_TRUE : VK_FALSE;
+	const auto&                                   pattern = static_params.sample_pattern;
+	std::array<vk::SampleLocationEXT, 16>         sample_locations {};
+	vk::PipelineSampleLocationsStateCreateInfoEXT sample_locations_state {};
+	if (pattern.count != 0) {
+		EXIT_IF(pattern.count != static_params.samples || pattern.count > sample_locations.size());
+		for (uint32_t index = 0; index < pattern.count; index++) {
+			sample_locations[index] = {static_cast<float>(pattern.xy[index] & 0xfu) / 16.0f,
+			                           static_cast<float>(pattern.xy[index] >> 4u) / 16.0f};
+		}
+		auto& info                                   = sample_locations_state.sampleLocationsInfo;
+		info.sampleLocationsPerPixel                 = vulkan_sample_count(pattern.count);
+		info.sampleLocationGridSize                  = vk::Extent2D {1, 1};
+		info.sampleLocationsCount                    = pattern.count;
+		info.pSampleLocations                        = sample_locations.data();
+		sample_locations_state.sampleLocationsEnable = VK_TRUE;
+		multisampling.pNext                          = &sample_locations_state;
+	}
 
 	vk::PipelineColorBlendAttachmentState color_blend_attachment[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < rendering.color_count; i++) {

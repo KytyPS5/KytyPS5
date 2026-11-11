@@ -85,6 +85,8 @@ void CheckConsoleClosesOnlyAfterCleanExit() {
 void CheckValuesArriveVerbatim(bool close_on_clean_exit) {
   const QStringList values = {
       QStringLiteral("a\"b"),
+      QStringLiteral("a\\\\\"b"),
+      QStringLiteral("x\" & y"),
       QStringLiteral("trailing\\"),
       QStringLiteral("two\\\\"),
       QStringLiteral("!PATH! %PATH% ^! ^^ !!"),

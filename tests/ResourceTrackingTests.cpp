@@ -3719,6 +3719,68 @@ void TestIndexedMaterialImageKeys() {
   }
 }
 
+void TestFullExecIndexedMaterialKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // A waterfall over a key that every launched lane loads, so wave emulation does not
+  // select it: matching lanes sample the descriptor at the user-data pointer plus key * 32.
+  // A key loaded only on some lanes is not their value elsewhere and has no selector.
+  const auto track = [](bool load_on_all_lanes) {
+    auto f = std::make_unique<Fixture>();
+    auto *entry = f->block, *body = f->AddBlock(), *done = f->AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(done);
+    body->AddBranch(done);
+    const auto lane = f->Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto some = f->Emit(ValueOpcode::INotEqual32, {lane, Value(7u)});
+    const auto material = f->Buffer({f->UserData(0), f->UserData(1), f->UserData(2), f->UserData(3)});
+    MemoryInfo request;
+    request.kind = ResourceKind::Buffer;
+    request.idxen = true;
+    const auto loaded = f->Emit(ValueOpcode::LoadBufferU32x3,
+        {material, lane, Value(0u), Value(0u), load_on_all_lanes ? Value(true) : some},
+        f->AddMemory(request, 0x1c));
+    const auto local = f->Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)});
+    const auto key = f->Emit(ValueOpcode::ReadLane, {local, f->UserData(6)});
+    const auto guard = f->Emit(ValueOpcode::IEqual32, {key, local});
+    entry->condition = f->Emit(ValueOpcode::ConditionRef, {guard}, CFG::BranchCondition::ExecNonZero);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body, .false_block = done};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+    done->terminator.kind = CFG::TerminatorKind::Return;
+    f->block = body;
+    const auto table = f->Address(f->UserData(4), f->UserData(5));
+    const auto offset = f->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = word * 4u;
+      words[word] = f->Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                            f->AddMemory(scalar, 0x68));
+    }
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    f->Emit(ValueOpcode::ImageSampleRaw,
+        {f->Image(words, 0x74), f->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
+         f->ImageAddress(), guard},
+        f->AddMemory(sample, 0x74));
+    f->PlanAndTrack();
+    return f;
+  };
+  const auto tracked = track(true);
+  const auto plan = ExtractResourcePlan(tracked->program);
+  Check(plan.info.images.size() == 1u, "full-EXEC waterfall image was not tracked");
+  const auto &indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.selector && indirect.selector->stride == 0u && indirect.selector->offset == 8u &&
+            !indirect.table_scalar && indirect.table_stride == 32u &&
+            plan.descriptor_sources[indirect.table_source].dword_count == 2u,
+        "full-EXEC waterfall lost its indexed x3 material selector");
+  CheckFatal([&] { track(false); }, "not a valid runtime value",
+             "a key loaded on some lanes was taken as every lane's value");
+}
+
 void TestPointerTableIndexedMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   // A waterfall scalarizes one lane's x3 key from record 2 * lane + 1, clamped at zero;
@@ -9939,6 +10001,7 @@ int main() {
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
+    Run("full-EXEC indexed material keys", TestFullExecIndexedMaterialKeys);
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);

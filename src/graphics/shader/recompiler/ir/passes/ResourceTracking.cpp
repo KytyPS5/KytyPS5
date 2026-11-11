@@ -1635,7 +1635,17 @@ private:
 		return {};
 	}
 
-	const Inst* UniformizedMaterialValue(Value key, const Inst& use, Value executing = {}) const {
+	struct LaneValue {
+		Value              active;
+		Value              value;
+		[[nodiscard]] bool IsEmpty() const { return value.IsEmpty(); }
+		[[nodiscard]] bool operator==(const LaneValue& other) const {
+			return active.Resolve() == other.active.Resolve() &&
+			       value.Resolve() == other.value.Resolve();
+		}
+	};
+
+	LaneValue UniformizedMaterialValue(Value key, const Inst& use, Value executing = {}) const {
 		Value guard;
 		Value local;
 		const auto* first = key.Resolve().TryInstruction();
@@ -1645,17 +1655,23 @@ private:
 			// Empty EXEC selects lane zero, which may not have loaded a material key.
 			// An executing store also witnesses nonempty EXEC at the lane read.
 			if (executing.IsEmpty() ? !HasActiveLane(guard, first->Parent())
-			                        : !Implies(executing, guard)) return nullptr;
+			                        : !Implies(executing, guard))
+				return {};
 			local = first->Arg(0).Resolve();
 		} else {
 			guard = PositiveLaneWitness(use.Parent());
-			if (guard.IsEmpty()) return nullptr;
+			if (guard.IsEmpty()) return {};
 			local = EqualLocalKey(guard, key);
 		}
 		const auto* selected = local.Resolve().TryInstruction();
-		if (selected == nullptr || selected->GetOpcode() != ValueOpcode::SelectU32 ||
-		    selected->NumArgs() != 3u || !Implies(guard, selected->Arg(0))) return nullptr;
-		return selected;
+		if (selected == nullptr) return {};
+		if (selected->GetOpcode() == ValueOpcode::SelectU32 && selected->NumArgs() == 3u) {
+			if (!Implies(guard, selected->Arg(0))) return {};
+			return {selected->Arg(0).Resolve(), selected->Arg(1)};
+		}
+		// Wave emulation selects every value computed under a partial EXEC, so an
+		// unselected one is the lane's own value on every launched lane.
+		return {Value(true), local};
 	}
 
 	const Inst* SelectorReadValue(Value value, Value active,
@@ -1712,11 +1728,11 @@ private:
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
 	                                DescriptorSource& material_source, bool indexed, bool heap = false) {
-		const auto* selected = UniformizedMaterialValue(key, image);
-		if (selected == nullptr) return false;
-		const auto active = selected->Arg(0).Resolve();
+		const auto selected = UniformizedMaterialValue(key, image);
+		if (selected.IsEmpty()) return false;
+		const auto                                         active = selected.active;
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
-		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
+		const auto* read = SelectorReadValue(selected.value, active, selector);
 		if (indexed) {
 			read = IndexedMaterialRead(read, active, selector);
 			// Bounded heaps keep their full domain when the material may alias a write: written
@@ -3273,9 +3289,9 @@ private:
 			const bool indexed = memory == nullptr;
 			if (indexed) {
 				if (handle.NumArgs() != 8u) return false;
-				const auto* selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
-				if (selected == nullptr) return false;
-				const auto* extract = selected->Arg(1).Resolve().TryInstruction();
+				const auto selected = UniformizedMaterialValue(descriptor.dwords[dword], handle);
+				if (selected.IsEmpty()) return false;
+				const auto* extract = selected.value.Resolve().TryInstruction();
 				if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 				    !ImmediateU32(extract->Arg(1), component) || component >= 4u) return false;
 				read = extract->Arg(0).Resolve().TryInstruction();
@@ -3286,11 +3302,11 @@ private:
 				uint32_t offset = 1u, scalar = 1u;
 				if (memory->kind != ResourceKind::Buffer || memory->typed || memory->formatted ||
 				    !memory->idxen || memory->offen || memory->data_bits != 32u ||
-				    memory->data_dwords != 4u ||
-				    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
-				    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-				    !EquivalentValue(m_program, read->Arg(4), selected->Arg(0)) ||
-				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4)))) return false;
+				    memory->data_dwords != 4u || !ImmediateU32(read->Arg(2), offset) ||
+				    offset != 0u || !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
+				    !EquivalentValue(m_program, read->Arg(4), selected.active) ||
+				    (dword != 0u && !EquivalentValue(m_program, table_guard, read->Arg(4))))
+					return false;
 				table_guard = read->Arg(4);
 			}
 			if (memory->offset > INT32_MAX || (!allow_fixed && (memory->offset & 3u) != 0u) ||
@@ -3874,16 +3890,17 @@ private:
 		const auto* lane_read = key.Resolve().TryInstruction();
 		if (lane_read == nullptr || lane_read->GetOpcode() != ValueOpcode::ReadFirstLane)
 			return false;
-		const Inst* selected = nullptr;
+		LaneValue selected;
 		for (const auto& use: handle.Uses()) {
-			const auto* value = UniformizedMaterialValue(
-			    key, *use.user, use.user->Arg(use.user->NumArgs() - 1u));
-			if (value == nullptr || (selected != nullptr && selected != value)) return false;
+			const auto value =
+			    UniformizedMaterialValue(key, *use.user, use.user->Arg(use.user->NumArgs() - 1u));
+			if (value.IsEmpty() || (!selected.IsEmpty() && !(selected == value))) return false;
 			selected = value;
 		}
+		if (selected.IsEmpty()) return false;
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
-		const auto* read = IndexedMaterialRead(selected->Arg(1).Resolve().TryInstruction(),
-		                                       selected->Arg(0), selector);
+		const auto* read = IndexedMaterialRead(selected.value.Resolve().TryInstruction(),
+		                                       selected.active, selector);
 		if (read == nullptr || !MakeRuntimeTableSource(*read, material_source) ||
 		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
 		selector.source = InternSource(material_source);

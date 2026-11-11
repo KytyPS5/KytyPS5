@@ -591,6 +591,11 @@ TEST_F(PsmlMfsr2Test, SharedRequirementsCoverMaximumsUpTo8K) {
   EXPECT_EQ(requirements.size, 0x200000u);
   EXPECT_EQ(requirements.alignment, 0x200000u);
   EXPECT_EQ(requirements.count, 123u);
+  params.max_width = 3840;
+  params.max_height = 2160;
+  ASSERT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
+            0);
+  EXPECT_EQ(requirements.count, 31u);
   params.max_width = 959;
   EXPECT_EQ(Function<GetRequirements>("1ic5q-kdOsc")(&requirements, &params),
             MFSR2_INVALID_PARAMETER);

@@ -463,7 +463,6 @@ constexpr int      UNSUPPORTED_RENDER_SIZE   = static_cast<int>(0x8a8a000eu);
 constexpr int      NOT_AVAILABLE             = static_cast<int>(0x8a8a0012u);
 constexpr int      INVALID_SHARED_RESOURCES  = static_cast<int>(0x8a8a0014u);
 constexpr int      TOO_MANY_SHARED_RESOURCES = static_cast<int>(0x8a8a0015u);
-constexpr uint64_t SHARED_BLOCK_COUNT        = 123;
 constexpr uint32_t DISPATCH_DWORDS           = 0x800;
 
 struct SharedParameters {
@@ -551,6 +550,17 @@ int CheckContextParameters(const void* out, const ContextParameters* params) {
 	           : OK;
 }
 
+// The shared resources hold the buffers of the largest output the contexts may produce: 123 blocks
+// cover 7680x4320, and smaller maximums take their share of that. Games keep the blocks in lists
+// sized for what the system library asks for their maximums: Ghost of Yotei 02.002 keeps 67, and
+// with 123 it wrote past its list and crashed at boot.
+uint64_t SharedBlockCount(const SharedParameters& params) {
+	constexpr uint64_t MaxBlocks = 123;
+	constexpr uint64_t MaxPixels = uint64_t {7680} * 4320;
+	const uint64_t     pixels    = uint64_t {params.max_width} * params.max_height;
+	return std::max<uint64_t>((MaxBlocks * pixels + MaxPixels - 1) / MaxPixels, 1);
+}
+
 uint64_t ContextBlockCount(const ContextParameters& params) {
 	const uint64_t bytes =
 	    uint64_t {8} * ((params.width + 7u) & ~7u) * ((params.height + 7u) & ~7u) + 0x7f00;
@@ -623,7 +633,7 @@ int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const SharedPar
 	if (const int error = CheckSharedParameters(out, params); error != OK) {
 		return error;
 	}
-	*out = {MEMORY_BLOCK_SIZE, MEMORY_BLOCK_SIZE, SHARED_BLOCK_COUNT};
+	*out = {MEMORY_BLOCK_SIZE, MEMORY_BLOCK_SIZE, SharedBlockCount(*params)};
 	return OK;
 }
 
@@ -638,7 +648,7 @@ int KYTY_SYSV_ABI CreateSharedResources(void** out, const SharedParameters* para
 	if (const int error = CheckSharedParameters(out, params); error != OK) {
 		return error;
 	}
-	if (params->reserved != 0 || params->memory.block_count != SHARED_BLOCK_COUNT) {
+	if (params->reserved != 0 || params->memory.block_count != SharedBlockCount(*params)) {
 		return INVALID_PARAMETER;
 	}
 	g_shared = true;

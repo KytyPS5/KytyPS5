@@ -113,6 +113,10 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,
 			         pixel->ps_no_perspective ? "gl_BaryCoordNoPerspKHR" : "gl_BaryCoordKHR");
+			// A per-sample shader interpolates them at its sample.
+			if (pixel->ps_sample_shading) {
+				AddInput(info, StageInputKind::SampleId, 0, 1, "gl_SampleID");
+			}
 			break;
 		}
 	}

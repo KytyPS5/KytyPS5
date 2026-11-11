@@ -102,6 +102,18 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 			}
 			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value,
 			                          coordinates, component + 1u);
+		} else if (PixelShaderIsPerSample(state)) {
+			// Center I/J of a per-sample shader: a zero offset from the pixel center.
+			const auto coordinates = state.builder.AllocateId();
+			const auto zero        = ConstantF32(state, 0);
+			const auto center      = state.builder.Constant(spv::OpConstantComposite,
+			                                                TypeF32Vector(state, 2), zero, zero);
+			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
+			state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
+			                          GlslStd450(state), GLSLstd450InterpolateAtOffset, variable,
+			                          center);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coordinates,
+			                          component + 1u);
 		} else {
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpAccessChain,
@@ -216,15 +228,32 @@ uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint
 	                                  ? IR::StageInputKind::BaryCoordNoPerspective
 	                                  : IR::StageInputKind::BaryCoordSmooth;
 	const auto barycentric      = InputVariableForKind(state, barycentric_kind);
-	uint32_t   sum              = 0;
+	// The sample-located I/J of a per-sample shader are the barycentrics at its own sample.
+	uint32_t sample_weights = 0;
+	if (PixelShaderIsPerSample(state)) {
+		const auto sample_id = state.builder.AllocateId();
+		sample_weights       = state.builder.AllocateId();
+		state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
+		state.builder.AddFunction(spv::OpLoad, TypeI32(state), sample_id,
+		                          InputVariableForKind(state, IR::StageInputKind::SampleId));
+		state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), sample_weights,
+		                          GlslStd450(state), GLSLstd450InterpolateAtSample, barycentric,
+		                          sample_id);
+	}
+	uint32_t sum = 0;
 	for (uint32_t vertex = 0; vertex < 3u; vertex++) {
-		const auto pointer = state.builder.AllocateId();
 		const auto weight  = state.builder.AllocateId();
 		const auto product = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain,
-		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
-		                          pointer, barycentric, ConstantU32(state, vertex));
-		state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+		if (sample_weights != 0) {
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), weight,
+			                          sample_weights, vertex);
+		} else {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+			                          pointer, barycentric, ConstantU32(state, vertex));
+			state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+		}
 		state.builder.AddFunction(spv::OpFMul, TypeF32(state), product,
 		                          select(LoadVertexParameter(state, input, vertex, chan)), weight);
 		if (vertex == 0u) {

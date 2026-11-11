@@ -307,6 +307,9 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
+// A per-sample PS reads barycentrics only through interpolation functions.
+bool PixelShaderIsPerSample(const EmitterState& state);
+
 Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
 uint32_t VertexParameterComponentCount(const InputBinding& input);

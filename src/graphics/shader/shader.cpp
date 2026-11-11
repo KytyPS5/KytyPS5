@@ -481,6 +481,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_front_face));
 	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
 	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
+	key.push_back(static_cast<uint32_t>(info.ps_sample_shading));
 	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
 	key.push_back(static_cast<uint32_t>(info.parameter_mode));
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));

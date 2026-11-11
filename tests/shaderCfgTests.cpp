@@ -3864,6 +3864,23 @@ void TestCustomVintrpMovTranslation() {
   Check(SpirvHasDecorationValue(mixed_linear_result.spirv, 11u, 5287u),
         "mixed linear input did not use BaryCoordNoPerspKHR");
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
+
+  // A plain BaryCoordKHR load under sampleShadingEnable hits an int3 in NVIDIA's compiler.
+  for (const bool no_perspective : {false, true}) {
+    mixed_ps_info.ps_no_perspective = no_perspective;
+    mixed_ps_info.ps_sample_shading = true;
+    auto sample_result = RecompileForTest(mixed_shader, options);
+    const auto sample_source = DisassembleSpirvBinary(sample_result.spirv);
+    const std::string builtin = no_perspective ? "%gl_BaryCoordNoPerspKHR" : "%gl_BaryCoordKHR";
+    Check(SpirvContainsCapability(sample_result.spirv, 52u) &&
+              SpirvHasDecorationValue(sample_result.spirv, 11u, 18u) &&
+              sample_source.find("InterpolateAtSample " + builtin) != std::string::npos &&
+              !SpirvSourceHasInstructionUsing(sample_source, "OpAccessChain", builtin.c_str()) &&
+              !SpirvSourceHasInstructionUsing(sample_source, "OpLoad", builtin.c_str()),
+          "per-sample per-vertex input did not interpolate its barycentrics at SampleId");
+    CheckSpirvBinaryValidates(sample_result.spirv);
+  }
+  mixed_ps_info.ps_sample_shading = false;
 }
 
 void TestVop3F16InterpolationTranslation() {
@@ -3951,8 +3968,9 @@ void TestPerspectiveCentroidInputs() {
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
           "centroid input changed the shared center builtin's interpolation location");
     if (center != UINT32_MAX) {
-      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
-            "center pair lost its ordinary barycentric loads when centroid was enabled");
+      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float ") ||
+                source.find("InterpolateAtOffset %gl_BaryCoordKHR") != std::string::npos,
+            "center pair lost its pixel-center barycentric reads when centroid was enabled");
     }
     CheckSpirvBinaryValidates(result.spirv);
   }
@@ -3995,8 +4013,42 @@ void TestPerspectiveSampleInputs() {
           "sample I/J did not evaluate BaryCoordKHR Y/Z at SampleId");
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u),
           "sample interpolation changed the shared barycentric input location");
+    if ((inputs & 2u) != 0) {
+      Check(source.find("InterpolateAtOffset %gl_BaryCoordKHR") != std::string::npos &&
+                !SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%gl_BaryCoordKHR"),
+            "center I/J of a per-sample shader was not evaluated at the pixel center");
+    }
     CheckSpirvBinaryValidates(result.spirv);
   }
+
+  // Without sample-located I/J the barycentrics keep their default interpolation location.
+  const std::vector<uint32_t> center_shader = {EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 0, 1),
+                                               EncodeSopp(0x01)};
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(center_shader.data());
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = center_shader.size() * sizeof(uint32_t);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+  sh.ps_input_ena = sh.ps_input_addr = 2u;
+  sh.m_cbShaderMask = 0xf;
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  ShaderPixelInputInfo pixel{};
+  (void)PrepareProgram(regs, sh, mappings, pixel);
+  Check(!pixel.ps_sample_shading, "center-only I/J enabled sample shading");
+  const auto center_key = MakeStageStaticKey(pixel);
+  pixel.ps_sample_shading = true;
+  Check(center_key != MakeStageStaticKey(pixel), "sample shading is missing from shader key");
+  pixel.ps_sample_shading = false;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto result = RecompileForTest(center_shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
+            !SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u) &&
+            source.find("InterpolateAtOffset") == std::string::npos,
+        "center-only I/J changed the barycentric interpolation location");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestPsInputCountRegisterDecode() {

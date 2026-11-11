@@ -32,6 +32,10 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
+bool PixelShaderIsPerSample(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel && state.input_info.pixel->ps_sample_shading;
+}
+
 uint32_t MrtOutputType(EmitterState& state, uint32_t index) {
 	const auto& pixel = *state.input_info.pixel;
 	if ((pixel.target_sint_mask & (1u << index)) != 0u) return TypeI32Vector(state, 4);

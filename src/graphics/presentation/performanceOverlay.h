@@ -12,6 +12,10 @@ struct GraphicContext;
 // Called for each main-bus guest flip, with the guest's video-out size.
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept;
 
+// Number of main-bus guest flips so far (counted whether or not the panel is shown). Unlike the
+// presenter's own count it ignores what the emulator draws by itself (notices, trophies).
+[[nodiscard]] uint64_t PerformanceOverlayGuestFlips() noexcept;
+
 [[nodiscard]] bool PerformanceOverlayEnabled() noexcept;
 void               TogglePerformanceOverlay() noexcept;
 // Switches between the compact and the detailed panel, showing the panel if it was hidden.

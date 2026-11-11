@@ -148,6 +148,7 @@ FrameWindow           g_frames;
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
 std::atomic<uint64_t> g_revision {0};
+std::atomic<uint64_t> g_guest_flips {0};
 
 std::mutex                  g_host_mutex;
 Common::HostStats           g_host_stats;
@@ -746,6 +747,7 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
+	g_guest_flips.fetch_add(1, std::memory_order_relaxed);
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
@@ -753,6 +755,10 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 	g_frames.Record(Clock::now(), ReadCounters());
 	g_frames.guest_width  = guest_width;
 	g_frames.guest_height = guest_height;
+}
+
+uint64_t PerformanceOverlayGuestFlips() noexcept {
+	return g_guest_flips.load(std::memory_order_relaxed);
 }
 
 bool PerformanceOverlayEnabled() noexcept {

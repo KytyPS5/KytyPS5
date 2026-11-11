@@ -765,17 +765,20 @@ void WindowContext::Run() {
 
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
-	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+	// The title shows what the guest flips, like the performance overlay; the frames the emulator
+	// presents by itself (pipeline notice, trophies) only go into the host count.
+	auto title_frames = PerformanceOverlayGuestFlips();
 
 	while (!loop.need_exit) {
 		// Refresh the title on the main thread without making presentation wait for it.
 		const auto now     = SDL_GetTicks();
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
-			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
-			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+			const auto frames = PerformanceOverlayGuestFlips();
+			const auto host   = loop.presented_frames.load(std::memory_order_relaxed);
+			if (host != 0) {
+				UpdateTitle(frames, host, static_cast<double>(frames - title_frames) * 1000.0 /
+				                              static_cast<double>(elapsed));
 			}
 			title_time   = now;
 			title_frames = frames;
@@ -969,7 +972,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
+void WindowContext::UpdateTitle(uint64_t frame_num, uint64_t host_frames, double current_fps) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -984,10 +987,10 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}, presented: {}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps, host_frames);
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

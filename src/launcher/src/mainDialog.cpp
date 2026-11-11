@@ -400,14 +400,14 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 }
 #endif
 
-void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
+bool MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bool close_terminal) {
 	const auto& interpreter = m_p->GetInterpreter();
 
 	auto args = CreateEmulatorArgs(info);
 	if (args.isEmpty()) {
 		QMessageBox::critical(this, tr("Error"), tr("Invalid emulator configuration"));
 		QApplication::quit();
-		return;
+		return false;
 	}
 
 	// Without a terminal, the emulator runs directly.
@@ -431,7 +431,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		                      tr("The emulator arguments are longer than %1 characters or contain a "
 		                         "NUL character; cmd.exe cannot pass them on")
 		                          .arg(CmdArgumentsLimit));
-		return;
+		return false;
 	}
 	process->setProcessEnvironment(launch->environment);
 	process->setNativeArguments(launch->native_arguments);
@@ -457,10 +457,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 		QMessageBox::critical(
 		    this, tr("Error"),
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));
-		return;
+		return true;
 	}
 #endif
 	process->waitForFinished(100);
+	return true;
 }
 
 void MainDialog::WriteSettings(QSettings& s) {
@@ -530,7 +531,13 @@ void MainDialogPrivate::Run() {
 		        }
 	        });
 	auto info = m_ui->widget->CreateConfiguration(*item);
-	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
+	if (!m_main_dialog->RunInterpreter(process, *info, g_close_terminal)) {
+		if (item != nullptr) {
+			item->SetRunning(false);
+		}
+		m_running_games--;
+		process->deleteLater();
+	}
 
 	Update();
 }

@@ -536,6 +536,21 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 			if (selector->non_negative && static_cast<int32_t>(field) < 0) field = 0u;
 			key = std::min(field, selector->maximum);
 		}
+		if (selector->scale != 1u || !indirect.selector_addends.empty()) {
+			// The shader forms each key in U32 arithmetic from one of the addends.
+			const auto values  = keys.size();
+			const auto addends = std::max<size_t>(indirect.selector_addends.size(), 1u);
+			if (values * addends > MaxIndirectDescriptorProbes) return false;
+			keys.resize(values * addends);
+			for (size_t term = addends; term-- > 0u;) {
+				uint32_t addend = 0u;
+				if (!indirect.selector_addends.empty() &&
+				    !WalkedValue(program, indirect.selector_addends[term], addend))
+					return false;
+				for (size_t index = 0; index < values; ++index)
+					keys[term * values + index] = addend + selector->scale * keys[index];
+			}
+		}
 		if (selector->excluded) std::erase(keys, *selector->excluded);
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -1481,6 +1496,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			    Clone(target.indirect_descriptor->selector_first);
 			target.indirect_descriptor->selector_mask =
 			    Clone(target.indirect_descriptor->selector_mask);
+			for (auto& addend: target.indirect_descriptor->selector_addends)
+				addend = Clone(addend);
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);

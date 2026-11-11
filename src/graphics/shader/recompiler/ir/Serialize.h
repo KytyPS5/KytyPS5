@@ -163,10 +163,10 @@ KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r,
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
-               l, m, n, o)
+               l, m, n, o, p)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p,
-               q, r, s)
+               q, r, s, t)
 KYTY_IO_FIELDS(ParameterKey, a, b)
 KYTY_IO_FIELDS(DescriptorSource, a, b, c)
 KYTY_IO_FIELDS(SrtRead, a, b)

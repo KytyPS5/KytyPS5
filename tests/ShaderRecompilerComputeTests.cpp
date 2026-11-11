@@ -46246,6 +46246,135 @@ void CheckInclusiveGuardImageTable(VulkanHarness &vulkan) {
   }
 }
 
+// DS2 cs 0x228a640fcb11a26d and ps 0x83aa3dd5e5165b0f.
+void CheckRecordWordImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table = 18960u, addend = 3u, spread = 151u;
+  constexpr u32 exec_lo = 126u;
+  for (const bool two_level : {false, true})
+  for (const u32 wave : {32u, 64u}) {
+    const bool wide = wave == 64u;
+    TestCase test;
+    test.name = two_level ? "AssembledRecordWordImageTable" : "RecordWordImageTable";
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table + 128u * 32u) / 4u);
+    for (u32 tile = 0; tile < 4096u; ++tile) test.initial[(base + 16u) / 4u + tile] = tile % 5u;
+    for (u32 key = 0; key < 128u; ++key) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = key + 1u;
+      image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (base + table + key * 32u) / 4u);
+    }
+    test.user_data[0] = base;
+    test.user_data[3] = 3u << 28u;
+    test.user_data[6] = addend;
+    test.user_data[7] = spread;
+    const auto output = MakeStructuredStorageBufferData(0u, wave * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    // SOP1/SOP2 opcodes of the wave's EXEC width.
+    const u32 mov = wide ? 0x04u : 0x03u, ff1 = wide ? 0x14u : 0x13u;
+    const u32 and_saveexec = wide ? 0x24u : 0x3cu, andn2 = wide ? 0x15u : 0x14u;
+    auto &code = test.code;
+    AppendVop3(&code, 361, 1, Vgpr(0), 7);                // v_mul_lo_u32 v1, v0, s7
+    code.insert(code.end(), {EncodeVop2(0x13, 1, 255, 1), 0xfffu});  // v_min_u32 v1, 0xfff, v1
+    AppendVMovLiteral(&code, 8, 0u);
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    code.push_back(EncodeSop1(mov, 64, exec_lo));          // s_mov s64, exec
+    code.push_back(EncodeSop1(mov, 66, exec_lo));          // s_mov s66, exec
+    const auto tiles = code.size();
+    code.push_back(EncodeSop1(ff1, 68, 66));               // s_ff1_i32 s68, s66
+    AppendVop3(&code, 0x360, 69, Vgpr(1), 68);             // v_readlane_b32 s69, v1, s68
+    AppendVop3(&code, 0xc2, 70, 69, Vgpr(1));              // v_cmp_eq_u32 s70, s69, v1
+    code.push_back(EncodeSop1(and_saveexec, 72, 70));      // s_and_saveexec s72, s70
+    const auto skip = code.size();
+    code.push_back(0u);                                    // s_cbranch_execz skip
+    code.insert(code.end(), {
+        EncodeSop2(0x20, 74, 69, InlineU32(2)),            // s_lshr_b32 s74, s69, 2
+        EncodeSop2(0x0e, 75, 69, InlineU32(3)),            // s_and_b32 s75, s69, 3
+        EncodeSop2(0x31, 74, 74, InlineU32(16)),           // s_lshl4_add_u32 s74, s74, 16
+        EncodeSmem0(0x02, 76, 0), EncodeSmem1(0, 74),      // s_load_dwordx4 s[76:79], s[0:1], s74
+        EncodeSopp(0x0c),
+        EncodeSopc(0x06, 75, InlineU32(1)), EncodeSop2(0x0a, 76, 77, 76),  // T[tile]
+        EncodeSopc(0x06, 75, InlineU32(2)), EncodeSop2(0x0a, 76, 78, 76),
+        EncodeSopc(0x06, 75, InlineU32(3)), EncodeSop2(0x0a, 76, 79, 76)});
+    const auto load_descriptor = [&](u32 key) {
+      code.insert(code.end(), {
+          EncodeSop2(0x1e, 81, key, InlineU32(5)),         // s_lshl_b32 s81, key, 5
+          EncodeSmem0(0x03, 84, 0), EncodeSmem1(table, 81),  // s_load_dwordx8 s[84:91]
+          EncodeSopp(0x0c),
+          EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 84 / 4u),  // image_load v4, v[20:21]
+          EncodeSopp(0x0c),
+          EncodeVop1(0x01, 8, Vgpr(4))});                  // v_mov_b32 v8, v4
+    };
+    if (two_level) {
+      code.push_back(EncodeVop1(0x01, 3, 76));             // v_mov_b32 v3, s76
+    } else {
+      code.insert(code.end(), {
+          EncodeSop2(0x26, 76, 76, InlineU32(31)),         // s_mul_i32 s76, s76, 31
+          EncodeSop2(0x02, 80, 6, 76)});                   // s_add_i32 s80, s6, s76
+      load_descriptor(80);
+    }
+    code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+    code.push_back(EncodeSop2(andn2, 66, 66, 70));         // s_andn2 s66, s66, s70
+    code.push_back(EncodeSop1(mov, exec_lo, 72));          // s_mov exec, s72
+    code.push_back(EncodeSopp(0x05, tiles - code.size() - 1u));  // s_cbranch_scc1 tiles
+    if (two_level) {
+      AppendVop3(&code, 361, 5, InlineU32(31), Vgpr(3));   // v_mul_lo_u32 v5, 31, v3
+      code.push_back(EncodeVop2(0x25, 6, 6, 5));           // v_add_nc_u32 v6, s6, v5
+      const auto keys = code.size();
+      code.push_back(EncodeVop1(0x02, 80, Vgpr(6)));       // v_readfirstlane_b32 s80, v6
+      AppendVop3(&code, 0xc2, 70, 80, Vgpr(6));            // v_cmp_eq_u32 s70, s80, v6
+      code.push_back(EncodeSop1(and_saveexec, 72, 70));    // s_and_saveexec s72, s70
+      load_descriptor(80);
+      code.push_back(EncodeSop2(andn2, exec_lo, 72, 70));  // s_andn2 exec, s72, s70
+      code.push_back(EncodeSopp(0x09, keys - code.size() - 1u));  // s_cbranch_execnz keys
+    }
+    code.push_back(EncodeSop1(mov, exec_lo, 64));          // s_mov exec, s64
+    AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 0u);
+    AppendEnd(&code);
+    test.opcodes = {O::V_MUL_LO_U32, O::V_MIN_U32, O::S_FF1_I32_B32, O::V_READLANE_B32,
+                    O::V_CMP_EQ_U32, O::S_LSHR_B32, O::S_AND_B32, O::S_LSHL4_ADD_U32,
+                    O::S_LOAD_DWORDX4, O::S_CMP_EQ_U32, O::S_CSELECT_B32, O::S_LSHL_B32,
+                    O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::S_CBRANCH_EXECZ, O::S_CBRANCH_SCC1,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    test.opcodes.push_back(wide ? O::S_AND_SAVEEXEC_B64 : O::S_AND_SAVEEXEC_B32);
+    if (wide) test.opcodes.push_back(O::S_FF1_I32_B64);
+    if (two_level)
+      test.opcodes.insert(test.opcodes.end(), {O::V_READFIRSTLANE_B32, O::V_ADD_NC_U32,
+                                               O::S_CBRANCH_EXECNZ});
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    // T[tile] = tile % 5 selects the keys 3 + 31 * {0, ..., 4}.
+    Require(test.name, "record-word candidates", compiled.resources.images.size() == 5u,
+            "record-word key escaped the tile table's materials");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, vk::Sampler{},
+                    images);
+    std::vector<u32> expected(wave);
+    for (u32 lane = 0; lane < wave; ++lane) {
+      const auto key = addend + 31u * (std::min(lane * spread, 0xfffu) % 5u);
+      expected[lane] = std::bit_cast<u32>(static_cast<float>(key + 1u));
+    }
+    CompareWords(test, "each lane loads the T# of its tile's material", expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
+  }
+}
+
+// DS2 cs 0x98af2e853f33b143: key = bit < 32 ? bit : -1, EXEC skips key < 0.
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -58045,6 +58174,7 @@ int main(int argc, char **argv) {
     CheckLaneCountedImageTable(vulkan);
     CheckGuardedSelectorImageTable(vulkan);
     CheckInclusiveGuardImageTable(vulkan);
+    CheckRecordWordImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -58238,6 +58368,7 @@ int main(int argc, char **argv) {
   CheckLaneCountedImageTable(vulkan);
   CheckGuardedSelectorImageTable(vulkan);
   CheckInclusiveGuardImageTable(vulkan);
+  CheckRecordWordImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);

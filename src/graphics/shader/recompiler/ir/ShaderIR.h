@@ -653,6 +653,8 @@ struct DescriptorSource {
 			bool non_negative = false; // Signed-negative fields read as zero before the maximum.
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
+			// Keys are addend + scale * value (U32) for each of the descriptor's selector addends.
+			uint32_t scale  = 1;
 			bool global = false;
 			// Four or eight DWORD bitmap words per record; set ranks subtract from the last key.
 			bool bitset = false;
@@ -693,6 +695,8 @@ struct DescriptorSource {
 		// range.
 		Value                 selector_first;
 		Value    selector_mask;
+		// Host-evaluable terms added to scaled selector values; empty adds zero.
+		std::vector<Value>    selector_addends;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;

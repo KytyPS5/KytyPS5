@@ -2977,6 +2977,328 @@ void TestDescendingImageRange() {
   }
 }
 
+constexpr uint32_t RecordWordTable = 18960u;
+
+struct RecordWordBuilder {
+  Fixture &fixture;
+  std::array<uint32_t, 4> components{0u, 4u, 8u, 12u};
+
+  // S_LOAD_DWORDX4 at (tile >> 2) * 16 + 16, then S_CSELECT by tile & 3.
+  Value Material(Value tile) {
+    const auto pointer = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto record = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                      {fixture.Emit(ValueOpcode::ShiftRightLogical32, {tile, Value(2u)}),
+         Value(16u)});
+      memory.offset = components[word];
+          {pointer, record, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x4e8));
+    }
+    const auto select = fixture.Emit(ValueOpcode::BitwiseAnd32, {tile, Value(3u)});
+      chosen = fixture.Emit(ValueOpcode::SelectU32,
+          {fixture.Emit(ValueOpcode::IEqual32, {select, Value(word)}), words[word], chosen});
+    return chosen;
+  }
+
+  void Access(Value key, Value active) {
+    const auto pointer = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = RecordWordTable + word * sizeof(uint32_t);
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x54c));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {fixture.Image(words, 0x558), fixture.ImageAddress(), active},
+                 fixture.AddMemory(load, 0x558));
+  }
+};
+
+void CheckRecordWordDomain(const Program &program) {
+  const auto &indirect =
+      program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+  Check(indirect && indirect->selector && indirect->selector->stride == 4u &&
+            indirect->selector->offset == 16u && indirect->selector->scale == 31u &&
+            !indirect->selector->global && indirect->selector_first == Value(0u) &&
+            indirect->key_count == Value(4096u) && indirect->selector_addends.size() == 1u &&
+            program.descriptor_sources[indirect->selector->source].dword_count == 2u &&
+            indirect->table_stride == 32u && indirect->table_immediate == RecordWordTable,
+        "record-word key lost its tile table domain");
+}
+
+// T[tile] = tile % 5 and c = 3 select keys 3, 34, 65, 96 and 127; only those T# are read.
+void CheckRecordWordMaterialization(const ResourcePlan &plan) {
+  LinearTestMemory memory;
+  memory.words.assign((RecordWordTable + 128u * 32u) / 4u, 0u);
+  for (uint32_t tile = 0; tile < 4096u; ++tile) memory.words[4u + tile] = tile % 5u;
+  for (uint32_t key = 0; key < 128u; ++key) {
+    const auto word = RecordWordTable / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 8> user_data{0x1000u, 0u, 3u, 64u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.descriptor_reads == 5u && snapshot.images.size() == 5u,
+        "record-word key did not read exactly the descriptors its tiles select");
+  for (const uint32_t key : {3u, 34u, 65u, 96u, 127u})
+    Check(std::ranges::any_of(snapshot.images, [&](const auto &image) {
+            return image.dwords[0] == 0x100u + key;
+          }),
+          "record-word key lost a descriptor one of its tiles selects");
+}
+
+// DS2 cs 0x228a640fcb11a26d: a waterfall over a clamped screen tile.
+void TestAffineRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant {
+    Valid, TwoAddends, Unclamped, UnrelatedMask, StaleLane, UnguardedEntry, GappedWords,
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 32u;
+    RecordWordBuilder build{fixture};
+    if (variant == Variant::GappedWords) build.components = {0u, 4u, 8u, 16u};
+    auto *entry = fixture.block;
+    auto *ready = fixture.AddBlock();
+    auto *header = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto active = fixture.Emit(ValueOpcode::ULessThan32, {local, fixture.UserData(3)});
+    const auto spread = fixture.Emit(ValueOpcode::IMul32, {local, Value(151u)});
+    const auto tile = variant == Variant::Unclamped
+        ? spread : fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), spread});
+    const auto written = variant == Variant::StaleLane
+        ? fixture.Emit(ValueOpcode::INotEqual32, {local, fixture.UserData(4)}) : active;
+    const auto lane_value = fixture.Emit(ValueOpcode::SelectU32, {written, tile, local});
+    auto lanes = variant == Variant::UnrelatedMask
+        ? fixture.UserData(5)
+        : fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                       {fixture.Emit(ValueOpcode::Ballot, {active}), Value(0u)});
+    auto guard = active;
+           Value(0u)});
+      const auto selected = fixture.Emit(ValueOpcode::SelectU32, {uniform, lanes, Value(0u)});
+      lanes = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {lanes, fixture.Emit(ValueOpcode::BitwiseNot32,
+                               {fixture.Emit(ValueOpcode::BitwiseOr32, {skipped, selected})})});
+      guard = fixture.Emit(ValueOpcode::LogicalAnd,
+          {active, fixture.Emit(ValueOpcode::LogicalNot,
+                                {fixture.Emit(ValueOpcode::LogicalOr, {skip, uniform})})});
+    }
+    if (variant == Variant::UnguardedEntry) {
+      entry->AddBranch(ready);
+      entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = ready};
+    } else {
+      choose(entry, ready, exit,
+             fixture.Emit(ValueOpcode::ConditionRef, {guard}, CFG::BranchCondition::ExecNonZero));
+    }
+    ready->AddBranch(header);
+    ready->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    auto &remaining = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = header;
+    const auto lane = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::FindILsb32, {Value(&remaining)}), Value(31u)});
+    const auto key_tile = fixture.Emit(ValueOpcode::ReadLane, {lane_value, lane});
+    const auto match = fixture.Emit(ValueOpcode::LogicalAnd,
+        {active, fixture.Emit(ValueOpcode::IEqual32, {key_tile, lane_value})});
+    choose(header, access, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {match}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    const auto material = build.Material(key_tile);
+    const auto scaled = fixture.Emit(ValueOpcode::IMul32, {material, Value(31u)});
+    build.Access(fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(2), scaled}), match);
+    // A second texture slot of the same material keys a different T# range.
+    if (variant == Variant::TwoAddends)
+      build.Access(fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(6), scaled}), match);
+    access->AddBranch(latch);
+    access->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    fixture.block = latch;
+    const auto served = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+        {fixture.Emit(ValueOpcode::Ballot, {match}), Value(0u)});
+    const auto next = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {Value(&remaining), fixture.Emit(ValueOpcode::BitwiseNot32, {served})});
+    choose(latch, header, exit,
+           fixture.Emit(ValueOpcode::ConditionRef,
+                        {fixture.Emit(ValueOpcode::INotEqual32, {next, Value(0u)})},
+                        CFG::BranchCondition::SccNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    remaining.AddPhiOperand(ready, lanes);
+    remaining.AddPhiOperand(latch, next);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    if (variant == Variant::TwoAddends) {
+      const auto &images = fixture.program.info.images;
+      const auto addends = [&](size_t image) {
+        return fixture.program.descriptor_sources[images[image].source]
+            .indirect_descriptor->selector_addends;
+      };
+      Check(images.size() == 2u && images[0].source != images[1].source &&
+                addends(0).size() == 1u && addends(1).size() == 1u &&
+                addends(0)[0] != addends(1)[0],
+            "record-word keys with different addends shared one domain");
+    }
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  make_plan(Variant::TwoAddends);
+  for (const auto variant : {Variant::Unclamped, Variant::UnrelatedMask, Variant::StaleLane,
+                             Variant::UnguardedEntry, Variant::GappedWords,
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "record-word key accepted a tile no proof bounds or a gapped record");
+  CheckRecordWordMaterialization(plan);
+}
+
+// DS2 ps 0x83aa3dd5e5165b0f: two waterfalls, the first assembling T[tile].
+void TestAssembledRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // The drained mask starts as WQM of every lane, or of the live lanes (ps 0xfd3a8eec7807d518).
+  enum class Variant {
+    Valid, LiveMaskEntry, ComputeWqm, UnwrittenLanes, LowExit, CarriedUse,
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture(variant == Variant::ComputeWqm ? ShaderType::Compute : ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    RecordWordBuilder build{fixture};
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *after = fixture.AddBlock();
+    auto *second = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto jump = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto varying = variant == Variant::ComputeWqm
+        ? fixture.Emit(ValueOpcode::GetBuiltin,
+            {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)})
+        : fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
+    const auto tile = fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), varying});
+    const bool live = variant == Variant::LiveMaskEntry || variant == Variant::SwappedLiveMask;
+    const auto ballot = live ? fixture.Emit(ValueOpcode::LiveMask, {})
+                             : fixture.Emit(ValueOpcode::Ballot, {Value(true)});
+    const uint32_t low_word = variant == Variant::SwappedLiveMask ? 1u : 0u;
+    const auto wqm = fixture.Emit(ValueOpcode::WqmU64,
+        {fixture.Emit(ValueOpcode::CompositeConstructU64,
+                      {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(low_word)}),
+                       fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                    {ballot, Value(low_word ^ 1u)})})});
+    std::array<Value, 2> initial;
+    for (uint32_t word = 0; word < 2u; ++word)
+      initial[word] = fixture.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(word)});
+    // Upstream folds a 32-wide host's absent high EXEC word away, so a zero one is never all lanes.
+    auto &carried = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    std::array<Inst *, 2> remaining;
+    for (auto &word : remaining)
+      word = &header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = header;
+    const auto low = fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[0])});
+    const auto high = fixture.Emit(ValueOpcode::BitwiseOr32,
+        {fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[1])}), Value(32u)});
+    const auto lane = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::UMin32, {low, high}), Value(63u)});
+    const auto key_tile = fixture.Emit(ValueOpcode::ReadLane, {tile, lane});
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {key_tile, tile});
+    choose(header, body, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {match}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = body;
+    const auto material = build.Material(key_tile);
+    const auto writes = variant == Variant::UnwrittenLanes
+        ? fixture.Emit(ValueOpcode::LogicalAnd,
+              {match, fixture.Emit(ValueOpcode::INotEqual32, {varying, fixture.UserData(4)})})
+        : match;
+    const auto written =
+        fixture.Emit(ValueOpcode::SelectU32, {writes, material, Value(&carried)});
+    jump(body, latch);
+    auto &assembled = latch->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = latch;
+    const auto served = fixture.Emit(ValueOpcode::Ballot, {match});
+    std::array<Value, 2> left;
+    for (uint32_t word = 0; word < 2u; ++word)
+      left[word] = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {Value(remaining[word]),
+           fixture.Emit(ValueOpcode::BitwiseNot32,
+                        {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {served, Value(word)})})});
+    const auto pending = variant == Variant::LowExit
+        ? left[0] : fixture.Emit(ValueOpcode::BitwiseOr32, {left[0], left[1]});
+    choose(latch, header, after,
+           fixture.Emit(ValueOpcode::ConditionRef,
+                        {fixture.Emit(ValueOpcode::INotEqual32, {pending, Value(0u)})},
+                        CFG::BranchCondition::SccNonZero));
+    fixture.block = after;
+    const auto key_value = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.UserData(2),
+         fixture.Emit(ValueOpcode::IMul32,
+                      {Value(31u), variant == Variant::CarriedUse ? Value(&carried)
+                                                                   : Value(&assembled)})});
+    jump(after, second);
+    auto &waiting = second->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixture.block = second;
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(second, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    build.Access(key, selected);
+    jump(access, next_key);
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, second, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest}, CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    carried.AddPhiOperand(entry, varying);
+    carried.AddPhiOperand(latch, Value(&assembled));
+    for (uint32_t word = 0; word < 2u; ++word) {
+      remaining[word]->AddPhiOperand(entry, initial[word]);
+      remaining[word]->AddPhiOperand(latch, left[word]);
+    }
+    assembled.AddPhiOperand(header, Value(&carried));
+    assembled.AddPhiOperand(body, written);
+    waiting.AddPhiOperand(after, Value(true));
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  CheckRecordWordMaterialization(make_plan(Variant::LiveMaskEntry));
+  for (const auto variant : {Variant::ComputeWqm, Variant::UnwrittenLanes, Variant::LowExit,
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "assembled record-word key accepted a lane the waterfall may not have written");
+  CheckRecordWordMaterialization(plan);
+}
 void TestUniformizedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
@@ -10011,6 +10333,8 @@ int main() {
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
     Run("descending image range", TestDescendingImageRange);
+    Run("affine record-word image table", TestAffineRecordWordImageTable);
+    Run("assembled record-word image table", TestAssembledRecordWordImageTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

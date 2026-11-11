@@ -7147,15 +7147,17 @@ void TestGpuSelectedFormattedRecordStore() {
   }
   const auto saved_stride = memory.words[first + 1u];
   const auto saved_selector = memory.words[first + 3u];
-  for (const uint32_t descriptor : {
-           (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) |
-               Libs::Graphics::DstSel(4, 0, 0, 1),
-           uint32_t(Prospero::BufferFormat::k8UInt) << 12u}) {
-    memory.words[first + 3u] = descriptor;
-    Check(materialize() && specialization.buffers[root].descriptor_format ==
-                                Prospero::BufferFormat::k8UInt,
-          "UInt8 store descriptor was rejected or lost its runtime format");
-  }
+  memory.words[first + 3u] =
+      (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) |
+      Libs::Graphics::DstSel(4, 0, 0, 1);
+  Check(materialize() && specialization.buffers[root].descriptor_format ==
+                              Prospero::BufferFormat::k8UInt,
+        "UInt8 store descriptor was rejected or lost its runtime format");
+  memory.words[first + 3u] = uint32_t(Prospero::BufferFormat::k8UInt) << 12u;
+  Check(materialize() &&
+            std::ranges::all_of(snapshot.buffers[root].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "zero-selector UInt8 store row was not treated as an unused null descriptor");
   memory.words[first + 3u] = saved_selector;
   memory.words[first + 1u] = 1u << 16u;
   Check(materialize(), "a stride larger than one-byte UInt8 records was rejected");

@@ -239,8 +239,9 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 			return SpecializationFail("indirect formatted buffers require a supported indexed format");
 		if (!formatted_read) {
 			const auto swizzle = descriptor.DstSelXYZW();
-			if (!IsValidImageSwizzle(swizzle, 4u) || resource.max_byte_extent == 0u ||
-			    resource.max_byte_extent > 16u || descriptor.Stride() < format.byte_size)
+			if (!IsValidImageSwizzle(swizzle, 4u) ||
+			    resource.max_byte_extent < format.byte_size || resource.max_byte_extent > 16u ||
+			    descriptor.Stride() < format.byte_size)
 				return SpecializationFail(fmt::format(
 				    "indirect formatted stores require a supported selector and full-format "
 				    "records: format={} stride={} format_bytes={} max_extent={} dst_sel={:03x} "

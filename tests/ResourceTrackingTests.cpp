@@ -6265,16 +6265,23 @@ void TestBoundedFormattedBufferStore() {
   Check(materialize() && specialization == original &&
             snapshot.buffers[0].dwords[0] == memory.words[32],
         "destination address refresh was frozen or caused needless specialization");
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 9>{
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 4>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
             {35u, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u | 4u},
-             {35u, memory.words[35] ^ 1u}, {35u, memory.words[35] | (4u << 3u)},
-            {32u, memory.words[32] + 1u},
-            {33u, 8u << 16u}, {33u, (4u << 16u) | (1u << 31u)},
-            {35u, memory.words[35] | (1u << 23u)}, {35u, memory.words[35] | (3u << 28u)}}}) {
+            {35u, memory.words[35] | (4u << 3u)}, {33u, 8u << 16u}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
-    Check(!materialize(), "formatted finite store accepted an unproved format or bounds mode");
+    Check(materialize(), "finite formatted store rejected a supported format, selector or stride");
+    memory.words[word] = saved;
+  }
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 7>{
+           {{35u, (memory.words[35] & ~7u) | 2u}, {35u, memory.words[35] | (3u << 3u)},
+            {32u, memory.words[32] + 1u}, {33u, 2u << 16u},
+            {33u, (4u << 16u) | (1u << 31u)}, {35u, memory.words[35] | (1u << 23u)},
+            {35u, memory.words[35] | (3u << 28u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = replacement;
+    Check(!materialize(), "formatted finite store accepted an invalid selector, stride or bounds mode");
     memory.words[word] = saved;
   }
   for (const uint32_t count : {MaxIndirectDescriptorProbes + 1u, 0x80000000u, UINT32_MAX}) {
@@ -7247,14 +7254,24 @@ void TestGpuSelectedFormattedRecordStore() {
   Check(wide_materialize() && specialization == wide_original &&
             snapshot.buffers[wide_root].dwords[0] == memory.words[table_offset / 4u],
         "RGBA16 destination refresh froze the address or changed format specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
-      {0u, memory.words[table_offset / 4u] | 1u}, {1u, 16u << 16u},
-      {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba | (1u << 28u)},
-      {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}, {3u, rgba ^ 1u}}}) {
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 3>{
+           {{1u, 16u << 16u},
+            {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}, {3u, rgba ^ 1u}}}) {
     auto& field = memory.words[table_offset / 4u + word];
     const auto saved = field;
     field = value;
-    Check(!wide_materialize(), "RGBA16 store accepted unproved format, alignment, stride, bounds or swizzle");
+    Check(wide_materialize(), "RGBA16 store rejected a supported format, selector or stride");
+    field = saved;
+  }
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{
+           {{0u, memory.words[table_offset / 4u] | 1u}, {1u, 4u << 16u},
+            {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba | (1u << 28u)},
+            {3u, (rgba & ~7u) | 2u}}}) {
+    auto& field = memory.words[table_offset / 4u + word];
+    const auto saved = field;
+    field = value;
+    Check(!wide_materialize(),
+          "RGBA16 store accepted an invalid selector, alignment, stride, bounds or swizzle");
     field = saved;
   }
   wide_plan.info.buffers[wide_root].max_byte_extent = 4u;

@@ -1767,6 +1767,8 @@ private:
 	// g when value is 32-lane word `word` of Ballot(g), or scalar mask logic over such words: a
 	// waterfall's EXEC may start as EXEC with some ballots and uniformly selected words removed.
 	Value BallotWordPredicate(Value value, uint32_t word, Value within = {},
+	                          uint32_t depth = 0) const {
+		value = value.Resolve();
 		if (const auto leaf = BallotSourcePredicate(value, word); !leaf.IsEmpty())
 			return WithoutConjunct(leaf, within);
 		if (value == Value(0u)) return Value(false);
@@ -2379,6 +2381,15 @@ private:
 		return memory.kind == ResourceKind::Global && !memory.address_is_full &&
 		               memory.data_bits == 32u && memory.data_dwords == 1u
 		           ? &memory
+	// Every access of `handle` runs on lanes of `guard`: with none, the key it forms goes unused.
+	bool AccessesRequire(const Inst& handle, Value guard) const {
+		return !handle.Uses().empty() && std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			return ImageOpcodeInfoOf(use.user->GetOpcode()).access != ImageAccess::None &&
+			       Implies(use.user->Arg(use.user->NumArgs() - 1u), guard);
+		});
+	}
+
+	// An upper bound of a record read's index on the lanes of `guard` (empty: every lane), where
 		index             = guard.IsEmpty() ? index.Resolve() : ActiveValue(index, guard);
 		const auto* inst  = index.TryInstruction();
 		uint32_t    shift = 0;
@@ -2398,6 +2409,9 @@ private:
 				                SelectorMaximum(inst->Arg(0), {}, 0u, lanes));
 			}
 			case ValueOpcode::ReadFirstLane:
+				if (!HasActiveLane(inst->Arg(1), inst->Parent()) &&
+				    !AccessesRequire(handle, inst->Arg(1)))
+					break;
 				return std::min(SelectorMaximum(index),
 				                SelectorMaximum(inst->Arg(0), {}, 0u, inst->Arg(1)));
 			default: break;
@@ -4723,6 +4737,7 @@ private:
 
 	// Maximum of a nonnegative select arm while its select condition has the given value.
 	uint32_t NonnegativeArmMaximum(Value condition, Value arm, bool positive,
+	                               uint32_t depth = 0) const {
 		const auto* test = condition.Resolve().TryInstruction();
 		if (test == nullptr || depth > 8u) return UINT32_MAX;
 		const auto op = test->GetOpcode();

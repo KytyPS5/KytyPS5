@@ -3338,6 +3338,69 @@ void TestAssembledRecordWordImageTable() {
                "assembled record-word key accepted a lane the waterfall may not have written");
   CheckRecordWordMaterialization(plan);
 }
+// DS2 vs 0x788243a6d8537c1f: a wave-uniform T[tile] read at the first lane of the EXEC
+// predicate, whose lanes no branch proves nonempty; its key is used only on those lanes.
+void TestUniformRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, UnguardedAccess };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    RecordWordBuilder build{fixture};
+    auto *entry = fixture.block;
+    auto *second = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto exec = fixture.Emit(ValueOpcode::ULessThan32, {local, fixture.UserData(3)});
+    const auto spread = fixture.Emit(ValueOpcode::IMul32, {local, Value(151u)});
+    // Only the EXEC lanes clamp their tile.
+    const auto tile = fixture.Emit(ValueOpcode::SelectU32,
+        {exec, fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), spread}), spread});
+    const auto material = build.Material(fixture.Emit(ValueOpcode::ReadFirstLane, {tile, exec}));
+    const auto key_value = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.UserData(2), fixture.Emit(ValueOpcode::IMul32, {Value(31u), material})});
+    entry->AddBranch(second);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = second};
+    auto &waiting = second->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixture.block = second;
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(second, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    build.Access(key, selected);
+    access->AddBranch(next_key);
+    access->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = next_key};
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, second, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest}, CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    waiting.AddPhiOperand(entry, variant == Variant::UnguardedAccess ? Value(true) : exec);
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  CheckFatal([&] { make_plan(Variant::UnguardedAccess); }, "not a valid runtime value",
+             "uniform record-word key accepted a lane outside the read's EXEC predicate");
+  CheckRecordWordMaterialization(plan);
+}
+
+// DS2 cs 0x12db0180e6634d01 and vs 0xc01cd981407ebfa0: global-load T[tile].
 void TestGlobalRecordWordImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant { Valid, QueryOnly, Predicated, FullAddress, WiderLanes };
@@ -10941,6 +11004,7 @@ int main() {
     Run("affine record-word image table", TestAffineRecordWordImageTable);
     Run("assembled record-word image table", TestAssembledRecordWordImageTable);
     Run("loop-selected image table", TestLoopSelectedImageTable);
+    Run("uniform record-word image table", TestUniformRecordWordImageTable);
     Run("global record-word image table", TestGlobalRecordWordImageTable);
     Run("material-word image table", TestMaterialWordImageTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

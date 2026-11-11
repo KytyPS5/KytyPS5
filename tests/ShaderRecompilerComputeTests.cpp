@@ -2174,8 +2174,9 @@ u32 EncodeD16AsD32(uint16_t value) {
   return std::bit_cast<u32>(static_cast<float>(value) / 65535.0f);
 }
 
-// The depth-feedback selectors use fully initialized descriptors and do not
-// need the byte-granular robust-buffer capabilities required by the full suite.
+// The depth-feedback selectors still use null descriptors for unused bindings,
+// but do not need the byte-granular robust-buffer capabilities required by the
+// full suite.
 enum class VulkanHarnessProfile {
   kStrict,
   kDepthFeedback,
@@ -23788,9 +23789,9 @@ private:
     vk::PhysicalDeviceProperties2 properties2{};
     properties2.pNext = &robustness2_properties;
     m_physical_device.getProperties2(&properties2);
+    Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
+            "null descriptors are not supported");
     if (RequiresRobustAccess()) {
-      Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
-              "null descriptors are not supported");
       Require("VulkanHarness", "dispatch",
               available_robustness2.robustBufferAccess2 == true &&
                   available_pipeline_robustness.pipelineRobustness == true &&
@@ -23860,6 +23861,11 @@ private:
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
                                 available_provoking_vertex.provokingVertexLast;
+#if !defined(__APPLE__)
+    // The production pipeline enables depth clamping on non-Apple platforms.
+    m_rasterization_supported =
+        m_rasterization_supported && available_features.depthClamp;
+#endif
     m_feedback_dynamic_supported =
         m_rasterization_supported &&
         available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -23942,15 +23948,15 @@ private:
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
+    robustness2.nullDescriptor = true;
     if (RequiresRobustAccess()) {
       pipeline_robustness.pipelineRobustness = true;
       pipeline_robustness.pNext = &maintenance8;
-      robustness2.nullDescriptor = true;
       robustness2.pNext = &pipeline_robustness;
-      conditional_rendering.pNext = &robustness2;
     } else {
-      conditional_rendering.pNext = &maintenance8;
+      robustness2.pNext = &maintenance8;
     }
+    conditional_rendering.pNext = &robustness2;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     mesh.meshShader = mesh.taskShader = true;
     mesh.pNext = &conditional_rendering;
@@ -23974,6 +23980,9 @@ private:
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+#if !defined(__APPLE__)
+    device_features.depthClamp = m_rasterization_supported;
+#endif
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{

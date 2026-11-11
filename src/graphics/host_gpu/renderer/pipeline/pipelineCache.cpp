@@ -490,7 +490,20 @@ PipelineCache::~PipelineCache() {
 			m_graphics.device.destroyShaderModule(module.module, nullptr);
 		}
 	}
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	std::vector<vk::PipelineCache> driver_caches;
+	{
+		std::scoped_lock lock(m_driver_cache_mutex);
+		if (m_driver_cache != nullptr) {
+			driver_caches.push_back(m_driver_cache);
+		}
+		driver_caches.insert(driver_caches.end(), m_retired_driver_caches.begin(),
+		                     m_retired_driver_caches.end());
+		m_driver_cache = nullptr;
+		m_retired_driver_caches.clear();
+	}
+	for (const auto cache: driver_caches) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -569,7 +582,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::CheckpointDriverCache() {
-	if (m_driver_cache == nullptr) {
+	if (AcquireDriverCache() == nullptr) {
 		return;
 	}
 	m_driver_cache_dirty = true;
@@ -590,18 +603,22 @@ void PipelineCache::Save() {
 }
 
 void PipelineCache::WriteDriverCache() const {
+	const auto driver_cache = AcquireDriverCache();
+	if (driver_cache == nullptr) {
+		return;
+	}
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+		result = m_graphics.device.getPipelineCacheData(driver_cache, &size, nullptr);
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
 		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+		result = m_graphics.device.getPipelineCacheData(driver_cache, &size, payload.data());
 		if (result != vk::Result::eIncomplete) {
 			break;
 		}
@@ -644,6 +661,24 @@ void PipelineCache::WriteDriverCache() const {
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
+}
+
+vk::PipelineCache PipelineCache::AcquireDriverCache() const {
+	std::scoped_lock lock(m_driver_cache_mutex);
+	return m_driver_cache;
+}
+
+void PipelineCache::AbandonDriverCache(vk::PipelineCache cache, vk::Result failure) {
+	std::scoped_lock lock(m_driver_cache_mutex);
+	if (m_driver_cache != cache) {
+		return;
+	}
+	m_driver_cache       = nullptr;
+	m_driver_cache_dirty = false;
+	m_retired_driver_caches.push_back(cache);
+	PipelineCacheLog("Vulkan pipeline cache: disabled after pipeline creation failed ({}); "
+	                 "continuing without a driver cache",
+	                 vk::to_string(failure));
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
@@ -1065,7 +1100,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+		CreatePipelineInternal(m_graphics, *this, pipeline, key, stages);
 	}
 	StorePipeline(key);
 	CheckpointDriverCache();
@@ -1092,7 +1127,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
-		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
+		CreatePipelineInternal(m_graphics, *this, pipeline, module);
 	}
 	CheckpointDriverCache();
 

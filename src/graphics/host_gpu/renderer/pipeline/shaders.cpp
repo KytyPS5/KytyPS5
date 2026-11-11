@@ -139,10 +139,9 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
-                            const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache) {
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache& pipeline_cache,
+                            PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key,
+                            const std::array<const ShaderModule*, 4>& stages) {
 	const auto& rendering     = key.rendering;
 	const auto& vertex_input  = key.vertex_input;
 	const auto& static_params = key.static_params;
@@ -353,13 +352,24 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = pipeline.pipeline_layout;
 
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
-	if (result != vk::Result::eSuccess) {
-		EXIT("graphics pipeline creation failed: result=%s (%d) stages=0x%016" PRIx64
-		     ",0x%016" PRIx64 ",0x%016" PRIx64 ",0x%016" PRIx64 "\n",
-		     vk::to_string(result).c_str(), static_cast<int32_t>(result), key.stage_ids[0],
-		     key.stage_ids[1], key.stage_ids[2], key.stage_ids[3]);
+	const auto creation = CreatePipelineWithDriverCacheFallback(
+	    pipeline_cache.AcquireDriverCache(),
+	    [&](vk::PipelineCache driver_cache) {
+		    pipeline.pipeline = nullptr;
+		    return graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                   &pipeline.pipeline);
+	    },
+	    [&](vk::PipelineCache driver_cache, vk::Result failure) {
+		    pipeline_cache.AbandonDriverCache(driver_cache, failure);
+	    });
+	if (!creation.Succeeded()) {
+		EXIT("graphics pipeline creation failed: result=%s (%d) cache_result=%s (%d) "
+		     "retried_without_cache=%u stages=0x%016" PRIx64 ",0x%016" PRIx64
+		     ",0x%016" PRIx64 ",0x%016" PRIx64 "\n",
+		     vk::to_string(creation.result).c_str(), static_cast<int32_t>(creation.result),
+		     vk::to_string(creation.first_result).c_str(),
+		     static_cast<int32_t>(creation.first_result), creation.retried_without_cache ? 1u : 0u,
+		     key.stage_ids[0], key.stage_ids[1], key.stage_ids[2], key.stage_ids[3]);
 	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -367,8 +377,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	graphics.device.destroyShaderModule(task_module, nullptr);
 }
 
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache& pipeline_cache,
+                            PipelineCache::Pipeline& pipeline, const ShaderModule& module) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -394,15 +404,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
-	const auto result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-	if (result != vk::Result::eSuccess) {
-		EXIT("compute pipeline creation failed: result=%s (%d) module=0x%016" PRIx64
-		     " shader=0x%016" PRIx64 " wave=%u bindings=0x%08x gds=%u image_heap=%u "
-		     "push_descriptors=%u\n",
-		     vk::to_string(result).c_str(), static_cast<int32_t>(result), module.id,
-		     module.info.shader_hash, module.info.wave_size, module.info.bindings.descriptor_mask,
-		     module.info.info.uses_gds ? 1u : 0u, module.info.info.uses_image_heap ? 1u : 0u,
+	const auto creation = CreatePipelineWithDriverCacheFallback(
+	    pipeline_cache.AcquireDriverCache(),
+	    [&](vk::PipelineCache driver_cache) {
+		    pipeline.pipeline = nullptr;
+		    return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+		                                                  &pipeline.pipeline);
+	    },
+	    [&](vk::PipelineCache driver_cache, vk::Result failure) {
+		    pipeline_cache.AbandonDriverCache(driver_cache, failure);
+	    });
+	if (!creation.Succeeded()) {
+		EXIT("compute pipeline creation failed: result=%s (%d) cache_result=%s (%d) "
+		     "retried_without_cache=%u module=0x%016" PRIx64 " shader=0x%016" PRIx64
+		     " wave=%u bindings=0x%08x gds=%u image_heap=%u push_descriptors=%u\n",
+		     vk::to_string(creation.result).c_str(), static_cast<int32_t>(creation.result),
+		     vk::to_string(creation.first_result).c_str(),
+		     static_cast<int32_t>(creation.first_result), creation.retried_without_cache ? 1u : 0u,
+		     module.id, module.info.shader_hash, module.info.wave_size,
+		     module.info.bindings.descriptor_mask, module.info.info.uses_gds ? 1u : 0u,
+		     module.info.info.uses_image_heap ? 1u : 0u,
 		     pipeline.uses_push_descriptors ? 1u : 0u);
 	}
 }

@@ -13558,6 +13558,79 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
+void TestPipelineCacheCreationFallback() {
+  constexpr uintptr_t driver_cache = 1;
+  int create_calls = 0;
+  int disable_calls = 0;
+  auto result = CreatePipelineWithDriverCacheFallback(
+      driver_cache,
+      [&](auto cache) {
+        create_calls++;
+        if (create_calls == 1) {
+          Check(cache == driver_cache,
+                "pipeline cache fallback did not try the driver cache first");
+          return vk::Result::eErrorOutOfHostMemory;
+        }
+        Check(cache == 0,
+              "pipeline cache fallback retried with the failed driver cache");
+        return vk::Result::eSuccess;
+      },
+      [&](auto cache, vk::Result failure) {
+        disable_calls++;
+        Check(cache == driver_cache,
+              "pipeline cache fallback disabled the wrong cache");
+        Check(failure == vk::Result::eErrorOutOfHostMemory,
+              "pipeline cache fallback lost the initial Vulkan result");
+      });
+  Check(result.Succeeded() && result.retried_without_cache &&
+            result.first_result == vk::Result::eErrorOutOfHostMemory &&
+            create_calls == 2 && disable_calls == 1,
+        "pipeline cache fallback did not recover an out-of-host-memory failure");
+
+  create_calls = 0;
+  disable_calls = 0;
+  result = CreatePipelineWithDriverCacheFallback(
+      driver_cache,
+      [&](auto) {
+        create_calls++;
+        return vk::Result::eSuccess;
+      },
+      [&](auto, vk::Result) { disable_calls++; });
+  Check(result.Succeeded() && !result.retried_without_cache &&
+            create_calls == 1 && disable_calls == 0,
+        "pipeline cache fallback retried a successful cached creation");
+
+  create_calls = 0;
+  disable_calls = 0;
+  result = CreatePipelineWithDriverCacheFallback(
+      driver_cache,
+      [&](auto) {
+        create_calls++;
+        return vk::Result::eErrorInitializationFailed;
+      },
+      [&](auto, vk::Result) { disable_calls++; });
+  Check(!result.Succeeded() && !result.retried_without_cache &&
+            result.result == vk::Result::eErrorInitializationFailed &&
+            result.first_result == vk::Result::eErrorInitializationFailed &&
+            create_calls == 1 && disable_calls == 0,
+        "pipeline cache fallback hid a non-cache pipeline failure");
+
+  create_calls = 0;
+  disable_calls = 0;
+  result = CreatePipelineWithDriverCacheFallback(
+      0u,
+      [&](auto cache) {
+        create_calls++;
+        Check(cache == 0,
+              "pipeline cache fallback invented a missing driver cache");
+        return vk::Result::eErrorOutOfHostMemory;
+      },
+      [&](auto, vk::Result) { disable_calls++; });
+  Check(!result.Succeeded() && !result.retried_without_cache &&
+            create_calls == 1 && disable_calls == 0,
+        "pipeline cache fallback retried an already uncached creation");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -13765,6 +13838,7 @@ int main() {
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
+  TestPipelineCacheCreationFallback();
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();

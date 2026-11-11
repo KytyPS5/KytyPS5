@@ -42,6 +42,18 @@ namespace {
 // A tiled chain stores small mips first, so the level count moves mip 0: images at one address
 // with the same extent hold different guest bytes unless every level they share starts at the
 // same offset.
+[[nodiscard]] bool SharedMipsAtSameOffsets(const ImageInfo& a, const ImageInfo& b) {
+	const auto levels = std::min({a.resources.levels, b.resources.levels,
+	                              static_cast<uint32_t>(a.mip_layout.size()),
+	                              static_cast<uint32_t>(b.mip_layout.size())});
+	for (uint32_t level = 0; level < levels; level++) {
+		if (a.mip_layout[level].offset != b.mip_layout[level].offset) {
+			return false;
+		}
+	}
+	return true;
+}
+
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
@@ -799,7 +811,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    (requested.resources == cached.info.resources &&
 		     !std::equal(requested.mip_layout.begin(),
 		                 requested.mip_layout.begin() + requested.resources.levels,
-		                 cached.info.mip_layout.begin()))) {
+		                 cached.info.mip_layout.begin())) ||
+		    !SharedMipsAtSameOffsets(requested, cached.info)) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}

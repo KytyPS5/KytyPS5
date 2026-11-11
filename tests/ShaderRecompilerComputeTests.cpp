@@ -6814,6 +6814,63 @@ public:
       Require(name, "partial pixels", read_level(clamped) == read_level(reference),
               "the partial image's level 2 differs from a full image of the same bytes");
 
+      // A second clamped chain, at an address of its own.
+      constexpr uint64_t second_address = base + 0x100000;
+      std::memcpy(reinterpret_cast<void *>(second_address), mapped, 0x100000u);
+      const auto second = resolve(second_address, 2u << 8u);
+
+      // Death Stranding 2: another surface at a clamped chain's address, two one-level slices
+      // of the same extent. Its level 0 starts at the address, the chain's after the small mips:
+      // different guest bytes, so it gets an image of its own.
+      {
+        TextureCache::ImageDesc slices{};
+        slices.info = textures.GetImage(second).info;
+        slices.info.first_level = 0;
+        slices.info.resources = {1u, 2u};
+        slices.info.data.size = 0;
+        slices.info.pitch = 0;
+        slices.info.mip_layout = {};
+        slices.info.UpdateSize();
+        slices.view_info.format = slices.info.pixel_format;
+        slices.view_info.type = vk::ImageViewType::e2DArray;
+        slices.view_info.layer_count = 2u;
+        const auto &chain = textures.GetImage(second).info;
+        Require(name, "slices fixture",
+                slices.info.data.size > chain.data.size &&
+                    slices.info.mip_layout[0].offset != chain.mip_layout[0].offset,
+                "the one-level slices do not cover the chain or share its level 0 offset");
+        const auto slices_id = textures.FindImage(slices);
+        Require(name, "separate surface",
+                slices_id && slices_id != second &&
+                    textures.GetImage(slices_id).info.resources == slices.info.resources &&
+                    textures.GetImage(slices_id).info.first_level == 0u,
+                "a surface whose level 0 lies elsewhere was served from the clamped chain");
+        RenderExecutorTestAccess::ResetBindings(executor);
+
+        // Dead Space: a one-level texture at a full chain's address fits inside the chain's
+        // bytes, but its level 0 is the chain's smallest mips, not the chain's level 0.
+        TextureCache::ImageDesc single = slices;
+        single.info = textures.GetImage(reference).info;
+        single.info.resources = {1u, 1u};
+        single.info.data.size = 0;
+        single.info.pitch = 0;
+        single.info.mip_layout = {};
+        single.info.UpdateSize();
+        single.view_info.type = vk::ImageViewType::e2D;
+        single.view_info.layer_count = 1u;
+        const auto &full_chain = textures.GetImage(reference).info;
+        Require(name, "single fixture",
+                single.info.data.size <= full_chain.data.size &&
+                    single.info.mip_layout[0].offset != full_chain.mip_layout[0].offset,
+                "the one-level texture does not fit the chain or shares its level 0 offset");
+        const auto single_id = textures.FindImage(single);
+        Require(name, "separate single level",
+                single_id && single_id != reference &&
+                    textures.GetImage(single_id).info.resources == single.info.resources,
+                "a one-level texture was served from a chain whose level 0 lies elsewhere");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+
       // Sampling the larger levels needs a full image; a clamped request then shares it.
       const auto unclamped = resolve(clamped_address, 0u);
       Require(name, "replacement",
@@ -14767,17 +14824,27 @@ public:
                                     {probe_width, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
         if (fill_case.reuse_mips) {
+          // A tiled chain stores small mips first: the two-level chain's mip 0 is not at offset 0,
+          // where a one-level target's is.
           const auto &image = texture_cache.GetImage(color.image_id);
-          Require(name, "single-mip clear reuses mip chain",
-                  color.image_id == preexisting_id && image.info.resources.levels == 2 &&
-                      color.desc.info.resources.levels == (fill_case.dcc_mips ? 2u : 1u) &&
-                      color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
-                  "the single-mip target did not retain its cached image and view scope");
-          Require(name, "single-mip clear preserves higher mip",
-                  ReadCachedTexel(name, context, color.image_id, {255, 127, 0},
-                                  {1, 1, 1}, selected_layer, 1) ==
-                      std::vector<u32>{0x00003c00u, 0x00003c00u},
-                  "clearing mip zero changed its higher mip");
+          if (fill_case.dcc_mips) {
+            Require(name, "mip-chain clear reuses mip chain",
+                    color.image_id == preexisting_id && image.info.resources.levels == 2 &&
+                        color.desc.info.resources.levels == 2 &&
+                        color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
+                    "the mip-chain target did not retain its cached image and view scope");
+            Require(name, "mip-chain clear preserves higher mip",
+                    ReadCachedTexel(name, context, color.image_id, {255, 127, 0},
+                                    {1, 1, 1}, selected_layer, 1) ==
+                        std::vector<u32>{0x00003c00u, 0x00003c00u},
+                    "clearing mip zero changed its higher mip");
+          } else {
+            Require(name, "single-mip clear gets its own image",
+                    color.image_id != preexisting_id && image.info.resources.levels == 1 &&
+                        color.desc.info.resources.levels == 1 &&
+                        color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
+                    "the single-mip target reused a chain whose mip 0 lies at another offset");
+          }
         }
         check_expanded_metadata();
 

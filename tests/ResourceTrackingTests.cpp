@@ -6302,6 +6302,18 @@ void TestBoundedFormattedBufferStore() {
   Check(!materialize(), "formatted destination bypassed failed coherent descriptor reads");
   memory.fail_address = UINT64_MAX;
   Check(materialize(), "valid uniform descriptor table did not recover after a failed refresh");
+  memory.words[72] = 1u;
+  std::array<uint32_t, 4> saved_descriptor;
+  std::copy_n(memory.words.begin() + 32u, saved_descriptor.size(), saved_descriptor.begin());
+  const std::array<uint32_t, 4> invalid_descriptor{
+      0x00000100u, 0x00005204u, 0x00006092u, 0x00fff000u};
+  std::copy(invalid_descriptor.begin(), invalid_descriptor.end(), memory.words.begin() + 32u);
+  Check(materialize() && snapshot.buffers.size() == 1u &&
+            std::ranges::all_of(snapshot.buffers[0].dwords, [](uint32_t word) { return word == 0u; }),
+        "uninitialized formatted store candidate did not become a null descriptor");
+  std::copy(saved_descriptor.begin(), saved_descriptor.end(), memory.words.begin() + 32u);
+  memory.words[72] = 8u;
+  Check(materialize(), "valid uniform descriptor table did not recover after an invalid candidate");
   ApplyResourceSpecialization(fixture->program, specialization);
   bool formatted = false;
   for (auto* block : fixture->program.blocks)

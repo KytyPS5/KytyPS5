@@ -115,6 +115,16 @@ public:
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
+	// Host-only images have no guest backing, so AccountedSize is zero; use the VMA allocation
+	// size to charge them against the texture cache budget.
+	[[nodiscard]] uint64_t BackingSize() const noexcept {
+		if (backing.allocation == nullptr) {
+			return 0;
+		}
+		VmaAllocationInfo allocation {};
+		vmaGetAllocationInfo(m_graphics.allocator, backing.allocation, &allocation);
+		return allocation.size;
+	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
 		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal

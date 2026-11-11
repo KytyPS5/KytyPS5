@@ -64,7 +64,9 @@ public:
 	// own, outside any render pass, for the draw to sample instead: the draw reads the values from
 	// before it ran. The copy lives until the depth image is deleted.
 	[[nodiscard]] ImageId CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
-	                                           vk::ImageAspectFlags aspects);
+	                                           vk::ImageAspectFlags aspects,
+	                                           vk::ImageAspectFlags clear_aspects,
+	                                           const vk::ClearDepthStencilValue& clear);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);

@@ -15974,6 +15974,7 @@ public:
 
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
+    const bool feedback_loops = m_runtime_context.attachment_feedback_loop_enabled;
     constexpr uintptr_t base = 0x0000000203600000ull;
     constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -17473,14 +17474,15 @@ public:
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), disjoint_binding));
       const auto &disjoint_image = texture_cache.GetImage(disjoint_depth_id);
+      const auto disjoint_layout = feedback_loops
+          ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+          : vk::ImageLayout::eGeneral;
       Require(name, "disjoint depth sampling during depth writes",
               !disjoint_feedback &&
                   disjoint_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
-                  disjoint_binding.images[0].layout ==
-                      disjoint_rendering.depth_stencil_attachment.image_layout &&
-                  disjoint_image.backing.state.layout ==
-                      disjoint_rendering.depth_stencil_attachment.image_layout &&
+                      disjoint_layout &&
+                  disjoint_binding.images[0].layout == disjoint_layout &&
+                  disjoint_image.backing.state.layout == disjoint_layout &&
                   disjoint_image.backing.subresource_states.empty(),
               "disjoint sampling used inconsistent image layouts or enabled feedback");
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -17515,15 +17517,28 @@ public:
           depth_views_stages, &depth_views_feedback);
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), depth_views_binding));
+      const bool depth_views_copied = !feedback_loops;
+      const auto depth_views_layout = feedback_loops
+          ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+          : vk::ImageLayout::eGeneral;
+      const auto overlapping_binding_layout = depth_views_copied
+          ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+          : depth_views_layout;
+      const auto disjoint_binding_layout = depth_views_layout;
       Require(name, "overlapping and disjoint depth views",
               overlapping_view != nullptr &&
-                  depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
+                  depth_views_feedback == (feedback_loops
+                                               ? vk::ImageAspectFlagBits::eDepth
+                                               : vk::ImageAspectFlags{}) &&
                   depth_views_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      depth_views_layout &&
                   MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
-                      depth_views_rendering.depth_stencil_attachment.image_layout &&
+                      overlapping_binding_layout &&
                   MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
-                      depth_views_rendering.depth_stencil_attachment.image_layout,
+                      disjoint_binding_layout &&
+                  (!depth_views_copied ||
+                   (depth_views_binding.images[0].image_id != disjoint_depth_id &&
+                    depth_views_binding.images[1].image_id == disjoint_depth_id)),
               "two depth views chose different descriptor layouts or feedback aspects");
 
       Libs::LibKernel::Memory::WriteBacking(
@@ -17917,24 +17932,32 @@ public:
             bounds_bindings.pixel));
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
         const auto &pixel_depth = bounds_bindings.pixel.images[0];
+        const bool bounds_copied = pass == 0 && !feedback_loops;
         const auto expected_layout = pass == 0
-            ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+            ? (feedback_loops ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                              : vk::ImageLayout::eDepthAttachmentOptimal)
             : vk::ImageLayout::eDepthReadOnlyOptimal;
+        const auto expected_binding_layout = bounds_copied
+            ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+            : expected_layout;
+        const auto expected_image_id = bounds_copied
+            ? bounds_bindings.pixel.images[0].image_id
+            : depth_only.image_id;
         Require(name, "deferred clear with sampled depth bounds",
                 bounds_depth.image_id == depth_only.image_id &&
                     bounds_depth.depth_bounds_test_enable &&
                     !bounds_depth.depth_write_enable &&
                     static_cast<bool>(bounds_depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) == (pass == 0) &&
                     !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
-                    bounds_feedback == (pass == 0
+                    bounds_feedback == (pass == 0 && feedback_loops
                                             ? vk::ImageAspectFlagBits::eDepth
                                             : vk::ImageAspectFlags{}) &&
                     bounds_rendering.depth_stencil_attachment.image_layout == expected_layout &&
                     bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
-                    vertex_depth.image_id == depth_only.image_id &&
-                    pixel_depth.image_id == depth_only.image_id &&
-                    MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
-                    MakeImageInfo(pixel_depth).imageLayout == expected_layout,
+                    vertex_depth.image_id == expected_image_id &&
+                    pixel_depth.image_id == expected_image_id &&
+                    MakeImageInfo(vertex_depth).imageLayout == expected_binding_layout &&
+                    MakeImageInfo(pixel_depth).imageLayout == expected_binding_layout,
                 "a deferred clear sampled by vertex and pixel stages missed depth feedback");
         scheduler.Current().BeginRendering(bounds_rendering);
         scheduler.EndRendering();
@@ -18361,10 +18384,22 @@ public:
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), shared_bindings.vertex[0],
             shared_bindings.pixel));
-        const auto expected_layout =
-            stencil_write
-                ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-                : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+        const bool copied = !feedback_loops && stencil_write;
+        const auto expected_layout = stencil_write
+            ? (feedback_loops ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                              : vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal)
+            : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+        const auto expected_vertex_layout = expected_layout;
+        const auto expected_pixel_layout = copied
+            ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+            : expected_layout;
+        const auto expected_vertex_id = shared_depth.image_id;
+        const auto expected_pixel_id = copied
+            ? shared_bindings.pixel.images[0].image_id
+            : shared_depth.image_id;
+        const auto expected_stencil_view = copied
+            ? texture_cache.GetImage(expected_pixel_id).FindView(stencil_view_info)
+            : stencil_view;
         const auto expected_access =
             vk::AccessFlagBits2::eShaderRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
@@ -18373,14 +18408,14 @@ public:
         Require(name, "sampled depth and stencil attachment layout",
                 shared_depth.image_id == phased_depth.image_id &&
                     stencil_view != nullptr &&
-                    shared_feedback == (stencil_write
+                    shared_feedback == (stencil_write && !copied
                                             ? vk::ImageAspectFlagBits::eStencil
                                             : vk::ImageAspectFlags{}) &&
-                    vertex_image.image_id == shared_depth.image_id &&
-                    pixel_image.image_id == shared_depth.image_id &&
-                    pixel_image.image_view == stencil_view &&
-                    MakeImageInfo(vertex_image).imageLayout == expected_layout &&
-                    MakeImageInfo(pixel_image).imageLayout == expected_layout &&
+                    vertex_image.image_id == expected_vertex_id &&
+                    pixel_image.image_id == expected_pixel_id &&
+                    pixel_image.image_view == expected_stencil_view &&
+                    MakeImageInfo(vertex_image).imageLayout == expected_vertex_layout &&
+                    MakeImageInfo(pixel_image).imageLayout == expected_pixel_layout &&
                     shared_rendering.depth_stencil_attachment.image_layout ==
                         expected_layout &&
                     shared_image.backing.state.layout == expected_layout &&
@@ -20426,18 +20461,19 @@ public:
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
       const bool depth_read_write = depth_feedback && depth.depth_write_enable;
-      const ImageId sampled_id = bindings.pixel.images[0].image_id;
+      const bool has_sampled = !bindings.pixel.images.empty();
+      const ImageId sampled_id = has_sampled ? bindings.pixel.images[0].image_id : ImageId{};
       const bool copied = depth_read_write && !feedback_loops;
       Require(name, "per-draw depth feedback",
               feedback_enabled == (feedback_loops && depth_read_write) &&
                   feedback_aspects == (feedback_enabled
                                           ? vk::ImageAspectFlagBits::eDepth
                                           : vk::ImageAspectFlags{}) &&
-                  (!copied || sampled_id != depth.image_id),
+                  (!copied || (has_sampled && sampled_id != depth.image_id)),
               "feedback was not selected only for an overlapping fragment depth read/write");
       Require(name, "host-only depth feedback copy",
               !copied ||
-                  (!cache.GetImage(sampled_id).registered &&
+                  (has_sampled && !cache.GetImage(sampled_id).registered &&
                    cache.GetImage(sampled_id).info.data.Empty() &&
                    cache.GetImage(sampled_id).info.IsDepth()),
               "the unsupported feedback path did not sample a host-only depth copy");
@@ -49641,6 +49677,10 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
 void CheckShaderStore(VulkanHarness &vulkan) {
   constexpr const char *name = "ShaderStore";
+  if (!vulkan.RasterizationSupported()) {
+    vulkan.SkipRasterizationCases(1);
+    return;
+  }
   constexpr uintptr_t base = 0x0000000205000000ull;
   constexpr uint64_t allocation_size = 0x10000;
   constexpr u32 value = 0x2a;
@@ -57160,7 +57200,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-rebind-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -57190,7 +57230,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }

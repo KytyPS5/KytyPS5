@@ -514,7 +514,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 					const auto  native =
 					    std::ranges::find(views, binding.image_view, &CachedImageView::view);
 					EXIT_IF(native == views.end());
-					if (!DepthFeedbackAspects(draw_writes, depth.desc.view_info, native->info)) {
+					std::vector<const CachedImageView*> feedback_views {&*native};
+					for (const auto mip_view: binding.mip_views) {
+						const auto mip =
+						    std::ranges::find(views, mip_view, &CachedImageView::view);
+						EXIT_IF(mip == views.end());
+						feedback_views.push_back(&*mip);
+					}
+					if (std::ranges::none_of(feedback_views, [&](const auto* view) {
+						    return static_cast<bool>(DepthFeedbackAspects(
+						        draw_writes, depth.desc.view_info, view->info));
+					    })) {
 						continue;
 					}
 					const auto include = [&](const ImageViewInfo& info) {
@@ -538,17 +548,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 						    std::min(copy_range.base_layer, info.base_layer);
 						copy_range.layer_count = layer_end - copy_range.base_layer;
 					};
-					include(native->info);
-					for (const auto mip_view: binding.mip_views) {
-						const auto mip =
-						    std::ranges::find(views, mip_view, &CachedImageView::view);
-						EXIT_IF(mip == views.end());
-						include(mip->info);
+					for (const auto* view: feedback_views) {
+						include(view->info);
 					}
 				}
 			}
 			if (copy_range_set) {
-				copy_id = cache.CopyDepthForFeedback(depth.image_id, copy_range, copy_aspects);
+				const vk::ClearDepthStencilValue clear {depth.depth_clear_value,
+				                                        depth.stencil_clear_value};
+				copy_id = cache.CopyDepthForFeedback(depth.image_id, copy_range, copy_aspects,
+				                                    depth.load_clear_aspects, clear);
 			}
 		}
 		auto& image = cache.GetImage(depth.image_id);
@@ -561,8 +570,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				const auto native =
 				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 				EXIT_IF(native == image.views.end());
-				const auto feedback =
+				auto feedback =
 				    DepthFeedbackAspects(draw_writes, depth.desc.view_info, native->info);
+				std::vector<const CachedImageView*> sampled_views {&*native};
+				for (const auto mip_view: binding.mip_views) {
+					const auto mip =
+					    std::ranges::find(image.views, mip_view, &CachedImageView::view);
+					EXIT_IF(mip == image.views.end());
+					feedback |= DepthFeedbackAspects(draw_writes, depth.desc.view_info, mip->info);
+					sampled_views.push_back(&*mip);
+				}
 				if (copy_id && feedback) {
 					const auto info    = native->info;
 					binding.image_id   = copy_id;
@@ -576,7 +593,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 					}
 					continue;
 				}
-				sampled_aspects |= native->info.aspect;
+				for (const auto* view: sampled_views) {
+					sampled_aspects |= view->info.aspect;
+				}
 				feedback_aspects |= feedback;
 			}
 		}

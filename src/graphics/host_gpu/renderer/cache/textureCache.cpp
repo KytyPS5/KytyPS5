@@ -284,16 +284,24 @@ void TextureCache::ReleaseDepthFeedbackCopy(ImageId depth_id) {
 	}
 	const auto copy_id = found->second;
 	m_depth_feedback_copies.erase(found);
+	const auto copy_bytes =
+	    m_graphics.CanReportMemoryUsage() ? 0 : m_slot_images[copy_id].BackingSize();
 	// The copy is never registered: queued work may still sample it.
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, copy_id] { m_slot_images.erase(copy_id); });
+		m_scheduler.DeferOperation([this, copy_id, copy_bytes] {
+			m_total_used_memory -= copy_bytes;
+			m_slot_images.erase(copy_id);
+		});
 	} else {
+		m_total_used_memory -= copy_bytes;
 		m_slot_images.erase(copy_id);
 	}
 }
 
 ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
-                                           vk::ImageAspectFlags aspects) {
+                                           vk::ImageAspectFlags aspects,
+                                           vk::ImageAspectFlags clear_aspects,
+                                           const vk::ClearDepthStencilValue& clear) {
 	if (const auto found = m_depth_feedback_copies.find(depth_id);
 	    found != m_depth_feedback_copies.end()) {
 		const auto& depth = m_slot_images[depth_id].backing;
@@ -312,6 +320,9 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 		info.stencil  = {};
 		info.metadata = {};
 		entry->second = m_slot_images.insert(m_graphics, m_scheduler, info);
+		if (!m_graphics.CanReportMemoryUsage()) {
+			m_total_used_memory += m_slot_images[entry->second].BackingSize();
+		}
 	}
 	// References after the insertion: it may allocate a new image chunk.
 	auto& depth = m_slot_images[depth_id];
@@ -344,6 +355,18 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 		command.copyImage(depth.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                  copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                  static_cast<uint32_t>(copies.size()), copies.data());
+	}
+	// The draw's pending loadOp clear has not run yet, so apply it to the copy before the
+	// shader reads it; otherwise the first feedback draw samples the previous contents.
+	const auto cleared_aspects = clear_aspects & aspects;
+	if (cleared_aspects) {
+		copy.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		             range, command);
+		const vk::ImageSubresourceRange clear_range {cleared_aspects, range.base_level,
+		                                             range.level_count, range.base_layer,
+		                                             range.layer_count};
+		command.clearDepthStencilImage(copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                               &clear, 1, &clear_range);
 	}
 	copy.Transit(copy.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, command);
 	return entry->second;

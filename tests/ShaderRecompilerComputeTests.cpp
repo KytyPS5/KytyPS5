@@ -31236,7 +31236,12 @@ TestCase VectorMadF32RoundsProduct() {
                   O::V_MAD_F32, O::V_MADMK_F32, O::V_MADAK_F32,
                   O::V_FMAC_F32, O::V_FMA_F32, O::V_FMAMK_F32, O::V_FMAAK_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+#if defined(__APPLE__)
+  // macOS rounds the MAD product with fma(a, b, -0.0) instead of a NoContraction multiply.
+  test.required_spirv = {"OpFAdd", "Fma"};
+#else
   test.required_spirv = {"OpFMul", "OpFAdd", "NoContraction", "Fma"};
+#endif
   return test;
 }
 

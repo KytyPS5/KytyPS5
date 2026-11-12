@@ -6076,11 +6076,13 @@ void TestRaisedSignalReachesCancellingThread() {
 	std::this_thread::sleep_for(std::chrono::milliseconds(20));
 	CheckOk(test, raise_exception(canceller.thread, 30), "raise exception on the canceller");
 	const bool reached      = WaitUntil([] { return g_raised_signal_entries.load() == 2; });
+	const bool on_canceller = g_raised_signal_thread.load() == canceller.id.load();
 	g_raised_signal_release = true;
 	CheckOk(test, PthreadJoin(waiter.thread, nullptr), "PthreadJoin waiter");
 	CheckOk(test, PthreadJoin(canceller.thread, nullptr), "PthreadJoin canceller");
 	CheckOk(test, EventFlag::KernelDeleteEventFlag(g_cancel_flag), "KernelDeleteEventFlag");
 	Check(test, reached, "a thread cancelling an event flag did not run its handler while it waited for the waiters");
+	Check(test, on_canceller, "the canceller's signal ran on another thread");
 	CheckOk(test, g_cancel_result, "KernelCancelEventFlag");
 	Check(test, g_cancel_wait_result == KERNEL_ERROR_ECANCELED, "the waiter did not see the cancel");
 }
@@ -6097,12 +6099,11 @@ void TestRaisedSignalWaitsForItsHandler() {
 	      "the handler did not run");
 	CheckOk(test, raise_exception(target.thread, 30), "raise exception again");
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	const int nested        = g_raised_signal_max_depth.load();
 	g_raised_signal_release = true;
 	const bool delivered    = WaitUntil([] { return g_raised_signal_entries.load() == 2; });
 	target.stop             = true;
 	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
-	Check(test, nested == 1, "a raised signal ran inside its own handler");
+	Check(test, g_raised_signal_max_depth.load() == 1, "a raised signal ran inside its own handler");
 	Check(test, delivered, "the signal raised during its handler was not delivered after it");
 }
 

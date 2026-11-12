@@ -1108,8 +1108,11 @@ private:
 			m_cv.wait(lock, [this] { return !m_targets.empty(); });
 			m_cv.wait_for(lock, REDELIVERY_INTERVAL);
 			std::erase_if(m_targets, [](const auto& target) {
-				return !PthreadHasPendingSignal(target.first, target.second) ||
-				       !QueueSignalApc(target.first, target.second);
+				if (!PthreadHasPendingSignal(target.first, target.second)) {
+					return true;
+				}
+				QueueSignalApc(target.first, target.second);
+				return false;
 			});
 		}
 	}

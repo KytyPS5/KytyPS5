@@ -22,6 +22,7 @@
 #include "kernel/eventQueue.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -92,6 +93,14 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
+	// MappedRangesVersion without the lock (the scout and the table draws' ticket checks ask at every draw): written
+	// only under m_mapped_ranges_mutex, with it; readers compare it for change only.
+	[[nodiscard]] uint64_t MappingEpoch() const noexcept { return m_mapping_epoch.load(std::memory_order_acquire); }
+	// PageManager's read-watcher filter (chenxiao07's GpuResourceManager names): a hint, see PageManager::HasReadWatchers.
+	[[nodiscard]] bool HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
+		return m_page_manager.HasReadWatchers(vaddr, size);
+	}
+	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept { return m_page_manager.ReadGranules(); }
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
@@ -143,6 +152,7 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
+	std::atomic<uint64_t>     m_mapping_epoch {0}; // (m_mapped_ranges_version's lock-free copy)
 	// Ranges mapped since the last BDA synchronization (under m_mapped_ranges_mutex): that
 	// synchronization forces their regions (BufferCache::ForceSynchronization()).
 	std::vector<std::pair<uint64_t, uint64_t>> m_bda_mapped_since_sync;

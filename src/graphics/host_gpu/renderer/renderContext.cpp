@@ -240,6 +240,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
 		m_mapped_ranges_version++;
+		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		m_bda_mapped_since_sync.emplace_back(vaddr, size);
 	}
 	// Texture arrays that keep their other layers when one is unmapped learn that memory came
@@ -286,6 +287,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_mapped_ranges_version++;
+		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

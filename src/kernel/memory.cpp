@@ -967,6 +967,17 @@ bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
 	return true;
 }
 
+bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr) {
+		return true;
+	}
+	if (size != 0 && size <= (uint64_t {1} << 24u) && g_guest_address_space->IsBacked(vaddr, size)) {
+		return true;
+	}
+	std::shared_lock state(g_memory_state_mutex);
+	return g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Backed pages lie in committed ranges, so a fully backed buffer needs no range walk. Up to
 	// 16 MiB (1024 pages) the page walk costs about as much as the locked range walk.

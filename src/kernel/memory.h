@@ -178,6 +178,15 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool BackingChangesSince(uint64_t epoch,
                                        std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Whether the whole range is guest memory that is mapped (ClampRangeSize without the exit and the log for a range that
+// is not): a page unmapped meanwhile is not mapped again for the caller's epoch (RenderContext::MappingEpoch).
+[[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
+// chenxiao07's names for the backing reads of host destinations (the scout and the table draws read the tables
+// through them): the backing store's bytes, and the backing store's bytes when no GPU work wrote the range.
+inline bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) { return TryReadBacking(vaddr, data, size); }
+inline bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return TryReadGpuCleanBacking(vaddr, data, size);
+}
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED

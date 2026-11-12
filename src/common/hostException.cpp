@@ -1,5 +1,7 @@
 #include "common/hostException.h"
 
+#include "common/guardedCopy.h"
+
 #include <atomic>
 #include <cstdio>
 
@@ -90,6 +92,11 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	if (exception_record->ExceptionCode == 0x406D1388) {
 		// 0x406D1388 only names the thread for an attached debugger.
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
+	// A guarded copy reached a page without access: it stops there (never the guest's fault).
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ResumeGuardedCopy(exception->ContextRecord)) {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 

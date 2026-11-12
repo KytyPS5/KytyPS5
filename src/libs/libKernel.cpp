@@ -522,21 +522,24 @@ bool KernelIsDispatchingSignalOnCurrentThread() {
 
 template <typename Deliver>
 static void DispatchPendingSignals(Pthread thread, Deliver deliver) {
-	SignalDispatchScope scope(thread);
-	if (!scope.owned) {
-		return;
-	}
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers));) {
-		if (!PthreadTakePendingSignal(thread, signum)) {
-			signum++;
-			continue;
+	do {
+		SignalDispatchScope scope(thread);
+		if (!scope.owned) {
+			return;
 		}
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			deliver(handler, signum);
+		for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers));) {
+			if (!PthreadTakePendingSignal(thread, signum)) {
+				signum++;
+				continue;
+			}
+			auto* handler =
+			    reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+			if (handler != nullptr) {
+				deliver(handler, signum);
+			}
+			signum = 0;
 		}
-		signum = 0;
-	}
+	} while (PthreadHasAnyPendingSignal(thread));
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

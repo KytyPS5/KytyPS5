@@ -151,7 +151,7 @@
       const auto expect = [&](const char *step, const std::vector<u32> &result,
                               std::span<const Hit> hits) {
         Require(name, step, result[0] == 1 && result[1] == 4, "the mirror is not valid");
-        const auto near = [](u32 value, float wanted) {
+        const auto close_to = [](u32 value, float wanted) {
           return std::abs(std::bit_cast<float>(value) - wanted) < 1e-4f;
         };
         for (size_t i = 0; i < hits.size(); ++i) {
@@ -160,8 +160,8 @@
           const bool ok = wanted.record == Miss
                               ? hit[0] == 0
                               : hit[0] == 1 && hit[4] == wanted.index && hit[5] == wanted.record &&
-                                    near(hit[1], wanted.t) && near(hit[2], wanted.u) &&
-                                    near(hit[3], wanted.v);
+                                    close_to(hit[1], wanted.t) && close_to(hit[2], wanted.u) &&
+                                    close_to(hit[3], wanted.v);
           if (!ok) {
             std::printf("[gpu]     %s ray %zu: hit %u t %f u %f v %f index %u "
                         "record %u\n",

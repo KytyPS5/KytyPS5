@@ -376,9 +376,28 @@ void MappingFamilies() {
 	f.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
 }
 
+void Mp3ParseFrame() {
+	// MPEG-1 Layer III, 128 kbps, 44.1 kHz, joint stereo, no CRC.
+	std::array<uint8_t, 4>  frame = {0xff, 0xfb, 0x90, 0x64};
+	AjmDecMp3ParseFrameInfo info;
+	std::memset(&info, 0xff, sizeof(info));
+	Check(AjmDecMp3ParseFrame(frame.data(), frame.size(), 1, &info) == OK, "parse MP3 frame");
+	Check(info.frame_size == 417 && info.num_channels == 2 && info.samples_per_channel == 1152 &&
+	          info.bitrate == 128000 && info.sample_rate == 44100 && info.encoder_delay == 0 &&
+	          info.num_frames == 0 && info.total_samples == 0 && info.ofl_type == 0,
+	      "MP3 frame info");
+	Check(AjmDecMp3ParseFrame(frame.data(), frame.size(), 0, nullptr) ==
+	          AJM_ERROR_INVALID_PARAMETER,
+	      "MP3 parse without output");
+	frame[1] = 0xfd;
+	Check(AjmDecMp3ParseFrame(frame.data(), frame.size(), 0, &info) == AJM_ERROR_INVALID_PARAMETER,
+	      "MP3 parse of a Layer II frame");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+	Mp3ParseFrame();
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
 	SmallOutputs(packet, 312);

@@ -131,6 +131,18 @@ struct AjmDecAt9ConfigDataInfo {
 	uint32_t superframe_size;
 };
 
+struct AjmDecMp3ParseFrameInfo {
+	size_t   frame_size;
+	uint32_t num_channels;
+	uint32_t samples_per_channel;
+	uint32_t bitrate;
+	uint32_t sample_rate;
+	uint32_t encoder_delay;
+	uint32_t num_frames;
+	uint32_t total_samples;
+	uint32_t ofl_type;
+};
+
 int KYTY_SYSV_ABI AjmInitialize(int64_t reserved, uint32_t* context);
 int KYTY_SYSV_ABI AjmModuleRegister(uint32_t context, uint32_t codec, int64_t reserved);
 int KYTY_SYSV_ABI AjmModuleUnregister(uint32_t context, uint32_t codec);
@@ -191,6 +203,8 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
                                       void* sideband_output, size_t sideband_output_size);
 int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
                                            AjmDecAt9ConfigDataInfo* config_info);
+int KYTY_SYSV_ABI AjmDecMp3ParseFrame(const void* bitstream, size_t size, int parse_ofl,
+                                      AjmDecMp3ParseFrameInfo* frame_info);
 const char* KYTY_SYSV_ABI AjmStrError(int error);
 
 } // namespace Ajm

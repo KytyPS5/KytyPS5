@@ -686,8 +686,9 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,
-                                      AudioOut2PortHandle* port) {
+// PPSA28180 calls this with rsp off the 16-byte alignment; the host device open needs it.
+[[gnu::force_align_arg_pointer]] int KYTY_SYSV_ABI AudioOut2PortCreate(
+    AudioOut2ContextHandle ctx, const AudioOut2PortParam* params, AudioOut2PortHandle* port) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 

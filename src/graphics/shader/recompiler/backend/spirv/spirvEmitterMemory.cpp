@@ -1391,30 +1391,31 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
-	const auto base = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
-	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
-	const auto fault_label     = state.builder.AllocateId();
-	const auto available_label = state.builder.AllocateId();
-	const auto merge_label     = state.builder.AllocateId();
+	const auto entry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, entry, entry_pointer);
+	const auto tag    = Binary(state, spv::OpBitwiseAnd, type, entry,
+	                           ConstantU64(state, BufferCache::BDA_ACCESSED));
+	const auto offset = Binary(state, spv::OpBitwiseAnd, type, address,
+	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
+	const auto pointer =
+	    Binary(state, spv::OpISub, type, Binary(state, spv::OpIAdd, type, entry, offset), tag);
+	const auto unaccessed =
+	    Binary(state, spv::OpIEqual, TypeBool(state), tag, ConstantU64(state, 0));
+	const auto fault_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, available_label);
+	state.builder.AddFunction(spv::OpBranchConditional, unaccessed, fault_label, merge_label);
 
+	// Unbacked pages have zero entries and return a null pointer.
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-
-	EmitLabel(state, available_label);
-	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
-	                              ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
-	state.builder.AddFunction(spv::OpBranch, merge_label);
+	const auto unbacked =
+	    Binary(state, spv::OpIEqual, TypeBool(state), entry, ConstantU64(state, 0));
+	state.builder.AddFunction(spv::OpReturnValue,
+	                          Select(state, type, unbacked, ConstantU64(state, 0), pointer));
 
 	EmitLabel(state, merge_label);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpPhi, type, result, ConstantU64(state, 0), fault_label,
-	                          available, available_label);
-	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpReturnValue, pointer);
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 

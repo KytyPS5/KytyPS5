@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <list>
@@ -336,6 +337,41 @@ struct StageOutput {
 
 	bool operator==(const StageOutput& other) const = default;
 };
+
+// Sizes of the gl_ClipDistance and gl_CullDistance arrays the SPIR-V backend declares for these
+// outputs: the shader's own distances, the enabled user clip planes, then the plane it appends to
+// a vertex shader to cull zero homogeneous positions (invalid_position_plane, last clip distance).
+struct OutputDistanceCounts {
+	uint32_t clip                   = 0;
+	uint32_t cull                   = 0;
+	uint32_t user_clip_planes       = 0;
+	bool     position               = false;
+	bool     invalid_position_plane = false;
+};
+
+inline OutputDistanceCounts CountOutputDistances(ShaderType                      stage,
+                                                 const std::vector<StageOutput>& outputs,
+                                                 uint32_t user_clip_planes = 0) {
+	OutputDistanceCounts counts;
+	for (const auto& output: outputs) {
+		if (output.kind == StageOutputKind::ClipDistance) {
+			counts.clip = std::max(counts.clip, output.index + 1);
+		} else if (output.kind == StageOutputKind::CullDistance) {
+			counts.cull = std::max(counts.cull, output.index + 1);
+		} else if (output.kind == StageOutputKind::Position) {
+			counts.position = true;
+		}
+	}
+	if (counts.position && user_clip_planes != 0) {
+		counts.user_clip_planes = static_cast<uint32_t>(std::popcount(user_clip_planes));
+		counts.clip += counts.user_clip_planes;
+	}
+	if (stage == ShaderType::Vertex && counts.clip + counts.cull < 8u && counts.position) {
+		counts.invalid_position_plane = true;
+		counts.clip++;
+	}
+	return counts;
+}
 
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;

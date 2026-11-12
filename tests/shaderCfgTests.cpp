@@ -896,7 +896,13 @@ SpirvStoredBuiltInElements(const std::vector<uint32_t> &binary,
                          member->second;
     if (const auto decorated = member_builtins.find(key);
         decorated != member_builtins.end() && decorated->second == builtin) {
-      elements.push_back(UINT32_MAX);
+      // An arrayed member (ClipDistance in gl_PerVertex) names the element
+      // with the second index.
+      const auto element = access->second.indices.size() > 1u
+                               ? constants.find(access->second.indices[1])
+                               : constants.end();
+      elements.push_back(element != constants.end() ? element->second
+                                                    : UINT32_MAX);
     }
   }
   std::sort(elements.begin(), elements.end());
@@ -8561,7 +8567,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
                 std::vector<uint32_t>({0u, 1u, 2u}),
         "partial clip/cull exports or the appended clipping-error plane used the wrong elements");
   Check(SpirvHasDecorationValue(all.spirv, 11u, 1u) &&
-            SpirvHasDecorationValue(all.spirv, 11u, 3u) &&
+            SpirvHasMemberDecorationValue(all.spirv, 11u, 3u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 4u) &&
             SpirvHasDecorationValue(all.spirv, 11u, 9u) &&
             SpirvContainsCapability(all.spirv, 32u) &&
@@ -13206,7 +13212,11 @@ void TestRepeatedExportsHaveOneInterface() {
     }
     offset += result.spirv[offset] >> spv::WordCountShift;
   }
-  Check(outputs == 2 && SpirvHasDecorationValue(result.spirv, 11u, 3u),
+  // Position and the clipping-error plane share the gl_PerVertex block.
+  const auto planes = SpirvStoredBuiltInElements(result.spirv, 3u);
+  Check(outputs == 1 && SpirvHasMemberDecorationValue(result.spirv, 11u, 3u) &&
+            !planes.empty() &&
+            std::ranges::all_of(planes, [](uint32_t e) { return e == 0u; }),
         "repeated exports duplicated Position or its clipping-error plane");
 }
 

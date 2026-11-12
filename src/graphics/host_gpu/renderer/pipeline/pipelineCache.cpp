@@ -847,7 +847,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	} else if (clip_control.user_clip_planes != 0) {
 		// CLIP_DISABLE also disables user planes. How they combine with shader clip and cull
 		// distances is unverified; draw push constants only reach VS/mesh and PS, and the
-		// generated RECTLIST stages do not forward clip distances.
+		// generated RECTLIST stages forward the vertex shader's clip distances without user planes.
 		EXIT_NOT_IMPLEMENTED((last_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 || tess_active ||
 		                     Prospero::IsRectList(user_config.GetPrimType()));
 		last_stage.user_clip_planes = clip_control.user_clip_planes;

@@ -860,6 +860,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	ShaderRecompiler::IR::WriteIndirectMappingOffsets(program.bindings, snapshot,
+	                                                  prepared.shader_data);
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}

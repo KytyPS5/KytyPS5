@@ -35,6 +35,8 @@ struct ResourceSnapshot {
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
+	// Where each indirect mapping slot's table starts in flattened_srt.
+	std::vector<uint32_t>                      indirect_mapping_offsets;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;

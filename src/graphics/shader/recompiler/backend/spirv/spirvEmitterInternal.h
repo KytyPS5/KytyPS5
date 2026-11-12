@@ -118,6 +118,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                           indirect_search_function          = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
@@ -423,10 +424,11 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
-uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource);
+// The resource a key selects through the mapping in slot `mapping_slot`, or default_resource.
+uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_slot,
+                                   bool searched, uint32_t default_resource);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
-uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
+uint32_t             EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_slot);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);
 
@@ -526,6 +528,7 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void     DefineIndirectKeySearch(EmitterState& state);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);

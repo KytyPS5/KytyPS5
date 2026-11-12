@@ -114,6 +114,9 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// Modules read a mapping's flattened-SRT offset, ResourceSnapshot::indirect_mapping_offsets[slot].
+inline constexpr uint32_t NoIndirectMappingSlot = UINT32_MAX;
+
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
@@ -130,9 +133,9 @@ struct BufferResource {
 	bool                   formatted          = false;
 	bool                   scalar             = false;
 	bool                   live               = false;
-	uint32_t               indirect_root              = NoIndirectBuffer;
-	uint32_t               indirect_mapping_offset    = 0;
-	uint32_t               indirect_search_iterations = 0;
+	uint32_t               indirect_root         = NoIndirectBuffer;
+	uint32_t               indirect_mapping_slot = NoIndirectMappingSlot;
+	bool                   indirect_searched     = false;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
@@ -167,9 +170,9 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
-	uint32_t                      indirect_root     = NoIndirectImage;
-	uint32_t                      indirect_mapping_offset   = 0;
-	uint32_t                      indirect_search_iterations = 0;
+	uint32_t                      indirect_root          = NoIndirectImage;
+	uint32_t                      indirect_mapping_slot  = NoIndirectMappingSlot;
+	bool                          indirect_searched      = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -199,9 +202,9 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
 	uint32_t snapshot_index        = 0;
-	uint32_t indirect_root = NoIndirectSampler;
-	uint32_t indirect_mapping_offset = 0;
-	uint32_t indirect_search_iterations = 0;
+	uint32_t              indirect_root         = NoIndirectSampler;
+	uint32_t              indirect_mapping_slot = NoIndirectMappingSlot;
+	bool                  indirect_searched     = false;
 	std::vector<uint32_t> indirect_resources;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
@@ -499,6 +502,9 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
+	// Flattened-SRT offsets of the indirect mappings, one dword per slot.
+	uint32_t indirect_mapping_dword = 0;
+	uint32_t indirect_mapping_count = 0;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength

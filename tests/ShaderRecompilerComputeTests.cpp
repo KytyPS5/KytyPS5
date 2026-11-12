@@ -2022,6 +2022,8 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  ShaderRecompiler::IR::WriteIndirectMappingOffsets(result.program.bindings, resources,
+                                                    packed_user_data);
   for (u32 resource = 0; resource < result.program.info.buffers.size(); ++resource) {
     const auto index = result.program.info.buffers[resource].descriptor_index;
     if (index == UINT32_MAX) continue;
@@ -2154,6 +2156,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  ShaderRecompiler::IR::WriteIndirectMappingOffsets(result.program.bindings, resources,
+                                                    packed_user_data);
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
 }
@@ -46250,11 +46254,12 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   root.packed_stride = 1;
   root.written = true;
   root.indirect_root = 0;
-  root.indirect_mapping_offset = 4;
-  root.indirect_search_iterations = std::bit_width(3u);
+  root.indirect_mapping_slot = 0;
+  root.indirect_searched = true;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
-  candidate.indirect_search_iterations = 0;
+  candidate.indirect_mapping_slot = NoIndirectMappingSlot;
+  candidate.indirect_searched = false;
   candidate.indirect_resources.clear();
   program.descriptor_sources.resize(1);
   program.descriptor_sources[0].indirect_descriptor =
@@ -46289,7 +46294,8 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       program.info.buffers.resize(1);
       if (layout == Layout::AllNull) program.info.buffers[0].packed_stride = 0;
       program.info.buffers[0].indirect_root = BufferResource::NoIndirectBuffer;
-      program.info.buffers[0].indirect_search_iterations = 0;
+      program.info.buffers[0].indirect_mapping_slot = NoIndirectMappingSlot;
+      program.info.buffers[0].indirect_searched = false;
       program.info.buffers[0].indirect_resources.clear();
     }
     program.shader_info_complete = false;
@@ -46304,6 +46310,8 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
             "indirect store lost a buffer binding");
     compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
     compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
+    // The searched mapping sits at flattened-SRT word 4.
+    if (!single) compiled.packed_user_data[program.bindings.indirect_mapping_dword] = 4u;
     ValidateSpirv(test.name, compiled.spirv);
     test.required_spirv.clear();
     test.forbidden_spirv = {"PhysicalStorageBuffer"};
@@ -48431,7 +48439,6 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
 
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
-  constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
   Program program{};
@@ -48495,11 +48502,12 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   root.read = true;
   root.indirect_root = 0;
-  root.indirect_mapping_offset = 0;
-	root.indirect_search_iterations = std::bit_width(mapping_capacity);
+  root.indirect_mapping_slot = 0;
+  root.indirect_searched = true;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
-	candidate.indirect_search_iterations = 0;
+  candidate.indirect_mapping_slot = NoIndirectMappingSlot;
+  candidate.indirect_searched = false;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
   program.info.samplers.push_back({1u, 0x10f0u});
@@ -48534,7 +48542,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
           sampled_image != 0u && std::ranges::find(nonuniform, sampled_image) != nonuniform.end(),
           "the sample operand lacks its nonuniform decoration");
 
-  program.info.images[0].indirect_search_iterations = 0;
+  program.info.images[0].indirect_searched = false;
   program.shader_info_complete = false;
   CollectShaderInfo(program, {.compute = &compute});
   spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
@@ -48598,7 +48606,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   // A resident heap selects its typed kind and element from a device slot word.
   auto heap_root = root;
   heap_root.heap = true;
-  heap_root.indirect_search_iterations = 0;
+  heap_root.indirect_searched = false;
   heap_root.indirect_resources = {0u, 1u, 2u};
   auto heap_kind = candidate;
   heap_kind.heap = true;
@@ -48689,7 +48697,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   // Keep an unrelated native root between the null image and appended children,
   // then select both sides of a cube boundary and the unmapped suffix on the GPU.
   root.indirect_resources = {0u, 2u, 3u, 4u, 5u, 6u};
-  root.indirect_search_iterations = 0;
+  root.indirect_searched = false;
   program.info.images.assign(7, candidate);
   program.info.images[0] = root;
   program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
@@ -49184,8 +49192,8 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
     sampler.SetArg(0, mapped ? Value(&sampler_key) : Value(&ordinal));
     auto &root = program.info.samplers[0];
     root.indirect_root = mapped ? 0u : SamplerResource::NoIndirectSampler;
-    root.indirect_mapping_offset = 0u;
-    root.indirect_search_iterations = 0u;
+    root.indirect_mapping_slot = mapped ? 0u : NoIndirectMappingSlot;
+    root.indirect_searched = false;
     compiled.resources.flattened_srt.clear();
     if (mapped) {
       // Only the sampler needs a lookup buffer: reverse its keys to distinct sampler ordinals.
@@ -55105,14 +55113,14 @@ void CheckImageSamplerSpecialization() {
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.images.size() == count + 1u,
             "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
     const auto ordinal = [&](u32 byte_offset) {
       const auto word = byte_offset >> 2u;
       return word < snapshot.flattened_srt[offset]
                  ? snapshot.flattened_srt[offset + 1u + word] : 0u;
     };
     Require(name, "dense table map and coherent snapshot",
-            specialization.images[0].indirect_search_iterations == 0u &&
+            !specialization.images[0].indirect_searched &&
                 snapshot.flattened_srt[offset] == (count - 1u) * 8u + 1u &&
                 ordinal(32u) != 0u &&
                 ordinal(count * 32u) == 0u && snapshot.images[0].dwords[0] == 0u &&

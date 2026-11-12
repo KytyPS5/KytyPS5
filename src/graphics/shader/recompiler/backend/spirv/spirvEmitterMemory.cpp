@@ -1820,8 +1820,8 @@ uint32_t EmitLoadDeviceAddressU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& buffer = ctx.state.program.info.buffers.at(inst.Flags<uint32_t>());
 	if (buffer.indirect_resources.empty()) return ConstantU32(ctx.state, 0u);
-	return EmitIndirectResourceIndex(ctx.state, ctx.Arg(inst, 0), buffer.indirect_mapping_offset,
-	                                 buffer.indirect_search_iterations, UINT32_MAX);
+	return EmitIndirectResourceIndex(ctx.state, ctx.Arg(inst, 0), buffer.indirect_mapping_slot,
+	                                 buffer.indirect_searched, UINT32_MAX);
 }
 
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {

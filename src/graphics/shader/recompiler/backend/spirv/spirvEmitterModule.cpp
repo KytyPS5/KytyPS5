@@ -267,6 +267,20 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
 	}
+	uint32_t   mapping_slots = 0;
+	const auto count_slots   = [&](const auto& resources) {
+		for (const auto& resource: resources) {
+			if (resource.indirect_mapping_slot != IR::NoIndirectMappingSlot) {
+				mapping_slots = std::max(mapping_slots, resource.indirect_mapping_slot + 1u);
+			}
+		}
+	};
+	count_slots(info.buffers);
+	count_slots(info.images);
+	count_slots(info.samplers);
+	bindings.indirect_mapping_dword = bindings.memory_offset_dword;
+	bindings.indirect_mapping_count = mapping_slots;
+	bindings.memory_offset_dword += mapping_slots;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

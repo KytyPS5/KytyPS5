@@ -6265,16 +6265,25 @@ void TestBoundedFormattedBufferStore() {
   Check(materialize() && specialization == original &&
             snapshot.buffers[0].dwords[0] == memory.words[32],
         "destination address refresh was frozen or caused needless specialization");
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 9>{
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 6>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
             {35u, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u | 4u},
-            {35u, memory.words[35] & ~7u}, {35u, memory.words[35] | (4u << 3u)},
-            {32u, memory.words[32] + 1u},
-            {33u, 8u << 16u}, {33u, (4u << 16u) | (1u << 31u)},
-            {35u, memory.words[35] | (1u << 23u)}, {35u, memory.words[35] | (3u << 28u)}}}) {
+            {35u, memory.words[35] | (4u << 3u)}, {33u, 8u << 16u},
+            {35u, memory.words[35] | (3u << 28u)},
+            {35u, memory.words[35] | (1u << 23u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
-    Check(!materialize(), "formatted finite store accepted an unproved format or bounds mode");
+    Check(materialize(), "finite formatted store rejected a supported format, selector or stride");
+    memory.words[word] = saved;
+  }
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 6>{
+           {{35u, (memory.words[35] & ~7u) | 2u}, {35u, memory.words[35] | (3u << 3u)},
+            {32u, memory.words[32] + 1u}, {33u, 2u << 16u},
+            {33u, (4u << 16u) | (1u << 31u)},
+            {35u, memory.words[35] | (2u << 28u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = replacement;
+    Check(!materialize(), "formatted finite store accepted an invalid selector, stride or bounds mode");
     memory.words[word] = saved;
   }
   for (const uint32_t count : {MaxIndirectDescriptorProbes + 1u, 0x80000000u, UINT32_MAX}) {
@@ -6302,6 +6311,28 @@ void TestBoundedFormattedBufferStore() {
   Check(!materialize(), "formatted destination bypassed failed coherent descriptor reads");
   memory.fail_address = UINT64_MAX;
   Check(materialize(), "valid uniform descriptor table did not recover after a failed refresh");
+  memory.words[72] = 1u;
+  std::array<uint32_t, 4> saved_descriptor;
+  std::copy_n(memory.words.begin() + 32u, saved_descriptor.size(), saved_descriptor.begin());
+  const std::array<uint32_t, 4> invalid_descriptor{
+      0x00000100u, 0x00005204u, 0x00006092u, 0x00fff000u};
+  std::copy(invalid_descriptor.begin(), invalid_descriptor.end(), memory.words.begin() + 32u);
+  Check(materialize() && snapshot.buffers.size() == 1u &&
+            std::ranges::all_of(snapshot.buffers[0].dwords, [](uint32_t word) { return word == 0u; }),
+        "uninitialized formatted store candidate did not become a null descriptor");
+  const std::array<uint32_t, 4> unused_row{
+      0x00000005u, 0x10050c00u, 0x000002afu, 0x00040000u};
+  std::copy(unused_row.begin(), unused_row.end(), memory.words.begin() + 32u);
+  Check(materialize() && snapshot.buffers.size() == 1u &&
+            std::ranges::all_of(snapshot.buffers[0].dwords, [](uint32_t word) { return word == 0u; }),
+        "unused formatted store row did not become a null descriptor");
+  auto selected_swizzle = unused_row;
+  selected_swizzle[3] |= 1u;
+  std::copy(selected_swizzle.begin(), selected_swizzle.end(), memory.words.begin() + 32u);
+  Check(!materialize(), "an invalid formatted store with a destination swizzle was silently ignored");
+  std::copy(saved_descriptor.begin(), saved_descriptor.end(), memory.words.begin() + 32u);
+  memory.words[72] = 8u;
+  Check(materialize(), "valid uniform descriptor table did not recover after an invalid candidate");
   ApplyResourceSpecialization(fixture->program, specialization);
   bool formatted = false;
   for (auto* block : fixture->program.blocks)
@@ -7103,20 +7134,121 @@ void TestGpuSelectedFormattedRecordStore() {
                   std::pair{memory.base + table_offset + row * 592u + 448u, uint64_t{16u}}) !=
                   snapshot.specialization_reads.end(),
           "exact row descriptor escaped selection mapping or writable-alias capture");
+  std::array<uint32_t, 6> saved_add_tid;
+  for (uint32_t row = 0; row < saved_add_tid.size(); ++row) {
+    auto& selector = memory.words[first + row * 592u / 4u + 3u];
+    saved_add_tid[row] = selector;
+    selector |= 1u << 23u;
+  }
+  Check(materialize() &&
+            std::ranges::any_of(specialization.buffers, [root](const auto& buffer) {
+              return buffer.indirect_root == root &&
+                     buffer.descriptor_format == Prospero::BufferFormat::k8SInt &&
+                     (buffer.packed_stride & (1u << 20u)) != 0u;
+            }),
+        "ADD_TID formatted store was rejected or lost its lane-index specialization");
+  memory.words[first + 1u] |= 1u << 31u;
+  Check(!materialize(), "ADD_TID formatted store accepted hardware swizzling");
+  memory.words[first + 1u] &= ~(1u << 31u);
+  memory.words[first + 3u] = (memory.words[first + 3u] & ~(3u << 28u)) | (1u << 28u);
+  Check(!materialize(), "ADD_TID formatted store accepted a partial-record bounds mode");
+  memory.words[first + 3u] =
+      (memory.words[first + 3u] & ~(0x7fu << 12u)) | (uint32_t {0x7fu} << 12u);
+  Check(!materialize(), "ADD_TID formatted store accepted an unsupported format");
+  for (uint32_t row = 0; row < saved_add_tid.size(); ++row)
+    memory.words[first + row * 592u / 4u + 3u] = saved_add_tid[row];
+  Check(materialize(), "ADD_TID formatted store did not recover after invalid candidates");
   const auto original = specialization;
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,
-        "signed byte destination refresh required alignment or needless specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
-      {first + 1u, 2u << 16u}, {first + 1u, (1u << 16u) | (1u << 31u)},
-      {first + 3u, (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | 4u},
+        "byte destination refresh required a tight stride or needless specialization");
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+      {first + 1u, 0u}, {first + 1u, (1u << 16u) | (1u << 31u)},
       {first + 3u, memory.words[first + 3u] | (1u << 28u)},
-      {first + 3u, memory.words[first + 3u] | (4u << 3u)}}}) {
+      {first + 3u, memory.words[first + 3u] | (2u << 3u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;
-    Check(!materialize(), "signed byte candidate accepted an unproved format, stride or bounds");
+    Check(!materialize(), "byte candidate accepted an unproved stride, selector or bounds");
     memory.words[word] = saved;
   }
+  const auto saved_stride = memory.words[first + 1u];
+  const auto saved_selector = memory.words[first + 3u];
+  const auto saved_sparse_base = memory.words[first];
+  const auto saved_sparse_records = memory.words[first + 2u];
+  memory.words[first] &= ~1u;
+  memory.words[first + 3u] =
+      (uint32_t(Prospero::BufferFormat::k16UNorm) << 12u) |
+      Libs::Graphics::DstSel(4, 0, 0, 1) | (2u << 28u);
+  Check(materialize(),
+        "sparse OOB_SELECT=2 formatted record ignored its valid unchecked address");
+  memory.words[first] |= 1u;
+  memory.words[first + 1u] =
+      (memory.words[first + 1u] & 0xffffu) | (3u << 16u);
+  Check(materialize(),
+        "malformed OOB_SELECT=2 scan probe terminated an otherwise valid sparse table");
+  const auto sparse_mapping = specialization.buffers[root].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[sparse_mapping] == 6u &&
+            snapshot.flattened_srt[sparse_mapping + 1u] == 0u,
+        "unaligned OOB_SELECT=2 scan probe was not retained as a null candidate");
+  memory.words[first] = saved_sparse_base;
+  memory.words[first + 1u] = saved_stride;
+  memory.words[first + 2u] = saved_sparse_records;
+  memory.words[first + 3u] = saved_selector | (3u << 28u);
+  Check(materialize(), "UInt8 store rejected supported raw byte bounds");
+  const auto original_base = memory.words[first];
+  memory.words[first] &= ~3u;
+  for (const auto format : {Prospero::BufferFormat::k8_8UInt, Prospero::BufferFormat::k32UInt}) {
+    const auto format_bytes = format == Prospero::BufferFormat::k8_8UInt ? 2u : 4u;
+    memory.words[first + 1u] =
+        (memory.words[first + 1u] & 0xffffu) | (format_bytes << 16u);
+    memory.words[first + 3u] =
+        (uint32_t(format) << 12u) | Libs::Graphics::DstSel(4, 0, 0, 1) | (3u << 28u);
+    Check(materialize() &&
+              std::ranges::any_of(specialization.buffers, [format](const auto& buffer) {
+                return buffer.descriptor_format == format;
+              }),
+          "raw-bounded formatted store rejected a supported indexed format");
+  }
+  memory.words[first] = original_base;
+  const auto saved_base0 = memory.words[first];
+  const auto saved_base1 = memory.words[first + 1u];
+  const auto saved_records = memory.words[first + 2u];
+  user_data[2] = 1u;
+  constexpr uint32_t raw_records = 0x1000u;
+  constexpr uint32_t raw_stride = 0x3ffeu;
+  constexpr uint64_t last_address = 0x0000ffffffffffffull;
+  constexpr uint64_t raw_base = last_address - (raw_records - 1u);
+  memory.words[first] = uint32_t(raw_base);
+  memory.words[first + 1u] = uint32_t(raw_base >> 32u) | (raw_stride << 16u);
+  memory.words[first + 2u] = raw_records;
+  memory.words[first + 3u] =
+      (uint32_t(Prospero::BufferFormat::k8_8UInt) << 12u) |
+      Libs::Graphics::DstSel(4, 0, 0, 1) | (3u << 28u);
+  Check(materialize(),
+        "raw byte bounds incorrectly required stride times record count to fit the address");
+  memory.words[first + 2u] = raw_records + 1u;
+  Check(!materialize(), "raw byte bounds admitted the first byte beyond the address mask");
+  memory.words[first] = saved_base0;
+  memory.words[first + 1u] = saved_base1;
+  memory.words[first + 2u] = saved_records;
+  user_data[2] = 6u;
+  memory.words[first + 3u] =
+      (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) |
+      Libs::Graphics::DstSel(4, 0, 0, 1);
+  Check(materialize() &&
+            std::ranges::any_of(specialization.buffers, [](const auto& buffer) {
+              return buffer.descriptor_format == Prospero::BufferFormat::k8UInt;
+            }),
+        "UInt8 store descriptor was rejected or lost its runtime format");
+  memory.words[first + 3u] = uint32_t(Prospero::BufferFormat::k8UInt) << 12u;
+  Check(materialize() &&
+            std::ranges::all_of(snapshot.buffers[root].dwords,
+                                [](uint32_t word) { return word == 0u; }),
+        "zero-selector UInt8 store row was not treated as an unused null descriptor");
+  memory.words[first + 3u] = saved_selector;
+  memory.words[first + 1u] = 1u << 16u;
+  Check(materialize(), "a stride larger than one-byte UInt8 records was rejected");
+  memory.words[first + 1u] = saved_stride;
   user_data[1] = 0u;
   user_data[2] = 5u * 592u + 448u + 12u;
   memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;
@@ -7211,14 +7343,24 @@ void TestGpuSelectedFormattedRecordStore() {
   Check(wide_materialize() && specialization == wide_original &&
             snapshot.buffers[wide_root].dwords[0] == memory.words[table_offset / 4u],
         "RGBA16 destination refresh froze the address or changed format specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
-      {0u, memory.words[table_offset / 4u] | 1u}, {1u, 16u << 16u},
-      {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba | (1u << 28u)},
-      {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}, {3u, rgba ^ 1u}}}) {
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 3>{
+           {{1u, 16u << 16u},
+            {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}, {3u, rgba ^ 1u}}}) {
     auto& field = memory.words[table_offset / 4u + word];
     const auto saved = field;
     field = value;
-    Check(!wide_materialize(), "RGBA16 store accepted unproved format, alignment, stride, bounds or swizzle");
+    Check(wide_materialize(), "RGBA16 store rejected a supported format, selector or stride");
+    field = saved;
+  }
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{
+           {{0u, memory.words[table_offset / 4u] | 1u}, {1u, 4u << 16u},
+            {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba | (1u << 28u)},
+            {3u, (rgba & ~7u) | 2u}}}) {
+    auto& field = memory.words[table_offset / 4u + word];
+    const auto saved = field;
+    field = value;
+    Check(!wide_materialize(),
+          "RGBA16 store accepted an invalid selector, alignment, stride, bounds or swizzle");
     field = saved;
   }
   wide_plan.info.buffers[wide_root].max_byte_extent = 4u;
@@ -8092,6 +8234,89 @@ void TestFiniteInlineSampler() {
              "finite sampler planning accepted a shared SampleAdjust handle");
 }
 
+void TestFiniteBufferAtomic() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto Build = [](Fixture& fixture, ValueOpcode atomic, Value data) {
+    auto* entry = fixture.block;
+    auto* reloaded = fixture.AddBlock();
+    auto* merge = fixture.AddBlock();
+    entry->AddBranch(reloaded);
+    entry->AddBranch(merge);
+    reloaded->AddBranch(merge);
+    std::array<Value, 8> descriptors;
+    for (uint32_t word = 0; word < descriptors.size(); ++word)
+      descriptors[word] = fixture.UserData(word);
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    entry->condition = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = reloaded, .false_block = merge};
+    reloaded->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+    fixture.block = merge;
+    std::array<Value, 4> chosen;
+    for (uint32_t word = 0; word < chosen.size(); ++word) {
+      auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(entry, descriptors[word]);
+      phi.AddPhiOperand(reloaded, descriptors[word + 4u]);
+      chosen[word] = Value(&phi);
+    }
+    const auto handle = fixture.Buffer(chosen, 0x980);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(atomic, {handle, Value(0u), Value(0u), Value(0u), data, Value(true)},
+                 fixture.AddMemory(memory, 0x980));
+    return std::pair{handle, merge};
+  };
+  Fixture fixture;
+  auto* entry = fixture.block;
+  const auto [handle, merge] = Build(fixture, ValueOpcode::BufferAtomicIAdd32, Value(1u));
+  fixture.PlanAndTrack();
+  const auto& tracked = fixture.program.memory_info[0];
+  Check(tracked.kind == ResourceKind::Buffer &&
+            tracked.resource < fixture.program.info.buffers.size(),
+        "atomic on a Phi of two buffer descriptors was not bound as a buffer");
+  const auto root = tracked.resource;
+  const auto& finite = fixture.program
+      .descriptor_sources[fixture.program.info.buffers[root].source].indirect_descriptor;
+  Check(fixture.program.info.buffers[root].atomic && finite && finite->sources.size() == 2,
+        "finite buffer plan lost a descriptor or its atomic use");
+  const auto* selection = handle.Instruction()->Arg(0).TryInstruction();
+  Check(selection != nullptr && selection->GetOpcode() == ValueOpcode::GetBufferResourceIndex,
+        "finite buffer handle does not select its candidate");
+  const auto* key = selection->Arg(0).TryInstruction();
+  Check(key != nullptr && key->GetOpcode() == ValueOpcode::Phi && key->Parent() == merge &&
+            key->PhiBlock(0) == entry && key->PhiBlock(1) != entry &&
+            key->Arg(0).U32() == 0 && key->Arg(1).U32() == 1,
+        "finite buffer key does not follow the descriptor Phis");
+  const auto plan = ExtractResourcePlan(fixture.program);
+  const std::array<uint32_t, 8> user_data{0x1000, 16u << 16u, 1, 0x4dfac,
+                                          0x3000, 16u << 16u, 1, 0x4dfac};
+  TestMemory memory;
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite buffer descriptors could not materialize");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  const auto& candidates = fixture.program.info.buffers[root].indirect_resources;
+  Check(candidates.size() == 2 && std::ranges::max(candidates) < snapshot.buffers.size(),
+        "finite buffer specialization lost a candidate");
+  Check(snapshot.buffers[candidates[0]].dwords[0] == 0x1000 &&
+            snapshot.buffers[candidates[1]].dwords[0] == 0x3000,
+        "finite buffer candidates do not hold the two descriptors in key order");
+  Check(std::ranges::all_of(candidates, [&](uint32_t candidate) {
+          return fixture.program.info.buffers[candidate].atomic;
+        }),
+        "finite buffer candidate is not tracked as atomically written");
+
+  Fixture wide;
+  Build(wide, ValueOpcode::BufferAtomicIAdd64, Value(uint64_t{1}));
+  CheckFatal([&] { wide.PlanAndTrack(); }, "not a valid runtime value",
+             "finite buffer planning accepted a 64-bit atomic without candidate selection");
+}
+
 void TestFiniteImageBitScanSentinel() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   for (const bool nonzero : {false, true}) {
@@ -8188,6 +8413,39 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
                 fixture.program.info.buffers[0].source, descriptor) &&
             descriptor.dwords[0] == user_data[0],
         "runtime-rooted invariant loop lost its buffer source");
+}
+
+void TestLoopPhiBufferAtomicIAdd32() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  std::array<Inst *, 4> phis{};
+  for (uint32_t word = 0; word < 4u; ++word) {
+    phis[word] = &loop->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U32));
+  }
+  for (uint32_t word = 0; word < 4u; ++word) {
+    const auto next = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {Value(phis[word]), Value(word == 0u ? 1u : 0u)}, 0, loop);
+    phis[word]->AddPhiOperand(entry, fixture.UserData(word));
+    phis[word]->AddPhiOperand(loop, next);
+  }
+  const auto handle = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(phis[0]), Value(phis[1]), Value(phis[2]), Value(phis[3])},
+      MemoryFlags{0, 0x980}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+               {handle, Value(0u), Value(0u), Value(1u), Value(0u),
+                Value(true)},
+               fixture.AddMemory(memory, 0x980), loop);
+  fixture.PlanAndTrack();
+  Check(fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
+        "loop-Phi BufferAtomicIAdd32 was not planned as an indirect buffer");
 }
 
 void TestInvariantLoopPhi() {
@@ -9186,8 +9444,10 @@ int main() {
     Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
+    Run("finite buffer atomic", TestFiniteBufferAtomic);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
+    Run("loop-phi buffer atomic iadd32", TestLoopPhiBufferAtomicIAdd32);
     Run("invariant loop phi", TestInvariantLoopPhi);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     Run("descriptor behind a long phi chain", TestDescriptorBehindLongPhiChain);

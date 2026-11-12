@@ -2,10 +2,12 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -80,10 +82,28 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	auto              result        = static_cast<vk::Result>(
+	    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+	                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
 	if (result != vk::Result::eSuccess) {
+		LOGF("vmaCreateBuffer failed: result=%s, usage=%u, size=%" PRIu64
+		     ", flags=0x%x; retrying without the allocator budget constraint\n",
+		     vk::to_string(result).c_str(), static_cast<uint32_t>(usage), size,
+		     static_cast<uint32_t>(allocation_info.flags));
+		graphics.LogMemoryBudget();
+
+		allocation_info.flags = AllocationFlags(usage);
+		native_buffer         = VK_NULL_HANDLE;
+		m_allocation          = nullptr;
+		allocation_result     = {};
+		result                = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator,
+		                    static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		                    &native_buffer, &m_allocation, &allocation_result));
+	}
+	if (result != vk::Result::eSuccess) {
+		LOGF("vmaCreateBuffer retry failed: result=%s, usage=%u, size=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<uint32_t>(usage), size);
 		graphics.LogMemoryBudget();
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

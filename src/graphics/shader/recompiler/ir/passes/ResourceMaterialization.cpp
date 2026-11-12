@@ -209,17 +209,30 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 	return ReadTable(base & AddressMask & ~uint64_t {3}, size, offset & ~uint64_t {3}, runtime, words);
 }
 
-bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                             ShaderType stage, bool probe_scan = false) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return false;
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
+	const bool add_tid_store =
+	    stage == ShaderType::Compute && resource.formatted && resource.written;
 	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
 	    (!formatted_read && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u))) {
 		value.dwords.fill(0u);
 		return true;
 	}
-	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
-	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
+	const auto format = Format::GetFormatInfo(descriptor.Format());
+	if (resource.formatted && !formatted_read && descriptor.DstSelXYZW() == 0u) {
+		// GPU-selected tables use a zero destination swizzle for unused rows.
+		value.dwords.fill(0u);
+		return true;
+	}
+	const bool raw_bounds = descriptor.OutOfBounds() == 3u;
+	const bool scanned_loose_store =
+	    probe_scan && resource.formatted && resource.written && descriptor.OutOfBounds() == 2u;
+	if (descriptor.SwizzleEnabled() || (descriptor.AddTid() && !add_tid_store) ||
+	    (descriptor.OutOfBounds() != (indexed ? 0u : 3u) &&
+	     !(resource.formatted && (raw_bounds || scanned_loose_store)))) {
 		return SpecializationFail(fmt::format(
 		    "indirect buffers require exact linear index or byte bounds: "
 		    "descriptor={:08x},{:08x},{:08x},{:08x} swizzle={} add_tid={} oob={} "
@@ -229,18 +242,33 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		    resource.formatted, resource.read, resource.written, resource.max_byte_extent));
 	}
 	if (resource.formatted) {
-		const auto format = Format::GetFormatInfo(descriptor.Format());
 		if (!indexed || format.type == Format::ComponentType::Unknown)
 			return SpecializationFail("indirect formatted buffers require a supported indexed format");
 		if (!formatted_read) {
-			const bool scalar = resource.max_byte_extent == 4u &&
-			    (descriptor.Format() == Prospero::BufferFormat::k32UInt ||
-			     descriptor.Format() == Prospero::BufferFormat::k8SInt);
-			const bool rgba16 = resource.max_byte_extent == 16u &&
-			    descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
-			if ((!scalar && !rgba16) || descriptor.Stride() != format.byte_size ||
-			    descriptor.DstSelXYZW() != (rgba16 ? DstSel(4, 5, 6, 7) : DstSel(4, 0, 0, 0)))
-				return SpecializationFail("indirect formatted stores require tight identity SInt8, UInt32 or RGBA16Float records");
+			const auto swizzle = descriptor.DstSelXYZW();
+			const bool selector_valid = IsValidImageSwizzle(swizzle, 4u) &&
+			    resource.max_byte_extent >= format.byte_size && resource.max_byte_extent <= 16u;
+			if (scanned_loose_store) {
+				const auto alignment = std::min(4u, format.byte_size);
+				const bool addressable = descriptor.Stride() >= format.byte_size &&
+				    (descriptor.Stride() & (alignment - 1u)) == 0u &&
+				    (descriptor.Base48() & (alignment - 1u)) == 0u;
+				if (!selector_valid || !addressable) {
+					// A bounded sparse table can include padding or unrelated heap words.
+					// OOB_SELECT=2 has no useful span check, so malformed probes are null.
+					value.dwords.fill(0u);
+					return true;
+				}
+				return true;
+			}
+			if (!selector_valid || descriptor.Stride() < format.byte_size)
+				return SpecializationFail(fmt::format(
+				    "indirect formatted stores require a supported selector and full-format "
+				    "records: format={} stride={} format_bytes={} max_extent={} dst_sel={:03x} "
+				    "records={} base={:#x}",
+				    static_cast<uint32_t>(descriptor.Format()), descriptor.Stride(), format.byte_size,
+				    resource.max_byte_extent, descriptor.DstSelXYZW(), descriptor.NumRecords(),
+				    descriptor.Base48()));
 		}
 		if (formatted_read &&
 		    (descriptor.Base48() == 0u || descriptor.Stride() == 0u || descriptor.NumRecords() == 0u)) {
@@ -254,6 +282,13 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		    (descriptor.Stride() & (alignment - 1u)) != 0u ||
 		    (descriptor.Base48() & (alignment - 1u)) != 0u)
 			return SpecializationFail("indirect formatted buffers require aligned full-format records");
+		// Without swizzling OOB_SELECT=3 treats NUM_RECORDS as a byte limit. SOFFSET is
+		// included in the same runtime bound, so the largest reachable end is NUM_RECORDS.
+		const auto record_end = raw_bounds
+		    ? uint64_t {descriptor.NumRecords()}
+		    : uint64_t {descriptor.NumRecords() - 1u} * descriptor.Stride() + format.byte_size;
+		if (record_end != 0u && record_end - 1u > AddressMask - descriptor.Base48())
+			return SpecializationFail("indirect formatted buffers require an in-range record span");
 	} else if ((!indexed && descriptor.Stride() != 1u) ||
 	           (indexed && resource.max_byte_extent != 1u && descriptor.Stride() != 4u)) {
 		return SpecializationFail("indirect buffer stores require exact linear DWORD or byte bounds");
@@ -561,6 +596,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& byte_offsets = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	bool       probe_scan = false;
 	const auto intern_candidate = [&](const DescriptorValue& candidate) {
 		if (candidate == descriptors[resource_index]) return 0u;
 		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
@@ -666,6 +702,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				if (!EvaluateIndirectCount(program, indirect, runtime, key_count)) return false;
 				domain = std::min(domain, uint64_t {key_count});
 			}
+			probe_scan = selector == nullptr && byte_keys && !use_selector && domain > 1u;
 			if (indexed_pointer &&
 			    (!indirect.table_maximum || table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
 			     table.OutOfBounds() != 0u || (table_base & 3u) != 0u || (table.Stride() & 3u) != 0u ||
@@ -749,7 +786,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
 						            candidate.dwords.begin());
 					}
-					if (!normalize(candidate))
+					if (!normalize(candidate, probe_scan))
 						return normalization_failed(table_offset, word, step,
 						                            indirect.table_maximum ? "key" : "probe");
 					const auto ordinal = intern_candidate(candidate);
@@ -840,7 +877,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!WalkedDescriptor(program, sources[entry], candidate)) {
 			return false;
 		}
-		if (!normalize(candidate))
+		if (!normalize(candidate, false))
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");
 		uint32_t ordinal = 0;
 		if (entry == 0 && !byte_keys) {
@@ -1663,9 +1700,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot,
 					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
+					        [&](DescriptorValue& value, bool probe_scan) {
+						        return !source->indirect_descriptor->sources.empty() ||
+						               NormalizeIndirectBuffer(
+						                   value, source->indirect_descriptor->indexed, base,
+						                   program.stage, probe_scan);
 					        }))
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 				}
@@ -1726,7 +1765,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
+			        specialization.images, [&](DescriptorValue& value, bool) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
@@ -1762,7 +1801,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
 				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
 				        specialization.samplers,
-				        [](DescriptorValue&) { return true; }))
+				        [](DescriptorValue&, bool) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];

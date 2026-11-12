@@ -298,14 +298,9 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	    std::invoke_result_t<Fn, const IR::MemoryInfo&, const MemoryResourceAccess&>>;
 	const auto access = [&](uint32_t resource) {
 		mem.resource = resource;
-		if (mem.kind == IR::ResourceKind::Buffer) {
-			const auto& buffer = state.program.info.buffers[resource];
-			if (buffer.packed_stride == 0u &&
-			    buffer.source < state.program.descriptor_sources.size() &&
-			    state.program.descriptor_sources[buffer.source].indirect_descriptor) {
-				// Empty candidates still carry the format/swizzle needed for OOB loads.
-				return emit(mem, MemoryResourceAccess{});
-			}
+		if (mem.kind == IR::ResourceKind::Buffer && EmptyIndirectBufferCandidate(state, resource)) {
+			// Empty candidates still carry the format/swizzle needed for OOB loads.
+			return emit(mem, MemoryResourceAccess{});
 		}
 		return emit(mem, PrepareMemoryResourceAccess(state, mem));
 	};
@@ -319,7 +314,7 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	const auto selected = ctx.Arg(handle, 0);
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
-	const auto empty_root = shared && buffer.packed_stride == 0u;
+	const auto empty_root = shared && EmptyIndirectBufferCandidate(state, root_resource);
 	const auto selected_access = [&]() {
 		if (shared) {
 			const auto root_slot = buffer.descriptor_index;
@@ -651,16 +646,18 @@ template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		auto index = DwordIndex(ctx, inst, mem);
-		if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-			// Keep region-address truncation local to DS atomics.
-			index = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), index,
-			               ConstantU32(ctx.state, 0x3fffu));
-		}
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return EmitValueOrZeroIfCondition(
-		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-			    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
+		return EmitBufferAccess(ctx, inst, mem, 1u,
+		    [&](const IR::MemoryInfo& selected, const MemoryResourceAccess& resource) {
+			    if (resource.object_pointer == 0u) return ConstantU32(ctx.state, 0u);
+			    auto index = DwordIndex(ctx, inst, selected, resource.byte_offset);
+			    if (selected.kind == IR::ResourceKind::Lds || selected.kind == IR::ResourceKind::Gds) {
+				    index = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), index,
+				                   ConstantU32(ctx.state, 0x3fffu));
+			    }
+			    return EmitValueOrZeroIfCondition(
+			        ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+				        return operation(EmitMemoryElementPointer(ctx.state, resource, index));
+			        });
 		    });
 	});
 }
@@ -828,22 +825,33 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	if (resource.object_pointer == 0u) return;
 	// RDNA2 formatted stores transfer the entire format, zero-filling missing VGPRs.
 	const auto count = mem.data_bits == 16u ? mem.component_count : components;
+	const auto swizzle = mem.typed ? DstSel(4, 5, 6, 7)
+	                               : ctx.state.program.info.buffers[mem.resource].descriptor_swizzle;
 	const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
 	EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
 		auto packed = ConstantU32(ctx.state, 0);
 		for (uint32_t component = 0; component < info.component_count; component++) {
 			auto value = ConstantU32(ctx.state, 0);
-			if (component < count) {
-				const auto word = mem.data_bits == 16u ? component / 2u : component;
+			const auto source = Format::ResolveFormattedStoreSource(swizzle, component);
+			if (source < count) {
+				const auto word = mem.data_bits == 16u ? source / 2u : source;
 				value = data;
 				if (components != 1u) {
 					value = ctx.state.builder.AllocateId();
 					ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state),
 					                              value, data, word);
 				}
-				if (mem.data_bits == 16u && (component & 1u) != 0u)
+				if (mem.data_bits == 16u && (source & 1u) != 0u)
 					value = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), value,
 					               ConstantU32(ctx.state, 16u));
+			} else if (GetDstSel(swizzle, component) == 1u) {
+				const auto bits = Format::FormattedConstantBits(
+				    info, Format::FormattedSourceKind::One);
+				value = ConstantU32(ctx.state, mem.data_bits == 16u && info.type !=
+				                                       Format::ComponentType::Uint &&
+				                                       info.type != Format::ComponentType::Sint
+				                                   ? 0x3c00u
+				                                   : bits);
 			}
 			value = EncodeFormattedStoreComponent(ctx.state, info, component, value, mem.data_bits);
 			const auto bits = info.component_bits[component];
@@ -1312,6 +1320,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Read) continue;
 			const auto components = IR::BufferComponentCount(inst.GetOpcode());
 			if (components == 0u || inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) continue;
 			const auto& memory = ctx.Memory(inst);
@@ -1407,8 +1416,34 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+uint32_t EmitIndirectBufferAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		return EmitValueOrZeroIfCondition(
+		    state, IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false), [&]() {
+			    const auto bda = GetBdaPointer(state, aligned);
+			    const auto present =
+			        Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+			    return EmitValueOrZeroIfCondition(state, present, [&]() {
+				    const auto pointer = state.builder.AllocateId();
+				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+				                              pointer, bda);
+				    const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				    EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
+				    return old;
+			    });
+		    });
+	});
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		return EmitIndirectBufferAtomic32(ctx, inst);
+	}
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

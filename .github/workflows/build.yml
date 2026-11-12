@@ -43,35 +43,17 @@ jobs:
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Locate vcpkg
-        id: vcpkg
-        shell: pwsh
-        run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Cache glslang
-        id: glslang_cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
-
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-            vcpkg install glslang[tools,opt]:x64-windows
-          }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $archive = Join-Path $env:RUNNER_TEMP "glslang.zip"
+          Invoke-WebRequest `
+            -Uri "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip" `
+            -OutFile $archive
+          Expand-Archive $archive -DestinationPath "$env:RUNNER_TEMP\glslang"
 
       - name: Install Qt 6.10.3
+        id: qt
         uses: jurplel/install-qt-action@v4
         with:
           version: "6.10.3"
@@ -90,8 +72,8 @@ jobs:
           cmake --version
           ninja --version
           clang-cl --version
-          glslangValidator --version
-          echo Qt6_DIR=%Qt6_DIR%
+          "%RUNNER_TEMP%\glslang\bin\glslang.exe" --version
+          echo QT_ROOT_DIR=%QT_ROOT_DIR%
 
       - name: Configure
         shell: cmd
@@ -107,7 +89,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+            -DKYTY_GLSLANG_VALIDATOR="%RUNNER_TEMP%\glslang\bin\glslang.exe" ^
+            -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%"
 
       - name: Build
         shell: cmd
@@ -115,7 +98,7 @@ jobs:
           cmake --build _Build/windows --target launcher ^
             audio_out2_port_tests ngs2_sampler_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
-            resource_tracking_tests scalar_provenance_tests ^
+            shader_cfg_tests resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests ^
             memory_tracker_tests page_manager_tests image_page_table_tests bit_array_tests build_flags_tests ^
             event_queue_lifetime_tests sync_on_address_tests save_data_memory_tests trophy_system_tests ^
@@ -124,7 +107,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ngs2_sampler|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|shader_cfg|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation|memory_tracker|page_manager|image_page_table|bit_array|build_flags|event_queue_lifetime|sync_on_address|save_data_memory|trophy_system|audio_out_timing|ajm_resample|png_enc|jpeg_dec|jpeg_enc|occlusion_queries|ces|save_data_dialog|psml)$"
 
       - name: Install
         shell: cmd

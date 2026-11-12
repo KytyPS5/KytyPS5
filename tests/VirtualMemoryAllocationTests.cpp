@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -84,6 +85,10 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
 int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 } // namespace Libs::Fiber
+
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+} // namespace Libs
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
@@ -5859,6 +5864,90 @@ void TestTlsStubsPreserveFlags() {
 }
 #endif
 
+struct SignalTarget {
+	Libs::LibKernel::Pthread     thread = nullptr;
+	std::vector<uint8_t>         stack  = std::vector<uint8_t>(1024 * 1024);
+	std::atomic<std::thread::id> id {};
+	std::atomic<uint64_t>        progress {0};
+	std::atomic<bool>            stop {false};
+};
+
+std::atomic<std::thread::id> g_raised_signal_thread {};
+std::atomic<bool>            g_raised_signal_entered {false};
+std::atomic<bool>            g_raised_signal_release {false};
+
+void* KYTY_SYSV_ABI RunSignalTarget(void* arg) {
+	auto& target = *static_cast<SignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	while (!target.stop) {
+		target.progress++;
+		Libs::LibKernel::KernelUsleep(100);
+	}
+	return nullptr;
+}
+
+void KYTY_SYSV_ABI HoldRaisedSignal(int /*signum*/, void* /*context*/) {
+	g_raised_signal_thread  = std::this_thread::get_id();
+	g_raised_signal_entered = true;
+	while (!g_raised_signal_release) {
+		std::this_thread::yield();
+	}
+}
+
+template <typename Predicate>
+bool WaitUntil(Predicate ready) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ready()) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+void TestRaisedSignalHoldsTarget() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test = "RaisedSignalHoldsTarget";
+	Common::Singleton<Loader::RuntimeLinker>::Instance();
+	Initialize();
+	PthreadInitSelfForMainThread();
+	Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+	const auto* raise_symbol   = symbols.FindByNid("il03nluKfMk", Loader::SymbolType::Func);
+	Check(test, install_symbol != nullptr && raise_symbol != nullptr,
+	      "the exception exports do not resolve");
+	const auto install =
+	    reinterpret_cast<int(KYTY_SYSV_ABI*)(int, void*)>(install_symbol->vaddr);
+	const auto raise_exception =
+	    reinterpret_cast<int(KYTY_SYSV_ABI*)(Pthread, int)>(raise_symbol->vaddr);
+	CheckOk(test, install(30, reinterpret_cast<void*>(HoldRaisedSignal)), "install handler");
+
+	static SignalTarget target;
+	PthreadAttr         attr = nullptr;
+	CheckOk(test, PthreadAttrInit(&attr), "PthreadAttrInit");
+	CheckOk(test, PthreadAttrSetstack(&attr, target.stack.data(), target.stack.size()),
+	        "PthreadAttrSetstack");
+	CheckOk(test, PthreadCreate(&target.thread, &attr, RunSignalTarget, &target, "SignalTarget"),
+	        "PthreadCreate");
+	CheckOk(test, PthreadAttrDestroy(&attr), "PthreadAttrDestroy");
+	Check(test, WaitUntil([] { return target.progress.load() != 0; }),
+	      "the target thread did not start");
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	const auto progress = target.progress.load();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const bool held      = target.progress.load() == progress;
+	const bool on_target = g_raised_signal_thread.load() == target.id.load();
+	g_raised_signal_release = true;
+	target.stop             = true;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, on_target, "the handler ran on another thread than its target");
+	Check(test, held, "the target kept running while its handler held");
+}
+
 int RunTrinityTests();
 
 int main(int argc, char** argv) {
@@ -6062,6 +6151,7 @@ int main(int argc, char** argv) {
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);
 	RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
+	RunTest(TestRaisedSignalHoldsTarget);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

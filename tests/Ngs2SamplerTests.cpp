@@ -95,6 +95,99 @@ struct Fixture {
 	}
 };
 
+void TestStereoPan() {
+	Ngs2PanWork work;
+	Check(Ngs2PanInit(&work, nullptr, 360.0f, 2) == OK, "pan init failed");
+	Check(work.speaker_angles[0] == 270.0f && work.speaker_angles[1] == 90.0f,
+	      "pan init did not install the default speaker positions");
+	auto pan = [&](float angle, float distance = 1.0f) {
+		const Ngs2PanParam   param {angle, distance, 1.0f, 1.0f};
+		std::array<float, 2> matrix {};
+		Check(Ngs2PanGetVolumeMatrix(&work, &param, 1, 2, matrix.data()) == OK,
+		      "pan matrix failed");
+		return matrix;
+	};
+	const auto left  = pan(270.0f);
+	const auto right = pan(90.0f);
+	Check(std::abs(left[0] - 1.0f) < 1e-6f && std::abs(left[1]) < 1e-6f,
+	      "270 degrees should be hard left");
+	Check(std::abs(right[1] - 1.0f) < 1e-6f && std::abs(right[0]) < 1e-6f,
+	      "90 degrees should be hard right");
+	const auto centre = pan(0.0f);
+	Check(std::abs(centre[0] - centre[1]) < 1e-6f &&
+	          std::abs(centre[0] - std::numbers::sqrt2_v<float> / 2.0f) < 1e-6f,
+	      "0 degrees should be centred");
+	const auto opposite = pan(90.0f, -1.0f);
+	Check(std::abs(opposite[0] - left[0]) < 1e-6f && std::abs(opposite[1] - left[1]) < 1e-6f,
+	      "negative pan distance did not reverse direction");
+
+	// L is across zero from R; positions need not use the default 180-degree separation.
+	const float speakers[] = {320.0f, 40.0f};
+	Check(Ngs2PanInit(&work, speakers, 360.0f, 2) == OK, "custom pan init failed");
+	const auto custom_left  = pan(320.0f);
+	const auto custom_right = pan(40.0f);
+	Check(std::abs(custom_left[0] - 1.0f) < 1e-6f && std::abs(custom_left[1]) < 1e-6f &&
+	          std::abs(custom_right[1] - 1.0f) < 1e-6f && std::abs(custom_right[0]) < 1e-6f,
+	      "custom speaker positions were ignored");
+	const auto front = pan(0.0f);
+	const auto rear  = pan(180.0f);
+	Check(std::abs(front[0] - front[1]) < 1e-6f && std::abs(rear[0] - rear[1]) < 1e-6f,
+	      "custom speaker arcs did not meet at their midpoints");
+	for (float angle: {-40.0f, 320.0f, 680.0f}) {
+		const auto wrapped = pan(angle);
+		Check(std::abs(wrapped[0] - custom_left[0]) < 1e-6f &&
+		          std::abs(wrapped[1] - custom_left[1]) < 1e-6f,
+		      "source pan angle did not wrap across zero");
+	}
+	const float wrapped_speakers[] = {-40.0f, 400.0f};
+	Check(Ngs2PanInit(&work, wrapped_speakers, 360.0f, 2) == OK, "wrapped speaker pan init failed");
+	const auto wrapped_front = pan(0.0f);
+	Check(std::abs(wrapped_front[0] - front[0]) < 1e-6f &&
+	          std::abs(wrapped_front[1] - front[1]) < 1e-6f,
+	      "speaker angles did not wrap across zero");
+
+	// All gains for one destination must be adjacent, even for a non-square input matrix.
+	const Ngs2PanParam params[] = {
+	    {320.0f, 1.0f, 0.25f, 0.0f}, {40.0f, 1.0f, 0.75f, 0.0f}, {320.0f, 1.0f, 0.5f, 0.0f}};
+	float matrix[6] {};
+	Check(Ngs2PanGetVolumeMatrix(&work, params, 3, 2, matrix) == OK,
+	      "multi-input pan matrix failed");
+	const float expected[] = {0.25f, 0.0f, 0.5f, 0.0f, 0.75f, 0.0f};
+	for (size_t i = 0; i < std::size(matrix); i++) {
+		Check(std::abs(matrix[i] - expected[i]) < 1e-6f,
+		      "pan matrix channel order or FBW level is incorrect");
+	}
+
+	const auto      degrees           = pan(17.0f, 0.4f);
+	constexpr float radians           = 2.0f * std::numbers::pi_v<float>;
+	const float     radian_speakers[] = {-40.0f / 360.0f * radians, 400.0f / 360.0f * radians};
+	Check(Ngs2PanInit(&work, radian_speakers, radians, 2) == OK, "radian pan init failed");
+	const auto in_radians = pan(17.0f / 360.0f * radians, 0.4f);
+	Check(std::abs(degrees[0] - in_radians[0]) < 1e-6f &&
+	          std::abs(degrees[1] - in_radians[1]) < 1e-6f,
+	      "degree and radian panning disagree");
+	Check(Ngs2PanInit(&work, nullptr, radians, 2) == OK &&
+	          std::abs(work.speaker_angles[0] - 0.75f * radians) < 1e-6f &&
+	          std::abs(work.speaker_angles[1] - 0.25f * radians) < 1e-6f,
+	      "default speaker angles did not use the requested units");
+
+	const float narrow_and_large_layouts[][2] = {
+	    {100.0f, std::nextafter(100.0f, 101.0f)}, {0.0f, -1e-20f}, {1e20f, 40.0f}};
+	for (const auto& speakers: narrow_and_large_layouts) {
+		Check(Ngs2PanInit(&work, speakers, 360.0f, 2) == OK,
+		      "distinct finite speaker positions were rejected");
+		const auto endpoint_left  = pan(speakers[0]);
+		const auto endpoint_right = pan(speakers[1]);
+		Check(std::abs(endpoint_left[0] - 1.0f) < 1e-6f && std::abs(endpoint_left[1]) < 1e-6f &&
+		          std::abs(endpoint_right[1] - 1.0f) < 1e-6f && std::abs(endpoint_right[0]) < 1e-6f,
+		      "speaker angle normalization lost distinct endpoints");
+	}
+
+	const float duplicate_speakers[] = {0.0f, 360.0f};
+	Check(Ngs2PanInit(&work, duplicate_speakers, 360.0f, 2) == static_cast<int32_t>(0x804a8451u),
+	      "coincident speaker positions were accepted");
+}
+
 void TestWaveformQueueCapacity() {
 	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
 	constexpr int32_t invalid_count = static_cast<int32_t>(0x804a8053u);
@@ -675,6 +768,7 @@ void TestSubmixerSetupAndRouting() {
 	submixer.ports.resize(1);
 	submixer.matrices.resize(1);
 	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -894,6 +988,185 @@ void TestMasteringDownmix() {
 	      "mono mastering voice did not upmix into a stereo output");
 }
 
+struct ReverbControl {
+	Ngs2VoiceParamHeader header {96, 0, 0x20010001};
+	float                wet = 1.0f, dry = 0.0f;
+	int32_t              room = 0, room_hf = 0;
+	uint32_t             reflection_pattern = 0;
+	float                decay_time = 1.0f, hf_ratio = 1.0f;
+	int32_t              reflections       = 0;
+	float                reflections_delay = 0.0f;
+	int32_t              reverb            = -10000;
+	float    reverb_delay = 0.0f, diffusion = 100.0f, density = 100.0f, hf_reference = 5000.0f;
+	uint32_t channel_mask = 0, reserved[7] {};
+};
+static_assert(sizeof(ReverbControl) == 96);
+
+struct ReverbFixture {
+	Fixture           source;
+	Ngs2RackInternal  rack {};
+	Ngs2VoiceInternal voice;
+
+	explicit ReverbFixture(uint32_t channels = 1): source(48000, channels) {
+		rack.ngs   = &source.system;
+		rack.type  = Ngs2RackType::Reverb;
+		voice.rack = &rack;
+		Setup();
+		source.voice.ports.push_back({&voice, 0, 1.0f, -1});
+	}
+
+	void Setup() {
+		struct {
+			Ngs2VoiceParamHeader header {24, 0, 0x20010000};
+			uint32_t             input, output, flags = 0, reserved = 0;
+		} setup {{24, 0, 0x20010000}, source.voice.channels, source.voice.channels};
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
+		      "reverb setup failed");
+		Event(1);
+	}
+
+	void Control(const ReverbControl& param) {
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header) == OK,
+		      "reverb I3DL2 control failed");
+	}
+
+	void Event(uint32_t event) {
+		Ngs2VoiceEventParam param {{sizeof(Ngs2VoiceEventParam), 0, 6}, event};
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header) == OK,
+		      "reverb event failed");
+	}
+
+	const std::vector<float>& Render(uint32_t grain) {
+		source.voice.rendered = voice.rendered = false;
+		Ngs2RenderVoice(voice, {&source.voice, &voice}, grain);
+		return voice.samples;
+	}
+};
+
+void TestReverbMaskAndLevels() {
+	ReverbFixture f(6);
+	ReverbControl param;
+	param.wet               = 2.0f;
+	param.dry               = 3.0f;
+	param.channel_mask      = 0x8; // The stock presets exclude the LFE channel.
+	param.reflections_delay = 0.001f;
+	f.Control(param);
+	const int16_t impulse[6] = {8192, 0, 0, 8192, 0, 0};
+	f.source.Queue(impulse, 1, 0);
+	const auto& output = f.Render(128);
+	Check(output[0] == 0.75f && output[3 * 128] == 0.75f && output[48] == 0.5f &&
+	          output[3 * 128 + 48] == 0.0f,
+	      "reverb lost gain above one, dry mixing or the preset LFE mask");
+
+	ReverbFixture clipped;
+	param.channel_mask = 0;
+	param.wet = param.dry = 64.0f;
+	clipped.Control(param);
+	clipped.source.Queue(impulse, 1, 0);
+	const auto& limited = clipped.Render(128);
+	Check(limited[0] == 8.0f && limited[48] == 8.0f,
+	      "reverb wet/dry gains did not clamp to the PS5 maximum of 32");
+
+	ReverbFixture toggled;
+	param                   = {};
+	param.reflections_delay = 0.02f;
+	toggled.Control(param);
+	toggled.source.Queue(impulse, 1, 0);
+	toggled.Render(64);
+	param.channel_mask = 1;
+	toggled.Control(param);
+	param.channel_mask = 0;
+	toggled.Control(param);
+	const auto& cleared = toggled.Render(2048);
+	Check(std::ranges::all_of(cleared, [](float v) { return v == 0.0f; }),
+	      "unmasking a channel replayed its old reflection");
+}
+
+void TestReverbRoomFilter() {
+	std::vector<int16_t> sine(48000);
+	for (size_t i = 0; i < sine.size(); ++i) {
+		sine[i] =
+		    static_cast<int16_t>(8192.0 * std::sin(2.0 * std::numbers::pi * 5000 * i / 48000));
+	}
+	auto energy = [&](int32_t room_hf, float reference) {
+		ReverbFixture f;
+		ReverbControl param;
+		param.room_hf      = room_hf;
+		param.hf_reference = reference;
+		f.Control(param);
+		f.source.Queue(sine.data(), sine.size(), 0);
+		const auto& output = f.Render(sine.size());
+		double      energy = 0.0;
+		for (size_t i = sine.size() / 2; i < sine.size(); ++i) {
+			energy += double(output[i]) * output[i];
+		}
+		return energy;
+	};
+	const double bright = energy(0, 5000.0f);
+	const double dark   = energy(-6000, 5000.0f);
+	Check(std::abs(std::sqrt(dark / bright) - 0.001) < 0.00003,
+	      "roomHF did not attenuate early reflections at HFReference");
+	Check(energy(-2000, 1000.0f) < energy(-2000, 5000.0f) * 0.1,
+	      "HFReference did not move the room filter response");
+
+	ReverbFixture extreme;
+	ReverbControl param;
+	param.room_hf      = -10000;
+	param.hf_reference = 20.0f;
+	extreme.Control(param);
+	const int16_t impulse = 8192;
+	extreme.source.Queue(&impulse, 1, 0);
+	const auto& output = extreme.Render(32);
+	Check(output[0] > 0.0f && std::ranges::all_of(output, [](float v) { return std::isfinite(v); }),
+	      "extreme room filtering rounded its input coefficient to zero");
+}
+
+void TestReverbLifecycleAndDecayRange() {
+	const int16_t impulse = 8192;
+	for (uint32_t event: {2u, 4u, 8u}) {
+		ReverbFixture f;
+		ReverbControl param;
+		param.reflections_delay = 0.02f;
+		f.Control(param);
+		f.source.Queue(&impulse, 1, 0);
+		f.Render(64);
+		f.Event(event);
+		f.Render(64); // Include a stopped render before restarting the effect.
+		f.Event(1);
+		const auto& output = f.Render(2048);
+		Check(std::ranges::all_of(output, [](float v) { return v == 0.0f; }),
+		      "restarted reverb replayed reflections from a terminated voice");
+	}
+	ReverbFixture reset;
+	ReverbControl param;
+	param.wet = 2.0f;
+	param.dry = 3.0f;
+	reset.Control(param);
+	reset.Setup();
+	reset.source.Queue(&impulse, 1, 0);
+	const auto& defaults = reset.Render(4096);
+	Check(std::ranges::all_of(defaults, [](float v) { return v == 0.0f; }),
+	      "reverb setup did not restore the silent default preset");
+
+	auto tail = [&](float ratio) {
+		ReverbFixture f;
+		ReverbControl param;
+		param.reflections = -10000;
+		param.reverb      = 0;
+		param.hf_ratio    = ratio;
+		f.Control(param);
+		f.source.Queue(&impulse, 1, 0);
+		return f.Render(8192);
+	};
+	const auto damped = tail(0.01f), brighter = tail(0.1f);
+	float      difference = 0.0f;
+	for (size_t i = 0; i < damped.size(); ++i) {
+		Check(std::isfinite(damped[i]), "minimum HF decay ratio produced nonfinite audio");
+		difference = std::max(difference, std::abs(damped[i] - brighter[i]));
+	}
+	Check(difference > 0.001f, "valid PS5 HF decay ratios below 0.1 were clamped away");
+}
+
 void TestReverbDryLevel() {
 	Fixture          f(48000);
 	Ngs2RackInternal reverb_rack {};
@@ -908,13 +1181,185 @@ void TestReverbDryLevel() {
 		Ngs2VoiceParamHeader header {24, 24, 0x20010000};
 		uint32_t             channels[4] = {1, 1, 0, 0};
 		Ngs2VoiceParamHeader levels_header {96, 0, 0x20010001};
-		float                levels[22] = {0.6f, 0.4f};
+		float                levels[22] = {0.0f, 0.4f};
 	} setup;
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header);
 	reverb.SetEvent(1);
 	Ngs2RenderVoice(reverb, {&f.voice, &reverb}, 1);
 	Check(reverb.has_samples && reverb.samples[0] == 0.25f * 0.4f,
 	      "reverb did not pass its dry signal");
+}
+
+// Geometry flags: source cone=1, Doppler=2, volume matrix=4, Audio3d attributes=8.
+void TestGeomStereoPlacement() {
+	Ngs2GeomListenerParam listener;
+	Ngs2GeomListenerWork  work;
+	Ngs2GeomResetListenerParam(&listener);
+	Check(listener.orient_front.z == -1.0f && listener.sound_speed == 340.29f,
+	      "geometry listener defaults are incorrect");
+
+	auto place = [&](float x, float z, uint32_t format = 2) {
+		Ngs2GeomSourceParam source;
+		Ngs2GeomResetSourceParam(&source);
+		source.matrix_format = format;
+		source.position      = {x, 0.0f, z};
+		Ngs2GeomAttribute attrib;
+		Check(Ngs2GeomApply(&work, &source, &attrib, 4) == OK, "geom apply failed");
+		for (uint32_t i = format; i < 64; ++i) {
+			Check(attrib.level[i] == 0.0f, "geometry emitted more than one input row");
+		}
+		return attrib;
+	};
+	for (uint32_t flags: {0u, 1u}) {
+		// No flag means right-handed; bit 0 explicitly selects left-handed coordinates.
+		listener.orient_front.z = flags == 0 ? -1.0f : 1.0f;
+		Check(Ngs2GeomCalcListener(&listener, &work, flags) == OK, "geom listener failed");
+		auto attrib = place(0.0f, listener.orient_front.z);
+		Check(std::abs(attrib.level[0] - attrib.level[1]) < 0.001f && attrib.level[0] > 0.5f,
+		      "source ahead should be centred");
+		attrib = place(1.0f, 0.0f);
+		Check(attrib.level[1] > 0.99f && std::abs(attrib.level[0]) < 0.001f,
+		      "source on the right should pan right in either coordinate system");
+		attrib = place(-1.0f, 0.0f);
+		Check(attrib.level[0] > 0.99f && std::abs(attrib.level[1]) < 0.001f,
+		      "source on the left should pan left in either coordinate system");
+		Check(place(1.0f, 0.0f, 1).level[0] == 1.0f && place(-1.0f, 0.0f, 1).level[0] == 1.0f,
+		      "mono geometry output depends on stereo pan direction");
+		const auto near = place(2.0f, 0.0f);
+		Check(place(20.0f, 0.0f).level[1] < near.level[1], "a distant source should be quieter");
+	}
+	listener.position     = {10.0f, 0.0f, 0.0f};
+	listener.orient_front = {1.0f, 0.0f, 0.0f};
+	Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK, "rotated listener failed");
+	Check(place(10.0f, 1.0f).level[1] > 0.99f, "listener position or rotation was ignored");
+}
+
+void TestGeomRolloffAndFlags() {
+	Ngs2GeomListenerParam listener;
+	Ngs2GeomListenerWork  work;
+	Ngs2GeomResetListenerParam(&listener);
+	Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK, "geom listener failed");
+	Ngs2GeomSourceParam source;
+	Ngs2GeomResetSourceParam(&source);
+	Ngs2GeomAttribute attrib;
+	// The six models are inverse, linear, exponential, then their clamped variants.
+	const float at_five[3]   = {1.0f / 3.0f, 7.0f / 9.0f, std::sqrt(0.2f)};
+	const float at_twenty[6] = {2.0f / 21.0f, 0.0f, std::sqrt(0.05f),
+	                            2.0f / 11.0f, 0.5f, std::sqrt(0.1f)};
+	for (uint32_t model = 0; model < 6; ++model) {
+		source.rolloff  = {model, 10.0f, 0.5f, 1.0f};
+		source.position = {0.0f, 0.0f, -5.0f};
+		Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK &&
+		          std::abs(attrib.a3d_attrib.volume - at_five[model % 3]) < 1e-6f,
+		      "geometry selected the wrong rolloff equation");
+		source.position.z = -20.0f;
+		Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK &&
+		          std::abs(attrib.a3d_attrib.volume - at_twenty[model]) < 1e-6f,
+		      "geometry confused clamped and unclamped rolloff models");
+	}
+
+	source.rolloff.rolloff_factor = 0.0f;
+	source.position               = {0.0f, 0.0f, -1.0f};
+	source.direction              = {0.0f, 0.0f, -1.0f};
+	source.cone                   = {1.0f, 30.0f, 0.0f, 60.0f};
+	source.velocity               = {0.0f, 0.0f, 5.0f};
+	Check(Ngs2GeomApply(&work, &source, &attrib, 4) == OK && attrib.pitch_ratio == 1.0f &&
+	          attrib.a3d_attrib.volume == 0.0f && attrib.a3d_attrib.position.z == 0.0f &&
+	          attrib.level[0] > 0.5f && attrib.level[1] > 0.5f,
+	      "matrix-only geometry applied disabled cone, Doppler, or Audio3d flags");
+	Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK && attrib.a3d_attrib.volume == 1.0f,
+	      "disabled source cone changed Audio3d volume");
+	for (float value: attrib.level) {
+		Check(value == 0.0f, "Audio3d-only geometry calculated a volume matrix");
+	}
+	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK && attrib.a3d_attrib.volume == 0.0f,
+	      "enabled source cone did not attenuate a listener behind the source");
+	source.cone.outer_angle = 360.0f;
+	// acos and the conversion to degrees can round just below the outer cone boundary.
+	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK &&
+	          std::abs(attrib.a3d_attrib.volume) < 1e-6f,
+	      "360-degree outer cone bypassed source directionality");
+	source.cone      = {2.0f, 360.0f, 2.0f, 360.0f};
+	source.max_level = 0.75f;
+	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK && attrib.a3d_attrib.volume == 0.75f,
+	      "source cone amplification exceeded the maximum level");
+	source.cone      = {-1.0f, 0.0f, 1.0f, 360.0f};
+	source.direction = {1.0f, 0.0f, 0.0f};
+	source.max_level = 1.0f;
+	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK &&
+	          std::abs(attrib.a3d_attrib.volume - 0.5f) < 1e-6f,
+	      "cone levels were not clamped before interpolation");
+	source.position  = {};
+	source.rolloff   = {0, 100.0f, 1.0f, 1.0f};
+	source.min_level = source.max_level = 0.0f;
+	Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK && attrib.a3d_attrib.volume == 0.0f,
+	      "a muted colocated source produced a non-finite volume");
+}
+
+void TestGeomDoppler() {
+	Ngs2GeomListenerParam listener;
+	Ngs2GeomListenerWork  work;
+	Ngs2GeomResetListenerParam(&listener);
+	Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK, "geom listener failed");
+
+	auto pitch = [&](float source_vz, float listener_vz, uint32_t flags = 2,
+	                 float doppler_factor = 1.0f) {
+		Ngs2GeomListenerWork moving = work;
+		moving.velocity             = {0.0f, 0.0f, listener_vz};
+		Ngs2GeomSourceParam source;
+		Ngs2GeomResetSourceParam(&source);
+		source.position       = {0.0f, 0.0f, 10.0f};
+		source.velocity       = {0.0f, 0.0f, source_vz};
+		source.doppler_factor = doppler_factor;
+		Ngs2GeomAttribute attrib;
+		Check(Ngs2GeomApply(&moving, &source, &attrib, flags) == OK, "geom apply failed");
+		return attrib.pitch_ratio;
+	};
+	Check(pitch(-5.0f, 0.0f) > 1.0f, "approaching source should raise pitch");
+	Check(pitch(5.0f, 0.0f) < 1.0f, "receding source should lower pitch");
+	Check(pitch(0.0f, 5.0f) > 1.0f, "approaching listener should raise pitch");
+	Check(pitch(0.0f, -5.0f) < 1.0f, "receding listener should lower pitch");
+	Check(pitch(-5.0f, 5.0f, 0) == 1.0f, "disabled Doppler changed pitch");
+	Check(pitch(-1000.0f, 0.0f) == 4.0f, "Doppler exceeded the pitch ratio limit");
+	Check(std::abs(pitch(-0.5f, 0.0f, 2, work.sound_speed) - 2.0f) < 1e-6f,
+	      "a large Doppler factor incorrectly capped subsonic velocity");
+}
+
+void TestReverbTail() {
+	Ngs2ReverbState reverb;
+	reverb.params = {0.6f, 0.4f, -1000, -602, -302, 2.91f, 1.3f, 0.015f, 0.022f};
+	reverb.Prepare(2, 48000);
+	const uint32_t     grain = 256;
+	std::vector<float> block(2 * grain, 0.0f);
+	Check(!reverb.Process(block, grain, false), "idle reverb produced output");
+
+	block[0]     = 1.0f;
+	block[grain] = 1.0f;
+	Check(reverb.Process(block, grain, true), "reverb dropped its input");
+	Check(std::abs(block[0] - 0.4f) < 1e-6f, "reverb changed the dry level");
+
+	float early = 0.0f, late = 0.0f;
+	for (int g = 1; g < 1400; ++g) {
+		std::ranges::fill(block, 0.0f);
+		const bool out  = reverb.Process(block, grain, false);
+		float      peak = 0.0f;
+		for (float v: block) {
+			Check(std::isfinite(v) && std::abs(v) < 1.0f, "reverb tail is unstable");
+			peak = std::max(peak, std::abs(v));
+		}
+		if (g == 20) {
+			early = peak;
+		}
+		if (g == 400) {
+			late = peak;
+		}
+		if (!out) {
+			Check(g > 600, "reverb tail ended too early");
+			Check(late > 0.0f && late < early, "reverb tail did not decay");
+			return;
+		}
+	}
+	Check(false, "reverb tail never ended");
 }
 
 void TestCustomMasteringChannelMixer() {
@@ -1115,6 +1560,7 @@ void TestMonoRateAndRouting() {
 	std::vector<int16_t> pcm(441, 16384);
 	f.Queue(pcm.data(), 441, 0);
 	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1168,6 +1614,7 @@ void TestDefaultMatrix() {
 void TestMatrixOutputChannels() {
 	Fixture f(48000, 2);
 	Ngs2RackInternal mastering_rack {};
+	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1200,6 +1647,7 @@ void TestSamplerReuseResetsRouting() {
 	for (auto type: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
 		Fixture          f(48000, 1, type);
 		Ngs2RackInternal mastering_rack {};
+		mastering_rack.ngs  = &f.system;
 		mastering_rack.type = Ngs2RackType::Mastering;
 		Ngs2VoiceInternal mastering;
 		mastering.rack     = &mastering_rack;
@@ -1993,6 +2441,7 @@ void TestFiniteFilterTail() {
 
 int main() {
 	TestProgressDrivenWaveformRing();
+	TestStereoPan();
 	TestWaveformQueueCapacity();
 	TestWaveformRingReuse();
 	TestAtrac9Vibration();
@@ -2002,6 +2451,13 @@ int main() {
 	TestMasteringGain();
 	TestMasteringDownmix();
 	TestReverbDryLevel();
+	TestReverbMaskAndLevels();
+	TestReverbRoomFilter();
+	TestReverbLifecycleAndDecayRange();
+	TestReverbTail();
+	TestGeomStereoPlacement();
+	TestGeomDoppler();
+	TestGeomRolloffAndFlags();
 	TestCustomMasteringChannelMixer();
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();

@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 

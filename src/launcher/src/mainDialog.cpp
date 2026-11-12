@@ -270,7 +270,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.stretch_enabled, "--stretch");
 	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
 	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
+	AddFlag(args, info.readback_storage_images, "--readback-storage-images");
 	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
+	args << "--flush-draws" << QString::number(info.flush_draws);
 	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
@@ -279,12 +281,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
+	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
 	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
 	AddFlag(args, info.shader_validation_enabled, "--shader-validation");
-	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
 	AddFlag(args, info.command_buffer_dump_enabled, "--command-buffer-dump");
@@ -293,6 +295,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.pro_enabled, "--trinity");
+	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
+		args << "--dlss" << info.dlss_folder;
+	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)

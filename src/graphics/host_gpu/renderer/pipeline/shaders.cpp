@@ -321,9 +321,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #if !defined(__APPLE__)
 	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
 	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
-	if (rendering.color_count != 0) {
-		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
-	}
 #endif
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);

@@ -8,9 +8,6 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-struct SccTag {
-	auto operator<=>(const SccTag&) const = default;
-};
 struct ThreadBitScalarReg {
 	ScalarReg reg {};
 	auto      operator<=>(const ThreadBitScalarReg&) const = default;
@@ -19,35 +16,17 @@ struct ScalarMaskTag {
 	ScalarReg reg {};
 	auto      operator<=>(const ScalarMaskTag&) const = default;
 };
-struct ExecTag {
-	auto operator<=>(const ExecTag&) const = default;
-};
-struct ExecLoTag {
-	auto operator<=>(const ExecLoTag&) const = default;
-};
-struct ExecHiTag {
-	auto operator<=>(const ExecHiTag&) const = default;
-};
-struct VccTag {
-	auto operator<=>(const VccTag&) const = default;
-};
-struct VccLoTag {
-	auto operator<=>(const VccLoTag&) const = default;
-};
-struct VccHiTag {
-	auto operator<=>(const VccHiTag&) const = default;
-};
-struct M0Tag {
-	auto operator<=>(const M0Tag&) const = default;
-};
+// Indexes Block::ssa_flag_values.
+enum class Flag : uint8_t { Scc, Exec, ExecLo, ExecHi, Vcc, VccLo, VccHi, M0, Count };
+static_assert(std::tuple_size_v<decltype(Block::ssa_flag_values)> ==
+              static_cast<size_t>(Flag::Count));
 struct GotoVariable {
 	uint32_t index                                  = 0;
 	auto     operator<=>(const GotoVariable&) const = default;
 };
 
 using Variable =
-    std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable, SccTag,
-                 ExecTag, ExecLoTag, ExecHiTag, VccTag, VccLoTag, VccHiTag, M0Tag>;
+    std::variant<ScalarReg, ThreadBitScalarReg, ScalarMaskTag, VectorReg, GotoVariable, Flag>;
 using ValueMap = std::unordered_map<Block*, Value>;
 
 struct DefTable {
@@ -95,31 +74,13 @@ struct DefTable {
 		goto_variables[value.index][block] = definition;
 	}
 
-	const Value& Get(Block* block, SccTag) { return scc[block]; }
-	void         Set(Block* block, SccTag, Value value) { scc[block] = value; }
-	const Value& Get(Block* block, ExecTag) { return exec[block]; }
-	void         Set(Block* block, ExecTag, Value value) { exec[block] = value; }
-	const Value& Get(Block* block, ExecLoTag) { return exec_lo[block]; }
-	void         Set(Block* block, ExecLoTag, Value value) { exec_lo[block] = value; }
-	const Value& Get(Block* block, ExecHiTag) { return exec_hi[block]; }
-	void         Set(Block* block, ExecHiTag, Value value) { exec_hi[block] = value; }
-	const Value& Get(Block* block, VccTag) { return vcc[block]; }
-	void         Set(Block* block, VccTag, Value value) { vcc[block] = value; }
-	const Value& Get(Block* block, VccLoTag) { return vcc_lo[block]; }
-	void         Set(Block* block, VccLoTag, Value value) { vcc_lo[block] = value; }
-	const Value& Get(Block* block, VccHiTag) { return vcc_hi[block]; }
-	void         Set(Block* block, VccHiTag, Value value) { vcc_hi[block] = value; }
-	const Value& Get(Block* block, M0Tag) { return m0[block]; }
-	void         Set(Block* block, M0Tag, Value value) { m0[block] = value; }
+	const Value& Get(Block* block, Flag flag) {
+		return block->ssa_flag_values[static_cast<size_t>(flag)];
+	}
+	void Set(Block* block, Flag flag, Value value) {
+		block->ssa_flag_values[static_cast<size_t>(flag)] = value;
+	}
 
-	ValueMap                               scc;
-	ValueMap                               exec;
-	ValueMap                               exec_lo;
-	ValueMap                               exec_hi;
-	ValueMap                               vcc;
-	ValueMap                               vcc_lo;
-	ValueMap                               vcc_hi;
-	ValueMap                               m0;
 	std::unordered_map<uint32_t, ValueMap> goto_variables;
 };
 
@@ -138,29 +99,10 @@ Value InitialValue(VectorReg) {
 Value InitialValue(GotoVariable) {
 	return Value(false);
 }
-Value InitialValue(SccTag) {
-	return Value(false);
-}
-Value InitialValue(ExecTag) {
-	return Value(false);
-}
-Value InitialValue(ExecLoTag) {
-	return Value(0u);
-}
-Value InitialValue(ExecHiTag) {
-	return Value(0u);
-}
-Value InitialValue(VccTag) {
-	return Value(false);
-}
-Value InitialValue(VccLoTag) {
-	return Value(0u);
-}
-Value InitialValue(VccHiTag) {
-	return Value(0u);
-}
-Value InitialValue(M0Tag) {
-	return Value(0u);
+Value InitialValue(Flag flag) {
+	// SCC, EXEC and VCC are U1; the 32-bit halves and M0 are U32.
+	const bool u1 = flag == Flag::Scc || flag == Flag::Exec || flag == Flag::Vcc;
+	return u1 ? Value(false) : Value(0u);
 }
 
 enum class ReadStep { Start, SetValue, PushPhiArgument };
@@ -309,14 +251,14 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 		case ValueOpcode::SetGotoVariable:
 			pass.Write(GotoVariable {inst.Arg(0).U32()}, block, inst.Arg(1));
 			break;
-		case ValueOpcode::SetScc: pass.Write(SccTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetExec: pass.Write(ExecTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetExecLo: pass.Write(ExecLoTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetExecHi: pass.Write(ExecHiTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetVcc: pass.Write(VccTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetVccLo: pass.Write(VccLoTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetVccHi: pass.Write(VccHiTag {}, block, inst.Arg(0)); break;
-		case ValueOpcode::SetM0: pass.Write(M0Tag {}, block, inst.Arg(0)); break;
+		case ValueOpcode::SetScc: pass.Write(Flag::Scc, block, inst.Arg(0)); break;
+		case ValueOpcode::SetExec: pass.Write(Flag::Exec, block, inst.Arg(0)); break;
+		case ValueOpcode::SetExecLo: pass.Write(Flag::ExecLo, block, inst.Arg(0)); break;
+		case ValueOpcode::SetExecHi: pass.Write(Flag::ExecHi, block, inst.Arg(0)); break;
+		case ValueOpcode::SetVcc: pass.Write(Flag::Vcc, block, inst.Arg(0)); break;
+		case ValueOpcode::SetVccLo: pass.Write(Flag::VccLo, block, inst.Arg(0)); break;
+		case ValueOpcode::SetVccHi: pass.Write(Flag::VccHi, block, inst.Arg(0)); break;
+		case ValueOpcode::SetM0: pass.Write(Flag::M0, block, inst.Arg(0)); break;
 		case ValueOpcode::GetScalarRegister:
 			inst.ReplaceUsesWith(pass.Read(inst.Arg(0).ScalarRegister(), block));
 			break;
@@ -333,14 +275,14 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 		case ValueOpcode::GetGotoVariable:
 			inst.ReplaceUsesWith(pass.Read(GotoVariable {inst.Arg(0).U32()}, block));
 			break;
-		case ValueOpcode::GetScc: inst.ReplaceUsesWith(pass.Read(SccTag {}, block)); break;
-		case ValueOpcode::GetExec: inst.ReplaceUsesWith(pass.Read(ExecTag {}, block)); break;
-		case ValueOpcode::GetExecLo: inst.ReplaceUsesWith(pass.Read(ExecLoTag {}, block)); break;
-		case ValueOpcode::GetExecHi: inst.ReplaceUsesWith(pass.Read(ExecHiTag {}, block)); break;
-		case ValueOpcode::GetVcc: inst.ReplaceUsesWith(pass.Read(VccTag {}, block)); break;
-		case ValueOpcode::GetVccLo: inst.ReplaceUsesWith(pass.Read(VccLoTag {}, block)); break;
-		case ValueOpcode::GetVccHi: inst.ReplaceUsesWith(pass.Read(VccHiTag {}, block)); break;
-		case ValueOpcode::GetM0: inst.ReplaceUsesWith(pass.Read(M0Tag {}, block)); break;
+		case ValueOpcode::GetScc: inst.ReplaceUsesWith(pass.Read(Flag::Scc, block)); break;
+		case ValueOpcode::GetExec: inst.ReplaceUsesWith(pass.Read(Flag::Exec, block)); break;
+		case ValueOpcode::GetExecLo: inst.ReplaceUsesWith(pass.Read(Flag::ExecLo, block)); break;
+		case ValueOpcode::GetExecHi: inst.ReplaceUsesWith(pass.Read(Flag::ExecHi, block)); break;
+		case ValueOpcode::GetVcc: inst.ReplaceUsesWith(pass.Read(Flag::Vcc, block)); break;
+		case ValueOpcode::GetVccLo: inst.ReplaceUsesWith(pass.Read(Flag::VccLo, block)); break;
+		case ValueOpcode::GetVccHi: inst.ReplaceUsesWith(pass.Read(Flag::VccHi, block)); break;
+		case ValueOpcode::GetM0: inst.ReplaceUsesWith(pass.Read(Flag::M0, block)); break;
 		default: break;
 	}
 }

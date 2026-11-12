@@ -77,13 +77,45 @@ struct CommandSpace {
 };
 
 struct DispatchParameters {
-  const uint32_t *output;
-  const uint32_t *input;
-  std::array<uint8_t, 0xe0> unused{};
-  uint32_t width;
-  uint32_t height;
+  const uint32_t *output = nullptr;
+  const uint32_t *input = nullptr;
+  const uint32_t *motion = nullptr;
+  const uint32_t *previous_depth = nullptr;
+  const uint32_t *depth = nullptr;
+  const uint32_t *exposure = nullptr;
+  std::array<uint8_t, 0x34> unused0{};
+  float pre_exposure = 1.0f;
+  std::array<uint8_t, 0x88> unused1{};
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  float jitter[2]{};
+  float motion_scale[2]{1.0f, 1.0f};
+  float motion_offset[2]{};
+  float motion_gamma = 0.0f;
+  uint8_t reset = 0;
+  uint32_t flags = 0;
+  const void *vr_lookup = nullptr;
 };
+static_assert(offsetof(DispatchParameters, pre_exposure) == 0x64);
 static_assert(offsetof(DispatchParameters, width) == 0xf0);
+static_assert(offsetof(DispatchParameters, vr_lookup) == 0x128);
+
+struct LegacyDispatchParameters {
+  const uint32_t *output = nullptr;
+  const uint32_t *input = nullptr;
+  std::array<uint8_t, 0xe0> unused{};
+  uint32_t width = 0;
+  uint32_t height = 0;
+  float jitter[2]{};
+  float motion_scale[2]{1.0f, 1.0f};
+  float motion_offset[2]{};
+  float motion_gamma = 0.0f;
+  uint8_t reset = 0;
+  uint32_t flags = 0;
+};
+static_assert(offsetof(LegacyDispatchParameters, flags) == 0x118);
 
 struct GuardedHandle {
   uint64_t before = CANARY;
@@ -247,10 +279,13 @@ TEST_F(PsmlTest, CapsLiveContextsAndReleasesCapacity) {
 TEST_F(PsmlTest, DispatchSnapshotsFixedSlotsAndActiveExtent) {
   auto output = Texture(960, 540, 0x10000);
   auto input = Texture(1920, 1080, 0x20000);
-  DispatchParameters params{output.data(), input.data(), {}, 640, 360};
-  std::array<uint32_t, 32> command;
+  DispatchParameters params{.output = output.data(),
+                            .input = input.data(),
+                            .width = 640,
+                            .height = 360};
+  std::array<uint32_t, Pssr::RequestDwords + 12> command;
   command.fill(0xdeadbeef);
-  const CommandSpace space{command.data() + 1, 28};
+  const CommandSpace space{command.data() + 1, Pssr::RequestDwords + 9};
   ASSERT_EQ(Function<Dispatch>("94iBp3KvIuI")(context, &space, &params), 0);
   EXPECT_EQ(KYTY_PM4_LEN(command[1]), space.dwords);
   EXPECT_EQ(KYTY_PM4_R(command[1]), Pm4::R_PSSR);
@@ -263,8 +298,8 @@ TEST_F(PsmlTest, DispatchSnapshotsFixedSlotsAndActiveExtent) {
   EXPECT_EQ(request.width, 640u);
   EXPECT_EQ(request.height, 360u);
   EXPECT_EQ(command.front(), 0xdeadbeefu);
-  EXPECT_EQ(command[29], 0xdeadbeefu);
-  for (size_t i = 2 + Pssr::RequestDwords; i < 29; ++i) {
+  EXPECT_EQ(command[1 + space.dwords], 0xdeadbeefu);
+  for (size_t i = 2 + Pssr::RequestDwords; i < 1 + space.dwords; ++i) {
     EXPECT_EQ(command[i], 0u);
   }
   output.fill(0);
@@ -275,10 +310,111 @@ TEST_F(PsmlTest, DispatchSnapshotsFixedSlotsAndActiveExtent) {
   EXPECT_EQ(std::memcmp(&snapshot, &request, sizeof(request)), 0);
 }
 
+TEST_F(PsmlTest, DispatchCarriesTemporalInputs) {
+  const auto output = Texture(960, 540, 0x10000);
+  const auto input = Texture(960, 540, 0x20000);
+  const auto motion = Texture(960, 540, 0x30000);
+  const auto depth = Texture(960, 540, 0x40000);
+  const auto exposure = Texture(1, 1, 0x50000);
+  DispatchParameters params{.output = output.data(),
+                            .input = input.data(),
+                            .motion = motion.data(),
+                            .depth = depth.data(),
+                            .exposure = exposure.data(),
+                            .pre_exposure = 0.0f,
+                            .width = 640,
+                            .height = 360,
+                            .x = 16,
+                            .y = 8,
+                            .jitter = {0.25f, -0.375f},
+                            .motion_scale = {-480.0f, 270.0f},
+                            .motion_gamma = 1.0f,
+                            .reset = 1,
+                            .flags = 1u << 15};
+  std::array<uint32_t, Pssr::RequestDwords + 1> command{};
+  const CommandSpace space{command.data(), command.size()};
+  const auto dispatch = [&] {
+    EXPECT_EQ(Function<Dispatch>("94iBp3KvIuI")(context, &space, &params), 0);
+    Pssr::Request request;
+    std::memcpy(&request, command.data() + 1, sizeof(request));
+    return request;
+  };
+  auto request = dispatch();
+  EXPECT_EQ(std::to_array(request.motion), motion);
+  EXPECT_EQ(std::to_array(request.depth), depth);
+  EXPECT_EQ(std::to_array(request.exposure), exposure);
+  EXPECT_EQ(request.context, reinterpret_cast<uintptr_t>(context));
+  EXPECT_EQ(request.x, 16u);
+  EXPECT_EQ(request.y, 8u);
+  EXPECT_EQ(std::to_array(request.jitter), std::to_array(params.jitter));
+  EXPECT_EQ(std::to_array(request.motion_scale),
+            std::to_array(params.motion_scale));
+  EXPECT_EQ(request.pre_exposure, 1.0f);
+  EXPECT_EQ(request.flags, Pssr::kReset | Pssr::kReverseDepth);
+
+  params.reset = 0;
+  params.flags = 1u << 16;
+  params.pre_exposure = 2.0f;
+  params.exposure = nullptr;
+  params.motion_gamma = 0.0f;
+  request = dispatch();
+  EXPECT_EQ(request.flags, Pssr::kAutoExposure);
+  EXPECT_EQ(request.pre_exposure, 2.0f);
+  EXPECT_EQ(std::to_array(request.exposure), decltype(exposure){});
+  params.flags = 0;
+  params.motion_gamma = 2.0f;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.motion_gamma = 0.0f;
+  params.motion_offset[1] = -1.0f;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.motion_offset[1] = 0.0f;
+  params.flags = 1u << 14;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.flags = 1u << 31;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.flags = 0;
+  params.vr_lookup = &params;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+}
+
+TEST_F(PsmlTest, LegacyDispatchHasNoRenderOffsetAndTwoFlags) {
+  const auto output = Texture(960, 540, 0x10000);
+  const auto input = Texture(960, 540, 0x20000);
+  LegacyDispatchParameters params{.output = output.data(),
+                                  .input = input.data(),
+                                  .width = 640,
+                                  .height = 360,
+                                  .jitter = {0.25f, -0.375f},
+                                  .motion_scale = {-480.0f, 270.0f},
+                                  .reset = 1,
+                                  .flags =
+                                      (1u << 14) | (1u << 15) | (1u << 16)};
+  std::array<uint32_t, Pssr::RequestDwords + 1> command{};
+  const CommandSpace space{command.data(), command.size()};
+  const auto dispatch = [&] {
+    EXPECT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params), 0);
+    Pssr::Request request;
+    std::memcpy(&request, command.data() + 1, sizeof(request));
+    return request;
+  };
+  const auto request = dispatch();
+  EXPECT_EQ(request.width, 640u);
+  EXPECT_EQ(request.height, 360u);
+  EXPECT_EQ(request.x, 0u);
+  EXPECT_EQ(request.y, 0u);
+  EXPECT_EQ(std::to_array(request.jitter), std::to_array(params.jitter));
+  EXPECT_EQ(request.flags, Pssr::kReset | Pssr::kReverseDepth);
+  params.flags = 1u << 31;
+  EXPECT_EQ(dispatch().flags, Pssr::kReset | Pssr::kSpatialOnly);
+}
+
 TEST_F(PsmlTest, DispatchAcceptsEqualSizedBuffersAndValidatesWithoutWriting) {
   auto output = Texture(960, 540, 0x10000);
   auto input = Texture(960, 540, 0x20000);
-  DispatchParameters params{output.data(), input.data(), {}, 960, 540};
+  DispatchParameters params{.output = output.data(),
+                            .input = input.data(),
+                            .width = 960,
+                            .height = 540};
   uint32_t dwords = 0;
   ASSERT_EQ(Function<GetSize>("AHalTX9wFZY")(context, &dwords), 0);
   std::vector<uint32_t> command(dwords, 0xdeadbeef);
@@ -313,7 +449,10 @@ TEST_F(PsmlTest, DispatchChecksDescriptorContractAndSelectedMip) {
   auto input = Texture(1920, 1080, 0x20000);
   input[3] |= (1u << 12) | (1u << 16);
   input[5] |= 1u << 4;
-  DispatchParameters params{output.data(), input.data(), {}, 960, 540};
+  DispatchParameters params{.output = output.data(),
+                            .input = input.data(),
+                            .width = 960,
+                            .height = 540};
   std::array<uint32_t, Pssr::RequestDwords + 1> command{};
   const CommandSpace space{command.data(), command.size()};
   ASSERT_EQ(Function<Dispatch>("RUNLFro+qok")(context, &space, &params), 0);
@@ -385,14 +524,27 @@ static_assert(offsetof(Mfsr2ContextParameters, width) == 0x28);
 struct Mfsr2DispatchParameters {
   const uint32_t *output = nullptr;
   const uint32_t *color = nullptr;
-  std::array<const uint32_t *, 4> optional{};
+  const uint32_t *motion = nullptr;
+  const uint32_t *depth = nullptr;
+  const uint32_t *exposure = nullptr;
+  const uint32_t *particle_mask = nullptr;
   float pre_exposure = 1.0f;
   uint32_t x = 0;
   uint32_t y = 0;
   uint32_t width = 0;
   uint32_t height = 0;
+  float jitter[2]{};
+  float motion_scale[2]{1.0f, 1.0f};
+  float motion_offset[2]{};
+  float depth_range[2]{};
+  uint8_t reset = 0;
+  uint8_t reserved = 0;
+  uint8_t encoding = 0;
+  uint8_t particle_bits = 0;
+  uint32_t flags = 0;
 };
 static_assert(offsetof(Mfsr2DispatchParameters, x) == 0x34);
+static_assert(offsetof(Mfsr2DispatchParameters, flags) == 0x68);
 
 using GetRequirements = int(KYTY_SYSV_ABI *)(Requirements *, const void *);
 using Create = int(KYTY_SYSV_ABI *)(void **, const void *);
@@ -558,6 +710,66 @@ TEST_F(PsmlMfsr2Test, DispatchFillsTheReservedSpaceWithOnePacket) {
   expect_nop(nullptr, MFSR2_INVALID_CONTEXT);
   EXPECT_EQ(command.front(), 0xdeadbeefu);
   EXPECT_EQ(command.back(), 0xdeadbeefu);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+}
+
+TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
+  void *context = NewContext(3840, 2160, 32);
+  const auto output = Texture(3840, 2160, 0x10000);
+  const auto color = Texture(2560, 1440, 0x20000);
+  const auto motion = Texture(2560, 1440, 0x30000);
+  const auto depth = Texture(2560, 1440, 0x40000);
+  const auto exposure = Texture(1, 1, 0x50000);
+  Mfsr2DispatchParameters params{.output = output.data(),
+                                 .color = color.data(),
+                                 .motion = motion.data(),
+                                 .depth = depth.data(),
+                                 .exposure = exposure.data(),
+                                 .pre_exposure = 0.5f,
+                                 .x = 32,
+                                 .y = 24,
+                                 .width = 1920,
+                                 .height = 1080,
+                                 .jitter = {-0.125f, 0.5f},
+                                 .motion_scale = {-1280.0f, 720.0f},
+                                 .reset = 1,
+                                 .flags = 1};
+  std::vector<uint32_t> command(0x800);
+  const CommandSpace space{command.data(), 0x800};
+  const auto dispatch = [&] {
+    EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, &space, &params), 0);
+    Pssr::Request request;
+    std::memcpy(&request, command.data() + 1, sizeof(request));
+    return request;
+  };
+  auto request = dispatch();
+  EXPECT_EQ(std::to_array(request.motion), motion);
+  EXPECT_EQ(std::to_array(request.depth), depth);
+  EXPECT_EQ(std::to_array(request.exposure), exposure);
+  EXPECT_EQ(request.context, reinterpret_cast<uintptr_t>(context));
+  EXPECT_EQ(request.x, 32u);
+  EXPECT_EQ(request.y, 24u);
+  EXPECT_EQ(std::to_array(request.jitter), std::to_array(params.jitter));
+  EXPECT_EQ(std::to_array(request.motion_scale),
+            std::to_array(params.motion_scale));
+  EXPECT_EQ(request.pre_exposure, 0.5f);
+  EXPECT_EQ(request.flags, Pssr::kReset | Pssr::kReverseDepth);
+
+  params.reset = 0;
+  params.flags = 1u << 1;
+  params.motion = nullptr;
+  request = dispatch();
+  EXPECT_EQ(request.flags, Pssr::kAutoExposure);
+  EXPECT_EQ(std::to_array(request.motion), decltype(motion){});
+  params.flags = 0;
+  params.encoding = 1;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.encoding = 0;
+  params.flags = 1u << 2;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  params.flags = 0;
+  params.motion_offset[0] = 1.0f;
+  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
 }
 

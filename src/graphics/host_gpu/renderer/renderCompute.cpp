@@ -214,6 +214,20 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
+// Global loads read pages without a buffer as zero. Back the 32 KiB after each base the shader
+// loads from scalar data before the dispatch reads it.
+static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
+	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+	const auto&        flat = stage.resources->flattened_srt;
+	for (const auto [low, high]: stage.module->info.info.address_bases) {
+		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
+		for (uint64_t index = 0; index <= 2; ++index) {
+			const auto page = base + index * Page;
+			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+		}
+	}
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.module->info.bindings.descriptor_counts[
@@ -347,6 +361,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	PreparedBindings* descriptor_stage = &bindings;
+	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
@@ -483,6 +498,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
+	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {

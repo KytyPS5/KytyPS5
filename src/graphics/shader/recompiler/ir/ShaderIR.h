@@ -73,6 +73,7 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	bool                    image_cube                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
@@ -527,6 +528,7 @@ struct ShaderInfo {
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
+	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
@@ -540,6 +542,7 @@ struct ShaderInfo {
 	bool                            uses_gds                      = false;
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
+	bool                            uses_device_address           = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;

@@ -23,20 +23,12 @@ inline bool IsExecute(Mode mode) {
 	        mode == Mode::ExecuteReadWrite);
 }
 
-void Init();
-
-uint64_t Alloc(uint64_t address, uint64_t size, Mode mode);
-uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment);
-bool     AllocFixed(uint64_t address, uint64_t size, Mode mode);
-bool     Commit(uint64_t address, uint64_t size, Mode mode);
-uint64_t Reserve(uint64_t address, uint64_t size);
-uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment);
-bool     ReserveFixed(uint64_t address, uint64_t size);
-bool     Decommit(uint64_t address, uint64_t size);
-bool     Free(uint64_t address);
-bool     FreeRange(uint64_t address, uint64_t size);
-bool     Protect(uint64_t address, uint64_t size, Mode mode);
-bool     FlushInstructionCache(uint64_t address, uint64_t size);
+// Maps committed pages at exactly `address`; fails if any page there is already mapped.
+bool AllocFixed(uint64_t address, uint64_t size, Mode mode);
+// Releases exactly one AllocFixed range.
+bool Free(uint64_t address, uint64_t size);
+bool Protect(uint64_t address, uint64_t size, Mode mode);
+bool FlushInstructionCache(uint64_t address, uint64_t size);
 
 } // namespace VirtualMemory
 

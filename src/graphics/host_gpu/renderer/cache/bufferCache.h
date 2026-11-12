@@ -34,6 +34,9 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Tags the BDA page-table entries of pages a DMA shader accessed; an access to another page
+	// records a fault.
+	static constexpr vk::DeviceAddress BDA_ACCESSED = 1;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -79,6 +82,7 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
@@ -86,10 +90,13 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Tags fault-scan pages as DMA-accessed and queues them; creates buffers for unbacked ones.
+	void MarkDmaAccess(const RangeSet& pages);
+	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
+	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] RangeSet TakeBdaSync();
+	// A write queues only the pages a DMA shader accessed.
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
 	void               RunGarbageCollector();
 
 private:
@@ -106,6 +113,12 @@ private:
 		bool                has_stream_leap;
 	};
 
+	// Copies [previous upload's end, end) go to `buffer`.
+	struct BufferUpload {
+		Buffer* buffer;
+		size_t  end;
+	};
+
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
@@ -120,8 +133,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
+	                  uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -143,6 +156,8 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	// Pages DMA shaders accessed, guarded by m_bda_sync_mutex.
+	RangeSet                                          m_dma_accessed;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

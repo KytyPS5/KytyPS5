@@ -43,7 +43,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -243,7 +243,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
-	        .r8g8_srgb_views        = graphics.r8g8_srgb_views};
+	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -374,8 +375,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (options.stage == ShaderType::Mesh ||
 		    options.stage == ShaderType::TessellationControl) {
 			options.user_data_base = 0;
-			options.wave_size =
-			    options.stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+		}
+		if (options.stage == ShaderType::Mesh) {
+			options.wave_size = input_info.mesh.wave_size;
 		}
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 		options.stage            = ShaderType::Pixel;
@@ -572,17 +574,23 @@ void PipelineCache::CheckpointDriverCache() {
 		return;
 	}
 	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
-		Save();
+	if (const auto now = std::chrono::steady_clock::now(); now >= m_next_driver_cache_save) {
+		m_driver_cache_dirty     = false;
+		m_next_driver_cache_save = now + DriverCacheSaveInterval;
+		// The cache object is internally synchronized, so pipelines may be created meanwhile.
+		m_store.Post([this] { WriteDriverCache(); });
 	}
 }
 
 void PipelineCache::Save() {
-	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
-		return;
+	m_store.Finish();
+	if (m_driver_cache_dirty) {
+		m_driver_cache_dirty = false;
+		WriteDriverCache();
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+}
 
+void PipelineCache::WriteDriverCache() const {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -637,7 +645,6 @@ void PipelineCache::Save() {
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
@@ -874,9 +881,10 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state) {
-	const auto* colors        = state.color_info;
-	const auto& depth         = state.depth_info;
+                                                            const DrawRenderState& state,
+                                                            const DrawTargets&     targets) {
+	const auto* colors        = targets.colors;
+	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
@@ -892,7 +900,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		stages[3] = ps_input_info.stage.module;
 	}
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
-	const auto color_count = state.color_count;
+	const auto color_count = targets.color_count;
 
 	auto&             ctx = command.GetRegisters();
 

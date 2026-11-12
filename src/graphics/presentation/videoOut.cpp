@@ -9,7 +9,6 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -28,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -194,6 +194,7 @@ struct VideoOutConfig {
 	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	uint64_t                            pre_vblanks = 0;
+	uint64_t                            flip_vblank = 0; // vblank_status.count at the last flip.
 	VideoOutFlipStatus                  flip_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
@@ -338,16 +339,10 @@ static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
 static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    triggered_event.fflags < 0xfu ? triggered_event.fflags + 1u : triggered_event.fflags;
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-		return;
-	}
-	event->event     = triggered_event;
-	event->triggered = true;
+	// One event counts every occurrence until it is delivered.
+	event->event.fflags = std::min(event->event.fflags + 1u, 0xfu);
+	event->event.data   = MakeVideoOutEventData(event->event.data, trigger_data);
+	event->triggered    = true;
 }
 
 static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
@@ -486,10 +481,12 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// A flip is due once flip_rate + 1 vblanks have passed since the last flip, so a late frame flips
+// at the next vblank.
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
-	const int interval = cfg.flip_rate + 1;
+	const auto interval = static_cast<uint64_t>(cfg.flip_rate) + 1;
 
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	return interval <= 1 || cfg.vblank_status.count - cfg.flip_vblank >= interval;
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -665,6 +662,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.pre_vblanks               = 0;
+	config.flip_vblank               = 0;
 	config.vblank_status             = VideoOutVblankStatus();
 
 	return handle;
@@ -789,24 +787,20 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	EXIT_IF(frequency == 0);
-	const auto period = std::max(frequency / Config::GetVblankFrequency(), uint64_t {1});
+	using Clock       = std::chrono::steady_clock;
+	const auto period = Clock::duration(std::chrono::seconds(1)) / Config::GetVblankFrequency();
 
-	int64_t total_wait = 0;
+	std::chrono::nanoseconds total_wait {};
 	while (!token.stop_requested()) {
-		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
-			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+		const auto sleep_begin = Clock::now();
+		if (total_wait.count() > 0) {
+			Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
 		}
 		if (token.stop_requested()) {
 			break;
 		}
-		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
+		const auto frame_begin = Clock::now();
+		total_wait -= frame_begin - sleep_begin;
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip();
@@ -816,7 +810,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 			presented = true;
 		}
-		if (!presented && total_wait < 0) {
+		if (!presented && total_wait.count() < 0) {
 			bool any_open = false;
 			{
 				Common::LockGuard lock(m_mutex);
@@ -830,9 +824,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 		VblankEnd();
 
-		const auto frame_end = Common::Timer::QueryPerformanceCounter();
-		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
-		if (total_wait < 0) {
+		total_wait += period - (Clock::now() - frame_begin);
+		if (total_wait.count() < 0) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
 		}
 	}
@@ -1104,7 +1097,9 @@ bool FlipQueue::Flip() {
 	}
 	m_mutex.Unlock();
 
-	// Lock each port in bus order, then present and complete the whole group at one Vblank.
+	// Present and complete the whole group at one Vblank, taking the port locks in bus order. The
+	// present runs without them: Cancel waits for Presenting requests, so their frames and ports
+	// stay valid.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
 	bool due = true;
@@ -1112,8 +1107,8 @@ bool FlipQueue::Flip() {
 	size_t                      layer_count = 0;
 	Graphics::Presenter::Frame* hidden      = nullptr; // The main port behind the headset image.
 	for (size_t i = 0; i < count; i++) {
-		auto& r = requests[i];
-		r.cfg->mutex.Lock();
+		auto&             r = requests[i];
+		Common::LockGuard lock(r.cfg->mutex);
 		due &= r.cfg->generation == r.generation;
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg);
@@ -1139,6 +1134,9 @@ bool FlipQueue::Flip() {
 		}
 	}
 
+	for (size_t i = 0; i < count; i++) {
+		requests[i].cfg->mutex.Lock();
+	}
 	m_mutex.Lock();
 	for (auto it = m_requests.begin(); it != m_requests.end();) {
 		if (it->group != group) {
@@ -1150,6 +1148,7 @@ bool FlipQueue::Flip() {
 			continue;
 		}
 		auto& r = *it;
+		r.cfg->flip_vblank = r.cfg->vblank_status.count;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();

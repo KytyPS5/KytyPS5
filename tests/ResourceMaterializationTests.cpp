@@ -108,7 +108,6 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   AddValueBlock(program);
-  program.info.uses_dma = true;
   return Extract(program);
 }
 
@@ -1473,15 +1472,9 @@ void TestShaderCacheRecords() {
 
 namespace Common {
 
-int DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
+void DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
 
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
-  std::abort();
-}
-
-int DbgExitIfHandler(const char *, const char *, int) { return 1; }
-
-void DbgExit(int) { std::abort(); }
+void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 

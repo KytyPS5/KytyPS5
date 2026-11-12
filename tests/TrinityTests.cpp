@@ -2,7 +2,6 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
-#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -25,7 +24,6 @@ namespace Pm4 = Libs::Graphics::Pm4;
 
 TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 	static Common::Subsystems subsystems;
-	Common::VirtualMemory::Init();
 	Common::InitializeThreads();
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::ConfigOptions options;

@@ -17,12 +17,7 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -594,10 +589,16 @@ void TestGpuDirtyBits() {
             !tracker.IsRegionGpuModified(address + page_size, page_size) &&
             Protection(memory) == PAGE_NOACCESS,
         "GPU dirty state escaped the requested range");
+  // CPU-dirtying the next page does not conflict with the GPU-dirty one.
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   Check(!tracker.IsRegionGpuModified(address, page_size) &&
             Protection(memory) == PAGE_READONLY,
         "GPU dirty state did not restore write-only tracking");
+  // Nor does CPU-dirtying the previous page.
+  MarkGpuModified(tracker, address + page_size, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size * 2);
   Release(memory);
 }
@@ -811,6 +812,36 @@ void TestConcurrentColdUploads() {
   Release(memory);
 }
 
+// Runs probe on a thread while an upload of the page at address is parked in
+// its callback, holding that region's lock, and returns whether the probe
+// finished within 5 s.
+template <typename Probe>
+bool RunDuringParkedUpload(MemoryTracker &tracker, uint64_t address,
+                           Probe &&probe) {
+  std::binary_semaphore upload_entered{0};
+  std::binary_semaphore finish_upload{0};
+  std::binary_semaphore probe_finished{0};
+  std::jthread uploader([&] {
+    tracker.ForEachUploadRange(
+        address, Libs::Graphics::TRACKER_PAGE_SIZE, true,
+        [](uint64_t, uint64_t) noexcept {},
+        [&]() noexcept {
+          upload_entered.release();
+          finish_upload.acquire();
+        });
+  });
+  upload_entered.acquire();
+  std::jthread worker([&] {
+    probe();
+    probe_finished.release();
+  });
+  const bool finished = probe_finished.try_acquire_for(std::chrono::seconds(5));
+  finish_upload.release();
+  uploader.join();
+  worker.join();
+  return finished;
+}
+
 void TestUploadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -829,37 +860,44 @@ void TestUploadDoesNotSerializeDisjointRegion() {
             tracker.IsRegionCpuModified(second_region, page_size),
         "disjoint upload setup did not initialize both regions");
 
-  std::binary_semaphore upload_entered{0};
-  std::binary_semaphore finish_upload{0};
-  std::binary_semaphore query_finished{0};
-  std::atomic_bool query_result{false};
-  std::jthread uploader([&] {
-    tracker.ForEachUploadRange(
-        allocation_base, page_size, true, [](uint64_t, uint64_t) noexcept {},
-        [&]() noexcept {
-          upload_entered.release();
-          finish_upload.acquire();
-        });
-  });
-  upload_entered.acquire();
-  std::jthread query([&] {
-    query_result.store(tracker.IsRegionCpuModified(second_region, page_size),
-                       std::memory_order_relaxed);
-    query_finished.release();
-  });
-
   const bool completed_while_upload_blocked =
-      query_finished.try_acquire_for(std::chrono::seconds(5));
-  finish_upload.release();
-  uploader.join();
-  query.join();
+      RunDuringParkedUpload(tracker, allocation_base, [&] {
+        MarkGpuModified(tracker, second_region, page_size);
+      });
+  const bool second_marked =
+      tracker.IsRegionGpuModified(second_region, page_size);
 
   tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
+  tracker.UnmarkRegionAsGpuModified(second_region, page_size);
   tracker.MarkRegionAsCpuModified(allocation_base, region_size * 2);
   Release(memory);
-  Check(completed_while_upload_blocked &&
-            query_result.load(std::memory_order_relaxed),
+  Check(completed_while_upload_blocked && second_marked,
         "upload callback serialized an unrelated tracker region");
+}
+
+void TestQueriesSkipRegionLock() {
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto *memory = Allocate(1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  bool cpu_modified = true;
+  bool gpu_modified = true;
+  // The upload holds the region lock until its writes are marked.
+  const bool completed_while_upload_blocked =
+      RunDuringParkedUpload(tracker, address, [&] {
+        cpu_modified = tracker.IsRegionCpuModified(address, page_size);
+        gpu_modified = tracker.IsRegionGpuModified(address, page_size);
+      });
+
+  const bool marked = tracker.IsRegionGpuModified(address, page_size);
+  tracker.UnmarkRegionAsGpuModified(address, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size);
+  Release(memory);
+  Check(completed_while_upload_blocked && !cpu_modified && !gpu_modified &&
+            marked,
+        "dirty queries waited for an upload holding the region lock");
 }
 
 void TestDownloadDoesNotSerializeDisjointRegion() {
@@ -1032,7 +1070,7 @@ void TestFullRegionGpuUnmarkBatching() {
     tracker.ForEachUploadRange(
         address, page_size, true, [](uint64_t, uint64_t) noexcept {},
         [&]() noexcept {
-          (void)tracker.IsRegionCpuModified(address, page_size);
+          tracker.MarkRegionAsCpuModified(address, page_size);
         });
   } else if (std::strcmp(name, "recursive-tracking-lock") == 0) {
     Libs::Graphics::TrackingSpinLock lock;
@@ -1201,6 +1239,7 @@ int main(int argc, char **argv) {
   TestCrossRegionUpload();
   TestConcurrentColdUploads();
   TestUploadDoesNotSerializeDisjointRegion();
+  TestQueriesSkipRegionLock();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();

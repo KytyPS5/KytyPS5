@@ -31,12 +31,7 @@
 #include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #endif
 
 namespace Libs::Graphics {
@@ -291,8 +286,6 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
                                            ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
-
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
 	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
@@ -339,7 +332,6 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
-	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
 
@@ -556,7 +548,6 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
-	info                     = {};
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
@@ -632,8 +623,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
-	EXIT_NOT_IMPLEMENTED((context.GetShaderStages() & 0x4u) == 0 ||
-	                     (context.GetShaderStages() & 0x00600020u) != 0);
+	const auto stages = context.GetShaderStages();
+	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0 || (stages & 0x20u) != 0);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
@@ -649,15 +640,18 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
-	input_info = {};
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
+	// LS and HS share the HS wave; the TES runs in the GS wave.
 	input_info[0].logical_stage       = ShaderType::Local;
+	input_info[0].wave_size           = (stages & 0x00200000u) != 0 ? 32u : 64u;
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
+	input_info[1].wave_size           = input_info[0].wave_size;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
+	input_info[2].wave_size           = (stages & 0x00400000u) != 0 ? 32u : 64u;
 	input_info[2].scratch_size_dwords = evaluation.scratch_size_dwords;
 	input_info[2].pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 

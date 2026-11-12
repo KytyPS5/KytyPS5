@@ -22,7 +22,6 @@ struct RemoteFile {
 	QString version;
 	QString format;
 
-	[[nodiscard]] bool IsSupported() const;
 	[[nodiscard]] QUrl Url() const;
 };
 

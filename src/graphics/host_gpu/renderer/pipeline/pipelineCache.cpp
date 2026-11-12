@@ -828,6 +828,16 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				pixel_info.target_export_mapping[1] = {};
 			}
 		}
+		// Packed UNorm targets and alpha blend sources read the mapping while translating.
+		static const bool dynamic_export_mapping = [] {
+			const char* value = std::getenv("KYTY_DYNAMIC_EXPORT_MAPPING");
+			const bool  on    = value != nullptr && *value == '1';
+			if (on) PipelineCacheLog("DynamicExportMapping: one pixel shader module for every target order");
+			return on;
+		}();
+		pixel_info.dynamic_export_mapping =
+		    dynamic_export_mapping && pixel_info.target_packed_unorm_mask == 0 &&
+		    pixel_info.alpha_blend_source == ShaderAlphaBlendSource::None;
 	}
 	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
 	const auto& clip_control = context.GetClipControl();
@@ -914,6 +924,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	auto&    static_params      = key.static_params;
 	auto&    rendering          = key.rendering;
 	uint32_t attachment_samples = 0;
+	if (ps_active && ps_input_info.dynamic_export_mapping) {
+		for (uint32_t i = 0; i < 8u; i++) {
+			static_params.export_mapping[i] = ps_input_info.target_export_mapping[i].packed;
+		}
+	}
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
 		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);

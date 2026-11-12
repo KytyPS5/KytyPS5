@@ -220,10 +220,17 @@ struct ShaderPixelInputInfo {
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
+	// KYTY_DYNAMIC_EXPORT_MAPPING=1: the color component order of each MRT export comes from
+	// specialization constants set at pipeline creation, so one module serves every target order.
+	bool                                           dynamic_export_mapping       = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
+
+// First specialization constant id of the eight MRT export mappings (packed ColorComponentMapping
+// in the low byte, the export index in the next one).
+inline constexpr uint32_t ShaderExportMappingSpecId = 100;
 
 union ShaderStageInputInfo {
 	const ShaderVertexInputInfo*  vertex;

@@ -496,7 +496,9 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	              (uint32_t {info.target_sint_mask} << 24u));
 	const auto mask = info.target_shader_mask;
 	key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
-	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
+	key.push_back(info.dynamic_export_mapping ? 1u : 0u);
+	for (uint32_t base = 0; !info.dynamic_export_mapping && base < info.target_export_mapping.size();
+	     base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
 			packed |= static_cast<uint32_t>(info.target_export_mapping[base + i].packed)

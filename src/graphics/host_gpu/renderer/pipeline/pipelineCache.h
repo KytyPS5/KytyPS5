@@ -70,6 +70,9 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	// KYTY_DYNAMIC_EXPORT_MAPPING: the PS export mappings given to its specialization constants
+	// (all zero when the module has them built in).
+	uint8_t                    export_mapping[8]                                  = {};
 };
 
 struct PipelineRenderingState {

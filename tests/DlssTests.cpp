@@ -1,6 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/pssr.h"
-#include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/renderer/upscaler/dlss.h"
 
 #include <SDL3/SDL_loadso.h>
 #include <array>
@@ -8,6 +8,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <variant>
 
@@ -298,9 +299,8 @@ TEST(DlssTest, EvaluationPassesTheRequest) {
 	EXPECT_EQ(values["Reset"], Value(0));
 }
 
-// DLSS loads the driver's NGX library, which needs one instance extension, only in Pro mode with
-// a model folder.
-TEST(DlssTest, LoadsOnlyInProModeWithAFolder) {
+// DLSS loads NGX, which needs one instance extension, only when selected with a folder.
+TEST(DlssTest, LoadsOnlyWhenSelectedWithAFolder) {
 	auto* ngx = SDL_LoadObject("libnvidia-ngx.so.1");
 	if (ngx == nullptr) {
 		GTEST_SKIP() << "NVIDIA's Linux driver is not installed";
@@ -309,15 +309,20 @@ TEST(DlssTest, LoadsOnlyInProModeWithAFolder) {
 	vk::ExtensionProperties properties2;
 	properties2.extensionName = std::string(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 	Config::Initialize();
-	for (const auto& [pro, folder]: {std::pair {false, "dlss"}, {true, ""}, {true, "dlss"}}) {
+	using enum Config::PssrUpscaler;
+	for (const auto& [pro, upscaler, folder]:
+	     {std::tuple {false, DLSS, "dlss"}, {true, FSR, "dlss"}, {true, DLSS, ""},
+	      {true, DLSS, "dlss"}}) {
 		Config::ConfigOptions options;
-		options.pro_enabled = pro;
-		options.dlss_folder = folder;
+		options.pro_enabled   = pro;
+		options.pssr_upscaler = upscaler;
+		options.dlss_folder   = folder;
 		Config::Load(options);
 		Dlss::Load();
 		std::vector<const char*> extensions;
 		Dlss::AppendExtensions(extensions, {properties2}, false);
-		EXPECT_EQ(extensions.size(), pro && *folder != '\0' ? 1u : 0u) << pro << folder;
+		EXPECT_EQ(extensions.size(), pro && upscaler == DLSS && *folder != '\0' ? 1u : 0u)
+		    << pro << ' ' << static_cast<int>(upscaler) << ' ' << folder;
 		Dlss::Shutdown();
 	}
 	Config::Shutdown();

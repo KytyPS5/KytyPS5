@@ -1,4 +1,4 @@
-#include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/renderer/upscaler/dlss.h"
 
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -34,9 +34,6 @@ constexpr int IS_HDR         = 1 << 0;
 constexpr int MV_LOW_RES     = 1 << 1;
 constexpr int DEPTH_INVERTED = 1 << 3;
 constexpr int AUTO_EXPOSURE  = 1 << 6;
-
-// The request flags a feature fixes at creation.
-constexpr uint32_t FIXED_FLAGS = Pssr::kReverseDepth | Pssr::kAutoExposure;
 
 struct FeatureCommonInfo {
 	const wchar_t* const* paths;
@@ -224,7 +221,11 @@ void SetEvaluation(Parameter& parameters, const Pssr::Request& request, Inputs& 
 }
 
 void Load() {
-	if (!Config::Ps5ProEnabled() || Config::GetDlssFolder().empty()) {
+	if (!Config::Ps5ProEnabled() || Config::GetPssrUpscaler() != Config::PssrUpscaler::DLSS) {
+		return;
+	}
+	if (Config::GetDlssFolder().empty()) {
+		Warn("no model folder is set");
 		return;
 	}
 	OpenCore();

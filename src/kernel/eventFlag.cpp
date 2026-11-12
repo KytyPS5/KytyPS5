@@ -9,6 +9,10 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+namespace Libs::LibKernel {
+void KernelDispatchPendingSignalForCurrentThread();
+} // namespace Libs::LibKernel
+
 namespace Libs::LibKernel::EventFlag {
 
 LIB_NAME("libkernel", "libkernel");
@@ -84,6 +88,7 @@ KernelEventFlagPrivate::~KernelEventFlagPrivate() {
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 
@@ -94,6 +99,7 @@ KernelEventFlagPrivate::~KernelEventFlagPrivate() {
 	while (m_waiting_threads > 0) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 }
@@ -184,6 +190,7 @@ void KernelEventFlagPrivate::Set(uint64_t bits) {
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 
@@ -200,6 +207,7 @@ void KernelEventFlagPrivate::Clear(uint64_t bits) {
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 
@@ -214,6 +222,7 @@ void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 
@@ -229,6 +238,7 @@ void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
 	while (m_waiting_threads > 0) {
 		m_mutex.Unlock();
 		Common::Thread::SleepMicro(10);
+		LibKernel::KernelDispatchPendingSignalForCurrentThread();
 		m_mutex.Lock();
 	}
 

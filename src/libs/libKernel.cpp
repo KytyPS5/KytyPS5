@@ -22,8 +22,8 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
-#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -989,7 +989,7 @@ static bool EnsureHostSignalDispatchInstalled() {
 		struct sigaction action {};
 		action.sa_sigaction = HostSignalDispatchHandler;
 		sigemptyset(&action.sa_mask);
-		action.sa_flags = SA_SIGINFO | SA_RESTART;
+		action.sa_flags         = SA_SIGINFO | SA_RESTART;
 		const int signal_number = Common::HostException::GuestSignalDispatchSignal();
 		return ::sigaction(signal_number, &action, nullptr) == 0;
 	}();
@@ -1232,7 +1232,7 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 	rt->RelocateProgram(program);
 
 	program->load_count = 1;
-	int result = rt->StartModule(program, args, argp, nullptr);
+	int result          = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
 
@@ -1246,8 +1246,8 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 }
 
 int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
-                                        uint32_t flags, const KernelUnloadModuleOpt* opt,
-                                        int* res) {
+                                         uint32_t flags, const KernelUnloadModuleOpt* opt,
+                                         int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -2100,8 +2100,8 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
-                           void* uaddr, const void* timeout) {
+int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value, void* uaddr,
+                         const void* timeout) {
 	constexpr int UMTX_OP_WAIT = 2;
 	constexpr int UMTX_OP_WAKE = 3;
 
@@ -2116,12 +2116,13 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 					*GetErrorAddr() = POSIX_EINVAL;
 					return -1;
 				}
-				const auto max_ns = std::chrono::nanoseconds::max().count();
+				const auto max_ns     = std::chrono::nanoseconds::max().count();
 				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
 				                            ? max_ns
 				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
 				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
+				    static_cast<volatile uint64_t*>(address), value,
+				    std::chrono::nanoseconds(timeout_ns),
 				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
 			}
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
@@ -2356,7 +2357,29 @@ struct FiberThreadContext {
 	FiberObject*    returned_fiber;
 	FiberObject*    pending_idle_fiber;
 	FiberCpuContext cpu_context;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	uintptr_t thread_stack_base;
+	uintptr_t thread_stack_limit;
+#endif
 };
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+static void FiberGetThreadStackBounds(uintptr_t* stack_base, uintptr_t* stack_limit) {
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(*stack_base), "=r"(*stack_limit)
+	             :
+	             : "memory");
+}
+
+static void FiberSetThreadStackBounds(uintptr_t stack_base, uintptr_t stack_limit) {
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(stack_base), "r"(stack_limit)
+	             : "memory");
+}
+#endif
 
 static const auto g_fiber_context_key = [] {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2402,10 +2425,10 @@ static void FiberStoreState(FiberObject* fiber, uint32_t state) {
 }
 
 static void FiberCompleteSwitch(FiberObject* current) {
-	auto* context = FiberGetThreadContext();
+	auto* context          = FiberGetThreadContext();
 	context->current_fiber = current;
 	// Only publish IDLE after switching away from the departing fiber's stack.
-	auto* fiber = context->pending_idle_fiber;
+	auto* fiber                 = context->pending_idle_fiber;
 	context->pending_idle_fiber = nullptr;
 	if (fiber != nullptr) {
 		FiberStoreState(fiber, FIBER_STATE_IDLE);
@@ -2512,10 +2535,10 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
 	FiberSetContextValid(fiber, false);
-	fiber->arg_on_return  = 0;
-	auto* context = FiberGetThreadContext();
+	fiber->arg_on_return    = 0;
+	auto* context           = FiberGetThreadContext();
 	context->returned_fiber = fiber;
-	context->current_fiber = nullptr;
+	context->current_fiber  = nullptr;
 
 	FiberRestoreContext(&context->cpu_context, 1);
 }
@@ -2638,16 +2661,31 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	fiber->arg_on_return = 0;
 	// Register on the host stack; switching fibers only reads the native TLS slot.
 	FiberThreadContext context {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	FiberGetThreadStackBounds(&context.thread_stack_base, &context.thread_stack_limit);
+#endif
 	FiberSetThreadContext(&context);
 
 	if (FiberSaveContext(&context.cpu_context) == 0) {
+		// Fibers use guest-provided stacks that can be anywhere in memory. Host stack
+		// probing against the thread's bounds would walk from this fiber into unrelated
+		// pages, so leave the Windows TEB bounds unset until FiberRun resumes.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+		FiberSetThreadStackBounds(0, 0);
+#endif
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
 	}
 
-	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	// FiberReturnToThread and the fiber trampoline restore the caller context. Reinstate
+	// the bounds belonging to the native thread that entered FiberRun (fibers may migrate).
+	FiberSetThreadStackBounds(context.thread_stack_base, context.thread_stack_limit);
+#endif
+
+	auto* returned_fiber    = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
 	const auto return_value = returned_fiber->arg_on_return;
 	const auto return_code =
 	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
@@ -2709,7 +2747,7 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	}
 
 	const auto* context = FiberGetThreadContext();
-	*fiber = context != nullptr ? context->current_fiber : nullptr;
+	*fiber              = context != nullptr ? context->current_fiber : nullptr;
 
 	return OK;
 }
@@ -2727,7 +2765,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
 		FiberSetContextValid(fiber, true);
-		context->returned_fiber = fiber;
+		context->returned_fiber     = fiber;
 		context->pending_idle_fiber = fiber;
 		FiberRestoreContext(&context->cpu_context, 1);
 	}
@@ -2824,15 +2862,15 @@ void KYTY_SYSV_ABI KernelAioInitializeParam(void* param) {
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 }
 
-constexpr int32_t KERNEL_AIO_STATE_SUBMITTED  = 1;
-constexpr int32_t KERNEL_AIO_STATE_PROCESSING = 2;
-constexpr int32_t KERNEL_AIO_STATE_COMPLETED  = 3;
-constexpr int32_t KERNEL_AIO_STATE_ABORTED    = 4;
-constexpr int32_t KERNEL_AIO_STATE_NOTIFIED   = 0x10000;
-constexpr int32_t KERNEL_AIO_MAX_QUEUE        = 512;
-constexpr int32_t KERNEL_AIO_MAX_REQUESTS     = 128;
-constexpr uint32_t KERNEL_AIO_WAIT_AND        = 1;
-constexpr uint32_t KERNEL_AIO_WAIT_OR         = 2;
+constexpr int32_t  KERNEL_AIO_STATE_SUBMITTED  = 1;
+constexpr int32_t  KERNEL_AIO_STATE_PROCESSING = 2;
+constexpr int32_t  KERNEL_AIO_STATE_COMPLETED  = 3;
+constexpr int32_t  KERNEL_AIO_STATE_ABORTED    = 4;
+constexpr int32_t  KERNEL_AIO_STATE_NOTIFIED   = 0x10000;
+constexpr int32_t  KERNEL_AIO_MAX_QUEUE        = 512;
+constexpr int32_t  KERNEL_AIO_MAX_REQUESTS     = 128;
+constexpr uint32_t KERNEL_AIO_WAIT_AND         = 1;
+constexpr uint32_t KERNEL_AIO_WAIT_OR          = 2;
 
 struct KernelAioResult {
 	int64_t  return_value;
@@ -2941,9 +2979,10 @@ static int32_t kernel_aio_get_state(int32_t id, bool notify) {
 	}
 
 	auto current = g_kernel_aio_state[id].load(std::memory_order_acquire);
-	while (notify && (current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED)) {
-		if (g_kernel_aio_state[id].compare_exchange_weak(current, current | KERNEL_AIO_STATE_NOTIFIED,
-		                                                std::memory_order_acq_rel)) {
+	while (notify &&
+	       (current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED)) {
+		if (g_kernel_aio_state[id].compare_exchange_weak(
+		        current, current | KERNEL_AIO_STATE_NOTIFIED, std::memory_order_acq_rel)) {
 			break;
 		}
 	}
@@ -2986,21 +3025,23 @@ int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* stat
 	}
 
 	const auto collect_states = [&](bool notify) {
-		int32_t finished = 0;
-		bool newly_complete = false;
+		int32_t finished       = 0;
+		bool    newly_complete = false;
 		for (int32_t i = 0; i < num; i++) {
 			const auto current = kernel_aio_get_state(ids[i], notify);
-			states[i] = current;
+			states[i]          = current;
 			finished += current != KERNEL_AIO_STATE_PROCESSING;
-			newly_complete |= current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED;
+			newly_complete |=
+			    current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED;
 		}
 		return finished == num || (mode == KERNEL_AIO_WAIT_OR && newly_complete);
 	};
 	const auto start = std::chrono::steady_clock::now();
 	for (;;) {
-		const bool complete = collect_states(false);
-		const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-		                         std::chrono::steady_clock::now() - start).count();
+		const bool complete  = collect_states(false);
+		const auto elapsed   = std::chrono::duration_cast<std::chrono::microseconds>(
+		                           std::chrono::steady_clock::now() - start)
+		                           .count();
 		const bool timed_out = usec != nullptr && elapsed >= *usec;
 		if (complete || timed_out) {
 			// A competing waiter can claim the newly completed request after the first scan.

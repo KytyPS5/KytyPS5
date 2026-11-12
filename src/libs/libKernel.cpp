@@ -22,18 +22,20 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
-#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -744,10 +746,6 @@ static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 	return ctx;
 }
 
-static bool IsGuestCodeAddress(uint64_t addr) {
-	return addr >= 0x0000000900000000ull && addr < 0x0000000980000000ull;
-}
-
 static bool IsAddressInRange(uint64_t addr, uint64_t base, uint64_t size) {
 	return size != 0 && addr >= base && addr < base + size;
 }
@@ -767,7 +765,7 @@ static uint64_t GetFallbackStackPointer(Pthread thread) {
 }
 
 static void SanitizeNonGuestSignalUcontext(SignalUcontext* ctx, Pthread thread) {
-	if (ctx == nullptr || IsGuestCodeAddress(ctx->uc_mcontext.mc_rip)) {
+	if (ctx == nullptr || Loader::IsGuestCodeAddress(ctx->uc_mcontext.mc_rip)) {
 		return;
 	}
 
@@ -971,7 +969,7 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 		if (handler != nullptr) {
 			SignalDispatchScope scope;
 			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+			if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
 				handler(signum, &ctx);
 				ApplySignalUcontextToHost(host_ctx, ctx);
 			} else {
@@ -1025,31 +1023,84 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
 	auto*      thread = static_cast<Pthread>(arg1);
 	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!PthreadTakePendingSignal(thread, signum)) {
+	PthreadClearSignalApcQueued(thread);
+	if (!Loader::IsGuestCodeAddress(context->Rip) || !PthreadTakePendingSignal(thread, signum)) {
 		return;
 	}
 
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
 		SignalDispatchScope scope;
-		auto                ctx           = CreateSignalUcontext(context);
-		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
-		if (!guest_context) {
-			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx]() mutable {
-				SignalDispatchScope helper_scope;
-				auto*               previous_self = PthreadSwapSelfForSignal(thread);
-				handler(signum, &ctx);
-				PthreadSwapSelfForSignal(previous_self);
-			}).detach();
-			return;
-		}
+		auto                ctx = CreateSignalUcontext(context);
 		handler(signum, &ctx);
-		if (guest_context) {
-			ApplySignalUcontext(context, ctx);
-		}
+		ApplySignalUcontext(context, ctx);
 	}
 }
+
+static bool QueueSignalApc(Pthread thread, int signum) {
+	if (!PthreadMarkSignalApcQueued(thread)) {
+		return true;
+	}
+
+	auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
+	const auto thread_id              = static_cast<DWORD>(PthreadGetHostThreadId(thread));
+	HANDLE     target_thread =
+	    (nt_queue_apc_thread_ex != nullptr && thread_id != 0)
+	        ? OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, thread_id)
+	        : nullptr;
+	KytyUserApcOption option {};
+	option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
+	const bool queued =
+	    target_thread != nullptr && GetProcessIdOfThread(target_thread) == GetCurrentProcessId() &&
+	    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
+		                       reinterpret_cast<void*>(static_cast<intptr_t>(signum)),
+		                       nullptr) == 0;
+	if (target_thread != nullptr) {
+		CloseHandle(target_thread);
+	}
+	if (!queued) {
+		PthreadClearSignalApcQueued(thread);
+	}
+	return queued;
+}
+
+class SignalRedelivery {
+public:
+	static SignalRedelivery& Instance() {
+		static auto* redelivery = new SignalRedelivery;
+		return *redelivery;
+	}
+
+	void Track(Pthread thread, int signum) {
+		std::lock_guard lock(m_mutex);
+		m_targets.emplace_back(thread, signum);
+		if (!m_started) {
+			m_started = true;
+			std::thread([this] { Run(); }).detach();
+		}
+		m_cv.notify_one();
+	}
+
+private:
+	void Run() {
+		constexpr auto REDELIVERY_INTERVAL = std::chrono::milliseconds(1);
+
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			m_cv.wait(lock, [this] { return !m_targets.empty(); });
+			m_cv.wait_for(lock, REDELIVERY_INTERVAL);
+			std::erase_if(m_targets, [](const auto& target) {
+				return !PthreadHasPendingSignal(target.first, target.second) ||
+				       !QueueSignalApc(target.first, target.second);
+			});
+		}
+	}
+
+	std::mutex                           m_mutex;
+	std::condition_variable              m_cv;
+	std::vector<std::pair<Pthread, int>> m_targets;
+	bool                                 m_started = false;
+};
 
 #endif
 
@@ -1116,8 +1167,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const auto target_thread_id       = PthreadGetHostThreadId(thread);
-		auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
+		const auto target_thread_id = PthreadGetHostThreadId(thread);
 		if (target_thread_id == 0) {
 			return KERNEL_ERROR_EINVAL;
 		}
@@ -1128,35 +1178,16 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			handler(signum, &ctx);
 			return OK;
 		}
-		if (nt_queue_apc_thread_ex == nullptr) {
-			return KERNEL_ERROR_EINVAL;
-		}
-
-		HANDLE target_thread =
-		    OpenThread(THREAD_SET_CONTEXT, FALSE, static_cast<DWORD>(target_thread_id));
-		if (target_thread == nullptr) {
-			return KERNEL_ERROR_EINVAL;
-		}
 
 		PthreadQueuePendingSignal(thread, signum);
-		KytyUserApcOption option {};
-		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
-
-		const auto status =
-		    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
-		                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)), nullptr);
-
-		if (status != 0) {
+		if (!QueueSignalApc(thread, signum)) {
 			PthreadTakePendingSignal(thread, signum);
-			CloseHandle(target_thread);
-			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
-			     "\n",
-			     target_thread_id, status);
+			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 "\n", target_thread_id);
 			return KERNEL_ERROR_EINVAL;
 		}
 
 		PthreadWakeForSignal(thread);
-		CloseHandle(target_thread);
+		SignalRedelivery::Instance().Track(thread, signum);
 		return OK;
 #elif defined(__x86_64__)
 		// Deliver on the target thread.

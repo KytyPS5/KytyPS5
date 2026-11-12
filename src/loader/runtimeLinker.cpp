@@ -216,7 +216,7 @@ constexpr uint64_t INVALID_OFFSET   = 0x040000000u;
 constexpr uint64_t CODE_BASE_OFFSET = 0x100000000u;
 constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 
-static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+static std::atomic<uint64_t> g_desired_base_addr {SYSTEM_RESERVED + CODE_BASE_OFFSET};
 static uint64_t g_invalid_memory    = 0;
 
 static Program*              g_tls_main_program        = nullptr;
@@ -538,6 +538,10 @@ static Common::VirtualMemory::Mode GetMode(Elf64_Word flags) {
 
 		default: return Common::VirtualMemory::Mode::NoAccess;
 	}
+}
+
+bool IsGuestCodeAddress(uint64_t address) {
+	return address >= SYSTEM_RESERVED + CODE_BASE_OFFSET && address < g_desired_base_addr;
 }
 
 struct GuestStackFrame {

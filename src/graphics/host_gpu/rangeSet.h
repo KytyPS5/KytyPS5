@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -42,13 +43,22 @@ public:
 		while (it != m_ranges.end() && it->first < end) {
 			const auto begin = it->first;
 			const auto last  = it->second;
-			it               = m_ranges.erase(it);
 			if (begin < address) {
-				m_ranges.emplace(begin, address);
-			}
-			if (last > end) {
-				m_ranges.emplace(end, last);
+				if (last > end) {
+					m_ranges.emplace_hint(std::next(it), end, last);
+					it->second = address;
+					break;
+				}
+				it->second = address;
+				++it;
+			} else if (last > end) {
+				const auto next = std::next(it);
+				auto node       = m_ranges.extract(it);
+				node.key()      = end;
+				m_ranges.insert(next, std::move(node));
 				break;
+			} else {
+				it = m_ranges.erase(it);
 			}
 		}
 	}

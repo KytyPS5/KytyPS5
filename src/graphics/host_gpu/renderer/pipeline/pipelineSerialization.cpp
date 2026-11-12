@@ -68,8 +68,10 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 		return {};
 	}
 	Writer header;
+	// A host with a different native subgroup emits different wave32 fallback SPIR-V.
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize,
+	      graphics.subgroup_size, graphics.compute_subgroup_size_control_enabled);
 	return std::move(header.bytes);
 }
 

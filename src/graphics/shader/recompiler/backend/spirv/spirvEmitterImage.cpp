@@ -661,6 +661,115 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return texel;
 }
 
+// Every indirect geometry query needs its own static descriptor, so a candidate list longer than
+// the shared-query budget stops using one body per candidate and folds runs of consecutive slots
+// into loops instead.
+
+// A materialized image array can hold hundreds of candidates. One query body per candidate is
+// exact but grows the module with the array, so long runs of consecutive descriptor slots share a
+// single loop: its induction variable is wave-uniform, which keeps every query in the run uniform,
+// and the per-lane answer is picked with a predicate. The subgroup vote then skips the candidates
+// no lane of the subgroup asked for, so an iteration that no lane needs costs a compare and a vote
+// instead of an image query.
+template <typename Emit>
+uint32_t EmitSharedIndirectImageQuery(ValueEmitContext& ctx, uint32_t result_type,
+                                      uint32_t selected, const IR::ImageResource& image,
+                                      const Emit& emit) {
+	auto& state = ctx.state;
+	const auto& images     = state.program.info.images;
+	const auto& candidates = image.indirect_resources;
+	const auto ContinuesRun = [&](uint32_t ordinal) {
+		const auto& current  = images[candidates[ordinal]];
+		const auto& previous = images[candidates[ordinal - 1u]];
+		// A run shares one descriptor array, one query shape and consecutive slots, so the loop
+		// index alone addresses every candidate of the run.
+		return current.descriptor_index != UINT32_MAX &&
+		       current.descriptor_index == previous.descriptor_index + 1u &&
+		       current.dimension == previous.dimension &&
+		       IR::DescriptorBindingForImage(current) == IR::DescriptorBindingForImage(previous);
+	};
+	const auto Matches = [&](uint32_t ordinal) {
+		return Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, ordinal));
+	};
+	// Query geometry is always a four-component vector, so a lane predicate needs broadcasting
+	// before it can select a whole result (a scalar condition may only select a scalar).
+	const auto Pick = [&](uint32_t condition, uint32_t value, uint32_t otherwise) {
+		const auto lanes = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4), lanes,
+		                          condition, condition, condition, condition);
+		return Select(state, result_type, lanes, value, otherwise);
+	};
+	// The first candidate also answers unmapped keys, exactly like the switch's default case.
+	auto result = emit(candidates.front(), 0u);
+	for (uint32_t first = 1u; first < candidates.size();) {
+		auto count = 1u;
+		while (first + count < candidates.size() && ContinuesRun(first + count)) count++;
+		if (count == 1u) {
+			result = Pick(Matches(first), emit(candidates[first], 0u), result);
+			first += count;
+			continue;
+		}
+		const auto base      = images[candidates[first]].descriptor_index;
+		const auto preheader = state.builder.AllocateId();
+		const auto header    = state.builder.AllocateId();
+		const auto body      = state.builder.AllocateId();
+		const auto cont      = state.builder.AllocateId();
+		const auto merge     = state.builder.AllocateId();
+		const auto index     = state.builder.AllocateId();
+		const auto next      = state.builder.AllocateId();
+		const auto carry     = state.builder.AllocateId();
+		const auto stepped   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBranch, preheader);
+		EmitLabel(state, preheader);
+		state.builder.AddFunction(spv::OpBranch, header);
+		EmitLabel(state, header);
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), index, ConstantU32(state, 0u),
+		                          preheader, next, cont);
+		state.builder.AddFunction(spv::OpPhi, result_type, carry, result, preheader, stepped, cont);
+		const auto more = Binary(state, spv::OpULessThan, TypeBool(state), index,
+		                         ConstantU32(state, count));
+		state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, more, body, merge);
+		EmitLabel(state, body);
+		const auto hit = Binary(state, spv::OpIEqual, TypeBool(state), selected,
+		                        Binary(state, spv::OpIAdd, TypeU32(state), index,
+		                               ConstantU32(state, first)));
+		const auto wanted = state.builder.AllocateId();
+		if (state.program.wave_size == 32u && state.host_subgroup_size != 32u) {
+			// The wave sharing this native subgroup sits at a different instruction, so the vote may
+			// only read the caller's ballot word.
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+			const auto word = ctx.HalfBallotWord(ctx.BallotOf(hit));
+			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), wanted, word,
+			                          ConstantU32(state, 0u));
+		} else {
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+			state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+			state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), wanted,
+			                          ConstantU32(state, spv::ScopeSubgroup), hit);
+		}
+		const auto taken  = state.builder.AllocateId();
+		const auto joined = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, joined, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, wanted, taken, joined);
+		EmitLabel(state, taken);
+		const auto slot  = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, base));
+		const auto value = Pick(hit, emit(candidates[first], slot), carry);
+		state.builder.AddFunction(spv::OpBranch, joined);
+		EmitLabel(state, joined);
+		state.builder.AddFunction(spv::OpPhi, result_type, stepped, value, taken, carry, body);
+		state.builder.AddFunction(spv::OpBranch, cont);
+		EmitLabel(state, cont);
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next, index, ConstantU32(state, 1u));
+		state.builder.AddFunction(spv::OpBranch, header);
+		EmitLabel(state, merge);
+		result = carry;
+		first += count;
+	}
+	return result;
+}
+
 template <typename Emit>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
                      const Emit& emit) {
@@ -698,6 +807,22 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto selected = EmitIndirectResourceIndex(
 	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
+	if constexpr (!std::is_void_v<std::invoke_result_t<Emit, uint32_t, uint32_t>>) {
+		if (inst.GetOpcode() == IR::ValueOpcode::ImageQueryDimensions) {
+			// A lane-selected descriptor cannot drive an image query: drivers resolve the
+			// descriptor with one wave-uniform index, so every lane would report the first
+			// lane's geometry. Query one static slot per candidate, like the indirect
+			// buffer length chains.
+			if (image.indirect_resources.size() <= MaxIndirectQueryBodies) {
+				return EmitIndexSwitch(state, selected,
+				                       static_cast<uint32_t>(image.indirect_resources.size()),
+				                       result_type, [&](uint32_t ordinal) {
+					                       return emit(image.indirect_resources[ordinal], 0u);
+					                       });
+			}
+			return EmitSharedIndirectImageQuery(ctx, result_type, selected, image, emit);
+		}
+	}
 	const auto SameType = [&](uint32_t lhs, uint32_t rhs) {
 		const auto& first = state.program.info.images[lhs];
 		const auto& second = state.program.info.images[rhs];

@@ -388,6 +388,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
+	if (ShaderWorkgroupInput(options.stage, options.input_info) == nullptr) {
+		// Graphics stages have no workgroup metadata; their native subgroups are the device's.
+		options.host_subgroup_size = m_graphics.subgroup_size;
+	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;

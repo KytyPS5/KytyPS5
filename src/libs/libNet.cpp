@@ -112,6 +112,10 @@ int KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
 	return FinishSocketCall(Net::Getsockname(s, addr, addrlen));
 }
 
+int KYTY_SYSV_ABI NetGetpeername(int s, void* addr, uint32_t* addrlen) {
+	return FinishSocketCall(Net::Getpeername(s, addr, addrlen));
+}
+
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
 	return FinishNetCall(Net::NetPoolCreate(name, size, flags));
 }
@@ -262,6 +266,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("6Oc0bLsIYe0", LibNet::NetGetMacAddress);
 	LIB_FUNC("hLuXdjHnhiI", LibNet::NetGetSockInfo);
 	LIB_FUNC("hoOAofhhRvE", LibNet::NetGetsockname);
+	LIB_FUNC("TCkRD0DWNLg", LibNet::NetGetpeername);
 	LIB_FUNC("SF47kB2MNTo", LibNet::NetEpollCreate);
 	LIB_FUNC("ZVw46bsasAk", LibNet::NetEpollControl);
 	LIB_FUNC("drjIbDbA7UQ", LibNet::NetEpollWait);

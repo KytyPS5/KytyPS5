@@ -203,8 +203,9 @@ sudo apt-get install --no-install-recommends \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, and Widgets) is required for the launcher. Use your distribution's
-packages (`qt6-base-dev`) or an official Qt installation.
+Qt 6 (Concurrent, Network, Widgets, and LinguistTools) is required for the launcher. On Debian
+or Ubuntu, install `qt6-base-dev` and `qt6-tools-dev-tools`; other distributions package the
+equivalent LinguistTools component separately or with their base Qt development package.
 
 ```bash
 git submodule update --init --recursive
@@ -282,7 +283,7 @@ sudo dnf install -y \
   mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
   libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
   alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
-  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+  wayland-devel wayland-protocols-devel qt6-qtbase-devel qt6-qttools-devel
 ```
 
 From the repository root, follow the launcher configure, build and install steps in

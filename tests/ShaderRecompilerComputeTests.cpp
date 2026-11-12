@@ -56,6 +56,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -58566,6 +58567,387 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void SetDeadLaneWave64(TestCase *test) {
+  test->compute_info.threads_num[0] = 64;
+  test->compute_info.threads_num[1] = test->compute_info.threads_num[2] = 1;
+  test->compute_info.thread_ids_num = 1;
+  test->compute_info.wave_size = 64;
+  test->has_compute_info = true;
+}
+
+TestCase DeadLaneEarlyOut() {
+  TestCase test;
+  test.name = "DeadLaneEarlyOut";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  AppendVMovU32(&code, 2, 7);
+  code.push_back(EncodeSMovB32(22, InlineU32(1)));
+  code.push_back(EncodeVopc(0xd1, 22, 1)); // v_cmpx_lt_u32 exec, s22, v1
+  const auto exit_branch = static_cast<u32>(code.size());
+  code.push_back(0);                                    // s_cbranch_execz exit
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));      // v_add_nc_u32 v2, v1, v2
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2)); // v_add_nc_u32 v2, 1, v2
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  code[exit_branch] = EncodeSopp(0x08, static_cast<u32>(code.size()) - exit_branch - 1u);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,       ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,       ShaderOpcode::V_CMPX_LT_U32,
+                  ShaderOpcode::S_CBRANCH_EXECZ, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_LSHLREV_B32,   ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 low = lane & 3u;
+    test.expected.push_back(low > 1u ? 7u + low + 1u : 0x5a5a5a5au);
+  }
+  return test;
+}
+
+TestCase DeadLaneRestoredExec() {
+  TestCase test;
+  test.name = "DeadLaneRestoredExec";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  AppendVMovU32(&code, 2, 100);
+  code.push_back(EncodeSMovB32(22, InlineU32(1)));
+  code.push_back(EncodeSop1(0x04, 20, 126));            // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd1, 22, 1));              // v_cmpx_lt_u32 exec, s22, v1
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 1)); // v_add_nc_u32 v2, 1, v1
+  code.push_back(EncodeSop1(0x04, 126, 20));            // s_mov_b64 exec, s[20:21]
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_LT_U32, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_LSHLREV_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 low = lane & 3u;
+    test.expected.push_back(low > 1u ? low + 1u : 100u);
+  }
+  return test;
+}
+
+TestCase DeadLaneRegionTemporary() {
+  TestCase test;
+  test.name = "DeadLaneRegionTemporary";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  AppendVMovU32(&code, 2, 100);
+  code.push_back(EncodeSMovB32(22, InlineU32(1)));
+  code.push_back(EncodeSop1(0x04, 20, 126));            // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd1, 22, 1));              // v_cmpx_lt_u32 exec, s22, v1
+  code.push_back(EncodeVop2(0x25, 3, InlineU32(5), 1)); // v_add_nc_u32 v3, 5, v1
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(3), 3));      // v_add_nc_u32 v2, v3, v3
+  code.push_back(EncodeSop1(0x04, 126, 20));            // s_mov_b64 exec, s[20:21]
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_LT_U32, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_LSHLREV_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 low = lane & 3u;
+    test.expected.push_back(low > 1u ? 2u * (low + 5u) : 100u);
+  }
+  return test;
+}
+
+// A write under `v1 < 16`, read back only under a later `v1 < limit`: lanes the first EXEC left
+// out are observed exactly when limit > 16.
+TestCase DeadLaneRangeRegions(u32 limit) {
+  TestCase test;
+  test.name = limit <= 16u ? "DeadLaneNarrowerRegion" : "DeadLaneWiderRegion";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(63), 0)); // v_and_b32 v1, 63, v0
+  AppendVMovU32(&code, 2, 100);
+  AppendVMovU32(&code, 3, 200);
+  code.push_back(EncodeSMovB32(22, InlineU32(16)));
+  code.push_back(EncodeSMovB32(23, InlineU32(limit)));
+  code.push_back(EncodeSop1(0x04, 20, 126));            // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd4, 22, 1));              // v_cmpx_gt_u32 exec, s22, v1
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(5), 1)); // v_add_nc_u32 v2, 5, v1
+  code.push_back(EncodeSop1(0x04, 126, 20));            // s_mov_b64 exec, s[20:21]
+  code.push_back(EncodeVopc(0xd4, 23, 1));              // v_cmpx_gt_u32 exec, s23, v1
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(2), 2));      // v_add_nc_u32 v3, v2, v2
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_GT_U32, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_LSHLREV_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    test.expected.push_back(lane >= limit ? 0x5a5a5a5au : lane < 16u ? 2u * (lane + 5u) : 200u);
+  }
+  return test;
+}
+
+// EXEC holds only lane i in iteration i: each lane must store v2 incremented exactly once.
+TestCase DeadLaneLoopCarried() {
+  TestCase test;
+  test.name = "DeadLaneLoopCarried";
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 7);
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));
+  code.push_back(EncodeSop1(0x04, 22, 126)); // s_mov_b64 s[22:23], exec
+  const auto loop = code.size();
+  code.push_back(EncodeSop2(0x1f, 126, InlineU32(1), 20)); // s_lshl_b64 exec, 1, s20
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));    // v_add_nc_u32 v2, 1, v2
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  code.push_back(EncodeSop1(0x04, 126, 22));               // s_mov_b64 exec, s[22:23]
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));  // s_add_u32 s20, s20, 1
+  code.push_back(EncodeSopc(0x0a, 20, InlineU32(64)));     // s_cmp_lt_u32 s20, 64
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_MOV_B32,         ShaderOpcode::S_MOV_B32,
+                  ShaderOpcode::S_MOV_B64,         ShaderOpcode::S_LSHL_B64,
+                  ShaderOpcode::V_ADD_NC_U32,      ShaderOpcode::V_LSHLREV_B32,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ADD_U32,
+                  ShaderOpcode::S_CMP_LT_U32,      ShaderOpcode::S_CBRANCH_SCC1,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  test.expected.assign(64, 8u);
+  return test;
+}
+
+// A uniform loop inside one EXEC region set before the loop.
+TestCase DeadLaneUniformLoop() {
+  TestCase test;
+  test.name = "DeadLaneUniformLoop";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  AppendVMovU32(&code, 2, 100);
+  code.push_back(EncodeSMovB32(22, InlineU32(1)));
+  code.push_back(EncodeSop1(0x04, 20, 126)); // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd1, 22, 1));   // v_cmpx_lt_u32 exec, s22, v1
+  code.push_back(EncodeSMovB32(24, InlineU32(0)));
+  const auto loop = code.size();
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));        // v_add_nc_u32 v2, v1, v2
+  code.push_back(EncodeSop2(0x00, 24, 24, InlineU32(1))); // s_add_u32 s24, s24, 1
+  code.push_back(EncodeSopc(0x0a, 24, InlineU32(4)));     // s_cmp_lt_u32 s24, 4
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  code.push_back(EncodeSop1(0x04, 126, 20)); // s_mov_b64 exec, s[20:21]
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_LT_U32, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::S_ADD_U32,     ShaderOpcode::S_CMP_LT_U32,
+                  ShaderOpcode::S_CBRANCH_SCC1, ShaderOpcode::V_LSHLREV_B32,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 low = lane & 3u;
+    test.expected.push_back(low > 1u ? 100u + 4u * low : 0x5a5a5a5au);
+  }
+  return test;
+}
+
+// V_READFIRSTLANE under an empty EXEC reads lane 0, which the write before it left alone.
+TestCase DeadLaneReadFirstLaneEmptyExec() {
+  TestCase test;
+  test.name = "DeadLaneReadFirstLaneEmptyExec";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(63), 0)); // v_and_b32 v1, 63, v0
+  AppendVMovU32(&code, 2, 100);
+  code.push_back(EncodeSMovB32(22, InlineU32(64)));
+  code.push_back(EncodeSop1(0x04, 20, 126));            // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd1, 22, 1));              // v_cmpx_lt_u32 exec, s22, v1
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(5), 1)); // v_add_nc_u32 v2, 5, v1
+  code.push_back(EncodeVop1(0x02, 24, Vgpr(2)));        // v_readfirstlane_b32 s24, v2
+  code.push_back(EncodeSop1(0x04, 126, 20));            // s_mov_b64 exec, s[20:21]
+  AppendStoreSgpr(&code, 24, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_LT_U32, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_READFIRSTLANE_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial = {0x5a5a5a5au};
+  test.expected = {100u};
+  return test;
+}
+
+// Lanes leave once v2 reaches their index; only v2 is read after the loop.
+TestCase DeadLaneDivergentLoop() {
+  TestCase test;
+  test.name = "DeadLaneDivergentLoop";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(63), 0)); // v_and_b32 v1, 63, v0
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 4, 0);
+  code.push_back(EncodeSop1(0x04, 20, 126)); // s_mov_b64 s[20:21], exec
+  const auto loop = code.size();
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2)); // v_add_nc_u32 v2, 1, v2
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(2), 2));      // v_add_nc_u32 v3, v2, v2
+  code.push_back(EncodeVop2(0x25, 4, InlineU32(3), 4)); // v_add_nc_u32 v4, 3, v4
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 64);
+  code.push_back(EncodeVopc(0xd1, Vgpr(2), 1)); // v_cmpx_lt_u32 exec, v2, v1
+  code.push_back(EncodeSopp(0x09, static_cast<int16_t>(loop - code.size() - 1u)));
+  code.push_back(EncodeSop1(0x04, 126, 20)); // s_mov_b64 exec, s[20:21]
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 128);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,       ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B64,       ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_LSHLREV_B32,   ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::V_CMPX_LT_U32,   ShaderOpcode::S_CBRANCH_EXECNZ,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(192, 0x5a5a5a5au);
+  test.expected.resize(192);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 iterations = std::max(lane, 1u);
+    test.expected[lane] = 2u * iterations;
+    test.expected[64 + lane] = 3u * iterations;
+    test.expected[128 + lane] = iterations;
+  }
+  return test;
+}
+
+// Two writes of v2 in one EXEC region, read after it by every lane.
+TestCase DeadLaneOverwriteChain() {
+  TestCase test;
+  test.name = "DeadLaneOverwriteChain";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  AppendVMovU32(&code, 2, 5);
+  code.push_back(EncodeSMovB32(22, InlineU32(1)));
+  code.push_back(EncodeSop1(0x04, 20, 126));            // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd1, 22, 1));              // v_cmpx_lt_u32 exec, s22, v1
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(7), 1)); // v_add_nc_u32 v2, 7, v1
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2)); // v_add_nc_u32 v2, 1, v2
+  code.push_back(EncodeSop1(0x04, 126, 20));            // s_mov_b64 exec, s[20:21]
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_LT_U32, ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_LSHLREV_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const u32 low = lane & 3u;
+    test.expected.push_back(low > 1u ? 8u + low : 5u);
+  }
+  return test;
+}
+
+// v2 written under `v1 > 1`, then under `v1 < 3`: lane 3 keeps the first write.
+TestCase DeadLaneCrossingOverwrite() {
+  TestCase test;
+  test.name = "DeadLaneCrossingOverwrite";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  AppendVMovU32(&code, 2, 5);
+  code.push_back(EncodeSMovB32(22, InlineU32(1)));
+  code.push_back(EncodeSMovB32(23, InlineU32(3)));
+  code.push_back(EncodeSop1(0x04, 20, 126)); // s_mov_b64 s[20:21], exec
+  code.push_back(EncodeVopc(0xd1, 22, 1));   // v_cmpx_lt_u32 exec, s22, v1
+  AppendVMovU32(&code, 2, 10);
+  code.push_back(EncodeSop1(0x04, 126, 20)); // s_mov_b64 exec, s[20:21]
+  code.push_back(EncodeVopc(0xd4, 23, 1));   // v_cmpx_gt_u32 exec, s23, v1
+  AppendVMovU32(&code, 2, 20);
+  code.push_back(EncodeSop1(0x04, 126, 20)); // s_mov_b64 exec, s[20:21]
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,     ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::S_MOV_B32,     ShaderOpcode::S_MOV_B64,
+                  ShaderOpcode::V_CMPX_LT_U32, ShaderOpcode::V_CMPX_GT_U32,
+                  ShaderOpcode::V_LSHLREV_B32, ShaderOpcode::BUFFER_STORE_DWORD,
+                  ShaderOpcode::S_ENDPGM};
+  SetDeadLaneWave64(&test);
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    test.expected.push_back((lane & 3u) < 3u ? 20u : 10u);
+  }
+  return test;
+}
+
+size_t CountVgprWriteMasks(const ShaderRecompiler::IR::Program &program) {
+  size_t count = 0;
+  for (const auto *block : program.blocks) {
+    for (const auto &inst : *block) {
+      count += inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SelectU32 &&
+                       inst.Flags<uint64_t>() == ShaderRecompiler::IR::VgprWriteMaskFlag
+                   ? 1u
+                   : 0u;
+    }
+  }
+  return count;
+}
+
+void CheckDeadLaneWriteMasks(VulkanHarness &vulkan) {
+  const auto early_out = DeadLaneEarlyOut();
+  const auto restored = DeadLaneRestoredExec();
+  const auto temporary = DeadLaneRegionTemporary();
+  const auto narrower = DeadLaneRangeRegions(4);
+  const auto wider = DeadLaneRangeRegions(32);
+  const auto carried = DeadLaneLoopCarried();
+  const auto uniform_loop = DeadLaneUniformLoop();
+  const auto first_lane = DeadLaneReadFirstLaneEmptyExec();
+  const auto divergent = DeadLaneDivergentLoop();
+  const auto chain = DeadLaneOverwriteChain();
+  const auto crossing = DeadLaneCrossingOverwrite();
+  const auto masks = [](const TestCase &test, int mode) {
+    ShaderRecompiler::IR::OverrideDeadLaneWriteMasks(mode);
+    const auto compiled = CompileCase(test, 32u);
+    ShaderRecompiler::IR::OverrideDeadLaneWriteMasks(-1);
+    return CountVgprWriteMasks(compiled.program);
+  };
+  const auto early_kept = masks(early_out, 0);
+  const auto early_left = masks(early_out, 1);
+  Require(early_out.name, "dead-lane masks", early_left < early_kept,
+          "writes after a V_CMPX early-out kept their inactive-lane select");
+  Require(restored.name, "dead-lane masks", masks(restored, 1) == masks(restored, 0),
+          "a write whose lanes come back lost its inactive-lane select");
+  const auto temporary_kept = masks(temporary, 0);
+  const auto temporary_left = masks(temporary, 1);
+  Require(temporary.name, "lane demand masks",
+          temporary_left < temporary_kept && temporary_left >= 1u,
+          "the region temporary kept its select, or the value read after the region lost it");
+  Require(narrower.name, "lane demand masks", masks(narrower, 1) == 0u,
+          "a value read only under a narrower range compare kept its select");
+  Require(wider.name, "lane demand masks", masks(wider, 1) >= 1u,
+          "a value read in lanes its EXEC left out lost its select");
+  const auto carried_kept = masks(carried, 0);
+  const auto carried_left = masks(carried, 1);
+  Require(carried.name, "lane demand masks", carried_left >= 1u && carried_left < carried_kept,
+          "the loop-carried value lost its select, or the per-iteration address kept its own");
+  Require(uniform_loop.name, "lane demand masks",
+          masks(uniform_loop, 1) < masks(uniform_loop, 0),
+          "a loop inside one EXEC region kept its write masks");
+  Require(first_lane.name, "lane demand masks", masks(first_lane, 1) == masks(first_lane, 0),
+          "a value V_READFIRSTLANE reads under an empty EXEC lost its select");
+  Require(divergent.name, "lane demand masks", masks(divergent, 1) == 1u,
+          "only the counter read after the shrinking loop should keep its select");
+  Require(chain.name, "lane demand masks", masks(chain, 1) == 1u,
+          "a write the region overwrites again kept its select");
+  for (const int mode : {1, 0}) {
+    ShaderRecompiler::IR::OverrideDeadLaneWriteMasks(mode);
+    for (const auto *test : {&early_out, &restored, &temporary, &narrower, &wider, &carried,
+                             &uniform_loop, &first_lane, &divergent, &chain, &crossing}) {
+      RunCase(&vulkan, *test);
+    }
+  }
+  ShaderRecompiler::IR::OverrideDeadLaneWriteMasks(-1);
+  std::printf("[compute] %-32s ok (selects %zu -> %zu)\n", "DeadLaneWriteMasks", early_kept,
+              early_left);
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -58650,6 +59032,11 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, test);
       }
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dead-lane-only") == 0) {
+    VulkanHarness vulkan;
+    CheckDeadLaneWriteMasks(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
@@ -59982,6 +60369,7 @@ int main(int argc, char **argv) {
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
+  CheckDeadLaneWriteMasks(vulkan);
   CheckSamplerCandidateTables(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();

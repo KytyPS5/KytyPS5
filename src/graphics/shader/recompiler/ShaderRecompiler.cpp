@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/passes/AddressRanges.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -683,6 +684,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
 			     stage, ir.shader_hash, traced);
 		}
+	}
+	if (IR::EliminateUndemandedWriteMasks(ir) != 0) {
+		IR::RemoveIdentities(ir);
+		IR::EliminateDeadCode(ir.blocks);
 	}
 
 	IR::CollectShaderInfo(ir, options.input_info);

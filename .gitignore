@@ -1,4 +1,5 @@
 # Visual Studio 2015 cache/options directory
+.claude/
 .vs/
 .idea/
 build/

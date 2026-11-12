@@ -1,11 +1,21 @@
 #include "mainDialog.h"
 #include "launcherTheme.h"
+#include "settingsElevation.h"
 
 #include <QApplication>
 #include <QIcon>
 
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
+
+	// Elevated copy of the configuration file, started by the launcher itself when it cannot save.
+	const QStringList args = QCoreApplication::arguments();
+	if ((args.size() == 4 || args.size() == 5) &&
+	    args.at(1) == QLatin1String(SettingsElevation::COPY_SETTINGS_ARG)) {
+		return SettingsElevation::CopySettings(args.at(2), args.at(3),
+		                                       args.size() == 5 ? args.at(4) : QString());
+	}
+
 	// Title bars and taskbars get the bolder small-size artwork.
 	const QIcon small_art(QStringLiteral(":/icons/kyty-small.svg"));
 	const QIcon large_art(QStringLiteral(":/icons/kyty.svg"));

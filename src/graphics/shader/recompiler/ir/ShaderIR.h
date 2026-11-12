@@ -345,8 +345,8 @@ inline constexpr uint32_t ImageBindingCount           = 50u;
 // Resident image heaps share one sampled-image array at binding 0 of this set. A heap slot
 // word is kind << ImageHeapKindShift | element; element 0 is the null descriptor.
 inline constexpr uint32_t ImageHeapSet                = 1u;
-inline constexpr uint32_t ImageHeapCapacity           = 65536u;
 inline constexpr uint32_t ImageHeapKindShift          = 20u;
+inline constexpr uint32_t ImageHeapCapacity           = 1u << ImageHeapKindShift;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,

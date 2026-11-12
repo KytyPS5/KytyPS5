@@ -26,7 +26,7 @@ struct ImageHeapTestAccess;
 // of a table owns device slot words, one per table dword, that select an array element. CPU
 // writes to a table fault in its snapshot, which each draw refreshes once; a view takes the
 // changes when a draw first acquires it. Changes to the images behind elements bump
-// Image::heap_epoch. A smaller table leaves at a suspend point if the frame did not acquire it.
+// Image::heap_epoch. A table leaves at a suspend point if the frame did not acquire it.
 class ImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
 public:
 	ImageHeap(RenderContext& context, PageManager& page_manager);

@@ -97,6 +97,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
+	bool                   native_rt                   = false;
 	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
@@ -174,6 +175,7 @@ uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
+bool NativeRtEnabled();
 bool LodStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();

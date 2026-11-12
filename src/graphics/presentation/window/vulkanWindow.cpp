@@ -397,11 +397,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
-	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>
+	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+	                   vk::PhysicalDeviceRayQueryFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
-	       image_atomic_int64, conditional_rendering, barycentric] = supported;
+	       image_atomic_int64, conditional_rendering, barycentric, acceleration_structure,
+	       ray_query] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
@@ -437,10 +440,26 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
+	// Ray queries take all three extensions or none.
+	const bool ray_query_extensions =
+	    Config::NativeRtEnabled() &&
+	    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+	if (ray_query_extensions) {
+		add(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+		add(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+		add(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+	} else {
+		supported.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+		supported.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
+	const bool ray_query_enabled =
+	    acceleration_structure.accelerationStructure && ray_query.rayQuery;
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
@@ -563,6 +582,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    graphics.occlusion_queries_enabled && supported2.features.occlusionQueryPrecise;
 	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
 	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+	LOGF("Vulkan ray query: %s\n", ray_query_enabled ? "true" : "false");
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
@@ -602,6 +622,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
 	    shader_clock, conditional_rendering,
+	    vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE},
+	    vk::PhysicalDeviceRayQueryFeaturesKHR {.rayQuery = VK_TRUE},
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -638,6 +660,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+	}
+	if (!ray_query_enabled) {
+		create.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
 
 	vk::Device device = nullptr;

@@ -237,6 +237,10 @@ bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
 }
 
+bool NativeRtEnabled() {
+	return g_config->native_rt;
+}
+
 bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }

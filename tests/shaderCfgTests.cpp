@@ -13132,7 +13132,7 @@ void TestSpirvConditionVotes() {
   using namespace ShaderRecompiler;
   using K = CFG::BranchCondition;
   for (const auto [wave, host] : {std::pair{32u, 32u}, std::pair{64u, 64u},
-                                  std::pair{64u, 32u}}) {
+                                  std::pair{64u, 32u}, std::pair{32u, 64u}}) {
     const uint32_t shader[] = {EncodeSopp(0x01)};
     ShaderComputeInputInfo compute{};
     compute.wave_size = wave;
@@ -13161,15 +13161,26 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
+    const auto all    = SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll);
+    const auto any    = SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny);
+    const auto ballot = SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot);
     Check(compiled.program.info.subgroup_vote && !compiled.program.info.subgroup_ballot &&
-              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 0,
-          "condition votes used ballots, duplicated halves, or lost their capability");
+              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote),
+          "condition votes lost their vote capability or gained a ballot builtin");
+    if (wave == 32u && host != 32u) {
+      // The wave shares its native subgroup with another guest wave, so both the zero and
+      // nonzero conditions read only the caller's ballot word (two ballots for All).
+      Check(all == 0u && any == 0u && ballot == 9u &&
+                SpirvInstructionOpcodeCount(binary, spv::OpVectorExtractDynamic) == 9u &&
+                SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformBallot),
+            "wide wave32 condition votes did not read only the caller's ballot word");
+    } else {
+      Check(all == 3u && any == 3u && ballot == 0u,
+            "condition votes used ballots or lost the native opcode");
+    }
     Check(scalar.TryInstruction()->Definition(0) == predicate.TryInstruction()->Definition(0),
           "scalar instruction condition acquired a subgroup vote");
-    if (wave != host) {
+    if (wave == 64u && host == 32u) {
       Check(SpirvInstructionOpcodeCount(binary, spv::OpLogicalAnd) == 3 &&
                 SpirvInstructionOpcodeCount(binary, spv::OpLogicalOr) == 3 &&
                 std::ranges::all_of(conditions, [](const auto *inst) {
@@ -13187,6 +13198,50 @@ void TestSpirvConditionVotes() {
               !SpirvContainsCapability(scalar_only, spv::CapabilityGroupNonUniformVote),
           "recollection retained the removed condition vote capability");
   }
+}
+
+void TestSpirvWave32HalfReductions() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {EncodeSopp(0x01)};
+  const auto emit = [&](uint32_t host) {
+    ShaderComputeInputInfo compute{};
+    compute.wave_size = 32;
+    compute.host_subgroup_size = host;
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 32;
+    options.input_info.compute = &compute;
+    auto compiled = RecompileForTest(shader, options);
+    IR::IREmitter emitter(compiled.program.blocks.front());
+    const auto lane = emitter.Emit(IR::ValueOpcode::LaneId, {});
+    const auto value = emitter.Emit(IR::ValueOpcode::IAdd32, {lane, IR::Value(1000u)});
+    for (const auto opcode : {IR::ValueOpcode::SubgroupUMinU32, IR::ValueOpcode::SubgroupUMaxU32,
+                              IR::ValueOpcode::SubgroupOrU32}) {
+      const auto alive = emitter.Emit(IR::ValueOpcode::IEqual32,
+                                      {emitter.Emit(opcode, {value}), IR::Value(0u)});
+      compiled.program.blocks.front()->AppendNewInst(IR::ValueOpcode::Reference, {alive});
+    }
+    compiled.program.shader_info_complete = false;
+    IR::CollectShaderInfo(compiled.program, options.input_info);
+    return Spirv::EmitProgram(compiled.program, options.input_info);
+  };
+
+  const auto wide = emit(64);
+  CheckSpirvBinaryValidates(wide);
+  Check(SpirvInstructionOpcodeCount(wide, spv::OpGroupNonUniformShuffleXor) == 15u &&
+            SpirvInstructionOpcodeCount(wide, spv::OpGroupNonUniformUMin) == 0u &&
+            SpirvInstructionOpcodeCount(wide, spv::OpGroupNonUniformUMax) == 0u &&
+            SpirvInstructionOpcodeCount(wide, spv::OpGroupNonUniformBitwiseOr) == 0u,
+        "wave32 reductions on a 64-lane subgroup did not stay in the caller's half");
+
+  const auto native = emit(32);
+  CheckSpirvBinaryValidates(native);
+  Check(SpirvInstructionOpcodeCount(native, spv::OpGroupNonUniformShuffleXor) == 0u &&
+            SpirvInstructionOpcodeCount(native, spv::OpGroupNonUniformUMin) == 1u &&
+            SpirvInstructionOpcodeCount(native, spv::OpGroupNonUniformUMax) == 1u &&
+            SpirvInstructionOpcodeCount(native, spv::OpGroupNonUniformBitwiseOr) == 1u,
+        "wave32 reductions on a 32-lane subgroup lost their native reduction");
 }
 
 void TestRepeatedExportsHaveOneInterface() {
@@ -13530,6 +13585,7 @@ int main() {
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();
+  TestSpirvWave32HalfReductions();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();

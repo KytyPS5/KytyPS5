@@ -463,6 +463,11 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	}
 }
 
+// A 32-lane guest wave that shares its native subgroup with a second guest wave.
+bool WideWave32(const EmitterState& state) {
+	return state.program.wave_size == 32u && state.host_subgroup_size != 32u;
+}
+
 void DefineInputs(EmitterState& state) {
 	state.inputs.reserve(state.program.info.inputs.size());
 	for (const auto& input: state.program.info.inputs) {
@@ -570,7 +575,9 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	if (state.program.info.subgroup_local_invocation_id ||
+	    (WideWave32(state) &&
+	     (state.program.info.subgroup_vote || state.program.info.subgroup_arithmetic))) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -810,13 +817,15 @@ void DefineModule(EmitterState& state) {
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot ||
+	    (WideWave32(state) && state.program.info.subgroup_vote)) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.program.info.subgroup_vote) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
-	if (state.program.info.subgroup_shuffle) {
+	if (state.program.info.subgroup_shuffle ||
+	    (WideWave32(state) && state.program.info.subgroup_arithmetic)) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
 	if (state.program.info.subgroup_arithmetic) {

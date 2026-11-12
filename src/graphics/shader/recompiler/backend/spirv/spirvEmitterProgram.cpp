@@ -516,6 +516,13 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	              low_first, high_lane);
 }
 
+uint32_t ValueEmitContext::HalfBallotWord(uint32_t ballot) {
+	// Ballot word N holds native lanes 32N..32N+31; a 32-lane guest wave lives in one word.
+	const auto word = EmitBinaryU32(state, spv::OpShiftRightLogical,
+	                                EmitSubgroupLocalInvocationId(state), ConstantU32(state, 5));
+	return EmitNative<spv::OpVectorExtractDynamic, IR::Type::U32>(state, ballot, word);
+}
+
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);

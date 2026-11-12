@@ -100,9 +100,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (volume && samples != 1) {
 		EXIT("multisampled 3D render targets are unsupported\n");
 	}
-	const uint32_t depth = volume ? rt.attrib3.depth + 1u : 1u;
-	// For volumes, CB_COLOR_VIEW bounds exported slices; ATTRIB3 defines storage depth.
-	// The host attachment contains only the selected slices that exist in this mip.
+	// For volumes, the CB writes every slice CB_COLOR_VIEW selects, even past MIP0_DEPTH, so the
+	// storage covers them. The host attachment holds only the selected slices of this mip.
+	const uint32_t depth =
+	    volume ? std::max(rt.attrib3.depth, rt.view.last_array_slice_index) + 1u : 1u;
 	const uint32_t last_layer = volume
 	                                ? std::min(rt.view.last_array_slice_index,
 	                                           std::max(depth >> rt.view.current_mip_level, 1u) - 1u)

@@ -5871,11 +5871,13 @@ void TestTlsStubsPreserveFlags() {
 int RunTrinityTests();
 
 [[noreturn]] void ReportFaultTo(const char* log_path) {
+	static Common::Subsystems subsystems;
+	subsystems.Initialize<Config::Lifecycle>();
 	Config::ConfigOptions options;
 	options.printf_direction   = Config::LogDirection::File;
 	options.printf_output_file = std::filesystem::path(log_path);
 	Config::Load(options);
-	Log::Initialize();
+	subsystems.Initialize<Log::Lifecycle>();
 	static std::array<uint8_t, 96>       code {};
 	static std::array<uint64_t, 32>      stack {};
 	Common::HostException::ExceptionInfo info {};
@@ -5985,10 +5987,10 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
-	InitSubsystems();
 	if (argc == 3 && std::strcmp(argv[1], "--fault-report") == 0) {
 		ReportFaultTo(argv[2]);
 	}
+	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);

@@ -1877,6 +1877,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		SetupTlsHandler(program);
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Libs::LibKernel::PthreadRegisterFunctionTable(program->base_vaddr, program->mapped_size);
+#endif
+
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
 }
 
@@ -1898,6 +1902,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		Libs::LibKernel::PthreadUnregisterFunctionTable(program->base_vaddr);
+#endif
 		if (program->instruction_trampoline_size != 0) {
 			UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr));
 		}

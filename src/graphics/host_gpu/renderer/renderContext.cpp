@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "graphics/shader/shader.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -147,6 +148,35 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	m_gpu->SendCommandSync(unmap);
+}
+
+void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
+	const auto& program   = runtime.module->info;
+	const auto& user_data = runtime.resources->user_data;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	for (const auto reg: program.info.dma_base_registers) {
+		if (reg < program.user_data_base) {
+			continue;
+		}
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		if (index + 1u >= user_data.size()) {
+			continue;
+		}
+		const auto base =
+		    static_cast<uint64_t>(user_data[index]) | (static_cast<uint64_t>(user_data[index + 1u]) << 32u);
+		// The registers of an access that never runs may hold stale data. Mapped memory never
+		// reaches the top of the address space, so a window that would overflow is skipped.
+		if (base > UINT64_MAX - BufferCache::CACHING_PAGESIZE) {
+			continue;
+		}
+		// DMA reaches only memory with a cached buffer; any other access records a fault and
+		// reads zero, and the buffer arrives after the shader has run. That loses data the guest
+		// writes for a single dispatch, such as the glyph bitmaps GTA V copies into its font atlas.
+		m_mapped_ranges.ForEachInRange(base, BufferCache::CACHING_PAGESIZE,
+		                               [this](uint64_t start, uint64_t end) {
+			                               (void)m_buffer_cache.FindBuffer(start, end - start);
+		                               });
+	}
 }
 
 void RenderContext::PrepareBda() {

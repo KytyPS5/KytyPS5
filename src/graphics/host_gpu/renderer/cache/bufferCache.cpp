@@ -835,6 +835,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+bool BufferCache::NoImageStartsAt(uint64_t vaddr) const noexcept {
+	// Images register their pages before anything else sees them (TextureCache::RegisterImage()),
+	// so a page without one has no image that starts on it.
+	TextureCache::ImagePageTable::PageRange pages {};
+	return TextureCache::ImagePageTable::TryGetPageRange(vaddr, 1, pages) &&
+	       !m_texture_cache.m_registered_pages.Any(pages.first, pages.last_exclusive);
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
@@ -848,7 +856,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	RecordBufferUpload(buffer, copies, source);
-	if (is_texel_buffer && !is_written) {
+	if (is_texel_buffer && !is_written && !NoImageStartsAt(vaddr)) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
@@ -1006,15 +1014,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// buffer and none of its pages became CPU dirty since a lookup found it clean (or uploaded
 	// it), the lookup finds the same buffer and has nothing to upload. The epoch is read before
 	// the dirty check: a page dirtied after it advances it.
-	const bool  plain_read = !is_written && !is_texel_buffer;
+	const bool  plain_read = !is_written;
 	ObtainMemo* memo       = nullptr;
 	uint64_t    cpu_epoch  = 0;
 	if (plain_read) {
 		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
 		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
 		cpu_epoch       = CpuDirtyEpoch(vaddr, size);
-		if (memo->vaddr == vaddr && memo->size == size &&
-		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch) {
+		if (memo->vaddr == vaddr && memo->size == size && memo->texel == is_texel_buffer &&
+		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch &&
+		    (!is_texel_buffer || NoImageStartsAt(vaddr))) {
 			auto& buffer = m_slot_buffers[memo->id];
 			TouchBuffer(buffer);
 			return {&buffer, memo->offset};
@@ -1082,13 +1091,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		            .gpu_epoch    = written_gpu_epoch,
 		            .id           = id};
 	}
-	if (plain_read) {
+	if (plain_read && (!is_texel_buffer || NoImageStartsAt(vaddr))) {
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,
 		         .buffer_epoch = m_buffer_set_epoch,
 		         .cpu_epoch    = cpu_epoch,
 		         .offset       = buffer.Offset(vaddr),
-		         .id           = id};
+		         .id           = id,
+		         .texel        = is_texel_buffer};
 	}
 	if (is_written) {
 		m_gpu_write_generation++;

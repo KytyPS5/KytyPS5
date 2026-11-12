@@ -278,6 +278,9 @@ private:
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	void CollectStaleBuffers(uint64_t tick);
+	// Whether no image is registered on the page where `vaddr` starts, so that no image can start at it
+	// (FindImageFromRange() finds only images starting at the address).
+	[[nodiscard]] bool NoImageStartsAt(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -508,6 +511,9 @@ private:
 		uint64_t cpu_epoch    = 0;
 		uint64_t offset       = 0;
 		BufferId id;
+		// A texel buffer read: also needs no image to start on the range's first page (see
+		// NoImageStartsAt()).
+		bool texel = false;
 	};
 	// The last synchronization of a range bound as written (see ObtainBuffer()).
 	struct WrittenMemo {

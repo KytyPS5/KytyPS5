@@ -24040,6 +24040,7 @@ private:
                                 available_features.multiDrawIndirect &&
                                 available_features.depthBounds &&
                                 available_features.fragmentStoresAndAtomics &&
+                                available_features.vertexPipelineStoresAndAtomics &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -24149,6 +24150,7 @@ private:
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
+    device_features.vertexPipelineStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,

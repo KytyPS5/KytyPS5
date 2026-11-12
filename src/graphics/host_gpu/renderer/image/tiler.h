@@ -44,6 +44,11 @@ public:
 
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
+	// Detiles `count` array layers from `first` on of a layered image (ImageInfo::LayersTransferable())
+	// whose tiled data holds only those layers, from `tiled_offset` on. The result is packed as
+	// ImageInfo::LayerRunLinearLayout() says, for ImageInfo::BufferCopiesLayers().
+	[[nodiscard]] Result DetileLayers(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info,
+	                                  uint32_t first, uint32_t count);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
@@ -81,6 +86,9 @@ private:
 		uint32_t slice_bytes;
 		uint32_t tiled_slice_bytes;
 		uint32_t blocks_per_row;
+		// First array layer of a layer run (see DetileLayers()): the z swizzle of depth and render
+		// target blocks depends on the slice index.
+		uint32_t surface_z;
 		uint32_t tail_x;
 		uint32_t tail_y;
 		uint32_t num_texels;
@@ -117,9 +125,13 @@ private:
 	                                             uint64_t active, uint32_t remaining,
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
+	struct LayerRun {
+		uint32_t first = 0;
+		uint32_t count = 0;
+	};
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	                             const ImageInfo& info, uint32_t levels, uint64_t source_offset,
-	                             uint64_t target_offset);
+	                             uint64_t target_offset, const LayerRun* run = nullptr);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling);

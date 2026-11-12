@@ -236,10 +236,22 @@ uint64_t RenderContext::MappedRangesVersion() const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
-	m_mapped_ranges_version++;
-	m_bda_mapped_since_sync.emplace_back(vaddr, size);
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		m_mapped_ranges_version++;
+		m_bda_mapped_since_sync.emplace_back(vaddr, size);
+	}
+	// Texture arrays that keep their other layers when one is unmapped learn that memory came
+	// back under them. Without such an image there is nothing to tell the GPU thread.
+	if (m_texture_cache.HasPartialCandidates()) {
+		const auto map = [this, vaddr, size] { m_texture_cache.MapMemory(vaddr, size); };
+		if (m_gpu == nullptr || m_gpu->IsStopping()) {
+			map();
+		} else {
+			m_gpu->SendUrgentCommandSync(map);
+		}
+	}
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {

@@ -128,6 +128,12 @@ public:
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
+	void MapMemory(uint64_t address, uint64_t size);
+	// Whether some cached image keeps its other pages while part of it is written or unmapped
+	// (MapMemory() matters only then).
+	[[nodiscard]] bool HasPartialCandidates() const noexcept {
+		return m_partial_candidates.load(std::memory_order_relaxed) != 0;
+	}
 	void ProcessDownloadImages();
 	// Whether storage readback is on (constant while the GPU runs; the command processor reads it).
 	[[nodiscard]] bool StorageReadbackEnabled() const { return m_readback_storage_images; }
@@ -354,6 +360,14 @@ private:
 	void                      UntrackImage(ImageId id);
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
+	// Partial CPU writes of large layered images (see Image::InvalidateCpuWritePartial()).
+	// Caller holds m_lock.
+	[[nodiscard]] static bool PartialDirtyCandidate(const Image& image);
+	[[nodiscard]] bool        TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
+	                                                uint64_t granule);
+	void                      UntrackImagePages(Image& image, uint64_t begin, uint64_t end);
+	void                      RetrackHoles(Image& image);
+	[[nodiscard]] bool        UploadImageLayers(Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -493,6 +507,8 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// Registered images that take partial CPU writes (Image::partial_candidate).
+	std::atomic<uint32_t> m_partial_candidates {0};
 	uint64_t         m_image_set_epoch        = 0;
 	// The image range of the last registrations and unregistrations, by ImageSetEpoch.
 	static constexpr uint64_t ImageSetChangeHistory = 1024;

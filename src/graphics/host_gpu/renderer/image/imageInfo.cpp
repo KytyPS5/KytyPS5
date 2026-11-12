@@ -372,4 +372,90 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 	return copies;
 }
 
+bool ImageInfo::LayersTransferable() const {
+	if (!IsTiled() || IsVolume() || samples != 1 || resources.layers < 2 || HasMetadata() ||
+	    HasStencil() || tiling.texel_width == 0 || tiling.texel_height == 0 ||
+	    tiling.block.block_depth != 1 || tiled_slice_stride == 0 || data.size == 0 ||
+	    data.size % resources.layers != 0 || tiled_slice_stride != data.size / resources.layers) {
+		return false;
+	}
+	// Every level of a layer lies inside the layer's slice.
+	for (uint32_t level = 0; level < resources.levels; ++level) {
+		const auto& mip = mip_layout[level];
+		if (mip.size % resources.layers != 0 ||
+		    mip.offset > tiled_slice_stride || mip.size / resources.layers > tiled_slice_stride - mip.offset) {
+			return false;
+		}
+	}
+	return true;
+}
+
+ImageInfo::LayerRunLayout ImageInfo::LayerRunLinearLayout(uint32_t count) const {
+	const auto     linear = LinearLayout();
+	LayerRunLayout layout {};
+	for (uint32_t level = 0; level < resources.levels; ++level) {
+		const auto& mip = linear.mips[level];
+		if (linear.slice_stride != 0) {
+			const auto last       = Add(mip.offset, Multiply(count - 1u, linear.slice_stride));
+			layout.offsets[level] = mip.offset;
+			layout.size           = std::max(layout.size, Add(last, mip.size));
+		} else {
+			const auto alignment  = std::max(tiling.block.bytes_per_element, 4u);
+			const auto offset     = Common::AlignUp<uint64_t>(layout.size, alignment);
+			layout.offsets[level] = offset;
+			layout.size           = Add(offset, Multiply(mip.size, count));
+		}
+	}
+	return layout;
+}
+
+std::vector<vk::BufferImageCopy> ImageInfo::BufferCopiesLayers(uint32_t first, uint32_t count,
+                                                               uint64_t buffer_offset) const {
+	EXIT_IF(!LayersTransferable() || count == 0 || first >= resources.layers ||
+	        count > resources.layers - first);
+	const auto aspect = IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                              : pixel_format == vk::Format::eS8Uint
+	                                    ? vk::ImageAspectFlagBits::eStencil
+	                                    : vk::ImageAspectFlagBits::eColor;
+	const auto linear = LinearLayout();
+	const auto layout = LayerRunLinearLayout(count);
+	std::vector<vk::BufferImageCopy> copies;
+	for (uint32_t level = 0; level < resources.levels; ++level) {
+		const auto& mip    = linear.mips[level];
+		const auto  active = MipExtent(level);
+		uint32_t    image_height = 0;
+		if (linear.slice_stride == 0) {
+			image_height = Common::AlignUp(active.height, tiling.texel_height);
+		} else {
+			const auto row_bytes = Multiply(mip.pitch, tiling.block.bytes_per_element);
+			EXIT_IF(row_bytes == 0);
+			const auto rows = linear.slice_stride / row_bytes;
+			if (linear.slice_stride % row_bytes == 0 &&
+			    rows >= (uint64_t {active.height} + tiling.texel_height - 1u) / tiling.texel_height &&
+			    rows <= UINT32_MAX / tiling.texel_height) {
+				image_height = static_cast<uint32_t>(rows) * tiling.texel_height;
+			}
+		}
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset      = Add(buffer_offset, layout.offsets[level]);
+		copy.bufferRowLength   = mip.pitch * tiling.texel_width;
+		copy.bufferImageHeight = image_height;
+		copy.imageSubresource  = {aspect, level, first, 1};
+		copy.imageExtent       = {active.width, active.height, 1};
+		if (image_height == 0) {
+			copy.bufferImageHeight = Common::AlignUp(active.height, tiling.texel_height);
+			for (uint32_t slice = 0; slice < count; ++slice) {
+				copy.bufferOffset = Add(Add(buffer_offset, layout.offsets[level]),
+				                        Multiply(slice, linear.slice_stride));
+				copy.imageSubresource.baseArrayLayer = first + slice;
+				copies.push_back(copy);
+			}
+		} else {
+			copy.imageSubresource.layerCount = count;
+			copies.push_back(copy);
+		}
+	}
+	return copies;
+}
+
 } // namespace Libs::Graphics

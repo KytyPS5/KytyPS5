@@ -46,6 +46,17 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 // size (PPSA30528 writes about ten 4K storage images per frame, 300 MB of readback that no CPU
 // code ever reads); below this size the readback is cheaper than watching the pages.
 constexpr uint64_t LazyReadbackBytes = 256 * 1024;
+// Partial CPU writes of a large layered image (a texture array the game streams into one layer
+// at a time): only images this big keep watching their pages while some are written; a write
+// fault releases the 256 KiB granule around it (granules start at the image start), so a
+// streamed layer faults a few times, not once per 4 KiB page.
+constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
+constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
+// A refresh whose dirty layers cover more than 1/PartialUploadMaxShare of the image uploads all
+// of it as before.
+constexpr uint64_t PartialUploadMaxShare = 2;
+// Largest source one partial upload stages at once.
+constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -291,6 +302,10 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
+	if (PartialDirtyCandidate(image)) {
+		image.partial_candidate = true;
+		m_partial_candidates.fetch_add(1, std::memory_order_relaxed);
+	}
 	image.StateChanged();
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
@@ -306,6 +321,10 @@ void TextureCache::UnregisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	image.HeapChanged();
 	UntrackImage(id);
+	if (image.partial_candidate) {
+		image.partial_candidate = false;
+		m_partial_candidates.fetch_sub(1, std::memory_order_relaxed);
+	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		auto* bucket = m_image_page_table.Find(page);
 		if (bucket == nullptr) {
@@ -530,6 +549,7 @@ void TextureCache::TrackImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	RetrackHoles(image);
 	const auto image_begin = image.info.data.address;
 	const auto image_end   = image.info.data.End();
 	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
@@ -589,6 +609,8 @@ void TextureCache::TrackImageTail(ImageId id) {
 
 void TextureCache::UntrackImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	// Unwatched pages no longer report writes: only a whole upload is complete again.
+	image.DropPartialDirty();
 	if (!image.IsTracked()) {
 		return;
 	}
@@ -597,15 +619,121 @@ void TextureCache::UntrackImage(ImageId id) {
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
 	image.StateChanged();
+	if (!image.untracked_holes.empty()) {
+		// The released pages are not watched any more.
+		const auto holes = std::move(image.untracked_holes);
+		image.untracked_holes.clear();
+		auto       cursor = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		const auto end    = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		for (const auto& [hole_begin, hole_end]: holes) {
+			if (cursor < hole_begin) {
+				m_page_manager.UpdatePageWatchers<false>(cursor, hole_begin - cursor);
+			}
+			cursor = std::max(cursor, hole_end);
+		}
+		if (cursor < end) {
+			m_page_manager.UpdatePageWatchers<false>(cursor, end - cursor);
+		}
+		return;
+	}
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
+}
+
+void TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end) {
+	const auto tracked_begin = Common::AlignDown(image.track_addr, TRACKER_PAGE_SIZE);
+	const auto tracked_end   = Common::AlignUp(image.track_addr_end, TRACKER_PAGE_SIZE);
+	begin = std::max(begin, tracked_begin);
+	end   = std::min(end, tracked_end);
+	if (begin >= end) {
+		return;
+	}
+	auto cursor = begin;
+	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
+		if (hole_end <= cursor) {
+			continue;
+		}
+		if (hole_begin >= end) {
+			break;
+		}
+		if (cursor < hole_begin) {
+			m_page_manager.UpdatePageWatchers<false>(cursor, hole_begin - cursor);
+		}
+		cursor = std::max(cursor, hole_end);
+	}
+	if (cursor < end) {
+		m_page_manager.UpdatePageWatchers<false>(cursor, end - cursor);
+	}
+	Image::AddRange(image.untracked_holes, begin, end);
+	image.StateChanged();
+}
+
+void TextureCache::RetrackHoles(Image& image) {
+	if (image.untracked_holes.empty()) {
+		return;
+	}
+	if (!image.IsTracked()) {
+		EXIT("TextureCache: untracked image keeps page holes\n");
+	}
+	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
+		m_page_manager.UpdatePageWatchers<true>(hole_begin, hole_end - hole_begin);
+	}
+	image.untracked_holes.clear();
+	image.StateChanged();
+}
+
+bool TextureCache::PartialDirtyCandidate(const Image& image) {
+	const auto& info = image.info;
+	return info.data.size >= PartialDirtyMinSize && !image.depth_id &&
+	       image.backing.image != nullptr &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       !image.usage.render_target && !image.usage.video_out &&
+	       // A depth array uploads as it is stored when no D16 promotion is involved.
+	       (!info.IsDepth() || (info.resources.levels == 1 &&
+	                            DepthAspectTransferBytes(info.pixel_format) == info.bytes_per_block &&
+	                            Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block)) &&
+	       info.LayersTransferable();
+}
+
+// A CPU write into a large layered image: instead of marking all of it dirty and unwatching all
+// of its pages, only the granule around the write is released and recorded dirty, and the
+// refresh uploads only the layers over the dirty ranges. A game streaming textures into an
+// array writes one layer at a time; the whole-image path re-copied, detiled and uploaded every
+// layer (hundreds of MiB) at each use after a write.
+bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
+                                        uint64_t granule) {
+	const auto& info = image.info;
+	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
+	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
+	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsGpuModified()) {
+		return false;
+	}
+	const auto base  = info.data.address;
+	const auto first = std::max(address, base) - base;
+	const auto last  = std::min(address + size, info.data.End()) - base;
+	if (first >= last || last - first > info.data.size / PartialUploadMaxShare) {
+		return false;
+	}
+	const auto granule_begin = base + first / granule * granule;
+	const auto granule_end =
+	    base + std::min(info.data.size, ((last - 1) / granule + 1) * granule);
+	const auto page_begin = Common::AlignDown(granule_begin, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(granule_end, TRACKER_PAGE_SIZE);
+	// The released pages are dirty wherever they hold image bytes.
+	image.InvalidateCpuWritePartial(std::max(page_begin, base), std::min(page_end, info.data.End()));
+	UntrackImagePages(image, page_begin, page_end);
+	return true;
 }
 
 void TextureCache::UntrackImageHead(ImageId id) {
 	auto&      image = m_slot_images[id];
 	const auto begin = image.info.data.address;
 	if (!image.IsTracked() || begin < image.track_addr) {
+		return;
+	}
+	if (!image.untracked_holes.empty()) {
+		UntrackImage(id);
 		return;
 	}
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
@@ -624,6 +752,10 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	auto&      image = m_slot_images[id];
 	const auto end   = image.info.data.End();
 	if (!image.IsTracked() || image.track_addr_end < end) {
+		return;
+	}
+	if (!image.untracked_holes.empty()) {
+		UntrackImage(id);
 		return;
 	}
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
@@ -1400,6 +1532,10 @@ void TextureCache::InitializeImage(ImageId id) {
 		image.RefreshComplete();
 		return;
 	}
+	if (upload && image.IsPartiallyCpuDirty() && UploadImageLayers(image)) {
+		image.RefreshComplete();
+		return;
+	}
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
@@ -1410,6 +1546,60 @@ void TextureCache::InitializeImage(ImageId id) {
 		image.ClearBufferModified();
 	}
 	image.RefreshComplete();
+}
+
+// The layers of an image that only CPU writes over known ranges made dirty, uploaded from the
+// guest bytes of those layers alone (a run of layers per source and per detile pass). Returns
+// false when the whole image has to be uploaded instead.
+bool TextureCache::UploadImageLayers(Image& image) {
+	const auto& info = image.info;
+	if (!image.IsPartiallyCpuDirty() || image.IsMaybeCpuDirty() || image.IsBufferModified() ||
+	    image.depth_id || !PartialDirtyCandidate(image)) {
+		return false;
+	}
+	const uint32_t       layers = info.resources.layers;
+	const uint64_t       slice  = info.tiled_slice_stride;
+	const uint64_t       base   = info.data.address;
+	std::vector<uint8_t> dirty(layers, 0);
+	uint32_t             dirty_layers = 0;
+	for (const auto& [begin, end]: image.CpuDirtyRanges()) {
+		if (begin >= end || begin < base || end > info.data.End()) {
+			return false;
+		}
+		const auto first = static_cast<uint32_t>((begin - base) / slice);
+		const auto last  = static_cast<uint32_t>((end - 1 - base) / slice);
+		for (auto layer = first; layer <= last && layer < layers; layer++) {
+			dirty_layers += dirty[layer] == 0 ? 1u : 0u;
+			dirty[layer] = 1;
+		}
+	}
+	if (static_cast<uint64_t>(dirty_layers) * slice > info.data.size / PartialUploadMaxShare) {
+		return false;
+	}
+	const auto chunk_layers =
+	    static_cast<uint32_t>(std::max<uint64_t>(1, PartialUploadChunk / slice));
+	for (uint32_t layer = 0; layer < layers;) {
+		if (dirty[layer] == 0) {
+			layer++;
+			continue;
+		}
+		uint32_t count = 1;
+		while (layer + count < layers && dirty[layer + count] != 0 && count < chunk_layers) {
+			count++;
+		}
+		const auto [source, source_offset] =
+		    m_buffer_cache.ObtainBufferForImage(base + slice * layer, slice * count);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		const auto linear =
+		    m_tiler.DetileLayers(source->Handle(), source_offset, info, layer, count);
+		const auto copies = info.BufferCopiesLayers(layer, count, linear.offset);
+		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
+		layer += count;
+	}
+	return true;
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -2841,6 +3031,9 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	for (const auto id: image_ids) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
+			if (TryInvalidatePartial(owner, address, size, PartialDirtyGranule)) {
+				continue;
+			}
 			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;
@@ -2925,7 +3118,35 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		// A texture array the game streams through keeps its other layers: the game unmaps and
+		// maps one layer's memory at a time. The unmapped span becomes dirty (uploaded from the
+		// memory that is there when the image is next used) and stays unwatched until then.
+		if (owner->Overlaps(address, size) &&
+		    (address > owner->info.data.address || address + size < owner->info.data.End()) &&
+		    TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
 		FreeImage(id);
+	}
+}
+
+void TextureCache::MapMemory(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	// Memory mapped under a cached array replaces its contents without a CPU write through the
+	// watched pages (and the pages it maps are not protected, whatever the tracking counts).
+	Common::SmallVector<ImageId, 8> mapped_images;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
+		if (image.partial_candidate && image.Overlaps(address, size)) {
+			mapped_images.push_back(id);
+		}
+	});
+	for (const auto id: mapped_images) {
+		auto& owner = m_slot_images[id];
+		if (TryInvalidatePartial(owner, address, size, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		owner.MarkCpuDirty();
+		UntrackImage(id);
 	}
 }
 

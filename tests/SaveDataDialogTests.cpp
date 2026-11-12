@@ -1,9 +1,13 @@
 #include "libs/dialog.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 namespace Loader::Timer {
 double GetTimeMs() {
@@ -123,7 +127,162 @@ bool TestCloseAndReset(Param& param) {
 	passed = TestRunningThenFinished(param) && passed;
 	return passed;
 }
+
+bool TestErrorHandling(Param& param) {
+	bool passed = true;
+	passed = CheckStatus(Save::SaveDataDialogInitialize(), static_cast<int>(0x81360002u),
+	                     "initialize when already initialized") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogOpen(nullptr), static_cast<int>(0x81360003u),
+	                     "open null param") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogOpen(&param), 0, "open for invalid state check") && passed;
+
+	struct DialogResult {
+		int32_t  mode;
+		int32_t  result;
+		int32_t  button_id;
+		uint32_t pad0;
+		void*    dir_name;
+		void*    param;
+		void*    user_data;
+		uint8_t  reserved[32];
+	};
+	DialogResult dummy_res {};
+	passed = CheckStatus(Save::SaveDataDialogGetResult(&dummy_res), static_cast<int>(0x81360005u),
+	                     "get result before finished") && passed;
+	passed = CheckStatus(Save::SaveDataDialogOpen(&param), static_cast<int>(0x81360005u),
+	                     "open when already running") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogClose(nullptr), 0, "close for get result check") && passed;
+	passed = CheckStatus(Save::SaveDataDialogGetResult(nullptr), static_cast<int>(0x81360003u),
+	                     "get result nullptr") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogTerminate(), 0, "terminate in error handling") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogOpen(&param), static_cast<int>(0x81360001u),
+	                     "open when not initialized") && passed;
+	passed = CheckStatus(Save::SaveDataDialogClose(nullptr), static_cast<int>(0x81360001u),
+	                     "close when not initialized") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogInitialize(), 0, "reinitialize after error test") && passed;
+	return passed;
+}
+
+bool TestProgressBar(Param& param) {
+	bool passed = true;
+	passed = CheckStatus(Save::SaveDataDialogOpen(&param), 0, "open for progress bar test") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogProgressBarSetValue(0, 45), 0, "progress bar set 45") && passed;
+	if (Save::SaveDataDialogGetProgressBarValue(0) != 45) {
+		std::fprintf(stderr, "SaveDataDialogTests: progress bar value expected 45, got %u\n",
+		             Save::SaveDataDialogGetProgressBarValue(0));
+		passed = false;
+	}
+
+	passed = CheckStatus(Save::SaveDataDialogProgressBarInc(0, 30), 0, "progress bar inc 30") && passed;
+	if (Save::SaveDataDialogGetProgressBarValue(0) != 75) {
+		std::fprintf(stderr, "SaveDataDialogTests: progress bar value expected 75, got %u\n",
+		             Save::SaveDataDialogGetProgressBarValue(0));
+		passed = false;
+	}
+
+	passed = CheckStatus(Save::SaveDataDialogProgressBarInc(0, 50), 0, "progress bar inc clamp") && passed;
+	if (Save::SaveDataDialogGetProgressBarValue(0) != 100) {
+		std::fprintf(stderr, "SaveDataDialogTests: progress bar value expected 100, got %u\n",
+		             Save::SaveDataDialogGetProgressBarValue(0));
+		passed = false;
+	}
+
+	passed = CheckStatus(Save::SaveDataDialogProgressBarSetValue(10, 50),
+	                     static_cast<int>(0x81360003u), "invalid progress bar target") && passed;
+
+	passed = CheckStatus(Save::SaveDataDialogClose(nullptr), 0, "close after progress bar test") && passed;
+	return passed;
+}
+
+bool TestResultsAndFocus() {
+	bool passed = true;
+	struct DirName {
+		char data[32];
+	};
+	struct DialogResult {
+		int32_t  mode;
+		int32_t  result;
+		int32_t  button_id;
+		uint32_t pad0;
+		void*    dir_name;
+		void*    param;
+		void*    user_data;
+		uint8_t  reserved[32];
+	};
+
+	DirName focus_name {};
+	std::snprintf(focus_name.data, sizeof(focus_name.data), "SAVEDIR99");
+
+	Items items {};
+	items.user_id        = 1000;
+	items.focus_dir_name = &focus_name;
+
+	int user_tag = 0xbeef;
+	Param param {};
+	param.base.size = sizeof(BaseParam);
+	param.size      = sizeof(Param);
+	param.mode      = 3;
+	param.items     = &items;
+	param.user_data = &user_tag;
+
+	passed = CheckStatus(Save::SaveDataDialogOpen(&param), 0, "open with focus dir name") && passed;
+	passed = CheckStatus(Save::SaveDataDialogClose(nullptr), 0, "close with focus dir name") && passed;
+
+	DirName out_dir {};
+	DialogResult res {};
+	res.dir_name = &out_dir;
+
+	passed = CheckStatus(Save::SaveDataDialogGetResult(&res), 0, "get result with focus dir") && passed;
+	if (res.mode != 3 || res.result != 0 || res.button_id != 1 || res.user_data != &user_tag ||
+	    std::strcmp(out_dir.data, "SAVEDIR99") != 0) {
+		std::fprintf(stderr, "SaveDataDialogTests: GetResult returned incorrect data (dir=%s, mode=%d)\n",
+		             out_dir.data, res.mode);
+		passed = false;
+	}
+
+	return passed;
+}
+
+bool TestConcurrentMultithreadedAccess(Param& param) {
+	bool passed = true;
+	std::vector<std::thread> workers;
+
+	passed = CheckStatus(Save::SaveDataDialogOpen(&param), 0, "open before thread test") && passed;
+
+	for (int i = 0; i < 8; ++i) {
+		workers.emplace_back([i]() {
+			for (int iter = 0; iter < 100; ++iter) {
+				if (i % 3 == 0) {
+					Save::SaveDataDialogGetStatus();
+					Save::SaveDataDialogIsReadyToDisplay();
+				} else if (i % 3 == 1) {
+					Save::SaveDataDialogProgressBarSetValue(0, 50);
+					Save::SaveDataDialogProgressBarInc(0, 1);
+					Save::SaveDataDialogGetProgressBarValue(0);
+				} else {
+					Save::SaveDataDialogUpdateStatus();
+				}
+			}
+		});
+	}
+
+	for (auto& w : workers) {
+		w.join();
+	}
+
+	passed = CheckStatus(Save::SaveDataDialogTerminate(), 0, "terminate after thread test") && passed;
+	passed = CheckStatus(Save::SaveDataDialogInitialize(), 0, "reinit after thread test") && passed;
+	return passed;
+}
 } // namespace
+
 
 int main(int argc, char** argv) {
 	const bool consistency_only = argc == 2 && std::strcmp(argv[1], "--consistency-only") == 0;
@@ -159,6 +318,10 @@ int main(int argc, char** argv) {
 	if (!consistency_only) {
 		passed = TestRunningThenFinished(param) && passed;
 		passed = TestCloseAndReset(param) && passed;
+		passed = TestErrorHandling(param) && passed;
+		passed = TestProgressBar(param) && passed;
+		passed = TestResultsAndFocus() && passed;
+		passed = TestConcurrentMultithreadedAccess(param) && passed;
 	}
 	Save::SaveDataDialogTerminate();
 	passed = CheckLatestStatus("terminated") && passed;

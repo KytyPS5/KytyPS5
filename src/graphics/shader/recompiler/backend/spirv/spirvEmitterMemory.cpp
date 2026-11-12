@@ -77,8 +77,12 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 }
 
 uint32_t BufferLane(EmitterState& state) {
+	// ADD_TID adds the guest wave's lane. Two wave-32 shaders can share one 64-wide host
+	// subgroup, so the subgroup lane alone would let the upper wave address lanes 32..63
+	// instead of restarting at lane zero.
+	const auto lanes = state.program.wave_size >= 64u ? 63u : 31u;
 	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+	              ConstantU32(state, lanes));
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -1543,13 +1547,22 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto mask  = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), mask, low, high,
 	                          ConstantU32(state, 0), ConstantU32(state, 0));
-	const auto first = ctx.FirstLane(mask);
-	const auto source_lane =
-	    state.lane_count == 2
-	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
-	        : first;
-	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
-	                                   EmitSubgroupLocalInvocationId(state), source_lane);
+	const auto first       = ctx.FirstLane(mask);
+	const auto native_lane = EmitSubgroupLocalInvocationId(state);
+	// A 32-lane guest wave occupies one half of a 64-lane native subgroup, so its allocation and
+	// the broadcast of the result stay inside that half; a 64-lane wave owns the whole subgroup.
+	uint32_t source_lane = first;
+	if (state.lane_count == 2) {
+		source_lane =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31));
+	} else if (state.program.wave_size == 32u) {
+		source_lane = Binary(state, spv::OpBitwiseOr, TypeU32(state),
+		                    Binary(state, spv::OpBitwiseAnd, TypeU32(state), native_lane,
+		                           ConstantU32(state, ~31u)),
+		                    Binary(state, spv::OpBitwiseAnd, TypeU32(state), first,
+		                           ConstantU32(state, 31)));
+	}
+	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state), native_lane, source_lane);
 	auto bounds = EmitMemoryElementInBounds(state, access, index);
 	if (mem.kind == IR::ResourceKind::Gds) {
 		bounds = AndCondition(state, bounds, region_bounds);

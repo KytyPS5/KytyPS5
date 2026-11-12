@@ -328,10 +328,15 @@ void Translator::V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low) {
 	const auto lane  = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto local = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
 	const auto below = RightMask32(local);
-	const auto high_lane =
-	    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {lane, IR::Value(32u)}));
-	const auto thread_mask = low ? ir.Select(high_lane, IR::U32(IR::Value(0xffffffffu)), below)
-	                             : ir.Select(high_lane, below, IR::U32(IR::Value(0u)));
+	// Only a wave64 ranks lanes past the first 32: a wave32 guest can occupy either half of a
+	// wider native subgroup, and its lanes are the low five bits in both halves.
+	IR::U32 thread_mask = low ? below : IR::U32(IR::Value(0u));
+	if (program.wave_size == 64u) {
+		const auto high_lane =
+		    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {lane, IR::Value(32u)}));
+		thread_mask = low ? ir.Select(high_lane, IR::U32(IR::Value(0xffffffffu)), below)
+		                  : ir.Select(high_lane, below, IR::U32(IR::Value(0u)));
+	}
 	const auto active      = ir.BitwiseAnd(ReadU32(inst.src0), thread_mask);
 	const auto count       = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {active}));
 	WriteOperand(DestinationOperand(inst), ir.IAdd(count, ReadU32(inst.src1)));

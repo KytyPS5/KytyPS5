@@ -499,16 +499,44 @@ using exception_handler_func_t = KYTY_SYSV_ABI void (*)(int, void*);
 static thread_local bool g_dispatching_signal_handler = false;
 
 struct SignalDispatchScope {
-	SignalDispatchScope(): previous(g_dispatching_signal_handler) {
+	explicit SignalDispatchScope(Pthread thread)
+	    : thread(thread), owned(PthreadBeginSignalDispatch(thread)),
+	      previous(g_dispatching_signal_handler) {
 		g_dispatching_signal_handler = true;
 	}
-	~SignalDispatchScope() { g_dispatching_signal_handler = previous; }
+	~SignalDispatchScope() {
+		if (owned) {
+			PthreadEndSignalDispatch(thread);
+		}
+		g_dispatching_signal_handler = previous;
+	}
 
-	bool previous;
+	Pthread thread;
+	bool    owned;
+	bool    previous;
 };
 
 bool KernelIsDispatchingSignalOnCurrentThread() {
 	return g_dispatching_signal_handler;
+}
+
+template <typename Deliver>
+static void DispatchPendingSignals(Pthread thread, Deliver deliver) {
+	SignalDispatchScope scope(thread);
+	if (!scope.owned) {
+		return;
+	}
+	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers));) {
+		if (!PthreadTakePendingSignal(thread, signum)) {
+			signum++;
+			continue;
+		}
+		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+		if (handler != nullptr) {
+			deliver(handler, signum);
+		}
+		signum = 0;
+	}
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -959,27 +987,16 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 	}
 
 	auto* host_ctx = static_cast<ucontext_t*>(native_context);
-
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
-			continue;
+	DispatchPendingSignals(current, [&](exception_handler_func_t handler, int signum) {
+		auto ctx = CreateSignalUcontextFromHost(host_ctx);
+		if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+			handler(signum, &ctx);
+			ApplySignalUcontextToHost(host_ctx, ctx);
+		} else {
+			SanitizeNonGuestSignalUcontext(&ctx, current);
+			handler(signum, &ctx);
 		}
-
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
-				handler(signum, &ctx);
-				ApplySignalUcontextToHost(host_ctx, ctx);
-			} else {
-				// Do not expose or restore a host frame.
-				SanitizeNonGuestSignalUcontext(&ctx, current);
-				handler(signum, &ctx);
-			}
-		}
-		return;
-	}
+	});
 }
 
 static bool EnsureHostSignalDispatchInstalled() {
@@ -1020,25 +1037,21 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 	return nt_queue_apc_thread_ex;
 }
 
-static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
-	auto*      thread = static_cast<Pthread>(arg1);
-	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
+static void SignalApcHandler(void* arg1, void* /*arg2*/, void* /*arg3*/, PCONTEXT context) {
+	auto* thread = static_cast<Pthread>(arg1);
 	PthreadClearSignalApcQueued(thread);
-	if (!Loader::IsGuestCodeAddress(context->Rip) || !PthreadTakePendingSignal(thread, signum)) {
+	if (!Loader::IsGuestCodeAddress(context->Rip)) {
 		return;
 	}
-
-	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-	if (handler != nullptr) {
-		SignalDispatchScope scope;
-		auto                ctx = CreateSignalUcontext(context);
+	DispatchPendingSignals(thread, [context](exception_handler_func_t handler, int signum) {
+		auto ctx = CreateSignalUcontext(context);
 		handler(signum, &ctx);
 		ApplySignalUcontext(context, ctx);
-	}
+	});
 }
 
 static bool QueueSignalApc(Pthread thread, int signum) {
-	if (!PthreadMarkSignalApcQueued(thread)) {
+	if (PthreadIsDispatchingSignal(thread) || !PthreadMarkSignalApcQueued(thread)) {
 		return true;
 	}
 
@@ -1073,7 +1086,9 @@ public:
 
 	void Track(Pthread thread, int signum) {
 		std::lock_guard lock(m_mutex);
-		m_targets.emplace_back(thread, signum);
+		if (std::ranges::find(m_targets, std::pair {thread, signum}) == m_targets.end()) {
+			m_targets.emplace_back(thread, signum);
+		}
 		if (!m_started) {
 			m_started = true;
 			std::thread([this] { Run(); }).detach();
@@ -1109,21 +1124,11 @@ void KernelDispatchPendingSignalForCurrentThread() {
 	if (!PthreadHasAnyPendingSignal(current)) {
 		return;
 	}
-
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
-			continue;
-		}
-
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontext();
-			SanitizeNonGuestSignalUcontext(&ctx, current);
-			handler(signum, &ctx);
-		}
-		return;
-	}
+	DispatchPendingSignals(current, [current](exception_handler_func_t handler, int signum) {
+		auto ctx = CreateSignalUcontext();
+		SanitizeNonGuestSignalUcontext(&ctx, current);
+		handler(signum, &ctx);
+	});
 }
 
 static int KYTY_SYSV_ABI KernelInstallExceptionHandler(int signum, void* handler) {
@@ -1157,6 +1162,14 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 	return OK;
 }
 
+static void RaiseOnCurrentThread(Pthread thread, int signum, uint64_t return_address) {
+	PthreadQueuePendingSignal(thread, signum);
+	DispatchPendingSignals(thread, [return_address](exception_handler_func_t handler, int pending) {
+		auto ctx = CreateCurrentGuestCallSignalUcontext(return_address);
+		handler(pending, &ctx);
+	});
+}
+
 static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	constexpr int POSIX_SIGUSR1 = 30;
 
@@ -1172,10 +1185,8 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
-			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			handler(signum, &ctx);
+			RaiseOnCurrentThread(thread, signum,
+			                     reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			return OK;
 		}
 
@@ -1192,10 +1203,8 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 #elif defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
-			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			handler(signum, &ctx);
+			RaiseOnCurrentThread(thread, signum,
+			                     reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			return OK;
 		}
 

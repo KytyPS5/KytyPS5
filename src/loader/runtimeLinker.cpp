@@ -364,7 +364,26 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 #endif
 }
 
+static void ClaimGuestCode(uint64_t base, uint64_t size) {
+	g_desired_base_addr = base + CODE_BASE_INCR * (1 + size / CODE_BASE_INCR);
+}
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+uint64_t TestMapGuestCode(uint64_t size, uint64_t occupied) {
+	const uint64_t desired = g_desired_base_addr;
+	if (occupied != 0 && Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	                         desired, occupied, Common::VirtualMemory::Mode::ReadWrite,
+	                         "guest_code_test_occupied", true) != desired) {
+		return 0;
+	}
+	const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    desired, size, Common::VirtualMemory::Mode::ExecuteReadWrite, "guest_code_test");
+	if (base != 0) {
+		ClaimGuestCode(base, size);
+	}
+	return base;
+}
+
 struct MainEntryStackTestState {
 	bool      called = false;
 	uintptr_t rsp    = 0;
@@ -1729,7 +1748,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
 	}
 
-	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
+	ClaimGuestCode(program->base_vaddr, program->mapped_size);
 
 	EXIT_IF(program->base_size_aligned < program->base_size);
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"

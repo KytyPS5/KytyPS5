@@ -91,7 +91,6 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
-Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
 int KYTY_SYSV_ABI     PthreadDetach(Pthread thread);
@@ -123,6 +122,9 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
+#else
+bool PthreadMarkSignalApcQueued(Pthread thread);
+void PthreadClearSignalApcQueued(Pthread thread);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();

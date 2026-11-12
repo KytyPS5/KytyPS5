@@ -74,7 +74,7 @@ static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size) {
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	EXIT_IF(g_shader_map == nullptr);
 
-	EXIT_IF(metadata.vertex_attrib_reg >= 0 && metadata.vertex_attrib_reg + 1 < HW::UserSgprInfo::SGPRS_MAX);
+	EXIT_IF(metadata.vertex_attrib_reg + 1 < HW::UserSgprInfo::SGPRS_MAX);
 		EXIT("ShaderMapUserData shader=0x%016" PRIx64 " has invalid shader_size=0x%08" PRIx32 "\n",
 		     addr, data.code_size_bytes);
 	}

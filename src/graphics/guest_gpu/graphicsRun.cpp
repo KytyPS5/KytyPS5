@@ -308,11 +308,14 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
+	auto& buffers = m_renderer.GetBufferCache();
+	if (!write_one_address) {
+		buffers.WriteMemory(reinterpret_cast<uint64_t>(dst), src,
+		                    uint64_t {dw_num} * sizeof(uint32_t));
+		return;
+	}
 	for (uint32_t i = 0; i < dw_num; i++) {
-		*output = src[i];
-		output += !write_one_address;
+		buffers.WriteMemory(reinterpret_cast<uint64_t>(dst), src + i, sizeof(uint32_t));
 	}
 }
 
@@ -323,7 +326,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.GetBufferCache().WriteMemory(dst_address, &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64

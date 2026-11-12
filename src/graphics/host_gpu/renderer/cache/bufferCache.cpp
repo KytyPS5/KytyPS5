@@ -561,6 +561,32 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+void BufferCache::WriteMemory(uint64_t vaddr, const void* data, uint64_t size) {
+	if (data == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid memory write\n");
+	}
+	if (!GuestRange {vaddr, size}.Valid() || !IsRegionGpuModified(vaddr, size)) {
+		// Access the guest mapping so write faults invalidate cached buffers and images.
+		if (((vaddr | size) & 3u) != 0) {
+			std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
+			return;
+		}
+		// Completion labels can be reused immediately; memcpy may write a destination twice.
+		auto*       output = reinterpret_cast<volatile uint32_t*>(vaddr);
+		const auto* input  = static_cast<const uint8_t*>(data);
+		for (uint64_t offset = 0; offset < size; offset += sizeof(uint32_t)) {
+			uint32_t word = 0;
+			std::memcpy(&word, input + offset, sizeof(word));
+			*output++ = word;
+		}
+		return;
+	}
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	(void)dst_offset;
+	WriteDataBuffer(*dst, vaddr, data, size);
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;

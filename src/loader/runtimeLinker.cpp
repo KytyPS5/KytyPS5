@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <iterator>
 #include <magic_enum.hpp>
 #include <memory>
 #include <vector>
@@ -689,32 +690,34 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 		}
 	}
-	std::printf("--- Guest fault context ---\n");
-	std::printf("thread: %s\n", thread_name);
-	std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-	            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-	            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-	            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-	            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-	            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-	            info->r14, info->r15);
+	fmt::basic_memory_buffer<char, 2048> report;
+	const auto                           out = std::back_inserter(report);
+	fmt::format_to(out, "--- Guest fault context ---\nthread: {}\n", thread_name);
+	fmt::format_to(out,
+	               "rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+	               "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+	               "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+	               "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+	               info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+	               info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+	               info->r14, info->r15);
 	if (IsReadableRange(info->exception_address - 48, 96)) {
 		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-		std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+		fmt::format_to(out, "code (pc-48 .. pc+48, fault at byte 48):");
 		for (int i = 0; i < 96; i++) {
-			std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+			fmt::format_to(out, "{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
 		}
-		std::printf("\n");
+		report.push_back('\n');
 	}
 	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-		std::printf("stack:");
+		fmt::format_to(out, "stack:");
 		for (int i = 0; i < 32; i++) {
-			std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+			fmt::format_to(out, "{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 		}
-		std::printf("\n");
+		report.push_back('\n');
 	}
-	std::fflush(stdout);
+	Log::WriteToConsoleAndLog(std::string_view(report.data(), report.size()));
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,

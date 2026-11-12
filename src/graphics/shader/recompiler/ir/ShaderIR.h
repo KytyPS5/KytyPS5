@@ -927,6 +927,9 @@ struct Program: ResourcePlan {
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
+	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
+	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
+	bool                          lane_local     = false;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	// Byte pcs where the code of an inlined call target starts (programs expanded by

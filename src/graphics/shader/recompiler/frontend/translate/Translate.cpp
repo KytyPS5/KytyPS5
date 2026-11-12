@@ -1029,6 +1029,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u) {
+		// (Only a host with 32-wide subgroups runs two lanes per invocation otherwise.)
+		const auto* group = ShaderWorkgroupInput(options.stage, options.input_info);
+		result.lane_local = group != nullptr && group->host_subgroup_size == 32u && IsWaveLaneLocal(decoded);
+	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1167,7 +1172,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
-			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u && !result.lane_local &&
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));

@@ -13906,6 +13906,9 @@ void TestSpirvConditionVotes() {
     options.wave_size = wave;
     options.input_info.compute = &compute;
     auto compiled = RecompileForTest(shader, options);
+    // A wave64 program on 32-wide subgroups that the lane-locality proof accepts runs one lane per invocation and
+    // has no virtual halves; this test is about the halves.
+    compiled.program.lane_local = false;
     IR::IREmitter emitter(compiled.program.blocks.front());
     const auto lane = emitter.Emit(IR::ValueOpcode::LaneId, {});
     const auto predicate = emitter.Emit(IR::ValueOpcode::IEqual32, {lane, IR::Value(33u)});

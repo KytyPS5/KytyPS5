@@ -75,8 +75,10 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.mip_stats_records     = mip_stats_records;
 	state.ray_stats             = ray_stats && program.info.ray_query;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	// (A lane-local wave64 program: one GCN lane per invocation, each 32-wide subgroup a half wave.)
 	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+	            !program.lane_local
 	        ? 2u
 	        : 1u;
 	DefineModule(state);

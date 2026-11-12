@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -33,5 +34,9 @@ struct TranslateOptions {
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options);
+
+// A wave64 program whose results in each lane depend on no lane outside its 32-lane half (LaneLocal.cpp): on a host
+// with 32-wide subgroups it runs one GCN lane per invocation. `reason`: why not.
+bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

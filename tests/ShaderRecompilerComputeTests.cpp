@@ -1719,6 +1719,9 @@ struct TestCase {
     return info;
   }();
   bool has_compute_info = false;
+  // Compile a wave64 program for 32-wide subgroups as two virtual halves even when the lane-locality proof accepts it
+  // (which runs one lane per invocation): the case is about the halves.
+  bool virtual_halves = false;
   u32 dispatch_x = 1;
   u32 dispatch_y = 1;
   u32 dispatch_z = 1;
@@ -2082,6 +2085,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  if (test.virtual_halves) {
+    translated.program.lane_local = false;
+  }
   auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -30498,7 +30504,8 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   test.expected = {0xa1b20007u, 0xa1b2001fu};
   test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {" UMin ", "OpSelect"};
+  // (One lane per invocation folds these constants, so no UMin is left: the stored words check the semantics.)
+  test.required_spirv = {"OpSelect"};
   return test;
 }
 
@@ -44751,6 +44758,7 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
   using O = ShaderOpcode;
   TestCase test;
   test.name = wave_size == 32u ? "DynamicSampleOffsets32" : "DynamicSampleOffsets64";
+  test.virtual_halves = true;
   test.has_compute_info = test.has_user_data = true;
   test.compute_info.wave_size = wave_size;
   test.compute_info.host_subgroup_size = vulkan.SubgroupSize();
@@ -45332,6 +45340,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
     for (const u32 count : {0u, 1u, 8u}) {
       TestCase test;
       test.name = wave == 32 ? "BoundedFormattedBufferCopy32" : "BoundedFormattedBufferCopy64";
+      test.virtual_halves = true;
       // Captured b3ade16b0485b3bd: uniform loop over two V# arrays; copy only lanes
       // below each row's count. Scalar+vector guards and register reuse are intact.
       test.code = {0xbfa00001u, 0xd7460000u, 0x04010c02u, 0xbeeb0380u,

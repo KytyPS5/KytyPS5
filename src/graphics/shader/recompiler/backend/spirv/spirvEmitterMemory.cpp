@@ -78,8 +78,10 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 }
 
 uint32_t BufferLane(EmitterState& state) {
-	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+	// (ADD_TID: the GCN lane. A lane-local wave64 program's subgroup is half a wave: its index in the group.)
+	const auto id = state.lane_count == 1 && state.program.lane_local ? EmitLocalInvocationIndex(state)
+	                                                                  : EmitSubgroupLocalInvocationId(state);
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 63));
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {

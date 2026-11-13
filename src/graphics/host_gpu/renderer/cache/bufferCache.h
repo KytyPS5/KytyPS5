@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/sparseBinding.h"
 
 #include <array>
 #include <map>
@@ -130,6 +131,9 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// A sparse table takes the pages its written entries need.
+	void WritePageTable(uint64_t offset, std::span<const vk::DeviceAddress> entries);
+	void BindPageTable(uint64_t offset, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -154,6 +158,8 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	// The pages of a sparse table by position; empty for a table with memory of its own.
+	std::vector<SparsePage>                           m_table_pages;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

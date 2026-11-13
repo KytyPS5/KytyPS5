@@ -218,6 +218,11 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static size_t BoundTablePages(const BufferCache &cache) {
+    return static_cast<size_t>(std::ranges::count_if(
+        cache.m_table_pages, [](const auto &page) { return page.allocation != nullptr; }));
+  }
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
@@ -5244,6 +5249,109 @@ public:
       }
 
       Require(name, "no leak", allocated() == bytes, "sparse pages were leaked");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A sparse BDA page table takes memory only where an entry was written. A page is zero when
+  // shaders first see it: the work recorded before it was bound finished on the unbound entries.
+  void CheckSparsePageTable() {
+    constexpr const char *name = "SparsePageTable";
+    constexpr uint64_t base = 0x0000000260000000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    using Libs::Graphics::Buffer;
+    using Libs::Graphics::SparsePage;
+    EnsureRuntimeContext();
+    auto &graphics = m_runtime_context;
+    {
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetBufferCache();
+      auto &table = *cache.GetBdaPageTableBuffer();
+      if (!table.IsSparse()) {
+        std::printf("[gpu]     %-32s skipped (no sparse page table)\n", name);
+        return;
+      }
+      auto &sparse = *graphics.sparse_binding;
+      // The guest addresses one page of the table holds the entries of.
+      const auto span = sparse.PageSize() / sizeof(vk::DeviceAddress) * page;
+      Require(name, "empty table", BufferCacheTestAccess::BoundTablePages(cache) == 0,
+              "the table took memory before an entry was written");
+      {
+        // The memory the table takes next holds other bytes.
+        std::array<SparsePage, 4> dirty{};
+        Require(name, "dirty pages", sparse.AllocatePages(dirty, true),
+                "sparse pages were not allocated");
+        Buffer scratch(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+                       dirty.size() * sparse.PageSize(), Buffer::Sparse::Residency);
+        std::array<vk::SparseMemoryBind, dirty.size()> binds{};
+        for (size_t index = 0; index < dirty.size(); ++index) {
+          binds[index] = vk::SparseMemoryBind{index * sparse.PageSize(), sparse.PageSize(),
+                                              dirty[index].memory, dirty[index].offset};
+        }
+        sparse.BindBuffer(scratch.Handle(), binds);
+        scratch.Fill(0, scratch.Size(), 0xa5a5a5a5u);
+        scheduler.Finish();
+        sparse.UnbindBuffer(scratch.Handle(), 0, scratch.Size(), dirty);
+        scheduler.Finish();
+        sparse.Collect();
+      }
+      auto readback = CreateHostBuffer(name, 6 * sizeof(uint64_t),
+                                       vk::BufferUsageFlagBits::eTransferDst, {});
+      const auto snapshot = [&](uint64_t address, u32 index) {
+        const vk::BufferCopy copy{BufferCache::PageIndex(address) * sizeof(uint64_t),
+                                  index * sizeof(uint64_t), sizeof(uint64_t)};
+        scheduler.Current().Handle().copyBuffer(table.Handle(), readback.buffer, 1, &copy);
+      };
+      // Recorded ahead of the bind, in the same recording.
+      snapshot(base + 16 * page, 0);
+      const auto tick = scheduler.CurrentTick();
+      const auto &buffer = cache.GetBuffer(cache.FindBuffer(base, page));
+      Require(name, "bind order", scheduler.CurrentTick() > tick,
+              "work recorded before a table page was bound did not finish first");
+      Require(name, "first page", BufferCacheTestAccess::BoundTablePages(cache) == 1,
+              "one entry did not take exactly one table page");
+      snapshot(base, 1);
+      snapshot(base + 16 * page, 2);
+      snapshot(base + span - page, 3);
+      snapshot(base + span, 4);
+      (void)cache.FindBuffer(base + span / 2, page);
+      Require(name, "shared page", BufferCacheTestAccess::BoundTablePages(cache) == 1,
+              "entries of one table page took a second one");
+      snapshot(base, 5);
+      (void)cache.FindBuffer(base + span, page);
+      Require(name, "second page", BufferCacheTestAccess::BoundTablePages(cache) == 2,
+              "an entry outside the bound table page took no page");
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+          1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, readback, 12);
+      const auto entry = [&](size_t index) {
+        return uint64_t{words[index * 2]} | (uint64_t{words[index * 2 + 1]} << 32);
+      };
+      Require(name, "earlier read", entry(0) == 0,
+              "work recorded before a table page was bound saw the page");
+      Require(name, "written entry",
+              entry(1) == buffer.BufferDeviceAddress() + buffer.Offset(base),
+              "an entry written to a fresh table page was lost");
+      Require(name, "zeroed page", entry(2) == 0 && entry(3) == 0,
+              "a fresh table page was not zero");
+      Require(name, "kept entry", entry(5) == entry(1),
+              "a later entry of the same table page replaced the page");
+      Require(name, "unbound page", entry(4) == 0, "an unbound table page did not read as zero");
+      DestroyBuffer(&readback);
     }
     std::printf("[gpu]     %-32s ok\n", name);
   }
@@ -60457,6 +60565,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sparse-buffer-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSparseBufferPages();
+    vulkan.CheckSparsePageTable();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
@@ -60761,6 +60870,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckDeviceBudgetPlacement();
     vulkan.CheckSparseBufferPages();
+    vulkan.CheckSparsePageTable();
     vulkan.CheckDescriptorTablePrefetch();
   } else {
     skipped_device_checks = true;

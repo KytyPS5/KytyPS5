@@ -50,6 +50,12 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	return {buffer, 0};
 }
 
+// A sparse table leaves the entries of unused address space without memory; they must read zero.
+bool SparsePageTable(const GraphicContext& graphics) {
+	return graphics.sparse_residency_buffer_enabled &&
+	       graphics.physical_device_properties.sparseProperties.residencyNonResidentStrict;
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -93,6 +99,42 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
+void BufferCache::BindPageTable(uint64_t offset, uint64_t size) {
+	if (m_table_pages.empty() || size == 0) {
+		return;
+	}
+	auto&                             sparse = *m_graphics.sparse_binding;
+	const auto                        page   = sparse.PageSize();
+	std::vector<vk::SparseMemoryBind> binds;
+	for (auto index = offset / page; index <= (offset + size - 1) / page; index++) {
+		auto& memory = m_table_pages[index];
+		if (memory.allocation != nullptr) {
+			continue;
+		}
+		if (!sparse.AllocatePages({&memory, 1}, false)) {
+			m_graphics.LogMemoryBudget();
+			EXIT("out of memory for the BDA page table\n");
+		}
+		binds.push_back({index * page, page, memory.memory, memory.offset});
+	}
+	if (binds.empty()) {
+		return;
+	}
+	// A bind takes effect ahead of the recording it is queued in: the work recorded so far, which
+	// reads these entries as zero, finishes before memory not yet zeroed takes their place.
+	m_scheduler.Wait(m_scheduler.CurrentTick());
+	sparse.BindBuffer(m_bda_pagetable_buffer.Handle(), binds);
+	for (const auto& bind: binds) {
+		m_bda_pagetable_buffer.Fill(bind.resourceOffset, bind.size, 0);
+	}
+}
+
+void BufferCache::WritePageTable(uint64_t offset, std::span<const vk::DeviceAddress> entries) {
+	const auto size = entries.size() * sizeof(vk::DeviceAddress);
+	BindPageTable(offset, size);
+	WriteDataBuffer(m_bda_pagetable_buffer, offset, entries.data(), size);
+}
+
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 }
@@ -125,8 +167,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		WritePageTable(table_offset, addresses);
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
@@ -229,8 +270,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+      m_bda_pagetable_buffer(
+          graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, BDA_PAGETABLE_SIZE,
+          SparsePageTable(graphics) ? Buffer::Sparse::Residency : Buffer::Sparse::None),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -241,9 +283,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	if (m_bda_pagetable_buffer.IsSparse()) {
+		const auto page = m_graphics.sparse_binding->PageSize();
+		EXIT_IF(BDA_PAGETABLE_SIZE % page != 0);
+		m_table_pages.resize(BDA_PAGETABLE_SIZE / page);
+	}
 	m_scheduler.BeginCommand();
 	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
-		buffer->Fill(0, buffer->Size(), 0);
+		// A sparse table has no pages yet; each is zeroed as it is bound.
+		if (!buffer->IsSparse()) {
+			buffer->Fill(0, buffer->Size(), 0);
+		}
 	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -273,6 +323,13 @@ BufferCache::~BufferCache() {
 		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
 			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
 		}
+	}
+	if (!m_table_pages.empty()) {
+		// No bind, queued or executing, may name the pages once they are freed.
+		auto& sparse = *m_graphics.sparse_binding;
+		sparse.Forget(m_bda_pagetable_buffer.Handle());
+		sparse.WaitIdle();
+		sparse.FreePages(m_table_pages);
 	}
 }
 

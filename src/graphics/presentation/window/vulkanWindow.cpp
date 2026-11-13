@@ -607,13 +607,26 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		const bool queue_sparse =
 		    queue_family < families.size() && static_cast<bool>(families[queue_family].queueFlags &
 		                                                        vk::QueueFlagBits::eSparseBinding);
+		const bool sparse = queue_sparse && supported2.features.sparseBinding == VK_TRUE;
 		graphics.sparse_residency_image2d_enabled =
-		    queue_sparse && supported2.features.sparseBinding == VK_TRUE &&
-		    supported2.features.sparseResidencyImage2D == VK_TRUE;
-		device_features.sparseBinding          = graphics.sparse_residency_image2d_enabled;
+		    sparse && supported2.features.sparseResidencyImage2D == VK_TRUE;
+		// Guest buffers and the BDA page table take memory only for the pages in use; the
+		// windows of the guest buffers overlap, which is what aliasing allows.
+		graphics.sparse_residency_buffer_enabled =
+		    sparse && Config::SparseBuffersEnabled() &&
+		    supported2.features.sparseResidencyBuffer == VK_TRUE;
+		graphics.sparse_residency_aliased_enabled =
+		    graphics.sparse_residency_buffer_enabled &&
+		    supported2.features.sparseResidencyAliased == VK_TRUE;
+		device_features.sparseBinding =
+		    graphics.sparse_residency_image2d_enabled || graphics.sparse_residency_buffer_enabled;
 		device_features.sparseResidencyImage2D = graphics.sparse_residency_image2d_enabled;
-		LOGF("Vulkan sparse 2D images: %s\n",
-		     graphics.sparse_residency_image2d_enabled ? "true" : "false");
+		device_features.sparseResidencyBuffer  = graphics.sparse_residency_buffer_enabled;
+		device_features.sparseResidencyAliased = graphics.sparse_residency_aliased_enabled;
+		LOGF("Vulkan sparse 2D images: %s, buffers: %s, aliased: %s\n",
+		     graphics.sparse_residency_image2d_enabled ? "true" : "false",
+		     graphics.sparse_residency_buffer_enabled ? "true" : "false",
+		     graphics.sparse_residency_aliased_enabled ? "true" : "false");
 	}
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {

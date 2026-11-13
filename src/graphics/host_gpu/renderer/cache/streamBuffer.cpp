@@ -59,9 +59,9 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, Sparse sparse)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_size(size) {
+      m_size(size), m_sparse(sparse) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -70,6 +70,28 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	if (sparse != Sparse::None) {
+		EXIT_IF(usage != MemoryUsage::DeviceLocal || !graphics.sparse_residency_buffer_enabled ||
+		        (sparse == Sparse::Aliased && !graphics.sparse_residency_aliased_enabled) ||
+		        (flags & ~SparseBufferUsage) != vk::BufferUsageFlags {});
+		buffer_info.flags =
+		    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		if (sparse == Sparse::Aliased) {
+			buffer_info.flags |= vk::BufferCreateFlagBits::eSparseAliased;
+		}
+		const auto result = graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer);
+		if (result != vk::Result::eSuccess) {
+			EXIT("cannot create a sparse buffer of %" PRIu64 " bytes: %s\n", size,
+			     vk::to_string(result).c_str());
+		}
+		if (with_bda) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+			EXIT_IF(m_device_address == 0);
+		}
+		return;
+	}
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags          = AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
@@ -115,7 +137,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (IsSparse()) {
+		// Binds still queued would name a destroyed buffer.
+		m_graphics->sparse_binding->Forget(m_buffer);
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

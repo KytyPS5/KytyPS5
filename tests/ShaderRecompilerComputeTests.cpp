@@ -5110,6 +5110,144 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Copies one dword per offset out of a cache buffer and waits for the result.
+  std::vector<u32> ReadBufferWords(const char *name, CommandScheduler &scheduler,
+                                   const Libs::Graphics::Buffer &buffer,
+                                   std::initializer_list<uint64_t> offsets) {
+    auto readback = CreateHostBuffer(name, offsets.size() * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    std::vector<vk::BufferCopy> copies;
+    for (const auto offset : offsets) {
+      copies.push_back({offset, copies.size() * sizeof(u32), sizeof(u32)});
+    }
+    const auto command = scheduler.Current().Handle();
+    command.copyBuffer(buffer.Handle(), readback.buffer, static_cast<u32>(copies.size()),
+                       copies.data());
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+                            nullptr);
+    scheduler.Finish();
+    auto words = ReadBuffer(name, readback, offsets.size());
+    DestroyBuffer(&readback);
+    return words;
+  }
+
+  // Sparse buffers take SparseBinding pages. The last bind queued for a page is the one applied,
+  // a released page is freed once its unbind ran, and aliased buffers share the bytes of a page.
+  void CheckSparseBufferPages() {
+    constexpr const char *name = "SparseBufferPages";
+    using Libs::Graphics::Buffer;
+    using Libs::Graphics::SparsePage;
+    EnsureRuntimeContext();
+    auto &graphics = m_runtime_context;
+    if (!graphics.sparse_residency_buffer_enabled) {
+      std::printf("[gpu]     %-32s skipped (no sparse buffers)\n", name);
+      return;
+    }
+    {
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &sparse = *graphics.sparse_binding;
+      const auto page = sparse.PageSize();
+      const bool strict =
+          graphics.physical_device_properties.sparseProperties.residencyNonResidentStrict;
+      Require(name, "page size", page != 0 && (page & (page - 1)) == 0,
+              "sparse buffers have no page size");
+      const auto allocated = [&] {
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(graphics.allocator, budgets);
+        uint64_t bytes = 0;
+        for (uint32_t heap = 0;
+             heap < graphics.physical_device_memory_properties.memoryHeapCount; ++heap) {
+          bytes += budgets[heap].statistics.allocationBytes;
+        }
+        return bytes;
+      };
+
+      const auto bytes = allocated();
+      std::array<SparsePage, 2> pages{};
+      Require(name, "pages",
+              sparse.AllocatePages(pages, true) && allocated() == bytes + 2 * page,
+              "sparse pages were not allocated");
+      {
+        Buffer buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 8 * page,
+                      Buffer::Sparse::Residency);
+        const std::array binds{
+            vk::SparseMemoryBind{0, page, pages[0].memory, pages[0].offset},
+            vk::SparseMemoryBind{4 * page, page, pages[1].memory, pages[1].offset},
+            vk::SparseMemoryBind{6 * page, page, pages[1].memory, pages[1].offset}};
+        sparse.BindBuffer(buffer.Handle(), {binds.data(), 2});
+        // Unbound then bound again stays bound; bound then unbound never reaches the device.
+        sparse.UnbindBuffer(buffer.Handle(), 4 * page, page, {});
+        sparse.BindBuffer(buffer.Handle(), {&binds[1], 1});
+        sparse.BindBuffer(buffer.Handle(), {&binds[2], 1});
+        sparse.UnbindBuffer(buffer.Handle(), 6 * page, page, {});
+        buffer.Fill(0, page, 0x11111111u);
+        buffer.Fill(4 * page, page, 0x22222222u);
+        buffer.Fill(2 * page, page, 0x33333333u);
+        auto words = ReadBufferWords(name, scheduler, buffer,
+                                     {0, page - 4, 4 * page, 5 * page - 4, 2 * page, 6 * page});
+        Require(name, "bound pages",
+                words[0] == 0x11111111u && words[1] == 0x11111111u &&
+                    words[2] == 0x22222222u && words[3] == 0x22222222u,
+                "a bound page lost its bytes");
+        Require(name, "unbound pages", !strict || (words[4] == 0 && words[5] == 0),
+                "a page left unbound did not read as zero");
+
+        sparse.UnbindBuffer(buffer.Handle(), 0, page, {&pages[0], 1});
+        Require(name, "queued release", allocated() == bytes + 2 * page,
+                "a released page was freed before its unbind ran");
+        words = ReadBufferWords(name, scheduler, buffer, {0, 4 * page});
+        sparse.Collect();
+        Require(name, "release",
+                (!strict || words[0] == 0) && words[1] == 0x22222222u &&
+                    allocated() == bytes + page,
+                "an unbound page kept its bytes or its memory");
+        sparse.UnbindBuffer(buffer.Handle(), 4 * page, page, {&pages[1], 1});
+        scheduler.Finish();
+        sparse.Collect();
+        Require(name, "all released", allocated() == bytes,
+                "the last page of a sparse buffer was not freed");
+      }
+
+      if (graphics.sparse_residency_aliased_enabled) {
+        SparsePage shared{};
+        Require(name, "shared page", sparse.AllocatePages({&shared, 1}, true),
+                "a sparse page was not allocated");
+        Buffer first(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 4 * page,
+                     Buffer::Sparse::Aliased);
+        Buffer second(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 4 * page,
+                      Buffer::Sparse::Aliased);
+        const vk::SparseMemoryBind low{0, page, shared.memory, shared.offset};
+        const vk::SparseMemoryBind high{3 * page, page, shared.memory, shared.offset};
+        sparse.BindBuffer(first.Handle(), {&low, 1});
+        sparse.BindBuffer(second.Handle(), {&high, 1});
+        first.Fill(0, page, 0x44444444u);
+        const auto words = ReadBufferWords(name, scheduler, second, {3 * page, 4 * page - 4});
+        Require(name, "aliased page", words[0] == 0x44444444u && words[1] == 0x44444444u,
+                "two buffers sharing a page did not share its bytes");
+        sparse.UnbindBuffer(first.Handle(), 0, page, {});
+        sparse.UnbindBuffer(second.Handle(), 3 * page, page, {&shared, 1});
+        scheduler.Finish();
+        sparse.Collect();
+      }
+
+      Require(name, "no leak", allocated() == bytes, "sparse pages were leaked");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -25123,6 +25261,8 @@ private:
   bool m_rasterization_supported = true;
   // Sparse 2D images, for textures the T# MIN_LOD clamps.
   bool m_sparse_image2d_supported = false;
+  bool m_sparse_buffer_supported = false;
+  bool m_sparse_aliased_supported = false;
   bool m_sample_locations_supported = false;
   u32   m_skipped_cases          = 0;
 
@@ -25174,6 +25314,8 @@ private:
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.sparse_residency_image2d_enabled = m_sparse_image2d_supported;
+    m_runtime_context.sparse_residency_buffer_enabled = m_sparse_buffer_supported;
+    m_runtime_context.sparse_residency_aliased_enabled = m_sparse_aliased_supported;
     m_runtime_context.subgroup_size = SubgroupSize();
     m_runtime_context.QuerySampleLocations(m_sample_locations_supported);
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -25533,13 +25675,18 @@ private:
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
-    m_sparse_image2d_supported =
+    const bool sparse =
         available_features.sparseBinding == VK_TRUE &&
-        available_features.sparseResidencyImage2D == VK_TRUE &&
         static_cast<bool>(m_physical_device.getQueueFamilyProperties()[m_queue_family].queueFlags &
                           vk::QueueFlagBits::eSparseBinding);
-    device_features.sparseBinding = m_sparse_image2d_supported;
+    m_sparse_image2d_supported = sparse && available_features.sparseResidencyImage2D == VK_TRUE;
+    m_sparse_buffer_supported = sparse && available_features.sparseResidencyBuffer == VK_TRUE;
+    m_sparse_aliased_supported =
+        m_sparse_buffer_supported && available_features.sparseResidencyAliased == VK_TRUE;
+    device_features.sparseBinding = m_sparse_image2d_supported || m_sparse_buffer_supported;
     device_features.sparseResidencyImage2D = m_sparse_image2d_supported;
+    device_features.sparseResidencyBuffer = m_sparse_buffer_supported;
+    device_features.sparseResidencyAliased = m_sparse_aliased_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -60307,6 +60454,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDeviceBudgetPlacement();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--sparse-buffer-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSparseBufferPages();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -60608,6 +60760,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckDeviceBudgetPlacement();
+    vulkan.CheckSparseBufferPages();
     vulkan.CheckDescriptorTablePrefetch();
   } else {
     skipped_device_checks = true;

@@ -55,7 +55,7 @@ bool GraphicContext::CreateAllocator() {
 
 void GraphicContext::CreateSparseBinding() {
 	EXIT_IF(allocator == nullptr || sparse_binding != nullptr);
-	if (sparse_residency_image2d_enabled) {
+	if (sparse_residency_image2d_enabled || sparse_residency_buffer_enabled) {
 		sparse_binding = new SparseBinding(*this);
 	}
 }
@@ -238,7 +238,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 
 bool GraphicContext::CreatePartialImage(const vk::ImageCreateInfo& base, uint32_t first_level,
                                         VulkanImage& image) {
-	if (sparse_binding == nullptr || base.imageType != vk::ImageType::e2D ||
+	if (!sparse_residency_image2d_enabled || base.imageType != vk::ImageType::e2D ||
 	    base.samples != vk::SampleCountFlagBits::e1 || base.tiling != vk::ImageTiling::eOptimal ||
 	    first_level == 0 || first_level >= base.mipLevels) {
 		return false;

@@ -716,7 +716,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!storage && !multisampled && clamp_level > view_base &&
 		    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic &&
-		    !desc.info.IsDepth() && m_context.GetGraphics().sparse_binding != nullptr) {
+		    !desc.info.IsDepth() && m_context.GetGraphics().sparse_residency_image2d_enabled) {
 			if (const auto chain = desc.info.MipChainFrom(clamp_level)) {
 				desc.info.first_level = clamp_level;
 				desc.info.data.size   = chain->data.size;

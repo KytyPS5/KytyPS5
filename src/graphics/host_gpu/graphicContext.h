@@ -37,7 +37,10 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	// Sparse 2D images: textures the T# MIN_LOD clamps leave their unsampled levels unbound.
 	bool sparse_residency_image2d_enabled = false;
-	// Null without sparse 2D images; created with the allocator.
+	// Sparse buffers take memory page by page; aliased ones can share a page.
+	bool sparse_residency_buffer_enabled  = false;
+	bool sparse_residency_aliased_enabled = false;
+	// Null without sparse images and buffers; created with the allocator.
 	SparseBinding*                            sparse_binding                         = nullptr;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;

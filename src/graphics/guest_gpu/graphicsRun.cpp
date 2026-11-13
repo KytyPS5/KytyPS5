@@ -887,7 +887,32 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
-	const auto sequence = EmitCallback([dst_address, num_bytes] {
+	const auto sequence = EmitCallback([this, dst_address, num_bytes] {
+		// A timestamp is the time at which the GPU reaches the packet. The execution thread
+		// records the packet long before the host GPU runs the work, and reading the clock here
+		// gave Days Gone (PPSA28180) the CPU's recording times as the timings of its GPU passes:
+		// with the execution right behind the command processor they were short and uneven, and
+		// the menu scene flickered (a frame or two doubled or squashed, which the TAA history
+		// carried for 10-45 frames). The clock is read when the host GPU finishes the work
+		// before the packet instead, in the priority completions that also write the labels of
+		// occlusion dumps; the labels the game waits on follow it (m_deferred_labels). The
+		// buffer is submitted so that each timestamp has a tick of its own.
+		auto& buffers = m_renderer.GetBufferCache();
+		if (GuestRange {dst_address, num_bytes}.Valid() &&
+		    !buffers.IsRegionGpuModified(dst_address, num_bytes)) {
+			void* address = reinterpret_cast<void*>(dst_address);
+			m_renderer.PrepareGpuWrite(address, num_bytes);
+			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
+			GetScheduler().DeferPriorityOperation(
+			    [this, address, num_bytes] {
+				    const auto value = Sync::ReadReferenceClock();
+				    m_renderer.WriteFromCompletion(address, &value, num_bytes);
+				    m_deferred_labels.fetch_sub(1, std::memory_order_release);
+			    },
+			    dst_address, num_bytes);
+			GetScheduler().Flush();
+			return;
+		}
 		const auto value = Sync::ReadReferenceClock();
 		std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 		static std::atomic<uint32_t> clock_log_count {0};

@@ -871,6 +871,22 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
+# Linux x86-64: the patcher's multi-threaded function scan gives the same patched code as one thread.
+if(NOT WIN32 AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+	add_executable(guest_instruction_patch_scan_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/GuestInstructionPatchScanTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+		"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
+	)
+	target_link_libraries(guest_instruction_patch_scan_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+	target_include_directories(guest_instruction_patch_scan_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME guest_instruction_patch_scan COMMAND $<TARGET_FILE:guest_instruction_patch_scan_tests>)
+		set_tests_properties(guest_instruction_patch_scan PROPERTIES TIMEOUT 60)
+		add_dependencies(kyty_tests guest_instruction_patch_scan_tests)
+	endif()
+endif()
+
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 

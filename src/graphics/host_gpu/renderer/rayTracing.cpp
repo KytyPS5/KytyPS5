@@ -389,7 +389,7 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	}
 
 	// Triangle buffers for records [begin, end), which the header bound keeps within the minimum
-	// primitive limit of a device.
+	// primitive limit of a device. Only BLASes the call builds from get theirs written.
 	std::vector<GpuBlas>                 blases(m_blases.size());
 	std::vector<std::array<uint32_t, 2>> triangle_chunks;
 	area.covered.assign(m_blases.size(), 0);
@@ -400,8 +400,7 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 			Reserve(blas.triangles, BuildInput, TriangleSize * records);
 			blas.capacity = static_cast<uint32_t>(blas.triangles->Size() / TriangleSize);
 		}
-		blases[index] = {blas.address, blas.triangles ? blas.triangles->BufferDeviceAddress() : 0,
-		                 blas.capacity};
+		blases[index] = {blas.address, 0, blas.capacity};
 		// A BLAS of unknown size gets one chunk, which reads its header.
 		do {
 			triangle_chunks.push_back({index, area.covered[index]});
@@ -445,10 +444,11 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 			       vk::AccelerationStructureTypeKHR::eBottomLevel, BlasFlags, pair.count);
 		}
 		if (rebuild || update) {
-			pair.built          = true;
-			pair.update_serial  = serial;
-			pair.geometry_known = false;
-			geometries.push_back(TriangleGeometry(blas.triangles->BufferDeviceAddress() +
+			pair.built                  = true;
+			pair.update_serial          = serial;
+			pair.geometry_known         = false;
+			blases[pair.blas].triangles = blas.triangles->BufferDeviceAddress();
+			geometries.push_back(TriangleGeometry(blases[pair.blas].triangles +
 			                                          TriangleSize * (pair.first - blas.begin),
 			                                      pair.count));
 			vk::AccelerationStructureBuildGeometryInfoKHR info {};

@@ -162,8 +162,9 @@
         u32 index = 0;
         float t = 0, u = 0, v = 0;
       };
-      // Mirrors the TLAS and traces each origin; returns {valid, instances, hit words...}.
-      const auto trace = [&](std::span<const Hit> hits) {
+      // Mirrors the TLAS, or reads two words at `read`, and traces each origin; returns {valid,
+      // instances, hit words...}.
+      const auto trace = [&](std::span<const Hit> hits, vk::DeviceAddress read = 0) {
         auto *origin = reinterpret_cast<float *>(origins.Mapped().data());
         for (size_t i = 0; i < hits.size(); ++i) {
           origin[i * 4] = hits[i].origin[0];
@@ -171,11 +172,14 @@
           origin[i * 4 + 2] = 0;
         }
         origins.Flush(0, origins.Size());
-        context.PrepareBda();
+        if (read == 0) {
+          context.PrepareBda();
+          read = mirror.Prepare(tlas);
+        }
         const struct {
           vk::DeviceAddress context, origins, output;
           u32 count, unused;
-        } push{mirror.Prepare(tlas), origins.BufferDeviceAddress(), output.BufferDeviceAddress(),
+        } push{read, origins.BufferDeviceAddress(), output.BufferDeviceAddress(),
                static_cast<u32>(hits.size()), 0};
         const auto command = scheduler.Current().Handle();
         command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
@@ -218,10 +222,16 @@
           Require(name, step, ok, "a ray hit the wrong triangle, instance or barycentrics");
         }
       };
-      // The call after a guest change finds it; a few calls later the mirror holds it.
-      const auto settle = [&](const char *step, std::span<const Hit> hits) {
+      // The call after a guest change finds it, writing no triangles: the word at `kept`, if any,
+      // keeps the fan's z = 5. A few calls later the mirror holds the change.
+      const auto settle = [&](const char *step, std::span<const Hit> hits,
+                              vk::DeviceAddress kept = 0) {
         auto result = trace(hits);
         Require(name, step, result[0] == 0, "the mirror stayed valid over a changed guest BVH");
+        if (kept != 0) {
+          Require(name, step, trace({}, kept)[0] == std::bit_cast<u32>(5.0f),
+                  "a call that built nothing wrote triangles");
+        }
         for (u32 call = 0; call < 8 && result[0] == 0; ++call) {
           result = trace(hits);
         }
@@ -261,11 +271,12 @@
       }};
       settle("relink", relinked);
 
-      // A refit raises vertex 0 of unit 10 to z = 7; the mirror then updates on every call.
+      // A refit raises vertex 0 of unit 10, word 8 of the triangles, to z = 7; the mirror then
+      // updates on every call.
       cache.InvalidateMemory(blas, page);
       bottom.Node(10)[2] = std::bit_cast<u32>(7.0f);
       relinked[2].t = 7.0f;
-      settle("refit", relinked);
+      settle("refit", relinked, RayTracingTestAccess::Triangles(mirror, 0) + 32);
 
       // A format 10 TLAS in the Trinity layout is not mirrored, even once its page is synchronized.
       if (format == 10) {

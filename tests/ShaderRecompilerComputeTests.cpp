@@ -239,6 +239,12 @@ struct RecordedCommandCounter {
   }
 };
 
+struct RayTracingTestAccess {
+  static vk::DeviceAddress Triangles(const RayTracing &mirror, uint32_t blas) {
+    return mirror.m_blases[blas].triangles->BufferDeviceAddress();
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {

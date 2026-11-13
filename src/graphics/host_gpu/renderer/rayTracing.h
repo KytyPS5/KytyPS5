@@ -17,6 +17,7 @@ class BufferCache;
 class CommandScheduler;
 class RenderContext;
 struct GraphicContext;
+struct RayTracingTestAccess;
 
 // Mirrors guest BVHs (header formats 1, 3 and 10) into host acceleration structures. The guest
 // builds and refits them on the GPU, so a GPU job reads them there; the host reads back only what
@@ -39,6 +40,8 @@ public:
 	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
 
 private:
+	friend struct RayTracingTestAccess;
+
 	static constexpr uint32_t Areas = 8;
 
 	struct Structure {

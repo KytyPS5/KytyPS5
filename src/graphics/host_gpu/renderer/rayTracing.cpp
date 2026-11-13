@@ -402,6 +402,10 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
+	// The mirror reads the guest's BVH as it is now: every call is a device-address reader that comes after the
+	// guest's writes, so the CPU writes since the last synchronization go up (see RenderContext::NoteOperation()).
+	m_context.NoteOperation(0, true);
+	m_context.PrepareBda(false);
 	Collect();
 	// A TLAS with no readback in flight waits for an area, so calls over other TLASes cannot take
 	// every area from it.

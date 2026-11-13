@@ -4,6 +4,9 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+
+#include <algorithm>
 
 namespace Libs::Graphics {
 namespace {
@@ -21,9 +24,13 @@ constexpr std::array DescriptorPoolSizes = {
 DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master_semaphore)
     : m_graphics(graphics), m_master_semaphore(master_semaphore) {
 	CreateDescriptorPool();
+	CreateCandidateLayout();
 }
 
 DescriptorHeap::~DescriptorHeap() {
+	m_graphics.candidate_buffer_layout = nullptr;
+	m_graphics.max_candidate_buffers   = 0;
+	m_graphics.device.destroyDescriptorSetLayout(m_candidate_buffer_layout, nullptr);
 	m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
 	for (const auto& [pool, tick]: m_pending_pools) {
 		m_master_semaphore.Wait(tick);
@@ -113,6 +120,36 @@ void DescriptorHeap::NextPool() {
 		CreateDescriptorPool();
 	}
 	m_sets.clear();
+}
+
+void DescriptorHeap::CreateCandidateLayout() {
+	namespace IR = ShaderRecompiler::IR;
+	// A draw's candidates fit one pool with their records, and a stage's sets the device.
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const auto  count =
+	    std::min({PoolCapacity(vk::DescriptorType::eStorageBuffer) - 1u,
+	              limits.maxPerStageDescriptorStorageBuffers / 2u,
+	              limits.maxDescriptorSetStorageBuffers / 2u, 1u << IR::CandidateClassShift});
+	const std::array<vk::DescriptorBindingFlags, 2> flags {
+	    vk::DescriptorBindingFlags {}, vk::DescriptorBindingFlagBits::eVariableDescriptorCount};
+	const std::array<vk::DescriptorSetLayoutBinding, 2> bindings {
+	    vk::DescriptorSetLayoutBinding {IR::CandidateRecordBinding,
+	                                    vk::DescriptorType::eStorageBuffer, 1,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr},
+	    vk::DescriptorSetLayoutBinding {IR::CandidateBufferBinding,
+	                                    vk::DescriptorType::eStorageBuffer, count,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr}};
+	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
+	flags_info.bindingCount  = static_cast<uint32_t>(flags.size());
+	flags_info.pBindingFlags = flags.data();
+	vk::DescriptorSetLayoutCreateInfo create {};
+	create.pNext        = &flags_info;
+	create.bindingCount = static_cast<uint32_t>(bindings.size());
+	create.pBindings    = bindings.data();
+	EXIT_IF(m_graphics.device.createDescriptorSetLayout(
+	            &create, nullptr, &m_candidate_buffer_layout) != vk::Result::eSuccess);
+	m_graphics.candidate_buffer_layout = m_candidate_buffer_layout;
+	m_graphics.max_candidate_buffers   = count;
 }
 
 void DescriptorHeap::CreateDescriptorPool() {

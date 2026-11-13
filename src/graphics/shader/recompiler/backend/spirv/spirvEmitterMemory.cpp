@@ -258,8 +258,11 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                      uint32_t prefix = 0) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
-		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
+		if (prefix == 0u) {
+			const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
+			EXIT_IF(resource == UINT32_MAX);
+			prefix = ctx.state.memory_byte_offsets[resource];
+		}
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -292,13 +295,15 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits);
 
+// Emits `emit` on the buffer an access reaches. A GPU-selected table reaches the candidate its
+// mapping word names, as the class of its shape; word 0 names nothing.
 template <typename Fn>
 auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
                       uint32_t components, Fn&& emit) {
 	auto& state = ctx.state;
 	constexpr bool has_result = !std::is_void_v<
 	    std::invoke_result_t<Fn, const IR::MemoryInfo&, const MemoryResourceAccess&>>;
-	const auto access = [&](uint32_t resource) {
+	const auto access = [&](uint32_t resource, uint32_t slot) {
 		mem.resource = resource;
 		if (mem.kind == IR::ResourceKind::Buffer) {
 			const auto& buffer = state.program.info.buffers[resource];
@@ -309,52 +314,38 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 				return emit(mem, MemoryResourceAccess{});
 			}
 		}
-		return emit(mem, PrepareMemoryResourceAccess(state, mem));
+		return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
 	};
 	if (mem.kind != IR::ResourceKind::Buffer ||
 	    state.program.info.buffers[mem.resource].indirect_root != mem.resource) {
-		return access(mem.resource);
+		return access(mem.resource, 0u);
 	}
-	const auto root_resource = mem.resource;
-	const auto& buffer = state.program.info.buffers[root_resource];
-	const auto& handle = *inst.Arg(0).ResolveInstruction();
-	const auto selected = ctx.Arg(handle, 0);
-	const auto representative = SharedIndirectBufferResource(state, root_resource);
-	const auto shared = representative != UINT32_MAX;
-	const auto empty_root = shared && buffer.packed_stride == 0u;
+	// A table's children are its classes, after the table itself.
+	const auto& classes = state.program.info.buffers[mem.resource].indirect_resources;
+	const auto  arms    = static_cast<uint32_t>(classes.size()) - 1u;
+	const auto  word    = ctx.Arg(*inst.Arg(0).ResolveInstruction(), 0);
+	const auto  slot =
+	    EmitAddU32(state,
+	               Binary(state, spv::OpBitwiseAnd, TypeU32(state), word,
+	                      ConstantU32(state, (1u << IR::CandidateClassShift) - 1u)),
+	               EmitShaderDataDwordLoad(state, state.program.bindings.candidate_buffer_dword));
 	const auto selected_access = [&]() {
-		if (shared) {
-			const auto root_slot = buffer.descriptor_index;
-			const auto child_slot = state.program.info.buffers[buffer.indirect_resources[1]].descriptor_index;
-			auto slot = EmitAddU32(state, selected, ConstantU32(state, child_slot - 1u));
-			if (!empty_root && child_slot != root_slot + 1u) {
-				slot = Select(state, TypeU32(state),
-				    Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, 0u)),
-				    ConstantU32(state, root_slot), slot);
-			}
-			mem.resource = representative;
-			return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
-		}
-		return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
+		if (arms == 1u) return access(classes[1], slot);
+		const auto arm = Binary(state, spv::OpISub, TypeU32(state),
+		                        Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+		                               ConstantU32(state, IR::CandidateClassShift)),
+		                        ConstantU32(state, 1u));
+		return EmitIndexSwitch(state, arm, arms,
 		                       has_result ? TypeU32Composite(state, components) : 0u,
-		                       [&](uint32_t item) { return access(buffer.indirect_resources[item]); });
+		                       [&](uint32_t item) { return access(classes[item + 1u], slot); });
 	};
-	if constexpr (!has_result) {
-		if (!shared) return selected_access();
-	}
-	auto valid = Binary(state, spv::OpULessThan, TypeBool(state), selected,
-	                          ConstantU32(state, buffer.indirect_resources.size()));
+	const auto valid =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), word, ConstantU32(state, 0u));
 	if constexpr (has_result) {
 		return EmitValueOrDefaultIfCondition(state, valid, TypeU32Composite(state, components),
-		    ConstantU32CompositeZero(state, components), [&]() {
-			    if (!empty_root) return selected_access();
-			    return EmitValueOrDefaultIfCondition(state,
-			        Binary(state, spv::OpINotEqual, TypeBool(state), selected, ConstantU32(state, 0u)),
-			        TypeU32Composite(state, components), access(root_resource), selected_access);
-		    });
+		                                     ConstantU32CompositeZero(state, components),
+		                                     selected_access);
 	} else {
-		if (empty_root) valid = AndCondition(state, valid,
-		    Binary(state, spv::OpINotEqual, TypeBool(state), selected, ConstantU32(state, 0u)));
 		EmitIfCondition(state, valid, selected_access);
 	}
 }
@@ -1821,7 +1812,7 @@ uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst)
 	const auto& buffer = ctx.state.program.info.buffers.at(inst.Flags<uint32_t>());
 	if (buffer.indirect_resources.empty()) return ConstantU32(ctx.state, 0u);
 	return EmitIndirectResourceIndex(ctx.state, ctx.Arg(inst, 0), buffer.indirect_mapping_slot,
-	                                 buffer.indirect_searched, UINT32_MAX);
+	                                 buffer.indirect_searched, 0u);
 }
 
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {

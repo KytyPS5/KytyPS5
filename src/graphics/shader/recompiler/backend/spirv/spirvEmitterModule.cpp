@@ -222,6 +222,40 @@ void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR
 	definition.pointer_type = TypePointer(state, spv::StorageClassUniformConstant, definition.type);
 }
 
+// The draw's candidate buffers, a runtime array per element width, after the slots' records.
+void DefineCandidateBuffers(EmitterState& state) {
+	const auto& info   = state.program.info;
+	const auto  Define = [&](uint32_t type, uint32_t binding, const char* name) {
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, type),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(variable, name);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::CandidateBufferSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		return variable;
+	};
+	state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+	state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+	state.candidate_record_variable = Define(StorageBufferType(state, state.storage_buffers[2]),
+	                                         IR::CandidateRecordBinding, "candidate_records");
+	const std::array     used {info.buffer_u8, info.buffer_u16, true};
+	constexpr std::array names {"candidates_u8", "candidates_u16", "candidates"};
+	for (uint32_t alias = 0; alias < used.size(); ++alias) {
+		if (!used[alias]) continue;
+		const auto type     = StorageBufferType(state, state.storage_buffers[alias], 8u << alias);
+		const auto variable = Define(state.builder.Type(spv::OpTypeRuntimeArray, type),
+		                             IR::CandidateBufferBinding, names[alias]);
+		state.candidate_buffer_variables[alias] = variable;
+		if (info.buffer_u8 || info.buffer_u16) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+		}
+		if (info.coherent_buffers) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
+		}
+	}
+}
+
 void DefineDescriptors(EmitterState& state) {
 	using Kind = IR::DescriptorBindingKind;
 	auto& info = state.program.info;
@@ -229,7 +263,10 @@ void DefineDescriptors(EmitterState& state) {
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	for (auto& buffer: info.buffers) {
-		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+		// A table and its classes read the draw's candidate buffers.
+		const bool bound =
+		    buffer.live && buffer.indirect_root == IR::BufferResource::NoIndirectBuffer;
+		buffer.descriptor_index = bound ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -281,6 +318,10 @@ void DefineDescriptors(EmitterState& state) {
 	bindings.indirect_mapping_dword = bindings.memory_offset_dword;
 	bindings.indirect_mapping_count = mapping_slots;
 	bindings.memory_offset_dword += mapping_slots;
+	if (info.uses_candidate_buffers) {
+		bindings.candidate_buffer_dword = bindings.memory_offset_dword++;
+		DefineCandidateBuffers(state);
+	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

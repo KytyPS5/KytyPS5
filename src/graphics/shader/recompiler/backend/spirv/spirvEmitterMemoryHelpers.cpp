@@ -194,49 +194,15 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
-uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
-	const auto& buffers = state.program.info.buffers;
-	const auto& root = buffers[resource];
-	if (root.indirect_root != resource || root.descriptor_index == UINT32_MAX ||
-	    root.indirect_resources.size() < 2u) {
-		return UINT32_MAX;
-	}
-	const auto first = root.packed_stride == 0u ? 1u : 0u;
-	const auto representative = root.indirect_resources[first];
-	const auto& shared = buffers[representative];
-	if (shared.packed_stride == 0u) return UINT32_MAX;
-	uint32_t next_child_slot = UINT32_MAX;
-	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
-		const auto& candidate = buffers[root.indirect_resources[ordinal]];
-		if (candidate.packed_stride != shared.packed_stride ||
-		    candidate.descriptor_format != shared.descriptor_format ||
-		    candidate.descriptor_swizzle != shared.descriptor_swizzle ||
-		    candidate.descriptor_index == UINT32_MAX ||
-		    (ordinal > 1u && candidate.descriptor_index != next_child_slot)) return UINT32_MAX;
-		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
-	}
-	return representative;
-}
-
 void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
-	std::vector<bool> dynamic_offsets(count);
-	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
-		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
-		for (const auto candidate: state.program.info.buffers[resource].indirect_resources) {
-			dynamic_offsets[state.program.info.buffers[candidate].descriptor_index] = true;
-		}
-	}
 	for (uint32_t i = 0; i < count; i += 4u) {
 		const auto lanes = std::min(4u, count - i);
-		if (std::all_of(dynamic_offsets.begin() + i, dynamic_offsets.begin() + i + lanes,
-		                [](bool dynamic) { return dynamic; })) continue;
 		const auto word =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
 		for (uint32_t lane = 0; lane < lanes; ++lane) {
-			if (dynamic_offsets[i + lane]) continue;
 			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 			state.memory_byte_sizes[i + lane] =
@@ -297,51 +263,52 @@ void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
-MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
-                                                         const IR::MemoryInfo& mem,
-                                                         BufferDefinition& buffer,
-                                                         uint32_t array_index) {
-	if (buffer.variable == 0) {
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
+                                                        const IR::MemoryInfo& mem,
+                                                        BufferDefinition&     buffer,
+                                                        uint32_t              candidate_slot) {
+	// storage_buffers[i] views a binding as 1 << i byte elements.
+	const auto shift        = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
+	const bool candidate    = candidate_slot != 0u;
+	const auto static_index = state.program.info.buffers.at(mem.resource).descriptor_index;
+	const auto variable     = candidate ? state.candidate_buffer_variables[shift] : buffer.variable;
+	if (variable == 0 || (!candidate && static_index == UINT32_MAX)) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
 	}
 	if (buffer.pointer_type == 0) {
 		buffer.pointer_type = TypePointer(state, spv::StorageClassStorageBuffer, buffer.type);
 	}
-	const bool non_uniform = array_index != 0u;
-	const auto static_index = state.program.info.buffers.at(mem.resource).descriptor_index;
-	if (!non_uniform) array_index = ConstantU32(state, static_index);
+	const auto array_index = candidate ? candidate_slot : ConstantU32(state, static_index);
 	MemoryResourceAccess access {.kind             = mem.kind,
 	                             .descriptor_index = array_index,
-	                             .non_uniform      = non_uniform,
+	                             .non_uniform      = candidate,
 	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
 	                                                              : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
-	                          buffer.variable, array_index);
-	if (non_uniform) {
-		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+	                          variable, array_index);
+	if (candidate) {
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
 		state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer, spv::DecorationNonUniform);
-		const auto& bindings   = state.program.bindings;
-		const auto  data_start = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
-		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
-		    state, ConstantU32(state, bindings.memory_offset_dword + data_start),
-		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
-		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
-		    ConstantU32(state, 3));
-		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
-		    state, word, shift, ConstantU32(state, 8));
-		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
-		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
+		// The slot's record: its bound range in bytes, then the guest base's offset in the range.
+		const auto record = Binary(state, spv::OpIMul, TypeU32(state), candidate_slot,
+		                           ConstantU32(state, IR::CandidateRecordDwords));
+		const auto load   = [&](uint32_t dword) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.candidate_record_variable,
+			                          ConstantU32(state, 0),
+			                          EmitAddU32(state, record, ConstantU32(state, dword)));
+			return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+		};
+		access.length      = load(0u);
+		access.byte_offset = load(1u);
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
 		access.length      = state.memory_byte_sizes[static_index];
 	}
-	// storage_buffers[i] views the binding as 1 << i byte elements.
-	const auto shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
 	if (shift != 0u) {
 		access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.length,
 		                       ConstantU32(state, shift));
@@ -350,7 +317,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 }
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
-                                                 uint32_t array_index) {
+                                                 uint32_t candidate_slot) {
 	MemoryResourceAccess access {.kind = mem.kind};
 	switch (mem.kind) {
 		case IR::ResourceKind::Lds:
@@ -390,7 +357,7 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			} else if (bits == 16u) {
 				buffer = &state.storage_buffers[1];
 			}
-			access = PrepareStorageBufferResourceAccess(state, mem, *buffer, array_index);
+			access = PrepareStorageBufferResourceAccess(state, mem, *buffer, candidate_slot);
 			access.element_bits = bits;
 			return access;
 		}

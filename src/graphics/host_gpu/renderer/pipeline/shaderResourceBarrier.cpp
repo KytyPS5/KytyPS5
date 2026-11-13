@@ -89,6 +89,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		// count is exactly the condition for a nonempty descriptor range.
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
+	for (const auto& candidate: resources.candidate_buffers) {
+		if (!program.info.buffers[candidate.resource].written) {
+			continue;
+		}
+		ShaderBufferResource descriptor;
+		std::memcpy(descriptor.fields, candidate.value.dwords.data(), sizeof(descriptor.fields));
+		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
+	}
 	return has_writes;
 }
 

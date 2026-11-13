@@ -125,10 +125,16 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
+	std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout,
+	                        graphics.candidate_buffer_layout};
+	EXIT_IF(pipeline.uses_candidate_buffers && !graphics.candidate_buffer_layout);
+	// A set the pipeline does not use may take any layout.
+	if (!set_layouts[1]) set_layouts[1] = set_layouts[2];
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
+	pipeline_layout_info.setLayoutCount         = pipeline.uses_candidate_buffers ? 3u
+	                                              : pipeline.uses_image_heap      ? 2u
+	                                                                              : 1u;
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
@@ -310,6 +316,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			const auto native_stage = NativeShaderStage(stage->info.stage);
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			pipeline.uses_candidate_buffers |= stage->info.info.uses_candidate_buffers;
 			pipeline.push_stages |= native_stage;
 		}
 	}
@@ -395,8 +402,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
-	pipeline.uses_image_heap = module.info.info.uses_image_heap;
-	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
+	pipeline.uses_image_heap        = module.info.info.uses_image_heap;
+	pipeline.uses_candidate_buffers = module.info.info.uses_candidate_buffers;
+	pipeline.push_stages            = vk::ShaderStageFlagBits::eCompute;
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::ComputePipelineCreateInfo info {};

@@ -41,6 +41,9 @@ struct PreparedBindings {
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// The stage's candidate buffers by slot, and where its block starts in the draw's array.
+	std::vector<BufferSource>             candidate_sources;
+	uint32_t                              candidate_base = 0;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};

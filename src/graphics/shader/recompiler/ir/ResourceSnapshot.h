@@ -30,10 +30,20 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
+// A descriptor a GPU-selected table can select, read as the class resource of its shape.
+struct Candidate {
+	DescriptorValue value;
+	uint32_t        resource = 0;
+
+	bool operator==(const Candidate&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
+	// Slot order of the stage's block in the draw's candidate buffer array.
+	std::vector<Candidate>       candidate_buffers;
 	std::vector<uint32_t>        flattened_srt;
 	// Where each indirect mapping slot's table starts in flattened_srt.
 	std::vector<uint32_t>                      indirect_mapping_offsets;

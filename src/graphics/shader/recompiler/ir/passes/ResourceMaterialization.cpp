@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <tuple>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -572,12 +573,12 @@ void SetIndirectMapping(ResourceSnapshot& snapshot, uint32_t slot, size_t offset
 }
 
 template <typename Specialization, typename Normalize>
-bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
-                                   uint32_t source_index,
-                                   uint32_t resource_index, uint32_t dword_count, uint32_t read_dwords,
-                                   const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_index,
+                                   uint32_t resource_index, uint32_t dword_count,
+                                   uint32_t read_dwords, const SrtRuntime& runtime,
+                                   ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
-                                   std::vector<Specialization>&  specializations,
+                                   std::vector<Specialization>& specializations, bool null_root,
                                    Normalize&& normalize) {
 	const auto& indirect = *program.descriptor_sources[source_index].indirect_descriptor;
 	const auto  descriptor_bytes = read_dwords * sizeof(uint32_t);
@@ -884,7 +885,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (!normalize(candidate))
 			return normalization_failed(table_offset, key, indirect.table_stride, "key");
 		uint32_t ordinal = 0;
-		if (entry == 0 && !byte_keys) {
+		// A table whose candidates are regrouped by shape keeps a null entry of its own.
+		if (entry == 0 && !byte_keys && !null_root) {
 			descriptors[resource_index] = candidate;
 		} else {
 			ordinal = intern_candidate(candidate);
@@ -1651,6 +1653,75 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// What a table candidate's code depends on; the folds apply to a resource's own descriptor.
+static ResourceSpecialization::Buffer CandidateShape(const ResourceSpecialization::Buffer& buffer) {
+	return {.packed_stride      = buffer.packed_stride,
+	        .descriptor_format  = buffer.descriptor_format,
+	        .descriptor_swizzle = buffer.descriptor_swizzle};
+}
+
+// Regroups each buffer table's children into a class per shape, in shape order, and its candidates
+// into slots: a module depends on the shapes a table selects, not on their count or order.
+static bool GroupBufferCandidates(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                  ResourceSpecialization& specialization) {
+	snapshot.candidate_buffers.clear();
+	auto&      buffers = specialization.buffers;
+	const auto roots   = static_cast<uint32_t>(program.info.buffers.size());
+	if (buffers.size() == roots) return true;
+	const auto order = [](const ResourceSpecialization::Buffer& shape) {
+		return std::tuple(shape.packed_stride, static_cast<uint32_t>(shape.descriptor_format),
+		                  shape.descriptor_swizzle);
+	};
+	std::vector<ResourceSpecialization::Buffer> grouped(buffers.begin(), buffers.begin() + roots);
+	std::vector<ResourceSpecialization::Buffer> classes;
+	std::vector<uint32_t>                       words;
+	auto&                                       slots = snapshot.candidate_buffers;
+	for (uint32_t root = 0; root < roots; ++root) {
+		if (buffers[root].indirect_root != root) continue;
+		classes.clear();
+		for (uint32_t child = roots; child < buffers.size(); ++child) {
+			if (buffers[child].indirect_root != root) continue;
+			const auto shape = CandidateShape(buffers[child]);
+			if (std::ranges::find(classes, shape) == classes.end()) classes.push_back(shape);
+		}
+		std::ranges::sort(classes, {}, order);
+		if (classes.size() > (UINT32_MAX >> CandidateClassShift)) {
+			return SpecializationFail(
+			    fmt::format("buffer table {} selects {} shapes", root, classes.size()));
+		}
+		const auto first = static_cast<uint32_t>(grouped.size());
+		// Ordinal 0 is the table's own null entry.
+		words.assign(1u, 0u);
+		for (uint32_t child = roots; child < buffers.size(); ++child) {
+			if (buffers[child].indirect_root != root) continue;
+			const auto index = static_cast<uint32_t>(
+			    std::ranges::find(classes, CandidateShape(buffers[child])) - classes.begin());
+			words.push_back((index + 1u) << CandidateClassShift |
+			                static_cast<uint32_t>(slots.size()));
+			slots.push_back({snapshot.buffers[child], first + index});
+		}
+		if (slots.size() > (1u << CandidateClassShift)) {
+			return SpecializationFail(fmt::format("buffer tables select {} buffers", slots.size()));
+		}
+		for (const auto& shape: classes)
+			grouped.emplace_back(shape).indirect_root = root;
+		const auto&  table   = buffers[root];
+		auto&        flat    = snapshot.flattened_srt;
+		const size_t mapping = snapshot.indirect_mapping_offsets[table.indirect_mapping_slot];
+		const size_t stride  = table.indirect_searched ? 2u : 1u;
+		EXIT_IF(mapping >= flat.size() || flat[mapping] > (flat.size() - mapping - 1u) / stride);
+		for (size_t entry = 0; entry < flat[mapping]; ++entry) {
+			auto& word = flat[mapping + stride + entry * stride];
+			EXIT_IF(word >= words.size());
+			word = words[word];
+		}
+	}
+	buffers = std::move(grouped);
+	snapshot.buffers.resize(roots);
+	snapshot.buffers.resize(buffers.size(), DescriptorValue {.dword_count = 4u});
+	return true;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           std::vector<uint32_t>* unbindable_pcs) {
@@ -1738,7 +1809,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					bool unbindable = false;
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot, snapshot.buffers,
-					        specialization.buffers, [&](DescriptorValue& value) {
+					        specialization.buffers, true, [&](DescriptorValue& value) {
 						        unbindable = !NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
 						        return !unbindable;
@@ -1778,6 +1849,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	if (!GroupBufferCandidates(program, snapshot, specialization)) return false;
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1805,8 +1877,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
-			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
+			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot,
+			        snapshot.images, specialization.images, false, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        // A sample of a T# whose channels all select 0 reads 0 at any address.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
@@ -1846,10 +1918,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
 			if (indirect != nullptr && indirect->sources.empty()) {
 				snapshot.samplers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
-				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
-				        specialization.samplers,
-				        [](DescriptorValue&) { return true; }))
+				if (WalkedActive(program, source) &&
+				    !MaterializeIndirectDescriptor(program, source, i, 4u, 4u, observed, snapshot,
+				                                   snapshot.samplers, specialization.samplers,
+				                                   false, [](DescriptorValue&) { return true; }))
 					return resource_failed("sampler", i, source, snapshot.samplers.size());
 			} else {
 				if (indirect != nullptr) source = indirect->sources[0];

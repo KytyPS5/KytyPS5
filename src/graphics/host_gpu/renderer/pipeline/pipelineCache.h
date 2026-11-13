@@ -209,8 +209,9 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
-		bool                    uses_push_descriptors = false;
-		bool                    uses_image_heap       = false;
+		bool                    uses_push_descriptors  = false;
+		bool                    uses_image_heap        = false;
+		bool                    uses_candidate_buffers = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.

@@ -870,61 +870,77 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
+	// The guest range a V# binds, with the cache buffer that holds it.
+	const auto find = [&](const ShaderRecompiler::IR::BufferResource&  metadata,
+	                      const ShaderRecompiler::IR::DescriptorValue& value) {
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(value);
+		const auto address    = descriptor.Base48();
+		auto       size       = descriptor.GetSize();
+		if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
+		    !metadata.scalar) {
+			// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
+			// still needs its full payload when NumRecords is smaller than it.
+			size = std::max(size, uint64_t {metadata.max_byte_extent});
+		}
+		if (address == 0 || size == 0) {
+			return PreparedBindings::BufferSource {};
+		}
+		if (descriptor.NumRecords() == UINT32_MAX) {
+			if (metadata.written) {
+				// Sentinel write ranges end before tables captured by any bound stage.
+				for (const auto* reader: stages) {
+					for (const auto [read_address, read_size]:
+					     reader->runtime->resources->specialization_reads) {
+						if (read_size == 0) continue;
+						if (read_address > address) {
+							size = std::min(size, read_address - address);
+						} else if (address - read_address < read_size) {
+							EXIT("scalar resource reads overlap a shader buffer write\n");
+						}
+					}
+				}
+			}
+			//  PPSA15246
+			const auto& graphics = m_context.GetGraphics();
+			const auto  limit =
+			    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+			    (graphics.StorageMinAlignment() - 1);
+			size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+		}
+		// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
+		if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
+			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+		}
+		return PreparedBindings::BufferSource {address, size, cache.FindBuffer(address, size)};
+	};
+	uint32_t candidates = 0;
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
 		PrefetchDescriptorTables(m_context, program.info, snapshot.buffers);
 		const auto& layout   = program.bindings;
-		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
-			continue;
-		}
+		prepared.buffer_sources.resize(
+		    layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
-			auto& source = prepared.buffer_sources[metadata.descriptor_index];
-			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
-			const auto address = descriptor.Base48();
-			auto size = descriptor.GetSize();
-			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
-			    !metadata.scalar) {
-				// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
-				// still needs its full payload when NumRecords is smaller than it.
-				size = std::max(size, uint64_t {metadata.max_byte_extent});
-			}
-			if (address == 0 || size == 0) {
-				source = {};
-				continue;
-			}
-			if (descriptor.NumRecords() == UINT32_MAX) {
-				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
-					for (const auto* reader: stages) {
-						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
-							if (read_size == 0) continue;
-							if (read_address > address) {
-								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
-							}
-						}
-					}
-				}
-				//  PPSA15246
-				const auto& graphics = m_context.GetGraphics();
-				const auto  limit =
-				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
-				    (graphics.StorageMinAlignment() - 1);
-				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
-			}
-			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
-			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			prepared.buffer_sources[metadata.descriptor_index] =
+			    find(metadata, snapshot.buffers[resource]);
 		}
+		// Each stage's candidates take a block of the draw's array, in slot order.
+		prepared.candidate_base = candidates;
+		prepared.candidate_sources.clear();
+		if (!program.info.uses_candidate_buffers) continue;
+		for (const auto& candidate: snapshot.candidate_buffers) {
+			prepared.candidate_sources.push_back(
+			    find(program.info.buffers[candidate.resource], candidate.value));
+		}
+		candidates += static_cast<uint32_t>(prepared.candidate_sources.size());
+		prepared.shader_data[layout.candidate_buffer_dword] = prepared.candidate_base;
 	}
+	m_candidate_buffers.resize(candidates);
+	m_candidate_records.resize(size_t {candidates} * ShaderRecompiler::IR::CandidateRecordDwords);
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -951,6 +967,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
+	}
+	for (uint32_t slot = 0; slot < prepared.candidate_sources.size(); ++slot) {
+		const auto& source         = prepared.candidate_sources[slot];
+		const auto  index          = prepared.candidate_base + slot;
+		uint32_t    buffer_offset  = 0;
+		m_candidate_buffers[index] = NativeStorageBuffer(
+		    m_context, source, program.info.buffers[snapshot.candidate_buffers[slot].resource],
+		    buffer_offset);
+		auto* record =
+		    &m_candidate_records[size_t {index} * ShaderRecompiler::IR::CandidateRecordDwords];
+		record[0] = static_cast<uint32_t>(source.size + buffer_offset);
+		record[1] = buffer_offset;
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -1217,6 +1245,34 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+
+	if (pipeline.uses_candidate_buffers) {
+		namespace IR         = ShaderRecompiler::IR;
+		const auto& graphics = m_context.GetGraphics();
+		const auto  count    = static_cast<uint32_t>(m_candidate_buffers.size());
+		if (count == 0 || count > graphics.max_candidate_buffers) {
+			EXIT("a draw selects %u candidate buffers; the device binds 1 to %u\n", count,
+			     graphics.max_candidate_buffers);
+		}
+		const auto set =
+		    m_context.GetDescriptorHeap().CommitVariable(graphics.candidate_buffer_layout, count);
+		const auto records = NativeUpload(m_context, m_candidate_records);
+		std::array<vk::WriteDescriptorSet, 2> writes {};
+		writes[0].dstSet          = set;
+		writes[0].dstBinding      = IR::CandidateRecordBinding;
+		writes[0].descriptorCount = 1;
+		writes[0].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[0].pBufferInfo     = &records;
+		writes[1].dstSet          = set;
+		writes[1].dstBinding      = IR::CandidateBufferBinding;
+		writes[1].descriptorCount = count;
+		writes[1].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[1].pBufferInfo     = m_candidate_buffers.data();
+		graphics.device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0,
+		                                     nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             IR::CandidateBufferSet, 1, &set, 0, nullptr);
 	}
 }
 

@@ -36,12 +36,14 @@ private:
 
 	void CreateDescriptorPool();
 	void NextPool();
+	void CreateCandidateLayout();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;
 	vk::DescriptorPool                                  m_current_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
+	vk::DescriptorSetLayout                             m_candidate_buffer_layout = nullptr;
 };
 
 } // namespace Libs::Graphics

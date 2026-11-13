@@ -39,16 +39,19 @@
 #include <vector>
 
 namespace Libs::Graphics {
-static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
-                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
-	for (uint32_t i = 0; i < sources.size(); ++i) {
-		if (i == output_buffer) continue;
-		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
+static bool FillSourcesDisjoint(const ShaderRecompiler::IR::ResourceSnapshot& resources,
+                                GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+	const auto disjoint = [&](const ShaderRecompiler::IR::DescriptorValue& value) {
+		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(value);
 		const auto bytes  = source.GetSize();
-		if (source.Base48() < destination.End() && destination.address < source.Base48() + bytes)
-			return false;
+		return source.Base48() >= destination.End() ||
+		       destination.address >= source.Base48() + bytes;
+	};
+	for (uint32_t i = 0; i < resources.buffers.size(); ++i) {
+		if (i != output_buffer && !disjoint(resources.buffers[i])) return false;
 	}
-	return true;
+	return std::ranges::all_of(resources.candidate_buffers,
+	                           [&](const auto& candidate) { return disjoint(candidate.value); });
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
@@ -59,29 +62,28 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& resource   = program.info.buffers[i];
-		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
-		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
-		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
-			return false;
-		}
-	}
-
-	if (!program.info.has_bitwise_xor) {
+	// Every buffer the dispatch binds: its own descriptors, then its tables' candidates.
+	const auto any_buffer = [&](const auto& predicate) {
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
+			if (predicate(program.info.buffers[i], resources.buffers[i])) return true;
 		}
+		return std::ranges::any_of(resources.candidate_buffers, [&](const auto& candidate) {
+			return predicate(program.info.buffers[candidate.resource], candidate.value);
+		});
+	};
+	// A metadata resource that is also read is not proven to be a full overwrite. Execute it
+	// conservatively instead of replacing the dispatch with a coarse full-surface clear.
+	if (any_buffer([&](const auto& resource, const auto& value) {
+		    return (!resource.written || resource.read) &&
+		           cache.IsMeta(DecodeNativeDescriptor<ShaderBufferResource>(value).Base48());
+	    })) {
+		return false;
 	}
-	return false;
+	return !program.info.has_bitwise_xor &&
+	       any_buffer([&](const auto& resource, const auto& value) {
+		       return resource.written &&
+		              cache.ClearMeta(DecodeNativeDescriptor<ShaderBufferResource>(value).Base48());
+	       });
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
@@ -124,8 +126,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
 		return false;
 	}
-	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource))
-		return false;
+	if (!FillSourcesDisjoint(resources, {descriptor.Base48(), size}, fill.resource)) return false;
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
@@ -166,7 +167,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
-		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
+		if (!FillSourcesDisjoint(resources, destination)) return false;
 		std::scoped_lock lock {cache.m_lock};
 		const auto&      image = cache.GetImage(binding.image_id);
 		const auto&      view  = binding.desc.view_info;

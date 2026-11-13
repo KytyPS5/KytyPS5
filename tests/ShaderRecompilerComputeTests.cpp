@@ -541,6 +541,10 @@ struct RenderExecutorTestAccess {
     return executor.m_targets.color_count;
   }
 
+  static std::span<const uint32_t> CandidateRecords(const RenderExecutor &executor) {
+    return executor.m_candidate_records;
+  }
+
   static bool TryConsumeComputeFill(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -1605,6 +1609,9 @@ struct TestCase {
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
+  // Offset and size of each table candidate's bytes in the backing buffer, by slot; a slot
+  // without one takes its descriptor's base and size.
+  std::vector<std::pair<u32, u32>> candidate_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
   // A BDA load from this unbacked address must record its page.
@@ -1923,6 +1930,16 @@ ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char *name,
   Require(name, "resource plan cache", LoadResourcePlan(bytes, plan) && SaveResourcePlan(plan) == bytes,
           "resource plan did not round-trip through its cache bytes");
   return plan;
+}
+
+// Gives each buffer resource of a compiled case, then each table candidate, the bytes `range`
+// returns for its descriptor.
+template <typename Range>
+void BindDescriptorRanges(TestCase &test, const CompiledShader &compiled, Range &&range) {
+  for (const auto &value : compiled.resources.buffers)
+    test.storage_buffer_ranges.push_back(range(value));
+  for (const auto &candidate : compiled.resources.candidate_buffers)
+    test.candidate_buffer_ranges.push_back(range(candidate.value));
 }
 
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
@@ -15123,20 +15140,31 @@ public:
       ShaderMapUserData(reinterpret_cast<uint64_t>(material_producer.data()),
           {.type = Prospero::ShaderBinaryType::kCs,
            .code_size_bytes = static_cast<u32>(material_producer.size() * sizeof(u32))});
-      for (const u32 wave : {32u, 64u}) {
+      // The last case binds fewer records in another order: the same class, so the same module.
+      struct MaterialCase {
+        u32 wave, rows;
+        bool reversed;
+      };
+      const ShaderModule *material_module = nullptr;
+      for (const auto [wave, rows, reversed] : {MaterialCase{32u, material_rows, false},
+                                                MaterialCase{64u, material_rows, false},
+                                                MaterialCase{64u, 41u, true}}) {
+        const auto material_of = [&](u32 row) { return reversed ? rows - row : row; };
         Require(name, "large material fixture reset", context.InvalidateMemory(base, 0x50000),
                 "material fixtures escaped the existing mapped allocation");
         std::vector<u32> records(material_rows * 592u / 4u);
         std::vector<u32> expected(material_count * material_slot / 4u, sentinel);
         auto expected_bytes = std::as_writable_bytes(std::span(expected));
-        for (u32 row = 1; row < material_rows; ++row) {
-          const auto target = material_output + (row - 1u) * material_slot + material_prefix(row);
+        for (u32 row = 1; row < rows; ++row) {
+          const auto material = material_of(row);
+          const auto offset = (material - 1u) * material_slot + material_prefix(material);
+          const auto target = material_output + offset;
           const std::array<u32, 4> descriptor{static_cast<u32>(target),
               static_cast<u32>(target >> 32u) | (1u << 16u), 20u,
               (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
           std::copy(descriptor.begin(), descriptor.end(), records.begin() + (row * 592u + 448u) / 4u);
           for (u32 lane = 0; lane < 20u; lane += 2u)
-            expected_bytes[(row - 1u) * material_slot + material_prefix(row) + lane] =
+            expected_bytes[offset + lane] =
                 std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
         }
         const std::vector<u32> untouched(expected.size(), sentinel);
@@ -15178,40 +15206,99 @@ public:
                              .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = static_cast<uint8_t>(wave), .user_sgpr = 8, .tgid_x_en = true});
         set_buffer(0, material_keys, material_groups, 4u);
-        set_buffer(4, material_table, material_rows, 592u);
+        set_buffer(4, material_table, rows, 592u);
         ShaderComputeInputInfo input{};
         input.workgroup_counts[0] = material_groups;
         input.workgroup_counts[1] = input.workgroup_counts[2] = 1u;
         (void)context.GetPipelineCache().GetComputeProgram(
             shaders.GetCs(), input);
+        // The records are one class of the table, each a slot; the null row selects nothing.
         const auto &info = input.stage.module->info.info;
-        const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
-          return buffer.indirect_resources.size() == material_rows;
+        const auto root = std::ranges::find_if(info.buffers, [&](const auto &buffer) {
+          return buffer.indirect_root == static_cast<u32>(&buffer - info.buffers.data());
         });
         const auto &bindings = input.stage.module->info.bindings;
-        const auto native_count = bindings.descriptor_counts[
-            static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
-        Require(name, "native material descriptor array",
-                root != info.buffers.end() && native_count > 64u && root->packed_stride == 0u &&
+        Require(name, "native material candidates",
+                root != info.buffers.end() && info.uses_candidate_buffers &&
+                    root->indirect_resources.size() == 2u && root->packed_stride == 0u &&
                     std::ranges::all_of(root->indirect_resources,
-                        [&](u32 index) { return info.buffers[index].live; }),
-                "material candidates were truncated, left unbound, or lost their null root");
-        Require(name, "large material shader-data buffer", !bindings.UsesPushData() &&
+                        [&](u32 index) { return info.buffers[index].live; }) &&
+                    input.stage.resources->candidate_buffers.size() == rows - 1u,
+                "material candidates were truncated, left unbound, or split by their order");
+        Require(name, "material shader data", bindings.UsesPushData() &&
                     bindings.descriptor_counts[static_cast<size_t>(
-                        ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)] == 1u,
-                "large binding-prefix data did not use the existing shader-data buffer");
+                        ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1u,
+                "a table's candidates took descriptors or shader data of the stage's own set");
+        if (wave == 64u) {
+          Require(name, "one material module for every candidate set",
+                  material_module == nullptr || material_module == input.stage.module,
+                  "the count or order of a table's candidates rebuilt its module");
+          material_module = input.stage.module;
+        }
         processor.DispatchDirect(material_groups, 1, 1, 0x41u |
             (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
-        for (u32 row = 1; row < material_rows; ++row)
+        for (u32 row = 1; row < rows; ++row)
           Require(name, "every selected material becomes GPU-owned",
                   cache.HasGpuDirtyBytes(material_output + (row - 1u) * material_slot + material_prefix(row), 20u),
                   "a writable material beyond the original descriptor capacity was not tracked");
         cache.ReadMemory(material_output, expected.size() * 4u);
         std::vector<u32> actual(expected.size());
-        Require(name, "132 material writes, null/OOB keys, masks and byte canaries",
+        Require(name, "material writes, null/OOB keys, masks and byte canaries",
                 LibKernel::Memory::TryReadBacking(material_output, actual.data(), actual.size() * 4u) &&
                     actual == expected,
                 "native material selection or per-binding byte offsets corrupted a target or neighboring byte");
+      }
+
+      // The stages of a draw take consecutive blocks of its candidate array.
+      {
+        struct Stage {
+          ShaderModule module;
+          ShaderRecompiler::IR::ResourceSnapshot snapshot;
+          ShaderStageRuntime runtime;
+          PreparedBindings prepared;
+        };
+        std::array<Stage, 2> draw;
+        std::vector<u32> sizes;
+        for (u32 index = 0; index < draw.size(); ++index) {
+          auto &stage = draw[index];
+          auto &program = stage.module.info;
+          program.stage = index == 0u ? ShaderType::Vertex : ShaderType::Pixel;
+          ShaderRecompiler::IR::BufferResource table;
+          table.live = true;
+          table.indirect_root = 0u;
+          program.info.buffers = {table, table};
+          program.info.buffers[1].packed_stride = 4u;
+          program.info.uses_candidate_buffers = true;
+          program.bindings.candidate_buffer_dword = 0u;
+          program.bindings.memory_offset_dword = 1u;
+          stage.snapshot.buffers.assign(2u, {.dword_count = 4u});
+          for (u32 slot = 0; slot < 2u + index; ++slot) {
+            // Every slot of the draw has a size of its own.
+            sizes.push_back(8u + 4u * static_cast<u32>(sizes.size()));
+            ShaderBufferResource descriptor{};
+            descriptor.UpdateAddress48(material_output + sizes.size() * material_slot);
+            descriptor.fields[1] |= 4u << 16u;
+            descriptor.fields[2] = sizes.back() / 4u;
+            ShaderRecompiler::IR::Candidate candidate{.resource = 1u};
+            candidate.value.dword_count = 4u;
+            std::copy_n(descriptor.fields, 4u, candidate.value.dwords.begin());
+            stage.snapshot.candidate_buffers.push_back(candidate);
+          }
+          stage.runtime = {&stage.module, &stage.snapshot};
+        }
+        auto &executor = context.GetRenderExecutor();
+        std::array<PreparedBindings *, 2> stages{&draw[0].prepared, &draw[1].prepared};
+        for (auto &stage : draw) executor.PrepareBindings(stage.runtime, stage.prepared);
+        RenderExecutorTestAccess::PrepareGraphicsBindings(executor, stages, {});
+        const auto records = RenderExecutorTestAccess::CandidateRecords(executor);
+        bool placed = records.size() == sizes.size() * ShaderRecompiler::IR::CandidateRecordDwords &&
+                      draw[0].prepared.candidate_base == 0u && draw[1].prepared.candidate_base == 2u &&
+                      draw[0].prepared.shader_data[0] == 0u && draw[1].prepared.shader_data[0] == 2u;
+        // A record holds its slot's bound range, then the bytes of it before the guest base.
+        for (u32 slot = 0; placed && slot < sizes.size(); ++slot)
+          placed = records[slot * 2u] - records[slot * 2u + 1u] == sizes[slot];
+        Require(name, "candidate blocks of a draw's stages", placed,
+                "a stage's candidates left its block of the draw's array");
       }
 
       // Exchange values across two waves in the last 512 bytes of each
@@ -21458,10 +21545,37 @@ public:
                                                  &descriptor_layout),
               "vkCreateDescriptorSetLayout");
 
+    // A table's candidates bind in a set of their own, after their records. The stage's block
+    // starts after a slot of another stage's, as in a draw of several stages.
+    constexpr u32 candidate_base = 1u;
+    const auto &candidates = compiled.resources.candidate_buffers;
+    const bool uses_candidates = compiled.program.info.uses_candidate_buffers;
+    vk::DescriptorSetLayout candidate_layout = nullptr;
+    if (uses_candidates) {
+      Require(test.name, "dispatch", !candidates.empty(),
+              "a table module was compiled without a candidate");
+      const std::array<vk::DescriptorSetLayoutBinding, 2> candidate_bindings{
+          vk::DescriptorSetLayoutBinding{ShaderRecompiler::IR::CandidateRecordBinding,
+                                         vk::DescriptorType::eStorageBuffer, 1,
+                                         vk::ShaderStageFlagBits::eCompute, nullptr},
+          vk::DescriptorSetLayoutBinding{ShaderRecompiler::IR::CandidateBufferBinding,
+                                         vk::DescriptorType::eStorageBuffer,
+                                         static_cast<u32>(candidates.size()) + candidate_base,
+                                         vk::ShaderStageFlagBits::eCompute, nullptr}};
+      vk::DescriptorSetLayoutCreateInfo candidate_info{};
+      candidate_info.bindingCount = static_cast<u32>(candidate_bindings.size());
+      candidate_info.pBindings = candidate_bindings.data();
+      RequireVk(test.name, "dispatch",
+                m_device.createDescriptorSetLayout(&candidate_info, nullptr, &candidate_layout),
+                "vkCreateDescriptorSetLayout(candidates)");
+    }
+    // Set 1 is the image heap's, which these dispatches do not use.
+    const std::array set_layouts{descriptor_layout, candidate_layout, candidate_layout};
+    static_assert(ShaderRecompiler::IR::CandidateBufferSet == 2u);
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
-    pipeline_layout_info.setLayoutCount = 1;
-    pipeline_layout_info.pSetLayouts = &descriptor_layout;
+    pipeline_layout_info.setLayoutCount = uses_candidates ? 3u : 1u;
+    pipeline_layout_info.pSetLayouts = set_layouts.data();
     vk::PushConstantRange push_range{};
     if (layout.UsesPushData()) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
@@ -21513,9 +21627,13 @@ public:
       const auto index = std::countr_zero(mask);
       add_pool_size(NativeDescriptorType(static_cast<Kind>(index)), layout.descriptor_counts[index]);
     }
+    if (uses_candidates) {
+      add_pool_size(vk::DescriptorType::eStorageBuffer,
+                    static_cast<u32>(candidates.size()) + candidate_base + 1u);
+    }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
-    pool_info.maxSets = 1;
+    pool_info.maxSets = 2;
     pool_info.poolSizeCount = static_cast<u32>(pool_sizes.size());
     pool_info.pPoolSizes = pool_sizes.empty() ? nullptr : pool_sizes.data();
     vk::DescriptorPool descriptor_pool = nullptr;
@@ -21621,6 +21739,57 @@ public:
       write.descriptorCount = static_cast<u32>(buffer_infos.size());
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = buffer_infos.data();
+      writes.push_back(write);
+    }
+    vk::DescriptorSet candidate_set = nullptr;
+    std::vector<vk::DescriptorBufferInfo> candidate_infos;
+    Buffer candidate_records;
+    vk::DescriptorBufferInfo candidate_records_info{};
+    if (uses_candidates) {
+      vk::DescriptorSetAllocateInfo candidate_set_info{};
+      candidate_set_info.descriptorPool = descriptor_pool;
+      candidate_set_info.descriptorSetCount = 1;
+      candidate_set_info.pSetLayouts = &candidate_layout;
+      RequireVk(test.name, "dispatch",
+                m_device.allocateDescriptorSets(&candidate_set_info, &candidate_set),
+                "vkAllocateDescriptorSets(candidates)");
+      const auto alignment = static_cast<u32>(
+          m_physical_device.getProperties().limits.minStorageBufferOffsetAlignment);
+      shader_data[layout.candidate_buffer_dword] = candidate_base;
+      candidate_infos.assign(candidate_base, {nullptr, 0, VK_WHOLE_SIZE});
+      std::vector<u32> records(candidate_base * ShaderRecompiler::IR::CandidateRecordDwords);
+      for (u32 slot = 0; slot < candidates.size(); ++slot) {
+        ShaderBufferResource descriptor{};
+        std::copy_n(candidates[slot].value.dwords.begin(), 4u, descriptor.fields);
+        const auto [offset, size] = slot < test.candidate_buffer_ranges.size()
+            ? test.candidate_buffer_ranges[slot]
+            : std::pair{static_cast<u32>(descriptor.Base48()),
+                        static_cast<u32>(descriptor.GetSize())};
+        if (size == 0u) {
+          // An empty candidate binds nothing, as in the renderer.
+          candidate_infos.push_back({nullptr, 0, VK_WHOLE_SIZE});
+          records.insert(records.end(), {0u, 0u});
+          continue;
+        }
+        // The binding starts at an aligned offset; the record keeps the bytes before the base.
+        const auto prefix = offset % alignment;
+        Require(test.name, "dispatch", uint64_t{offset} + size <= buffer.size,
+                "candidate buffer view exceeds its backing buffer");
+        candidate_infos.push_back({buffer.buffer, offset - prefix, size + prefix});
+        records.insert(records.end(), {size + prefix, prefix});
+      }
+      candidate_records = CreateStorageBuffer(test.name, records, records.size());
+      candidate_records_info = {candidate_records.buffer, 0, candidate_records.size};
+      vk::WriteDescriptorSet write{};
+      write.dstSet = candidate_set;
+      write.dstBinding = ShaderRecompiler::IR::CandidateRecordBinding;
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &candidate_records_info;
+      writes.push_back(write);
+      write.dstBinding = ShaderRecompiler::IR::CandidateBufferBinding;
+      write.descriptorCount = static_cast<u32>(candidate_infos.size());
+      write.pBufferInfo = candidate_infos.data();
       writes.push_back(write);
     }
     if (Count(Kind::FlattenedSrt) != 0) {
@@ -21790,6 +21959,11 @@ public:
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0,
                            1, &descriptor_set, 0, nullptr);
+    if (uses_candidates) {
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
+                             ShaderRecompiler::IR::CandidateBufferSet, 1, &candidate_set, 0,
+                             nullptr);
+    }
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
       std::copy(shader_data.begin(), shader_data.end(),
@@ -21799,7 +21973,7 @@ public:
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
-    if (Count(Kind::Buffers) != 0) {
+    if (Count(Kind::Buffers) != 0 || uses_candidates) {
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask =
@@ -21907,10 +22081,14 @@ public:
       DestroyBuffer(&user_data_buffer);
     }
     DestroyBuffer(&shared_buffer);
+    if (candidate_records.buffer != nullptr) {
+      DestroyBuffer(&candidate_records);
+    }
     m_device.destroyDescriptorPool(descriptor_pool, nullptr);
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(candidate_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
   }
 
@@ -46162,14 +46340,11 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                 "runtime loop count must retain the GPU formatted source read");
       }
       Require(test.name, "finite writable descriptors",
-              compiled.resources.buffers.size() == std::max(1u, count),
+              compiled.resources.candidate_buffers.size() == count,
               "the bounded loop lost or overprobed a destination");
-      test.storage_buffer_ranges.resize(compiled.resources.buffers.size());
-      for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
-        const auto& descriptor = compiled.resources.buffers[resource].dwords;
-        test.storage_buffer_ranges[resource] =
-            {descriptor[0], std::max(4u, descriptor[2] * 4u)};
-      }
+      BindDescriptorRanges(test, compiled, [](const auto &value) {
+        return std::pair{value.dwords[0], std::max(4u, value.dwords[2] * 4u)};
+      });
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
@@ -46362,8 +46537,10 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
       }
       if (count == 2u || count == 3u) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
-        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format",
+        test.forbidden_spirv = {"PhysicalStorageBuffer", "convert_indirect_buffer_format",
                                "indirect_buffer_format_geometry"};
+        // Three rows add the empty record, a class of its own beside the populated ones.
+        (count == 2u ? test.forbidden_spirv : test.required_spirv).push_back("OpSwitch");
       } else if (count == 6u) test.required_spirv = {"OpSwitch"};
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
       Require(test.name, "mixed native aliases", count != 6u ||
@@ -46374,20 +46551,27 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
         for (const auto &inst : *block) selections += inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex;
       Require(test.name, "shared loop selection", count == 0u ? selections <= 2u : selections == 2u,
               "repeated formatted loads repeated the descriptor lookup");
-      for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
+      const auto bytes_of = [&](const auto &value) {
         ShaderBufferResource descriptor{};
-        std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4u, descriptor.fields);
+        std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
         const u32 address = descriptor.Base48();
-        const u32 prefix = address % alignment;
         u32 bytes = std::max(4u, static_cast<u32>(descriptor.GetSize()));
         if (address == slot * 5u + 20u) bytes = 24u;
         if (address == slot * 6u + 24u) bytes = 23u;
+        return std::pair{address, bytes};
+      };
+      for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
+        const auto [address, bytes] = bytes_of(compiled.resources.buffers[resource]);
+        const u32 prefix = address % alignment;
         test.storage_buffer_ranges.emplace_back(address - prefix, bytes + prefix);
         const u32 binding = compiled.program.info.buffers[resource].descriptor_index;
         if (binding != UINT32_MAX)
           compiled.packed_user_data[compiled.program.bindings.memory_offset_dword + binding / 4u] |=
               prefix << ((binding % 4u) * 8u);
       }
+      // Candidates start at their unaligned bases; the harness binds from the aligned offset.
+      for (const auto &candidate : compiled.resources.candidate_buffers)
+        test.candidate_buffer_ranges.push_back(bytes_of(candidate.value));
       auto output_buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
       vulkan.Dispatch(test, compiled, output_buffer);
       CompareWords(test, "row keys, mixed formats, empty-One, partial payloads, prefixes and byte canaries",
@@ -46503,12 +46687,12 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       }
       Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u || components != 0u),
               "empty table retained BDA reads or nonempty table lost GPU descriptor loads");
-      for (const auto &descriptor : compiled.resources.buffers) {
+      BindDescriptorRanges(test, compiled, [&](const auto &descriptor) {
         ShaderBufferResource resource{};
         std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
-        test.storage_buffer_ranges.emplace_back(resource.Base48(),
-            components != 0u && resource.Base48() == slot * 5u ? 6u : std::max(4u, u32(resource.GetSize())));
-      }
+        return std::pair{u32(resource.Base48()),
+            components != 0u && resource.Base48() == slot * 5u ? 6u : std::max(4u, u32(resource.GetSize()))};
+      });
       TestCase producer;
       producer.name = "GpuRecordSelectorProducer";
       producer.initial = test.initial;
@@ -46666,11 +46850,11 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
     test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    for (const auto &descriptor : compiled.resources.buffers) {
+    BindDescriptorRanges(test, compiled, [](const auto &descriptor) {
       ShaderBufferResource resource{};
       std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
-      test.storage_buffer_ranges.emplace_back(resource.Base48(), std::max(4u, u32(resource.GetSize())));
-    }
+      return std::pair{u32(resource.Base48()), std::max(4u, u32(resource.GetSize()))};
+    });
     TestCase producer;
     producer.name = "WaterfallRecordKeyProducer";
     producer.initial = test.initial;
@@ -46830,13 +47014,13 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
       }
     Require(test.name, "shared scalar descriptor reads", bda_loads == 1u && native_stores == 1u,
             "native store planning replaced the BDA read or bypassed formatted conversion");
-    for (const auto &value : compiled.resources.buffers) {
+    BindDescriptorRanges(test, compiled, [&](const auto &value) {
       ShaderBufferResource descriptor{};
       std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
       auto range = std::max(4u, u32(descriptor.GetSize()));
       if (wide && descriptor.Base48() == slot * 4u) range -= 11u; // Last active record is partial.
-      test.storage_buffer_ranges.emplace_back(descriptor.Base48(), range);
-    }
+      return std::pair{u32(descriptor.Base48()), range};
+    });
     TestCase producer;
     producer.name = "FormattedRecordSelectorProducer";
     producer.initial = test.initial;
@@ -46923,10 +47107,12 @@ void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
     test.compute_info.lds_size_dwords = 0;
     test.compute_info.thread_ids_num = 1;
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "finite destination count", compiled.resources.buffers.size() == 6u,
+    Require(test.name, "finite destination count",
+            compiled.resources.candidate_buffers.size() == 5u,
             "selector lost a destination or retained a dynamic descriptor load");
-    for (const auto& descriptor : compiled.resources.buffers)
-      test.storage_buffer_ranges.emplace_back(descriptor.dwords[0], descriptor.dwords[2] * 4u);
+    BindDescriptorRanges(test, compiled, [](const auto &descriptor) {
+      return std::pair{descriptor.dwords[0], descriptor.dwords[2] * 4u};
+    });
     for (u32 key = 0; key < 5u; ++key) {
       for (u32 lane = 0; lane < wave; ++lane)
         test.initial[input / 4u + lane] = lane == first_lane ? key : (key + 1u) % 5u;
@@ -46965,11 +47151,11 @@ void CheckStorageBufferBindingOver2GiB(VulkanHarness &vulkan) {
   test.has_user_data = true;
   test.forbidden_spirv = {"OpArrayLength"};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-  for (const auto &value : compiled.resources.buffers) {
+  BindDescriptorRanges(test, compiled, [](const auto &value) {
     ShaderBufferResource descriptor{};
     std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
-    test.storage_buffer_ranges.emplace_back(descriptor.Base48(), u32(descriptor.GetSize()));
-  }
+    return std::pair{u32(descriptor.Base48()), u32(descriptor.GetSize())};
+  });
   VulkanHarness::Buffer buffer;
   {
     std::vector<u32> initial(end + 4u, 0u);
@@ -47053,6 +47239,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   compute.host_subgroup_size = vulkan.SubgroupSize();
   compute.threads_num[0] = 32;
   compute.threads_num[1] = compute.threads_num[2] = 1;
+  // The table is resource 0 and its classes follow it; its destinations bind as candidates.
   enum class Layout { Shared, NullChild, AllNull, DifferentStride, ShiftedPushData, StorageData,
                       Indexed, IndexedNullChild, IndexedSingle };
   for (const auto layout : {Layout::Shared, Layout::NullChild, Layout::AllNull,
@@ -47060,9 +47247,16 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                            Layout::Indexed, Layout::IndexedNullChild, Layout::IndexedSingle}) {
     const bool indexed = layout == Layout::Indexed || layout == Layout::IndexedNullChild ||
                          layout == Layout::IndexedSingle;
+    // The second destination is null: its keys select nothing.
     const bool null_child = layout == Layout::NullChild || layout == Layout::IndexedNullChild;
     const bool single = layout == Layout::AllNull || layout == Layout::IndexedSingle;
+    const bool two_classes = layout == Layout::DifferentStride;
     program.info.buffers = {root, candidate};
+    if (two_classes) {
+      program.info.buffers.push_back(candidate);
+      program.info.buffers[2].packed_stride = 2;
+      program.info.buffers[0].indirect_resources = {0u, 1u, 2u};
+    }
     if (indexed) {
       for (auto &buffer : program.info.buffers) buffer.packed_stride = 4;
     }
@@ -47071,8 +47265,16 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     program.memory_info[0].offen = !indexed;
     store.SetArg(1, indexed ? Value(&index) : Value(0u));
     store.SetArg(2, indexed ? Value(0u) : Value(&offset));
-    if (null_child) program.info.buffers[1].packed_stride = 0;
-    if (layout == Layout::DifferentStride) program.info.buffers[1].packed_stride = 2;
+    compiled.resources.candidate_buffers.clear();
+    test.candidate_buffer_ranges.clear();
+    if (!single) {
+      compiled.resources.candidate_buffers.push_back({.resource = 1u});
+      test.candidate_buffer_ranges.emplace_back(12u, 64u);
+      if (!null_child) {
+        compiled.resources.candidate_buffers.push_back({.resource = two_classes ? 2u : 1u});
+        test.candidate_buffer_ranges.emplace_back(108u, 64u);
+      }
+    }
     if (single) {
       // Materialization deduplicates all null destinations into one unmapped root.
       program.info.buffers.resize(1);
@@ -47087,37 +47289,36 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     const auto push_start = layout == Layout::ShiftedPushData ? 3u :
                             layout == Layout::StorageData ? PushData::NoStart : 0u;
     compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_start);
+    // A table and its classes take no descriptor of the stage's own set.
     Require(test.name, "candidate bindings",
-            program.bindings.descriptor_counts[0] == (single ? 1u : 2u) &&
-                program.info.buffers[0].descriptor_index == 0u &&
-                (single || program.info.buffers[1].descriptor_index == 1u),
+            program.info.uses_candidate_buffers == !single &&
+                program.bindings.descriptor_counts[0] == (single ? 1u : 0u) &&
+                program.info.buffers[0].descriptor_index == (single ? 0u : UINT32_MAX) &&
+                (single || program.info.buffers[1].descriptor_index == UINT32_MAX),
             "indirect store lost a buffer binding");
-    compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
-    compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
+    compiled.packed_user_data.assign(program.bindings.ShaderDataDwords(), 0u);
+    if (single) compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u;
     // The searched mapping sits at flattened-SRT word 4.
     if (!single) compiled.packed_user_data[program.bindings.indirect_mapping_dword] = 4u;
     ValidateSpirv(test.name, compiled.spirv);
     test.required_spirv.clear();
     test.forbidden_spirv = {"PhysicalStorageBuffer"};
-    if (!single && !null_child && layout != Layout::DifferentStride) {
-      test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
+    if (!single && !two_classes) {
+      test.required_spirv = {"StorageBufferArrayNonUniformIndexing", "RuntimeDescriptorArray"};
       test.forbidden_spirv.push_back("OpSwitch");
       std::set<u32> nonuniform;
       std::vector<u32> stored_pointers;
-      u32 prefix_extracts = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
           nonuniform.insert(words[1]);
         if (opcode == spv::OpStore) stored_pointers.push_back(words[1]);
-        if (opcode == spv::OpBitFieldUExtract) ++prefix_extracts;
         offset += words.size();
       }
       Require(test.name, "shared store and nonuniform pointers",
-              prefix_extracts == 1u && stored_pointers.size() == 1u &&
-                  nonuniform.contains(stored_pointers.front()),
-              "indirect store retained static prefixes, was duplicated or lost a NonUniform pointer decoration");
+              stored_pointers.size() == 1u && nonuniform.contains(stored_pointers.front()),
+              "the store of one class was duplicated or lost a NonUniform pointer decoration");
     } else if (single) {
       test.forbidden_spirv.push_back("OpSwitch");
     } else {
@@ -47129,10 +47330,13 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       if (layout != Layout::Shared && layout != Layout::IndexedNullChild && swapped) continue;
       // Repeated keys select two distinct logical buffers within one native allocation.
       // Keys below, between and above the live keys must not select either buffer.
+      const std::array<u32, 2> words{
+          1u << CandidateClassShift,
+          null_child ? 0u : (two_classes ? 2u : 1u) << CandidateClassShift | 1u};
       compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
-                                         10u, swapped ? 0u : 1u,
-                                         12u, swapped ? 1u : 0u,
-                                         14u, swapped ? 0u : 1u};
+                                         10u, words[swapped ? 0u : 1u],
+                                         12u, words[swapped ? 1u : 0u],
+                                         14u, words[swapped ? 0u : 1u]};
       test.expected = test.initial;
       for (u32 lane = 0; lane < 16u; ++lane) {
         if (lane == 4u || lane == 6u) continue;
@@ -47495,12 +47699,12 @@ void CheckCountedRowImageSelector(VulkanHarness &vulkan) {
                 return read.first <= srt + word * 4u &&
                     read.first + read.second >= srt + (word + 1u) * 4u;
               }), "count V# loaded from SRT escaped writable-alias capture");
-    for (const auto &buffer : compiled.resources.buffers) {
+    BindDescriptorRanges(test, compiled, [](const auto &buffer) {
       ShaderBufferResource descriptor{};
       std::copy_n(buffer.dwords.begin(), 4u, descriptor.fields);
-      test.storage_buffer_ranges.emplace_back(static_cast<u32>(descriptor.Base48()),
-                                              static_cast<u32>(descriptor.GetSize()));
-    }
+      return std::pair{static_cast<u32>(descriptor.Base48()),
+                       static_cast<u32>(descriptor.GetSize())};
+    });
     std::vector<VulkanHarness::Image> images;
     for (const auto &image : compiled.resources.images)
       images.push_back(vulkan.CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
@@ -48972,12 +49176,11 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
                                       [](u32 word) { return word == 0u; });
             }), "paired selector admitted poison or omitted the trailing 16-byte image");
     }
-    for (const auto &value : compiled.resources.buffers) {
+    BindDescriptorRanges(test, compiled, [](const auto &value) {
       ShaderBufferResource descriptor{};
       std::copy_n(value.dwords.begin(), 4, descriptor.fields);
-      test.storage_buffer_ranges.emplace_back(descriptor.Base48(),
-                                               std::max(4u, u32(descriptor.GetSize())));
-    }
+      return std::pair{u32(descriptor.Base48()), std::max(4u, u32(descriptor.GetSize()))};
+    });
     std::vector<VulkanHarness::Image> images;
     for (const auto &descriptor : compiled.resources.images)
       images.push_back(vulkan.CreateImage2D(test.name, 2, 1, vk::Format::eR32Sfloat,

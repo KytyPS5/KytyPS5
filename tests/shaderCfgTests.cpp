@@ -1134,6 +1134,18 @@ void TestNativeShaderResourceDependencies() {
   set_buffer(2, 0x2000, 0x3FFF, UINT32_MAX);
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a maximum-size strided buffer");
+  // A table's own descriptor is null; the buffers it writes are its candidates.
+  set_buffer(2, 0, 0, 0);
+  resources.candidate_buffers = {{.value = resources.buffers[1], .resource = 2u}};
+  Check(HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate lost a written table candidate");
+  resources.candidate_buffers[0].resource = 1u;
+  Check(!HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate included a read-only table candidate");
+  resources.candidate_buffers = {{.value = resources.buffers[2], .resource = 2u}};
+  Check(!HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate included a null table candidate");
+  resources.candidate_buffers.clear();
 
   const vk::Buffer buffer{reinterpret_cast<vk::Buffer::CType>(uintptr_t{1})};
   const auto gds_barrier = MakeGdsDependency(buffer);

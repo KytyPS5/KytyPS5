@@ -7583,21 +7583,34 @@ void TestBoundedFormattedBufferStore() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  ResourceSpecialization populated;
   for (const uint32_t count : {0u, 1u, 8u, 3u, 0u, 8u}) {
     memory.words[72] = count;
     memory.reads = memory.watched_reads = 0;
     memory.watched_address = memory.base + 128u;
-    Check(materialize() && snapshot.buffers.size() == std::max(1u, count),
+    // The destinations share one shape: the table has one class however many it selects.
+    Check(materialize() && snapshot.candidate_buffers.size() == count &&
+              snapshot.buffers.size() == (count == 0u ? 1u : 2u) &&
+              specialization.buffers.size() == snapshot.buffers.size(),
           "uniform buffer table count did not refresh or left stale descriptors");
+    if (count == 1u) populated = specialization;
+    Check(count == 0u || specialization == populated,
+          "the number of destinations a table selects changed the specialization");
     Check(count != 0u || memory.watched_reads == 0u,
           "an empty loop probed its unreachable descriptor table");
     Check(std::ranges::find(snapshot.specialization_reads,
                 std::pair{memory.base + 288u, uint64_t{4u}}) != snapshot.specialization_reads.end(),
           "writable descriptor loop count escaped same-dispatch overlap capture");
+    const auto mapping = count == 0u ? 0u
+        : snapshot.indirect_mapping_offsets.at(specialization.buffers[0].indirect_mapping_slot);
     for (uint32_t key = 0; key < count; ++key) {
-      Check(snapshot.buffers[key].dwords[0] == memory.words[32u + key * 4u] &&
-                snapshot.buffers[key].dwords[2] == lengths[key],
-            "finite formatted store lost a destination or its record bound");
+      const auto& candidate = snapshot.candidate_buffers[key];
+      Check(candidate.value.dwords[0] == memory.words[32u + key * 4u] &&
+                candidate.value.dwords[2] == lengths[key] && candidate.resource == 1u &&
+                snapshot.flattened_srt[mapping + 1u + key * 2u] == key &&
+                snapshot.flattened_srt[mapping + 2u + key * 2u] ==
+                    (1u << CandidateClassShift | key),
+            "finite formatted store lost a destination, its record bound or its slot");
       Check(std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + 128u + key * 16u, uint64_t{16u}}) !=
                 snapshot.specialization_reads.end(),
@@ -7607,7 +7620,8 @@ void TestBoundedFormattedBufferStore() {
   const auto original = specialization;
   memory.words[32] += 0x100u;
   Check(materialize() && specialization == original &&
-            snapshot.buffers[0].dwords[0] == memory.words[32],
+            snapshot.candidate_buffers[0].value.dwords[0] == memory.words[32] &&
+            snapshot.buffers[0].dwords[0] == 0u,
         "destination address refresh was frozen or caused needless specialization");
   for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 9>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
@@ -7637,7 +7651,7 @@ void TestBoundedFormattedBufferStore() {
     memory.watched_reads = 0;
     const bool negative = count != 3u;
     Check(MaterializeResources(signed_plan, runtime, snapshot, specialization) &&
-              snapshot.buffers.size() == (negative ? 1u : count) &&
+              snapshot.candidate_buffers.size() == (negative ? 0u : count) &&
               (!negative || memory.watched_reads == 0u),
           "signed loop bound did not preserve empty negative and populated positive domains");
   }
@@ -7816,8 +7830,9 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
     const uint32_t rows = count == UINT32_MAX ? 0u : count;
     user_data[2] = rows == 0u ? 0u : 4u * 192u / 8u;
     memory.reads = 0u;
-    Check(materialize() && snapshot.buffers.size() == 2u * std::max(rows, 1u) &&
-              memory.reads == 1u + rows * 2u,
+    // Each table has one class once it selects a record.
+    Check(materialize() && snapshot.candidate_buffers.size() == 2u * rows &&
+              snapshot.buffers.size() == (rows == 0u ? 2u : 4u) && memory.reads == 1u + rows * 2u,
           "bounded record enumeration read unrelated fields or retained stale candidates");
     for (uint32_t row = 0; row < rows; ++row)
       for (const auto member : {160u, 176u})
@@ -7832,16 +7847,23 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
         "record address refresh changed the shader specialization");
   user_data[2] = 4u;
   memory.reads = 0u;
-  Check(materialize() && snapshot.buffers.size() == 2u && memory.reads == 1u,
+  Check(materialize() && snapshot.buffers.size() == 2u && snapshot.candidate_buffers.empty() &&
+            memory.reads == 1u,
         "record enumeration read beyond the scalar buffer table bounds");
   user_data[2] = 4u * 192u / 8u;
   const auto first = (table_offset + 160u) / 4u;
   const auto first_address = memory.words[first];
   memory.words[first] = 0u;
   memory.words[first + 2u] = 0u;
-  Check(materialize() && specialization.buffers[0].zero_stride_oob &&
-            specialization.buffers[0].descriptor_swizzle == DstSel(4, 5, 6, 1) &&
-            specialization.buffers[0].indirect_root == 0u,
+  // The empty record is a class of its own next to the populated ones, in shape order. A class
+  // carries what its candidates are read with, not the folds of a resource's own descriptor.
+  Check(materialize() && specialization.buffers[0].indirect_root == 0u &&
+            specialization.buffers.size() == 5u && specialization.buffers[2].indirect_root == 0u &&
+            specialization.buffers[2].packed_stride == 0u &&
+            !specialization.buffers[2].zero_stride_oob &&
+            specialization.buffers[2].descriptor_swizzle == DstSel(4, 5, 6, 1) &&
+            specialization.buffers[3].indirect_root == 0u &&
+            specialization.buffers[3].packed_stride == 8u,
         "empty formatted candidate lost its OOB constants or other candidates");
   ApplyResourceSpecialization(fixture->program, specialization);
   uint32_t loads = 0u;
@@ -7850,6 +7872,33 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   Check(loads == 112u, "empty root incorrectly folded nonempty formatted candidates");
   memory.words[first] = first_address;
   memory.words[first + 2u] = 16u;
+  // Death Stranding 2 mixes 16-bit float and signed-normalized records in one table. Its classes
+  // follow the shapes, whichever record has them first and however many do.
+  const auto record = [&](uint32_t row) { return (table_offset + row * 192u + 160u) / 4u; };
+  const auto float16 = memory.words[record(0u) + 3u];
+  const auto snorm16 =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16SNorm) << 12u) | DstSel(4, 5, 6, 1);
+  memory.words[record(1u) + 3u] = snorm16;
+  Check(materialize() && specialization.buffers.size() == 5u &&
+            specialization.buffers[2].descriptor_format == Prospero::BufferFormat::k16_16_16_16SNorm &&
+            specialization.buffers[3].descriptor_format == Prospero::BufferFormat::k16_16_16_16Float &&
+            snapshot.candidate_buffers.size() == 8u,
+        "two record formats of one table were not its two classes");
+  const auto mixed = specialization;
+  const auto mixed_slots = snapshot.candidate_buffers;
+  memory.words[record(0u) + 3u] = snorm16;
+  memory.words[record(1u) + 3u] = float16;
+  Check(materialize() && specialization == mixed && snapshot.candidate_buffers != mixed_slots,
+        "the order of a table's record formats changed its classes");
+  memory.words[record(2u) + 3u] = snorm16;
+  Check(materialize() && specialization == mixed,
+        "the number of records of a format changed the table's classes");
+  // Two keys of one record are one slot.
+  memory.words[record(2u)] = memory.words[record(0u)];
+  Check(materialize() && specialization == mixed && snapshot.candidate_buffers.size() == 7u,
+        "a record two keys select took two slots");
+  memory.words[record(2u)] = memory.words[record(3u)] - 0x1000u;
+  for (uint32_t row = 0; row < 4u; ++row) memory.words[record(row) + 3u] = float16;
   for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
            {{first + 1u, 4u << 16u}, {first + 1u, 9u << 16u},
             {first, memory.words[first] + 1u}, {first + 3u, memory.words[first + 3u] | (1u << 28u)},
@@ -8018,7 +8067,8 @@ void TestGuardedWaterfallBufferRecords() {
       user_data[2] = count;
       memory.reads = 0;
       Check(materialize() && memory.reads == count &&
-                snapshot.buffers.size() == 1u + std::max(count, 1u),
+                snapshot.candidate_buffers.size() == count &&
+                snapshot.buffers.size() == (count == 0u ? 2u : 3u),
             "waterfall count refresh read GPU keys or unrelated record fields");
       for (uint32_t row = 0; row < count; ++row)
         Check(std::ranges::find(snapshot.specialization_reads,
@@ -8035,7 +8085,11 @@ void TestGuardedWaterfallBufferRecords() {
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + 704u, uint64_t{16u}}) ==
                   snapshot.specialization_reads.end() &&
-              std::ranges::all_of(snapshot.buffers.back().dwords, [](auto word) { return word == 0u; }),
+              // The second key's descriptor is null: its mapping word selects nothing.
+              snapshot.candidate_buffers.size() == 1u &&
+              snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(
+                  specialization.buffers[root - plan.info.buffers.begin()].indirect_mapping_slot) +
+                                     4u] == 0u,
           "waterfall partial descriptor overread or retained its missing format word");
     user_data[1] = 488u << 16u;
     memory.fail_address = memory.base + table_offset + 704u;
@@ -8174,7 +8228,8 @@ void TestGpuSelectedBufferRecords() {
       user_data[2] = size;
       memory.reads = 0u;
       Check(materialize() && memory.reads == (size == 0u ? 0u : 8u) &&
-                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 8u),
+                snapshot.candidate_buffers.size() == (size == 0u ? 0u : 8u) &&
+                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 2u),
             "affine table refresh read GPU selector bytes, unrelated fields or stale candidates");
     }
     for (uint32_t member = 0; member < 2u; ++member) {
@@ -8187,10 +8242,14 @@ void TestGpuSelectedBufferRecords() {
       for (const auto [key, slot] : {std::pair{0u, 0u}, std::pair{44739243u, 1u},
                                     std::pair{22369622u, 2u}, std::pair{1u, 3u}}) {
         const auto index = evaluate_key(evaluate_key, selections[root]->Arg(0), key) >> 2u;
-        Check(index == slot && snapshot.flattened_srt[mapping + 1u + index] == slot + 1u,
+        const auto candidate = member * 4u + slot;
+        Check(index == slot && snapshot.flattened_srt[mapping + 1u + index] ==
+                                   (1u << CandidateClassShift | candidate),
               "wrapped GPU record key selected the wrong physical descriptor");
-        const auto candidate = plan.info.buffers.size() + member * 4u + slot;
-        Check(snapshot.buffers[candidate].dwords[0] == 0x100000u + member * 0x10000u + slot * 0x1000u,
+        Check(snapshot.candidate_buffers[candidate].value.dwords[0] ==
+                      0x100000u + member * 0x10000u + slot * 0x1000u &&
+                  snapshot.candidate_buffers[candidate].resource ==
+                      plan.info.buffers.size() + member,
               "affine table read a stride192 row instead of a reachable stride64 member");
         Check(std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + aligned_bias + 160u + member * 16u + slot * 64u,
@@ -8206,8 +8265,7 @@ void TestGpuSelectedBufferRecords() {
     memory.words[tail + 3u] = 0x5204u;
     user_data[2] = 428u + aligned_bias;
     memory.reads = 0u;
-    Check(materialize() && memory.reads == 9u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + 8u &&
+    Check(materialize() && memory.reads == 9u && snapshot.candidate_buffers.size() == 8u &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + aligned_bias + 416u, uint64_t{12u}}) !=
                   snapshot.specialization_reads.end(),
@@ -8275,7 +8333,8 @@ void TestWorkgroupSelectedBufferRecords() {
     memory.words[selector / 4u + 6u] = 22369622u; // Would select the numeric fields at +288/+304.
     const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
     Check(materialize() && memory.watched_reads == 1u && memory.watched_dwords == 3u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + (empty ? 0u : (dimensions[0] - 1u) * 2u) &&
+              snapshot.candidate_buffers.size() == (empty ? 0u : dimensions[0] * 2u) &&
+              snapshot.buffers.size() == plan.info.buffers.size() + (empty ? 0u : 2u) &&
               memory.reads == (empty ? 1u : 2u + dimensions[0] * 2u),
           "workgroup prefix reread arguments, visited an inactive key or retained stale candidates");
     Check(std::ranges::find(snapshot.specialization_reads, std::pair{memory.base, uint64_t{12u}}) !=
@@ -8296,11 +8355,10 @@ void TestWorkgroupSelectedBufferRecords() {
   memory.words[selector / 4u] = 1u;
   user_data[5] = 0u;
   user_data[6] = 14u; // Second key has fewer than four in-bounds bytes: SMEM returns zero.
-  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+  Check(materialize() && snapshot.candidate_buffers.size() == 4u,
         "partial scalar selector did not zero-fill its OOB DWORD");
   user_data[6] = 0u;
-  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() &&
-            memory.reads == 3u,
+  Check(materialize() && snapshot.candidate_buffers.size() == 2u && memory.reads == 3u,
         "empty selector V# did not select key zero without reading payload");
   // Existing vector selectors use the V# stride; each scalar snapshot read
   // independently rounds its resulting byte offset down to a DWORD.
@@ -8316,8 +8374,7 @@ void TestWorkgroupSelectedBufferRecords() {
     std::fill_n(memory.words.begin() + selector / 4u, 8u, 0xdeadbeefu);
     for (uint32_t index = 0; index < 4u; ++index)
       memory.words[selector / 4u + ((index + 1u) * stride) / 4u] = index & 1u;
-    Check(materialize() && memory.reads == 6u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+    Check(materialize() && memory.reads == 6u && snapshot.candidate_buffers.size() == 4u,
           "batched vector selector changed independent scalar DWORD alignment");
   }
   for (const auto root : roots) {
@@ -8495,14 +8552,14 @@ void TestGpuSelectedFormattedRecordStore() {
   for (const uint32_t count : {0u, 6u, 0u, 6u}) {
     user_data[2] = count;
     memory.reads = 0u;
-    Check(materialize() && memory.reads == count &&
-              snapshot.buffers.size() == plan.info.buffers.size() + count,
+    Check(materialize() && memory.reads == count && snapshot.candidate_buffers.size() == count &&
+              snapshot.buffers.size() == plan.info.buffers.size() + (count == 0u ? 0u : 1u),
           "exact formatted records read GPU selector bytes, row padding or stale candidates");
   }
   const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.buffers[root].indirect_mapping_slot);
   Check(snapshot.flattened_srt[mapping] == 6u, "exact formatted records lost the dense row map");
   for (uint32_t row = 0; row < 6u; ++row)
-    Check(snapshot.flattened_srt[mapping + 1u + row] == row + 1u &&
+    Check(snapshot.flattened_srt[mapping + 1u + row] == (1u << CandidateClassShift | row) &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + row * 592u + 448u, uint64_t{16u}}) !=
                   snapshot.specialization_reads.end(),
@@ -8526,7 +8583,7 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;
   Check(materialize() && memory.watched_dwords == 3u &&
             snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.buffers[root].indirect_mapping_slot)] == 5u &&
-            snapshot.buffers.size() == plan.info.buffers.size() + 5u,
+            snapshot.candidate_buffers.size() == 5u,
         "partial direct V# did not zero-fill its missing format DWORD");
   user_data[1] = 592u << 16u;
   user_data[2] = 6u;
@@ -8599,7 +8656,8 @@ void TestGpuSelectedFormattedRecordStore() {
     }
     memory.reads = 0u;
     Check(wide_materialize() && memory.reads == 32u &&
-              snapshot.buffers.size() == wide_plan.info.buffers.size() + (populated ? 2u : 0u),
+              snapshot.candidate_buffers.size() == (populated ? 2u : 0u) &&
+              snapshot.buffers.size() == wide_plan.info.buffers.size() + (populated ? 1u : 0u),
           "finite RGBA16 table read GPU keys or retained stale null/active candidates");
   }
   const auto wide_mapping = snapshot.indirect_mapping_offsets.at(specialization.buffers[wide_root].indirect_mapping_slot);
@@ -8608,12 +8666,13 @@ void TestGpuSelectedFormattedRecordStore() {
   for (uint32_t row = 0; row < 32u; ++row)
     Check(snapshot.flattened_srt[wide_mapping + 1u + row * 2u] == row &&
               snapshot.flattened_srt[wide_mapping + 2u + row * 2u] ==
-                  (row == 0u ? 0u : row == 3u ? 2u : 1u),
+                  (row == 0u ? 1u << CandidateClassShift
+                             : row == 3u ? 1u << CandidateClassShift | 1u : 0u),
           "finite RGBA16 table selected the wrong active or null candidate");
   const auto wide_original = specialization;
   memory.words[table_offset / 4u] += 4u;
   Check(wide_materialize() && specialization == wide_original &&
-            snapshot.buffers[wide_root].dwords[0] == memory.words[table_offset / 4u],
+            snapshot.candidate_buffers[0].value.dwords[0] == memory.words[table_offset / 4u],
         "RGBA16 destination refresh froze the address or changed format specialization");
   for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
       {0u, memory.words[table_offset / 4u] | 1u}, {1u, 16u << 16u},
@@ -8695,8 +8754,9 @@ void TestGpuSelectedFormattedRecordStore() {
     };
     for (const uint32_t first : {0u, 2u, 4u, 0u}) {
       prefix_memory.words[first_offset / 4u] = first;
-      Check(refresh() && snapshot.buffers.size() == selected_plan.info.buffers.size() + (first == 4u ? 0u : 1u) &&
-                snapshot.buffers[wide_root].dwords[0] == 0x100000u + (first == 4u ? 256u : 0u),
+      Check(refresh() && snapshot.candidate_buffers.size() == (first == 4u ? 1u : 2u) &&
+                snapshot.candidate_buffers[0].value.dwords[0] ==
+                    0x100000u + (first == 4u ? 256u : 0u),
             "runtime-first refresh froze a prior selector range or enumerated unrelated numeric rows");
       for (const auto read : {std::pair{prefix_memory.base + first_offset, uint64_t{4u}},
                              std::pair{prefix_memory.base + selector_offset + first * 8u + 4u, uint64_t{12u}}})
@@ -8706,8 +8766,8 @@ void TestGpuSelectedFormattedRecordStore() {
     // An unreadable runtime first reads as zero.
     prefix_memory.words[first_offset / 4u] = 4u;
     prefix_memory.fail_address = prefix_memory.base + first_offset;
-    Check(refresh() && snapshot.buffers.size() == selected_plan.info.buffers.size() + 1u &&
-              snapshot.buffers[wide_root].dwords[0] == 0x100000u,
+    Check(refresh() && snapshot.candidate_buffers.size() == 2u &&
+              snapshot.candidate_buffers[0].value.dwords[0] == 0x100000u,
           "unreadable runtime first did not read as zero");
     prefix_memory.fail_address = UINT64_MAX;
     prefix_memory.words[first_offset / 4u] = 6u;
@@ -8725,14 +8785,16 @@ void TestGpuSelectedFormattedRecordStore() {
     indirect.selector->stride = 8u;
     counts[0] = 1u;
     prefix_memory.words[first_offset / 4u] = 0x1fffffffu;
-    Check(refresh() && prefix_memory.watched_reads == 0u && snapshot.buffers[wide_root].dwords[0] == 0x100000u,
+    Check(refresh() && prefix_memory.watched_reads == 0u &&
+              snapshot.candidate_buffers.size() == 1u &&
+              snapshot.candidate_buffers[0].value.dwords[0] == 0x100000u,
           "last nonwrapping selector DWORD lost scalar OOB key zero");
     prefix_memory.words[first_offset / 4u] = UINT32_MAX;
     for (const auto empty : {std::array{0u, 1u, 1u}, std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u}}) {
       counts = empty;
       Check(refresh() && prefix_memory.watched_reads == 0u &&
                 snapshot.buffers.size() == selected_plan.info.buffers.size() &&
-                snapshot.buffers[wide_root].dwords[0] == 0u,
+                snapshot.candidate_buffers.empty(),
             "empty dispatch evaluated an unreachable wrapped selector prefix");
     }
     counts = {2u, 1u, 1u};
@@ -8812,7 +8874,8 @@ void TestFiniteBufferSelection() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.buffers.size() == 5u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_buffers.size() == 5u && snapshot.buffers.size() == 2u,
         "finite buffer selection lost table roots after DCE or probed outside its domain");
   for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany}) {
     auto invalid = make(variant);
@@ -8895,13 +8958,13 @@ void TestPackedScalarBufferSelection() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
-  Check(materialize() && snapshot.buffers.size() == 19u && memory.reads == 20u &&
+  Check(materialize() && snapshot.candidate_buffers.size() == 19u && memory.reads == 20u &&
             memory.watched_reads == 1u && memory.watched_dwords == 256u,
         "packed scalar lookup did not batch its read and deduplicate writable candidates");
   Check(std::ranges::find(snapshot.specialization_reads,
                          std::pair{memory.base + 0x1c0u, uint64_t{1024u}}) != snapshot.specialization_reads.end() &&
-            std::ranges::all_of(snapshot.buffers, [&](const DescriptorValue& value) {
-              const auto key = (value.dwords[0] - 0x100000u) / 0x10000u;
+            std::ranges::all_of(snapshot.candidate_buffers, [&](const Candidate& candidate) {
+              const auto key = (candidate.value.dwords[0] - 0x100000u) / 0x10000u;
               return std::ranges::find(snapshot.specialization_reads,
                          std::pair{memory.base + 64u + key * 16u, uint64_t{16u}}) != snapshot.specialization_reads.end();
             }),

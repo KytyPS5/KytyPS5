@@ -352,6 +352,13 @@ inline constexpr uint32_t ImageBindingCount           = 50u;
 inline constexpr uint32_t ImageHeapSet                = 1u;
 inline constexpr uint32_t ImageHeapCapacity           = 65536u;
 inline constexpr uint32_t ImageHeapKindShift          = 20u;
+// GPU-selected buffer tables read a per-draw set: a record of range size and base offset per
+// slot, then the buffers. A mapping word is (class + 1) << CandidateClassShift | slot; 0 is none.
+inline constexpr uint32_t CandidateBufferSet     = 2u;
+inline constexpr uint32_t CandidateRecordBinding = 0u;
+inline constexpr uint32_t CandidateBufferBinding = 1u;
+inline constexpr uint32_t CandidateClassShift    = 20u;
+inline constexpr uint32_t CandidateRecordDwords  = 2u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -505,6 +512,8 @@ struct Bindings {
 	// Flattened-SRT offsets of the indirect mappings, one dword per slot.
 	uint32_t indirect_mapping_dword = 0;
 	uint32_t indirect_mapping_count = 0;
+	// Where the stage's block starts in the draw's candidate buffer array.
+	uint32_t candidate_buffer_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -617,6 +626,7 @@ struct ShaderInfo {
 	bool                            uses_gds                      = false;
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
+	bool                                 uses_candidate_buffers        = false;
 	bool                            uses_device_address           = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;

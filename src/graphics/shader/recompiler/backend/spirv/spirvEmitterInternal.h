@@ -113,6 +113,9 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
+	// The draw's candidate buffers by storage_buffers element width, and the slots' records.
+	std::array<uint32_t, 4>                            candidate_buffer_variables {};
+	uint32_t                                           candidate_record_variable = 0;
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	uint32_t                                         bda_pagetable_variable  = 0;
@@ -406,8 +409,6 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
-uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
-
 void EmitMemoryBindings(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
@@ -430,12 +431,12 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t             EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_slot);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
-                                                 uint32_t array_index = 0u);
+                                                 uint32_t candidate_slot = 0u);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        BufferDefinition& buffer,
-                                                        uint32_t array_index = 0);
+                                                        BufferDefinition&     buffer,
+                                                        uint32_t              candidate_slot = 0);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);

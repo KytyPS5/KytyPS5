@@ -225,6 +225,9 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// The draw's candidate buffers, every stage's block, and each slot's record.
+	std::vector<vk::DescriptorBufferInfo> m_candidate_buffers;
+	std::vector<uint32_t>                 m_candidate_records;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;

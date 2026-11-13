@@ -67,9 +67,11 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
-	// The set of a draw's candidate buffers and the most of them one draw binds.
+	// The sets of a draw's candidate buffers and images, and the most of each one draw binds.
 	vk::DescriptorSetLayout            candidate_buffer_layout = nullptr;
 	uint32_t                           max_candidate_buffers   = 0;
+	vk::DescriptorSetLayout            candidate_image_layout  = nullptr;
+	uint32_t                           max_candidate_images    = 0;
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;

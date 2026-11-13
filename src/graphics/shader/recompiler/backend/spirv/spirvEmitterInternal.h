@@ -142,6 +142,8 @@ struct EmitterState {
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
+	// The draw's candidate images, one view of the same runtime array per image type.
+	std::array<ImageDefinition, IR::ImageBindingCount> candidate_images {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   sampler_type                          = 0;
 	uint32_t                   sampler_pointer_type                  = 0;

@@ -750,6 +750,38 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	    image.indirect_resources.size() < 2u) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}
+	if (image.candidate) {
+		// The mapping word names a class and a slot of the stage's block; 0 names nothing.
+		constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Emit, uint32_t, uint32_t>>;
+		const auto     word = EmitIndirectResourceIndex(state, key, image.indirect_mapping_slot,
+		                                                image.indirect_searched, 0u);
+		const auto     slot = EmitAddU32(
+		    state,
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), word,
+		           ConstantU32(state, (1u << IR::CandidateClassShift) - 1u)),
+		    EmitShaderDataDwordLoad(state, state.program.bindings.candidate_image_dword));
+		const auto arms     = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
+		const auto selected = [&]() {
+			if (arms == 1u) return emit(image.indirect_resources[1], slot);
+			const auto arm = Binary(state, spv::OpISub, TypeU32(state),
+			                        Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+			                               ConstantU32(state, IR::CandidateClassShift)),
+			                        ConstantU32(state, 1u));
+			return EmitIndexSwitch(state, arm, arms, result_type, [&](uint32_t item) {
+				return emit(image.indirect_resources[item + 1u], slot);
+			});
+		};
+		const auto valid =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), word, ConstantU32(state, 0u));
+		if constexpr (has_result) {
+			return EmitValueOrDefaultIfCondition(
+			    state, valid, result_type, state.builder.Constant(spv::OpConstantNull, result_type),
+			    selected);
+		} else {
+			EmitIfCondition(state, valid, selected);
+			return;
+		}
+	}
 	if (image.heap) {
 		const auto entry = EmitImageHeapEntry(state, key, image.indirect_mapping_slot);
 		const auto kinds = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;

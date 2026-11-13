@@ -236,7 +236,7 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 ShaderRecompiler::Spirv::StageDescriptorLimits
 DeviceStageDescriptorLimits(const GraphicContext& graphics) {
 	// A stage's set also has to fit one descriptor pool when it is not pushed, and leave the
-	// device room for a draw's candidate buffers and their records.
+	// device room for a draw's candidate buffers, their records and its candidate images.
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	const auto  bound  = [](uint32_t device, vk::DescriptorType type) {
 		return std::min(device, DescriptorHeap::PoolCapacity(type));
@@ -247,7 +247,9 @@ DeviceStageDescriptorLimits(const GraphicContext& graphics) {
 	                                 vk::DescriptorType::eStorageBuffer),
 	        .samplers = bound(limits.maxPerStageDescriptorSamplers, vk::DescriptorType::eSampler),
 	        .sampled_images =
-	            bound(limits.maxPerStageDescriptorSampledImages, vk::DescriptorType::eSampledImage),
+	            bound(limits.maxPerStageDescriptorSampledImages -
+	                      (graphics.candidate_image_layout ? graphics.max_candidate_images : 0u),
+	                  vk::DescriptorType::eSampledImage),
 	        .storage_images =
 	            bound(limits.maxPerStageDescriptorStorageImages, vk::DescriptorType::eStorageImage),
 	        .resources = limits.maxPerStageResources};

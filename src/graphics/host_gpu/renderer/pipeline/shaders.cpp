@@ -126,15 +126,17 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout,
-	                        graphics.candidate_buffer_layout};
-	EXIT_IF(pipeline.uses_candidate_buffers && !graphics.candidate_buffer_layout);
+	                        graphics.candidate_buffer_layout, graphics.candidate_image_layout};
+	EXIT_IF((pipeline.uses_candidate_buffers && !graphics.candidate_buffer_layout) ||
+	        (pipeline.uses_candidate_images && !graphics.candidate_image_layout));
 	// A set the pipeline does not use may take any layout.
 	if (!set_layouts[1]) set_layouts[1] = set_layouts[2];
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_candidate_buffers ? 3u
-	                                              : pipeline.uses_image_heap      ? 2u
-	                                                                              : 1u;
+	pipeline_layout_info.setLayoutCount         = pipeline.uses_candidate_images    ? 4u
+	                                              : pipeline.uses_candidate_buffers ? 3u
+	                                              : pipeline.uses_image_heap        ? 2u
+	                                                                                : 1u;
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
@@ -317,6 +319,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
 			pipeline.uses_candidate_buffers |= stage->info.info.uses_candidate_buffers;
+			pipeline.uses_candidate_images |= stage->info.info.uses_candidate_images;
 			pipeline.push_stages |= native_stage;
 		}
 	}
@@ -404,6 +407,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap        = module.info.info.uses_image_heap;
 	pipeline.uses_candidate_buffers = module.info.info.uses_candidate_buffers;
+	pipeline.uses_candidate_images  = module.info.info.uses_candidate_images;
 	pipeline.push_stages            = vk::ShaderStageFlagBits::eCompute;
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
 

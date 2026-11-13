@@ -799,6 +799,24 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+namespace {
+struct StageImageRef {
+	const ShaderRecompiler::IR::ImageResource&   resource;
+	const ShaderRecompiler::IR::DescriptorValue& value;
+};
+
+// The image a stage binds at `index`: its own images, then its tables' candidates, each read as
+// the class of its shape.
+StageImageRef StageImage(const ShaderStageRuntime& runtime, uint32_t index) {
+	const auto& images = runtime.module->info.info.images;
+	if (index < images.size()) {
+		return {images[index], runtime.resources->images[index]};
+	}
+	const auto& candidate = runtime.resources->candidate_images[index - images.size()];
+	return {images[candidate.resource], candidate.value};
+}
+} // namespace
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
 		return;
@@ -836,15 +854,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
-	prepared.images.resize(program.info.images.size());
+	prepared.images.resize(program.info.images.size() + snapshot.candidate_images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (program.info.images[i].heap) {
+	for (uint32_t i = 0; i < prepared.images.size(); i++) {
+		const auto [resource, value] = StageImage(runtime, i);
+		// A heap, and a table with its classes, bind nothing of their own.
+		if (resource.heap || (resource.candidate && i < program.info.images.size())) {
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto binding = ResolveTexture(resource, value);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -913,7 +933,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		}
 		return PreparedBindings::BufferSource {address, size, cache.FindBuffer(address, size)};
 	};
-	uint32_t candidates = 0;
+	uint32_t candidates       = 0;
+	uint32_t image_candidates = 0;
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
@@ -928,9 +949,14 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			prepared.buffer_sources[metadata.descriptor_index] =
 			    find(metadata, snapshot.buffers[resource]);
 		}
-		// Each stage's candidates take a block of the draw's array, in slot order.
-		prepared.candidate_base = candidates;
+		// Each stage's candidates take a block of the draw's arrays, in slot order.
+		prepared.candidate_base       = candidates;
+		prepared.candidate_image_base = image_candidates;
 		prepared.candidate_sources.clear();
+		if (program.info.uses_candidate_images) {
+			image_candidates += static_cast<uint32_t>(snapshot.candidate_images.size());
+			prepared.shader_data[layout.candidate_image_dword] = prepared.candidate_image_base;
+		}
 		if (!program.info.uses_candidate_buffers) continue;
 		for (const auto& candidate: snapshot.candidate_buffers) {
 			prepared.candidate_sources.push_back(
@@ -941,6 +967,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 	m_candidate_buffers.resize(candidates);
 	m_candidate_records.resize(size_t {candidates} * ShaderRecompiler::IR::CandidateRecordDwords);
+	m_candidate_images.resize(image_candidates);
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -990,23 +1017,21 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& program       = prepared.runtime->module->info;
-	const auto& snapshot      = *prepared.runtime->resources;
-	auto&       images        = prepared.images;
-	auto&       texture_cache = m_context.GetTextureCache();
+	auto& images        = prepared.images;
+	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	for (uint32_t i = 0; i < images.size(); i++) {
 		if (!images[i].image_id) continue;
-		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
+		const auto [resource, value] = StageImage(*prepared.runtime, i);
+		auto& old_image              = texture_cache.m_slot_images[images[i].image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
 			old_image.binding = {};
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			images[i]         = ResolveTexture(resource, value);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
-		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
@@ -1106,7 +1131,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			auto& binding = descriptors.images[i];
 			if (!binding.image_id) continue;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
@@ -1208,13 +1233,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& resource = program.info.images[i];
 			const auto& texture = descriptors.images[i];
-			if (resource.heap) continue;
+			if (resource.heap || resource.candidate) continue;
 			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
 			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
 				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
 			}
+		}
+		for (auto slot = program.info.images.size(); slot < descriptors.images.size(); ++slot) {
+			m_candidate_images[descriptors.candidate_image_base + slot -
+			                   program.info.images.size()] =
+			    MakeImageInfo(descriptors.images[slot], 0u);
 		}
 
 		if (program.bindings.UsesPushData()) {
@@ -1273,6 +1303,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                                     nullptr);
 		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
 		                             IR::CandidateBufferSet, 1, &set, 0, nullptr);
+	}
+
+	if (pipeline.uses_candidate_images) {
+		namespace IR         = ShaderRecompiler::IR;
+		const auto& graphics = m_context.GetGraphics();
+		const auto  count    = static_cast<uint32_t>(m_candidate_images.size());
+		if (count == 0 || count > graphics.max_candidate_images) {
+			EXIT("a draw selects %u candidate images; the device binds 1 to %u\n", count,
+			     graphics.max_candidate_images);
+		}
+		const auto set =
+		    m_context.GetDescriptorHeap().CommitVariable(graphics.candidate_image_layout, count);
+		vk::WriteDescriptorSet write {};
+		write.dstSet          = set;
+		write.dstBinding      = IR::CandidateImageBinding;
+		write.descriptorCount = count;
+		write.descriptorType  = vk::DescriptorType::eSampledImage;
+		write.pImageInfo      = m_candidate_images.data();
+		graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             IR::CandidateImageSet, 1, &set, 0, nullptr);
 	}
 }
 

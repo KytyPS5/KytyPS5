@@ -956,6 +956,112 @@ private:
 	uint32_t                                    count = 0;
 };
 
+// What a table candidate's code depends on; the folds apply to a resource's own descriptor.
+static ResourceSpecialization::Buffer CandidateShape(const ResourceSpecialization::Buffer& buffer) {
+	return {.packed_stride      = buffer.packed_stride,
+	        .descriptor_format  = buffer.descriptor_format,
+	        .descriptor_swizzle = buffer.descriptor_swizzle};
+}
+
+static ResourceSpecialization::Image CandidateShape(ResourceSpecialization::Image image) {
+	image.indirect_root         = ImageResource::NoIndirectImage;
+	image.indirect_mapping_slot = NoIndirectMappingSlot;
+	image.indirect_searched     = false;
+	return image;
+}
+
+static auto ShapeOrder(const ResourceSpecialization::Buffer& shape) {
+	return std::tuple(shape.packed_stride, static_cast<uint32_t>(shape.descriptor_format),
+	                  shape.descriptor_swizzle);
+}
+
+static auto ShapeOrder(const ResourceSpecialization::Image& shape) {
+	return std::tuple(static_cast<uint32_t>(shape.numeric_class),
+	                  static_cast<uint32_t>(shape.dimension), shape.cube, shape.mip_count,
+	                  static_cast<uint32_t>(shape.conversion_format), shape.shader_swizzle,
+	                  static_cast<uint32_t>(shape.srgb_decode), shape.skip_degamma);
+}
+
+// Regroups the children of each table `uses_classes` names into a class per shape, in shape
+// order, and its candidates into slots: a module depends on the shapes a table selects, not on
+// their count or order. In place, so a warm materialization allocates nothing.
+template <typename Specialization, typename UsesClasses>
+static bool GroupCandidates(uint32_t roots, std::vector<Specialization>& resources,
+                            std::vector<DescriptorValue>& descriptors,
+                            std::vector<Candidate>& slots, ResourceSnapshot& snapshot,
+                            const UsesClasses& uses_classes) {
+	slots.clear();
+	const auto children = static_cast<uint32_t>(resources.size());
+	const auto grouped  = [&](uint32_t child) {
+		return uses_classes(resources[child].indirect_root);
+	};
+	uint32_t removed = 0;
+	for (uint32_t child = roots; child < children; ++child)
+		removed += grouped(child);
+	if (removed == 0) return true;
+	for (uint32_t root = 0; root < roots; ++root) {
+		if (resources[root].indirect_root != root || !uses_classes(root)) continue;
+		// A table's children are consecutive, in ordinal order.
+		uint32_t begin = roots;
+		while (begin < children && resources[begin].indirect_root != root)
+			++begin;
+		uint32_t end = begin;
+		while (end < children && resources[end].indirect_root == root)
+			++end;
+		// Its classes collect behind every child and move up once the children leave.
+		const auto first = static_cast<uint32_t>(resources.size());
+		for (uint32_t child = begin; child < end; ++child) {
+			const auto shape = CandidateShape(resources[child]);
+			if (std::find(resources.begin() + first, resources.end(), shape) == resources.end()) {
+				resources.push_back(shape);
+				descriptors.push_back({.dword_count = descriptors[root].dword_count});
+			}
+		}
+		const auto classes = std::span(resources).subspan(first);
+		std::ranges::sort(classes, {},
+		                  [](const Specialization& shape) { return ShapeOrder(shape); });
+		if (classes.size() > (UINT32_MAX >> CandidateClassShift)) {
+			return SpecializationFail(
+			    fmt::format("table {} selects {} shapes", root, classes.size()));
+		}
+		const auto class_of = [&](uint32_t child) {
+			return static_cast<uint32_t>(
+			    std::ranges::find(classes, CandidateShape(resources[child])) - classes.begin());
+		};
+		const auto first_slot = static_cast<uint32_t>(slots.size());
+		for (uint32_t child = begin; child < end; ++child) {
+			slots.push_back({descriptors[child], first + class_of(child) - removed});
+		}
+		if (slots.size() > (1u << CandidateClassShift)) {
+			return SpecializationFail(fmt::format("tables select {} candidates", slots.size()));
+		}
+		const auto&  table   = resources[root];
+		auto&        flat    = snapshot.flattened_srt;
+		const size_t mapping = snapshot.indirect_mapping_offsets[table.indirect_mapping_slot];
+		const size_t stride  = table.indirect_searched ? 2u : 1u;
+		EXIT_IF(mapping >= flat.size() || flat[mapping] > (flat.size() - mapping - 1u) / stride);
+		for (size_t entry = 0; entry < flat[mapping]; ++entry) {
+			// Ordinal 0 is the table's own null entry.
+			auto& word = flat[mapping + stride + entry * stride];
+			if (word == 0u) continue;
+			EXIT_IF(word > end - begin);
+			word = (class_of(begin + word - 1u) + 1u) << CandidateClassShift |
+			       (first_slot + word - 1u);
+		}
+		for (auto& shape: classes)
+			shape.indirect_root = root;
+	}
+	uint32_t kept = roots;
+	for (uint32_t index = roots; index < resources.size(); ++index) {
+		if (index < children && grouped(index)) continue;
+		resources[kept]     = resources[index];
+		descriptors[kept++] = descriptors[index];
+	}
+	resources.resize(kept);
+	descriptors.resize(kept);
+	return true;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1160,9 +1266,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			               (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagDerivative |
 			                Decoder::ImageSampleFlagLodClamp)) != 0u);
 		    });
+		// A table read by shape class keeps its own null entry as its instructions declare it.
+		const bool classes = !root.heap && SelectsCandidateImages(base);
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
-			if (image.indirect_root != root_index) {
+			if (image.indirect_root != root_index || (classes && candidate == root_index)) {
 				continue;
 			}
 			if (NullImageDescriptor(snapshot.images[candidate])) {
@@ -1191,6 +1299,17 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	if (!GroupCandidates(static_cast<uint32_t>(program.info.images.size()), specialization.images,
+	                     snapshot.images, snapshot.candidate_images, snapshot, [&](uint32_t root) {
+		                     return !specialization.images[root].heap &&
+		                            SelectsCandidateImages(program.info.images[root]);
+	                     })) {
+		return false;
+	}
+	// Candidates name their class as the compiled program numbers it.
+	const ImageRemap remap(specialization);
+	for (auto& candidate: snapshot.candidate_images)
+		candidate.resource = remap[candidate.resource];
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
@@ -1653,75 +1772,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-// What a table candidate's code depends on; the folds apply to a resource's own descriptor.
-static ResourceSpecialization::Buffer CandidateShape(const ResourceSpecialization::Buffer& buffer) {
-	return {.packed_stride      = buffer.packed_stride,
-	        .descriptor_format  = buffer.descriptor_format,
-	        .descriptor_swizzle = buffer.descriptor_swizzle};
-}
-
-// Regroups each buffer table's children into a class per shape, in shape order, and its candidates
-// into slots: a module depends on the shapes a table selects, not on their count or order.
-static bool GroupBufferCandidates(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                  ResourceSpecialization& specialization) {
-	snapshot.candidate_buffers.clear();
-	auto&      buffers = specialization.buffers;
-	const auto roots   = static_cast<uint32_t>(program.info.buffers.size());
-	if (buffers.size() == roots) return true;
-	const auto order = [](const ResourceSpecialization::Buffer& shape) {
-		return std::tuple(shape.packed_stride, static_cast<uint32_t>(shape.descriptor_format),
-		                  shape.descriptor_swizzle);
-	};
-	std::vector<ResourceSpecialization::Buffer> grouped(buffers.begin(), buffers.begin() + roots);
-	std::vector<ResourceSpecialization::Buffer> classes;
-	std::vector<uint32_t>                       words;
-	auto&                                       slots = snapshot.candidate_buffers;
-	for (uint32_t root = 0; root < roots; ++root) {
-		if (buffers[root].indirect_root != root) continue;
-		classes.clear();
-		for (uint32_t child = roots; child < buffers.size(); ++child) {
-			if (buffers[child].indirect_root != root) continue;
-			const auto shape = CandidateShape(buffers[child]);
-			if (std::ranges::find(classes, shape) == classes.end()) classes.push_back(shape);
-		}
-		std::ranges::sort(classes, {}, order);
-		if (classes.size() > (UINT32_MAX >> CandidateClassShift)) {
-			return SpecializationFail(
-			    fmt::format("buffer table {} selects {} shapes", root, classes.size()));
-		}
-		const auto first = static_cast<uint32_t>(grouped.size());
-		// Ordinal 0 is the table's own null entry.
-		words.assign(1u, 0u);
-		for (uint32_t child = roots; child < buffers.size(); ++child) {
-			if (buffers[child].indirect_root != root) continue;
-			const auto index = static_cast<uint32_t>(
-			    std::ranges::find(classes, CandidateShape(buffers[child])) - classes.begin());
-			words.push_back((index + 1u) << CandidateClassShift |
-			                static_cast<uint32_t>(slots.size()));
-			slots.push_back({snapshot.buffers[child], first + index});
-		}
-		if (slots.size() > (1u << CandidateClassShift)) {
-			return SpecializationFail(fmt::format("buffer tables select {} buffers", slots.size()));
-		}
-		for (const auto& shape: classes)
-			grouped.emplace_back(shape).indirect_root = root;
-		const auto&  table   = buffers[root];
-		auto&        flat    = snapshot.flattened_srt;
-		const size_t mapping = snapshot.indirect_mapping_offsets[table.indirect_mapping_slot];
-		const size_t stride  = table.indirect_searched ? 2u : 1u;
-		EXIT_IF(mapping >= flat.size() || flat[mapping] > (flat.size() - mapping - 1u) / stride);
-		for (size_t entry = 0; entry < flat[mapping]; ++entry) {
-			auto& word = flat[mapping + stride + entry * stride];
-			EXIT_IF(word >= words.size());
-			word = words[word];
-		}
-	}
-	buffers = std::move(grouped);
-	snapshot.buffers.resize(roots);
-	snapshot.buffers.resize(buffers.size(), DescriptorValue {.dword_count = 4u});
-	return true;
-}
-
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           std::vector<uint32_t>* unbindable_pcs) {
@@ -1849,7 +1899,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
-	if (!GroupBufferCandidates(program, snapshot, specialization)) return false;
+	if (!GroupCandidates(static_cast<uint32_t>(program.info.buffers.size()), specialization.buffers,
+	                     snapshot.buffers, snapshot.candidate_buffers, snapshot,
+	                     [](uint32_t) { return true; })) {
+		return false;
+	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1878,7 +1932,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot,
-			        snapshot.images, specialization.images, false, [&](DescriptorValue& value) {
+			        snapshot.images, specialization.images, SelectsCandidateImages(image),
+			        [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        // A sample of a T# whose channels all select 0 reads 0 at any address.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
@@ -2047,6 +2102,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.cube                       = source.cube;
 		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
+		image.candidate = source.indirect_root != ImageResource::NoIndirectImage && !source.heap &&
+		                  SelectsCandidateImages(image);
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

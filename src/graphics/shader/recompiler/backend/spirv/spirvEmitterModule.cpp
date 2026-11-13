@@ -213,8 +213,11 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 
 void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR::ImageResource& image,
                       uint32_t count, uint32_t set, uint32_t binding) {
-	definition.type     = ImageType(state, image);
-	const auto array    = state.builder.Type(spv::OpTypeArray, definition.type, ConstantU32(state, count));
+	definition.type = ImageType(state, image);
+	// A count of zero is a runtime array.
+	const auto array = count != 0u ? state.builder.Type(spv::OpTypeArray, definition.type,
+	                                                    ConstantU32(state, count))
+	                               : state.builder.Type(spv::OpTypeRuntimeArray, definition.type);
 	definition.variable = state.builder.DefineGlobalVariable(
 	    TypePointer(state, spv::StorageClassUniformConstant, array), spv::StorageClassUniformConstant);
 	state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationDescriptorSet, set);
@@ -283,6 +286,17 @@ void DefineDescriptors(EmitterState& state) {
 			}
 			continue;
 		}
+		if (image.candidate) {
+			// Candidate classes alias the draw's array; the table itself is never accessed.
+			auto& definition = state.candidate_images[IR::ImageBindingIndex(*kind)];
+			if (image.indirect_resources.empty() && definition.variable == 0) {
+				state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+				state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+				DefineImageArray(state, definition, image, 0u, IR::CandidateImageSet,
+				                 IR::CandidateImageBinding);
+			}
+			continue;
+		}
 		auto& count = counts[static_cast<size_t>(*kind)];
 		image.descriptor_index = count;
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
@@ -321,6 +335,9 @@ void DefineDescriptors(EmitterState& state) {
 	if (info.uses_candidate_buffers) {
 		bindings.candidate_buffer_dword = bindings.memory_offset_dword++;
 		DefineCandidateBuffers(state);
+	}
+	if (info.uses_candidate_images) {
+		bindings.candidate_image_dword = bindings.memory_offset_dword++;
 	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());

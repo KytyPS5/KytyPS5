@@ -212,6 +212,7 @@ public:
 		bool                    uses_push_descriptors  = false;
 		bool                    uses_image_heap        = false;
 		bool                    uses_candidate_buffers = false;
+		bool                    uses_candidate_images  = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.

@@ -371,16 +371,17 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // Both descriptors are slots of the table's one class.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
-            memory.watched_dwords == 36u && memory.reads == 1u,
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 2u &&
+            memory.watched_reads == 1u && memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
   const auto mapping = snapshot.indirect_mapping_offsets.at(root.indirect_mapping_slot);
   Check(!root.indirect_searched && snapshot.flattened_srt[mapping] == 17u &&
             snapshot.flattened_srt[mapping + 1u] == 0u &&
-            snapshot.flattened_srt[mapping + 5u] == 1u &&
-            snapshot.flattened_srt[mapping + 17u] == 2u &&
+            snapshot.flattened_srt[mapping + 5u] == 1u << CandidateClassShift &&
+            snapshot.flattened_srt[mapping + 17u] == (1u << CandidateClassShift | 1u) &&
             snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 144u}},
         "dense image mapping lost its null slot, trimmed length or coherent read dependency");
   for (const uint32_t stride : {1u, 2u}) {
@@ -408,7 +409,7 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
         "moving a table entry changed shader specialization or reused stale mapping bytes");
   put(112u, 7u);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images[2].dwords[0] == descriptor[0] + 7u,
+            snapshot.candidate_images[1].value.dwords[0] == descriptor[0] + 7u,
         "changed table descriptor was not refreshed");
   // Scalar reads align each DWORD and return zero beyond the V# byte size.
   data[5] = 0u;
@@ -418,7 +419,8 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   memory.fail_address = 0x2010u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.watched_dwords == 4u && snapshot.images.size() == 2u &&
-            snapshot.images[1].dwords == descriptor,
+            snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords == descriptor,
         "partial descriptor prefix did not zero its out-of-bounds DWORDs");
   memory.fail_address = 0x2008u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -533,7 +535,8 @@ void TestResidentImageHeap() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             heap.requests.size() == 3u && memory.watched_reads == 1u &&
             snapshot.images.size() == 2u && !specialization.images[0].heap &&
-            snapshot.images[1].dwords == descriptor,
+            snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords == descriptor,
         "a declined heap was not materialized entry by entry");
 }
 
@@ -604,19 +607,32 @@ void TestBoundedImageViewEligibility() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // A 2D instruction reads an array view as 2D: the three views are slots of one class.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4u && memory.reads == 1u,
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 3u &&
+            memory.reads == 1u,
         "unrelated cube/3D heap entries prevented a typed 2D table view");
   const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+  // With one root, a mapping word is the slot's class resource over the slot.
+  const auto word = [&](uint32_t slot) {
+    return snapshot.candidate_images[slot].resource << CandidateClassShift | slot;
+  };
+  const auto dimension = [&](uint32_t slot) {
+    return specialization.images[snapshot.candidate_images[slot].resource].dimension;
+  };
   Check(snapshot.flattened_srt[mapping] == 53u &&
-            snapshot.flattened_srt[mapping + 5u] == 1u &&
+            snapshot.flattened_srt[mapping + 5u] == word(0u) &&
             snapshot.flattened_srt[mapping + 17u] == 0u &&
             snapshot.flattened_srt[mapping + 29u] == 0u &&
-            snapshot.flattened_srt[mapping + 41u] == 2u &&
-            snapshot.flattened_srt[mapping + 53u] == 3u &&
-            snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-            snapshot.images[2].dwords == descriptor(0x23u, Type::kColor2DArray) &&
-            snapshot.images[3].dwords == descriptor(0x24u, Type::kColor2D),
+            snapshot.flattened_srt[mapping + 41u] == word(1u) &&
+            snapshot.flattened_srt[mapping + 53u] == word(2u) &&
+            snapshot.candidate_images[0].value.dwords == descriptor(0x20u, Type::kColor2D) &&
+            snapshot.candidate_images[1].value.dwords == descriptor(0x23u, Type::kColor2DArray) &&
+            snapshot.candidate_images[2].value.dwords == descriptor(0x24u, Type::kColor2D) &&
+            dimension(0u) == Decoder::ImageDimension::Dim2D &&
+            dimension(1u) == Decoder::ImageDimension::Dim2D &&
+            snapshot.candidate_images[1].resource == 1u &&
+            snapshot.candidate_images[0].resource == snapshot.candidate_images[2].resource,
         "typed table eligibility changed byte offsets or discarded compatible views");
 
   // CS127daf PC0x163c: an overlapping heap tuple is not a valid texture view.
@@ -626,10 +642,10 @@ void TestBoundedImageViewEligibility() {
   for (const bool r128 : {false, true}) {
     plan.info.images[0].r128 = r128;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (r128 ? 3u : 4u) &&
+              snapshot.candidate_images.size() == (r128 ? 2u : 3u) &&
               snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot) + 17u] == 0u &&
-              snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-              snapshot.images.back().dwords == descriptor(0x24u, Type::kColor2D),
+              snapshot.candidate_images.front().value.dwords == descriptor(0x20u, Type::kColor2D) &&
+              snapshot.candidate_images.back().value.dwords == descriptor(0x24u, Type::kColor2D),
           "invalid heap texture view survived normalization or removed valid neighbors");
   }
   plan.info.images[0].r128 = false;
@@ -707,17 +723,28 @@ void TestExactUnfilteredImageCandidates() {
       for (const bool depth : {false, true}) {
         plan.info.images[0].depth_compare = depth;
         Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-                  snapshot.images.size() == (depth ? 3u : 2u) &&
+                  snapshot.candidate_images.size() == (depth ? 2u : 1u) &&
                   snapshot.images[0].dwords == std::array<uint32_t, 8>{} &&
-                  snapshot.images[1].dwords == first &&
-                  (!depth || snapshot.images[2].dwords == second),
+                  snapshot.candidate_images[0].value.dwords == first &&
+                  (!depth || snapshot.candidate_images[1].value.dwords == second),
               "a sampled table slot of another type, or a zero-swizzle placeholder, was kept");
       }
     }
     if (!unfiltered) continue;
-    Check(snapshot.images.size() == 2u && snapshot.images[1].dwords == placeholder &&
-              specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
-              specialization.images[1].dimension == Decoder::ImageDimension::Dim1D,
+    // A sampled table reads its two descriptors as slots of a 2D and a 1D class; a storage
+    // table keeps the first as its own entry.
+    const bool classes = SelectsCandidateImages(plan.info.images[0]);
+    const auto placed = [&](uint32_t descriptor) {
+      return classes ? snapshot.candidate_images[descriptor].value : snapshot.images[descriptor];
+    };
+    const auto resource = [&](uint32_t descriptor) {
+      return classes ? snapshot.candidate_images[descriptor].resource : descriptor;
+    };
+    Check(snapshot.images.size() == (classes ? 3u : 2u) &&
+              snapshot.candidate_images.size() == (classes ? 2u : 0u) &&
+              placed(1u).dwords == placeholder &&
+              specialization.images[resource(0u)].dimension == Decoder::ImageDimension::Dim2D &&
+              specialization.images[resource(1u)].dimension == Decoder::ImageDimension::Dim1D,
           "a real 1D zero-swizzle descriptor was filtered, nulled or retyped");
     if (access == ValueOpcode::ImageWrite)
       Check(specialization.images[1].shader_swizzle == 0u,
@@ -729,19 +756,22 @@ void TestExactUnfilteredImageCandidates() {
     ApplyResourceSpecialization(fixture->program, specialization);
     const auto &images = fixture->program.info.images;
     const auto &selected = fixture->program.memory_info[operation->Flags<MemoryFlags>().index];
-    Check(images.size() == 2u && selected.resource == 0u &&
+    const auto &narrow = images[resource(1u)];
+    Check(images.size() == (classes ? 3u : 2u) && selected.resource == 0u &&
               selected.image_dimension == Decoder::ImageDimension::Dim2D &&
-              images[0].indirect_resources == std::vector<uint32_t>({0u, 1u}) &&
-              images[1].indirect_root == 0u &&
-              images[1].dimension == Decoder::ImageDimension::Dim1D &&
-              images[1].unfiltered_access_only &&
+              images[0].indirect_resources ==
+                  (classes ? std::vector<uint32_t>({0u, 1u, 2u}) : std::vector<uint32_t>({0u, 1u})) &&
+              images[0].candidate == classes && narrow.candidate == classes &&
+              narrow.indirect_root == 0u &&
+              narrow.dimension == Decoder::ImageDimension::Dim1D &&
+              narrow.unfiltered_access_only &&
               operation->Arg(0).ResolveInstruction()->Arg(0) == key &&
               (access != ValueOpcode::ImageWrite || images[1].shader_swizzle == 0u),
           "applying mixed candidates lost GPU selection, typed child or storage swizzle");
     second[0] += 2u;
     fill();
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images[1].dwords[0] == second[0],
+              placed(1u).dwords[0] == second[0],
           "mixed-dimension materialization reused a stale descriptor");
     plan.info.images[0].dimension = Decoder::ImageDimension::Dim1D;
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -1080,11 +1110,14 @@ void TestNestedPointerImageTable() {
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The images are slots of the table's float and integer classes; a sampler table lists its
+  // candidates.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+            snapshot.images.size() == 3u && snapshot.candidate_images.size() == count &&
+            snapshot.samplers.size() == count + 1u,
         "bounded nested pointer table lost image/sampler candidates or read the GPU selector");
   for (uint32_t row = 0; row < count; ++row)
-    Check(snapshot.images[row + 1u].dwords[0] == 10u + row &&
+    Check(snapshot.candidate_images[row].value.dwords[0] == 10u + row &&
               snapshot.samplers[row + 1u].dwords[0] == row,
           "nested pointer table mixed rows or pointee members");
   auto typed = make();
@@ -1127,8 +1160,9 @@ void TestNestedPointerImageTable() {
   *at(objects + 0x430u + 0x3d0u) = 10u + count;
   *at(objects + 0x430u + 0x3f8u) = count;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == count && snapshot.samplers.size() == count &&
-            snapshot.images[1].dwords[0] == 10u + count && snapshot.samplers[1].dwords[0] == count,
+            snapshot.candidate_images.size() == count - 1u && snapshot.samplers.size() == count &&
+            snapshot.candidate_images[0].value.dwords[0] == 10u + count &&
+            snapshot.samplers[1].dwords[0] == count,
         "nested descriptor refresh retained stale pointers or failed to deduplicate new pointees");
   *at(table) = objects;
 
@@ -1139,11 +1173,12 @@ void TestNestedPointerImageTable() {
   *at(static_cast<uint32_t>(memory.watched_address)) = objects;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.watched_reads != 0u && memory.watched_dwords == 1u &&
-            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+            snapshot.candidate_images.size() == count && snapshot.samplers.size() == count + 1u,
         "partial pointer row was skipped or read beyond its scalar buffer bounds");
   const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+  // The partial row points at the first row's image: its slot, in the float class.
   Check(snapshot.flattened_srt[mapping] == count + 1u &&
-            snapshot.flattened_srt[mapping + count + 1u] == 1u,
+            snapshot.flattened_srt[mapping + count + 1u] == 1u << CandidateClassShift,
         "partial pointer row lost its low-word pointee or dense key mapping");
   user_data[1] = stride << 16u;
   user_data[2] = count;
@@ -1359,7 +1394,8 @@ void TestIndexedPointerImageTable() {
                           .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 6u,
         "indexed pointer/child domain lost candidates or read poisoned child padding");
   const auto captured = [&](uint64_t address, uint64_t bytes) {
     return std::ranges::any_of(snapshot.specialization_reads, [&](const auto& span) {
@@ -1378,18 +1414,21 @@ void TestIndexedPointerImageTable() {
   Check(snapshot.flattened_srt[mapping] == 6u,
         "nested child table did not produce one dense composite-key mapping");
   for (uint32_t key = 0; key < 6u; ++key)
-    Check(snapshot.images[key + 1u].dwords[0] == 10u + key &&
-              snapshot.flattened_srt[mapping + key + 1u] == key + 1u,
+    Check(snapshot.candidate_images[key].value.dwords[0] == 10u + key &&
+              snapshot.flattened_srt[mapping + key + 1u] == (1u << CandidateClassShift | key),
           "nested composite key mixed parent rows or child records");
   const auto original = specialization;
   user_data[2] = 100u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 6u,
         "nested parent enumeration included unreachable poison rows");
   user_data[2] = 2u;
   *at(table) = objects + row_bytes;
   *at(objects + row_bytes + 64u) = 42u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 4u &&
-            snapshot.images[1].dwords[0] == 42u && specialization != original,
+  // Half as many images of the same shape: other slots, the same specialization.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 3u &&
+            snapshot.candidate_images[0].value.dwords[0] == 42u && specialization == original,
         "nested table refresh retained stale pointer/descriptor data or duplicated aliases");
   *at(table) = objects;
   for (const uint32_t records : {0u, 1u}) {
@@ -1455,7 +1494,8 @@ void TestIndexedPointerImageTable() {
   *at(table) = objects;
   *at(table + 4u) = 0xbeef0001u;
   *at(count_address) = *at(count_address + 4u) = 2u;
-  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 6u,
         "finite parent choices lost their runtime count and enumerated unavailable rows");
   const auto& counted_indirect = *counted_plan.descriptor_sources[counted_plan.info.images[0].source].indirect_descriptor;
   Check(counted_indirect.table_maximum == 3u && !counted_indirect.key_count.IsEmpty() &&
@@ -1465,7 +1505,8 @@ void TestIndexedPointerImageTable() {
   masked->PlanAndTrack();
   const auto masked_plan = ExtractResourcePlan(masked->program);
   Check(!masked_plan.descriptor_sources[masked_plan.info.images[0].source].indirect_descriptor->key_count.IsEmpty() &&
-            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 6u,
         "inactive preserved selector value discarded the selected lane's runtime count");
   memory.watched_address = high + table;
   for (const uint32_t count : {0u, 1u, 2u, 4u, 5u}) {
@@ -1473,7 +1514,7 @@ void TestIndexedPointerImageTable() {
     counted_data[2] = std::min(count, 4u);
     memory.watched_reads = 0u;
     Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u + 3u * std::min(count, 4u) &&
+              snapshot.candidate_images.size() == 3u * std::min(count, 4u) &&
               (count != 0u || memory.watched_reads == 0u),
           "finite parent count refresh lost candidates, ignored its static cap or read an empty domain");
   }
@@ -1858,44 +1899,50 @@ void TestGuardedDirectImageTable() {
   ResourceSpecialization specialization;
   auto packed = make_plan(Guard::Plain, 0u, true);
   memory.fail_address = table + 32u * 32u;
-  // Without a heap, one table read yields the null root and then each distinct slot.
+  // Without a heap, one table read yields each distinct slot as a candidate of the draw.
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 33u && snapshot.images[1].dwords[0] == 0x100u &&
-            snapshot.images.back().dwords[0] == 0x11fu,
+            snapshot.candidate_images.size() == 32u &&
+            snapshot.candidate_images.front().value.dwords[0] == 0x100u &&
+            snapshot.candidate_images.back().value.dwords[0] == 0x11fu,
         "packed five-bit selector did not enumerate exactly its finite domain");
+  const auto distinct = specialization;
   for (uint32_t key = 0; key < 32u; ++key)
     memory.words[(table - memory.base) / 4u + key * 8u] = 0x100u;
+  // Every key selecting one image is one slot of the same class, not another shader.
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images[1].dwords[0] == 0x100u &&
-            specialization.images[1].indirect_root == 0u,
-        "packed five-bit selector retained duplicate image bindings or lost keys");
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x100u && specialization == distinct,
+        "packed five-bit selector retained duplicate image slots or lost keys");
   memory.fail_address = UINT64_MAX;
   memory.reads = 0u;
   memory.descriptor_reads = 0u;
   fill_table(memory, table);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u && specialization.images.size() == 32u &&
+            snapshot.candidate_images.size() == 32u && specialization.images.size() == 2u &&
             snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
-  const auto original_descriptor = snapshot.images[16].dwords;
+  const auto original_descriptor = snapshot.candidate_images[16].value.dwords;
   const std::array<uint32_t, 8> captured_invalid{
       0x101f0000u, 0xcb500000u, 0x001fc01fu, 0xd0970facu,
       0x86000000u, 0x00500003u, 0x00000400u, 0x00005204u};
   std::copy(captured_invalid.begin(), captured_invalid.end(),
              memory.words.begin() + captured_word);
+  // Its key stays in the mapping and selects nothing.
+  const auto captured_mapping =
+      snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u &&
-            snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == 32u &&
-            std::ranges::all_of(snapshot.images[16].dwords,
-                                [](uint32_t word) { return word == 0u; }),
+            snapshot.candidate_images.size() == 31u &&
+            snapshot.flattened_srt[captured_mapping] == 32u &&
+            snapshot.flattened_srt[captured_mapping + 1u + 16u * 2u] == 16u &&
+            snapshot.flattened_srt[captured_mapping + 2u + 16u * 2u] == 0u,
         "captured non-descriptor record became a host image or lost its key mapping");
   std::copy(original_descriptor.begin(), original_descriptor.end(),
              memory.words.begin() + captured_word);
   memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images[31].dwords[0] == 0x987u,
+            snapshot.candidate_images[31].value.dwords[0] == 0x987u,
         "direct table refresh reused stale descriptor contents");
   memory.fail_address = table + 31u * 32u + 28u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -1955,8 +2002,9 @@ void TestGuardedDirectImageTable() {
     records.words[1] = 2u;
     records.descriptor_reads = 0u;
     Check(MaterializeResources(bounded, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && records.descriptor_reads == 2u &&
-              snapshot.images[0].dwords[0] == 0x500u && snapshot.images[2].dwords[0] == 0x501u,
+              snapshot.candidate_images.size() == 2u && records.descriptor_reads == 2u &&
+              snapshot.candidate_images[0].value.dwords[0] == 0x500u &&
+              snapshot.candidate_images[1].value.dwords[0] == 0x501u,
           "bounded interleaved table did not read precisely its two descriptor rows");
     const auto captured = [&](uint64_t address, uint64_t size) {
       return std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
@@ -1988,13 +2036,15 @@ void TestGuardedDirectImageTable() {
         : guard == Guard::FiniteAdd || guard == Guard::FiniteXor ? 32u : 12u;
     const uint64_t first = records.base + 3344u;
     fill_table(records, first);
-    // The GPU may select no bits or a sparse subset. Null rows remain valid candidates.
+    // The GPU may select no bits or a sparse subset. A null row's key selects nothing.
     std::fill_n(records.words.begin() + (first - records.base) / 4u + 5u * 8u, 8u, 0u);
     records.fail_address = first + count * 32u;
     user_data = {static_cast<uint32_t>(records.base), 0u};
     runtime.userdata = &records;
     Check(MaterializeResources(finite, runtime, snapshot, specialization) &&
-              records.descriptor_reads == count && snapshot.images.size() == std::max(count, 1u) + 1u,
+              records.descriptor_reads == count &&
+              snapshot.candidate_images.size() == (count == 0u ? 0u : count - 1u) &&
+              snapshot.images.size() == (count == 0u ? 2u : 3u),
           "finite bit table probed beyond its mask bound or lost a null row");
     if (count == 0u) {
       Check(std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
@@ -2473,10 +2523,11 @@ void TestBoundedComputeImageLoop() {
                 heap.requests[0].first == 0u && heap.requests[0].count == count &&
                 heap.requests[0].root == &post_plan.info.images[0],
             "post-tested image loop did not request a heap of zero through bound minus one");
-      // Without a heap, the null root precedes each slot.
+      // Without a heap, each slot is a candidate of the draw.
       Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u && snapshot.images[1].dwords[0] == 0x100u &&
-                snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+                snapshot.candidate_images.size() == count &&
+                snapshot.candidate_images.front().value.dwords[0] == 0x100u &&
+                snapshot.candidate_images.back().value.dwords[0] == 0x100u + count - 1u,
             "post-tested image loop did not enumerate precisely zero through bound minus one");
     }
   }
@@ -2491,25 +2542,30 @@ void TestBoundedComputeImageLoop() {
               heap.requests[0].size == (count + 1u) * 32u && heap.requests[0].count == count + 1u,
           "post-tested image loop did not request a heap through a carried-key bound");
     Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count + 2u && snapshot.images[1].dwords[0] == 0x100u &&
-              snapshot.images.back().dwords[0] == 0x100u + count,
+              snapshot.candidate_images.size() == count + 1u &&
+              snapshot.candidate_images.front().value.dwords[0] == 0x100u &&
+              snapshot.candidate_images.back().value.dwords[0] == 0x100u + count,
           "post-tested image loop did not enumerate a carried-key bound through the bound");
   }
   memory.fail_address = UINT64_MAX;
+  // The loop bound changes the table's slots, not its shader.
+  ResourceSpecialization bounded;
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count &&
-              specialization.images.size() == count &&
+              snapshot.candidate_images.size() == count &&
+              specialization.images.size() == 2u &&
+              (bounded.images.empty() || specialization == bounded) &&
               snapshot.flattened_srt[
                   snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == count &&
-              snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+              snapshot.candidate_images.back().value.dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
+    bounded = specialization;
   }
   for (const uint32_t count : {0u, UINT32_MAX}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u &&
+              snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
               specialization.images.size() == 1u &&
               std::ranges::all_of(snapshot.images[0].dwords,
                                   [](uint32_t word) { return word == 0u; }) &&
@@ -2532,8 +2588,8 @@ void TestBoundedComputeImageLoop() {
     const auto length = count > 1u && count <= INT32_MAX ? count - 1u : 0u;
     Check(MaterializeResources(nonzero, runtime, snapshot, specialization) &&
               memory.descriptor_reads == length &&
-              snapshot.images.size() == std::max(1u, length) + 1u &&
-              snapshot.images[0].dwords[0] == (length != 0u ? 0x101u : 0u),
+              snapshot.candidate_images.size() == length &&
+              (length == 0u || snapshot.candidate_images[0].value.dwords[0] == 0x101u),
           "nonzero-start image loop read index zero or mishandled its signed bound");
     Check(std::ranges::find(snapshot.specialization_reads,
               std::pair{uint64_t{user_data[0]}, uint64_t{4u}}) != snapshot.specialization_reads.end(),
@@ -2542,8 +2598,8 @@ void TestBoundedComputeImageLoop() {
       Check(std::ranges::find(snapshot.specialization_reads,
                 std::pair{uint64_t{table} + key * 32u, uint64_t{32u}}) !=
                     snapshot.specialization_reads.end() &&
-                std::ranges::any_of(snapshot.images, [&](const auto& image) {
-                  return image.dwords[0] == 0x100u + key;
+                std::ranges::any_of(snapshot.candidate_images, [&](const auto& image) {
+                  return image.value.dwords[0] == 0x100u + key;
                 }),
             "nonzero-start loop lost a descriptor or its writable-alias capture");
   }
@@ -2574,14 +2630,15 @@ void TestBoundedComputeImageLoop() {
   memory.reads = 0u;
   memory.fail_address = first_key;
   Check(MaterializeResources(material, runtime, snapshot, specialization) && memory.reads == 0u &&
-            snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0u,
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
+            snapshot.images[0].dwords[0] == 0u,
         "empty raw pointer selector read an unreachable record");
   user_data[2] = 2u;
   memory.fail_address = first_key + 96u;
   memory.descriptor_reads = 0u;
   Check(MaterializeResources(material, runtime, snapshot, specialization) &&
-            memory.descriptor_reads == 2u && snapshot.images.size() == 2u &&
-            snapshot.images[0].dwords[0] == 0x100u && snapshot.images[1].dwords[0] == 0x102u,
+            memory.descriptor_reads == 2u && snapshot.candidate_images.size() == 2u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x100u && snapshot.candidate_images[1].value.dwords[0] == 0x102u,
         "bounded raw pointer selector lost sparse keys or read an extra record");
   memory.fail_address = first_key + 48u;
   Check(!MaterializeResources(material, runtime, snapshot, specialization),
@@ -2602,8 +2659,8 @@ void TestBoundedComputeImageLoop() {
     memory.fail_address = first_key + 144u;
     memory.descriptor_reads = 0u;
     Check(MaterializeResources(clamped, runtime, snapshot, specialization) &&
-              memory.descriptor_reads == 2u && snapshot.images.size() == 2u &&
-              snapshot.images[0].dwords[0] == 0x100u && snapshot.images[1].dwords[0] == 0x102u,
+              memory.descriptor_reads == 2u && snapshot.candidate_images.size() == 2u &&
+              snapshot.candidate_images[0].value.dwords[0] == 0x100u && snapshot.candidate_images[1].value.dwords[0] == 0x102u,
           "clamped scalar selector read an unreachable image or failed to deduplicate clamped keys");
   }
   CheckFatal([&] { make_plan(Variant::Bounded, true, 0u, Clamp::Dynamic); },
@@ -2821,7 +2878,7 @@ void TestDescendingImageRange() {
       .read_specialization_memory = ReadLinearTestMemory};
   for (const auto count : {0u, 2u, 0u}) {
     user_data[2] = count;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u,
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.candidate_images.size() == 2u,
           "descending descriptor subtraction failed when the runtime key underflowed");
     const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
     Check(snapshot.flattened_srt[offset] == 128u, "descending mapping lost candidate keys");
@@ -2870,7 +2927,7 @@ void TestDescendingImageRange() {
               (bitmap_data[6] == 0u || memory.watched_dwords ==
                   std::min(dwords, MaxIndirectDescriptorProbes)) &&
               memory.descriptor_reads == keys.size() &&
-              snapshot.images.size() == std::max<size_t>(keys.size(), 1u),
+              snapshot.candidate_images.size() == keys.size(),
           "bitmap selector lost bounded reads or retained unreachable descriptors");
     for (uint32_t first = 0; first < dwords; first += MaxIndirectDescriptorProbes)
       Check(std::ranges::find(snapshot.specialization_reads,
@@ -2884,18 +2941,15 @@ void TestDescendingImageRange() {
             "empty bitmap retained a previously materialized image");
       return;
     }
-    if (keys.size() == 1u) {
-      Check(snapshot.images[0].dwords[0] == 0x100u + uint32_t(0x1000u + keys[0] * 32u) / 32u &&
-                specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
-            "a single bitmap rank became empty or required an indirect image mapping");
-      return;
-    }
+    // One rank is one slot of the same table: its count does not change the shader.
+    Check(specialization.images.size() == 2u && specialization.images[0].indirect_root == 0u,
+          "a bitmap rank did not become a slot of the table's class");
     const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
     Check(snapshot.flattened_srt[offset] == keys.size(), "bitmap mapping lost a selected key");
     for (uint32_t index = 0; index < keys.size(); ++index) {
       const auto descriptor_record = uint32_t(0x1000u + keys[index] * 32u) / 32u;
       Check(snapshot.flattened_srt[offset + 1u + index * 2u] == keys[index] &&
-                snapshot.images[index].dwords[0] == 0x100u + descriptor_record,
+                snapshot.candidate_images[index].value.dwords[0] == 0x100u + descriptor_record,
             "bitmap word association or U32-wrapped key selected a different descriptor");
     }
   };
@@ -2941,7 +2995,7 @@ void TestDescendingImageRange() {
   memory.watched_reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(bitmap_plan, bitmap_runtime, snapshot, specialization) &&
             memory.watched_reads == 0u && memory.descriptor_reads == 0u &&
-            snapshot.images.size() == 1u &&
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
             std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t value) { return value == 0u; }),
         "unbound bitmap V# read backing bytes or manufactured an image key");
   bitmap_data = valid_data;
@@ -2963,7 +3017,7 @@ void TestDescendingImageRange() {
   std::fill_n(memory.words.begin() + bitmap_word, 4u, UINT32_MAX);
   memory.fail_address = bitmap_address + MaxIndirectDescriptorProbes * 4u;
   Check(MaterializeResources(bitmap_plan, bitmap_runtime, snapshot, specialization) &&
-            snapshot.images.size() == 128u &&
+            snapshot.candidate_images.size() == 128u &&
             std::ranges::none_of(snapshot.specialization_reads, [&](const auto &read) {
               return read.first >= memory.fail_address;
             }),
@@ -3069,11 +3123,11 @@ void CheckRecordWordMaterialization(const ResourcePlan &plan) {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.descriptor_reads == 5u && snapshot.images.size() == 5u,
+            memory.descriptor_reads == 5u && snapshot.candidate_images.size() == 5u,
         "record-word key did not read exactly the descriptors its tiles select");
   for (const uint32_t key : {3u, 34u, 65u, 96u, 127u})
-    Check(std::ranges::any_of(snapshot.images, [&](const auto &image) {
-            return image.dwords[0] == 0x100u + key;
+    Check(std::ranges::any_of(snapshot.candidate_images, [&](const auto &image) {
+            return image.value.dwords[0] == 0x100u + key;
           }),
           "record-word key lost a descriptor one of its tiles selects");
 }
@@ -3807,13 +3861,13 @@ void TestMaterialWordImageTable() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.descriptor_reads == 3u && snapshot.images.size() == 3u,
+              memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u,
           "material-word key did not read exactly the descriptors its rows "
           "select");
     for (const uint32_t material : {1u, 2u, 4u})
-      Check(std::ranges::any_of(snapshot.images,
+      Check(std::ranges::any_of(snapshot.candidate_images,
                                 [&](const auto &image) {
-                                  return image.dwords[0] ==
+                                  return image.value.dwords[0] ==
                                          0x100u + addend + 31u * material;
                                 }),
             "material-word key lost a descriptor one of its rows selects");
@@ -3926,13 +3980,13 @@ void TestMaskedScalarMaterialImageTable() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.descriptor_reads == 3u && snapshot.images.size() == 3u,
+              memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u,
           "masked scalar material key did not read exactly the records its "
           "words select");
     for (const uint32_t key : {0u, 3u, 5u})
-      Check(std::ranges::any_of(snapshot.images,
+      Check(std::ranges::any_of(snapshot.candidate_images,
                                 [&](const auto &image) {
-                                  return image.dwords[0] == 0x100u + key;
+                                  return image.value.dwords[0] == 0x100u + key;
                                 }),
             "masked scalar material key lost a record one of its words "
             "selects");
@@ -4077,11 +4131,11 @@ void TestLoopSelectedImageTable() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.descriptor_reads == 32u && snapshot.images.size() == 32u,
+            memory.descriptor_reads == 32u && snapshot.candidate_images.size() == 32u,
         "loop-selected image table did not enumerate exactly keys zero through 31");
   for (uint32_t key = 0; key < 32u; ++key)
-    Check(std::ranges::any_of(snapshot.images, [&](const auto &image) {
-            return image.dwords[0] == 0x100u + key;
+    Check(std::ranges::any_of(snapshot.candidate_images, [&](const auto &image) {
+            return image.value.dwords[0] == 0x100u + key;
           }),
           "loop-selected image table lost a reachable descriptor");
 }
@@ -4483,7 +4537,7 @@ void TestUniformizedMaterialImageKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u &&
+            snapshot.candidate_images.size() == 2u &&
             memory.reads == 4u && memory.descriptor_reads == 2u &&
             snapshot.flattened_srt[
                 snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == 2u &&
@@ -4531,9 +4585,9 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
-            snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
-            snapshot.images[2].dwords[0] == 0x600u,
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x200u && snapshot.candidate_images[1].value.dwords[0] == 0x400u &&
+            snapshot.candidate_images[2].value.dwords[0] == 0x600u,
         "packed selector did not extract before clamping or read outside its sixteen records");
   memory.fail_address = base + 15u * 16u + 8u;
   Check(!MaterializeResources(packed, runtime, snapshot, specialization),
@@ -4548,8 +4602,8 @@ void TestUniformizedMaterialImageKeys() {
                       base_offset + immediate + record * 16u, &word, sizeof(word));
     }
     Check(MaterializeResources(immediate == 8u ? packed : unaligned, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x200u &&
-              snapshot.images[1].dwords[0] == 0x400u && snapshot.images[2].dwords[0] == 0x600u &&
+              snapshot.candidate_images.size() == 3u && snapshot.candidate_images[0].value.dwords[0] == 0x200u &&
+              snapshot.candidate_images[1].value.dwords[0] == 0x400u && snapshot.candidate_images[2].value.dwords[0] == 0x600u &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair<uint64_t, uint64_t>{base + base_offset + immediate, 244u}) !=
                   snapshot.specialization_reads.end(),
@@ -4563,9 +4617,9 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(merged, runtime, snapshot, specialization) &&
-            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
-            snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
-            snapshot.images[2].dwords[0] == 0x600u,
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x200u && snapshot.candidate_images[1].value.dwords[0] == 0x400u &&
+            snapshot.candidate_images[2].value.dwords[0] == 0x600u,
         "merged nibble selector did not preserve its sixteen-record domain and lower-half projection");
   for (const auto variant : {Variant::PackedNegativeOffset, Variant::PackedFullAddress,
                              Variant::PackedWrongGuard, Variant::PackedSparseOffset,
@@ -4724,11 +4778,21 @@ void TestIndexedMaterialImageKeys() {
                            .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The descriptors the three tables reach: the sampled table reads its two as slots of one
+  // class, the two dynamic-mip tables list theirs as children.
+  const auto listed = [&] {
+    const auto classes = std::count_if(
+        specialization.images.begin() + 3, specialization.images.end(),
+        [](const auto &image) { return image.indirect_root == 0u; });
+    return snapshot.images.size() - 3u - classes + snapshot.candidate_images.size();
+  };
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && memory.descriptors == 6u && snapshot.images.size() == 9u,
+            memory.selectors == 2u && memory.descriptors == 6u && listed() == 6u &&
+            snapshot.images.size() == 8u && snapshot.candidate_images.size() == 2u,
         "indexed selector scanned the broad heap or did not share its captured keys");
   ApplyResourceSpecialization(program, specialization);
-  Check(program.info.images[0].indirect_resources.size() == 3u,
+  Check(program.info.images[0].indirect_resources.size() == 2u && program.info.images[0].candidate &&
+            program.info.images[1].indirect_resources.size() == 3u && !program.info.images[1].candidate,
         "indirect dimension query lost its specialized candidates");
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &image = specialization.images[root];
@@ -4758,7 +4822,7 @@ void TestIndexedMaterialImageKeys() {
     memory.words[(2u * 96u + 64u) / 4u] = 13002u;
     memory.narrow = false;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 9u && specialization == before &&
+              listed() == 6u && specialization == before &&
               snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(
                   specialization.images[0].indirect_mapping_slot)] == 4u &&
               snapshot.indirect_mapping_offsets != before_offsets,
@@ -4779,7 +4843,7 @@ void TestIndexedMaterialImageKeys() {
     for (uint32_t row = 0; row < 10u; ++row) memory.words[(row * 96u + 64u) / 4u] = 100u;
     memory.narrow = false;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 4u && snapshot.indirect_mapping_offsets.size() == 3u &&
+              listed() == 1u && snapshot.indirect_mapping_offsets.size() == 3u &&
               specialization.images[0].indirect_root == ImageResource::NoIndirectImage &&
               specialization.images[1].indirect_root == ImageResource::NoIndirectImage &&
               specialization.images[2].indirect_root == 2u,
@@ -4796,12 +4860,12 @@ void TestIndexedMaterialImageKeys() {
   }
   auto shared_program = make_program(ShaderType::Compute, true);
   auto shared = ExtractResourcePlan(shared_program);
-  Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 9u,
+  Check(MaterializeResources(shared, runtime, snapshot, specialization) && listed() == 6u,
         "inherited indexed selector lost its bounded material domain");
   memory.words[64u / 4u] = 12996u;
   memory.selectors = 0;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && snapshot.images.size() == 11u,
+            memory.selectors == 2u && listed() == 8u,
         "changed material rows reused stale selector keys");
   memory.words[64u / 4u] = 12994u;
   memory.unreadable = true;
@@ -4821,7 +4885,7 @@ void TestIndexedMaterialImageKeys() {
     if (variant == 7u) user_data[0] = 0u;
     memory.selectors = 0;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.selectors == 0u && snapshot.images.size() > 100u,
+              memory.selectors == 0u && listed() > 97u,
           "unsupported geometry or writable selector lost the original heap domain");
   }
   user_data = original;
@@ -4836,7 +4900,7 @@ void TestIndexedMaterialImageKeys() {
   memory.unreadable = false;
   for (uint32_t row = 0; row < 10u; ++row)
     memory.words[(row * 96u + 64u) / 4u] = 0x08000000u; // U32 key*32 wraps to zero.
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && listed() == 4u,
         "indexed selector lost wrapped scalar descriptor offsets");
   for (auto &source : plan.descriptor_sources) {
     if (!source.indirect_descriptor) continue;
@@ -4849,7 +4913,7 @@ void TestIndexedMaterialImageKeys() {
   }
   memory.selectors = memory.descriptors = 0u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && memory.descriptors == 2u && snapshot.images.size() == 5u,
+            memory.selectors == 2u && memory.descriptors == 2u && listed() == 2u,
         "overflowed scalar immediate read a descriptor or lost valid wrapped keys");
   for (uint32_t root = 0; root < 2u; ++root) {
     const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[root].indirect_mapping_slot);
@@ -4872,7 +4936,7 @@ void TestIndexedMaterialImageKeys() {
     if (variant == 3u) user_data[1] = 64u << 16u;
     memory.selectors = 0;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.selectors == 0u &&
-              snapshot.images.size() == 6u,
+              listed() == 3u,
           "native zero/OOB indexed load read its unavailable payload");
   }
 }
@@ -5039,13 +5103,13 @@ void TestPointerTableIndexedMaterialKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
-            snapshot.images.size() == 4u,
+            snapshot.candidate_images.size() == 3u,
         "pointer-table selector did not read exactly the zero and material-key descriptors");
   Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 20u, 52u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");
   const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
-  Check(snapshot.images[0].dwords[0] == 0x100u && specialization.images[0].indirect_searched &&
+  Check(snapshot.candidate_images[0].value.dwords[0] == 0x100u && specialization.images[0].indirect_searched &&
             snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 5u &&
             snapshot.flattened_srt[mapping + 5u] == 9u,
         "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
@@ -5228,7 +5292,7 @@ void TestUniformScalarBufferImage() {
   ResourceSpecialization specialization;
   const auto materializes = [&](uint32_t address) {
     return MaterializeResources(plan, runtime, snapshot, specialization) &&
-           snapshot.images.size() == 1 && snapshot.images[0].dwords[0] == address;
+           snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == address;
   };
   Check(materializes(0x20u), "nested draw-uniform image descriptor did not materialize");
   user_data[8] = 1u;
@@ -5474,10 +5538,13 @@ void TestCompactScalarImageTable() {
       memory.selector_attempts = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "paired compact image/sampler table did not materialize");
-      Check(snapshot.images.size() == (shared ? 6u : 3u) && snapshot.samplers.size() == 3u &&
+      // Each image table reads its three descriptors as slots of one class.
+      Check(snapshot.candidate_images.size() == (shared ? 6u : 3u) &&
+                snapshot.images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 3u &&
                 memory.selector_attempts == 1u,
             "paired table omitted an image, index-list value or OOB zero key");
-      for (const auto &image : snapshot.images) {
+      for (const auto &candidate : snapshot.candidate_images) {
+        const auto &image = candidate.value;
         Check(image.dword_count == 8u, "compact image escaped normalized eight-DWORD ABI");
         if (compact) Check(std::ranges::all_of(std::span(image.dwords).subspan(4u),
                                               [](uint32_t word) { return word == 0u; }),
@@ -5488,16 +5555,17 @@ void TestCompactScalarImageTable() {
     const auto original = specialization;
     memory.words[(0x1000u + stride + member) / 4u] = 0x201u;
     materialize();
-    Check(specialization == original && std::ranges::any_of(snapshot.images,
-              [](const auto &image) { return image.dwords[0] == 0x201u; }),
+    Check(specialization == original && std::ranges::any_of(snapshot.candidate_images,
+              [](const auto &image) { return image.value.dwords[0] == 0x201u; }),
           "compact descriptor payload refresh changed specialization or stayed stale");
     data[2] = 4u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 2u,
+              snapshot.candidate_images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 2u,
           "index-list count refresh retained a stale sampler candidate");
     data[2] = 0u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (shared ? 2u : 1u) && snapshot.images[0].dwords[0] == 0x100u &&
+              snapshot.candidate_images.size() == (shared ? 2u : 1u) &&
+              snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
               snapshot.samplers.size() == 1u &&
               snapshot.samplers[0].dwords[0] == 0u,
           "empty index list lost the scalar OOB zero key");
@@ -5546,9 +5614,12 @@ void TestCompactScalarImageTable() {
       memory.selector_reads.clear();
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "shared selector domain failed to materialize");
+      // The tables' own entries are null; the descriptors they reach are their slots.
       std::vector<uint32_t> images;
-      for (const auto &image : snapshot.images) images.push_back(image.dwords[0]);
+      for (const auto &image : snapshot.candidate_images) images.push_back(image.value.dwords[0]);
       std::ranges::sort(images);
+      Check(std::ranges::all_of(snapshot.images, [](const auto &image) { return image.dwords[0] == 0u; }),
+            "an image table kept a descriptor as its own entry");
       std::vector<uint32_t> samplers;
       for (const auto &sampler : snapshot.samplers) samplers.push_back(sampler.dwords[0]);
       std::ranges::sort(samplers);
@@ -5576,7 +5647,7 @@ void TestCompactScalarImageTable() {
     materialize({0x101u, domain == Domain::SeparatePrefix ? 0x200u : 0x201u}, {1u});
     data[8] = 0u;
     counts[0] = 0u;
-    materialize({0u, 0u}, {0u});
+    materialize({}, {0u});
     counts[0] = 3u;
     data[2] = 0u;
     materialize({0x100u, 0x200u}, {0u});
@@ -5720,9 +5791,9 @@ void TestScalarBufferSelectorDomain() {
         "address tables at two offsets from one pointer did not request their own heaps");
   memory.watched_address = 0x1000u + 144u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
-            memory.watched_dwords == 9u && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[2].dwords[0] == 0x102u,
+            snapshot.candidate_images.size() == 3u && memory.watched_reads == 1u &&
+            memory.watched_dwords == 9u && snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[2].value.dwords[0] == 0x102u,
         "scalar selector interpreted batched padding or omitted the OOB zero key");
   Check(std::ranges::find(snapshot.specialization_reads,
             std::pair<uint64_t, uint64_t>{0x1090u, 36u}) != snapshot.specialization_reads.end(),
@@ -5730,23 +5801,23 @@ void TestScalarBufferSelectorDomain() {
   const auto scaled_lane = make_plan(true, false, true);
   memory.words[176u / 4u] = UINT32_MAX;
   Check(MaterializeResources(scaled_lane, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[1].dwords[0] == 0x101u && snapshot.images[2].dwords[0] == 0x102u,
+            snapshot.candidate_images.size() == 3u && snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[1].value.dwords[0] == 0x101u && snapshot.candidate_images[2].value.dwords[0] == 0x102u,
         "scaling after lane selection lost wrapped offsets, clamped keys, or the OOB zero key");
   memory.words[176u / 4u] = 2u;
   for (const auto size : {0u, 144u, 147u, 148u}) {
     user_data[2] = size;
     memory.watched_reads = 0u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (size == 148u ? 2u : 1u) &&
+              snapshot.candidate_images.size() == (size == 148u ? 2u : 1u) &&
               memory.watched_reads == (size == 148u ? 1u : 0u) &&
-              snapshot.images[0].dwords[0] == 0x100u,
+              snapshot.candidate_images[0].value.dwords[0] == 0x100u,
           "scalar selector read an incomplete DWORD or lost a fully OOB zero key");
   }
   user_data[2] = 180u;
   memory.words[176u / 4u] = 1u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u,
+            snapshot.candidate_images.size() == 2u,
         "scalar selector reused stale keys after material memory changed");
 
   plan = make_plan(true, true);
@@ -5773,7 +5844,7 @@ void TestScalarBufferSelectorDomain() {
             {.user_data = user_data, .userdata = &sparse, .read_specialization_memory = read_sparse},
             snapshot, specialization) &&
             sparse.offsets == std::vector<uint64_t>{144u, 0x80000090u} &&
-            snapshot.images.size() == 2u,
+            snapshot.candidate_images.size() == 2u,
         "large V# bounds extended the native U32 domain or invented an OOB zero key");
 }
 
@@ -6125,11 +6196,12 @@ void TestCountedRowImageSelector() {
     expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
     if (expected.empty()) {
       Check(memory.watched_reads == 0u && snapshot.images.size() == 1u &&
+                snapshot.candidate_images.empty() &&
                 std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
             "empty row counts read unused keys or retained stale image candidates");
       return;
     }
-    if (expected.size() > 1u) {
+    {
       const auto map = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
       Check(snapshot.flattened_srt[map] == expected.size(), "counted-row mapping lost selected keys");
       for (uint32_t index = 0; index < expected.size(); ++index)
@@ -6143,9 +6215,9 @@ void TestCountedRowImageSelector() {
     }
     std::ranges::sort(image_addresses);
     image_addresses.erase(std::unique(image_addresses.begin(), image_addresses.end()), image_addresses.end());
-    Check(snapshot.images.size() == image_addresses.size() &&
-              std::ranges::all_of(snapshot.images, [&](const DescriptorValue &image) {
-                return std::ranges::find(image_addresses, image.dwords[0]) != image_addresses.end();
+    Check(snapshot.candidate_images.size() == image_addresses.size() &&
+              std::ranges::all_of(snapshot.candidate_images, [&](const Candidate &image) {
+                return std::ranges::find(image_addresses, image.value.dwords[0]) != image_addresses.end();
               }), "counted rows lost a selected image or retained an unrelated descriptor");
   };
   check({});
@@ -6198,7 +6270,8 @@ void TestCountedRowImageSelector() {
         "counted-row discovery exceeded the existing row probe cap");
   user_data[6] = 0u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 0u &&
-            snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0u,
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
+            snapshot.images[0].dwords[0] == 0u,
         "empty count V# manufactured a selector key or retained stale images");
 
   user_data[6] = 5u;
@@ -6245,7 +6318,7 @@ void TestCountedRowImageSelector() {
   };
   Check(MaterializeResources(sparse_plan,
             {.user_data = user_data, .userdata = &sparse, .read_specialization_memory = read_sparse},
-            snapshot, specialization) && sparse.key_reads == 2u && snapshot.images.size() == 2u,
+            snapshot, specialization) && sparse.key_reads == 2u && snapshot.candidate_images.size() == 2u,
         "sparse rows exceeded the batch cap or read unselected gaps");
 }
 
@@ -6502,7 +6575,8 @@ void TestSharedAppendSelectorBounds() {
   ResourceSpecialization specialization;
   memory.fail_address = memory.watched_address = 0x1090u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 1u && memory.descriptor_reads == 0u && memory.watched_reads == 0u,
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
+            memory.descriptor_reads == 0u && memory.watched_reads == 0u,
         "empty shared append lists probed material keys or image descriptors");
   memory.fail_address = UINT64_MAX;
   for (const auto counts : {std::array{1u, 2u}, std::array{3u, 1u}, std::array{1u, 1u}, std::array{0u, 0u}}) {
@@ -6511,8 +6585,8 @@ void TestSharedAppendSelectorBounds() {
     const auto expected = counts[1];
     for (const auto *tested : {&plan, &lane_plan})
       Check(MaterializeResources(*tested, runtime, snapshot, specialization) &&
-                snapshot.images.size() == std::max(expected, 1u) &&
-                (expected == 0u || snapshot.images.back().dwords[0] == 0x100u + expected),
+                snapshot.candidate_images.size() == expected &&
+                (expected == 0u || snapshot.candidate_images.back().value.dwords[0] == 0x100u + expected),
             "disjoint shared append lists or refreshed counts selected unrelated material keys");
   }
   memory.words[0x800u / 4u] = 24u;
@@ -6520,8 +6594,8 @@ void TestSharedAppendSelectorBounds() {
   memory.words[(144u + 320u) / 4u] = 0xbe7cc577u;
   memory.fail_address = 0x1000u + 144u + 320u;
   user_data[2] = 24u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u &&
-            snapshot.images[0].dwords[0] == 0x101u && snapshot.images[1].dwords[0] == 0x102u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.candidate_images.size() == 2u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x101u && snapshot.candidate_images[1].value.dwords[0] == 0x102u,
         "a disjoint 24-entry list exposed float fields after the two active material records");
   for (const uint64_t address : {0x1800u, 0x1804u})
     Check(std::ranges::find(snapshot.specialization_reads, std::pair{address, uint64_t{4u}}) !=
@@ -6533,14 +6607,14 @@ void TestSharedAppendSelectorBounds() {
   memory.words[0x804u / 4u] = 2u;
   memory.words[(144u + 160u) / 4u] = 4u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images.back().dwords[0] == 0x104u,
+            snapshot.candidate_images.size() == 2u && snapshot.candidate_images.back().value.dwords[0] == 0x104u,
         "shared append materialization reused stale selector contents");
   // Record 1 lies past a one-record V#, so its scalar key reads zero instead of key 4.
   user_data[2] = 1u;
   memory.fail_address = 0x1000u + 144u + 160u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[1].dwords[0] == 0x101u,
+            snapshot.candidate_images.size() == 2u && snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[1].value.dwords[0] == 0x101u,
         "shared append materialization did not read records past its V# as zero");
   memory.fail_address = UINT64_MAX;
   user_data[2] = 8u;
@@ -6587,8 +6661,8 @@ void TestSharedAppendSelectorBounds() {
   user_data[6] = 0x40000000u;
   runtime = {.user_data = user_data, .userdata = &boundary, .read_specialization_memory = read_boundary};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            boundary.keys_read == 65536u && snapshot.images.size() == 1u &&
-            snapshot.images[0].dwords[0] == 0x101u,
+            boundary.keys_read == 65536u && snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x101u,
         "shared append materialization rejected its exact nonwrapping probe limit");
   const std::array bases{std::pair{1032u, 8u}, std::pair{8u, 1032u}, std::pair{8u, 8u}};
   struct OverlapCase { std::array<uint32_t, 2> counts; std::array<uint32_t, 3> expected; };
@@ -6603,8 +6677,9 @@ void TestSharedAppendSelectorBounds() {
       boundary.counts = test.counts;
       boundary.keys_read = 0u;
       Check(MaterializeResources(overlap_plan, runtime, snapshot, specialization) &&
-                boundary.keys_read == test.expected[layout] && snapshot.images.size() == 1u &&
-                snapshot.images[0].dwords[0] == (test.expected[layout] != 0u ? 0x101u : 0u),
+                boundary.keys_read == test.expected[layout] &&
+                snapshot.candidate_images.size() == (test.expected[layout] != 0u ? 1u : 0u) &&
+                (test.expected[layout] == 0u || snapshot.candidate_images[0].value.dwords[0] == 0x101u),
             "shared append bounds lost overlap, included a touching list or retained stale keys");
     }
   }
@@ -7070,7 +7145,7 @@ void TestFmaskLoadSpecialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
   RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
-  Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1 &&
+  Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1u &&
             snapshot.images[0].dwords[0] == 0x2000u &&
             ordinary.Instruction()->Flags<uint32_t>() == 0 &&
             fixture.program.memory_info[ordinary_flags.index].resource == 0,
@@ -7096,7 +7171,7 @@ void TestFmaskLoadSpecialization() {
   user_data[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u;
   ResourceSpecialization rebound;
   Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, rebound) &&
-            rebound != specialization && snapshot.images.size() == 2,
+            rebound != specialization && snapshot.images.size() == 2u,
         "rebinding FMASK as a texture reused the metadata specialization");
 }
 
@@ -9273,7 +9348,7 @@ void TestPackedDescriptorWaterfall() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && snapshot.samplers.size() == 60u,
+              snapshot.candidate_images.size() == 2u && snapshot.samplers.size() == 60u,
           "packed waterfall ignored the two-image/59-sampler heap bounds or lost the null roots");
     Check(std::ranges::all_of(snapshot.specialization_reads, [&](const auto& span) {
       return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
@@ -9407,14 +9482,14 @@ void TestFiniteImageWaterfall() {
       memory.reads = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "finite waterfall resource plan could not refresh its scalar descriptor leaves");
-      Check(snapshot.images.size() == (count == 0u ? 1u : 3u) &&
+      Check(snapshot.candidate_images.size() == (count == 0u ? 0u : 2u) &&
                 (count == 0u ? memory.reads == 0u : memory.reads != 0u),
             "finite waterfall leaves froze empty table bounds or retained stale image candidates");
       if (count != 0u) populated = specialization;
     }
     memory.words[256u / 4u] += 0x100u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == populated &&
-              std::ranges::any_of(snapshot.images, [](const auto& image) { return image.dwords[0] == 0x1100u; }),
+              std::ranges::any_of(snapshot.candidate_images, [](const auto& image) { return image.value.dwords[0] == 0x1100u; }),
           "finite image payload refresh changed its format specialization or reused an old leaf");
   }
   for (const auto variant : {Variant::DifferentMask, Variant::MixedWord, Variant::DifferentSelect,
@@ -10715,7 +10790,7 @@ void TestConditionalIndirectImageMaterialization() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads == 0 && snapshot.images.size() == 1 &&
+            reads == 0 && snapshot.images.size() == 1u &&
             snapshot.images[0].dwords == std::array<uint32_t, 8>{},
         "untaken indirect image branch probed its descriptor table");
   user_data[8] = 1;

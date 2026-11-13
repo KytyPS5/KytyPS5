@@ -42,8 +42,9 @@ struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
-	// Slot order of the stage's block in the draw's candidate buffer array.
+	// Slot order of the stage's block in the draw's candidate buffer and image arrays.
 	std::vector<Candidate>       candidate_buffers;
+	std::vector<Candidate>       candidate_images;
 	std::vector<uint32_t>        flattened_srt;
 	// Where each indirect mapping slot's table starts in flattened_srt.
 	std::vector<uint32_t>                      indirect_mapping_offsets;

@@ -545,6 +545,10 @@ struct RenderExecutorTestAccess {
     return executor.m_candidate_records;
   }
 
+  static std::span<const vk::DescriptorImageInfo> CandidateImages(const RenderExecutor &executor) {
+    return executor.m_candidate_images;
+  }
+
   static bool TryConsumeComputeFill(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
@@ -1940,6 +1944,15 @@ void BindDescriptorRanges(TestCase &test, const CompiledShader &compiled, Range 
     test.storage_buffer_ranges.push_back(range(value));
   for (const auto &candidate : compiled.resources.candidate_buffers)
     test.candidate_buffer_ranges.push_back(range(candidate.value));
+}
+
+// The image descriptors of a compiled case in the order Dispatch takes their images: each
+// resource's, then each table candidate's.
+std::vector<ShaderRecompiler::IR::DescriptorValue> ImageDescriptors(const CompiledShader &compiled) {
+  auto descriptors = compiled.resources.images;
+  for (const auto &candidate : compiled.resources.candidate_images)
+    descriptors.push_back(candidate.value);
+  return descriptors;
 }
 
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
@@ -15301,6 +15314,181 @@ public:
                 "a stage's candidates left its block of the draw's array");
       }
 
+      // A sampled image table of float and integer textures: each record binds as a slot of
+      // its class, and fewer records in another order reuse the module.
+      {
+        constexpr auto texture_base = base + 0xe0000;
+        constexpr auto image_parameters = base + 0xe8000;
+        constexpr auto image_table = base + 0xe8100;
+        constexpr auto image_output = base + 0xe9000;
+        constexpr u32 image_count = 12;
+        const auto texture_descriptor = [&](u32 texture) {
+          const auto address = texture_base + texture * 0x100u;
+          const auto format = (texture & 1u) != 0u ? Prospero::BufferFormat::k32UInt
+                                                    : Prospero::BufferFormat::k32Float;
+          return ShaderTextureResource{{static_cast<u32>(address >> 8u),
+              (static_cast<u32>(format) << 20u) | (3u << 30u), 1u << 14u,
+              DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                  (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+              0, 0x00700000u, 0, 0}};
+        };
+        const auto texel_of = [](u32 texture) {
+          return (texture & 1u) != 0u ? 0x1000u + texture
+                                      : std::bit_cast<u32>(static_cast<float>(texture) + 0.5f);
+        };
+        // WorkGroupID.z selects the record; the texel it loads goes to the output record.
+        std::vector<u32> image_shader{
+            EncodeSop2(0x26, 8, 4, 255), 32,
+            EncodeSmem0(0x02, 16), EncodeSmem1(0, 125),
+            EncodeSmem0(0x02, 20), EncodeSmem1(16, 125),
+            EncodeSmem0(0x0b, 32, 8), EncodeSmem1(0, 8),
+            EncodeVop1(0x01, 20, InlineU32(0)), EncodeVop1(0x01, 21, InlineU32(0)),
+            EncodeMimg0(0x00, 1), EncodeMimg1(2, 20, 8), EncodeSopp(0x0c, 0),
+            EncodeVop1(0x01, 3, 4),
+            EncodeMubuf0(0x1c, 0, true, false), EncodeMubuf1(2, 5, 3)};
+        AppendEnd(&image_shader);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(image_shader.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(image_shader.size() * sizeof(u32))});
+        struct ImageCase {
+          u32 rows;
+          bool reversed;
+        };
+        const ShaderModule *image_module = nullptr;
+        for (const auto [rows, reversed] : {ImageCase{image_count, false}, ImageCase{5u, true}}) {
+          Require(name, "image table fixture reset", context.InvalidateMemory(texture_base, 0x10000),
+                  "image table fixtures escaped the existing mapped allocation");
+          std::vector<u32> table(rows * 8u);
+          std::vector<u32> expected(image_count, sentinel);
+          for (u32 row = 0; row < rows; ++row) {
+            const u32 texture = reversed ? rows - 1u - row : row;
+            const std::array<u32, 8> texels{texel_of(texture), texel_of(texture), texel_of(texture),
+                texel_of(texture), texel_of(texture), texel_of(texture), texel_of(texture),
+                texel_of(texture)};
+            LibKernel::Memory::WriteBacking(texture_base + texture * 0x100u, texels.data(),
+                                            sizeof(texels));
+            const auto descriptor = texture_descriptor(texture);
+            std::copy_n(descriptor.fields, 8, table.begin() + row * 8u);
+            expected[row] = texel_of(texture);
+          }
+          const std::array<ShaderBufferResource, 2> views{{
+              {{static_cast<u32>(image_table), static_cast<u32>(image_table >> 32u) | (32u << 16u),
+                rows, 0x5204u}},
+              {{static_cast<u32>(image_output), static_cast<u32>(image_output >> 32u) | (4u << 16u),
+                image_count, 0x5204u}}}};
+          const std::vector<u32> untouched(image_count, sentinel);
+          LibKernel::Memory::WriteBacking(image_parameters, views.data(), sizeof(views));
+          LibKernel::Memory::WriteBacking(image_table, table.data(), table.size() * 4u);
+          LibKernel::Memory::WriteBacking(image_output, untouched.data(), untouched.size() * 4u);
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(image_shader.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true,
+                               .tgid_y_en = true, .tgid_z_en = true});
+          shaders.SetCsUserSgpr(0, static_cast<u32>(image_parameters));
+          shaders.SetCsUserSgpr(1, static_cast<u32>(image_parameters >> 32u));
+          ShaderComputeInputInfo input{};
+          input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
+          input.workgroup_counts[2] = rows;
+          (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+          const auto &info = input.stage.module->info.info;
+          Require(name, "image table classes",
+                  info.uses_candidate_images && info.images.size() == 3u &&
+                      info.images[0].candidate && info.images[0].indirect_resources.size() == 3u &&
+                      input.stage.resources->candidate_images.size() == rows,
+                  "image records were not slots of the table's float and integer classes");
+          Require(name, "one image table module for every candidate set",
+                  image_module == nullptr || image_module == input.stage.module,
+                  "the count or order of a table's images rebuilt its module");
+          image_module = input.stage.module;
+          processor.DispatchDirect(1, 1, rows, 0x41u);
+          cache.ReadMemory(image_output, image_count * 4u);
+          std::vector<u32> actual(image_count);
+          Require(name, "image table slots",
+                  LibKernel::Memory::TryReadBacking(image_output, actual.data(),
+                                                    actual.size() * 4u) && actual == expected,
+                  "a record loaded another record's image or its class read the texel wrongly");
+        }
+
+        // The stages of a draw take consecutive blocks of its candidate image array.
+        struct Stage {
+          ShaderModule module;
+          ShaderRecompiler::IR::ResourceSnapshot snapshot;
+          ShaderStageRuntime runtime;
+          PreparedBindings prepared;
+        };
+        std::array<Stage, 2> draw;
+        const std::array<std::vector<u32>, 2> stage_textures{{{1u}, {3u, 1u}}};
+        for (u32 index = 0; index < draw.size(); ++index) {
+          auto &stage = draw[index];
+          auto &program = stage.module.info;
+          program.stage = index == 0u ? ShaderType::Vertex : ShaderType::Pixel;
+          ShaderRecompiler::IR::ImageResource table;
+          table.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+          table.numeric_class = Prospero::TextureNumericClass::Uint;
+          table.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          table.read = true;
+          table.candidate = true;
+          table.indirect_root = 0u;
+          program.info.images = {table, table};
+          program.info.uses_candidate_images = true;
+          program.bindings.candidate_image_dword = 0u;
+          program.bindings.memory_offset_dword = 1u;
+          stage.snapshot.images.assign(2u, {.dword_count = 8u});
+          for (const auto texture : stage_textures[index]) {
+            ShaderRecompiler::IR::Candidate candidate{.resource = 1u};
+            candidate.value.dword_count = 8u;
+            const auto descriptor = texture_descriptor(texture);
+            std::copy_n(descriptor.fields, 8u, candidate.value.dwords.begin());
+            stage.snapshot.candidate_images.push_back(candidate);
+          }
+          stage.runtime = {&stage.module, &stage.snapshot};
+        }
+        auto &executor = context.GetRenderExecutor();
+        auto &graphics = context.GetGraphics();
+        // A pipeline whose only descriptors are the draw's candidate images.
+        PipelineCache::Pipeline pipeline{};
+        const vk::DescriptorSetLayoutCreateInfo empty_layout{};
+        Require(name, "image block pipeline",
+                graphics.device.createDescriptorSetLayout(&empty_layout, nullptr,
+                                                          &pipeline.descriptor_set_layout) ==
+                    vk::Result::eSuccess,
+                "the empty stage set layout was rejected");
+        const std::array set_layouts{pipeline.descriptor_set_layout, pipeline.descriptor_set_layout,
+                                     pipeline.descriptor_set_layout, graphics.candidate_image_layout};
+        static_assert(ShaderRecompiler::IR::CandidateImageSet == 3u);
+        pipeline.push_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+        const vk::PushConstantRange push_range{pipeline.push_stages, 0,
+                                               ShaderRecompiler::IR::NativePushConstantSize};
+        vk::PipelineLayoutCreateInfo layout_info{};
+        layout_info.setLayoutCount = static_cast<u32>(set_layouts.size());
+        layout_info.pSetLayouts = set_layouts.data();
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push_range;
+        Require(name, "image block pipeline",
+                graphics.device.createPipelineLayout(&layout_info, nullptr,
+                                                     &pipeline.pipeline_layout) ==
+                    vk::Result::eSuccess,
+                "the candidate image pipeline layout was rejected");
+        pipeline.uses_candidate_images = true;
+        std::array<PreparedBindings *, 2> stages{&draw[0].prepared, &draw[1].prepared};
+        for (auto &stage : draw) executor.PrepareBindings(stage.runtime, stage.prepared);
+        RenderExecutorTestAccess::PrepareGraphicsBindings(executor, stages, {});
+        RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(), pipeline,
+                                                 draw[0].prepared, draw[1].prepared);
+        const auto bound = RenderExecutorTestAccess::CandidateImages(executor);
+        Require(name, "candidate image blocks of a draw's stages",
+                bound.size() == 3u && draw[0].prepared.candidate_image_base == 0u &&
+                    draw[1].prepared.candidate_image_base == 1u &&
+                    draw[0].prepared.shader_data[0] == 0u && draw[1].prepared.shader_data[0] == 1u &&
+                    bound[0].imageView != nullptr && bound[1].imageView != nullptr &&
+                    bound[0].imageView == bound[2].imageView &&
+                    bound[0].imageView != bound[1].imageView,
+                "a stage's candidate images left its block of the draw's array");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        scheduler.Finish();
+        RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, std::span{&pipeline, 1u});
+      }
+
       // Exchange values across two waves in the last 512 bytes of each
       // workgroup's 64-KiB LDS, on a host restricted to 48-KiB native shared memory.
       constexpr auto lds_output = base + 0xb0000;
@@ -21569,12 +21757,34 @@ public:
                 m_device.createDescriptorSetLayout(&candidate_info, nullptr, &candidate_layout),
                 "vkCreateDescriptorSetLayout(candidates)");
     }
-    // Set 1 is the image heap's, which these dispatches do not use.
-    const std::array set_layouts{descriptor_layout, candidate_layout, candidate_layout};
-    static_assert(ShaderRecompiler::IR::CandidateBufferSet == 2u);
+    // A sampled image table's candidates bind in the next set, from the same block base.
+    const auto &image_candidates = compiled.resources.candidate_images;
+    const bool uses_image_candidates = compiled.program.info.uses_candidate_images;
+    vk::DescriptorSetLayout candidate_image_layout = nullptr;
+    if (uses_image_candidates) {
+      Require(test.name, "dispatch", !image_candidates.empty(),
+              "an image table module was compiled without a candidate");
+      const vk::DescriptorSetLayoutBinding candidate_binding{
+          ShaderRecompiler::IR::CandidateImageBinding, vk::DescriptorType::eSampledImage,
+          static_cast<u32>(image_candidates.size()) + candidate_base,
+          vk::ShaderStageFlagBits::eCompute, nullptr};
+      vk::DescriptorSetLayoutCreateInfo candidate_info{};
+      candidate_info.bindingCount = 1;
+      candidate_info.pBindings = &candidate_binding;
+      RequireVk(test.name, "dispatch",
+                m_device.createDescriptorSetLayout(&candidate_info, nullptr,
+                                                   &candidate_image_layout),
+                "vkCreateDescriptorSetLayout(candidate images)");
+    }
+    // Set 1 is the image heap's, which these dispatches do not use; an unused set takes any
+    // layout.
+    const auto filler = uses_candidates ? candidate_layout : candidate_image_layout;
+    const std::array set_layouts{descriptor_layout, filler, filler, candidate_image_layout};
+    static_assert(ShaderRecompiler::IR::CandidateBufferSet == 2u &&
+                  ShaderRecompiler::IR::CandidateImageSet == 3u);
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
-    pipeline_layout_info.setLayoutCount = uses_candidates ? 3u : 1u;
+    pipeline_layout_info.setLayoutCount = uses_image_candidates ? 4u : uses_candidates ? 3u : 1u;
     pipeline_layout_info.pSetLayouts = set_layouts.data();
     vk::PushConstantRange push_range{};
     if (layout.UsesPushData()) {
@@ -21631,9 +21841,13 @@ public:
       add_pool_size(vk::DescriptorType::eStorageBuffer,
                     static_cast<u32>(candidates.size()) + candidate_base + 1u);
     }
+    if (uses_image_candidates) {
+      add_pool_size(vk::DescriptorType::eSampledImage,
+                    static_cast<u32>(image_candidates.size()) + candidate_base);
+    }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
-    pool_info.maxSets = 2;
+    pool_info.maxSets = 3;
     pool_info.poolSizeCount = static_cast<u32>(pool_sizes.size());
     pool_info.pPoolSizes = pool_sizes.empty() ? nullptr : pool_sizes.data();
     vk::DescriptorPool descriptor_pool = nullptr;
@@ -21792,6 +22006,33 @@ public:
       write.pBufferInfo = candidate_infos.data();
       writes.push_back(write);
     }
+    vk::DescriptorSet candidate_image_set = nullptr;
+    std::vector<vk::DescriptorImageInfo> candidate_image_infos;
+    if (uses_image_candidates) {
+      vk::DescriptorSetAllocateInfo candidate_set_info{};
+      candidate_set_info.descriptorPool = descriptor_pool;
+      candidate_set_info.descriptorSetCount = 1;
+      candidate_set_info.pSetLayouts = &candidate_image_layout;
+      RequireVk(test.name, "dispatch",
+                m_device.allocateDescriptorSets(&candidate_set_info, &candidate_image_set),
+                "vkAllocateDescriptorSets(candidate images)");
+      const auto first = compiled.program.info.images.size();
+      Require(test.name, "dispatch", image_resources.size() == first + image_candidates.size(),
+              "table candidates need an image each, after the logical images");
+      shader_data[layout.candidate_image_dword] = candidate_base;
+      candidate_image_infos.assign(candidate_base, {nullptr, nullptr, vk::ImageLayout::eUndefined});
+      for (u32 slot = 0; slot < image_candidates.size(); ++slot) {
+        const auto &source = image_resources[first + slot];
+        candidate_image_infos.push_back({nullptr, source.view, source.layout});
+      }
+      vk::WriteDescriptorSet write{};
+      write.dstSet = candidate_image_set;
+      write.dstBinding = ShaderRecompiler::IR::CandidateImageBinding;
+      write.descriptorCount = static_cast<u32>(candidate_image_infos.size());
+      write.descriptorType = vk::DescriptorType::eSampledImage;
+      write.pImageInfo = candidate_image_infos.data();
+      writes.push_back(write);
+    }
     if (Count(Kind::FlattenedSrt) != 0) {
       flattened_buffer =
           CreateStorageBuffer(test.name, compiled.resources.flattened_srt,
@@ -21833,10 +22074,13 @@ public:
       writes.push_back(write);
     }
     Require(test.name, "dispatch", image_resources.empty() ||
-                image_resources.size() == compiled.program.info.images.size(),
-            "image resources must match the logical images");
+                image_resources.size() ==
+                    compiled.program.info.images.size() + image_candidates.size(),
+            "image resources must match the logical images and table candidates");
     for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
       const auto &image = compiled.program.info.images[resource];
+      // A table and its classes read the candidate set.
+      if (image.candidate) continue;
       const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
       auto &infos = image_infos[ShaderRecompiler::IR::ImageBindingIndex(kind)];
       infos.resize(Count(kind));
@@ -21964,6 +22208,11 @@ public:
                              ShaderRecompiler::IR::CandidateBufferSet, 1, &candidate_set, 0,
                              nullptr);
     }
+    if (uses_image_candidates) {
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
+                             ShaderRecompiler::IR::CandidateImageSet, 1, &candidate_image_set, 0,
+                             nullptr);
+    }
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
       std::copy(shader_data.begin(), shader_data.end(),
@@ -22089,6 +22338,7 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyDescriptorSetLayout(candidate_layout, nullptr);
+    m_device.destroyDescriptorSetLayout(candidate_image_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
   }
 
@@ -47425,10 +47675,10 @@ void CheckFiniteFirstLaneImageChoice(VulkanHarness &vulkan) {
         O::S_ANDN2_B64, O::S_CBRANCH_EXECNZ, O::V_LSHLREV_B32,
         O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "finite correlated image choices", compiled.resources.images.size() <= 5u,
+    Require(test.name, "finite correlated image choices", compiled.resources.candidate_images.size() <= 5u,
             "descriptor words formed an uncorrelated product");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {std::bit_cast<u32>(float(descriptor.dwords[0]))}, 1,
@@ -47689,9 +47939,9 @@ void CheckCountedRowImageSelector(VulkanHarness &vulkan) {
     if (masked) test.opcodes.insert(test.opcodes.end(), {O::V_READFIRSTLANE_B32,
         O::V_LSHL_ADD_U32, O::V_LSHLREV_B32, O::V_AND_B32, O::V_CMPX_NE_U32, O::S_CBRANCH_EXECZ});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "exact active images", compiled.resources.images.size() == 4u &&
-                std::ranges::all_of(compiled.resources.images, [](const auto &image) {
-                  return image.dwords[0] >= 0x101u && image.dwords[0] <= 0x104u;
+    Require(test.name, "exact active images", compiled.resources.candidate_images.size() == 4u &&
+                std::ranges::all_of(compiled.resources.candidate_images, [](const auto &image) {
+                  return image.value.dwords[0] >= 0x101u && image.value.dwords[0] <= 0x104u;
                 }), "unused row entries selected malformed material fields");
     for (u32 word = 0; word < 4u; ++word)
       Require(test.name, "count descriptor capture",
@@ -47706,7 +47956,7 @@ void CheckCountedRowImageSelector(VulkanHarness &vulkan) {
                        static_cast<u32>(descriptor.GetSize())};
     });
     std::vector<VulkanHarness::Image> images;
-    for (const auto &image : compiled.resources.images)
+    for (const auto &image : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
           vk::ImageUsageFlagBits::eSampled, {{0x3f800000u + image.dwords[0] - 0x100u, 0u, 0u, 0u}},
           4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D, vk::ImageViewType::e2D, 1));
@@ -47818,11 +48068,10 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
         O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     Require(test.name, "bounded image candidates",
-            packed ? compiled.resources.images.size() == 33u // The null root and every slot.
-                   : compiled.resources.images.size() == std::max(count, 1u),
+            compiled.resources.candidate_images.size() == (packed ? 32u : count),
             "descriptor planning escaped its selector domain");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -47883,14 +48132,16 @@ void CheckWorkgroupDividedImageTable(VulkanHarness &vulkan) {
                   O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-  Require(test.name, "reachable rows", compiled.resources.images.size() == 2u,
+  Require(test.name, "reachable rows", compiled.resources.candidate_images.size() == 2u,
           "descriptor planning enumerated rows no workgroup reaches");
-  // The key mapping ends the flattened SRT: its count, then a (key, ordinal) pair per row.
+  // The key mapping ends the flattened SRT: its count, then a key and its class and slot per row.
   const auto &flat = compiled.resources.flattened_srt;
-  CompareWords(test, "distinct row keys", {2u, 1u, 0u, 2u, 1u},
+  using ShaderRecompiler::IR::CandidateClassShift;
+  CompareWords(test, "distinct row keys",
+               {2u, 1u, 1u << CandidateClassShift, 2u, 1u << CandidateClassShift | 1u},
                std::vector<u32>(flat.end() - std::min<size_t>(flat.size(), 5u), flat.end()));
   std::vector<VulkanHarness::Image> images;
-  for (const auto &descriptor : compiled.resources.images)
+  for (const auto &descriptor : ImageDescriptors(compiled))
     images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
         vk::ImageUsageFlagBits::eSampled,
         {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -47965,10 +48216,10 @@ void CheckWaterfallFloorImageTable(VulkanHarness &vulkan) {
                   O::S_CBRANCH_SCC1, O::V_MADMK_F32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-  Require(test.name, "table rows", compiled.resources.images.size() == 8u,
+  Require(test.name, "table rows", compiled.resources.candidate_images.size() == 8u,
           "descriptor planning did not bound the waterfall rows to the table");
   std::vector<VulkanHarness::Image> images;
-  for (const auto &descriptor : compiled.resources.images)
+  for (const auto &descriptor : ImageDescriptors(compiled))
     images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
         vk::ImageUsageFlagBits::eSampled,
         {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -48050,7 +48301,7 @@ void CheckMixedDimensionImageTable(VulkanHarness &vulkan) {
                     O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images) {
+    for (const auto &descriptor : ImageDescriptors(compiled)) {
       const bool volume =
           (descriptor.dwords[3] >> 28u) == static_cast<u32>(Prospero::ImageType::kColor3D);
       images.push_back(vulkan.CreateImageMips(test.name, 1, 1, vk::Format::eR32Sfloat,
@@ -48151,24 +48402,25 @@ void CheckClampedSiblingImageTable(VulkanHarness &vulkan) {
                   O::S_ANDN2_B64, O::S_CBRANCH_SCC1, O::V_MADMK_F32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-  Require(test.name, "table rows", compiled.resources.images.size() == 8u,
+  Require(test.name, "table rows", compiled.resources.candidate_images.size() == 8u,
           "descriptor planning did not bound the rows by the clamp");
   std::vector<VulkanHarness::Image> images;
-  for (const auto &descriptor : compiled.resources.images)
+  for (const auto &descriptor : ImageDescriptors(compiled))
     images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
         vk::ImageUsageFlagBits::eSampled,
         {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
         vk::ImageLayout::eShaderReadOnlyOptimal));
   auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
   vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
-  // Rows past the clamp and negative rows read row 0; the clamp reads rows 7 and 0 for them.
+  // Rows past the clamp and negative rows select nothing and read zero; the clamp reads rows
+  // 7 and 0 for them.
   std::vector<u32> expected;
   for (u32 lane = 0; lane + 2u < lanes; ++lane) {
     const auto row = lane % 8u, next = std::min(row + 1u, 7u);
     expected.push_back(std::bit_cast<u32>(static_cast<float>(row + 1u + 16u * (next + 1u))));
   }
-  expected.push_back(std::bit_cast<u32>(1.0f + 16.0f * 8.0f));
-  expected.push_back(std::bit_cast<u32>(1.0f + 16.0f));
+  expected.push_back(std::bit_cast<u32>(16.0f * 8.0f));
+  expected.push_back(std::bit_cast<u32>(16.0f));
   CompareWords(test, "clamped sibling rows", expected,
                vulkan.ReadBuffer(test.name, buffer, expected.size()));
   vulkan.DestroyBuffer(&buffer);
@@ -48250,10 +48502,10 @@ void CheckLaneCountedImageTable(VulkanHarness &vulkan) {
                   O::V_CMPX_LT_U32, O::S_CBRANCH_EXECZ, O::V_MADMK_F32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-  Require(test.name, "table rows", compiled.resources.images.size() == rows,
+  Require(test.name, "table rows", compiled.resources.candidate_images.size() == rows,
           "the lane-counted loop did not take the scalar loops' rows");
   std::vector<VulkanHarness::Image> images;
-  for (const auto &descriptor : compiled.resources.images)
+  for (const auto &descriptor : ImageDescriptors(compiled))
     images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
         vk::ImageUsageFlagBits::eSampled,
         {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -48365,10 +48617,10 @@ void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
                     O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::V_ADD_F32, O::S_BITSET0_B32,
                     O::S_BRANCH, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "selected rows", compiled.resources.images.size() == 3u,
+    Require(test.name, "selected rows", compiled.resources.candidate_images.size() == 3u,
             "record keys did not select rows 0, 1 and 2");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -48443,10 +48695,10 @@ void CheckInclusiveGuardImageTable(VulkanHarness &vulkan) {
                     O::S_CBRANCH_SCC0, O::S_CBRANCH_SCC1, O::S_LSHL_B32, O::S_ADD_I32,
                     O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "guarded rows", compiled.resources.images.size() == 4u,
+    Require(test.name, "guarded rows", compiled.resources.candidate_images.size() == 4u,
             "the inclusive guard did not bound the key to rows 0 to 3");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -48565,10 +48817,10 @@ void CheckRecordWordImageTable(VulkanHarness &vulkan) {
                                                O::S_CBRANCH_EXECNZ});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     // T[tile] = tile % 5 selects the keys 3 + 31 * {0, ..., 4}.
-    Require(test.name, "record-word candidates", compiled.resources.images.size() == 5u,
+    Require(test.name, "record-word candidates", compiled.resources.candidate_images.size() == 5u,
             "record-word key escaped the tile table's materials");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -48654,10 +48906,10 @@ void CheckLoopSelectedPointerImageTable(VulkanHarness &vulkan) {
         O::S_ANDN2_B32, O::S_CBRANCH_SCC1, O::S_CBRANCH_EXECZ, O::S_BRANCH, O::IMAGE_LOAD,
         O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "bounded image candidates", compiled.resources.images.size() == 32u,
+    Require(test.name, "bounded image candidates", compiled.resources.candidate_images.size() == 32u,
             "loop-selected key escaped its compare-bounded domain");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
@@ -48767,10 +49019,10 @@ void CheckGlobalRecordWordImageTable(VulkanHarness &vulkan) {
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     // T[tile] = tile % 5 selects the keys 3 + 31 * {0, ..., 4}.
     Require(test.name, "record-word candidates",
-            compiled.resources.images.size() == 5u,
+            compiled.resources.candidate_images.size() == 5u,
             "global record-word key escaped the tile table's materials");
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(
           test.name, 1, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
@@ -48884,10 +49136,10 @@ void CheckMaterialWordImageTable(VulkanHarness &vulkan) {
       const auto compiled = CompileCase(test, vulkan.SubgroupSize());
       // Rows 0 to count - 1 hold distinct materials (1, 2, 4).
       Require(test.name, "material-word candidates",
-              compiled.resources.images.size() == count,
+              compiled.resources.candidate_images.size() == count,
               "material-word key escaped the clamped material rows");
       std::vector<VulkanHarness::Image> images;
-      for (const auto &descriptor : compiled.resources.images)
+      for (const auto &descriptor : ImageDescriptors(compiled))
         images.push_back(vulkan.CreateImage2D(
             test.name, 1, 1, vk::Format::eR32Sfloat,
             vk::ImageUsageFlagBits::eSampled,
@@ -49146,7 +49398,7 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
           }), "host planning captured GPU-only packed selector bytes");
     if (child_table) {
       std::vector<u32> candidates;
-      for (const auto &image : compiled.resources.images)
+      for (const auto &image : ImageDescriptors(compiled))
         if (image.dwords[0] != 0u) candidates.push_back(image.dwords[0]);
       std::ranges::sort(candidates);
       std::vector<u32> expected_candidates(records_count * children);
@@ -49166,13 +49418,14 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
     }
     if (compact) {
       std::vector<u32> candidates;
-      for (const auto &image : compiled.resources.images) candidates.push_back(image.dwords[0]);
+      for (const auto &image : compiled.resources.candidate_images)
+        candidates.push_back(image.value.dwords[0]);
       std::ranges::sort(candidates);
       Require(test.name, "paired R128 descriptor boundary",
         candidates == std::vector<u32>{10u, 11u, 12u, 13u, 14u, 15u} &&
-            std::ranges::all_of(compiled.resources.images, [](const auto &image) {
-              return image.dword_count == 8u &&
-                  std::ranges::all_of(std::span(image.dwords).subspan(4u),
+            std::ranges::all_of(compiled.resources.candidate_images, [](const auto &image) {
+              return image.value.dword_count == 8u &&
+                  std::ranges::all_of(std::span(image.value.dwords).subspan(4u),
                                       [](u32 word) { return word == 0u; });
             }), "paired selector admitted poison or omitted the trailing 16-byte image");
     }
@@ -49182,7 +49435,7 @@ void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
       return std::pair{u32(descriptor.Base48()), std::max(4u, u32(descriptor.GetSize()))};
     });
     std::vector<VulkanHarness::Image> images;
-    for (const auto &descriptor : compiled.resources.images)
+    for (const auto &descriptor : ImageDescriptors(compiled))
       images.push_back(vulkan.CreateImage2D(test.name, 2, 1, vk::Format::eR32Sfloat,
           vk::ImageUsageFlagBits::eSampled,
           {0u, std::bit_cast<u32>(float(descriptor.dwords[0]))}, 1,
@@ -49386,8 +49639,10 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
         [](const auto &image) {
           return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
         });
+    // Each member's table reads its rows as slots of one class.
     Require(test.name, "bounded descriptor rows",
-            rows == 0u ? sampled_count <= members : sampled_count == rows * members,
+            compiled.resources.candidate_images.size() == rows * members &&
+                (rows == 0u ? sampled_count <= members : sampled_count == 2u * members),
             "the runtime count lost a row or probed record padding");
     std::vector<VulkanHarness::Image> images(compiled.program.info.images.size());
     u32 storage_index = 0;
@@ -49405,6 +49660,11 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
           vk::ImageUsageFlagBits::eSampled, {std::bit_cast<u32>(value)}, 1,
           vk::ImageLayout::eShaderReadOnlyOptimal);
     }
+    for (const auto &candidate : compiled.resources.candidate_images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(candidate.value.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
     auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
     auto sampler = vulkan.CreateSampler(test.name, 1);
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
@@ -56098,7 +56358,7 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.candidate_images.size() == count,
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
     const auto ordinal = [&](u32 byte_offset) {
@@ -56118,7 +56378,9 @@ void CheckImageSamplerSpecialization() {
     memory[table_base / 4u + 8u] += 0x10000u;
     Require(name, "runtime descriptor refresh",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
+                specialization == previous &&
+                snapshot.candidate_images[ordinal(32u) & ((1u << CandidateClassShift) - 1u)]
+                        .value.dwords[0] == 0x11100u,
             "descriptor addresses were frozen or entered the shader specialization");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
     ValidateSpirv(name, compiled.spirv);

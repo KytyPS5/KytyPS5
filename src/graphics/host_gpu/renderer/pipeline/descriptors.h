@@ -44,7 +44,10 @@ struct PreparedBindings {
 	// The stage's candidate buffers by slot, and where its block starts in the draw's array.
 	std::vector<BufferSource>             candidate_sources;
 	uint32_t                              candidate_base = 0;
+	// The stage's images, then its tables' candidate images by slot, and where that block
+	// starts in the draw's array.
 	std::vector<TextureBinding>           images;
+	uint32_t                              candidate_image_base = 0;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;

@@ -11870,7 +11870,8 @@ void TestBoundedScalarMaterialImageKeys() {
   for (const uint32_t stride : {160u, 16u}) {
     memory = {.stride = stride, .records = stride == 160u ? 409u : 20u};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.key_reads == 2 && memory.images == 4 && snapshot.images.size() == 4,
+              memory.key_reads == 2 && memory.images == 4 && snapshot.images.size() == 4 &&
+              snapshot.candidate_images.size() == 4,
           "scalar material selection used V# stride as its instruction stride or scanned unused keys");
     for (const uint32_t field : {0x7cu, 0x94u})
       Check(std::ranges::find(snapshot.specialization_reads,
@@ -11887,14 +11888,14 @@ void TestBoundedScalarMaterialImageKeys() {
             "scalar material image mapping changed descriptor-index keys into byte offsets");
     }
   }
+  // One key is one slot of each image table's class: the same image state as two keys.
+  const auto two_keys = specialization.images;
   for (const bool same_key : {false, true}) {
     memory = {.count = same_key ? 2u : 1u, .same_key = same_key};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               memory.key_reads == 2 && memory.images == 2 &&
-              snapshot.images.size() == 2 &&
-              std::ranges::all_of(specialization.images, [](const auto &image) {
-                return image.indirect_root == ImageResource::NoIndirectImage;
-              }), "single-candidate scalar material loop retained an indirect image mapping");
+              snapshot.candidate_images.size() == 2 && specialization.images == two_keys,
+          "a single-candidate scalar material loop changed its image tables");
   }
   memory = {.count = 0};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -11922,12 +11923,13 @@ void TestBoundedScalarMaterialImageKeys() {
           "scalar material key past its V# did not read as zero");
   }
   memory = {.mixed = true};
+  // The table with the integer texture has a class for it beside its float class.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4 && specialization.images.size() == 4,
+            snapshot.candidate_images.size() == 4 && specialization.images.size() == 5,
         "selected material fields rejected mixed native numeric classes");
-  for (uint32_t i = 0; i < snapshot.images.size(); ++i) {
-    Check(specialization.images[i].numeric_class ==
-              (snapshot.images[i].dwords[0] == 5588u
+  for (const auto &candidate : snapshot.candidate_images) {
+    Check(specialization.images[candidate.resource].numeric_class ==
+              (candidate.value.dwords[0] == 5588u
                   ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float),
           "selected material fields lost a candidate's native numeric class");
   }
@@ -11937,7 +11939,8 @@ void TestBoundedScalarMaterialImageKeys() {
   ApplyResourceSpecialization(translated.program, specialization);
   Check(translated.program.info.images.size() == 4 &&
             translated.program.info.images[0].indirect_resources.size() == 2 &&
-            translated.program.info.images[1].indirect_resources.size() == 2,
+            translated.program.info.images[1].indirect_resources.size() == 2 &&
+            std::ranges::all_of(translated.program.info.images, &ImageResource::candidate),
         "native image reads lost their distinct material field dispatches");
 }
 

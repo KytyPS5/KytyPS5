@@ -612,6 +612,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	                           std::ranges::any_of(info.images, uses_mapping) ||
 	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
+	info.uses_candidate_images  = std::ranges::any_of(info.images, &ImageResource::candidate);
 	info.uses_candidate_buffers = std::ranges::any_of(info.buffers, [](const auto& buffer) {
 		return buffer.live && buffer.indirect_root != BufferResource::NoIndirectBuffer;
 	});

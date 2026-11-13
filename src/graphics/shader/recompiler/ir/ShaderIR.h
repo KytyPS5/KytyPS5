@@ -170,6 +170,7 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
+	bool                          candidate = false; // Per-draw candidate table or class.
 	uint32_t                      indirect_root          = NoIndirectImage;
 	uint32_t                      indirect_mapping_slot  = NoIndirectMappingSlot;
 	bool                          indirect_searched      = false;
@@ -177,6 +178,12 @@ struct ImageResource {
 
 	bool operator==(const ImageResource& other) const = default;
 };
+
+// A sampled table without dynamic mips selects among a draw's candidates, read by shape class.
+[[nodiscard]] constexpr bool SelectsCandidateImages(const ImageResource& root) {
+	return root.resource_class == ImageResourceClass::Sampled &&
+	       root.mip_mode != ImageMipMode::Dynamic;
+}
 
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
@@ -359,6 +366,9 @@ inline constexpr uint32_t CandidateRecordBinding = 0u;
 inline constexpr uint32_t CandidateBufferBinding = 1u;
 inline constexpr uint32_t CandidateClassShift    = 20u;
 inline constexpr uint32_t CandidateRecordDwords  = 2u;
+// Sampled image tables read a per-draw set of their own: one array of the images.
+inline constexpr uint32_t CandidateImageSet     = 3u;
+inline constexpr uint32_t CandidateImageBinding = 0u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -514,6 +524,7 @@ struct Bindings {
 	uint32_t indirect_mapping_count = 0;
 	// Where the stage's block starts in the draw's candidate buffer array.
 	uint32_t candidate_buffer_dword = PushData::NoStart;
+	uint32_t candidate_image_dword  = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -627,6 +638,7 @@ struct ShaderInfo {
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
 	bool                                 uses_candidate_buffers        = false;
+	bool                                 uses_candidate_images         = false;
 	bool                            uses_device_address           = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;

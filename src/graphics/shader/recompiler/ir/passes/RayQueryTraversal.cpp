@@ -309,21 +309,37 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 		}
 	}
 
-	// Instance BLAS loads run under the root load's lanes and the mask test, flags << k < 0: mask
-	// bit 23 - k.
-	const auto  leaf = root->Arg(3);
-	const auto* both = Producer(blas->Arg(3), ValueOpcode::LogicalAnd);
-	if (both == nullptr || (both->Arg(0) != leaf && both->Arg(1) != leaf)) return false;
-	const auto* sign =
-	    Producer(both->Arg(0) == leaf ? both->Arg(1) : both->Arg(0), ValueOpcode::SGreaterThan32);
-	const auto* mask = sign != nullptr ? Producer(ResolveActiveU32(sign->Arg(1), leaf),
-	                                              ValueOpcode::ShiftLeftLogical32)
-	                                   : nullptr;
-	const auto  bit  = mask != nullptr ? Immediate(mask->Arg(1)) : std::nullopt;
-	if (!bit || Immediate(sign->Arg(0)) != 0u || *bit < 16u || *bit > 23u ||
-	    ResolveActiveU32(mask->Arg(0), leaf).TryInstruction() != flags) {
-		return false;
+	// The instance BLAS load, or a select that moves it into the next header, runs under the root
+	// load's lanes and the mask test flags << k < 0: mask bit 23 - k.
+	const auto leaf = root->Arg(3);
+	const auto test = [&](Value condition) -> std::optional<uint32_t> {
+		const auto* both = Producer(condition, ValueOpcode::LogicalAnd);
+		if (both == nullptr || (both->Arg(0) != leaf && both->Arg(1) != leaf)) return std::nullopt;
+		const auto* sign = Producer(both->Arg(0) == leaf ? both->Arg(1) : both->Arg(0),
+		                            ValueOpcode::SGreaterThan32);
+		const auto* mask = sign != nullptr ? Producer(ResolveActiveU32(sign->Arg(1), leaf),
+		                                              ValueOpcode::ShiftLeftLogical32)
+		                                   : nullptr;
+		const auto  bit  = mask != nullptr ? Immediate(mask->Arg(1)) : std::nullopt;
+		const bool  kept = bit && Immediate(sign->Arg(0)) == 0u && *bit >= 16u && *bit <= 23u &&
+		                   ResolveActiveU32(mask->Arg(0), leaf).TryInstruction() == flags;
+		return kept ? bit : std::nullopt;
+	};
+	auto                            bit = test(blas->Arg(3));
+	std::unordered_set<const Inst*> next;
+	if (!bit) Collect(back(*phi(base->Arg(0))), t.header, next);
+	for (std::vector<const Inst*> taking {blas}; !bit && !taking.empty();) {
+		const auto* value = taking.back();
+		taking.pop_back();
+		for (const auto& use: value->Uses()) {
+			if (!bit && use.user->GetOpcode() == ValueOpcode::SelectU32 && use.operand == 1 &&
+			    next.contains(use.user)) {
+				bit = test(use.user->Arg(0));
+				taking.push_back(use.user);
+			}
+		}
 	}
+	if (!bit) return false;
 	t.cull_mask = 1u << (23u - *bit);
 	return true;
 }
@@ -410,7 +426,7 @@ void Rewrite(Traversal& t) {
 } // namespace
 
 uint32_t TraceTraversalsWithRayQueries(Program& program) {
-	if (program.stage != ShaderType::Compute || program.wave_size != 32) return 0;
+	if (program.stage != ShaderType::Compute) return 0;
 	std::vector<Inst*> intersections;
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {

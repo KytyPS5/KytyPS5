@@ -4,7 +4,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// Drives each recognized wave32 compute BVH traversal loop (64-bit node pointers, header version 1
+// Drives each recognized compute BVH traversal loop (64-bit node pointers, header formats 1 and 3
 // instances) with a ray query over the host mirror of its TLAS: every iteration takes one candidate
 // triangle into the loop's own triangle test, any-hit and commit code, which keep the hit state.
 // Without a valid mirror the loop traverses as before. Returns the loops it drives.

@@ -5,13 +5,15 @@ namespace {
 
 constexpr uint32_t Candidate = spv::RayQueryIntersectionRayQueryCandidateIntersectionKHR;
 
+// One query per 32-lane half of an emulated wave64.
 uint32_t RayQuery(EmitterState& s) {
-	if (s.ray_query_variable == 0) {
-		s.ray_query_variable = s.builder.DefineGlobalVariable(
+	auto& variable = s.ray_query_variables[s.lane_half];
+	if (variable == 0) {
+		variable = s.builder.DefineGlobalVariable(
 		    TypePointer(s, spv::StorageClassPrivate, s.builder.Type(spv::OpTypeRayQueryKHR)),
 		    spv::StorageClassPrivate);
 	}
-	return s.ray_query_variable;
+	return variable;
 }
 
 // The context address the host writes into shader data; 0 when the dispatch has no context.

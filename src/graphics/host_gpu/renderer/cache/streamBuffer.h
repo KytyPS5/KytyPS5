@@ -48,6 +48,7 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool               IsDeviceLocal() const noexcept { return m_device_local; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
@@ -91,7 +92,8 @@ private:
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
-	bool                          m_coherent = false;
+	bool                          m_coherent     = false;
+	bool                          m_device_local = false;
 	std::span<uint8_t>            m_mapped;
 };
 

@@ -5052,6 +5052,64 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // The device budget counts this process's own device-local memory: NVIDIA's reported usage
+  // also counts host-visible allocations (PPSA02015 then put its buffers in system memory until
+  // it ran out). A buffer leaves the device only when new device memory would pass the budget.
+  void CheckDeviceBudgetPlacement() {
+    constexpr const char *name = "DeviceBudgetPlacement";
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    using Libs::Graphics::Buffer;
+    EnsureRuntimeContext();
+    auto &graphics = m_runtime_context;
+    const auto &memory = graphics.physical_device_memory_properties;
+    bool host_types = false;
+    for (uint32_t type = 0; type < memory.memoryTypeCount; ++type) {
+      host_types |= !(memory.memoryTypes[type].propertyFlags &
+                      vk::MemoryPropertyFlagBits::eDeviceLocal);
+    }
+    if (!host_types) {
+      std::printf("[host]    %-32s skipped (no host memory types)\n", name);
+      return;
+    }
+    {
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      // A block with room to spare, so small buffers need no new device memory.
+      const Buffer seed(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, MiB);
+      Require(name, "seed", seed.IsDeviceLocal(), "a small buffer was not placed on the device");
+      const auto usage = graphics.GetDeviceMemoryUsage();
+      {
+        const Buffer upload(graphics, scheduler, MemoryUsage::Upload, 0, AllFlags, 300 * MiB);
+        Require(name, "host allocations",
+                upload.IsDeviceLocal() || graphics.GetDeviceMemoryUsage() == usage,
+                "host memory was counted as device memory");
+      }
+      graphics.device_budget_override = usage + 64 * MiB;
+      {
+        const Buffer over(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
+        Require(name, "past the budget",
+                !over.IsDeviceLocal() && graphics.GetDeviceMemoryUsage() == usage,
+                "a buffer took device memory past the budget");
+      }
+      graphics.device_budget_override = usage + 1024 * MiB;
+      {
+        const Buffer within(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
+        Require(name, "within the budget",
+                within.IsDeviceLocal() && graphics.GetDeviceMemoryUsage() >= usage + 512 * MiB,
+                "a buffer the budget allows left the device");
+        graphics.device_budget_override = graphics.GetDeviceMemoryUsage();
+        const Buffer held(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 64 * 1024);
+        Require(name, "held memory", held.IsDeviceLocal(),
+                "a buffer that fits the device memory already held left the device");
+        const Buffer full(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
+        Require(name, "full device", !full.IsDeviceLocal(),
+                "a buffer took new device memory with the budget used up");
+      }
+      graphics.device_budget_override = 0;
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -60244,6 +60302,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--device-budget-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDeviceBudgetPlacement();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -60544,6 +60607,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheOrderedWrite();
+    vulkan.CheckDeviceBudgetPlacement();
     vulkan.CheckDescriptorTablePrefetch();
   } else {
     skipped_device_checks = true;

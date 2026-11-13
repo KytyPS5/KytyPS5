@@ -71,8 +71,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags          = AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -80,13 +79,22 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+	const auto        allocate      = [&](const VmaAllocationCreateInfo& info) {
+		return vmaCreateBuffer(graphics.allocator,
+		                       static_cast<const VkBufferCreateInfo*>(buffer_info), &info,
+		                       &native_buffer, &m_allocation, &allocation_result);
+	};
+	// Device-local buffers move to host memory once the device is out of budget.
+	if (usage != MemoryUsage::DeviceLocal ||
+	    !graphics.AllocateDeviceLocal(size, allocation_info, allocate)) {
+		if (usage == MemoryUsage::DeviceLocal) {
+			allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		}
+		if (allocate(allocation_info) != VK_SUCCESS) {
+			graphics.LogMemoryBudget();
+			EXIT("out of memory for a buffer of %" PRIu64 " bytes\n", size);
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -98,7 +106,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
-	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_coherent     = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_device_local = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};

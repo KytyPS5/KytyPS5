@@ -88,7 +88,7 @@ void GraphicContext::LogMemoryBudget() const {
 }
 
 uint64_t GraphicContext::GetDeviceMemoryUsage() const {
-	if (!CanReportMemoryUsage() || allocator == nullptr) {
+	if (allocator == nullptr) {
 		return 0;
 	}
 	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
@@ -101,10 +101,31 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
 		                      vk::MemoryHeapFlagBits::eDeviceLocal);
 		if (!discrete || device_local) {
-			usage += budgets[heap].usage;
+			usage += budgets[heap].statistics.blockBytes;
 		}
 	}
 	return usage;
+}
+
+bool GraphicContext::DeviceBudgetAllows(uint64_t size) const {
+	if (allocator == nullptr) {
+		return false;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t usage  = 0;
+	uint64_t budget = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		if (physical_device_memory_properties.memoryHeaps[heap].flags &
+		    vk::MemoryHeapFlagBits::eDeviceLocal) {
+			usage += budgets[heap].statistics.blockBytes;
+			budget += budgets[heap].budget;
+		}
+	}
+	if (device_budget_override != 0) {
+		budget = device_budget_override;
+	}
+	return size <= budget && usage <= budget - size;
 }
 
 uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
@@ -164,19 +185,25 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		return true;
 	}
 
-	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+	const auto       allocate     = [&](const VmaAllocationCreateInfo& info) {
+		return vmaCreateImage(allocator,
+		                      static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                      &info, &native_image, &image.allocation, nullptr);
+	};
+	VmaAllocationCreateInfo alloc_info {};
+	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	const vk::DeviceImageMemoryRequirements query {.pCreateInfo = &image_info};
+	// Device memory while it is in budget, host memory past it.
+	if (!AllocateDeviceLocal(device.getImageMemoryRequirements(query).memoryRequirements.size,
+	                         alloc_info, allocate)) {
+		alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		if (allocate(alloc_info) != VK_SUCCESS) {
+			LogMemoryBudget();
+			return false;
+		}
 	}
+	image.image = native_image;
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -300,13 +327,12 @@ bool GraphicContext::CreatePartialImage(const vk::ImageCreateInfo& base, uint32_
 		}
 	}
 	const VkMemoryRequirements memory {size, block, requirements.memoryTypeBits & device_types};
-	VmaAllocationCreateInfo    create {};
-	create.flags         = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	const auto result = memory.memoryTypeBits == 0 ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-	                                               : vmaAllocateMemory(allocator, &memory, &create,
-	                                                                   &image.allocation, nullptr);
-	if (result != VK_SUCCESS) {
+	const bool                 allocated =
+	    memory.memoryTypeBits != 0 &&
+	    AllocateDeviceLocal(size, {}, [&](const VmaAllocationCreateInfo& info) {
+		    return vmaAllocateMemory(allocator, &memory, &info, &image.allocation, nullptr);
+	    });
+	if (!allocated) {
 		image.allocation = nullptr;
 		device.destroyImage(native, nullptr);
 		return false;

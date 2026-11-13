@@ -125,8 +125,31 @@ struct GraphicContext {
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+	// The device memory this process allocated. The driver's usage figure is not used: NVIDIA
+	// counts host-visible allocations in the device-local heap.
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// Whether `size` more bytes of device-local memory stay within the device-local budget.
+	[[nodiscard]] bool DeviceBudgetAllows(uint64_t size) const;
+	// Device-local memory through `allocate`: from the blocks already held, then from new memory
+	// while the budget allows. False when neither served it.
+	template <typename Allocate>
+	[[nodiscard]] bool AllocateDeviceLocal(uint64_t size, VmaAllocationCreateInfo info,
+	                                       Allocate&& allocate) const {
+		info.requiredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		info.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+		if (allocate(info) == VK_SUCCESS) {
+			return true;
+		}
+		if (!DeviceBudgetAllows(size)) {
+			return false;
+		}
+		info.flags &=
+		    ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT);
+		return allocate(info) == VK_SUCCESS;
+	}
+	// Replaces the device-local budget; zero keeps the reported one. For tests.
+	uint64_t device_budget_override = 0;
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.

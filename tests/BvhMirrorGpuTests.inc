@@ -238,6 +238,15 @@
       }};
       settle("build", built);
 
+      // A call with every readback area of its tick in flight neither submits nor waits.
+      const auto tick = scheduler.CurrentTick();
+      for (u32 call = 0; call <= 8; ++call) {
+        (void)mirror.Prepare(tlas);
+      }
+      Require(name, "busy areas", scheduler.CurrentTick() == tick,
+              "a call waited for a readback area");
+      expect("busy areas", trace(built), built);
+
       // A rebuild that keeps the records: A takes records 98, 99 and B 96, 97.
       cache.InvalidateMemory(blas, page);
       bottom.Children(6, {G::Link(98, 0), G::Link(99, 0), G::Empty, G::Empty});

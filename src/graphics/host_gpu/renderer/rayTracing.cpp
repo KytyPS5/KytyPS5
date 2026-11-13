@@ -372,12 +372,12 @@ void RayTracing::Apply(Area& area) {
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	Collect();
-	auto& area = m_areas[m_next_area];
-	if (area.tick != 0) {
-		m_scheduler.Wait(area.tick);
-		Collect();
+	Area       unread;
+	const bool readback = m_areas[m_next_area].tick == 0;
+	auto&      area     = readback ? m_areas[m_next_area] : unread;
+	if (readback) {
+		m_next_area = (m_next_area + 1) % Areas;
 	}
-	m_next_area       = (m_next_area + 1) % Areas;
 	const auto serial = ++m_serial;
 
 	auto& top = m_tlases[tlas];
@@ -503,7 +503,6 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	    Layout(m_blases.size(), m_pairs.size(), area.walks.size(), top.instance_slots);
 	Reserve(m_state, vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
 	        layout.size);
-	Reserve(area.buffer, vk::BufferUsageFlagBits::eTransferDst, layout.size, MemoryUsage::Download);
 	const auto state = m_state->BufferDeviceAddress();
 
 	// One upload: the parameters, then the tables they point to.
@@ -614,9 +613,13 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	command.buildAccelerationStructuresKHR(1, &info, &range_pointer);
 	Barrier(command);
 
-	const vk::BufferCopy copy {0, 0, layout.size};
-	command.copyBuffer(m_state->Handle(), area.buffer->Handle(), 1, &copy);
-	Barrier(command);
+	if (readback) {
+		Reserve(area.buffer, vk::BufferUsageFlagBits::eTransferDst, layout.size,
+		        MemoryUsage::Download);
+		const vk::BufferCopy copy {0, 0, layout.size};
+		command.copyBuffer(m_state->Handle(), area.buffer->Handle(), 1, &copy);
+		Barrier(command);
+	}
 	area.tick           = m_scheduler.CurrentTick();
 	area.serial         = serial;
 	area.tlas           = tlas;

@@ -21,6 +21,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/demonsSoulsIdle.h"
 #include "loader/elf.h"
@@ -1409,6 +1410,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	for (auto* program: m_programs) DemonsSoulsCopy::Install(program);
 	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
@@ -1440,6 +1442,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	DemonsSoulsGpuPages::Clear();
+	DemonsSoulsCopy::Clear();
 	GamePatch::Clear();
 
 	for (auto* p: m_programs) {

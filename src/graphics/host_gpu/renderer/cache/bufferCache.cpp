@@ -350,6 +350,54 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fau
 	}
 }
 
+// The game's large memmoves (DemonsSoulsCopy, >= 256 KiB) prepare their destination this way: at 1-1 a few a frame of
+// 4 MiB into memory GPU work had written, each read back first on the GPU thread (the copy and the wait for it) for bytes
+// the memmove then overwrote.
+void BufferCache::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	bool requested = false; // (the range, once for all of its regions)
+	m_memory_tracker.InvalidateRegion(vaddr, size, [&] {
+		if (std::exchange(requested, true)) return;
+		if (GuestGpu::IsGpuThread()) {
+			DiscardGpuWrites(vaddr, size);
+			return;
+		}
+		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size] { DiscardGpuWrites(vaddr, size); });
+	});
+}
+
+// As ReadMemory for a write, but only the GPU-written bytes of the first and last page outside [vaddr, vaddr + size) are
+// read back (the rest of those pages); the others are dropped: the write replaces them. A GPU write still under way to the
+// range races the guest's write on the console too.
+void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
+	const auto end   = vaddr + size;
+	const auto first = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto last  = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+	if (!IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	// Bytes another thread's readback downloaded are in the backing once it published them.
+	if (const auto inflight = InFlightReadbackTick(first, last); inflight != 0) {
+		m_scheduler.Wait(inflight);
+		m_scheduler.WaitPriorityOperations(inflight);
+		std::erase_if(m_inflight_readbacks, [inflight](const InFlightReadback& readback) { return readback.tick <= inflight; });
+	}
+	for (const auto& [begin, stop]: {std::pair {first, vaddr}, std::pair {end, last}}) {
+		if (begin >= stop || !m_gpu_modified_ranges.Intersects(begin, stop - begin)) continue;
+		// (The buffer of that page alone: one over the whole range would merge every buffer in it.)
+		auto& buffer = m_slot_buffers[FindBuffer(Common::AlignDown(begin, TRACKER_PAGE_SIZE), TRACKER_PAGE_SIZE)];
+		(void)DownloadBufferMemory<false>(buffer, begin, stop - begin);
+	}
+	if (m_gpu_modified_ranges.Subtract(first, last - first)) {
+		NoteGpuModifiedChange(first, last - first, false);
+	}
+	ForgetColorMetadataChecks(first, last - first);
+	m_memory_tracker.UnmarkRegionAsGpuModified(first, last - first);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+}
+
 void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept {
 	if (GuestRange {vaddr, size}.Valid()) {
 		m_memory_tracker.InvalidateRegion(vaddr, size, [] {});

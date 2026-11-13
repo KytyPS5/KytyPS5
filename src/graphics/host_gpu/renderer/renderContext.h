@@ -90,6 +90,9 @@ public:
 	// PrepareGpuWrite() and store the bytes itself.
 	[[nodiscard]] bool WriteAroundGpuWrites(void* destination, const void* data, uint64_t size);
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// As InvalidateMemory before a host write of all of the range: the GPU-written bytes it replaces are dropped, not read
+	// back (BufferCache::InvalidateMemoryForWrite).
+	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;

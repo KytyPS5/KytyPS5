@@ -92,6 +92,9 @@ public:
 
 	// `guest_fault`: a guest write faulted on the range (see ReadMemory()).
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fault = false);
+	// Before a host write of all of [vaddr, vaddr + size) (any thread): as InvalidateMemory, but the GPU-written bytes the
+	// write replaces are dropped, not read back (only those of its first and last page outside it are).
+	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	// A CPU write that already reached guest memory, from a thread that cannot read back:
@@ -277,6 +280,8 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// GPU thread: InvalidateMemoryForWrite's work where GPU-written bytes are in the range.
+	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	void CollectStaleBuffers(uint64_t tick);
 	// Whether no image is registered on the page where `vaddr` starts, so that no image can start at it
 	// (FindImageFromRange() finds only images starting at the address).

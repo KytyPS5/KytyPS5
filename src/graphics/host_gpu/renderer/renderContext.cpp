@@ -1,3 +1,4 @@
+#include "loader/demonsSoulsTitle.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
@@ -6,6 +7,7 @@
 #include "common/hackNotice.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
@@ -14,6 +16,9 @@
 #include "libs/errno.h"
 #include "loader/demonsSoulsPageFree.h"
 
+#include <atomic>
+#include <span>
+#include <bit>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -22,6 +27,25 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+
+namespace {
+// KYTY_BDA_REGIONS: the BDA synchronization by region requests with epoch proofs (PrepareBda, PrepareBdaReadRanges)
+// instead of a pass over all the mapped ranges whenever an epoch moved: on in Demon's Souls, where it was measured
+// (0 turns it off, 1 turns it on in any game). KYTY_BDA_DIRTY_REGIONS=0: a bounded preparation visits every region
+// of its ranges, not only the ones whose dirty bit is set (bdaDirtyRegions.h).
+uint32_t BdaSwitch(const char* name, uint32_t fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] != 0 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : fallback;
+}
+uint32_t BdaRegionsMode() {
+	static const uint32_t mode = BdaSwitch("KYTY_BDA_REGIONS", Loader::DemonsSoulsTitle::IsSupportedGame() ? 1u : 0u);
+	return mode;
+}
+uint32_t BdaDirtyRegionsMode() {
+	static const uint32_t mode = BdaSwitch("KYTY_BDA_DIRTY_REGIONS", 1);
+	return mode;
+}
+} // namespace
 
 namespace Libs::Graphics {
 
@@ -329,6 +353,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
+		if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
 		m_mapped_ranges_version++;
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		m_bda_mapped_since_sync.emplace_back(vaddr, size);
@@ -386,6 +411,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		if (registered) NoteBdaSpan(vaddr, size);
 		m_mapped_ranges_version++;
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		if (m_unmap_log.size() >= 4096) {
@@ -593,6 +619,29 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 	constexpr uint64_t MaxBufferBytes = uint64_t {256} * 1024 * 1024;
 	// An index offset or thread ID added to a V# record stays within a wave of records past it.
 	constexpr uint64_t WaveRecords = 64;
+	// KYTY_BDA_REGIONS: the programs' read plans (the memory their device-address loads reach, exactly) when every stage has
+	// one: only the regions of those ranges are synchronized.
+	// (Only for stages whose windows the analysis below could not bound: a bounded stage's windows cost less than a
+	// plan's ranges, whose preparation walks the region requests. Demon's Souls' ~6,200 draws a frame at Boletaria paid
+	// ~0.4 us each for it.)
+	const bool unbounded_stage = std::ranges::any_of(stages, [](const auto* stage) {
+		return stage->module->info.info.uses_dma && !stage->module->info.info.dma_bounded;
+	});
+	if (unbounded_stage && BdaRegionsMode() != 0) {
+		thread_local std::vector<GuestRange> second_ranges, all_ranges;
+		all_ranges.clear();
+		bool bounded = true;
+		for (const auto* stage: stages) {
+			if (!stage->module->info.info.uses_dma) continue;
+			second_ranges.clear();
+			if (!ShaderRecompiler::IR::EvaluateBdaReadPlan(stage->module->info.bda_read_plan, *stage->resources, second_ranges)) {
+				bounded = false;
+				break;
+			}
+			all_ranges.insert(all_ranges.end(), second_ranges.begin(), second_ranges.end());
+		}
+		if (bounded && PrepareBdaReadRanges(all_ranges)) return true;
+	}
 	m_dma_spans.clear();
 	m_dma_sets.clear();
 	std::shared_lock lock(m_mapped_ranges_mutex);
@@ -1152,6 +1201,124 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	return true;
 }
 
+void RenderContext::NoteBdaSpan(uint64_t vaddr, uint64_t size) {
+	if (m_bda_spans.size() < 256) {
+		m_bda_spans.push_back({vaddr, size});
+	} else {
+		m_bda_rebuild = true;
+	}
+}
+
+void RenderContext::RefreshBdaRanges() {
+	if (!m_buffer_cache.TakeRegistrationSpans(m_bda_spans) || m_bda_spans.size() > 256) m_bda_rebuild = true;
+	if (!m_bda_rebuild && m_bda_spans.empty()) return;
+	// The tracker regions to collect again, as merged [begin, end) windows (requests lie in one region each).
+	std::vector<std::pair<uint64_t, uint64_t>> windows;
+	if (m_bda_rebuild) {
+		windows.emplace_back(0, UINT64_MAX);
+	} else {
+		std::ranges::sort(m_bda_spans, {}, &GuestRange::address);
+		for (const auto& span: m_bda_spans) {
+			const auto begin = span.address / TRACKER_REGION_SIZE * TRACKER_REGION_SIZE;
+			const auto end   = (span.End() + TRACKER_REGION_SIZE - 1) / TRACKER_REGION_SIZE * TRACKER_REGION_SIZE;
+			if (!windows.empty() && begin <= windows.back().second) {
+				windows.back().second = std::max(windows.back().second, end);
+			} else {
+				windows.emplace_back(begin, end);
+			}
+		}
+	}
+	m_bda_spans.clear();
+	m_bda_rebuild = false;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	for (const auto& [window_begin, window_end]: windows) {
+		m_buffer_cache.CollectMappedRegisteredRanges(m_mapped_ranges, window_begin, window_end, ranges);
+		auto& fresh = m_fresh_bda_region_requests;
+		fresh.clear();
+		for (const auto& [address, size]: ranges) {
+			const auto end = address + size;
+			for (auto start = address; start < end;) {
+				const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+				fresh.push_back({start, finish - start});
+				start = finish;
+			}
+		}
+		// An unchanged request keeps its proof: SynchronizeRegionRequest checks it against its region's CPU and registration
+		// epochs (an unmap marks the range CPU-dirty, which moves the CPU epoch).
+		const auto before = [](const BufferCache::SyncRegionRequest& request, uint64_t address) {
+			return request.address < address;
+		};
+		const auto first = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), window_begin, before);
+		const auto last  = std::lower_bound(first, m_bda_region_requests.end(), window_end, before);
+		auto       old   = first;
+		for (auto& request: fresh) {
+			while (old != last && old->address < request.address) ++old;
+			if (old != last && old->address == request.address && old->size == request.size) {
+				request = *old;
+			} else if (request.address / TRACKER_REGION_SIZE < BdaDirtyRegions::Regions) {
+				// A new request starts unproven.
+				BdaDirtyRegions::Mark(request.address / TRACKER_REGION_SIZE);
+			}
+		}
+		m_bda_region_requests.insert(m_bda_region_requests.erase(first, last), fresh.begin(), fresh.end());
+	}
+}
+
+bool RenderContext::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
+	if (BdaRegionsMode() == 0) return false;
+	if (ranges.empty() || ranges.size() > 128 ||
+	    std::ranges::any_of(ranges, [](const auto& range) { return !range.Valid(); }))
+		return false;
+	// (Before the lock: making buffers asks for it.)
+	m_buffer_cache.EnsureBdaReadable(ranges);
+	m_buffer_cache.PrepareFaultBuffer();
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	RefreshBdaRanges();
+	if (BdaDirtyRegionsMode() != 0) {
+		// KYTY_BDA_DIRTY_REGIONS: only regions whose bit is set can hold a stale request.
+		for (const auto range: ranges) SynchronizeDirtyBdaRegions(range);
+	} else {
+		for (const auto range: ranges) {
+			auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), range.address,
+			                           [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
+			for (; it != m_bda_region_requests.end() && it->address < range.End(); ++it)
+				m_buffer_cache.SynchronizeRegionRequest(*it);
+		}
+	}
+	m_fault_process_pending = true;
+	m_use_scan_pending      = true;
+	return true;
+}
+
+void RenderContext::SynchronizeDirtyBdaRegions(GuestRange range) {
+	const auto first = range.address / TRACKER_REGION_SIZE;
+	if (first >= BdaDirtyRegions::Regions) return;
+	const auto last = std::min((range.End() - 1) / TRACKER_REGION_SIZE, BdaDirtyRegions::Regions - 1);
+	for (auto word = first / 64; word <= last / 64; ++word) {
+		auto mask = ~uint64_t {0};
+		if (word == first / 64) mask &= ~uint64_t {0} << (first % 64);
+		if (word == last / 64) mask &= ~uint64_t {0} >> (63 - last % 64);
+		auto& bits = BdaDirtyRegions::g_bits[word];
+		for (auto pending = bits.load(std::memory_order_acquire) & mask; pending != 0; pending &= pending - 1) {
+			const auto bit = uint64_t {1} << std::countr_zero(pending);
+			// Clear before synchronizing: a CPU write after the epoch read sets it again.
+			if ((bits.fetch_and(~bit, std::memory_order_acq_rel) & bit) == 0) continue;
+			const auto region_begin = (word * 64 + static_cast<uint64_t>(std::countr_zero(pending))) * TRACKER_REGION_SIZE;
+			auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), region_begin,
+			                           [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
+			bool unproven = false;
+			for (; it != m_bda_region_requests.end() && it->address < region_begin + TRACKER_REGION_SIZE; ++it) {
+				m_buffer_cache.SynchronizeRegionRequest(*it);
+				unproven |= it->cpu_epoch == 0;
+			}
+			// A request left unproven by its own uploads' queued write protection needs no other visit: a write before the
+			// protection lands is in the copies taken after it, and a write after it faults (and marks the region).
+			if (unproven && !m_buffer_cache.DeferredProtectionPending(region_begin))
+				BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
+		}
+	}
+}
+
 void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
@@ -1160,6 +1327,16 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	m_buffer_cache.PrepareFaultBuffer();
 	if (may_write) {
 		m_buffer_cache.NoteDeviceAddressUse();
+	}
+	if (BdaRegionsMode() != 0 && full_sync) {
+		// KYTY_BDA_REGIONS: every request proves itself against the epochs of its own region.
+		std::shared_lock regions_lock(m_mapped_ranges_mutex);
+		RefreshBdaRanges();
+		m_bda_mapped_since_sync.clear(); // (new requests start unproven)
+		for (auto& request: m_bda_region_requests) m_buffer_cache.SynchronizeRegionRequest(request);
+		m_fault_process_pending = true;
+		m_use_scan_pending      = true;
+		return;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// Nothing to upload when no page became CPU dirty, no buffer was registered and no range was

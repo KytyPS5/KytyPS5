@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -85,6 +86,10 @@ public:
 		if (submit_id != m_bda_submit || after_wait) {
 			m_bda_submit = submit_id;
 			m_bda_generation++;
+			// The guest threads' writes made before the submission, or before the label its work waited for, become
+			// visible to the operations after it (the dirty-region bits: chenxiao07 publishes them when the command
+			// processor takes a submission and when a WAIT_REG_MEM is met).
+			BdaDirtyRegions::Publish();
 		}
 	}
 	// A small command-processor write that GPU-owned pages would turn into a readback of all
@@ -121,6 +126,9 @@ public:
 	// Whether part of the range was unmapped after MappedRangesVersion() was `version` (true
 	// when the log of unmaps no longer reaches back that far).
 	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
+	// The ranges (at most 128) a draw or a dispatch reads through device addresses, bounded by its BdaReadPlan: only the
+	// regions of them whose bytes may have changed are synchronized (KYTY_BDA_REGIONS). False: the caller prepares them all.
+	[[nodiscard]] bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
@@ -217,6 +225,14 @@ private:
 	std::deque<UnmapEntry> m_unmap_log;
 	uint64_t               m_unmap_log_floor = 0; // the version of the newest unmap dropped
 	uint64_t               m_frame_number    = 0;
+	// KYTY_BDA_REGIONS: the BDA region requests (a tracker region's mapped, registered ranges with their proofs), sorted, and
+	// the spans whose registrations or mappings changed since they were collected.
+	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_fresh_bda_region_requests;
+	std::vector<GuestRange>                     m_bda_spans;
+	bool                                        m_bda_rebuild = true;
+	void NoteBdaSpan(uint64_t vaddr, uint64_t size);
+	void RefreshBdaRanges();
+	void SynchronizeDirtyBdaRegions(GuestRange range);
 	// SynchronizeDmaFootprint(): the spans of an operation.
 	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	// The guest TLASes the native builds wrote (NoteHleTlas()), and the memory sce::Psr captured

@@ -387,6 +387,9 @@ void GuestGpu::ExecutionThread() {
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
 	g_gpu_thread    = true;
 	g_executing_gpu = this;
+	// (The dirty-region bits of this thread's own writes to guest memory, the command stream's, are visible to its next
+	// operation: bdaDirtyRegions.h.)
+	BdaDirtyRegions::g_translating = true;
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;

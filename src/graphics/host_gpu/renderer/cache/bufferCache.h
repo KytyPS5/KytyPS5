@@ -97,10 +97,17 @@ public:
 	// Before a host write of all of [vaddr, vaddr + size) (any thread): as InvalidateMemory, but the GPU-written bytes the
 	// write replaces are dropped, not read back (only those of its first and last page outside it are).
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+	// A BDA region request: a tracker region's mapped buffers, with the proof (the region's CPU modification and
+	// registration epochs when it was last synchronized) that a later preparation can skip it (KYTY_BDA_REGIONS).
+	struct SyncRegionRequest {
+		uint64_t address = 0, size = 0, cpu_epoch = 0, registration_epoch = 0;
+	};
+	void SynchronizeRegionRequest(SyncRegionRequest& request);
 	// Moves when a buffer is registered or unregistered.
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a V# resolved before
-	// it, whose range lies in regions none of which changed since, still finds its buffer.
+	// it, whose range lies in regions none of which changed since, still finds its buffer (and a region request's proof
+	// only depends on the buffers of its own region).
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
 		const auto region = vaddr / TRACKER_REGION_SIZE;
 		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? m_region_registrations[region].load(std::memory_order_acquire)
@@ -108,6 +115,15 @@ public:
 	}
 	// A write protection of pages of the tracker region of `vaddr` is still queued (KYTY_ASYNC_REPROTECT).
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const { return m_memory_tracker.DeferredProtectionPending(vaddr); }
+	// The mapped parts of registered buffers in [begin, end), adjacent ones merged.
+	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
+	                                   std::vector<std::pair<uint64_t, uint64_t>>& ranges) const;
+	// The spans of the buffers registered or unregistered since the last call, appended to `spans`; false when more changed
+	// than it keeps (then anything may have).
+	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
+	// The start of each range shaders read through pointers held by a buffer with the guest's bytes: a read through a
+	// pointer into memory no buffer holds misses the GPU's page table and reads zeros.
+	void EnsureBdaReadable(std::span<const GuestRange> ranges);
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	// RenderContext::UnmapMemory, after InvalidateMemory: the buffers the unmapped range holds whole go (nothing the guest
@@ -529,6 +545,8 @@ private:
 	// Per tracker region, see RegionRegistrationEpoch.
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
+	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
+	bool                    m_registration_spans_lost = true;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;

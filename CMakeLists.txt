@@ -580,6 +580,7 @@ add_kyty_full_emulator_test(lane_local_tests "${KYTY_TESTS_DIR}/LaneLocalTests.c
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/common/hackNotice.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
@@ -674,6 +675,7 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/common/hackNotice.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -685,6 +687,7 @@ target_compile_definitions(resource_materialization_tests PRIVATE KYTY_HACK_NOTI
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/common/hackNotice.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"

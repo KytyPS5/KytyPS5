@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 
 #include <algorithm>
 #include <array>
@@ -228,6 +229,7 @@ public:
 				}
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 			}
 			m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 			UpdateProtection<!enable, false>(changed);

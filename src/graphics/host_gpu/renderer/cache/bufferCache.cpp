@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
@@ -123,12 +124,20 @@ void BufferCache::ChangeRegister(BufferId id) {
 			m_page_table[page] = {};
 		}
 	}
+	// Region requests prove their state against the registration epoch of their own region: only the requests of the regions
+	// the buffer covers need to be synchronized again (KYTY_BDA_REGIONS).
 	{
 		const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
+		if (m_registration_spans.size() < 64) {
+			m_registration_spans.push_back({buffer.CpuAddress(), buffer.Size()});
+		} else {
+			m_registration_spans_lost = true;
+		}
 		for (auto region = buffer.CpuAddress() / TRACKER_REGION_SIZE,
 		          last   = (buffer.CpuAddress() + buffer.Size() - 1) / TRACKER_REGION_SIZE;
 		     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
 			m_region_registrations[region].store(epoch, std::memory_order_release);
+			BdaDirtyRegions::Mark(region);
 		}
 		m_registration_epoch.store(epoch, std::memory_order_release);
 	}
@@ -2707,6 +2716,76 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, bool read_ba
 	}
 	const auto deleted = DeleteUnmappedBuffers(vaddr, size);
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
+}
+
+void BufferCache::CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
+                                                std::vector<std::pair<uint64_t, uint64_t>>& ranges) const {
+	ranges.clear();
+	auto it = m_buffers.upper_bound(begin);
+	if (it != m_buffers.begin()) --it; // (the last buffer starting before `begin` may reach into it)
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto first = std::max(it->first, begin), last = std::min(it->first + m_slot_buffers[it->second].Size(), end);
+		if (first >= last) continue;
+		mapped.ForEachInRange(first, last - first, [&](uint64_t from, uint64_t to) {
+			if (!ranges.empty() && ranges.back().first + ranges.back().second == from)
+				ranges.back().second += to - from;
+			else ranges.emplace_back(from, to - from);
+		});
+	}
+}
+
+bool BufferCache::TakeRegistrationSpans(std::vector<GuestRange>& spans) {
+	spans.insert(spans.end(), m_registration_spans.begin(), m_registration_spans.end());
+	m_registration_spans.clear();
+	return !std::exchange(m_registration_spans_lost, false);
+}
+
+void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+	const auto epoch = CpuModificationEpoch(request.address, request.size);
+	// A request lies in one tracker region: registrations elsewhere do not touch its buffers.
+	const auto registered = RegionRegistrationEpoch(request.address);
+	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered) {
+		return;
+	}
+	SynchronizeBuffersInRange(request.address, request.size);
+	request.cpu_epoch = 0;
+	if (epoch != 0 && RegionRegistrationEpoch(request.address) == registered &&
+	    CpuModificationEpoch(request.address, request.size) == epoch) {
+		request.cpu_epoch          = epoch;
+		request.registration_epoch = registered;
+	}
+}
+
+// A read through a pointer into memory no buffer holds misses the GPU's page table: it reads nothing (zeros) and leaves
+// a fault, which gets those pages a buffer only once the submission's faults are processed (FaultManager). A Bink video's
+// first decode read its blocks' flags that way, and the frames predicted from it kept the error until the video looped. So
+// the start of each range a dispatch or a draw reads through pointers - 64 KiB from its base, its offsets known or not - is
+// given a buffer with the guest's bytes before the work is recorded (RenderContext::PrepareBdaReadRanges).
+void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
+	constexpr uint64_t HeadBytes = uint64_t {64} << 10u;
+	const auto         held      = [this](uint64_t page) {
+        const auto* owner = m_page_table.Find(page);
+        return owner != nullptr && *owner;
+	};
+	for (const auto& range: ranges) {
+		const auto last = (range.address + std::min(range.size, HeadBytes) - 1) >> PageTable::kPageBits;
+		for (auto page = range.address >> PageTable::kPageBits; page <= last;) {
+			if (held(page)) {
+				++page;
+				continue;
+			}
+			// (One buffer for a run of such pages.)
+			auto end = page + 1;
+			while (end <= last && !held(end)) ++end;
+			const auto begin = page << PageTable::kPageBits, bytes = (end - page) << PageTable::kPageBits;
+			if (m_resources != nullptr && m_resources->IsMapped(begin, bytes) && LibKernel::Memory::IsFullyMapped(begin, bytes)) {
+				auto& buffer = m_slot_buffers[FindBuffer(begin, bytes)];
+				TouchBuffer(buffer);
+				(void)SynchronizeBuffer(buffer, begin, bytes, false, false);
+			}
+			page = end;
+		}
+	}
 }
 
 void BufferCache::RunGarbageCollector() {

@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_
 
 #include "common/common.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -956,6 +957,9 @@ struct TablePlan {
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
+	// The memory the program's loads through device addresses can reach, from the user data and the flattened SRT (taken
+	// first: it reads the program's blocks).
+	BdaReadPlan bda_read_plan;
 	ShaderType stage              = ShaderType::Unknown;
 	uint64_t   shader_hash        = 0;
 	uint32_t   wave_size          = 64;

@@ -18,7 +18,7 @@
 
 layout(local_size_x = 64) in;
 
-// Guest page -> host device address of the page, plus 1 once a DMA access synchronized it.
+// Guest page -> host device address of the page, or 0 when no buffer backs it.
 layout(std430, binding = 0) readonly buffer PageTable { uint64_t pages[]; };
 layout(std430, binding = 1) buffer Faults { uint faults[]; };
 
@@ -45,7 +45,7 @@ struct Pair {
 const uint PAIR_GEOMETRY = 1u; // `geometry` is known.
 const uint PAIR_UPDATED  = 2u; // Built or updated after this dispatch.
 
-const uint STATE_ABSENT    = 1u; // A page was not synchronized yet.
+const uint STATE_ABSENT    = 1u; // The job met a page no buffer backs.
 const uint STATE_MALFORMED = 2u;
 struct BlasState {
 	uint topology;
@@ -114,8 +114,8 @@ const uvec3 FAN[4] = uvec3[4](uvec3(0u, 1u, 2u), uvec3(1u, 3u, 2u), uvec3(2u, 3u
 
 bool g_present = true;
 
-// The host address of guest `address`, or 0 when its page is not synchronized yet. A 64-byte
-// node or an 8-byte record lies in one page.
+// The host address of guest `address`, or 0 when no buffer backs its page yet. A 64-byte node or
+// an 8-byte record lies in one page.
 uint64_t Host(uint64_t address) {
 	const uint64_t packed = address >= params.extended_base ? address - params.fold : address;
 	const uint64_t page   = packed >> params.page_bits;
@@ -124,12 +124,12 @@ uint64_t Host(uint64_t address) {
 		return 0ul;
 	}
 	const uint64_t entry = pages[uint(page)];
-	if ((entry & 1ul) == 0ul) {
+	if (entry == 0ul) {
 		atomicOr(faults[uint(page >> 5)], 1u << uint(page & 31ul));
 		g_present = false;
 		return 0ul;
 	}
-	return entry - 1ul + (address & ((1ul << params.page_bits) - 1ul));
+	return entry + (address & ((1ul << params.page_bits) - 1ul));
 }
 
 uint Read(uint64_t host, uint offset) {

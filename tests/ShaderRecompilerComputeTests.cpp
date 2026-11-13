@@ -1446,8 +1446,6 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
-  // Loads from an unaccessed mapping must record its first page.
-  bool accessed = true;
 };
 
 using ShaderProfile = ShaderRecompiler::Spirv::Profile;
@@ -1503,6 +1501,8 @@ struct TestCase {
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<uint64_t> fault_free_address;
+  // A BDA load from this unbacked address must record its page.
+  std::optional<uint64_t> fault_address;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -6628,7 +6628,7 @@ public:
     context.MapMemory(base + 2 * page, page);
     const auto id = cache.FindBuffer(base, 3 * page);
     auto &buffer = cache.GetBuffer(id);
-    auto readback = CreateHostBuffer(name, 11 * sizeof(u32),
+    auto readback = CreateHostBuffer(name, 9 * sizeof(u32),
                                      vk::BufferUsageFlagBits::eTransferDst, {});
     const auto snapshot_of = [&](const auto &source, uint64_t offset, uint32_t index) {
       const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
@@ -6651,21 +6651,6 @@ public:
             "BDA upload missed a mapped range or uploaded an unmapped hole");
     snapshot(0, 0);
     snapshot(2 * page, 1);
-
-    // A write queues a page only once a DMA access reported it; the report queues it too.
-    cache.InvalidateMemory(base + 17, 1);
-    context.PrepareBda();
-    Require(name, "unaccessed write", cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
-            "a write queued a page no DMA shader accessed");
-    cache.GetFaultBuffer()->Fill(BufferCache::PageIndex(base) / 32 * 4, 4,
-                                 1u << (BufferCache::PageIndex(base) % 32));
-    cache.ProcessFaultBuffer();
-    scheduler.Finish();
-    context.PrepareBda();
-    Require(name, "accessed page", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
-            "a DMA access report did not queue its page");
-    const auto tagged_entry = static_cast<u32>(buffer.BufferDeviceAddress() | BufferCache::BDA_ACCESSED);
-    snapshot_of(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(uint64_t), 8);
 
     cache.InvalidateMemory(base + 17, 1);
     words[4] = 0x87654321u;
@@ -6726,10 +6711,22 @@ public:
             "buffers replacing an evicted one did not upload their untracked pages");
     snapshot_of(cache.GetBuffer(low), 16, 6);
     snapshot_of(cache.GetBuffer(high), page, 7);
-    // Registration re-tags only the accessed page.
-    snapshot_of(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(uint64_t), 9);
-    snapshot_of(*cache.GetBdaPageTableBuffer(),
-                BufferCache::PageIndex(base + page) * sizeof(uint64_t), 10);
+
+    // Every write fault queues its page, however often the CPU rewrites it.
+    BufferCacheTestAccess::SetGarbageCollectionThresholds(
+        cache, std::numeric_limits<uint64_t>::max(),
+        std::numeric_limits<uint64_t>::max());
+    for (u32 interval = 0; interval < 8; ++interval) {
+      cache.RunGarbageCollector();
+      cache.InvalidateMemory(base + 8, 1);
+      words[2] = interval;
+      context.PrepareBda();
+      Require(
+          name, "repeated writes",
+          !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+          "a write fault on a page the CPU keeps rewriting was not uploaded");
+    }
+    snapshot_of(cache.GetBuffer(low), 8, 8);
 
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -6740,13 +6737,13 @@ public:
     scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
     scheduler.Finish();
-    Require(name, "GPU contents", ReadBuffer(name, readback, 11) ==
-        std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
-                        0x12345678u, 0xfedcba98u, 0x87654321u, 0xfedcba98u, tagged_entry,
-                        static_cast<u32>(cache.GetBuffer(low).BufferDeviceAddress() |
-                                         BufferCache::BDA_ACCESSED),
-                        static_cast<u32>(cache.GetBuffer(high).BufferDeviceAddress())},
-        "stale bytes on the GPU, or page-table entries with wrong accessed tags");
+    Require(name, "GPU contents",
+            ReadBuffer(name, readback, 9) ==
+                std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u,
+                                 0xabcdef01u, 0x12345678u, 0xfedcba98u,
+                                 0x87654321u, 0xfedcba98u, 7u},
+            "initial, re-dirtied, rewritten, newly mapped, remapped or "
+            "replacement bytes were stale on the GPU");
     context.UnmapMemory(base, 3 * page);
     scheduler.Finish();
     DestroyBuffer(&readback);
@@ -20075,7 +20072,7 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing, accessed] : test.bda_mappings) {
+      for (const auto &[guest_base, backing] : test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
@@ -20085,8 +20082,7 @@ public:
         const auto pages =
             (bytes + BufferCache::CACHING_PAGESIZE - 1) /
             BufferCache::CACHING_PAGESIZE;
-        auto address = buffer.device_address + backing - page_offset +
-                       (accessed ? BufferCache::BDA_ACCESSED : 0);
+        auto address = buffer.device_address + backing - page_offset;
         auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
@@ -20144,14 +20140,8 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    auto fault_address = test.fault_free_address;
-    u32 expected_fault = 0;
-    for (const auto &mapping : test.bda_mappings) {
-      if (!mapping.accessed) {
-        fault_address = mapping.guest_base;
-        expected_fault = 1u << (BufferCache::PageIndex(mapping.guest_base) & 31u);
-      }
-    }
+    const auto fault_address =
+        test.fault_address ? test.fault_address : test.fault_free_address;
     if (fault_address) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
       fault_result = CreateHostBuffer(test.name, sizeof(u32),
@@ -20161,8 +20151,9 @@ public:
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
-      const vk::BufferCopy region{(BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32),
-                                   0, sizeof(u32)};
+      const vk::BufferCopy region{
+          (BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32), 0,
+          sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                         .dstAccessMask = vk::AccessFlagBits::eHostRead};
@@ -20171,8 +20162,13 @@ public:
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
     if (fault_address) {
-      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
-              "an access recorded a suppressed or accessed page, or missed an unaccessed one");
+      const u32 expected_fault =
+          test.fault_address
+              ? 1u << (BufferCache::PageIndex(*test.fault_address) & 31u)
+              : 0u;
+      Require(test.name, "fault check",
+              ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
+              "an access recorded a suppressed page or missed an unbacked one");
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -39180,11 +39176,13 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   return test;
 }
 
-// A load from a page without the accessed tag reads it and records a fault.
-TestCase GlobalLoadRecordsUnaccessedPage() {
+// A load from a page no buffer backs reads zero and records the page.
+TestCase GlobalLoadRecordsUnbackedPage() {
   auto test = GlobalSignedImmediateRebasesBeforeSaddr();
-  test.name = "GlobalLoadRecordsUnaccessedPage";
-  test.bda_mappings.front().accessed = false;
+  test.name = "GlobalLoadRecordsUnbackedPage";
+  test.expected = {0u};
+  test.fault_address = test.bda_mappings.front().guest_base + 4;
+  test.bda_mappings.front().guest_base += BufferCache::CACHING_PAGESIZE;
   return test;
 }
 
@@ -49182,7 +49180,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
-  AddCase(GlobalLoadRecordsUnaccessedPage);
+  AddCase(GlobalLoadRecordsUnbackedPage);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -56411,7 +56409,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
-    RunCase(&vulkan, GlobalLoadRecordsUnaccessedPage());
+    RunCase(&vulkan, GlobalLoadRecordsUnbackedPage());
     RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;

@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
+#include "common/assert.h"
+#include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -8,7 +10,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
+#include <limits>
 
 namespace Libs::Graphics {
 
@@ -122,10 +126,14 @@ void FaultManager::ProcessFaultBuffer() {
 		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
 		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
 		for (uint32_t index = 1; index <= count; ++index) {
-			fault_ranges.Add(BufferCache::GuestAddress(faults[index]),
-			                 BufferCache::CACHING_PAGESIZE);
+			const auto address = BufferCache::GuestAddress(faults[index]);
+			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
-		m_buffer_cache.MarkDmaAccess(fault_ranges);
+		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			(void)m_buffer_cache.FindBuffer(start, end - start);
+		});
 		m_fault_areas[area] = 0;
 	});
 

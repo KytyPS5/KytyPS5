@@ -613,7 +613,7 @@
         const u32 wave32 = wave64 ? 0 : 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT;
         processor.DispatchDirect(1, 1, 1, 0x41u | wave32);
         scheduler.Finish();
-        // Tags the pages the mirror found unsynchronized for the next dispatch.
+        // Creates buffers for the pages the mirror faulted on.
         cache.ProcessFaultBuffer();
         cache.ReadMemory(output, lanes * 32);
         std::vector<u32> result(lanes * 8);

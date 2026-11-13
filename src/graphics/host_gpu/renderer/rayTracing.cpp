@@ -24,7 +24,7 @@ enum Mode : uint32_t { Walk, Triangles, Boxes, Instances };
 
 constexpr uint32_t PairGeometry = 1; // The geometry hash of its last build or update is known.
 constexpr uint32_t PairUpdated  = 2;
-constexpr uint32_t StateAbsent  = 1; // The job met an unsynchronized page.
+constexpr uint32_t StateAbsent  = 1; // The job met a page no buffer backs.
 constexpr uint32_t GroupSize    = 64;
 constexpr uint64_t TriangleSize = 36;
 

@@ -191,7 +191,7 @@
                                 vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0,
                                 nullptr);
         scheduler.Finish();
-        // Tags the pages the job found unsynchronized for the next call.
+        // Creates buffers for the pages the job faulted on.
         cache.ProcessFaultBuffer();
         scheduler.Finish();
         output.Invalidate(0, output.Size());

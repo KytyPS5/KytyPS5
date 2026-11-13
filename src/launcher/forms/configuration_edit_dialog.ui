@@ -209,6 +209,12 @@
               <property name="text"><string>Relaxed shader float math</string></property>
              </widget>
             </item>
+            <item row="13" column="1">
+             <widget class="QCheckBox" name="checkBox_native_rt">
+              <property name="toolTip"><string>Use native RT on the GPU.</string></property>
+              <property name="text"><string>Native ray tracing (experimental)</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

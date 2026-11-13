@@ -565,10 +565,10 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 	return true;
 }
 
-// The next mapping slot, whose table starts at `offset` in the flattened SRT.
-uint32_t AddIndirectMapping(ResourceSnapshot& snapshot, size_t offset) {
-	snapshot.indirect_mapping_offsets.push_back(static_cast<uint32_t>(offset));
-	return static_cast<uint32_t>(snapshot.indirect_mapping_offsets.size() - 1u);
+// A root's mapping starts at `offset` in the flattened SRT.
+void SetIndirectMapping(ResourceSnapshot& snapshot, uint32_t slot, size_t offset) {
+	EXIT_IF(slot >= snapshot.indirect_mapping_offsets.size());
+	snapshot.indirect_mapping_offsets[slot] = static_cast<uint32_t>(offset);
 }
 
 template <typename Specialization, typename Normalize>
@@ -597,7 +597,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		if (found == descriptors.end()) {
 			descriptors.push_back(candidate);
 			auto child = root_resource;
-			child.indirect_root = resource_index;
+			child.indirect_root         = resource_index;
+			child.indirect_mapping_slot = NoIndirectMappingSlot;
 			specializations.push_back(child);
 		}
 		return ordinal;
@@ -734,8 +735,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					if (view.kinds.empty()) return true;
 					auto root = root_resource;
 					root.indirect_root = resource_index;
-					root.indirect_mapping_slot =
-					    AddIndirectMapping(snapshot, snapshot.flattened_srt.size());
+					SetIndirectMapping(snapshot, root.indirect_mapping_slot,
+					                   snapshot.flattened_srt.size());
 					root.heap = true;
 					specializations[resource_index] = root;
 					snapshot.flattened_srt.insert(snapshot.flattened_srt.end(),
@@ -803,8 +804,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
-				root.indirect_mapping_slot = AddIndirectMapping(snapshot, mapping_offset);
-				root.indirect_searched     = false;
+				root.indirect_searched = false;
+				SetIndirectMapping(snapshot, root.indirect_mapping_slot, mapping_offset);
 			}
 			return true;
 		}
@@ -894,10 +895,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
-		auto& root                      = specializations[resource_index];
-		root.indirect_root              = resource_index;
-		root.indirect_mapping_slot      = AddIndirectMapping(snapshot, mapping_offset);
-		root.indirect_searched          = true;
+		auto& root             = specializations[resource_index];
+		root.indirect_root     = resource_index;
+		root.indirect_searched = true;
+		SetIndirectMapping(snapshot, root.indirect_mapping_slot, mapping_offset);
 	}
 	return true;
 }
@@ -1432,13 +1433,32 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+// A mapping slot per indirect root, in resource order: which tables hold candidates moves none.
+static void AssignIndirectMappingSlots(ResourcePlan& plan) {
+	plan.indirect_mapping_slots = 0;
+	const auto assign           = [&](auto& resources, bool sampler) {
+		for (auto& resource: resources) {
+			const auto* source = Source(plan, resource.source);
+			const bool  table  = source != nullptr && source->indirect_descriptor &&
+			                     (!sampler || source->indirect_descriptor->sources.empty());
+			resource.indirect_mapping_slot =
+			    table ? plan.indirect_mapping_slots++ : NoIndirectMappingSlot;
+		}
+	};
+	assign(plan.info.buffers, false);
+	assign(plan.info.images, false);
+	assign(plan.info.samplers, true);
+}
+
 // State an extracted or loaded plan derives from its fields: one key set per selector group, which
-// extraction numbers densely in order of first use (false when they are not), and the walker.
+// extraction numbers densely in order of first use (false when they are not), the mapping slots and
+// the walker.
 static bool DerivePlanState(ResourcePlan& plan) {
 	for (const auto group: plan.selector_groups) {
 		if (group == plan.selector_keys.size()) plan.selector_keys.emplace_back();
 		if (group != UINT32_MAX && group >= plan.selector_keys.size()) return false;
 	}
+	AssignIndirectMappingSlots(plan);
 	if (plan.srt_plan_complete && plan.resource_tracking_complete) CompileSrtWalker(plan);
 	return true;
 }
@@ -1644,7 +1664,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	snapshot.indirect_mapping_offsets.clear();
+	snapshot.indirect_mapping_offsets.assign(program.indirect_mapping_slots, 0u);
 	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
@@ -1700,6 +1720,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		specialization.buffers[i].indirect_mapping_slot =
+		    program.info.buffers[i].indirect_mapping_slot;
+	}
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
@@ -1807,6 +1831,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.samplers.resize(program.info.samplers.size());
 	specialization.samplers.assign(program.info.samplers.size(), {});
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		specialization.samplers[i].indirect_mapping_slot =
+		    program.info.samplers[i].indirect_mapping_slot;
+	}
 	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
@@ -2201,7 +2229,8 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       parameter_keys, capture_specialization_reads, srt_plan_complete,
 	       resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, srt_user_data, srt_captures, indirect_mapping_slots, srt_scratch,
+	       material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, parameter_keys,

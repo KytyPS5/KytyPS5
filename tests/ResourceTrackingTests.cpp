@@ -4769,6 +4769,31 @@ void TestIndexedMaterialImageKeys() {
               specialization == before && snapshot.indirect_mapping_offsets == before_offsets,
           "the original tables did not restore their mapping offsets");
   }
+  {
+    // The first two tables lose every candidate; the third keeps the slot it had.
+    const auto before = specialization;
+    const auto null_key = (heap - base) / 4u;
+    std::array<uint32_t, 8> saved{};
+    std::copy_n(memory.words.begin() + null_key, saved.size(), saved.begin());
+    std::fill_n(memory.words.begin() + null_key, saved.size(), 0u);
+    for (uint32_t row = 0; row < 10u; ++row) memory.words[(row * 96u + 64u) / 4u] = 100u;
+    memory.narrow = false;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 4u && snapshot.indirect_mapping_offsets.size() == 3u &&
+              specialization.images[0].indirect_root == ImageResource::NoIndirectImage &&
+              specialization.images[1].indirect_root == ImageResource::NoIndirectImage &&
+              specialization.images[2].indirect_root == 2u,
+          "the material rows did not leave the first tables without candidates");
+    for (uint32_t root = 0; root < 3u; ++root)
+      Check(specialization.images[root].indirect_mapping_slot == root &&
+                before.images[root].indirect_mapping_slot == root,
+            "a table that lost its candidates renumbered the mapping slots");
+    std::copy_n(saved.begin(), saved.size(), memory.words.begin() + null_key);
+    for (uint32_t row = 0; row < 10u; ++row) memory.words[(row * 96u + 64u) / 4u] = 12994u;
+    memory.narrow = true;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == before,
+          "the original tables did not restore their specialization");
+  }
   auto shared_program = make_program(ShaderType::Compute, true);
   auto shared = ExtractResourcePlan(shared_program);
   Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 9u,

@@ -810,6 +810,7 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
+	uint32_t                              indirect_mapping_slots = 0; // One per indirect root.
 	// GPU-thread scratch for walker results and material keys.
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;

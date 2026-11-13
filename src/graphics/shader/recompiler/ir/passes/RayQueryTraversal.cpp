@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
 #include <array>
 #include <optional>
@@ -86,6 +88,23 @@ Block::iterator Position(Inst& inst) {
 	return std::ranges::find_if(*inst.Parent(), [&](const Inst& other) { return &other == &inst; });
 }
 
+size_t BlockIndex(const Program& program, const Block* block) {
+	return static_cast<size_t>(std::ranges::find(program.blocks, block) - program.blocks.begin());
+}
+
+// The innermost loop around a block: the nearest header before it whose latch is at or after it.
+Block* EnclosingLoop(const Program& program, const Block* block) {
+	const auto at = BlockIndex(program, block);
+	for (auto header = at; header-- > 0;) {
+		const auto& term = program.blocks[header]->terminator;
+		if (term.loop_header && term.continue_block != nullptr &&
+		    BlockIndex(program, term.continue_block) >= at) {
+			return program.blocks[header];
+		}
+	}
+	return nullptr;
+}
+
 struct Traversal {
 	Block*               preheader = nullptr;
 	Block*               header    = nullptr;
@@ -119,18 +138,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	}
 
 	// The innermost loop around the intersection, entered from one preheader.
-	const auto& blocks = program.blocks;
-	const auto  index  = [&](const Block* block) {
-		return static_cast<size_t>(std::ranges::find(blocks, block) - blocks.begin());
-	};
-	const auto at = index(bvh.Parent());
-	for (auto header = at; header-- > 0 && t.header == nullptr;) {
-		const auto& term = blocks[header]->terminator;
-		if (term.loop_header && term.continue_block != nullptr &&
-		    index(term.continue_block) >= at) {
-			t.header = blocks[header];
-		}
-	}
+	t.header = EnclosingLoop(program, bvh.Parent());
 	if (t.header == nullptr || t.header->terminator.kind != CFG::TerminatorKind::Branch ||
 	    t.header->terminator.true_block == nullptr) {
 		return false;
@@ -231,15 +239,14 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 		}
 	}
 	if (root == nullptr || word0 == nullptr) return false;
-	const auto loop =
-	    std::span(blocks).subspan(index(t.header), index(t.latch) + 1 - index(t.header));
+	const auto loop = std::span(program.blocks.begin() + BlockIndex(program, t.header),
+	                            program.blocks.begin() + BlockIndex(program, t.latch) + 1);
 
 	// The query's iterations skip the box path, which pushes intersection results, and run the rest
 	// on stale state: it must have no other side effects and leave the loop only at the latch. Prim
 	// record word 1 and the instance flags and BLAS are each loaded once.
 	const auto inside = [&](const Block* block) {
-		const auto at = index(block);
-		return at >= index(t.header) && at <= index(t.latch);
+		return std::ranges::find(loop, block) != loop.end();
 	};
 	const std::array<std::pair<const Inst*, uint32_t>, 3> wanted {
 	    {{word0, 4}, {root, InstanceFlags}, {root, InstanceBlas}}};
@@ -412,14 +419,18 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 	}
 	uint32_t traced = 0;
 	for (auto* bvh: intersections) {
-		Traversal traversal;
-		if (!Match(program, *bvh, traversal) ||
-		    (traced != 0 && traversal.tlas != program.info.ray_query_tlas)) {
-			continue;
+		Traversal  traversal;
+		const bool traceable = Match(program, *bvh, traversal) &&
+		                       (traced == 0 || traversal.tlas == program.info.ray_query_tlas);
+		if (traceable) {
+			Rewrite(traversal);
+			program.info.ray_query_tlas = traversal.tlas;
+			++traced;
+		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x}\n",
+				            program.shader_hash));
 		}
-		Rewrite(traversal);
-		program.info.ray_query_tlas = traversal.tlas;
-		++traced;
 	}
 	return traced;
 }

@@ -261,6 +261,30 @@
     Require(name, "pixel shader", !traced(program, ShaderType::Pixel),
             "a pixel shader traversal was driven by a ray query");
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    // The console reports a loop the pass leaves alone, not a loop-free intersection.
+    const auto reported = [&](std::span<const u32> code) {
+      std::fflush(stdout);
+      const int console = dup(STDOUT_FILENO);
+      auto *capture = std::tmpfile();
+      dup2(fileno(capture), STDOUT_FILENO);
+      traced(code, ShaderType::Compute);
+      std::fflush(stdout);
+      dup2(console, STDOUT_FILENO);
+      close(console);
+      std::rewind(capture);
+      std::string text(4096, '\0');
+      text.resize(std::fread(text.data(), 1, text.size(), capture));
+      std::fclose(capture);
+      return text.find("BVH traversal left to emulation") != std::string::npos;
+    };
+    auto once = program;
+    once[at(0xbf89ff5au)] = 0xbf800000u; // s_nop 0 for s_cbranch_execnz loop
+    Require(name, "unrecognized loop", reported(stores),
+            "a loop the pass left alone was not reported");
+    Require(name, "loop-free", !reported(once), "a loop-free intersection was reported");
+#endif
+
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;

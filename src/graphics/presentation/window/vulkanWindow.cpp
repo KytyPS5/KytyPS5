@@ -62,6 +62,8 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	        .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 	        .descriptorBindingUpdateUnusedWhilePending    = VK_TRUE,
 	        .descriptorBindingPartiallyBound              = VK_TRUE,
+	        .descriptorBindingVariableDescriptorCount     = VK_TRUE,
+	        .runtimeDescriptorArray                       = VK_TRUE,
 	        .timelineSemaphore                            = VK_TRUE,
 	        .bufferDeviceAddress                          = VK_TRUE,
 	        .shaderOutputViewportIndex                    = VK_TRUE,
@@ -249,6 +251,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "descriptorBindingUpdateUnusedWhilePending");
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
+		check_feature(features12.descriptorBindingVariableDescriptorCount,
+		              "descriptorBindingVariableDescriptorCount");
+		check_feature(features12.runtimeDescriptorArray, "runtimeDescriptorArray");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering");

@@ -74,6 +74,36 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 		return batch.sets[--batch.size];
 	}
 
+	NextPool();
+	auto& fresh_batch       = m_sets[layout];
+	allocate.descriptorPool = m_current_pool;
+	EXIT_IF(!fill(fresh_batch));
+	return fresh_batch.sets[--fresh_batch.size];
+}
+
+vk::DescriptorSet DescriptorHeap::CommitVariable(vk::DescriptorSetLayout layout, uint32_t count) {
+	vk::DescriptorSetVariableDescriptorCountAllocateInfo variable {};
+	variable.descriptorSetCount = 1;
+	variable.pDescriptorCounts  = &count;
+	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.pNext              = &variable;
+	allocate.descriptorSetCount = 1;
+	allocate.pSetLayouts        = &layout;
+	vk::DescriptorSet set       = nullptr;
+	for (const bool fresh: {false, true}) {
+		allocate.descriptorPool = m_current_pool;
+		const auto result       = m_graphics.device.allocateDescriptorSets(&allocate, &set);
+		if (result == vk::Result::eSuccess) {
+			break;
+		}
+		EXIT_IF(fresh || (result != vk::Result::eErrorOutOfPoolMemory &&
+		                  result != vk::Result::eErrorFragmentedPool));
+		NextPool();
+	}
+	return set;
+}
+
+void DescriptorHeap::NextPool() {
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
@@ -82,12 +112,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	} else {
 		CreateDescriptorPool();
 	}
-
 	m_sets.clear();
-	auto& fresh_batch       = m_sets[layout];
-	allocate.descriptorPool = m_current_pool;
-	EXIT_IF(!fill(fresh_batch));
-	return fresh_batch.sets[--fresh_batch.size];
 }
 
 void DescriptorHeap::CreateDescriptorPool() {

@@ -20,6 +20,8 @@ public:
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
+	// A set whose variable-count binding holds `count` descriptors.
+	[[nodiscard]] vk::DescriptorSet CommitVariable(vk::DescriptorSetLayout layout, uint32_t count);
 
 	// Descriptors of `type` one pool holds; a set that needs more can never be allocated.
 	[[nodiscard]] static uint32_t PoolCapacity(vk::DescriptorType type);
@@ -33,6 +35,7 @@ private:
 	};
 
 	void CreateDescriptorPool();
+	void NextPool();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;

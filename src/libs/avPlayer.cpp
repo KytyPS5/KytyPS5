@@ -1129,8 +1129,19 @@ private:
 		if (c == nullptr) {
 			return false;
 		}
-		if (avcodec_parameters_to_context(c, s->codecpar) < 0 ||
-		    avcodec_open2(c, dec, nullptr) < 0) {
+		if (avcodec_parameters_to_context(c, s->codecpar) < 0) {
+			avcodec_free_context(&c);
+			return false;
+		}
+		if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+			// Decode video on one thread per CPU. One emulated core decodes a 3840x2160 60 Hz H.264
+			// stream (Astro Bot's PlayStation Studios intro) at about 40 frames per second, so the
+			// video plays late and stutters. FFmpeg's decoded frames do not depend on the thread
+			// count; frame threading only delays the first output by a few frames.
+			c->thread_count = 0;
+			c->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+		}
+		if (avcodec_open2(c, dec, nullptr) < 0) {
 			avcodec_free_context(&c);
 			return false;
 		}

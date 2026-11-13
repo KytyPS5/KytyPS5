@@ -292,6 +292,35 @@ public:
 		return split ? nullptr : result;
 	}
 
+	// The backing bytes of [vaddr, vaddr + size) as one piece per run of contiguous backing, in order (the pieces are
+	// contiguous in the guest range); false if a part is not backed.
+	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
+		pieces.clear();
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		bool complete = true;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t, uint64_t bytes) { pieces.emplace_back(m_backing_base + offset, bytes); },
+		    [&](uint64_t, uint64_t) { complete = false; });
+		return complete && !pieces.empty();
+	}
+
+	// Linux: the pages of [address, address + size) of the backing view freed (a hole punched in the store's memfd: gone
+	// from every view of them, a later read gets zeros). False elsewhere.
+	bool DiscardPages(uint64_t address, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		return address >= base && address - base < m_size && size <= m_size - (address - base) &&
+		       fallocate(m_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(address - base),
+		                 static_cast<off_t>(size)) == 0;
+#else
+		(void)address, (void)size;
+		return false;
+#endif
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) const {
 		auto* destination = static_cast<uint8_t*>(data);
@@ -703,6 +732,12 @@ public:
 	[[nodiscard]] const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) const {
 		return m_backing->FindBackingPointer(vaddr, size);
 	}
+
+	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
+		return m_backing->BackingPieces(vaddr, size, pieces);
+	}
+
+	bool DiscardBacking(uint64_t address, uint64_t size) { return m_backing->DiscardPages(address, size); }
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {

@@ -28,6 +28,8 @@ public:
 	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept;
 	// Whether cache tracking currently restricts access to the page holding vaddr.
 	[[nodiscard]] bool IsWatched(uint64_t vaddr) const;
+	// Whether any page of [vaddr, vaddr + size) is watched; then the first watched page and the end of the last one.
+	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept;
 	// The watchers' protections carry no execute permission: puts it back on the page holding
 	// vaddr, with their access. False while read watchers keep the page inaccessible.
 	[[nodiscard]] bool AllowExecute(uint64_t vaddr);

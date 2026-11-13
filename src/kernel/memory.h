@@ -142,9 +142,25 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The
 // pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+// The backing store's bytes of [vaddr, vaddr + size) as one piece per run of contiguous backing, in order; false if a
+// part is not backed.
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+// Linux: the pages of [address, address + size) of the backing view (an address in the view, as TryGetBackingPieces gives
+// them) freed from every view of them: a hole punched in the store, a later read gets zeros. False elsewhere.
+bool DiscardBacking(uint64_t address, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
-// Whether TryReadGpuCleanBacking() would read the size bytes at expected, compared in place.
-[[nodiscard]] bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size);
+// Whether a GPU cache's tracker watches a page of [vaddr, vaddr + size) (its guest pages are protected).
+[[nodiscard]] bool     GuestRangeWatched(uint64_t vaddr, uint64_t size);
+// The game freed [vaddr, vaddr + size) and keeps it mapped (Demon's Souls' page allocator): if a GPU cache's tracker
+// watches a page of it, the buffers over it go without waiting (RenderContext::FreedByGame).
+void                   NoteGameFree(uint64_t vaddr, uint64_t size);
+// The texture offload / hot reads are about to take [backing, backing + size) of the backing view: the pages read back
+// there are no longer locked.
+void                   DropHotReadsBacking(uint64_t backing, uint64_t size);
+// Whether TryReadGpuCleanBacking() would read the size bytes at expected, compared in place (by
+// `equal` when given, else memcmp).
+[[nodiscard]] bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
+                                         bool (*equal)(const void*, const void*, uint64_t) = nullptr);
 // GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
 bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
 // Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU

@@ -28,6 +28,7 @@ struct GraphicContext;
 class CommandScheduler;
 class CommandRecorder;
 class TextureCache;
+class RenderContext;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
@@ -86,7 +87,7 @@ public:
 	}
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	            TextureCache& texture_cache);
+	            TextureCache& texture_cache, RenderContext* resources = nullptr);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
@@ -97,6 +98,25 @@ public:
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
+	// RenderContext::UnmapMemory, after InvalidateMemory: the buffers the unmapped range holds whole go (nothing the guest
+	// maps reaches them any more); the bytes of the buffers let go.
+	uint64_t               DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
+	// The game's free blocks (its page allocator's, pages kept mapped) over [begin, end) added to `blocks` as (address,
+	// size): false when not known (Loader::DemonsSoulsPageFree::FreeBlocksIn).
+	using FreeBlocksQuery = bool (*)(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks);
+	// What DropFreedRange's free block lists did: lists read, bytes cut off only thanks to them.
+	struct FreeBlockSplits {
+		uint64_t lists = 0, cut = 0;
+	};
+	// A buffer the range holds in part, mapped in no more than half of it now, is cut to its mapped parts (new buffers with
+	// its bytes copied on the GPU); the bytes cut off. With `free_blocks` (a freed range, DropFreedRange), the game's free
+	// blocks over it count as unmapped too.
+	uint64_t               SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks = nullptr,
+	                                            FreeBlockSplits* splits = nullptr);
+	// The game freed [vaddr, vaddr + size) and keeps it mapped: its GPU-written bytes read back (`read_back`) or dropped,
+	// then its buffers go as an unmapped range's do; the bytes of buffers let go. Nothing when no buffer is registered there.
+	uint64_t               DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
+	                                      FreeBlockSplits* splits);
 	// A CPU write that already reached guest memory, from a thread that cannot read back:
 	// pages the GPU owns stay GPU-owned, the rest become CPU-modified.
 	void                   InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept;
@@ -370,6 +390,7 @@ private:
 	};
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	RenderContext*                                    m_resources = nullptr;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;

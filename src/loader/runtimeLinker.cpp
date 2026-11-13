@@ -22,6 +22,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsCopy.h"
+#include "loader/demonsSoulsPageFree.h"
 #include "loader/demonsSoulsLoaderGuard.h"
 #include "loader/demonsSoulsSceneGuard.h"
 #include "loader/demonsSoulsTouchGuard.h"
@@ -1412,6 +1413,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		                                                !game_patch.empty());
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsPageFree::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program: m_programs) DemonsSoulsCopy::Install(program);
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
@@ -1447,6 +1449,7 @@ void RuntimeLinker::Clear() {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
 	Common::LockGuard lock(m_mutex);
+	DemonsSoulsPageFree::Clear();
 	DemonsSoulsGpuPages::Clear();
 	DemonsSoulsCopy::Clear();
 	GamePatch::Clear();

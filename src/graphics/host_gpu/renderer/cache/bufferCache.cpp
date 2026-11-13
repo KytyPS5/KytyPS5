@@ -260,8 +260,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                         PageManager& page_manager, TextureCache& texture_cache)
-    : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+                         PageManager& page_manager, TextureCache& texture_cache, RenderContext* resources)
+    : m_graphics(graphics), m_scheduler(scheduler), m_resources(resources),
+      m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
@@ -1963,6 +1964,168 @@ void BufferCache::CollectStaleBuffers(uint64_t tick) {
 		}
 		DeleteBuffer(id);
 	}
+}
+
+// RenderContext::UnmapMemory, after InvalidateMemory: the buffers the unmapped range holds whole go. Nothing the guest
+// maps reaches them any more (the BDA page table drops them with the registration), and kept they stayed in video
+// memory for good (the collector waits for a frame without BDA shaders, which this game never has): at 1-1, 151
+// buffers of 2.5 GiB after 12 minutes. Their GPU-written bytes were read back by InvalidateMemory; one still GPU-owned
+// stays. A buffer the range holds in part stays (its mapped rest is still the game's).
+uint64_t BufferCache::DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size) return 0;
+	const auto            end = vaddr + size;
+	std::vector<BufferId> ids;
+	uint64_t              bytes = 0;
+	for (auto it = m_buffers.lower_bound(vaddr); it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.is_deleted || buffer.CpuAddress() + buffer.Size() > end ||
+		    m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()))
+			continue;
+		ids.push_back(it->second);
+	}
+	for (const auto id: ids) {
+		auto& buffer = m_slot_buffers[id];
+		bytes += buffer.Size();
+		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
+		DeleteBuffer(id);
+	}
+	return bytes;
+}
+
+// A buffer the unmapped range holds in part stays for its mapped rest, and joins of buffers next to it grew it on (stream
+// leaps over memory the game maps and unmaps as it streams): at 1-1, partly unmapped buffers of 3.6 GiB of the 4.9 GiB
+// registered after 9 rounds of the user's route (36 minutes), one of 1.2 GiB, all kept by the collector (GPU-owned
+// bytes, read through BDA). Once mapped in no more than half of it, it is cut to its mapped runs: new buffers with its
+// bytes copied on the GPU (as a join copies them; the BDA page table points at them), so the bytes copied are at most
+// the bytes freed. Its unmapped bytes are nobody's: their GPU-owned ones were read back when unmapped (InvalidateMemory),
+// and a buffer with some there left is kept as it is.
+uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBlocksQuery free_blocks,
+                                           FreeBlockSplits* splits) {
+	if (m_resources == nullptr || size == 0 || UINT64_MAX - vaddr < size) return 0;
+	const auto            end = vaddr + size;
+	std::vector<BufferId> candidates;
+	uint64_t              cut = 0, lowest = vaddr, highest = end;
+	auto                  it = m_buffers.lower_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		const auto& buffer = m_slot_buffers[std::prev(it)->second];
+		if (buffer.CpuAddress() + buffer.Size() > vaddr) candidates.push_back(std::prev(it)->second);
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > end) candidates.push_back(it->second);
+	}
+	for (const auto id: candidates) {
+		lowest  = std::min(lowest, m_slot_buffers[id].CpuAddress());
+		highest = std::max(highest, m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size());
+	}
+	// Mapped runs closer than the game's 64 KiB pages stay one buffer. (A stream leap no longer joins them again over the
+	// gap: ResolveOverlaps. With 2 MiB here a pool mapping 256 KiB of each MiB stayed whole.)
+	constexpr uint64_t Gap = CACHING_PAGESIZE * 4;
+	// (A freed range's: the game's free blocks over the candidates, its allocator's lists read once for all of them, and
+	// only for one of a MiB or more that would stay otherwise.)
+	constexpr uint64_t                         MinFreeBlockSplit = uint64_t {1} << 20u;
+	std::vector<std::pair<uint64_t, uint64_t>> free_list;
+	bool                                       listed = false, have_list = false;
+	for (const auto id: candidates) {
+		const auto& old = m_slot_buffers[id];
+		if (old.is_deleted) continue;
+		const auto begin = old.CpuAddress(), stop = begin + old.Size();
+		RangeSet   mapped;
+		m_resources->MappedRanges(begin, stop - begin, mapped);
+		mapped.Subtract(vaddr, size); // (not subtracted yet: UnmapMemory does it after this)
+		std::vector<std::pair<uint64_t, uint64_t>> pieces;
+		uint64_t                                   kept = 0;
+		const auto                                 cut_pieces = [&] {
+			pieces.clear();
+			mapped.ForEach([&](uint64_t from, uint64_t to) {
+				from = std::max(begin, from & ~(CACHING_PAGESIZE - 1));
+				to   = std::min(stop, (to + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1));
+				if (!pieces.empty() && from <= pieces.back().second + Gap) {
+					pieces.back().second = std::max(pieces.back().second, to);
+				} else if (from < to) {
+					pieces.emplace_back(from, to);
+				}
+			});
+			kept = 0;
+			for (const auto& [from, to]: pieces) kept += to - from;
+		};
+		cut_pieces();
+		bool over_free_blocks = false;
+		if (kept * 2 > stop - begin) {
+			// A buffer over freed blocks next to each other (the game's GPU heap gives three of 120 MiB back at a world load,
+			// one at a time, and one buffer of 360 MiB was over them; each block alone left it two thirds mapped) or over
+			// blocks freed before: their bytes are nobody's as this one's. Their GPU-written bytes read back first, as for
+			// this one, and their pages left CPU-dirty for whatever buffer the next owner's use makes there.
+			if (free_blocks == nullptr || stop - begin < MinFreeBlockSplit) continue;
+			if (!std::exchange(listed, true)) {
+				have_list = free_blocks(lowest, highest, &free_list);
+				if (splits != nullptr) splits->lists++;
+			}
+			if (!have_list) continue;
+			std::vector<std::pair<uint64_t, uint64_t>> over;
+			for (const auto& [address, bytes]: free_list) {
+				const auto from = std::max(begin, address), to = std::min(stop, address + bytes);
+				if (from < to) over.emplace_back(from, to - from);
+			}
+			if (over.empty()) continue;
+			for (const auto& [address, bytes]: over) mapped.Subtract(address, bytes);
+			cut_pieces();
+			if (kept * 2 > stop - begin) continue;
+			for (const auto& [address, bytes]: over) InvalidateMemory(address, bytes);
+			if (m_slot_buffers[id].is_deleted) continue;
+			over_free_blocks = true;
+		}
+		// (GPU-owned bytes outside the pieces would be lost with it.)
+		bool     owned_outside = false;
+		uint64_t at            = begin;
+		for (const auto& [from, to]: pieces) {
+			owned_outside = owned_outside || (from > at && m_gpu_modified_ranges.Intersects(at, from - at));
+			at            = to;
+		}
+		if (owned_outside || (stop > at && m_gpu_modified_ranges.Intersects(at, stop - at))) continue;
+		// New buffers first (inserting can move the slots: the old one is looked up again after), then the copies, the
+		// old one out, the new ones in (CreateBuffer's order).
+		std::vector<BufferId> ids;
+		for (const auto& [from, to]: pieces) {
+			ids.push_back(m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, from,
+			                                    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, to - from));
+		}
+		const auto& source = m_slot_buffers[id];
+		for (size_t i = 0; i < ids.size(); ++i) {
+			auto&      piece      = m_slot_buffers[ids[i]];
+			const auto [from, to] = pieces[i];
+			piece.device_address_pinned |= source.device_address_pinned;
+			SetVulkanObjectNameF(m_graphics.device, piece.Handle(), "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", from,
+			                     to - from);
+			piece.CopyFrom(m_scheduler.Current(), source, from - begin, 0, to - from);
+			NoteWrite(from, to - from); // (as JoinOverlap)
+		}
+		cut += stop - begin - kept;
+		if (over_free_blocks && splits != nullptr) splits->cut += stop - begin - kept;
+		DeleteBuffer(id);
+		for (const auto piece: ids) Register(piece);
+	}
+	return cut;
+}
+
+// Demon's Souls' page allocator keeps the pages of a block it takes back mapped and hands them to the next pool that asks.
+// A buffer over a freed block stayed for good when shaders had read it through pointers (a BDA-read buffer goes only with
+// its memory unmapped), and joins grew the next ones over it: the game's GPU heap moves three of its 120 MiB blocks at
+// each world load, other pools took the old ones over, and a buffer of 120 MiB stayed over each (long runs on an 8 GB
+// card with reduced texture streaming: the buffers grew from ~2 GiB to 3.1-3.4 in 40 loads, past the video memory
+// budget). The bytes there are nobody's until the game takes them again: GPU-written ones read back first all the same (an
+// older submission still to run may read them: commands run between its packets), unless dropped (`read_back` false). A
+// buffer over this block and others free too (`free_blocks`, the allocator's lists) is cut to the rest or goes.
+uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
+                                     FreeBlockSplits* splits) {
+	if (size == 0 || UINT64_MAX - vaddr < size || !IsRegionRegistered(vaddr, size)) return 0;
+	if (read_back) {
+		InvalidateMemory(vaddr, size);
+	} else {
+		DiscardGpuWrites(vaddr, size);
+	}
+	const auto deleted = DeleteUnmappedBuffers(vaddr, size);
+	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
 }
 
 void BufferCache::RunGarbageCollector() {

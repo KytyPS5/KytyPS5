@@ -5640,24 +5640,33 @@ public:
         }
       }
 
+      // The buffers an unmap holds whole go with it (RenderContext::UnmapMemory ->
+      // DeleteUnmappedBuffers): nothing the guest maps reaches them any more. Buffers elsewhere
+      // stay, and the unmapped bytes read as CPU modified for whatever is cached over them later.
+      const auto survivor_begin = base + index_offset + 8 * index_page;
+      const auto mapped_owner = cache.FindBuffer(survivor_begin + 0x100, sizeof(uint32_t));
+      Require(name, "unmap keeps other owners", mapped_owner && cache.IsRegionRegistered(survivor_begin, index_page),
+              "no buffer over the memory that stays mapped");
       resources.UnmapMemory(index_begin, index_span);
       resources.UnmapMemory(base + recycled_offset, index_page);
-      Require(name, "invalidation retains owners",
+      Require(name, "unmap deletes the buffers over unmapped memory",
               !resources.IsMapped(index_begin, index_span) &&
                   !resources.IsMapped(base + recycled_offset, index_page) &&
-                  cache.IsRegionRegistered(index_begin, index_span) &&
-                  BufferCacheTestAccess::PageOwner(cache, index_begin) ==
-                      index_bridge &&
-                  BufferCacheTestAccess::PageOwner(
-                      cache, index_begin + index_page) == index_bridge &&
-                  BufferCacheTestAccess::PageOwner(
-                      cache, index_begin + 2 * index_page) == index_bridge &&
-                  BufferCacheTestAccess::PageOwner(
-                      cache, base + recycled_offset) == recycled &&
+                  !cache.IsRegionRegistered(index_begin, index_span) &&
+                  !cache.IsRegionRegistered(base + recycled_offset, index_page) &&
+                  !BufferCacheTestAccess::PageOwner(cache, index_begin) &&
+                  !BufferCacheTestAccess::PageOwner(cache, index_begin + index_page) &&
+                  !BufferCacheTestAccess::PageOwner(cache, index_begin + 2 * index_page) &&
+                  !BufferCacheTestAccess::PageOwner(cache, base + recycled_offset) &&
                   cache.IsRegionCpuModified(index_begin, index_span) &&
                   cache.IsRegionCpuModified(base + recycled_offset,
                                             index_page),
-              "CPU invalidation retired a reusable Buffer owner");
+              "an unmap left a buffer over memory nothing maps, or did not mark it CPU modified");
+      Require(name, "unmap keeps other owners",
+              cache.IsRegionRegistered(survivor_begin, index_page) &&
+                  BufferCacheTestAccess::PageOwner(cache, survivor_begin) == mapped_owner &&
+                  resources.IsMapped(survivor_begin, index_page),
+              "an unmap deleted a buffer over memory that stays mapped");
       resources.MapMemory(index_begin, index_span);
       resources.MapMemory(base + recycled_offset, index_page);
 
@@ -6019,18 +6028,19 @@ public:
       Require(name, "direct-invalidation contents",
               unmap_backing == unmap_value &&
                   !resources.IsMapped(base + 0x4000, 0x4000) &&
-                  cache.IsRegionRegistered(base + 0x4000, 0x4000) &&
+                  !cache.IsRegionRegistered(base + 0x4000, 0x4000) &&
                   cache.IsRegionCpuModified(base + 0x4000, 0x4000) &&
                   !cache.IsRegionGpuModified(base + 0x4000, 0x4000) &&
                   !cache.HasGpuDirtyBytes(base + 0x4000, 0x4000),
-              "dirty invalidation did not publish bytes and retain its owner");
+              "dirty invalidation did not publish bytes and let go its owner");
       std::memcpy(memory + unmap_offset, &remap_value, sizeof(remap_value));
       resources.MapMemory(base + 0x4000, 0x4000);
       const auto remapped =
           cache.ObtainBuffer(base + unmap_offset, sizeof(remap_value), true);
       Require(name, "same-address remap allocation",
-              remapped.first == unmap_allocation.first,
-              "same-address remap did not synchronize the retained Buffer");
+              remapped.first != nullptr &&
+                  cache.IsRegionRegistered(base + 0x4000, 0x4000),
+              "same-address remap did not cache the memory again");
       Require(name, "same-address remap contents",
               ReadNativeValue(*remapped.first, remapped.second) == remap_value,
               "same-address remap reused stale native Buffer bytes");

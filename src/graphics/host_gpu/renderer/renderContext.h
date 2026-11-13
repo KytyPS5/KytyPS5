@@ -93,6 +93,12 @@ public:
 	// As InvalidateMemory before a host write of all of the range: the GPU-written bytes it replaces are dropped, not read
 	// back (BufferCache::InvalidateMemoryForWrite).
 	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+	// The mapped parts of [vaddr, vaddr + size), added to `out`.
+	void               MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;
+	// The game freed the range and keeps it mapped (LibKernel::Memory::NoteGameFree): queued for the GPU thread, whose
+	// buffers it holds go as for an unmap (BufferCache::DropFreedRange). KYTY_ENGINE_FREE_BUFFERS=0: nothing; =2: their
+	// GPU-written bytes dropped, not read back.
+	void               FreedByGame(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
@@ -104,6 +110,10 @@ public:
 		return m_page_manager.HasReadWatchers(vaddr, size);
 	}
 	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept { return m_page_manager.ReadGranules(); }
+	// PageManager::WatchedSpan.
+	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
+		return m_page_manager.WatchedSpan(vaddr, size, first, end);
+	}
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);

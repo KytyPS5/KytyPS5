@@ -848,6 +848,19 @@ bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
 }
 
+void NoteGameFree(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	if (g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) &&
+	    g_gpu_resources->WatchedSpan(vaddr, size, &first, &end))
+		g_gpu_resources->FreedByGame(vaddr, size);
+}
+
+void DropHotReadsBacking(uint64_t backing, uint64_t size) {
+	// Pages read back keep no access, their backing page locked in RAM, only with guard pages and the hot reads of the
+	// read-guard system (not in this tree yet): no backing page is locked, nothing to drop.
+	(void)backing, (void)size;
+}
+
 bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 	return TryPrepareHostWrite(vaddr, size);
 }
@@ -867,6 +880,14 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->FindBackingPointer(vaddr, size)
 	                                        : nullptr;
+}
+
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
+}
+
+bool DiscardBacking(uint64_t address, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->DiscardBacking(address, size);
 }
 
 static bool IsGpuCleanBacking(uint64_t vaddr, uint64_t size) {
@@ -916,6 +937,12 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool GuestRangeWatched(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->WatchedSpan(vaddr, size, &first, &end);
 }
 
 bool MayBeGpuWritten(uint64_t vaddr, uint64_t size) {

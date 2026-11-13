@@ -23,6 +23,7 @@
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsLoaderGuard.h"
+#include "loader/demonsSoulsSceneGuard.h"
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/demonsSoulsIdle.h"
@@ -1413,6 +1414,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program: m_programs) DemonsSoulsCopy::Install(program);
+	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsLoaderGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	Common::WriteFpEnv(Common::GuestFpEnv);
@@ -1675,6 +1677,13 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	}
 
 	return nullptr;
+}
+
+std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr) {
+	auto* linker = Common::Singleton<RuntimeLinker>::Instance();
+	const auto* program = vaddr == 0 ? nullptr : linker->FindProgramByAddr(vaddr);
+	if (program == nullptr) return {};
+	return program->file_name.filename().string() + "+0x" + fmt::format("{:x}", vaddr - program->base_vaddr);
 }
 
 void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {

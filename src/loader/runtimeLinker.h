@@ -215,6 +215,9 @@ bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
 #endif
 
+// "<module>+0x<offset>" for an address in a loaded guest module, else empty (diagnostics).
+std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr);
+
 } // namespace Loader
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_LOADER_RUNTIMELINKER_H_ */

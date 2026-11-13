@@ -488,6 +488,8 @@ list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
+	"${KYTY_SOURCE_DIR}/local/local-platform.h"
+	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 

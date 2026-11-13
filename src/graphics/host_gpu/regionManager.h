@@ -160,6 +160,17 @@ public:
 		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
 	}
 
+	// What a proof of unchanged bytes holds on: moves when pages of the region become CPU dirty, when GPU-written
+	// pages are given back to the CPU (their bytes are the GPU's now) and when the emulator wrote CPU-dirty pages
+	// (NoteHostWrite); with the guest's writes to dirty pages, every change of the region's bytes the CPU can see.
+	// (chenxiao07's RegionManager::CpuModificationEpoch.)
+	[[nodiscard]] uint64_t CpuModificationEpoch() const {
+		return m_cpu_dirty_epoch.load(std::memory_order_acquire) + m_gpu_clean_epoch.load(std::memory_order_acquire) +
+		       m_host_write_epoch.load(std::memory_order_acquire);
+	}
+	// The emulator wrote CPU-dirty pages of the region (their state stays).
+	void NoteHostWrite() noexcept { m_host_write_epoch.fetch_add(1, std::memory_order_release); }
+
 	// Advances whenever pages of any region stop being GPU dirty.
 	[[nodiscard]] static uint64_t GpuCleanEpoch() {
 		return s_gpu_clean_epoch.load(std::memory_order_acquire);
@@ -465,6 +476,7 @@ private:
 	RegionBits                 m_gpu_written;
 	std::unique_ptr<BusyPages> m_busy;
 	std::atomic<uint32_t>      m_kept_sync {0};
+	std::atomic<uint64_t> m_host_write_epoch {0};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 	inline static std::atomic<uint64_t> s_gpu_clean_epoch {0};

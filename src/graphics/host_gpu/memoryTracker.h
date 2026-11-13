@@ -123,6 +123,22 @@ public:
 		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
 	}
 
+	// RegionManager::CpuModificationEpoch of the region the range is in; 0 for an untracked region or a range over
+	// several regions (nothing provable: do not cache).
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || !GuestRange {vaddr, size}.Valid() ||
+		    vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE)
+			return 0;
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
+	}
+	// The emulator wrote guest memory itself (any thread): the epochs of the regions it touches move.
+	void NoteHostWrite(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || !GuestRange {vaddr, size}.Valid()) return;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size; ++index)
+			if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) manager->NoteHostWrite();
+	}
+
 	// The GPU-clean epoch of the tracking region `index`, which advances whenever its pages stop
 	// being GPU dirty; 0 while the region is untracked.
 	[[nodiscard]] uint64_t RegionGpuCleanEpoch(uint64_t index) const {

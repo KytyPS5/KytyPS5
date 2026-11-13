@@ -145,6 +145,7 @@ void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_s
 	EXIT_IF(dst == nullptr || offset > gds.Size() || size > gds.Size() - offset ||
 	        gds.Mapped().empty());
 	std::memcpy(dst, gds.Mapped().data() + offset, static_cast<size_t>(size));
+	LibKernel::Memory::NoteEmulatorWrite(reinterpret_cast<uint64_t>(dst), size);
 }
 
 } // namespace Libs::Graphics::Sync

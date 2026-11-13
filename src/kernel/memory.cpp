@@ -865,12 +865,20 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 	return TryPrepareHostWrite(vaddr, size);
 }
 
+void NoteEmulatorWrite(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr) g_gpu_resources->GetBufferCache().NoteHostWrite(vaddr, size);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (written) NoteEmulatorWrite(vaddr, size);
+	return written;
 }
 
 bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride) {
-	return g_guest_address_space->TryWriteBackingQwords(vaddr, values, count, stride);
+	const bool written = g_guest_address_space->TryWriteBackingQwords(vaddr, values, count, stride);
+	if (written && count != 0) NoteEmulatorWrite(vaddr, uint64_t {count - 1u} * stride + sizeof(uint64_t));
+	return written;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

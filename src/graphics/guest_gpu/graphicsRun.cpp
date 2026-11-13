@@ -862,6 +862,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		const auto* data  = write_one_address ? src + dw_num - 1 : src;
 		const auto  bytes = uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t);
 		if (m_renderer.WriteAroundGpuWrites(dst, data, bytes)) {
+			LibKernel::Memory::NoteEmulatorWrite(reinterpret_cast<uint64_t>(dst), bytes);
 			return;
 		}
 		m_renderer.PrepareGpuWrite(dst, bytes);
@@ -870,6 +871,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 			*output = src[i];
 			output += !write_one_address;
 		}
+		LibKernel::Memory::NoteEmulatorWrite(reinterpret_cast<uint64_t>(dst), bytes);
 	}, {.address = reinterpret_cast<uint64_t>(dst), .data = src, .dwords = dw_num,
 	    .one_address = write_one_address});
 	if (write_one_address) {
@@ -915,6 +917,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		}
 		const auto value = Sync::ReadReferenceClock();
 		std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+		LibKernel::Memory::NoteEmulatorWrite(dst_address, num_bytes);
 		static std::atomic<uint32_t> clock_log_count {0};
 		if (clock_log_count.fetch_add(1) < 64) {
 			LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -2435,6 +2438,7 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 			m_renderer.PrepareGpuWrite(address, size);
 			std::memcpy(address, value, size);
+			LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
 		}
 	};
 	// Occlusion counters reach guest memory in a priority completion once the GPU got past

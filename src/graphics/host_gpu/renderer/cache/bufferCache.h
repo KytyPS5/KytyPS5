@@ -266,6 +266,36 @@ public:
 		}
 		return epoch;
 	}
+	// chenxiao07's BufferCache::CpuModificationEpoch: the sum of the tracker regions' RegionManager::CpuModificationEpoch
+	// over the range (up to 64 regions); 0 when a region is untracked or the range is larger: nothing provable.
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || !GuestRange {vaddr, size}.Valid()) return 0;
+		constexpr uint64_t MaxRegions = 64;
+		const uint64_t     first      = vaddr / TRACKER_REGION_SIZE;
+		const uint64_t     last       = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		if (last - first >= MaxRegions) return 0;
+		uint64_t sum = 0;
+		for (uint64_t region = first; region <= last; ++region) {
+			const uint64_t begin = std::max(vaddr, region * TRACKER_REGION_SIZE);
+			const uint64_t end   = std::min(vaddr + size, (region + 1) * TRACKER_REGION_SIZE);
+			const uint64_t epoch = m_memory_tracker.CpuModificationEpoch(begin, end - begin);
+			if (epoch == 0) return 0;
+			sum += epoch;
+		}
+		return sum;
+	}
+	// The emulator wrote the range in guest memory (any thread): see MemoryTracker::NoteHostWrite.
+	void NoteHostWrite(uint64_t vaddr, uint64_t size) { m_memory_tracker.NoteHostWrite(vaddr, size); }
+	// The tracker's answer on CPU-written bytes the range may hold (what a cache of the bytes may keep).
+	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) { return m_memory_tracker.IsRegionCpuModified(vaddr, size); }
+	// The registered buffer over the whole range, else none (FindBuffer makes one).
+	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size) const {
+		if (vaddr == 0 || !GuestRange {vaddr, size}.Valid()) return {};
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) return {};
+		const auto* buffer = m_slot_buffers.try_get(*owner);
+		return buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size) ? *owner : BufferId {};
+	}
 	void               RunGarbageCollector();
 	// Execution thread, after each operation: the GPU writes the operation recorded get the
 	// tick of the command buffer that holds them (see DownloadOnReadbackQueue()). True when the

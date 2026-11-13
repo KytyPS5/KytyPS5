@@ -156,6 +156,7 @@ void RenderContext::WriteFromCompletion(void* destination, const void* data,
 	} else {
 		std::memcpy(destination, data, size);
 	}
+	LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
 }
 
 void RenderContext::WriteQwordsFromCompletion(void* destination, const uint64_t* values,

@@ -1407,6 +1407,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		m_texture_cache.InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
 		return;
 	}
 
@@ -1440,6 +1441,7 @@ bool BufferCache::ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t
 		std::memcpy(target + written, target, chunk);
 		written += chunk;
 	}
+	LibKernel::Memory::NoteEmulatorWrite(destination, size);
 	return true;
 }
 
@@ -1467,6 +1469,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		LibKernel::Memory::NoteEmulatorWrite(dst_vaddr, size);
 		return;
 	}
 

@@ -220,6 +220,11 @@ SparseWait SparseBinding::Flush() {
 	return {m_timeline, m_value};
 }
 
+void SparseBinding::FlushNow() {
+	Common::LockGuard lock(m_graphics.queue_mutex);
+	(void)Flush();
+}
+
 void SparseBinding::Collect() {
 	std::lock_guard lock(m_mutex);
 	if (m_releases.empty()) {

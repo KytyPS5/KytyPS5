@@ -2077,14 +2077,14 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!image.SafeToDownload()) {
 		return false;
 	}
-	if (!buffer.IsInBounds(image.info.data.address, 1)) {
+	const auto available = HeldBytes(buffer, image.info.data.address, image.info.data.size);
+	if (available == 0) {
 		return false;
 	}
 	const auto buf_offset = buffer.Offset(image.info.data.address);
-	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+	if (available == image.info.data.size) {
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
 	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {

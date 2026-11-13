@@ -178,6 +178,21 @@ static_assert(!HasPolicyTileImageBacking<TileManager>);
 static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
+// Keeps guest buffers joined, not windowed, while it lives: for checks of the joined cache.
+struct JoinedGuestBuffers {
+  explicit JoinedGuestBuffers(Libs::Graphics::GraphicContext &graphics)
+      : m_graphics(graphics), m_aliased(graphics.sparse_residency_aliased_enabled) {
+    graphics.sparse_residency_aliased_enabled = false;
+  }
+  ~JoinedGuestBuffers() { m_graphics.sparse_residency_aliased_enabled = m_aliased; }
+  JoinedGuestBuffers(const JoinedGuestBuffers &) = delete;
+  JoinedGuestBuffers &operator=(const JoinedGuestBuffers &) = delete;
+
+private:
+  Libs::Graphics::GraphicContext &m_graphics;
+  bool m_aliased;
+};
+
 struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
@@ -222,6 +237,19 @@ struct BufferCacheTestAccess {
   static size_t BoundTablePages(const BufferCache &cache) {
     return static_cast<size_t>(std::ranges::count_if(
         cache.m_table_pages, [](const auto &page) { return page.allocation != nullptr; }));
+  }
+
+  static bool Windowed(const BufferCache &cache) { return cache.Windowed(); }
+  static uint64_t WindowPage(const BufferCache &cache) { return cache.m_page_size; }
+  static uint64_t WindowRegion(const BufferCache &cache) {
+    return uint64_t{1} << cache.m_region_bits;
+  }
+  static size_t WindowCount(const BufferCache &cache) { return cache.m_windows.size(); }
+  // Resident pages and released ones that are still bound.
+  static size_t WindowPages(const BufferCache &cache) { return cache.m_pages.size(); }
+  static uint64_t HeldBytes(const BufferCache &cache, const Buffer &buffer, uint64_t address,
+                            uint64_t size) {
+    return cache.HeldBytes(buffer, address, size);
   }
 };
 
@@ -5144,6 +5172,438 @@ public:
     return words;
   }
 
+  // Bytes of this process's Vulkan allocations, and the room left in the device memory it holds.
+  uint64_t AllocatedBytes() {
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(m_runtime_context.allocator, budgets);
+    uint64_t bytes = 0;
+    for (uint32_t heap = 0; heap < m_memory_properties.memoryHeapCount; ++heap) {
+      bytes += budgets[heap].statistics.allocationBytes;
+    }
+    return bytes;
+  }
+  uint64_t HeldDeviceRoom() {
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(m_runtime_context.allocator, budgets);
+    uint64_t bytes = 0;
+    for (uint32_t heap = 0; heap < m_memory_properties.memoryHeapCount; ++heap) {
+      if (m_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+        bytes += budgets[heap].statistics.blockBytes - budgets[heap].statistics.allocationBytes;
+      }
+    }
+    return bytes;
+  }
+
+  // Maps `size` bytes of guest memory at `base`, each dword holding its guest address.
+  int64_t MapGuestPattern(const char *name, uint64_t base, uint64_t size) {
+    int64_t direct = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "guest memory",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000, 0, &direct) ==
+                    0 &&
+                LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, direct,
+                                                         0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "guest allocation failed");
+    auto *words = static_cast<u32 *>(mapped);
+    for (uint64_t offset = 0; offset < size; offset += sizeof(u32)) {
+      words[offset / sizeof(u32)] = static_cast<u32>(base + offset);
+    }
+    return direct;
+  }
+  void UnmapGuestPattern(const char *name, uint64_t base, uint64_t size, int64_t direct) {
+    Require(name, "guest memory release",
+            LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(direct, size) == 0,
+            "guest allocation release failed");
+  }
+
+  // Guest buffers in sparse windows. A range keeps its offset in the window of its first byte,
+  // only its pages take memory, and one across two regions is whole in the lower window, which
+  // shares the pages of the region above.
+  void CheckBufferWindowPages() {
+    constexpr const char *name = "BufferWindowPages";
+    constexpr uint64_t MiB = 1024 * 1024;
+    constexpr uint64_t boundary = 0x0000000300000000ull;
+    constexpr uint64_t base = boundary - MiB;
+    constexpr uint64_t size = 2 * MiB;
+    // A second boundary, whose upper pages are resident before its lower window exists.
+    constexpr uint64_t late = 0x0000000600000000ull;
+    constexpr uint64_t late_base = late - MiB;
+    constexpr uint64_t guest_page = BufferCache::CACHING_PAGESIZE;
+    using Libs::Graphics::Buffer;
+    EnsureRuntimeContext();
+    bool windowed = false;
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      windowed = BufferCacheTestAccess::Windowed(cache);
+      if (windowed) {
+        HW::Context registers{};
+        HW::UserConfig user_config{};
+        HW::Shader shaders{};
+        scheduler.Begin(registers, user_config, shaders);
+        context.InitializeGpu(nullptr);
+        const auto page = BufferCacheTestAccess::WindowPage(cache);
+        const auto region = BufferCacheTestAccess::WindowRegion(cache);
+        Require(name, "fixture", boundary % region == 0 && late % region == 0 && MiB % page == 0,
+                "the fixture does not lie across two regions");
+        const auto direct = MapGuestPattern(name, base, size);
+        const auto late_direct = MapGuestPattern(name, late_base, size);
+        context.MapMemory(base, size);
+        context.MapMemory(late_base, size);
+        const auto pattern = [](uint64_t address) { return static_cast<u32>(address); };
+        const auto pages = [&](uint64_t address, uint64_t bytes) {
+          return (Common::AlignUp(address + bytes, page) - Common::AlignDown(address, page)) /
+                 page;
+        };
+
+        const auto low = cache.FindBuffer(base + 0x100, 0x20000);
+        const auto &window = cache.GetBuffer(low);
+        Require(name, "window",
+                cache.FindBuffer(base + 0x80000, 16) == low &&
+                    window.CpuAddress() == boundary - region && window.Size() == 2 * region,
+                "ranges of one region did not share the window of that region");
+        const auto hole = Common::AlignUp(base + 0x100 + 0x20000, page);
+        Require(name, "resident pages",
+                cache.IsRegionRegistered(base, 1) &&
+                    cache.IsRegionRegistered(base + 0x100 + 0x20000 - 1, 1) &&
+                    !cache.IsRegionRegistered(hole, base + 0x80000 - hole) &&
+                    cache.IsRegionRegistered(base + 0x80000, 16) &&
+                    BufferCacheTestAccess::WindowPages(cache) ==
+                        pages(base + 0x100, 0x20000) + pages(base + 0x80000, 16),
+                "a range took pages other than its own");
+
+        const auto [read, read_offset] = cache.ObtainBuffer(base + 0x100, 0x20000, false);
+        Require(name, "fixed offset",
+                read == &window && read_offset == window.Offset(base + 0x100),
+                "a range was not at its fixed offset in the window");
+        auto words = ReadBufferWords(name, scheduler, window,
+                                     {window.Offset(base + 0x100),
+                                      window.Offset(base + 0x100 + 0x20000 - 4)});
+        Require(name, "upload",
+                words[0] == pattern(base + 0x100) &&
+                    words[1] == pattern(base + 0x100 + 0x20000 - 4),
+                "a window did not hold the guest bytes of a read range");
+
+        // Across the boundary: the pages of the region above are bound into both windows.
+        const auto [across, across_offset] =
+            cache.ObtainBuffer(boundary - 0x20000, 0x40000, false);
+        const auto high = cache.FindBuffer(boundary + 0x100, 0x100);
+        Require(name, "two windows",
+                across == &window && across_offset == window.Offset(boundary - 0x20000) &&
+                    high != low && cache.GetBuffer(high).CpuAddress() == boundary &&
+                    BufferCacheTestAccess::WindowCount(cache) == 2,
+                "a range across two regions was not whole in the lower window");
+        const auto [written, written_offset] = cache.ObtainBuffer(boundary + 0x40, 0x40, true);
+        written->Fill(written_offset, 0x40, 0x77777777u);
+        words = ReadBufferWords(name, scheduler, window,
+                                {window.Offset(boundary - 4), window.Offset(boundary),
+                                 window.Offset(boundary + 0x40),
+                                 window.Offset(boundary + 0x20000 - 4)});
+        Require(name, "shared pages",
+                written == &cache.GetBuffer(high) && words[0] == pattern(boundary - 4) &&
+                    words[1] == pattern(boundary) && words[2] == 0x77777777u &&
+                    words[3] == pattern(boundary + 0x20000 - 4),
+                "the lower window did not share the pages of the region above");
+
+        // The upper pages are resident first; the lower window takes them when it is made.
+        (void)cache.FindBuffer(late + 0x10, 0x100);
+        const auto windows = BufferCacheTestAccess::WindowCount(cache);
+        const auto [joined, joined_offset] = cache.ObtainBuffer(late - 0x8000, 0x10000, false);
+        words = ReadBufferWords(name, scheduler, *joined,
+                                {joined_offset, joined_offset + 0x8000 - 4, joined_offset + 0x8000,
+                                 joined_offset + 0x10000 - 4});
+        Require(name, "later window",
+                BufferCacheTestAccess::WindowCount(cache) == windows + 1 &&
+                    joined->CpuAddress() == late - region && words[0] == pattern(late - 0x8000) &&
+                    words[1] == pattern(late - 4) && words[2] == pattern(late) &&
+                    words[3] == pattern(late + 0x8000 - 4),
+                "a window made after the pages of the region above did not take them");
+
+        // The BDA page table follows the pages, and an image source needs its range resident.
+        (void)cache.FindBuffer(base + 0xc0000, guest_page);
+        auto &table = *cache.GetBdaPageTableBuffer();
+        const auto entry = [](uint64_t address) {
+          return BufferCache::PageIndex(address) * sizeof(uint64_t);
+        };
+        words = ReadBufferWords(name, scheduler, table,
+                                {entry(base), entry(base + guest_page), entry(base + 0x40000),
+                                 entry(base + 0xc0000)});
+        const auto address_of = [&](uint64_t address) {
+          return static_cast<u32>(window.BufferDeviceAddress() + window.Offset(address));
+        };
+        Require(name, "page table",
+                words[0] == address_of(base) && words[1] == address_of(base + guest_page) &&
+                    words[2] == 0 && words[3] == address_of(base + 0xc0000) &&
+                    cache.IsRegionRegistered(base + 0xc0000, 1),
+                "the BDA page table did not follow the resident pages");
+        Require(name, "held bytes",
+                BufferCacheTestAccess::HeldBytes(cache, window, base + 0x100, MiB) ==
+                        hole - (base + 0x100) &&
+                    cache.ObtainBufferForImage(base + 0x100, 0x1000).first == &window &&
+                    cache.ObtainBufferForImage(hole - 0x1000, 0x2000).first != &window,
+                "a window was taken to hold bytes of pages that are not resident");
+
+        // Unmapping reads back what the GPU wrote; the bytes are in the guest's memory then.
+        context.UnmapMemory(base, size);
+        context.UnmapMemory(late_base, size);
+        u32 guest = 0;
+        std::memcpy(&guest, reinterpret_cast<const void *>(boundary + 0x40), sizeof(guest));
+        Require(name, "readback",
+                guest == 0x77777777u && !cache.IsRegionGpuModified(boundary + 0x40, 0x40),
+                "GPU-written window bytes did not reach guest memory");
+        scheduler.Finish();
+        UnmapGuestPattern(name, base, size, direct);
+        UnmapGuestPattern(name, late_base, size, late_direct);
+      }
+    }
+    std::printf(windowed ? "[gpu]     %-32s ok\n" : "[gpu]     %-32s skipped (no buffer windows)\n",
+                name);
+  }
+
+  // Pages leave a window by age once device memory passes the trigger: clean ones as they are,
+  // GPU-written ones only under critical pressure and written back first. A page used again
+  // before its unbind ran stays; one a DMA shader keeps marking used never ages.
+  void CheckBufferWindowRelease() {
+    constexpr const char *name = "BufferWindowRelease";
+    constexpr uint64_t MiB = 1024 * 1024;
+    constexpr uint64_t base = 0x0000000310000000ull;
+    constexpr uint64_t size = 4 * MiB;
+    constexpr uint64_t clean = base + 0x100;
+    constexpr uint64_t clean_size = 0x20000;
+    constexpr uint64_t dirty = base + MiB;
+    constexpr uint64_t marked = base + 2 * MiB;
+    constexpr uint64_t never = std::numeric_limits<uint64_t>::max();
+    EnsureRuntimeContext();
+    bool windowed = false;
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      windowed = BufferCacheTestAccess::Windowed(cache);
+      if (windowed) {
+        HW::Context registers{};
+        HW::UserConfig user_config{};
+        HW::Shader shaders{};
+        scheduler.Begin(registers, user_config, shaders);
+        context.InitializeGpu(nullptr);
+        const auto page = BufferCacheTestAccess::WindowPage(cache);
+        const auto direct = MapGuestPattern(name, base, size);
+        context.MapMemory(base, size);
+        const auto pattern = [](uint64_t address) { return static_cast<u32>(address); };
+        const auto collect = [&](uint64_t trigger, uint64_t critical, uint32_t ticks) {
+          BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, trigger, critical);
+          for (uint32_t tick = 0; tick < ticks; ++tick) {
+            cache.MarkGpuUse(marked, page);
+            cache.RunGarbageCollector();
+          }
+        };
+        // Runs the unbinds of released pages, then frees their memory.
+        const auto settle = [&] {
+          scheduler.Finish();
+          scheduler.Finish();
+          collect(never, never, 1);
+        };
+
+        // The entries of the pages take pages of the BDA page table, which stay.
+        const auto before = AllocatedBytes();
+        const auto [first, first_offset] = cache.ObtainBuffer(clean, clean_size, false);
+        const auto &window = *first;
+        const auto [written, written_offset] = cache.ObtainBuffer(dirty, 0x1000, true);
+        written->Fill(written_offset, 0x1000, 0x99999999u);
+        (void)cache.FindBuffer(marked, 16);
+        (void)cache.FindBuffer(marked - page, 16);
+        const auto clean_pages =
+            (Common::AlignUp(clean + clean_size, page) - Common::AlignDown(clean, page)) / page;
+        const auto pages = BufferCacheTestAccess::WindowPages(cache);
+        const auto full = AllocatedBytes();
+        const auto empty = before + BufferCacheTestAccess::BoundTablePages(cache) * page;
+        Require(name, "pages", full == empty + pages * page && pages == clean_pages + 1 + 2,
+                "the ranges did not take exactly their pages");
+
+        collect(never, never, 200);
+        Require(name, "no pressure",
+                BufferCacheTestAccess::WindowPages(cache) == pages &&
+                    cache.IsRegionRegistered(clean, clean_size),
+                "idle pages left a window without memory pressure");
+
+        collect(0, never, 1);
+        Require(name, "idle pages",
+                !cache.IsRegionRegistered(clean, clean_size) &&
+                    !cache.IsRegionRegistered(marked - page, 16) &&
+                    cache.IsRegionCpuModified(clean, clean_size) &&
+                    cache.IsRegionRegistered(dirty, 0x1000) &&
+                    cache.IsRegionGpuModified(dirty, 0x1000) &&
+                    cache.IsRegionRegistered(marked, 16),
+                "pressure kept idle pages, or took GPU-written or DMA-used ones");
+
+        // Used again before the unbind ran: the pages are kept, with no new memory.
+        const auto [again, again_offset] = cache.ObtainBuffer(clean, clean_size, false);
+        Require(name, "revived pages",
+                again == &window && again_offset == first_offset && AllocatedBytes() == full,
+                "pages used again before their unbind took new memory");
+        settle();
+        auto words = ReadBufferWords(name, scheduler, window,
+                                     {again_offset, again_offset + clean_size - 4});
+        Require(name, "kept pages",
+                words[0] == pattern(clean) && words[1] == pattern(clean + clean_size - 4) &&
+                    AllocatedBytes() == full - page,
+                "pages used again before their unbind were unbound");
+        // Work recorded before the release reads the pages: they are unbound after it ran.
+        collect(never, never, 161);
+        auto earlier = CreateHostBuffer(name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+                                        {});
+        const vk::BufferCopy early_copy{again_offset, 0, sizeof(u32)};
+        scheduler.Current().Handle().copyBuffer(window.Handle(), earlier.buffer, 1, &early_copy);
+        collect(0, never, 1);
+        settle();
+        Require(name, "freed pages",
+                !cache.IsRegionRegistered(clean, clean_size) &&
+                    AllocatedBytes() == full - page - clean_pages * page &&
+                    BufferCacheTestAccess::WindowPages(cache) == 2,
+                "released pages kept their memory");
+        Require(name, "earlier work", ReadBuffer(name, earlier, 1)[0] == pattern(clean),
+                "released pages were unbound before the work recorded ahead of the release ran");
+        DestroyBuffer(&earlier);
+        const auto &table = *cache.GetBdaPageTableBuffer();
+        words = ReadBufferWords(name, scheduler, table,
+                                {BufferCache::PageIndex(clean) * sizeof(uint64_t),
+                                 BufferCache::PageIndex(dirty) * sizeof(uint64_t)});
+        Require(name, "page table",
+                words[0] == 0 &&
+                    words[1] == static_cast<u32>(window.BufferDeviceAddress() +
+                                                 window.Offset(dirty)),
+                "the BDA page table kept the entry of a released page");
+
+        // Critical pressure: the GPU's bytes reach guest memory, then the page goes.
+        collect(0, 0, 1);
+        u32 guest = 0;
+        const bool tracked = cache.IsRegionGpuModified(dirty, 0x1000);
+        std::memcpy(&guest, reinterpret_cast<const void *>(dirty), sizeof(guest));
+        Require(name, "written back",
+                !tracked && guest == 0x99999999u && !cache.IsRegionRegistered(dirty, 0x1000),
+                "a GPU-written page was not written back and released under critical pressure");
+        Require(name, "marked page", cache.IsRegionRegistered(marked, 16),
+                "a page marked used through device addresses aged out");
+
+        // Without its marks the last page ages out too, and the window with it.
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+        for (uint32_t tick = 0; tick < 161; ++tick) {
+          cache.RunGarbageCollector();
+        }
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, never);
+        cache.RunGarbageCollector();
+        scheduler.Finish();
+        scheduler.Finish();
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+        cache.RunGarbageCollector();
+        Require(name, "retired window",
+                BufferCacheTestAccess::WindowPages(cache) == 0 &&
+                    BufferCacheTestAccess::WindowCount(cache) == 0 && AllocatedBytes() == empty,
+                "a window without pages was kept, or its pages were not freed");
+
+        context.UnmapMemory(base, size);
+        scheduler.Finish();
+        UnmapGuestPattern(name, base, size, direct);
+      }
+    }
+    std::printf(windowed ? "[gpu]     %-32s ok\n" : "[gpu]     %-32s skipped (no buffer windows)\n",
+                name);
+  }
+
+  // With the device budget used up, new pages take the place of pages no work of the frame
+  // bound, without new device memory. Pages of this frame and DMA-accessed pages stay; when
+  // nothing else can go, the new pages pass the budget.
+  void CheckBufferWindowBudget() {
+    constexpr const char *name = "BufferWindowBudget";
+    constexpr uint64_t MiB = 1024 * 1024;
+    constexpr uint64_t idle = 0x0000000320000000ull;
+    constexpr uint64_t idle_size = 768 * MiB;
+    constexpr uint64_t fresh = 0x0000000360000000ull;
+    constexpr uint64_t past = 0x00000003a0000000ull;
+    constexpr uint64_t never = std::numeric_limits<uint64_t>::max();
+    EnsureRuntimeContext();
+    auto &graphics = m_runtime_context;
+    bool windowed = false;
+    {
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      windowed = BufferCacheTestAccess::Windowed(cache);
+      if (windowed) {
+        HW::Context registers{};
+        HW::UserConfig user_config{};
+        HW::Shader shaders{};
+        scheduler.Begin(registers, user_config, shaders);
+        context.InitializeGpu(nullptr);
+        const auto page = BufferCacheTestAccess::WindowPage(cache);
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+
+        // The oldest pages are the start of the range that grows next frame; then idle pages,
+        // the first of them holding guest bytes.
+        const auto direct = MapGuestPattern(name, idle, MiB);
+        context.MapMemory(idle, MiB);
+        (void)cache.FindBuffer(fresh, MiB);
+        const auto [held, held_offset] = cache.ObtainBuffer(idle, 0x20000, false);
+        (void)cache.FindBuffer(idle, idle_size);
+        cache.RunGarbageCollector();
+
+        // A frame later there is no budget for more. The range grows into the place of idle
+        // pages, not of its own, and the work recorded so far still reads the pages that go.
+        auto usage = graphics.GetDeviceMemoryUsage();
+        graphics.device_budget_override = usage;
+        const auto wanted = Common::AlignUp(HeldDeviceRoom() + 2 * MiB, page);
+        const auto taken = wanted - MiB;
+        Require(name, "fixture", taken < idle_size,
+                "the idle pages cannot make room for the new ones");
+        auto earlier = CreateHostBuffer(name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+                                        {});
+        const vk::BufferCopy early_copy{held_offset, 0, sizeof(u32)};
+        scheduler.Current().Handle().copyBuffer(held->Handle(), earlier.buffer, 1, &early_copy);
+        (void)cache.FindBuffer(fresh, wanted);
+        Require(name, "reclaimed",
+                cache.IsRegionRegistered(fresh, page) &&
+                    cache.IsRegionRegistered(fresh + wanted - page, page) &&
+                    graphics.GetDeviceMemoryUsage() <= usage &&
+                    !cache.IsRegionRegistered(idle, taken) &&
+                    cache.IsRegionRegistered(idle + taken, page),
+                "new pages did not take the place of idle ones within the device budget");
+        scheduler.Finish();
+        Require(name, "earlier work", ReadBuffer(name, earlier, 1)[0] == static_cast<u32>(idle),
+                "idle pages were unbound before the work recorded ahead of them ran");
+        DestroyBuffer(&earlier);
+
+        // Next frame the idle pages left are DMA-accessed and the new ones are bound again:
+        // neither makes room, so more pages pass the budget.
+        cache.MarkGpuUse(idle + taken, idle_size - taken);
+        cache.RunGarbageCollector();
+        (void)cache.FindBuffer(fresh, wanted);
+        usage = graphics.GetDeviceMemoryUsage();
+        graphics.device_budget_override = usage;
+        const auto more = Common::AlignUp(HeldDeviceRoom() + MiB, page);
+        Require(name, "second fixture", more <= idle_size - taken,
+                "the DMA-accessed pages could not make room for the new ones");
+        (void)cache.FindBuffer(past, more);
+        graphics.device_budget_override = 0;
+        Require(name, "kept pages",
+                cache.IsRegionRegistered(past, page) &&
+                    cache.IsRegionRegistered(past + more - page, page) &&
+                    cache.IsRegionRegistered(fresh, page) &&
+                    cache.IsRegionRegistered(idle + taken, page) &&
+                    graphics.GetDeviceMemoryUsage() > usage,
+                "pages bound this frame or DMA-accessed pages made room for new ones");
+        context.UnmapMemory(idle, MiB);
+        scheduler.Finish();
+        UnmapGuestPattern(name, idle, MiB, direct);
+      }
+    }
+    std::printf(windowed ? "[gpu]     %-32s ok\n" : "[gpu]     %-32s skipped (no buffer windows)\n",
+                name);
+  }
+
   // Sparse buffers take SparseBinding pages. The last bind queued for a page is the one applied,
   // a released page is freed once its unbind ran, and aliased buffers share the bytes of a page.
   void CheckSparseBufferPages() {
@@ -5382,6 +5842,7 @@ public:
     constexpr uint32_t ring_fault_second_value = 0x4e5f6071u;
 
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -7645,6 +8106,7 @@ public:
     constexpr auto region = BufferCache::BDA_USE_REGIONSIZE;
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     int64_t direct = -1;
     void *mapped = nullptr;
     Require(name, "allocation",
@@ -7711,6 +8173,7 @@ public:
     constexpr const char *name = "AddressRangeBacking";
     constexpr uint64_t size = 1024 * 1024;
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     int64_t direct = -1;
     void *mapped = nullptr;
     Require(name, "allocation",
@@ -7825,6 +8288,7 @@ public:
     constexpr const char *name = "BdaSyncUploads";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     // Direct memory, so readbacks can publish GPU-dirty bytes.
     int64_t direct = -1;
     void *mapped = nullptr;
@@ -7983,6 +8447,7 @@ public:
     constexpr std::array<uint64_t, 3> page_counts{2, 521, 525};
     constexpr uint64_t result_entries = page_counts[0] + page_counts[1] + page_counts[2];
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -8163,6 +8628,7 @@ public:
     constexpr uint64_t allocation_size = 0x3000000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -14173,6 +14639,7 @@ public:
     }
 
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -17211,6 +17678,7 @@ public:
     constexpr uint32_t tail_backing_value = 0x2468ace0u;
     constexpr uint32_t tail_gpu_value = 0x13579bdfu;
     EnsureRuntimeContext();
+    const JoinedGuestBuffers joined(m_runtime_context);
 
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
@@ -25405,10 +25873,13 @@ private:
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
+    vk::PhysicalDeviceMaintenance4Properties maintenance4{};
+    maintenance4.pNext = &m_runtime_context.mesh_shader_properties;
     vk::PhysicalDeviceProperties2 properties{};
-    properties.pNext = &m_runtime_context.mesh_shader_properties;
+    properties.pNext = &maintenance4;
     m_physical_device.getProperties2(&properties);
     m_runtime_context.physical_device_properties = properties.properties;
+    m_runtime_context.max_buffer_size = maintenance4.maxBufferSize;
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
@@ -60568,6 +61039,13 @@ int main(int argc, char **argv) {
     vulkan.CheckSparsePageTable();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-window-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferWindowPages();
+    vulkan.CheckBufferWindowRelease();
+    vulkan.CheckBufferWindowBudget();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -60871,6 +61349,9 @@ int main(int argc, char **argv) {
     vulkan.CheckDeviceBudgetPlacement();
     vulkan.CheckSparseBufferPages();
     vulkan.CheckSparsePageTable();
+    vulkan.CheckBufferWindowPages();
+    vulkan.CheckBufferWindowRelease();
+    vulkan.CheckBufferWindowBudget();
     vulkan.CheckDescriptorTablePrefetch();
   } else {
     skipped_device_checks = true;

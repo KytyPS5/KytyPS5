@@ -502,10 +502,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
 	    vk::PhysicalDeviceRobustness2PropertiesEXT, vk::PhysicalDeviceVulkan11Properties,
 	    vk::PhysicalDeviceSubgroupSizeControlProperties, vk::PhysicalDevicePushDescriptorProperties,
-	    vk::PhysicalDeviceMeshShaderPropertiesEXT>
+	    vk::PhysicalDeviceMaintenance4Properties, vk::PhysicalDeviceMeshShaderPropertiesEXT>
 	    properties;
 	auto& [properties2, float_controls, robustness2_props, properties11, subgroup_control,
-	       push_descriptor, mesh_properties] = properties;
+	       push_descriptor, maintenance4, mesh_properties] = properties;
 	if (!graphics.mesh_shader_enabled) {
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
@@ -513,6 +513,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
+	graphics.max_buffer_size            = maintenance4.maxBufferSize;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
 

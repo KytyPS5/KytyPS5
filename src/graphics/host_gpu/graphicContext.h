@@ -40,6 +40,8 @@ struct GraphicContext {
 	// Sparse buffers take memory page by page; aliased ones can share a page.
 	bool sparse_residency_buffer_enabled  = false;
 	bool sparse_residency_aliased_enabled = false;
+	// The largest buffer the device creates.
+	uint64_t max_buffer_size = 0;
 	// Null without sparse images and buffers; created with the allocator.
 	SparseBinding*                            sparse_binding                         = nullptr;
 	bool                               robust_buffer_access_enabled          = false;

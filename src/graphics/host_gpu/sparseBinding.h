@@ -76,6 +76,8 @@ public:
 
 	// The caller holds GraphicContext::queue_mutex and submits to the queue right after.
 	[[nodiscard]] SparseWait Flush();
+	// For a point no submission follows; takes GraphicContext::queue_mutex.
+	void FlushNow();
 	// Frees the pages whose unbind has executed.
 	void Collect();
 	void WaitIdle();

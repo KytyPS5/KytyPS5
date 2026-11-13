@@ -847,6 +847,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-budget-only)
 	add_test(NAME graphics_sparse_buffer
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sparse-buffer-only)
+	add_test(NAME buffer_cache_windows
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-window-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 

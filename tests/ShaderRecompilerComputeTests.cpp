@@ -824,6 +824,57 @@ struct PipelineCacheTestAccess {
   static std::array<size_t, 2> Pipelines(const PipelineCache &cache) {
     return {cache.m_graphics_pipelines.size(), cache.m_compute_pipelines.size()};
   }
+
+  static ShaderRecompiler::CompileOptions ComputeOptions() {
+    static ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = 64;
+    compute.threads_num[1] = compute.threads_num[2] = 1;
+    compute.wave_size = 64;
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.input_info.compute = &compute;
+    options.dump_ir = false;
+    return options;
+  }
+
+  static std::vector<uint8_t> PlanBytes(const std::vector<uint32_t> &code) {
+    return ShaderRecompiler::IR::SaveResourcePlan(ShaderRecompiler::IR::ExtractResourcePlan(
+        ShaderRecompiler::TranslateProgram(code, ComputeOptions()).program));
+  }
+
+  // Compiles and stores a module of compute program `hash` with the accesses at `decoded` decoded
+  // in the shader and the plan of `plan_code`; the module itself is an empty program's.
+  static void StoreDecodedModule(PipelineCache &cache, uint64_t hash, std::vector<uint32_t> decoded,
+                                 const std::vector<uint32_t> &plan_code) {
+    static const std::vector<uint32_t> end_program{0xbf810000u};
+    const auto options = ComputeOptions();
+    PipelineCache::Program program;
+    program.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(
+        ShaderRecompiler::TranslateProgram(plan_code, options).program);
+    program.in_shader_buffer_pcs = std::move(decoded);
+    const PipelineCache::ProgramKey key{.stage = ShaderType::Compute, .hash = hash};
+    (void)cache.CompileModule(program, key, options,
+                              ShaderRecompiler::TranslateProgram(end_program, options), 0);
+    for (const auto &module : program.modules)
+      cache.m_graphics.device.destroyShaderModule(module.module, nullptr);
+  }
+
+  struct StoredProgram {
+    std::vector<uint32_t> decoded;
+    std::vector<std::vector<uint32_t>> modules;
+    std::vector<uint8_t> plan;
+  };
+  static std::optional<StoredProgram> Stored(const PipelineCache &cache, uint64_t hash) {
+    for (const auto &[key, program] : cache.m_program_cache) {
+      if (key.stage != ShaderType::Compute || key.hash != hash) continue;
+      StoredProgram stored{.decoded = program.in_shader_buffer_pcs,
+                           .plan = ShaderRecompiler::IR::SaveResourcePlan(program.resource_plan)};
+      for (const auto &module : program.modules)
+        stored.modules.push_back(module.in_shader_buffer_pcs);
+      return stored;
+    }
+    return std::nullopt;
+  }
 };
 
 namespace {
@@ -53504,6 +53555,74 @@ void CheckModuleIdentityDecodedAccesses() {
           "a program found a module for another decoded set");
   std::printf("[host]    %-32s ok\n", name);
 }
+
+// A restart takes each program's most-learned decode set from the store: every module records
+// the accesses decoded in its shader when it was compiled, and a program's set only grows, so
+// its latest record names them all. Modules of other sets can never be selected again.
+void CheckShaderStoreDecodes(VulkanHarness &vulkan) {
+  constexpr const char *name = "ShaderStoreDecodes";
+  constexpr uint64_t hash = 0x5701e0000001ull;
+  // Two different plans: an empty program's and one that stores through a V# in user data.
+  std::vector<u32> buffer_store;
+  AppendVMovU32(&buffer_store, 1, 0x2a);
+  buffer_store.insert(buffer_store.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(1, 0, 0)});
+  AppendEnd(&buffer_store);
+  std::vector<u32> empty;
+  AppendEnd(&empty);
+  const auto learned = PipelineCacheTestAccess::PlanBytes(buffer_store);
+  Require(name, "distinct plans", learned != PipelineCacheTestAccess::PlanBytes(empty),
+          "the two programs extracted the same plan");
+  const auto directory = std::filesystem::temp_directory_path() /
+                         fmt::format("kyty_shader_store_{}",
+                                     std::chrono::steady_clock::now().time_since_epoch().count());
+  struct Stored {
+    std::vector<u32> decoded;
+    bool buffer = false;
+  };
+  // Writes a store of `records` in order and returns the program a restart loads from it.
+  const auto restart = [&](const char *file, std::initializer_list<Stored> records) {
+    const auto store = directory / file;
+    {
+      RenderContext context(vulkan.RuntimeContext(), store);
+      for (const auto &record : records) {
+        PipelineCacheTestAccess::StoreDecodedModule(context.GetPipelineCache(), hash,
+                                                    record.decoded,
+                                                    record.buffer ? buffer_store : empty);
+      }
+    }
+    const auto size = std::filesystem::file_size(store);
+    RenderContext context(vulkan.RuntimeContext(), store);
+    auto stored = PipelineCacheTestAccess::Stored(context.GetPipelineCache(), hash);
+    Require(name, "load compiles nothing",
+            std::filesystem::file_size(store) == size &&
+                PipelineCacheTestAccess::Compiled(context.GetPipelineCache()) ==
+                    decltype(PipelineCacheTestAccess::Compiled(context.GetPipelineCache())){},
+            "loading the store compiled a module or appended a record");
+    return stored;
+  };
+  const std::vector<u32> two{0x40u, 0x80u};
+  // Compile order within a run: nothing decoded, then one access, then two.
+  const auto grown = restart("TEST00001.shaders", {{{}, false}, {{0x40u}, false}, {two, true}});
+  Require(name, "most-learned record",
+          grown && grown->decoded == two && grown->plan == learned &&
+              grown->modules == std::vector<std::vector<u32>>{two},
+          "a restart kept a program's first decode set, its plan, or modules it cannot select");
+  // Records of an older or an unrelated, larger set after it change nothing.
+  const auto stale = restart("TEST00002.shaders",
+                             {{two, true}, {{}, false}, {{0x100u, 0x140u, 0x180u}, false}});
+  Require(name, "stale records",
+          stale && stale->decoded == two && stale->plan == learned &&
+              stale->modules == std::vector<std::vector<u32>>{two},
+          "an older or unrelated decode set replaced the program's, or added a module");
+  // Modules of the program's own set are all kept.
+  const auto same = restart("TEST00003.shaders", {{two, true}, {two, false}});
+  Require(name, "same set", same && same->decoded == two && same->modules.size() == 2u,
+          "a second module of the program's decode set was dropped");
+  std::error_code error;
+  std::filesystem::remove_all(directory, error);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckShaderStore(VulkanHarness &vulkan) {
   constexpr const char *name = "ShaderStore";
   constexpr uintptr_t base = 0x0000000205000000ull;
@@ -60639,6 +60758,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckModuleIdentityDecodedAccesses();
     CheckShaderStore(vulkan);
+    CheckShaderStoreDecodes(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
@@ -61998,6 +62118,7 @@ int main(int argc, char **argv) {
   CheckStableProgramIds(vulkan);
   CheckModuleIdentityDecodedAccesses();
   CheckShaderStore(vulkan);
+  CheckShaderStoreDecodes(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();

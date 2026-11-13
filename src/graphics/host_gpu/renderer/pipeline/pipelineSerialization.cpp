@@ -239,17 +239,29 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
-			if (inserted &&
-			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
-				m_program_cache.erase(program);
-				return false;
-			}
-			// The plan was extracted with this module's accesses decoded in the shader.
-			if (inserted) {
-				program->second.in_shader_buffer_pcs = module.in_shader_buffer_pcs;
+			auto&       state              = program->second;
+			const auto& decoded            = module.in_shader_buffer_pcs;
+			// A program's decoded accesses only grow, so its latest record names them all, and only
+			// modules of the program's own set can be selected again.
+			if (inserted || (decoded.size() > state.in_shader_buffer_pcs.size() &&
+			                 std::ranges::includes(decoded, state.in_shader_buffer_pcs))) {
+				ShaderRecompiler::IR::ResourcePlan learned;
+				if (!ShaderRecompiler::IR::LoadResourcePlan(plan, learned)) {
+					if (inserted) m_program_cache.erase(program);
+					return false;
+				}
+				// The plan was extracted with this module's accesses decoded in the shader.
+				state.resource_plan        = std::move(learned);
+				state.in_shader_buffer_pcs = decoded;
+				for (const auto& stale: state.modules) {
+					m_graphics.device.destroyShaderModule(stale.module, nullptr);
+				}
+				state.modules.clear();
+			} else if (decoded != state.in_shader_buffer_pcs) {
+				break;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
-			program->second.modules.push_back(std::move(module));
+			state.modules.push_back(std::move(module));
 			break;
 		}
 		case Record::GraphicsPipeline: {

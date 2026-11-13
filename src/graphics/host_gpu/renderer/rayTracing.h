@@ -39,10 +39,16 @@ public:
 	// next call. The guest page table must be synchronized first (PrepareBda).
 	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
 
+	// Called at each suspend point. Every EvictFrames of them, the mirrors no call used since the
+	// last pass go: TLASes no call prepared, pairs no visible instance of a prepared TLAS named,
+	// and BLASes left without pairs. A BVH used again gets its mirror a few readbacks later.
+	void RunGarbageCollector();
+
 private:
 	friend struct RayTracingTestAccess;
 
-	static constexpr uint32_t Areas = 8;
+	static constexpr uint32_t Areas       = 8;
+	static constexpr uint32_t EvictFrames = 64;
 
 	struct Structure {
 		std::unique_ptr<Buffer>      buffer;
@@ -84,12 +90,14 @@ private:
 		bool     walked         = false;
 		bool     walking        = false;
 		bool     geometry_known = false;
+		bool     used           = true; // Since the last eviction pass.
 	};
 
 	struct Tlas {
 		Structure               structure;
 		std::unique_ptr<Buffer> instances;
 		uint32_t                instance_slots = 64;
+		bool                    used           = true; // Since the last eviction pass.
 	};
 
 	// A dispatch's readback.
@@ -108,6 +116,8 @@ private:
 	void Collect();
 	void Apply(Area& area);
 	void AddPair(uint64_t blas, uint32_t root);
+	void Retire(std::unique_ptr<Buffer>& buffer);
+	void Retire(Structure& structure);
 	void Create(Structure& structure, const vk::AccelerationStructureGeometryKHR& geometry,
 	            vk::AccelerationStructureTypeKHR type, vk::BuildAccelerationStructureFlagsKHR flags,
 	            uint32_t capacity);
@@ -136,6 +146,7 @@ private:
 	uint32_t                                          m_next_area = 0;
 	uint64_t                                          m_serial    = 0;
 	uint64_t                                          m_applied = 0; // Serial of the last readback.
+	uint32_t                                          m_frame   = 0; // Suspend points seen.
 };
 
 } // namespace Libs::Graphics

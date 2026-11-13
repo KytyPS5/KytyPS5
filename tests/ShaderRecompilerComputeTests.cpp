@@ -243,6 +243,19 @@ struct RayTracingTestAccess {
   static vk::DeviceAddress Triangles(const RayTracing &mirror, uint32_t blas) {
     return mirror.m_blases[blas].triangles->BufferDeviceAddress();
   }
+  // TLASes, pairs, BLASes and readbacks in flight.
+  static std::array<size_t, 4> Counts(const RayTracing &mirror) {
+    const auto busy = std::ranges::count_if(
+        mirror.m_areas, [](const auto &area) { return area.tick != 0; });
+    return {mirror.m_tlases.size(), mirror.m_pairs.size(),
+            mirror.m_blases.size(), static_cast<size_t>(busy)};
+  }
+  // Runs suspend points up to the next eviction pass.
+  static void Evict(RayTracing &mirror) {
+    for (uint32_t frame = 0; frame < RayTracing::EvictFrames; ++frame) {
+      mirror.RunGarbageCollector();
+    }
+  }
 };
 
 struct StreamBufferTestAccess {

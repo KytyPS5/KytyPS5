@@ -167,6 +167,9 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	if (m_ray_tracing) {
+		m_ray_tracing->RunGarbageCollector();
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

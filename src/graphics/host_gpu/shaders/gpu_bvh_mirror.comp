@@ -12,8 +12,9 @@
 // Mode 1, a thread per BLAS prim record: writes the record's triangle and sums hashes of the BLAS
 // records (topology) and triangles (geometry).
 // Mode 2, a thread per box node a pair's walk visited: sums the hash of its links again.
-// Mode 3, a thread per TLAS instance slot: writes the host instance, and clears the context's
-// valid word unless every visible instance has a mirror of its pair as the guest holds it now.
+// Mode 3, a thread per TLAS instance slot: writes the host instance, marks its pair used, and
+// clears the context's valid word unless every visible instance has a mirror of its pair as the
+// guest holds it now.
 
 layout(local_size_x = 64) in;
 
@@ -57,6 +58,7 @@ struct BlasState {
 struct PairState {
 	uint links;
 	uint fail;
+	uint used;
 };
 
 layout(buffer_reference, std430) readonly buffer Blases { Blas blases[]; };
@@ -434,6 +436,7 @@ void WriteInstance(uint slot) {
 			if (mirrored && pair == ~0u) {
 				params.missing.keys[atomicAdd(context.missing_count, 1u)] = uvec4(key, 0u);
 			} else if (mirrored) {
+				params.pair_states.states[pair].used = 1u;
 				const Pair      known    = params.pairs.pairs[pair];
 				const BlasState state    = params.blas_states.states[known.blas];
 				const PairState rehashed = params.pair_states.states[pair];

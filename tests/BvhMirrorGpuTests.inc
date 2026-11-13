@@ -278,6 +278,28 @@
       relinked[2].t = 7.0f;
       settle("refit", relinked, RayTracingTestAccess::Triangles(mirror, 0) + 32);
 
+      // An eviction pass keeps what calls used since the last one. Then A loses record 99 and B
+      // its root: the next pass drops B and the readback in flight with A's new walk, which A
+      // takes again. With no call before two more passes, everything goes.
+      const auto counts = [&](std::array<size_t, 4> wanted) {
+        return RayTracingTestAccess::Counts(mirror) == wanted;
+      };
+      RayTracingTestAccess::Evict(mirror);
+      Require(name, "eviction", counts({1, 2, 1, 0}), "an eviction pass dropped a used mirror");
+      cache.InvalidateMemory(blas, 2 * page);
+      bottom.Children(6, {G::Link(98, 0), G::Empty, G::Empty, G::Empty});
+      top.Instance(0x180, blas, G::Empty, 0xff02, identity);
+      const std::array<Hit, 2> only_a{relinked[0], {{3.2f, 1.0f}}};
+      trace(only_a);
+      (void)mirror.Prepare(tlas);
+      RayTracingTestAccess::Evict(mirror);
+      Require(name, "eviction", counts({1, 1, 1, 0}),
+              "an eviction pass kept an unused pair or a readback");
+      settle("eviction", only_a);
+      RayTracingTestAccess::Evict(mirror);
+      RayTracingTestAccess::Evict(mirror);
+      Require(name, "eviction", counts({0, 0, 0, 0}), "an eviction pass kept an unused mirror");
+
       // A format 10 TLAS in the Trinity layout is not mirrored, even once its page is synchronized.
       if (format == 10) {
         cache.InvalidateMemory(tlas, page);

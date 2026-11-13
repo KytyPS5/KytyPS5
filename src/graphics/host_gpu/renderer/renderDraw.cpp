@@ -1137,9 +1137,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const bool depth_feedback_loop =
 	    rendering.depth_stencil_attachment.image_layout ==
 	    vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
-	                                                      depth_feedback_loop);
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
+	                                                                  depth_feedback_loop);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {

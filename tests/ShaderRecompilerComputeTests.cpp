@@ -20185,14 +20185,14 @@ public:
   }
 
   void CheckRasterizationLayoutOnly() {
-    if (!m_runtime_context.attachment_feedback_loop_enabled ||
-        !m_runtime_context.attachment_feedback_loop_dynamic_state_enabled) {
+    if (!m_runtime_context.attachment_feedback_loop_enabled) {
       return;
     }
+    const bool dynamic = m_runtime_context.attachment_feedback_loop_dynamic_state_enabled;
     m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = false;
     CheckRasterization(true, Prospero::BufferFormat::k32_32_32_32Float,
                        "DepthAttachmentFeedbackStatic");
-    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = true;
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = dynamic;
   }
 
   void CheckRasterization(
@@ -55333,7 +55333,7 @@ void CheckDeviceCreation() {
       vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
       vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
   const auto &mesh = features.get<vk::PhysicalDeviceMeshShaderFeaturesEXT>();
-  const bool feedback =
+  const bool feedback_dynamic_extension =
       has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
       has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
   const bool feedback_layout =
@@ -55358,7 +55358,7 @@ void CheckDeviceCreation() {
           command("vkCmdBeginConditionalRenderingEXT") ==
                   has(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) &&
               command("vkCmdDrawMeshTasksEXT") == has(VK_EXT_MESH_SHADER_EXTENSION_NAME) &&
-              command("vkCmdSetAttachmentFeedbackLoopEnableEXT") == feedback &&
+              command("vkCmdSetAttachmentFeedbackLoopEnableEXT") == feedback_dynamic_extension &&
               graphics.memory_budget_ext_enabled == has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME),
           "an optional extension the GPU has was not enabled");
   Require(name, "features",
@@ -57016,20 +57016,16 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-static-only") == 0) {
     VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
+    auto &graphics = vulkan.RuntimeContext();
     if (!vulkan.RasterizationSupported()) {
       std::fprintf(stderr, "[gpu] rasterization feedback is unavailable\n");
       return 1;
     }
-    auto &graphics = vulkan.RuntimeContext();
     if (!graphics.attachment_feedback_loop_enabled) {
       std::fprintf(stderr, "[gpu] attachment feedback layout is unavailable\n");
       return 1;
     }
-    const bool dynamic = graphics.attachment_feedback_loop_dynamic_state_enabled;
-    graphics.attachment_feedback_loop_dynamic_state_enabled = false;
-    vulkan.CheckRasterization(true, Prospero::BufferFormat::k32_32_32_32Float,
-                               "DepthAttachmentFeedbackStatic");
-    graphics.attachment_feedback_loop_dynamic_state_enabled = dynamic;
+    vulkan.CheckRasterizationLayoutOnly();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {

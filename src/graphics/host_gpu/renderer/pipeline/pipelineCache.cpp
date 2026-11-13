@@ -881,8 +881,8 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
-	                                                            const DrawTargets& targets,
-	                                                            bool depth_feedback_loop) {
+                                                            const DrawTargets&     targets,
+                                                            bool depth_feedback_loop) {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();

@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
+#include "libs/agc.h"
 #include "libs/audio.h"
 #include "libs/libs.h"
 
@@ -485,6 +486,9 @@ public:
 	uint8_t* Get() const { return m_data; }
 	bool     Valid() const { return m_data != nullptr; }
 	uint32_t Size() const { return m_size; }
+	// A video output the guest gave back: the guest GPU work submitted until then (0: none), which
+	// may still read it (Source::Video, ReceiveFrames).
+	uint64_t gpu_work = 0;
 
 private:
 	void Move(GuestBuffer& r) {
@@ -492,6 +496,7 @@ private:
 		m_data    = r.m_data;
 		m_size    = r.m_size;
 		m_texture = r.m_texture;
+		gpu_work  = r.gpu_work;
 		r.m_data  = nullptr;
 		r.m_size  = 0;
 	}
@@ -978,6 +983,10 @@ public:
 			return false;
 		}
 		if (current_video) {
+			// The guest's GPU work may still read the frame it gives back (Astro Bot copies each one
+			// with a DMA the command processor runs up to two frames later): the decoder writes the
+			// buffer again only once all work submitted until now has completed.
+			current_video->buffer->gpu_work = Graphics::SubmittedGpuWork();
 			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
@@ -1415,6 +1424,14 @@ private:
 			if (!buffer) {
 				av_frame_free(&frame);
 				return false;
+			}
+			if ((*buffer)->gpu_work != 0) {
+				if (!Graphics::WaitForGpuWork((*buffer)->gpu_work, worker_stop)) {
+					buffers.Push(std::move(*buffer));
+					av_frame_free(&frame);
+					return false;
+				}
+				(*buffer)->gpu_work = 0;
 			}
 			ReadyFrame ready {.buffer = std::move(*buffer)};
 			if (!(this->*prepare)(frame, ready.buffer, &ready.info)) {

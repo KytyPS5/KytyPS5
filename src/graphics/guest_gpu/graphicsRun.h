@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <set>
 #include <span>
 #include <thread>
 
@@ -41,6 +42,12 @@ public:
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
+	// The admission sequence of the latest submission on any queue (0: none yet). Any thread.
+	[[nodiscard]] uint64_t SubmittedWork();
+	// Waits until the command processor has completed every submission admitted up to `marker`
+	// (SubmittedWork), or the GPU stops: true. False when `cancel` is set first. Not on the GPU
+	// thread.
+	[[nodiscard]] bool WaitForWork(uint64_t marker, const std::atomic_bool& cancel);
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
@@ -60,6 +67,7 @@ private:
 		Pm4Execution              execution;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		uint64_t                  sequence        = 0; // admission order (m_queue_mutex)
 	};
 
 	void              Enqueue(Submission submission);
@@ -76,6 +84,12 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	// WaitForWork: the admission sequence numbers of submissions not yet completed, the next one to
+	// give, and the markers waited for; m_work_progress is signalled once the smallest is reached.
+	std::set<uint64_t>                             m_in_flight;
+	uint64_t                                       m_next_submission_sequence = 1;
+	std::multiset<uint64_t>                        m_work_waits;
+	Common::CondVar                                m_work_progress;
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

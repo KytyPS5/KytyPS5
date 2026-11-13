@@ -21,16 +21,6 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	};
 }
 
-const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
-	switch (index) {
-		case 0: return inst.src0;
-		case 1: return inst.src1;
-		case 2: return inst.src2;
-		case 3: return inst.src3;
-		default: EXIT("decoded source operand index is out of range");
-	}
-}
-
 Decoder::Operand Translator::DestinationOperand(const Decoder::Instruction& inst) {
 	auto destination = inst.dst;
 	if (destination.kind != Decoder::OperandKind::Vgpr) {
@@ -1033,13 +1023,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
-	result.cfg_failure_kind    = cfg.failure_kind;
-	result.fallback_reason     = cfg.unsupported_reason;
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
 	}
 
+	LaneSpills lane_spills;
+	lane_spills.fill({UINT32_MAX, 0u});
 	uint32_t vector_limit = 1u;
 	for (const auto& cfg_block: cfg.blocks) {
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
@@ -1052,6 +1042,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			IncludeInstructionVectorRegisters(instruction, vector_limit);
+			if (instruction.opcode == Decoder::Opcode::V_WRITELANE_B32) {
+				auto& first = lane_spills[instruction.dst.reg].first;
+				first       = std::min(first, instruction.pc);
+			} else if (instruction.opcode == Decoder::Opcode::V_READLANE_B32 &&
+			           instruction.src0.kind == Decoder::OperandKind::Vgpr) {
+				auto& last = lane_spills[instruction.src0.reg].second;
+				last       = std::max(last, instruction.pc);
+			}
 		}
 	}
 
@@ -1304,16 +1302,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				const auto index_low    = draw(3);
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
 				                                           entry_ir.IMul(input_vertex, index_bytes));
-				const auto index_resource = entry_ir.Emit(
-				    IR::ValueOpcode::GetAddressResource,
-				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(4)});
-				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
-				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+				// Indexed draws pass the device address of their indices.
 				const auto packed_index = entry_ir.Emit(
-				    IR::ValueOpcode::LoadAddressU32,
-				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-				    IR::MemoryFlags {.index = memory_index});
+				    IR::ValueOpcode::LoadDeviceAddressU32,
+				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(4),
+				     entry_ir.BitwiseAnd(byte_offset, u32(~3u)),
+				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))});
 				const auto index = IR::U32(entry_ir.Emit(
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
@@ -1348,7 +1342,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
 			                              IR::U32(IR::Value(8u))));
 		} else if (options.stage == ShaderType::TessellationEvaluation) {
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
+			// GS_TG_INFO and the merged wave info both count one full wave of vertices.
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
+			                      IR::U32(IR::Value(options.wave_size << 12u)));
+			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+			                      IR::U32(IR::Value(options.wave_size)));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(4),
 			    IR::U32(entry_ir.Emit(IR::ValueOpcode::TessellationBase, {IR::Value(0u)})));
@@ -1434,7 +1432,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, flush_f32_inputs,
+		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];

@@ -116,7 +116,7 @@ static void FreeShadow(uintptr_t min_addr, uintptr_t max_addr) {
 		if (it != g_ctx->shadows.end()) {
 			const auto bytes = ShadowCoverage(page, min_addr, max_addr);
 			if (bytes >= it->covered_bytes) {
-				if (!Common::VirtualMemory::Free(page)) {
+				if (!Common::VirtualMemory::Free(page, page_size)) {
 					EXIT("can't free shadow memory\n");
 				}
 
@@ -151,8 +151,7 @@ static void KYTY_SYSV_ABI asan_init() {
 
 	g_ctx = new AsanContext;
 
-	sys_dbg_stack_info_t s {};
-	SysStackUsage(s);
+	const auto s = SysStackUsage();
 
 	// Cover the full stack reservation.
 	AllocShadow(s.reserved_addr, reinterpret_cast<uintptr_t>(&s));

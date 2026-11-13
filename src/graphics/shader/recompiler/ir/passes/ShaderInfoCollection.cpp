@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -325,11 +326,13 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
 			} else {
 				info.coherent_buffers |= memory.coherent;
+				info.uses_dma |= !memory.planning_only;
 			}
 		}
 		if (buffer_access != BufferAccess::None) {
-			if (kind == ResourceKind::IndirectBuffer && op != ValueOpcode::ReadConstBuffer) {
-				info.subgroup_local_invocation_id = true;
+			if (kind == ResourceKind::IndirectBuffer) {
+				info.uses_dma = true;
+				info.subgroup_local_invocation_id |= op != ValueOpcode::ReadConstBuffer;
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
@@ -514,9 +517,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
-		case ValueOpcode::BvhIntersect: info.bvh = true; break;
-		case ValueOpcode::Bvh8Intersect: info.bvh8 = true; break;
+		case ValueOpcode::BvhIntersect: info.bvh = info.uses_dma = true; break;
+		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
+		case ValueOpcode::LoadDeviceAddressU32: info.uses_device_address = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
@@ -582,7 +586,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.user_data_registers.clear();
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
-	    info.uses_dispatch_threads = info.uses_swizzle = false;
+	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
+	        false;
 	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
@@ -601,7 +606,8 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		return resource.indirect_root != UINT32_MAX;
 	};
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, uses_mapping);
+	                           std::ranges::any_of(info.images, uses_mapping) ||
+	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
 	switch (program.stage) {
 		case ShaderType::Vertex:

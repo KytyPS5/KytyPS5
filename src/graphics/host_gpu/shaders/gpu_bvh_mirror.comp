@@ -1,0 +1,465 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Turns guest BVHs (header version 1), which the guest builds and refits on the GPU, into the
+// inputs of host acceleration structure builds. A guest TLAS instance names a pair (BLAS, subtree
+// root), mirrored over the prim-record range the subtree covers, which must be contiguous.
+// Refits rewrite neither child links nor prim records, so hashes of those tell a rebuild apart.
+// Mode 0 (built with WALK), a workgroup per listed pair: walks the subtree, reporting its record
+// range, the box nodes it visited and a hash of their links.
+// Mode 1, a thread per BLAS prim record: writes the record's triangle and sums hashes of the BLAS
+// records (topology) and triangles (geometry).
+// Mode 2, a thread per box node a pair's walk visited: sums the hash of its links again.
+// Mode 3, a thread per TLAS instance slot: writes the host instance, and clears the context's
+// valid word unless every visible instance has a mirror of its pair as the guest holds it now.
+
+layout(local_size_x = 64) in;
+
+// Guest page -> host device address of the page, plus 1 once a DMA access synchronized it.
+layout(std430, binding = 0) readonly buffer PageTable { uint64_t pages[]; };
+layout(std430, binding = 1) buffer Faults { uint faults[]; };
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Word { uint value; };
+
+struct Blas {
+	uint64_t address;
+	uint64_t triangles; // Of records [begin, begin + capacity), or 0.
+	uint     capacity;
+};
+struct Pair {
+	uint64_t structure; // 0 unless it holds, or this call builds, the walked range.
+	uint64_t boxes;     // Box nodes the walk visited.
+	uint     blas;
+	uint     root;
+	uint     first;    // Walked range.
+	uint     topology; // BLAS topology hash at the walk.
+	uint     links;    // Link hash of the walk.
+	uint     box_count;
+	uint     box_capacity;
+	uint     geometry; // BLAS geometry hash at the last build or update.
+	uint     flags;
+};
+const uint PAIR_GEOMETRY = 1u; // `geometry` is known.
+const uint PAIR_UPDATED  = 2u; // Built or updated after this dispatch.
+
+const uint STATE_ABSENT    = 1u; // A page was not synchronized yet.
+const uint STATE_MALFORMED = 2u;
+struct BlasState {
+	uint topology;
+	uint geometry;
+	uint begin;
+	uint end;
+	uint nodes;
+	uint fail;
+};
+struct PairState {
+	uint links;
+	uint fail;
+};
+
+layout(buffer_reference, std430) readonly buffer Blases { Blas blases[]; };
+layout(buffer_reference, std430) readonly buffer Pairs { Pair pairs[]; };
+// {BLAS low, BLAS high, root, pair} in key order.
+layout(buffer_reference, std430) readonly buffer Keys { uvec4 keys[]; };
+layout(buffer_reference, std430) readonly buffer Indices { uint indices[]; };
+layout(buffer_reference, std430) readonly buffer Chunks { uvec2 chunks[]; };
+layout(buffer_reference, std430) buffer Boxes { uint nodes[]; };
+layout(buffer_reference, std430) writeonly buffer Words { uint words[]; };
+layout(buffer_reference, std430) buffer Context {
+	uint     valid;
+	uint     instances; // Guest instance count, ~0 when the header is unreadable.
+	uint     missing_count;
+	uint64_t structure;
+};
+layout(buffer_reference, std430) buffer BlasStates { BlasState states[]; };
+layout(buffer_reference, std430) buffer PairStates { PairState states[]; };
+// {count, first, boxes, links}, or {0, STATE_*, 0, 0}.
+layout(buffer_reference, std430) writeonly buffer WalkResults { uvec4 results[]; };
+// {BLAS low, BLAS high, root, 0} of visible instances without a pair.
+layout(buffer_reference, std430) writeonly buffer Missing { uvec4 keys[]; };
+
+layout(buffer_reference, std430) readonly buffer Parameters {
+	uint64_t    tlas;
+	uint64_t    extended_base; // Guest addresses from here on page from extended_base - fold.
+	uint64_t    fold;
+	Blases      blases;
+	Pairs       pairs;
+	Keys        keys;
+	Indices     walks;           // Pairs to walk.
+	Chunks      triangle_chunks; // {BLAS, first record - begin} per 64 records.
+	Chunks      box_chunks;      // {pair, first box} per 64 boxes.
+	Words       instances;
+	Context     context;
+	BlasStates  blas_states;
+	PairStates  pair_states;
+	WalkResults walk_results;
+	Missing     missing;
+	uint        instance_slots;
+	uint        key_count;
+	uint        page_bits;
+};
+layout(push_constant) uniform Push {
+	Parameters params;
+	uint       mode;
+};
+
+// The vertices of fan triangles 0..3.
+const uvec3 FAN[4] = uvec3[4](uvec3(0u, 1u, 2u), uvec3(1u, 3u, 2u), uvec3(2u, 3u, 4u),
+                              uvec3(2u, 4u, 0u));
+
+bool g_present = true;
+
+// The host address of guest `address`, or 0 when its page is not synchronized yet. A 64-byte
+// node or an 8-byte record lies in one page.
+uint64_t Host(uint64_t address) {
+	const uint64_t packed = address >= params.extended_base ? address - params.fold : address;
+	const uint64_t page   = packed >> params.page_bits;
+	if (page >= uint64_t(pages.length())) {
+		g_present = false;
+		return 0ul;
+	}
+	const uint64_t entry = pages[uint(page)];
+	if ((entry & 1ul) == 0ul) {
+		atomicOr(faults[uint(page >> 5)], 1u << uint(page & 31ul));
+		g_present = false;
+		return 0ul;
+	}
+	return entry - 1ul + (address & ((1ul << params.page_bits) - 1ul));
+}
+
+uint Read(uint64_t host, uint offset) {
+	return host != 0ul ? Word(host + offset).value : 0u;
+}
+
+uint Load(uint64_t address) {
+	return Read(Host(address), 0u);
+}
+
+uint64_t Load64(uint64_t address) {
+	return uint64_t(Load(address)) | uint64_t(Load(address + 4ul)) << 32;
+}
+
+bool IsHeader(uint64_t header, bool blas) {
+	// "PSR_BVHL", version 1, bottom-level property.
+	return Load(header) == 0x5f525350u && Load(header + 4ul) == 0x4c485642u &&
+	       Load(header + 0xfcul) == 1u && ((Load(header + 0x18ul) & 0x40u) != 0u) == blas;
+}
+
+uint Mix(uint hash, uint word) {
+	hash = (hash ^ word) * 0xcc9e2d51u;
+	return (hash ^ (hash >> 15)) * 0x1b873593u;
+}
+
+struct BlasHeader {
+	uint nodes;
+	uint begin;
+	uint end;
+	bool valid; // Node count, records [begin, end) and size bound one another.
+};
+
+BlasHeader ReadBlas(uint64_t blas) {
+	BlasHeader     header;
+	const bool     magic = IsHeader(blas, true);
+	const uint64_t size  = Load64(blas + 0x10ul);
+	const uint64_t nodes = Load64(blas + 0x50ul), end = Load64(blas + 0x58ul);
+	header.nodes = uint(nodes);
+	header.begin = Load(blas + 0x84ul);
+	header.end   = uint(end);
+	header.valid = magic && size < (1ul << 32) && nodes * 64ul <= size &&
+	               end * 8ul <= size && header.begin <= header.end;
+	return header;
+}
+
+// The children of a box node, FP16 (kind 4) or FP32 (kind 5, two units), in words 0..3.
+uvec4 Links(uint64_t blas, uint node) {
+	const uint64_t host = Host(blas + uint64_t(node) * 64ul);
+	return uvec4(Read(host, 0u), Read(host, 4u), Read(host, 8u), Read(host, 12u));
+}
+
+uint LinkHash(uint node, uvec4 links) {
+	return Mix(Mix(Mix(Mix(Mix(2u, node), links.x), links.y), links.z), links.w);
+}
+
+#ifdef WALK
+
+// Keeps shared memory within the 16 KiB every device has.
+const uint STACK_SIZE = 4088u;
+
+shared uint s_stack[STACK_SIZE];
+shared uint s_top, s_count, s_first, s_last, s_boxes, s_links, s_fail;
+
+void main() {
+	const uint     lane   = gl_LocalInvocationID.x;
+	const uint     index  = params.walks.indices[gl_WorkGroupID.x];
+	const Pair     pair   = params.pairs.pairs[index];
+	const uint64_t blas   = params.blases.blases[pair.blas].address;
+	const BlasHeader header = ReadBlas(blas);
+	if (lane == 0u) {
+		s_stack[0] = pair.root;
+		s_top      = 1u;
+		s_count    = 0u;
+		s_first    = ~0u;
+		s_last     = 0u;
+		s_boxes    = 0u;
+		s_links    = 0u;
+		s_fail     = (header.valid ? 0u : STATE_MALFORMED) | (g_present ? 0u : STATE_ABSENT);
+	}
+	barrier();
+	// A tree visits each node and record once; a longer walk follows a cycle or a shared run.
+	for (uint step = 0u; s_top != 0u && s_fail == 0u; ++step) {
+		const uint top   = s_top;
+		// A step pops up to 64 entries, fewer when the 4 pushes per box would not fit.
+		const uint taken = min(min(top, gl_WorkGroupSize.x), max(1u, (STACK_SIZE - top) / 3u));
+		const uint entry = lane < taken ? s_stack[top - taken + lane] : 7u;
+		barrier();
+		if (lane == 0u) {
+			s_top = top - taken;
+			if (step > header.nodes + header.end - header.begin ||
+			    s_count > header.end - header.begin) {
+				atomicOr(s_fail, STATE_MALFORMED);
+			}
+		}
+		barrier();
+		const uint kind = entry & 7u, node = entry >> 3;
+		if (kind == 4u || kind == 5u) {
+			const uint box = atomicAdd(s_boxes, 1u);
+			if (node < 4u || node + kind - 4u >= header.nodes || box >= pair.box_capacity) {
+				atomicOr(s_fail, STATE_MALFORMED);
+			} else {
+				Boxes(pair.boxes).nodes[box] = node;
+				const uvec4 links = Links(blas, node);
+				atomicAdd(s_links, LinkHash(node, links));
+				for (uint child = 0u; child < 4u; ++child) {
+					// Kinds 6 and 7 are empty.
+					if ((links[child] & 6u) != 6u) {
+						const uint slot = atomicAdd(s_top, 1u);
+						if (slot < STACK_SIZE) {
+							s_stack[slot] = links[child];
+						} else {
+							atomicOr(s_fail, STATE_MALFORMED);
+						}
+					}
+				}
+			}
+		} else if (kind <= 3u) {
+			// A leaf: records from `node` up to the one with the last bit.
+			uint record = node;
+			for (;; ++record) {
+				if (record < header.begin || record >= header.end) {
+					atomicOr(s_fail, STATE_MALFORMED);
+					break;
+				}
+				const bool last = (Load(blas + uint64_t(record) * 8ul + 4ul) >> 31) != 0u;
+				if (last || !g_present) {
+					break;
+				}
+			}
+			atomicAdd(s_count, record - node + 1u);
+			atomicMin(s_first, node);
+			atomicMax(s_last, record);
+		}
+		if (!g_present) {
+			atomicOr(s_fail, STATE_ABSENT);
+		}
+		barrier();
+	}
+	if (lane == 0u) {
+		uint fail = s_fail;
+		if (fail == 0u && (s_count == 0u || s_last - s_first + 1u != s_count)) {
+			fail = STATE_MALFORMED;
+		}
+		params.walk_results.results[gl_WorkGroupID.x] =
+		    fail == 0u ? uvec4(s_count, s_first, s_boxes, s_links) : uvec4(0u, fail, 0u, 0u);
+	}
+}
+
+#else
+
+void WriteTriangles() {
+	const uvec2  chunk    = params.triangle_chunks.chunks[gl_WorkGroupID.x];
+	const Blas   info     = params.blases.blases[chunk.x];
+	const BlasHeader header = ReadBlas(info.address);
+	const uint   offset   = chunk.y + gl_LocalInvocationID.x;
+	const uint   record   = header.begin + offset;
+	uint         topology = 0u, geometry = 0u, fail = header.valid ? 0u : STATE_MALFORMED;
+	if (header.valid && record < header.end) {
+		const uint64_t entry    = Host(info.address + uint64_t(record) * 8ul);
+		const uint     triangle = Read(entry, 0u);
+		const uint     node = triangle >> 3, kind = triangle & 7u;
+		topology = Mix(Mix(Mix(0u, record), triangle), Read(entry, 4u));
+		// Records of other kinds hold no triangle: they get a point, which no ray hits.
+		uint words[9] = uint[9](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+		if (kind <= 3u && (node < 4u || node >= header.nodes)) {
+			fail = STATE_MALFORMED;
+		} else if (kind <= 3u) {
+			const uint64_t vertices = Host(info.address + uint64_t(node) * 64ul);
+			// Word 15 selects the triangle vertices whose weights are the guest's u and v; 3
+			// selects vertex 0, as 0 does.
+			const uint remap = Read(vertices, 60u) >> (kind * 8u);
+			const uint u = (remap & 3u) % 3u, v = ((remap >> 2) & 3u) % 3u;
+			if (u == v) {
+				fail = STATE_MALFORMED;
+			} else {
+				// Vulkan weighs vertex 1 with u and vertex 2 with v.
+				const uvec3 local = FAN[kind];
+				const uvec3 order = uvec3(local[3u - u - v], local[u], local[v]);
+				for (uint i = 0u; i < 9u; ++i) {
+					words[i] = Read(vertices, order[i / 3u] * 12u + i % 3u * 4u);
+				}
+			}
+		}
+		geometry = Mix(0u, record);
+		for (uint i = 0u; i < 9u; ++i) {
+			geometry = Mix(geometry, words[i]);
+		}
+		if (info.triangles != 0ul && offset < info.capacity) {
+			for (uint i = 0u; i < 9u; ++i) {
+				Words(info.triangles).words[offset * 9u + i] = words[i];
+			}
+		}
+	}
+	if (gl_LocalInvocationID.x == 0u && chunk.y == 0u) {
+		topology += Mix(Mix(Mix(1u, header.nodes), header.begin), header.end);
+		params.blas_states.states[chunk.x].begin = header.begin;
+		params.blas_states.states[chunk.x].end   = header.end;
+		params.blas_states.states[chunk.x].nodes = header.nodes;
+	}
+	fail     = subgroupOr(fail | (g_present ? 0u : STATE_ABSENT));
+	topology = subgroupAdd(topology);
+	geometry = subgroupAdd(geometry);
+	if (subgroupElect()) {
+		atomicAdd(params.blas_states.states[chunk.x].topology, topology);
+		atomicAdd(params.blas_states.states[chunk.x].geometry, geometry);
+		atomicOr(params.blas_states.states[chunk.x].fail, fail);
+	}
+}
+
+void HashBoxes() {
+	const uvec2 chunk = params.box_chunks.chunks[gl_WorkGroupID.x];
+	const Pair  pair  = params.pairs.pairs[chunk.x];
+	const uint  box   = chunk.y + gl_LocalInvocationID.x;
+	uint        hash  = 0u;
+	if (box < pair.box_count) {
+		const uint node = Boxes(pair.boxes).nodes[box];
+		hash            = LinkHash(node, Links(params.blases.blases[pair.blas].address, node));
+	}
+	const uint fail = subgroupOr(g_present ? 0u : STATE_ABSENT);
+	hash            = subgroupAdd(hash);
+	if (subgroupElect()) {
+		atomicAdd(params.pair_states.states[chunk.x].links, hash);
+		atomicOr(params.pair_states.states[chunk.x].fail, fail);
+	}
+}
+
+// The pair of a key, or ~0.
+uint FindPair(uvec3 key) {
+	const uint64_t blas = packUint2x32(key.xy);
+	uint           low = 0u, high = params.key_count;
+	while (low < high) {
+		const uint     middle = (low + high) / 2u;
+		const uvec4    entry  = params.keys.keys[middle];
+		const uint64_t other  = packUint2x32(entry.xy);
+		if (other == blas && entry.z == key.z) {
+			return entry.w;
+		}
+		if (other < blas || (other == blas && entry.z < key.z)) {
+			low = middle + 1u;
+		} else {
+			high = middle;
+		}
+	}
+	return ~0u;
+}
+
+void WriteInstance(uint slot) {
+	Context        context = params.context;
+	const uint64_t tlas    = params.tlas;
+	// Words are read 4-byte aligned only.
+	bool     header  = (tlas & 3ul) == 0ul;
+	uint64_t records = 0ul;
+	uint     guest   = 0u;
+	if (header) {
+		header = IsHeader(tlas, false);
+	}
+	if (header) {
+		records = tlas + Load64(tlas + 0x28ul);
+		guest   = Load(tlas + 0x70ul);
+		header  = (records & 3ul) == 0ul;
+	}
+	if (slot == 0u) {
+		context.instances = header && g_present ? guest : ~0u;
+		if (!header || !g_present || guest > params.instance_slots) {
+			context.valid = 0u;
+		}
+	}
+	if (slot >= params.instance_slots) {
+		return;
+	}
+	uint words[16];
+	for (uint i = 0u; i < 16u; ++i) {
+		words[i] = 0u; // Inactive.
+	}
+	if (header && slot < guest) {
+		const uint64_t record = records + uint64_t(slot) * 128ul;
+		const uint64_t blas   = Load64(record);
+		const uint     root = Load(record + 56ul), flags = Load(record + 60ul);
+		const uint     mask = (flags >> 8) & 0xffu;
+		// Instances without a BLAS, with an empty root (kinds 6, 7) or mask are never hit.
+		if (blas != 0ul && (root & 6u) != 6u && mask != 0u) {
+			const uvec3 key  = uvec3(unpackUint2x32(blas), root);
+			const uint  pair = FindPair(key);
+			// AABB instances (+112 bit 31) have no mirror.
+			const uint id       = Load(record + 112ul);
+			const bool mirrored = (blas & 63ul) == 0ul && (id >> 31) == 0u;
+			bool       ok       = false;
+			if (mirrored && pair == ~0u) {
+				params.missing.keys[atomicAdd(context.missing_count, 1u)] = uvec4(key, 0u);
+			} else if (mirrored) {
+				const Pair      known    = params.pairs.pairs[pair];
+				const BlasState state    = params.blas_states.states[known.blas];
+				const PairState rehashed = params.pair_states.states[pair];
+				ok = known.structure != 0ul && state.fail == 0u && rehashed.fail == 0u &&
+				     state.topology == known.topology && rehashed.links == known.links &&
+				     ((known.flags & PAIR_UPDATED) != 0u ||
+				      ((known.flags & PAIR_GEOMETRY) != 0u && state.geometry == known.geometry));
+				if (ok) {
+					// VkTransformMatrixKHR rows from the object-to-world columns at +64.
+					for (uint row = 0u; row < 3u; ++row) {
+						for (uint column = 0u; column < 4u; ++column) {
+							words[row * 4u + column] =
+							    Load(record + 64ul + column * 12ul + row * 4ul);
+						}
+					}
+					// Bit 0 without bit 1 forces every primitive opaque; else all are non-opaque
+					// candidates, whose prim records hold their opacity.
+					const uint opacity = (flags & 3u) == 1u ? 4u : 0u;
+					words[12]          = slot | mask << 24;
+					words[13]          = known.first | (1u | opacity) << 24;
+					words[14]          = uint(known.structure);
+					words[15]          = uint(known.structure >> 32);
+				}
+			}
+			if (!ok) {
+				context.valid = 0u;
+			}
+		}
+	}
+	if (!g_present) {
+		context.valid = 0u;
+	}
+	for (uint i = 0u; i < 16u; ++i) {
+		params.instances.words[slot * 16u + i] = words[i];
+	}
+}
+
+void main() {
+	switch (mode) {
+		case 1u: WriteTriangles(); break;
+		case 2u: HashBoxes(); break;
+		default: WriteInstance(gl_GlobalInvocationID.x); break;
+	}
+}
+
+#endif

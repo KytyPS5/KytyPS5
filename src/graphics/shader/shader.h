@@ -26,7 +26,6 @@ enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
-	Fetch,
 	Compute,
 	Mesh,
 	Local,
@@ -221,7 +220,6 @@ struct ShaderPixelInputInfo {
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
-	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }

@@ -103,9 +103,7 @@ void ImageInfo::UpdateSize() {
 		                      tile_mode != Prospero::TileMode::kRenderTarget));
 		const auto fragments = std::countr_zero(samples);
 		if (pitch == 0) {
-			pitch = tile_mode == Prospero::TileMode::kDepth
-			            ? TileGetDepthPitch(extent.width, bytes_per_block, fragments)
-			            : TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
+			pitch = TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
 		}
 		EXIT_NOT_IMPLEMENTED(!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
 		if (data.size == 0) {
@@ -303,9 +301,8 @@ uint64_t ImageInfo::LinearSize(uint32_t levels) const {
 	for (uint32_t level = 0; level < levels; ++level) {
 		const auto& mip    = mip_layout[level];
 		const auto  slices = MipExtent(level).depth;
-		const auto  stride = linear_slice_stride != 0 ? linear_slice_stride : mip.linear_size;
-		size               = std::max(
-		    size, Add(Add(mip.linear_offset, Multiply(slices - 1u, stride)), mip.linear_size));
+		const auto  last   = Add(mip.linear_offset, Multiply(slices - 1u, linear_slice_stride));
+		size               = std::max(size, Add(last, mip.linear_size));
 	}
 	return size;
 }
@@ -315,9 +312,12 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 	levels = levels == 0 ? resources.levels : levels;
 	EXIT_IF(levels > resources.levels || levels > mip_layout.size() || tiling.texel_width == 0 ||
 	        tiling.texel_height == 0);
-	const auto aspect = IsDepth()                             ? vk::ImageAspectFlagBits::eDepth
-	                    : pixel_format == vk::Format::eS8Uint ? vk::ImageAspectFlagBits::eStencil
-	                                                          : vk::ImageAspectFlagBits::eColor;
+	auto aspect = vk::ImageAspectFlagBits::eColor;
+	if (IsDepth()) {
+		aspect = vk::ImageAspectFlagBits::eDepth;
+	} else if (pixel_format == vk::Format::eS8Uint) {
+		aspect = vk::ImageAspectFlagBits::eStencil;
+	}
 	std::vector<vk::BufferImageCopy> copies;
 	std::array<uint32_t, 16>         image_heights {};
 	uint64_t                         count = 0;
@@ -346,12 +346,12 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 		vk::BufferImageCopy copy {};
 		copy.bufferOffset      = Add(buffer_offset, mip.linear_offset);
 		copy.bufferRowLength   = mip.linear_pitch * tiling.texel_width;
-		copy.bufferImageHeight = image_heights[level] != 0 ? image_heights[level]
-		                         : !IsTiled() ? mip.height * tiling.texel_height
-		                                      : Common::AlignUp(active.height, tiling.texel_height);
+		copy.bufferImageHeight = image_heights[level];
 		copy.imageSubresource  = {aspect, level, 0, 1};
 		copy.imageExtent       = {active.width, active.height, 1};
 		if (image_heights[level] == 0) {
+			copy.bufferImageHeight = IsTiled() ? Common::AlignUp(active.height, tiling.texel_height)
+			                                   : mip.height * tiling.texel_height;
 			for (uint32_t slice = 0; slice < active.depth; ++slice) {
 				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),
 				                                           Multiply(slice, linear_slice_stride));

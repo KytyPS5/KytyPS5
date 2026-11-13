@@ -114,6 +114,7 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
+bool        ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
 // Returns the one instruction defining `code` that reaches `before` (UINT32_MAX: the entry value),
 // or nullopt if several do.

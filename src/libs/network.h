@@ -20,6 +20,15 @@ struct NetEtherAddr {
 	uint8_t data[6] = {0};
 };
 
+struct NetMemoryPoolStats {
+	uint64_t pool_size;
+	uint64_t max_inuse_size;
+	uint64_t current_inuse_size;
+	int32_t  reserved;
+};
+
+static_assert(sizeof(NetMemoryPoolStats) == 32);
+
 union NetEpollData {
 	void*    ptr;
 	uint32_t u32;
@@ -58,6 +67,7 @@ int KYTY_SYSV_ABI NetInit();
 int KYTY_SYSV_ABI NetTerm();
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
 int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags);

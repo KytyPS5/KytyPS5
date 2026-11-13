@@ -925,17 +925,11 @@ void TestUndefinedRuntimeValueFails() {
 
 namespace Common {
 
-int DbgExitIfHandler(const char *, const char *, int) { return 1; }
+void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
-int DbgExitHandler(const char *, int, std::string_view text) {
+void DbgExitHandler(const char *, int, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
-
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
-  throw std::runtime_error(std::string(text));
-}
-
-void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 

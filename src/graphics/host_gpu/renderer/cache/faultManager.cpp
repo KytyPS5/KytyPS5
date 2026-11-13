@@ -1,17 +1,14 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
-#include "common/assert.h"
-#include "common/logging/log.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
-#include <cinttypes>
 #include <cstring>
-#include <limits>
 
 namespace Libs::Graphics {
 
@@ -44,8 +41,6 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                                &m_fault_process_desc_layout),
 	    "create fault-buffer descriptor layout");
 
-	const auto module = CompileSPV(FAULT_BUFFER_PROCESS_SPV, m_graphics.device);
-
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.setLayoutCount = 1;
 	pipeline_layout_info.pSetLayouts    = &m_fault_process_desc_layout;
@@ -54,17 +49,9 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	                                           &m_fault_process_pipeline_layout),
 	    "create fault-buffer pipeline layout");
 
-	vk::PipelineShaderStageCreateInfo stage {};
-	stage.stage  = vk::ShaderStageFlagBits::eCompute;
-	stage.module = module;
-	stage.pName  = "main";
-	vk::ComputePipelineCreateInfo pipeline_info {};
-	pipeline_info.stage  = stage;
-	pipeline_info.layout = m_fault_process_pipeline_layout;
-	const auto result = m_graphics.device.createComputePipelines(
-	    nullptr, 1, &pipeline_info, nullptr, &m_fault_process_pipeline);
-	m_graphics.device.destroyShaderModule(module, nullptr);
-	RequireVulkanSuccess(result, "create fault-buffer pipeline");
+	m_fault_process_pipeline =
+	    CreateComputePipeline(m_graphics.device, FAULT_BUFFER_PROCESS_SPV,
+		                      m_fault_process_pipeline_layout, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
 }
 
@@ -121,7 +108,7 @@ void FaultManager::ProcessFaultBuffer() {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
-	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
+	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 128; // Four words per invocation.
 	const auto num_workgroups = (num_threads + 63) / 64;
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
@@ -132,16 +119,13 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// An overflowing scan keeps counting past the MaxPageFaults - 1 records the area holds.
+		const auto count = std::min<uint64_t>(faults[0], MaxPageFaults - 1);
 		for (uint32_t index = 1; index <= count; ++index) {
-			const auto address = BufferCache::GuestAddress(faults[index]);
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			fault_ranges.Add(BufferCache::GuestAddress(faults[index]),
+			                 BufferCache::CACHING_PAGESIZE);
 		}
-		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
-		});
+		m_buffer_cache.MarkDmaAccess(fault_ranges);
 		m_fault_areas[area] = 0;
 	});
 

@@ -420,9 +420,8 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 			continue;
 		}
 		if (it->is_regular_file(error) && !error) {
-			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
-			if (!time.IsInvalid()) {
-				mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
+			if (const auto times = Common::File::GetTimes(it->path())) {
+				mtime = std::max(mtime, times->write_ns / 1000000000);
 			}
 		}
 		error.clear();
@@ -710,8 +709,6 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	     mount->user_id, mount->dir_name->data, mount->blocks, mount->system_blocks,
 	     mount->mount_mode, mount->resource);
 
-	*mount_result = {};
-
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name  = mount->dir_name->data;
 	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id);
@@ -731,16 +728,17 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
-	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
+	const bool exists = Common::File::IsDirectoryExisting(mount_dir);
+	if (open && !exists) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
+	if (create && exists) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
-	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
+	if ((create || create2) && !exists) {
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
@@ -766,6 +764,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		created = true;
 	}
 
+	*mount_result = {};
 	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
 }
 

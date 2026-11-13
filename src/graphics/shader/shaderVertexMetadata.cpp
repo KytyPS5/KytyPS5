@@ -8,16 +8,15 @@ namespace Libs::Graphics {
 const char* ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
                                      ShaderVertexMetadata& metadata) {
 	if (data.user_data == nullptr) {
-		return "missing AGC user-data header";
+		return "missing user-data header";
 	}
 
 	ShaderUserData user_data {};
 	std::memcpy(&user_data, data.user_data, sizeof(user_data));
 
-	constexpr uint32_t DirectResourceCount =
-	    static_cast<uint32_t>(AgcDirectResourceType::Last) + 1u;
+	constexpr uint32_t DirectResourceCount = static_cast<uint32_t>(DirectResourceType::Last) + 1u;
 	if (user_data.direct_resource_count > DirectResourceCount) {
-		return "AGC direct-resource count exceeds the known resource domain";
+		return "direct-resource count exceeds the known resource domain";
 	}
 
 	std::array<uint16_t, DirectResourceCount> direct_offsets {};
@@ -25,7 +24,7 @@ const char* ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_
 	    static_cast<uint64_t>(user_data.direct_resource_count) * sizeof(uint16_t);
 	if (direct_size != 0) {
 		if (user_data.direct_resource_offset == nullptr) {
-			return "missing AGC direct-resource offsets";
+			return "missing direct-resource offsets";
 		}
 		std::memcpy(direct_offsets.data(), user_data.direct_resource_offset, direct_size);
 	}
@@ -33,14 +32,12 @@ const char* ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_
 	ShaderVertexMetadata next;
 	for (uint32_t type = 0; type < user_data.direct_resource_count; type++) {
 		const auto reg = direct_offsets[type];
-		if (reg == AGC_ILLEGAL_DIRECT_OFFSET) {
+		if (reg == ILLEGAL_DIRECT_OFFSET) {
 			continue;
 		}
-		switch (static_cast<AgcDirectResourceType>(type)) {
-			case AgcDirectResourceType::PtrVertexBufferTable: next.vertex_buffer_reg = reg; break;
-			case AgcDirectResourceType::PtrVertexAttribDescTable:
-				next.vertex_attrib_reg = reg;
-				break;
+		switch (static_cast<DirectResourceType>(type)) {
+			case DirectResourceType::PtrVertexBufferTable: next.vertex_buffer_reg = reg; break;
+			case DirectResourceType::PtrVertexAttribDescTable: next.vertex_attrib_reg = reg; break;
 			default: break;
 		}
 	}

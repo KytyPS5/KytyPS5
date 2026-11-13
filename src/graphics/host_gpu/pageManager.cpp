@@ -22,12 +22,7 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #else
 #include <unistd.h>
 #endif
@@ -41,17 +36,6 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
-
-[[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
-	std::fputs("PageManager fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
-	std::fputc('\n', stderr);
-	std::fflush(stderr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
-#endif
-	std::_Exit(322);
-}
 
 [[noreturn]] void Fatal(const char* format, ...) {
 	std::fputs("PageManager fatal: ", stderr);
@@ -94,8 +78,8 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		uint8_t write_watchers  = 0;
+		uint8_t access_watchers = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -112,7 +96,7 @@ struct PageManager::Impl {
 			static_assert(delta >= -1 && delta <= 1);
 			if constexpr (is_read) {
 				if constexpr (delta == 1) {
-					if (access_watchers != 0) {
+					if (access_watchers == UINT8_MAX) {
 						Fatal("read-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++access_watchers;
@@ -126,7 +110,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == UINT8_MAX) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -141,7 +125,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -175,15 +159,14 @@ struct PageManager::Impl {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
 				if (page.write_watchers != 0 || page.access_watchers != 0) {
-					FailFast("PageManager destroyed with live page state");
+					Fatal("destroyed with live page state");
 				}
 			}
 		}
 	}
 
 	Region* FindRegion(uint64_t vaddr) const noexcept {
-		return vaddr < ADDRESS_SIZE ? regions[vaddr / REGION_SIZE].load(std::memory_order_acquire)
-		                            : nullptr;
+		return regions[vaddr / REGION_SIZE].load(std::memory_order_acquire);
 	}
 
 	Region* GetOrCreateRegion(uint64_t vaddr) {
@@ -226,13 +209,14 @@ struct PageManager::Impl {
 			}
 		};
 
+		constexpr int delta = track ? 1 : -1;
 		for (size_t page_index = first; page_index < last; page_index++) {
 			auto&      page    = region.pages[page_index];
 			const auto address = base_addr + page_index * PAGE_SIZE;
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
+			const auto new_count = update ? page.AddDelta<delta, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
 
@@ -290,32 +274,22 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
-uint64_t PageManager::GetPageSize() const {
-	return PAGE_SIZE;
-}
-
-template <bool track>
+template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
-	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
+	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
 }
 
-template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
-template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<true, true>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<true, false>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
+template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
-	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
-	    REGION_SIZE > ADDRESS_SIZE - base_addr) {
-		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);
-	}
-
 	const auto start_range = mask.FirstRange();
 	const auto end_range   = mask.LastRange();
-	if (start_range.first == REGION_PAGES) {
-		FailFast("empty region watcher mask");
-	}
-	const auto first = start_range.first;
-	const auto last  = end_range.second;
+	const auto first       = start_range.first;
+	const auto last        = end_range.second;
 	if (start_range.second == end_range.second) {
 		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
 		                                           (last - first) * PAGE_SIZE);

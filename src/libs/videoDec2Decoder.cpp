@@ -467,6 +467,23 @@ AvcPictureInfo MakeAvcPictureInfo(const PictureInfo& decoded, size_t size) {
 	return picture;
 }
 
+Vp9PictureInfo MakeVp9PictureInfo(const PictureInfo& decoded) {
+	// CopyFrame always writes 8-bit NV12.
+	return {.this_size      = sizeof(Vp9PictureInfo),
+	        .is_valid       = true,
+	        .pts_data       = decoded.pts,
+	        .dts_data       = decoded.dts,
+	        .attached_data  = decoded.attached_data,
+	        .profile        = decoded.profile,
+	        .key_frame_flag = decoded.key_frame,
+	        .bit_depth      = 8,
+	        .color_range    = decoded.color_range == 2,
+	        .frame_width    = decoded.width,
+	        .frame_height   = decoded.height,
+	        .render_width   = decoded.width,
+	        .render_height  = decoded.height};
+}
+
 bool GetPictureInfo(void* frame_buffer, PictureInfo* picture_info) {
 	std::scoped_lock lock(g_picture_mutex);
 	const auto       it = g_picture_infos.find(frame_buffer);

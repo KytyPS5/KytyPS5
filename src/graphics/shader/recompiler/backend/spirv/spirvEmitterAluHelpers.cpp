@@ -22,8 +22,8 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	        EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0)};
 }
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match) {
+static uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
+                                      uint32_t class_match) {
 	const auto selected =
 	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, mask, 1u << bit), 0);
 	return EmitLogicalAndBool(state, selected, class_match);
@@ -113,7 +113,7 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (state.profile.native_float_min_max) {
+	if (state.profile.native_float_min_max || state.profile.relaxed_float) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
@@ -124,6 +124,13 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.profile.relaxed_float) {
+		// The smallest pairwise maximum; a NaN source gives the minimum of the other two.
+		const auto ab = EmitMinMaxF32Value(state, a, b, true);
+		const auto bc = EmitMinMaxF32Value(state, b, c, true);
+		const auto ac = EmitMinMaxF32Value(state, a, c, true);
+		return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, ab, bc, false), ac, false);
+	}
 	const auto a_bits = EmitBitcastF32ToU32(state, a);
 	const auto b_bits = EmitBitcastF32ToU32(state, b);
 	const auto c_bits = EmitBitcastF32ToU32(state, c);
@@ -151,6 +158,9 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (state.profile.relaxed_float) {
+		return value;
+	}
 	// x * 0 keeps the sign of a denormal; NaN and infinity fail the ordered compare.
 	const auto magnitude = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), magnitude, GlslStd450(state),

@@ -151,18 +151,6 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
-            <!--
-            <item row="3" column="0">
-             <widget class="QLabel" name="label_shader_optimization">
-              <property name="text"><string>Shader optimization:</string></property>
-             </widget>
-            </item>
-            <item row="3" column="1">
-             <widget class="QComboBox" name="comboBox_shader_optimization_type">
-              <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
-             </widget>
-            </item>
-            -->
             <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>
@@ -186,27 +174,39 @@
              </widget>
             </item>
             <item row="7" column="1">
+             <widget class="QCheckBox" name="checkBox_readback_storage">
+              <property name="toolTip"><string>Read back shader-written images when the game flushes the GPU cache for the CPU. Images from linear and tiled readback are read back then too.</string></property>
+              <property name="text"><string>Enable storage readback</string></property>
+             </widget>
+            </item>
+            <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
               <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
               <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
-            <item row="8" column="1">
+            <item row="9" column="1">
              <widget class="QCheckBox" name="checkBox_occlusion_queries">
               <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
               <property name="text"><string>Enable occlusion queries</string></property>
              </widget>
             </item>
-            <item row="9" column="1">
+            <item row="10" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
              </widget>
             </item>
-            <item row="10" column="1">
+            <item row="11" column="1">
              <widget class="QCheckBox" name="checkBox_shader_cache">
               <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
               <property name="text"><string>Cache shaders</string></property>
+             </widget>
+            </item>
+            <item row="12" column="1">
+             <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
+              <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
+              <property name="text"><string>Relaxed shader float math</string></property>
              </widget>
             </item>
            </layout>
@@ -256,9 +256,45 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable experimental Pro mode for supported titles. PSSR uses linear scaling. Disabled by default.</string></property>
-              <property name="text"><string>Pro mode (experimental)</string></property>
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. Disabled by default.</string></property>
+              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
              </widget>
+            </item>
+            <item>
+             <layout class="QFormLayout" name="pssrLayout">
+              <item row="0" column="0">
+               <widget class="QLabel" name="label_pssr_upscaler">
+                <property name="text"><string>PSSR upscaler:</string></property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QComboBox" name="comboBox_pssr_upscaler">
+                <property name="toolTip"><string>DLSS needs an NVIDIA RTX GPU</string></property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QLabel" name="label_dlss_folder">
+                <property name="text"><string>DLSS model folder:</string></property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_dlss_folder">
+                <property name="toolTip"><string>Folder with nvngx_dlss.dll (Windows) or libnvidia-ngx-dlss.so.* (Linux)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+              <item row="2" column="0">
+               <widget class="QLabel" name="label_fsr_folder">
+                <property name="text"><string>FSR folder:</string></property>
+               </widget>
+              </item>
+              <item row="2" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_fsr_folder">
+                <property name="toolTip"><string>Folder with amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll (AMD FidelityFX SDK 2.4 or later)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+             </layout>
             </item>
             <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
@@ -302,7 +338,7 @@
             <item>
              <widget class="QCheckBox" name="checkBox_amd_cpu">
               <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-              <property name="text"><string>AMD CPU patch (experimental)</string></property>
+              <property name="text"><string>Intel CPU compatibility (experimental)</string></property>
              </widget>
             </item>
             <item>
@@ -545,6 +581,40 @@
             <property name="toolTip"><string>Can fix missing textures and incorrect transparency (Resident Evil 2).</string></property>
             <property name="text"><string>Accurate texture synchronization</string></property>
            </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="performance_tweaks_group">
+         <property name="title"><string>Performance tweaks</string></property>
+         <layout class="QVBoxLayout" name="performanceTweaksLayout">
+          <item>
+           <widget class="QLabel" name="label_performance_tweaks">
+            <property name="styleSheet"><string>color: red;</string></property>
+            <property name="text"><string>Game-specific tweaks: they may or may not improve performance. Use with caution and prefer setting them per game rather than globally.</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="flushDrawsLayout">
+            <item>
+             <widget class="QLabel" name="label_flush_draws">
+              <property name="text"><string>Submit GPU work every N draws (0 = off):</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QSpinBox" name="spinBox_flush_draws">
+              <property name="toolTip"><string>Can lower frame time in games that send a whole frame as one command buffer, at some submit overhead.</string></property>
+              <property name="maximum"><number>99999</number></property>
+             </widget>
+            </item>
+            <item>
+             <spacer name="flushDrawsSpacer">
+              <property name="orientation"><enum>Qt::Horizontal</enum></property>
+             </spacer>
+            </item>
+           </layout>
           </item>
          </layout>
         </widget>

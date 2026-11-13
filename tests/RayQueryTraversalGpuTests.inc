@@ -303,8 +303,7 @@
     WriteFanBlas({words});
     const G top{words + page / sizeof(u32)};
     top.Header(0x2c, 0x200 + 4 * 128);
-    top.words[0x28 / 4] = 0x200; // Instance offset.
-    top.words[0x70 / 4] = 4;     // Instance count.
+    top.Instances(0x200, 4);
     top.Children(4, {G::Link(0, 0), G::Link(1, 0), G::Link(2, 0), G::Link(3, 0)});
     top.Bounds(4, 0, {0, 0, 4.5f, 1, 1, 5.5f});
     top.Bounds(4, 1, {16, 0, 5.5f, 20, 4, 6.5f});

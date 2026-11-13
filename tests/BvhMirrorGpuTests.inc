@@ -1,7 +1,8 @@
-  // Writes a guest BVH (header version 1) of 64-byte node units at `words`, header first.
+  // Writes a guest BVH of header format `format` in 64-byte node units at `words`, header first.
   struct GuestBvh {
     static constexpr u32 Empty = ~0u;
     u32 *words;
+    u32 format = 1;
 
     static u32 Link(u32 index, u32 kind) { return index << 3 | kind; }
     u32 *Node(u32 unit) const { return words + unit * 16; }
@@ -9,8 +10,21 @@
       words[0] = 0x5f525350u; // "PSR_BVHL"
       words[1] = 0x4c485642u;
       words[0x10 / 4] = size;
-      words[0x18 / 4] = properties;
-      words[0xfc / 4] = 1; // Version.
+      // Format 10 builders also write the base layout (0x20000) and a large build (0x2000000).
+      words[0x18 / 4] = properties | (format == 10 ? 0x2020000u : 0u);
+      words[0xfc / 4] = format;
+    }
+    // A BLAS's node units and records [begin, end), 8 bytes higher in format 10.
+    void Records(u32 nodes, u32 begin, u32 end) const {
+      u32 *at = words + (format == 10 ? 2 : 0);
+      at[0x50 / 4] = nodes;
+      at[0x58 / 4] = end;
+      at[0x84 / 4] = begin;
+    }
+    // A TLAS's instance offset, 8 bytes higher in format 10, and count, at +0x74 in format 3.
+    void Instances(u32 offset, u32 count) const {
+      words[(format == 10 ? 0x30 : 0x28) / 4] = offset;
+      words[(format == 3 ? 0x74 : 0x70) / 4] = count;
     }
     void Children(u32 unit, std::array<u32, 4> links) const {
       std::ranges::copy(links, Node(unit));
@@ -35,16 +49,19 @@
       words[index * 2 + 1] = index | (last ? 1u << 31 : 0u);
     }
     // An instance record at byte `offset`. Flags: mask in bits 8..15, bit 0 opaque, bit 1
-    // non-opaque; object-to-world columns.
+    // non-opaque; object-to-world columns. Format 10 holds the BLAS >> 3 at +48 under the low
+    // flags at bit 54, the mask in bits 24..31 and rows.
     u32 *Instance(u32 offset, uint64_t blas, u32 root, u32 flags,
                   std::array<float, 12> columns) const {
       u32 *at = words + offset / 4;
-      at[0] = static_cast<u32>(blas);
-      at[1] = static_cast<u32>(blas >> 32);
+      const bool v10 = format == 10;
+      const uint64_t encoded = v10 ? blas >> 3 | uint64_t{flags & 0xffu} << 54 : blas;
+      at[v10 ? 12 : 0] = static_cast<u32>(encoded);
+      at[v10 ? 13 : 1] = static_cast<u32>(encoded >> 32);
       at[56 / 4] = root;
-      at[60 / 4] = flags;
+      at[60 / 4] = v10 ? (flags >> 8 & 0xffu) << 24 : flags;
       for (u32 i = 0; i < columns.size(); ++i) {
-        at[64 / 4 + i] = std::bit_cast<u32>(columns[i]);
+        at[64 / 4 + (v10 ? i % 3 * 4 + i / 3 : i)] = std::bit_cast<u32>(columns[i]);
       }
       return at;
     }
@@ -55,9 +72,7 @@
   static void WriteFanBlas(const GuestBvh &bvh) {
     using G = GuestBvh;
     bvh.Header(0x40, 100 * 8);
-    bvh.words[0x50 / 4] = 12;  // Node units.
-    bvh.words[0x58 / 4] = 100; // Records end
-    bvh.words[0x84 / 4] = 96;  // and begin.
+    bvh.Records(12, 96, 100);
     bvh.Children(4, {G::Link(6, 5), G::Link(8, 5), G::Empty, G::Empty});
     bvh.Bounds(4, 0, {0, 0, 4.5f, 1, 1, 5.5f});
     bvh.Bounds(4, 1, {3, 0, 4.5f, 5, 4, 5.5f});
@@ -75,12 +90,19 @@
     bvh.Record(99, 11, 3, true);
   }
 
-  // The fan BLAS and a TLAS naming A, B scaled and moved, the whole BLAS with an empty mask, and
-  // an empty root. Rays along +z must hit the mirror as the guest's own walk would, after a
-  // relink and after a refit too.
   void CheckBvhMirror() {
+    for (const u32 format : {1u, 3u, 10u}) {
+      CheckBvhMirror(format);
+    }
+  }
+
+  // The fan BLAS and a TLAS naming A, B scaled and moved, the whole BLAS with an empty mask, and
+  // an empty root, in a header format. Rays along +z must hit the mirror as the guest's own walk
+  // would, after a relink and after a refit too.
+  void CheckBvhMirror(u32 format) {
     using G = GuestBvh;
-    constexpr const char *name = "BvhMirror";
+    const auto label = "BvhMirror format " + std::to_string(format);
+    const char *name = label.c_str();
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
     constexpr u32 Miss = ~0u;
     EnsureRuntimeContext();
@@ -98,12 +120,11 @@
     const auto tlas = blas + page;
     auto *words = static_cast<u32 *>(mapped);
     std::fill_n(words, 2 * page / sizeof(u32), 0u);
-    const G bottom{words};
+    const G bottom{words, format};
     WriteFanBlas(bottom);
-    const G top{words + page / sizeof(u32)};
+    const G top{words + page / sizeof(u32), format};
     top.Header(0x2c, 0x100 + 4 * 128);
-    top.words[0x28 / 4] = 0x100; // Instance offset.
-    top.words[0x70 / 4] = 4;     // Instance count.
+    top.Instances(0x100, 4);
     constexpr std::array<float, 12> identity{1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
     top.Instance(0x100, blas, G::Link(6, 5), 0xff01, identity);
     top.Instance(0x180, blas, G::Link(8, 5), 0xff02, {2, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, 1});
@@ -236,6 +257,17 @@
       bottom.Node(10)[2] = std::bit_cast<u32>(7.0f);
       relinked[2].t = 7.0f;
       settle("refit", relinked);
+
+      // A format 10 TLAS in the Trinity layout is not mirrored, even once its page is synchronized.
+      if (format == 10) {
+        cache.InvalidateMemory(tlas, page);
+        top.words[0x18 / 4] |= 0x40000u;
+        trace(relinked);
+        trace(relinked);
+        const auto result = trace(relinked);
+        Require(name, "layout", result[0] == 0 && result[1] == ~0u,
+                "a TLAS in another node layout was mirrored");
+      }
 
       scheduler.Finish();
       m_device.destroyPipeline(pipeline, nullptr);

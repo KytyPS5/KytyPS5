@@ -3,9 +3,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Turns guest BVHs (header version 1), which the guest builds and refits on the GPU, into the
-// inputs of host acceleration structure builds. A guest TLAS instance names a pair (BLAS, subtree
-// root), mirrored over the prim-record range the subtree covers, which must be contiguous.
+// Turns guest BVHs (header formats 1, 3 and 10), which the guest builds and refits on the GPU,
+// into the inputs of host acceleration structure builds. A guest TLAS instance names a pair (BLAS,
+// subtree root), mirrored over the prim-record range the subtree covers, which must be contiguous.
 // Refits rewrite neither child links nor prim records, so hashes of those tell a rebuild apart.
 // Mode 0 (built with WALK), a workgroup per listed pair: walks the subtree, reporting its record
 // range, the box nodes it visited and a hash of their links.
@@ -142,10 +142,18 @@ uint64_t Load64(uint64_t address) {
 	return uint64_t(Load(address)) | uint64_t(Load(address + 4ul)) << 32;
 }
 
-bool IsHeader(uint64_t header, bool blas) {
-	// "PSR_BVHL", version 1, bottom-level property.
-	return Load(header) == 0x5f525350u && Load(header + 4ul) == 0x4c485642u &&
-	       Load(header + 0xfcul) == 1u && ((Load(header + 0x18ul) & 0x40u) != 0u) == blas;
+// The format of a "PSR_BVHL" header at the given level (bottom-level property 0x40), or 0.
+// Format 3 moves the TLAS instance count to +0x74; format 10 moves the instance offset, node
+// count and record bounds 8 bytes higher. Format 10 is read only in its base layout: not Trinity
+// (property 0x40000), BVH8 (0x80000), three-level (0x100000) or depopulated (0x20000000), nor a
+// GPU-sized TLAS (0x80000000), whose count covers slots the build leaves unwritten.
+uint Format(uint64_t header, bool blas) {
+	const uint version    = Load(header + 0xfcul);
+	const uint properties = Load(header + 0x18ul);
+	const bool known =
+	    version == 1u || version == 3u || (version == 10u && (properties & 0xa01c0000u) == 0u);
+	const bool magic = Load(header) == 0x5f525350u && Load(header + 4ul) == 0x4c485642u;
+	return magic && known && ((properties & 0x40u) != 0u) == blas ? version : 0u;
 }
 
 uint Mix(uint hash, uint word) {
@@ -162,13 +170,14 @@ struct BlasHeader {
 
 BlasHeader ReadBlas(uint64_t blas) {
 	BlasHeader     header;
-	const bool     magic = IsHeader(blas, true);
-	const uint64_t size  = Load64(blas + 0x10ul);
-	const uint64_t nodes = Load64(blas + 0x50ul), end = Load64(blas + 0x58ul);
+	const uint     format = Format(blas, true);
+	const uint64_t fields = blas + (format == 10u ? 8ul : 0ul);
+	const uint64_t size   = Load64(blas + 0x10ul);
+	const uint64_t nodes = Load64(fields + 0x50ul), end = Load64(fields + 0x58ul);
 	header.nodes = uint(nodes);
-	header.begin = Load(blas + 0x84ul);
+	header.begin = Load(fields + 0x84ul);
 	header.end   = uint(end);
-	header.valid = magic && size < (1ul << 32) && nodes * 64ul <= size &&
+	header.valid = format != 0u && size < (1ul << 32) && nodes * 64ul <= size &&
 	               end * 8ul <= size && header.begin <= header.end;
 	return header;
 }
@@ -379,14 +388,16 @@ void WriteInstance(uint slot) {
 	const uint64_t tlas    = params.tlas;
 	// Words are read 4-byte aligned only.
 	bool     header  = (tlas & 3ul) == 0ul;
+	uint     format  = 0u;
 	uint64_t records = 0ul;
 	uint     guest   = 0u;
 	if (header) {
-		header = IsHeader(tlas, false);
+		format = Format(tlas, false);
+		header = format != 0u;
 	}
 	if (header) {
-		records = tlas + Load64(tlas + 0x28ul);
-		guest   = Load(tlas + 0x70ul);
+		records = tlas + Load64(tlas + (format == 10u ? 0x30ul : 0x28ul));
+		guest   = Load(tlas + (format == 3u ? 0x74ul : 0x70ul));
 		header  = (records & 3ul) == 0ul;
 	}
 	if (slot == 0u) {
@@ -405,9 +416,13 @@ void WriteInstance(uint slot) {
 	}
 	if (header && slot < guest) {
 		const uint64_t record = records + uint64_t(slot) * 128ul;
-		const uint64_t blas   = Load64(record);
+		// Format 10 holds BLAS >> 3 at +48 under flags at bit 54, the mask in bits 24..31 and
+		// object-to-world rows; the others the BLAS at +0, the mask in bits 8..15 and columns.
+		const bool     v10  = format == 10u;
+		const uint64_t blas = v10 ? (Load64(record + 48ul) & ((1ul << 54) - 1ul)) << 3
+		                          : Load64(record);
 		const uint     root = Load(record + 56ul), flags = Load(record + 60ul);
-		const uint     mask = (flags >> 8) & 0xffu;
+		const uint     mask = v10 ? flags >> 24 : (flags >> 8) & 0xffu;
 		// Instances without a BLAS, with an empty root (kinds 6, 7) or mask are never hit.
 		if (blas != 0ul && (root & 6u) != 6u && mask != 0u) {
 			const uvec3 key  = uvec3(unpackUint2x32(blas), root);
@@ -427,11 +442,11 @@ void WriteInstance(uint slot) {
 				     ((known.flags & PAIR_UPDATED) != 0u ||
 				      ((known.flags & PAIR_GEOMETRY) != 0u && state.geometry == known.geometry));
 				if (ok) {
-					// VkTransformMatrixKHR rows from the object-to-world columns at +64.
+					// VkTransformMatrixKHR rows from the object-to-world matrix at +64.
 					for (uint row = 0u; row < 3u; ++row) {
 						for (uint column = 0u; column < 4u; ++column) {
-							words[row * 4u + column] =
-							    Load(record + 64ul + column * 12ul + row * 4ul);
+							const uint at = v10 ? row * 16u + column * 4u : column * 12u + row * 4u;
+							words[row * 4u + column] = Load(record + 64ul + at);
 						}
 					}
 					// Every primitive is a non-opaque candidate: the traversal decides opacity.

@@ -18,10 +18,10 @@ class CommandScheduler;
 class RenderContext;
 struct GraphicContext;
 
-// Mirrors guest BVHs (header version 1) into host acceleration structures. The guest builds and
-// refits them on the GPU, so a GPU job reads them there; the host reads back only what sizes the
-// builds. A guest TLAS instance names a (BLAS, subtree root) pair, mirrored as one BLAS over the
-// subtree's prim-record range.
+// Mirrors guest BVHs (header formats 1, 3 and 10) into host acceleration structures. The guest
+// builds and refits them on the GPU, so a GPU job reads them there; the host reads back only what
+// sizes the builds. A guest TLAS instance names a (BLAS, subtree root) pair, mirrored as one BLAS
+// over the subtree's prim-record range.
 class RayTracing {
 public:
 	explicit RayTracing(RenderContext& context);

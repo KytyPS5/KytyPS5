@@ -7,7 +7,6 @@
 #include "graphics/shader/recompiler/ir/passes/ParameterKeys.h"
 
 #include <algorithm>
-#include <iterator>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -39,6 +38,19 @@ std::pair<uint64_t, uint64_t> WatchedPages(uint64_t address, uint64_t size) {
 	        Common::AlignUp(address + size, TRACKER_PAGE_SIZE) / TRACKER_PAGE_SIZE};
 }
 
+// The page manager updates each run of consecutive pages at once.
+template <bool track>
+void UpdateWatches(PageManager& page_manager, const std::vector<uint64_t>& pages) {
+	for (size_t first = 0; first < pages.size();) {
+		size_t last = first + 1u;
+		while (last < pages.size() && pages[last] == pages[last - 1u] + 1u)
+			++last;
+		page_manager.UpdatePageWatchers<track>(pages[first] * TRACKER_PAGE_SIZE,
+		                                       (last - first) * TRACKER_PAGE_SIZE);
+		first = last;
+	}
+}
+
 } // namespace
 
 size_t ParameterKeyCache::KeyHash::operator()(const Key& key) const noexcept {
@@ -54,25 +66,36 @@ ParameterKeyCache::~ParameterKeyCache() {
 	Clear();
 }
 
+// One page-manager watch per indexed page, however many entries read it (it counts 255 at most).
 void ParameterKeyCache::Watch(Entry& entry) {
 	for (const auto& [address, size]: entry.ranges) {
-		m_page_manager.UpdatePageWatchers<true>(address, size);
 		const auto [first, end] = WatchedPages(address, size);
-		for (auto page = first; page < end; ++page)
-			m_pages[page].insert(&entry);
+		for (auto page = first; page < end; ++page) {
+			auto& entries = m_pages[page];
+			if (entries.empty()) m_changed_pages.push_back(page);
+			entries.insert(&entry);
+		}
 	}
+	UpdateWatches<true>(m_page_manager, m_changed_pages);
+	m_changed_pages.clear();
 	entry.valid = true;
 }
 
 void ParameterKeyCache::Unwatch(Entry& entry) {
 	for (const auto& [address, size]: entry.ranges) {
-		m_page_manager.UpdatePageWatchers<false>(address, size);
 		const auto [first, end] = WatchedPages(address, size);
 		for (auto page = m_pages.lower_bound(first); page != m_pages.end() && page->first < end;) {
 			page->second.erase(&entry);
-			page = page->second.empty() ? m_pages.erase(page) : std::next(page);
+			if (page->second.empty()) {
+				m_changed_pages.push_back(page->first);
+				page = m_pages.erase(page);
+			} else {
+				++page;
+			}
 		}
 	}
+	UpdateWatches<false>(m_page_manager, m_changed_pages);
+	m_changed_pages.clear();
 	entry.valid = false;
 }
 

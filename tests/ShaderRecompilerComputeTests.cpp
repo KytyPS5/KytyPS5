@@ -7797,7 +7797,8 @@ public:
   }
 
   // A CPU write invalidates the parameter-key results that watch its tracker page, even outside
-  // their ranges, and no others; the cache's page index forgets every result it unwatches.
+  // their ranges, and no others. The cache indexes results by page and holds one page watch per
+  // indexed page, released with the page's last result.
   void CheckParameterKeyPages() {
     constexpr const char *name = "ParameterKeyPages";
     constexpr uintptr_t base = 0x0000000236000000ull;
@@ -7831,6 +7832,18 @@ public:
       const auto write = [&](uint64_t address) {
         return context.HandleFault(PageFaultAccess::Write, address);
       };
+      // A watched page is read-only to the host. Only Windows is queried.
+      const auto protected_as = [](uint64_t address, bool watched) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+        MEMORY_BASIC_INFORMATION info{};
+        return VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof(info)) != 0 &&
+               info.Protect == static_cast<DWORD>(watched ? PAGE_READONLY : PAGE_READWRITE);
+#else
+        (void)address;
+        (void)watched;
+        return true;
+#endif
+      };
       // Exactly these of results 1 to 5 are valid.
       const auto valid = [&](std::vector<uint32_t> parameters) {
         for (uint32_t parameter = 1; parameter <= 5u; ++parameter) {
@@ -7852,11 +7865,15 @@ public:
       for (uint64_t index = 9; index < 40; ++index) tail.emplace_back(page(index), 1u);
       Pages all{{page(1), 2u}, {page(3), 1u}, {page(4), 1u}, {page(5), 1u}};
       all.insert(all.end(), tail.begin(), tail.end());
-      Require(name, "index", valid({1u, 2u, 3u, 4u, 5u}) && Access::Pages(keys) == all,
-              "the index did not hold each watched page once per result");
+      Require(name, "index",
+              valid({1u, 2u, 3u, 4u, 5u}) && Access::Pages(keys) == all &&
+                  protected_as(page(1), true) && protected_as(page(2), false) &&
+                  protected_as(page(39), true) && protected_as(page(40), false),
+              "the index did not hold each watched page once per result, or a page's watch is wrong");
       Require(name, "page neighbour",
               write(page(1) + 0xf00u) && valid({3u, 4u, 5u}) &&
-                  Access::Pages(keys) == Pages(all.begin() + 1, all.end()),
+                  Access::Pages(keys) == Pages(all.begin() + 1, all.end()) &&
+                  protected_as(page(1), false) && protected_as(page(3), true),
               "a write beside two results on their page left one valid or the page indexed");
       Require(name, "other pages",
               write(page(0)) && write(page(2)) && write(page(6) + 0xfffu) && write(page(8)) &&
@@ -7876,16 +7893,47 @@ public:
       Require(name, "full cache",
               Access::EntryCount(keys) == 0u && Access::Pages(keys).empty() && write(page(1)),
               "starting over kept a result or an indexed page");
+      // The page manager counts at most 255 watches per page, so results that share a page share
+      // one watch, until the page's last result goes.
+      for (uint32_t parameter = 100u; parameter < 400u; ++parameter)
+        Access::Store(keys, parameter, {{page(1) + parameter, 4u}});
+      Require(name, "shared watch",
+              Access::Pages(keys) == Pages{{page(1), 300u}} && protected_as(page(1), true),
+              "results sharing a page did not share its watch");
+      Access::Store(keys, 100u, {{page(2), 4u}});
+      Require(name, "moved result",
+              Access::Pages(keys) == Pages{{page(1), 299u}, {page(2), 1u}} &&
+                  protected_as(page(1), true) && protected_as(page(2), true),
+              "a result leaving a shared page released the page or missed its new one");
+      Require(name, "last result",
+              write(page(1)) && Access::Pages(keys) == Pages{{page(2), 1u}} &&
+                  Access::Valid(keys, 100u) && !Access::Valid(keys, 101u) &&
+                  protected_as(page(1), false) && protected_as(page(2), true),
+              "invalidating a shared page's results kept it watched or released another page");
+      Access::Store(keys, 8u, {{page(10), 4u}, {page(12), 4u}});
+      Require(name, "gap",
+              protected_as(page(10), true) && protected_as(page(11), false) &&
+                  protected_as(page(12), true),
+              "a watch covered the page between two ranges");
+      Access::Clear(keys);
+      Require(name, "released",
+              Access::Pages(keys).empty() && protected_as(page(2), false) &&
+                  protected_as(page(10), false) && protected_as(page(12), false),
+              "starting over left a page watched");
       // A cache unwatches its valid results on destruction, or the page manager's teardown fails.
       {
         ParameterKeyCache local(context, Access::PageManagerOf(keys));
         Access::Store(local, 1u, {{page(1), 0x10u}});
         Access::Store(local, 2u, {{page(1) + 0x20u, TRACKER_PAGE_SIZE}});
       }
+      Require(name, "destroyed cache", protected_as(page(1), false) && protected_as(page(2), false),
+              "a destroyed cache left its pages watched");
       Access::Store(keys, 1u, {{page(1) + 0x100u, 0x200u}});
       Access::Store(keys, 4u, {{page(7), TRACKER_PAGE_SIZE}});
       context.UnmapMemory(base, allocation_size);
-      Require(name, "unmapped", valid({}) && Access::Pages(keys).empty(),
+      Require(name, "unmapped",
+              valid({}) && Access::Pages(keys).empty() && protected_as(page(1), false) &&
+                  protected_as(page(7), false),
               "unmapping the memory left a result valid or a page indexed");
       scheduler.Finish();
     }

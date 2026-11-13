@@ -64,6 +64,7 @@ private:
 	std::unordered_map<Key, Entry, KeyHash> m_entries;
 	std::map<uint64_t, std::set<Entry*>>    m_pages; // Tracker page -> valid entries watching it.
 	std::vector<Entry*>                     m_hits;
+	std::vector<uint64_t>                   m_changed_pages; // Gained a first or lost a last entry.
 	std::vector<uint32_t>                   m_signature;
 };
 

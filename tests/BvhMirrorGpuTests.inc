@@ -248,13 +248,17 @@
       }};
       settle("build", built);
 
-      // A call with every readback area of its tick in flight neither submits nor waits.
+      // A call with every readback area of its tick in flight neither submits nor waits, unless
+      // its TLAS has none of them, like the BLAS header prepared as a second TLAS.
       const auto tick = scheduler.CurrentTick();
       for (u32 call = 0; call <= 8; ++call) {
         (void)mirror.Prepare(tlas);
       }
       Require(name, "busy areas", scheduler.CurrentTick() == tick,
               "a call waited for a readback area");
+      (void)mirror.Prepare(blas);
+      Require(name, "busy areas", scheduler.CurrentTick() != tick,
+              "a TLAS without a readback in flight went without one");
       expect("busy areas", trace(built), built);
 
       // A rebuild that keeps the records: A takes records 98, 99 and B 96, 97.
@@ -285,7 +289,7 @@
         return RayTracingTestAccess::Counts(mirror) == wanted;
       };
       RayTracingTestAccess::Evict(mirror);
-      Require(name, "eviction", counts({1, 2, 1, 0}), "an eviction pass dropped a used mirror");
+      Require(name, "eviction", counts({2, 2, 1, 0}), "an eviction pass dropped a used mirror");
       cache.InvalidateMemory(blas, 2 * page);
       bottom.Children(6, {G::Link(98, 0), G::Empty, G::Empty, G::Empty});
       top.Instance(0x180, blas, G::Empty, 0xff02, identity);

@@ -33,10 +33,11 @@ public:
 	// context {u32 valid, u32 guest instance count, u32, u64 TLAS address at +16, u64 guest
 	// instance array at +24}, valid once every visible instance has a mirror of its pair as the
 	// guest holds it at the dispatch. New or changed BVHs get mirrors a few readbacks later; a
-	// call made while every readback area is in flight reads nothing back. Instance i has custom
-	// index i and SBT offset equal to the first prim record of its range, so a hit's record is
-	// that plus the primitive. The context and the mirrors serve the commands recorded before the
-	// next call. The guest page table must be synchronized first (PrepareBda).
+	// call made while every readback area is in flight waits for one if none holds its TLAS, and
+	// otherwise reads nothing back. Instance i has custom index i and SBT offset equal to the first
+	// prim record of its range, so a hit's record is that plus the primitive. The context and the
+	// mirrors serve the commands recorded before the next call. The guest page table must be
+	// synchronized first (PrepareBda).
 	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
 
 	// Called at each suspend point. Every EvictFrames of them, the mirrors no call used since the

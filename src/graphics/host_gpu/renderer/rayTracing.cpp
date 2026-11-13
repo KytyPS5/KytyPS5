@@ -388,6 +388,13 @@ void RayTracing::Apply(Area& area) {
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	Collect();
+	// A TLAS with no readback in flight waits for an area, so calls over other TLASes cannot take
+	// every area from it.
+	const auto busy = [&](const Area& area) { return area.tick != 0 && area.tlas == tlas; };
+	if (m_areas[m_next_area].tick != 0 && std::ranges::none_of(m_areas, busy)) {
+		m_scheduler.Wait(m_areas[m_next_area].tick);
+		Collect();
+	}
 	Area       unread;
 	const bool readback = m_areas[m_next_area].tick == 0;
 	auto&      area     = readback ? m_areas[m_next_area] : unread;

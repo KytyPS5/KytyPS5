@@ -2063,6 +2063,18 @@ private:
 			selector.non_negative = true;
 			read = ActiveValue(value, active).TryInstruction();
 		}
+		// x & (2^w - 1) is the bit field of width w at bit 0.
+		uint32_t low_mask = UINT32_MAX;
+		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			uint32_t   mask  = 0;
+			const auto field = ImmediateU32(read->Arg(1), mask)   ? 0u
+			                   : ImmediateU32(read->Arg(0), mask) ? 1u
+			                                                      : 2u;
+			if (field != 2u && mask != 0u && (mask & (mask + 1u)) == 0u) {
+				low_mask = mask;
+				read     = ActiveValue(read->Arg(field), active).TryInstruction();
+			}
+		}
 		if (read != nullptr && read->GetOpcode() == ValueOpcode::BitFieldUExtract) {
 			uint32_t width;
 			if (!ImmediateU32(read->Arg(1), selector.bit_offset) ||
@@ -2071,6 +2083,7 @@ private:
 			selector.bit_mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
 			read = ActiveValue(read->Arg(0), active).TryInstruction();
 		}
+		selector.bit_mask &= low_mask;
 		return read;
 	}
 

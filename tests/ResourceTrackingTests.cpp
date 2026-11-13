@@ -3824,6 +3824,125 @@ void TestMaterialWordImageTable() {
         "material-word key accepted a mask that is not the word's low bits");
 }
 
+// DS2 cs 0xbff76855ee8b1cdb: S_PACK_LL_B32_B16 keeps a scalar-loaded material word's low half,
+// which selects a 992-byte record of a pointer table.
+void TestMaskedScalarMaterialImageTable() {
+  enum class Variant { Masked, Swapped, NotLowBits };
+  static constexpr uint32_t table = 18960u;
+  static constexpr uint32_t stride = 992u;
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto lane = fixture.Emit(
+        ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::IMul32, {local, Value(0x01234567u)}),
+         Value(true)});
+    const auto row =
+        fixture.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)});
+    const auto material =
+        fixture.Buffer({fixture.UserData(8), fixture.UserData(9),
+                        fixture.UserData(10), fixture.UserData(11)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    const auto word = fixture.Emit(
+        ValueOpcode::ReadConstBuffer,
+        {material,
+         fixture.Emit(ValueOpcode::ShiftLeftLogical32, {row, Value(2u)})},
+        fixture.AddMemory(scalar, 0x4c4));
+    const auto mask = Value(variant == Variant::NotLowBits ? 0xff00u : 0xffffu);
+    const auto key =
+        variant == Variant::Swapped
+            ? fixture.Emit(ValueOpcode::BitwiseAnd32, {mask, word})
+            : fixture.Emit(ValueOpcode::BitwiseAnd32, {word, mask});
+    const auto offset =
+        fixture.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+    const auto pointer =
+        fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 8> descriptor;
+    for (uint32_t dword = 0; dword < descriptor.size(); ++dword) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = table + dword * sizeof(uint32_t);
+      descriptor[dword] =
+          fixture.Emit(ValueOpcode::LoadAddressU32,
+                       {pointer, offset, Value(0u), Value(true)},
+                       fixture.AddMemory(memory, 0x580));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(
+        ValueOpcode::ImageRead,
+        {fixture.Image(descriptor, 0x610), fixture.ImageAddress(), Value(true)},
+        fixture.AddMemory(load, 0x610));
+    fixture.PlanAndTrack();
+    const auto &indirect =
+        fixture.program
+            .descriptor_sources[fixture.program.info.images[0].source]
+            .indirect_descriptor;
+    Check(indirect && indirect->selector && !indirect->selector->global &&
+              indirect->selector->stride == 4u &&
+              indirect->selector->offset == 0u &&
+              indirect->selector->bit_offset == 0u &&
+              indirect->selector->bit_mask == 0xffffu &&
+              indirect->key_count.Resolve() == Value(64u) &&
+              fixture.program.descriptor_sources[indirect->selector->source]
+                      .dword_count == 4u &&
+              indirect->table_stride == stride &&
+              indirect->table_immediate == table,
+          "masked scalar material key lost its selector rows");
+    return ExtractResourcePlan(fixture.program);
+  };
+  for (const auto variant : {Variant::Masked, Variant::Swapped}) {
+    const auto plan = make_plan(variant);
+    LinearTestMemory memory;
+    memory.base = 0u;
+    memory.words.assign((0x1000u + table + 6u * stride) / 4u, 0u);
+    // Selector words: their high halves are not part of the key.
+    memory.words[0x800u / 4u + 0u] = 0xabcd0003u;
+    memory.words[0x800u / 4u + 1u] = 0x00010005u;
+    memory.words[0x800u / 4u + 2u] = 0x12340003u;
+    for (const uint32_t key : {0u, 3u, 5u}) {
+      const auto at = (0x1000u + table + key * stride) / 4u;
+      memory.words[at] = 0x100u + key;
+      memory.words[at + 1u] =
+          static_cast<uint32_t>(
+              Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+          << 20u;
+      memory.words[at + 3u] =
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+           << 28u);
+    }
+    std::array<uint32_t, 12> user_data{0x1000u, 0u, 0u, 0u,     0u,  0u,
+                                       0u,      0u, 0x800u, 0u, 12u, 0u};
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.descriptor_reads == 3u && snapshot.images.size() == 3u,
+          "masked scalar material key did not read exactly the records its "
+          "words select");
+    for (const uint32_t key : {0u, 3u, 5u})
+      Check(std::ranges::any_of(snapshot.images,
+                                [&](const auto &image) {
+                                  return image.dwords[0] == 0x100u + key;
+                                }),
+            "masked scalar material key lost a record one of its words "
+            "selects");
+  }
+  CheckFatal([&] { make_plan(Variant::NotLowBits); },
+             "not a valid runtime value",
+             "scalar material key accepted a mask that is not the word's low "
+             "bits");
+}
+
 // DS2 cs 0x98af2e853f33b143: key = bit < 32 ? bit : -1, EXEC skips key < 0.
 void TestLoopSelectedImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
@@ -11247,6 +11366,7 @@ int main() {
     Run("uniform record-word image table", TestUniformRecordWordImageTable);
     Run("global record-word image table", TestGlobalRecordWordImageTable);
     Run("material-word image table", TestMaterialWordImageTable);
+    Run("masked scalar material image table", TestMaskedScalarMaterialImageTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

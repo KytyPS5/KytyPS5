@@ -7578,6 +7578,137 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A resident table holding a BC texture and a raw block view of its bytes (PPSA02015) keeps both
+  // images: heap passes create none after the first and queue no heap change. A GPU write to the
+  // raw image replaces the BC image and tells the heap.
+  void CheckImageHeapBcAliases() {
+    constexpr const char *name = "ImageHeapBcAliases";
+    constexpr uintptr_t base = 0x0000000207600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t table_size = 0x10000;
+    constexpr uint64_t texture = base + 0x10000;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    using Libs::Graphics::Image;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // A 32x32 BC1 texture and an RGBA16F view of block rows that start inside it, both linear.
+    // At the same base a heap would hold the view, as it holds a render target's other extents.
+    const auto descriptor = [](uint64_t address, Format format, uint32_t width, uint32_t height) {
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(address >> 8u);
+      words[1] = static_cast<uint32_t>(address >> 40u) | (static_cast<uint32_t>(format) << 20u);
+      words[2] = (width - 1u) | ((height - 1u) << 14u);
+      words[3] = DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    const auto bc = descriptor(texture, Format::kBc1UNorm, 32u, 32u);
+    const auto raw = descriptor(texture + 0x100u, Format::k16_16_16_16Float, 8u, 4u);
+    std::memcpy(reinterpret_cast<void *>(table), bc.data(), sizeof(bc));
+    std::memcpy(reinterpret_cast<void *>(table + 32u), raw.data(), sizeof(raw));
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto draw = [&] {
+        Require(name, "acquire",
+                heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &sampled}, view),
+                "the table was declined");
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+      };
+      const auto image_at = [&](uint32_t probe) {
+        return ImageHeapTestAccess::ImageOf(heap,
+                                            ImageHeapTestAccess::Views(heap)[0]->slots[probe * 8u]);
+      };
+      const auto both_cached = [&](ImageId bc_image, ImageId raw_image) {
+        return bc_image && raw_image && bc_image != raw_image &&
+               textures.GetImage(bc_image).registered && textures.GetImage(raw_image).registered;
+      };
+      draw();
+      const auto bc_image = image_at(0);
+      const auto raw_image = image_at(1);
+      Require(name, "both aliases", both_cached(bc_image, raw_image),
+              "a BC texture and a raw view of its blocks did not resolve to two cached images");
+      const auto serials = Image::serials.load();
+      const auto bc_serial = textures.GetImage(bc_image).serial;
+      const auto raw_serial = textures.GetImage(raw_image).serial;
+      const auto queued = [](uint64_t serial) {
+        std::scoped_lock lock{Image::heap_mutex};
+        return std::ranges::count(Image::heap_changes, serial, &Image::HeapChange::serial);
+      };
+      bool settled = true;
+      for (uint32_t pass = 0; pass < 4; ++pass) {
+        draw();
+        settled &= image_at(0) == bc_image && image_at(1) == raw_image &&
+                   queued(bc_serial) == 0 && queued(raw_serial) == 0;
+      }
+      Require(name, "settled aliases", settled && Image::serials.load() == serials,
+              "heap passes recreated BC aliases or queued heap changes for them");
+
+      // A GPU write to the raw image leaves the BC image stale.
+      textures.MarkGpuWritten(raw_image);
+      Require(name, "written alias",
+              !textures.GetImage(bc_image).registered && textures.GetImage(raw_image).registered &&
+                  queued(bc_serial) != 0,
+              "a GPU write to the raw image kept the clean BC image or did not tell the heap");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   // A streamer clamps a texture to its resident mips with the T# MIN_LOD and packs other data
   // over the bytes its larger mips would take (PPSA02015: BC 1024^2, tile 1, MIN_LOD 1-4). The
   // image is a sparse one holding only the levels from the clamp on, over only their guest bytes,
@@ -10375,8 +10506,9 @@ public:
       }
 
       // Image heaps keep a BC6H array and a raw block view of its first cube resident together.
-      // That raw read views the BC image and creates its view; a raw writer or a raw image of
-      // other levels, whose layers lie elsewhere, still replaces it.
+      // That raw read views the BC image and creates its view; a raw writer still replaces it. A
+      // raw image of other levels, whose layers lie elsewhere, is cached beside it until either
+      // takes GPU writes.
       for (uint32_t scenario = 0; scenario < 3; ++scenario) {
         const uint64_t address = base + 0x1b00000 + scenario * 0x180000;
         auto bc = MakeLinearDesc(address, 0, vk::Format::eBc6HUfloatBlock,
@@ -10402,10 +10534,95 @@ public:
         const bool viewed = scenario == 0;
         Require(name, "raw block view of a BC image",
                 (raw_image == bc_image) == viewed &&
-                    texture_cache.GetImage(bc_image).registered == viewed,
-                "a raw block read did not view the clean BC image, or a raw writer or "
-                "raw image of other levels kept it");
-        if (viewed) (void)texture_cache.FindTexture(raw_image, raw);
+                    texture_cache.GetImage(bc_image).registered == (scenario != 1),
+                "a raw block read did not view the clean BC image, a raw writer kept it, or a "
+                "raw image of other levels replaced it");
+        if (scenario != 1) (void)texture_cache.FindTexture(raw_image, raw);
+        if (scenario == 2) {
+          texture_cache.MarkGpuWritten(raw_image);
+          Require(name, "GPU write replaces a clean BC alias",
+                  !texture_cache.GetImage(bc_image).registered &&
+                      texture_cache.GetImage(raw_image).registered,
+                  "a GPU write to a raw image kept the clean BC image cached beside it");
+        }
+      }
+
+      // PPSA02015's resident tables hold BC1 textures and RGBA16F views of their levels' blocks.
+      // Reads of both keep both images instead of evicting each other on every lookup; a raw
+      // writer still replaces the BC image.
+      {
+        const uint64_t address = base + 0x1f80000;
+        auto bc = MakeLinearDesc(address, 0, vk::Format::eBc1RgbaUnormBlock,
+            Prospero::BufferFormat::kBc1UNorm, Prospero::ImageType::kColor2D,
+            {128, 128, 1}, 1, 8, 1);
+        bc.info.resources.levels = 4;
+        bc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        bc.info.UpdateSize();
+        bc.view_info.level_count = 4;
+        const auto &mip = bc.info.mip_layout[1];
+        auto raw = MakeLinearDesc(address + mip.offset, 0, vk::Format::eR16G16B16A16Sfloat,
+            Prospero::BufferFormat::k16_16_16_16Float, Prospero::ImageType::kColor2D,
+            {mip.pitch, mip.height, 1}, 1, 8, 1);
+        raw.info.tile_mode = bc.info.tile_mode;
+        raw.info.UpdateSize();
+        const auto bc_image = texture_cache.FindImage(bc);
+        (void)texture_cache.FindTexture(bc_image, bc);
+        const auto raw_image = texture_cache.FindImage(raw);
+        (void)texture_cache.FindTexture(raw_image, raw);
+        const auto serials = Libs::Graphics::Image::serials.load();
+        bool same = raw_image != bc_image;
+        for (uint32_t round = 0; round < 8; ++round) {
+          same &= texture_cache.FindImage(bc) == bc_image;
+          (void)texture_cache.FindTexture(bc_image, bc);
+          same &= texture_cache.FindImage(raw) == raw_image;
+          (void)texture_cache.FindTexture(raw_image, raw);
+        }
+        Require(name, "clean BC aliases stay cached",
+                same && Libs::Graphics::Image::serials.load() == serials &&
+                    texture_cache.GetImage(bc_image).registered &&
+                    texture_cache.GetImage(raw_image).registered,
+                "reads of a BC texture and a raw view of one of its levels evicted each other");
+        raw.type = BindingType::Storage;
+        raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        Require(name, "raw writer replaces a clean BC alias",
+                texture_cache.FindImage(raw) == raw_image &&
+                    !texture_cache.GetImage(bc_image).registered,
+                "a raw writer found its image but kept the clean BC image cached beside it");
+        (void)texture_cache.FindTexture(raw_image, raw);
+      }
+
+      // A lookup's image can take GPU writes by copy: a GPU-written raw view with the BC
+      // texture's own geometry becomes the BC image. A clean raw view of other geometry over the
+      // same bytes misses those writes, so it does not stay cached beside the BC image.
+      {
+        const uint64_t address = base + 0x1fc0000;
+        auto bc = MakeLinearDesc(address, 0, vk::Format::eBc1RgbaUnormBlock,
+            Prospero::BufferFormat::kBc1UNorm, Prospero::ImageType::kColor2D,
+            {128, 128, 1}, 1, 8, 1);
+        bc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        bc.info.UpdateSize();
+        auto same = MakeLinearDesc(address, 0, vk::Format::eR16G16B16A16Sfloat,
+            Prospero::BufferFormat::k16_16_16_16Float, Prospero::ImageType::kColor2D,
+            {32, 32, 1}, 1, 8, 1);
+        same.info.tile_mode = bc.info.tile_mode;
+        same.info.UpdateSize();
+        auto other = MakeLinearDesc(address, 0, vk::Format::eR16G16B16A16Sfloat,
+            Prospero::BufferFormat::k16_16_16_16Float, Prospero::ImageType::kColor2D,
+            {32, 8, 1}, 1, 8, 1);
+        other.info.tile_mode = bc.info.tile_mode;
+        other.info.UpdateSize();
+        const auto written = texture_cache.FindImage(same);
+        (void)texture_cache.FindTexture(written, same);
+        texture_cache.MarkGpuWritten(written);
+        const auto clean = texture_cache.FindImage(other);
+        (void)texture_cache.FindTexture(clean, other);
+        const auto bc_image = texture_cache.FindImage(bc);
+        Require(name, "copied GPU writes replace a clean raw alias",
+                clean != written && bc_image != written &&
+                    texture_cache.GetImage(bc_image).IsGpuModified() &&
+                    !texture_cache.GetImage(clean).registered,
+                "an image that took GPU writes by copy kept a clean raw alias cached beside it");
+        (void)texture_cache.FindTexture(bc_image, bc);
       }
 
       // A write through a separate buffer must not replace untouched image
@@ -61377,6 +61594,11 @@ int main(int argc, char **argv) {
     vulkan.CheckLargeSparseImageUpload();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-heap-changes-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageHeapBcAliases();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--memory-residency-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPartialResidency();
@@ -61555,6 +61777,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckImageHeapBcAliases();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -61752,6 +61975,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckImageHeapBcAliases();
   vulkan.CheckPartialResidency();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);

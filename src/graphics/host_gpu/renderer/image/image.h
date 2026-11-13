@@ -189,6 +189,8 @@ public:
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
+	// A clean BC alias of its bytes is cached beside it, until either takes GPU writes.
+	bool bc_alias_cached = false;
 	// Advances whenever a barrier hands the backing to a writer.
 	uint64_t                    content_stamp = 0;
 	std::unique_ptr<EqaaShadow> eqaa;

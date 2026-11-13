@@ -39,6 +39,12 @@ namespace {
 	return image.info.first_level != 0 && !image.IsGpuModified();
 }
 
+[[nodiscard]] bool WritesImage(TextureCache::BindingType binding) {
+	return binding == TextureCache::BindingType::Storage ||
+	       binding == TextureCache::BindingType::RenderTarget ||
+	       binding == TextureCache::BindingType::DepthTarget;
+}
+
 // A tiled chain stores small mips first, so the level count moves mip 0: images at one address
 // with the same extent hold different guest bytes unless every level they share starts at the
 // same offset.
@@ -796,7 +802,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
 	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
-		BcAlias::Resolve(*this, cached_id, merged_id);
+		// Two clean copies of the bytes need no reconciling, so a read keeps both.
+		if (cached.IsGpuModified() || WritesImage(binding)) {
+			BcAlias::Resolve(*this, cached_id, merged_id);
+		}
 		return {merged_id};
 	}
 	const bool safe_to_delete = m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
@@ -1316,7 +1325,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		Common::SmallVector<ImageId, 8> candidates;
 		ForEachImageInRegion(desc.info.data.address, desc.info.data.size,
 		                     [&](ImageId id, Image&) { candidates.push_back(id); });
-		bool block_alias = false;
+		bool       block_alias = false;
+		const bool writes      = WritesImage(desc.type);
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1335,7 +1345,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
-			} else if (image.SafeToDownload() &&
+			} else if ((image.SafeToDownload() || writes) &&
 			           BcAlias::Matches(desc.info, image.info)) {
 				block_alias = true;
 			}
@@ -1396,6 +1406,20 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
+		for (const auto candidate: candidates) {
+			auto* alias = m_slot_images.try_get(candidate);
+			if (alias == nullptr || !alias->registered || alias->IsGpuModified() ||
+			    !BcAlias::Matches(image.info, alias->info)) {
+				continue;
+			}
+			// A copy into the image can give it GPU writes the alias misses.
+			if (image.IsGpuModified()) {
+				alias->binding.needs_rebind |= alias->binding.is_bound || alias->binding.is_target;
+				FreeImage(candidate);
+			} else {
+				alias->bc_alias_cached = image.bc_alias_cached = true;
+			}
+		}
 		if (view_mip >= 0) {
 			// The request's own levels start at the container's level view_mip.
 			desc.view_info.base_level += static_cast<uint32_t>(view_mip);
@@ -1574,6 +1598,25 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
+	if (image.bc_alias_cached) {
+		FreeBcAliases(image);
+	}
+}
+
+void TextureCache::FreeBcAliases(Image& image) {
+	image.bc_alias_cached = false;
+	Common::SmallVector<ImageId, 8> aliases;
+	ForEachImageInRegion(
+	    image.info.data.address, image.info.data.size, [&](ImageId id, Image& alias) {
+		    if (!alias.IsGpuModified() && BcAlias::Matches(image.info, alias.info)) {
+			    aliases.push_back(id);
+		    }
+	    });
+	for (const auto id: aliases) {
+		auto& alias = m_slot_images[id];
+		alias.binding.needs_rebind |= alias.binding.is_bound || alias.binding.is_target;
+		FreeImage(id);
+	}
 }
 
 bool TextureCache::EqaaShadowSupported(ImageId id, uint32_t samples) {

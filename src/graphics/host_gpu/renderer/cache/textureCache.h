@@ -251,6 +251,7 @@ private:
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	void FreeBcAliases(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);

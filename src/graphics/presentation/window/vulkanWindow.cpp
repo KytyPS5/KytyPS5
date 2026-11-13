@@ -528,6 +528,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
+	graphics.ray_query_enabled                = ray_query_enabled;
 	// A coarser alignment rounds the range up past the guest's last byte.
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&

@@ -125,6 +125,7 @@ struct EmitterState {
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         bvh_stack_function      = 0;
+	uint32_t                                         ray_query_variable      = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;

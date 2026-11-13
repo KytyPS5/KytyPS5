@@ -228,6 +228,20 @@ static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& s
 	}
 }
 
+// Recognized traversals trace the mirror of the TLAS whose header address the shader loads from
+// scalar data.
+static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& stage,
+                            PreparedBindings& bindings) {
+	const auto& program = stage.module->info;
+	const auto  dword   = program.bindings.ray_query_dword;
+	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
+	const auto& flat       = stage.resources->flattened_srt;
+	const auto [low, high] = program.info.ray_query_tlas;
+	const auto address = context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+	bindings.shader_data[dword]     = static_cast<uint32_t>(address);
+	bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.module->info.bindings.descriptor_counts[
@@ -366,6 +380,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	PrepareRayQuery(m_context, input_info.stage, bindings);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
@@ -504,6 +519,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	PrepareRayQuery(m_context, input_info.stage, bindings);
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

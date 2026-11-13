@@ -263,6 +263,10 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
+	if (info.ray_query) {
+		bindings.ray_query_dword = bindings.memory_offset_dword;
+		bindings.memory_offset_dword += 2u;
+	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
@@ -762,9 +766,9 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	const bool physical_addresses = state.program.info.uses_dma ||
-	                                state.program.info.uses_image_heap ||
-	                                state.program.info.uses_device_address;
+	const bool physical_addresses =
+	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
+	    state.program.info.uses_device_address || state.program.info.ray_query;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -800,6 +804,10 @@ void DefineModule(EmitterState& state) {
 	if (InputVariableForKind(state, IR::StageInputKind::BaseVertex) != 0 ||
 	    InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
+	}
+	if (state.program.info.ray_query) {
+		state.builder.RequireCapability(spv::CapabilityRayQueryKHR);
+		state.builder.RequireExtension("SPV_KHR_ray_query");
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);

@@ -29,11 +29,12 @@ public:
 	KYTY_CLASS_NO_COPY(RayTracing);
 
 	// Records the mirror of the guest TLAS header at `tlas`. Returns the device address of its
-	// context {u32 valid, u32 guest instance count, u32, u64 TLAS address at +16}, valid once every
-	// visible instance has a mirror of its pair as the guest holds it at the dispatch. New or
-	// changed BVHs get mirrors a few calls later. Instance i has custom index i and SBT offset
-	// equal to the first prim record of its range, so a hit's record is that plus the primitive.
-	// The context and the mirrors serve the commands recorded before the next call.
+	// context {u32 valid, u32 guest instance count, u32, u64 TLAS address at +16, u64 guest
+	// instance array at +24}, valid once every visible instance has a mirror of its pair as the
+	// guest holds it at the dispatch. New or changed BVHs get mirrors a few calls later. Instance i
+	// has custom index i and SBT offset equal to the first prim record of its range, so a hit's
+	// record is that plus the primitive. The context and the mirrors serve the commands recorded
+	// before the next call. The guest page table must be synchronized first (PrepareBda).
 	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
 
 private:

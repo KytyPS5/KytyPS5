@@ -101,6 +101,7 @@ struct alignas(16) Context {
 	uint32_t instances;
 	uint32_t missing_count;
 	uint64_t structure;
+	uint64_t records;
 };
 static_assert(sizeof(Context) == 32);
 
@@ -370,7 +371,6 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
-	m_context.PrepareBda();
 	Collect();
 	auto& area = m_areas[m_next_area];
 	if (area.tick != 0) {

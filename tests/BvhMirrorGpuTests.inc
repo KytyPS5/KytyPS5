@@ -1,11 +1,88 @@
-  // A guest BLAS of two fan nodes under a root box over boxes A (records 96, 97) and B (98, 99),
-  // and a TLAS naming A, B scaled and moved, the whole BLAS with an empty mask, and an empty root.
-  // Rays along +z must hit the mirror as the guest's own walk would, after a relink and after a
-  // refit too.
+  // Writes a guest BVH (header version 1) of 64-byte node units at `words`, header first.
+  struct GuestBvh {
+    static constexpr u32 Empty = ~0u;
+    u32 *words;
+
+    static u32 Link(u32 index, u32 kind) { return index << 3 | kind; }
+    u32 *Node(u32 unit) const { return words + unit * 16; }
+    void Header(u32 properties, u32 size) const {
+      words[0] = 0x5f525350u; // "PSR_BVHL"
+      words[1] = 0x4c485642u;
+      words[0x10 / 4] = size;
+      words[0x18 / 4] = properties;
+      words[0xfc / 4] = 1; // Version.
+    }
+    void Children(u32 unit, std::array<u32, 4> links) const {
+      std::ranges::copy(links, Node(unit));
+    }
+    // Child bounds {min xyz, max xyz} of the FP32 box at `unit`.
+    void Bounds(u32 unit, u32 child, std::array<float, 6> bounds) const {
+      for (u32 i = 0; i < bounds.size(); ++i) {
+        Node(unit)[4 + child * 6 + i] = std::bit_cast<u32>(bounds[i]);
+      }
+    }
+    // Five vertices (x, y) at z = 5; word 15 holds each triangle's remap byte.
+    void Fan(u32 unit, std::array<float, 10> xy, u32 remap) const {
+      for (u32 vertex = 0; vertex < 5; ++vertex) {
+        Node(unit)[vertex * 3] = std::bit_cast<u32>(xy[vertex * 2]);
+        Node(unit)[vertex * 3 + 1] = std::bit_cast<u32>(xy[vertex * 2 + 1]);
+        Node(unit)[vertex * 3 + 2] = std::bit_cast<u32>(5.0f);
+      }
+      Node(unit)[15] = remap;
+    }
+    void Record(u32 index, u32 unit, u32 triangle, bool last) const {
+      words[index * 2] = Link(unit, triangle);
+      words[index * 2 + 1] = index | (last ? 1u << 31 : 0u);
+    }
+    // An instance record at byte `offset`. Flags: mask in bits 8..15, bit 0 opaque, bit 1
+    // non-opaque; object-to-world columns.
+    u32 *Instance(u32 offset, uint64_t blas, u32 root, u32 flags,
+                  std::array<float, 12> columns) const {
+      u32 *at = words + offset / 4;
+      at[0] = static_cast<u32>(blas);
+      at[1] = static_cast<u32>(blas >> 32);
+      at[56 / 4] = root;
+      at[60 / 4] = flags;
+      for (u32 i = 0; i < columns.size(); ++i) {
+        at[64 / 4 + i] = std::bit_cast<u32>(columns[i]);
+      }
+      return at;
+    }
+  };
+
+  // A BLAS of two fan nodes under a root box (unit 4) over boxes A (unit 6: records 96, 97) and
+  // B (unit 8: records 98, 99).
+  static void WriteFanBlas(const GuestBvh &bvh) {
+    using G = GuestBvh;
+    bvh.Header(0x40, 100 * 8);
+    bvh.words[0x50 / 4] = 12;  // Node units.
+    bvh.words[0x58 / 4] = 100; // Records end
+    bvh.words[0x84 / 4] = 96;  // and begin.
+    bvh.Children(4, {G::Link(6, 5), G::Link(8, 5), G::Empty, G::Empty});
+    bvh.Bounds(4, 0, {0, 0, 4.5f, 1, 1, 5.5f});
+    bvh.Bounds(4, 1, {3, 0, 4.5f, 5, 4, 5.5f});
+    bvh.Children(6, {G::Link(96, 0), G::Empty, G::Empty, G::Empty});
+    bvh.Bounds(6, 0, {0, 0, 4.5f, 1, 1, 5.5f});
+    bvh.Children(8, {G::Link(98, 0), G::Link(99, 0), G::Empty, G::Empty});
+    bvh.Bounds(8, 0, {3, 2, 4.5f, 5, 4, 5.5f});
+    bvh.Bounds(8, 1, {3, 0, 4.5f, 4, 4, 5.5f});
+    // The guest's u and v weigh triangle vertices (2, 0), (0, 1), (1, 2) and (2, 1).
+    bvh.Fan(10, {0, 0, 1, 0, 0, 1, 1, 1, 9, 9}, 0x02 | 0x04 << 8);
+    bvh.Fan(11, {3, 0, 9, 9, 3, 2, 5, 2, 4, 4}, 0x09 << 16 | 0x06 << 24);
+    bvh.Record(96, 10, 0, false);
+    bvh.Record(97, 10, 1, true);
+    bvh.Record(98, 11, 2, true);
+    bvh.Record(99, 11, 3, true);
+  }
+
+  // The fan BLAS and a TLAS naming A, B scaled and moved, the whole BLAS with an empty mask, and
+  // an empty root. Rays along +z must hit the mirror as the guest's own walk would, after a
+  // relink and after a refit too.
   void CheckBvhMirror() {
+    using G = GuestBvh;
     constexpr const char *name = "BvhMirror";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
-    constexpr u32 Empty = ~0u, Miss = ~0u;
+    constexpr u32 Miss = ~0u;
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;
@@ -21,68 +98,17 @@
     const auto tlas = blas + page;
     auto *words = static_cast<u32 *>(mapped);
     std::fill_n(words, 2 * page / sizeof(u32), 0u);
-    const auto bits = [](float value) { return std::bit_cast<u32>(value); };
-    const auto header = [](u32 *at, u32 properties, u32 size) {
-      at[0] = 0x5f525350u; // "PSR_BVHL"
-      at[1] = 0x4c485642u;
-      at[0x10 / 4] = size;
-      at[0x18 / 4] = properties;
-      at[0xfc / 4] = 1; // Version.
-    };
-    const auto link = [](u32 index, u32 kind) { return index << 3 | kind; };
-    const auto node = [&](u32 unit) { return words + unit * 16; };
-    const auto children = [&](u32 unit, std::array<u32, 4> links) {
-      std::ranges::copy(links, node(unit));
-    };
-    // Five vertices (x, y) at z = 5; word 15 holds each triangle's remap byte.
-    const auto fan = [&](u32 unit, std::array<float, 10> xy, u32 remap) {
-      for (u32 vertex = 0; vertex < 5; ++vertex) {
-        node(unit)[vertex * 3] = bits(xy[vertex * 2]);
-        node(unit)[vertex * 3 + 1] = bits(xy[vertex * 2 + 1]);
-        node(unit)[vertex * 3 + 2] = bits(5.0f);
-      }
-      node(unit)[15] = remap;
-    };
-    const auto record = [&](u32 index, u32 unit, u32 triangle, bool last) {
-      words[index * 2] = link(unit, triangle);
-      words[index * 2 + 1] = index | (last ? 1u << 31 : 0u);
-    };
-    header(words, 0x40, 100 * 8);
-    words[0x50 / 4] = 12;  // Node units.
-    words[0x58 / 4] = 100; // Records end
-    words[0x84 / 4] = 96;  // and begin.
-    children(4, {link(6, 5), link(8, 5), Empty, Empty});
-    children(6, {link(96, 0), Empty, Empty, Empty});
-    children(8, {link(98, 0), link(99, 0), Empty, Empty});
-    // The guest's u and v weigh triangle vertices (2, 0), (0, 1), (1, 2) and
-    // (2, 1).
-    fan(10, {0, 0, 1, 0, 0, 1, 1, 1, 9, 9}, 0x02 | 0x04 << 8);
-    fan(11, {3, 0, 9, 9, 3, 2, 5, 2, 4, 4}, 0x09 << 16 | 0x06 << 24);
-    record(96, 10, 0, false);
-    record(97, 10, 1, true);
-    record(98, 11, 2, true);
-    record(99, 11, 3, true);
-    auto *top = words + page / sizeof(u32);
-    header(top, 0x2c, 0x100 + 4 * 128);
-    top[0x28 / 4] = 0x100; // Instance offset.
-    top[0x70 / 4] = 4;     // Instance count.
-    // Flags: mask in bits 8..15, bit 0 opaque, bit 1 non-opaque;
-    // object-to-world columns.
-    const auto instance = [&](u32 index, u32 root, u32 flags, std::array<float, 12> columns) {
-      u32 *at = top + (0x100 + 128 * index) / 4;
-      at[0] = static_cast<u32>(blas);
-      at[1] = static_cast<u32>(blas >> 32);
-      at[56 / 4] = root;
-      at[60 / 4] = flags;
-      for (u32 i = 0; i < columns.size(); ++i) {
-        at[64 / 4 + i] = bits(columns[i]);
-      }
-    };
+    const G bottom{words};
+    WriteFanBlas(bottom);
+    const G top{words + page / sizeof(u32)};
+    top.Header(0x2c, 0x100 + 4 * 128);
+    top.words[0x28 / 4] = 0x100; // Instance offset.
+    top.words[0x70 / 4] = 4;     // Instance count.
     constexpr std::array<float, 12> identity{1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0};
-    instance(0, link(6, 5), 0xff01, identity);
-    instance(1, link(8, 5), 0xff02, {2, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, 1});
-    instance(2, link(4, 5), 0x0001, identity);
-    instance(3, Empty, 0xff01, identity);
+    top.Instance(0x100, blas, G::Link(6, 5), 0xff01, identity);
+    top.Instance(0x180, blas, G::Link(8, 5), 0xff02, {2, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, 1});
+    top.Instance(0x200, blas, G::Link(4, 5), 0x0001, identity);
+    top.Instance(0x280, blas, G::Empty, 0xff01, identity);
 
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -115,8 +141,7 @@
         u32 index = 0;
         float t = 0, u = 0, v = 0;
       };
-      // Mirrors the TLAS and traces each origin; returns {valid, instances, hit
-      // words...}.
+      // Mirrors the TLAS and traces each origin; returns {valid, instances, hit words...}.
       const auto trace = [&](std::span<const Hit> hits) {
         auto *origin = reinterpret_cast<float *>(origins.Mapped().data());
         for (size_t i = 0; i < hits.size(); ++i) {
@@ -125,6 +150,7 @@
           origin[i * 4 + 2] = 0;
         }
         origins.Flush(0, origins.Size());
+        context.PrepareBda();
         const struct {
           vk::DeviceAddress context, origins, output;
           u32 count, unused;
@@ -171,8 +197,7 @@
           Require(name, step, ok, "a ray hit the wrong triangle, instance or barycentrics");
         }
       };
-      // The call after a guest change finds it; a few calls later the mirror
-      // holds it.
+      // The call after a guest change finds it; a few calls later the mirror holds it.
       const auto settle = [&](const char *step, std::span<const Hit> hits) {
         auto result = trace(hits);
         Require(name, step, result[0] == 0, "the mirror stayed valid over a changed guest BVH");
@@ -194,8 +219,8 @@
 
       // A rebuild that keeps the records: A takes records 98, 99 and B 96, 97.
       cache.InvalidateMemory(blas, page);
-      children(6, {link(98, 0), link(99, 0), Empty, Empty});
-      children(8, {link(96, 0), Empty, Empty, Empty});
+      bottom.Children(6, {G::Link(98, 0), G::Link(99, 0), G::Empty, G::Empty});
+      bottom.Children(8, {G::Link(96, 0), G::Empty, G::Empty, G::Empty});
       std::array<Hit, 6> relinked{{
           {{4.5f, 2.5f}, 98, 0, 5.0f, 0.625f, 0.25f},
           {{3.2f, 1.0f}, 99, 0, 5.0f, 0.7f, 0.2f},
@@ -206,10 +231,9 @@
       }};
       settle("relink", relinked);
 
-      // A refit raises vertex 0 of unit 10 to z = 7; the mirror then updates on
-      // every call.
+      // A refit raises vertex 0 of unit 10 to z = 7; the mirror then updates on every call.
       cache.InvalidateMemory(blas, page);
-      node(10)[2] = bits(7.0f);
+      bottom.Node(10)[2] = std::bit_cast<u32>(7.0f);
       relinked[2].t = 7.0f;
       settle("refit", relinked);
 

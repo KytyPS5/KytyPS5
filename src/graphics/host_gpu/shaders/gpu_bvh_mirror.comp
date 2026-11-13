@@ -72,6 +72,7 @@ layout(buffer_reference, std430) buffer Context {
 	uint     instances; // Guest instance count, ~0 when the header is unreadable.
 	uint     missing_count;
 	uint64_t structure;
+	uint64_t records; // Guest instance array.
 };
 layout(buffer_reference, std430) buffer BlasStates { BlasState states[]; };
 layout(buffer_reference, std430) buffer PairStates { PairState states[]; };
@@ -390,6 +391,7 @@ void WriteInstance(uint slot) {
 	}
 	if (slot == 0u) {
 		context.instances = header && g_present ? guest : ~0u;
+		context.records   = records;
 		if (!header || !g_present || guest > params.instance_slots) {
 			context.valid = 0u;
 		}
@@ -432,13 +434,11 @@ void WriteInstance(uint slot) {
 							    Load(record + 64ul + column * 12ul + row * 4ul);
 						}
 					}
-					// Bit 0 without bit 1 forces every primitive opaque; else all are non-opaque
-					// candidates, whose prim records hold their opacity.
-					const uint opacity = (flags & 3u) == 1u ? 4u : 0u;
-					words[12]          = slot | mask << 24;
-					words[13]          = known.first | (1u | opacity) << 24;
-					words[14]          = uint(known.structure);
-					words[15]          = uint(known.structure >> 32);
+					// Every primitive is a non-opaque candidate: the traversal decides opacity.
+					words[12] = slot | mask << 24;
+					words[13] = known.first | 1u << 24;
+					words[14] = uint(known.structure);
+					words[15] = uint(known.structure >> 32);
 				}
 			}
 			if (!ok) {

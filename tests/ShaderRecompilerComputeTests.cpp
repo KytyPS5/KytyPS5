@@ -23530,6 +23530,7 @@ public:
 
 #include "PssrGpuTests.inc"
 #include "BvhMirrorGpuTests.inc"
+#include "RayQueryTraversalGpuTests.inc"
 
 private:
   bool m_rasterization_supported = true;
@@ -56884,6 +56885,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bvh-mirror-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBvhMirror();
+    vulkan.CheckRayQueryTraversal();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
@@ -57279,6 +57281,7 @@ int main(int argc, char **argv) {
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
   vulkan.CheckBvhMirror();
+  vulkan.CheckRayQueryTraversal();
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();

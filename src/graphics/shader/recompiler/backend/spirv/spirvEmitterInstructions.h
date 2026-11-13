@@ -343,6 +343,12 @@ uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

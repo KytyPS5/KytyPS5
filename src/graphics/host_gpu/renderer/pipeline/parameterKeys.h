@@ -4,7 +4,9 @@
 #include "common/common.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -13,6 +15,7 @@ namespace Libs::Graphics {
 
 class PageManager;
 class RenderContext;
+struct ParameterKeyCacheTestAccess;
 
 // The values vertex stages export to pixel inputs, evaluated from the vertex records they read.
 // A result is keyed by the stage's plan, the parameter and the uniform values it depends on, and
@@ -49,13 +52,18 @@ private:
 		bool                  valid = false;
 	};
 
-	void Watch(const std::vector<Range>& ranges);
-	void Unwatch(const std::vector<Range>& ranges);
+	void Watch(Entry& entry);
+	void Unwatch(Entry& entry);
+	void Clear();
+
+	friend struct ParameterKeyCacheTestAccess;
 
 	RenderContext&                          m_context;
 	PageManager&                            m_page_manager;
-	std::mutex                              m_mutex; // Entries, for faults on other threads.
+	std::mutex                              m_mutex; // The maps, for faults on other threads.
 	std::unordered_map<Key, Entry, KeyHash> m_entries;
+	std::map<uint64_t, std::set<Entry*>>    m_pages; // Tracker page -> valid entries watching it.
+	std::vector<Entry*>                     m_hits;
 	std::vector<uint32_t>                   m_signature;
 };
 

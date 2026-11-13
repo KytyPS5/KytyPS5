@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/passes/ParameterKeys.h"
 
 #include <algorithm>
+#include <iterator>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -14,7 +15,7 @@ namespace {
 
 namespace IR = ShaderRecompiler::IR;
 
-// Past this many results the cache starts over rather than scan more entries per fault.
+// Past this many results the cache starts over rather than keep growing.
 constexpr size_t MaxEntries = 8192;
 
 void Coalesce(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
@@ -32,11 +33,10 @@ void Coalesce(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
 	ranges.resize(out);
 }
 
-// Watches cover whole pages, so a write next to a range may also mean a write within it.
-bool PagesOverlap(const std::pair<uint64_t, uint64_t>& range, uint64_t address, uint64_t size) {
-	const auto begin = Common::AlignDown(range.first, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(range.first + range.second, TRACKER_PAGE_SIZE);
-	return address < end && begin < address + size;
+// The first tracker page a watch of the range covers and the one past its last.
+std::pair<uint64_t, uint64_t> WatchedPages(uint64_t address, uint64_t size) {
+	return {address / TRACKER_PAGE_SIZE,
+	        Common::AlignUp(address + size, TRACKER_PAGE_SIZE) / TRACKER_PAGE_SIZE};
 }
 
 } // namespace
@@ -51,19 +51,36 @@ ParameterKeyCache::ParameterKeyCache(RenderContext& context, PageManager& page_m
     : m_context(context), m_page_manager(page_manager) {}
 
 ParameterKeyCache::~ParameterKeyCache() {
-	for (const auto& [key, entry]: m_entries) {
-		if (entry.valid) Unwatch(entry.ranges);
-	}
+	Clear();
 }
 
-void ParameterKeyCache::Watch(const std::vector<Range>& ranges) {
-	for (const auto& [address, size]: ranges)
+void ParameterKeyCache::Watch(Entry& entry) {
+	for (const auto& [address, size]: entry.ranges) {
 		m_page_manager.UpdatePageWatchers<true>(address, size);
+		const auto [first, end] = WatchedPages(address, size);
+		for (auto page = first; page < end; ++page)
+			m_pages[page].insert(&entry);
+	}
+	entry.valid = true;
 }
 
-void ParameterKeyCache::Unwatch(const std::vector<Range>& ranges) {
-	for (const auto& [address, size]: ranges)
+void ParameterKeyCache::Unwatch(Entry& entry) {
+	for (const auto& [address, size]: entry.ranges) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
+		const auto [first, end] = WatchedPages(address, size);
+		for (auto page = m_pages.lower_bound(first); page != m_pages.end() && page->first < end;) {
+			page->second.erase(&entry);
+			page = page->second.empty() ? m_pages.erase(page) : std::next(page);
+		}
+	}
+	entry.valid = false;
+}
+
+void ParameterKeyCache::Clear() {
+	for (auto& [key, entry]: m_entries) {
+		if (entry.valid) Unwatch(entry);
+	}
+	m_entries.clear();
 }
 
 bool ParameterKeyCache::Keys(const IR::ResourcePlan& plan, const IR::SrtRuntime& runtime,
@@ -93,16 +110,11 @@ bool ParameterKeyCache::Keys(const IR::ResourcePlan& plan, const IR::SrtRuntime&
 	Coalesce(ranges);
 	{
 		std::scoped_lock lock(m_mutex);
-		if (m_entries.size() >= MaxEntries && !m_entries.contains(key)) {
-			for (const auto& [old_key, entry]: m_entries) {
-				if (entry.valid) Unwatch(entry.ranges);
-			}
-			m_entries.clear();
-		}
+		if (m_entries.size() >= MaxEntries && !m_entries.contains(key)) Clear();
 		auto& entry = m_entries[key];
-		if (entry.valid) Unwatch(entry.ranges);
-		entry = {.keys = result, .ranges = ranges, .valid = true};
-		Watch(entry.ranges);
+		if (entry.valid) Unwatch(entry);
+		entry = {.keys = result, .ranges = ranges};
+		Watch(entry);
 	}
 	std::vector<Range> again;
 	const bool evaluated = IR::EvaluateParameterKeys(plan, runtime, parameter, result, again);
@@ -111,12 +123,10 @@ bool ParameterKeyCache::Keys(const IR::ResourcePlan& plan, const IR::SrtRuntime&
 		std::scoped_lock lock(m_mutex);
 		auto&            entry = m_entries[key];
 		if (entry.valid && (!evaluated || again != entry.ranges)) {
-			Unwatch(entry.ranges);
-			entry.valid = false;
+			Unwatch(entry);
 			if (evaluated) {
 				entry.ranges = std::move(again);
-				entry.valid  = true;
-				Watch(entry.ranges);
+				Watch(entry);
 			}
 		}
 		if (entry.valid) entry.keys = result;
@@ -127,15 +137,15 @@ bool ParameterKeyCache::Keys(const IR::ResourcePlan& plan, const IR::SrtRuntime&
 }
 
 void ParameterKeyCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	const auto [first, end] = WatchedPages(address, size);
 	std::scoped_lock lock(m_mutex);
-	for (auto& [key, entry]: m_entries) {
-		if (!entry.valid || std::ranges::none_of(entry.ranges, [&](const Range& range) {
-			    return PagesOverlap(range, address, size);
-		    }))
-			continue;
-		Unwatch(entry.ranges);
-		entry.valid = false;
+	// Watches cover whole pages, so a write next to a range may also mean a write within it.
+	for (auto page = m_pages.lower_bound(first); page != m_pages.end() && page->first < end; ++page)
+		m_hits.insert(m_hits.end(), page->second.begin(), page->second.end());
+	for (auto* entry: m_hits) {
+		if (entry->valid) Unwatch(*entry);
 	}
+	m_hits.clear();
 }
 
 } // namespace Libs::Graphics

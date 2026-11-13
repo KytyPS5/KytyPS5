@@ -365,6 +365,42 @@ struct ImageHeapTestAccess {
   }
 };
 
+struct ParameterKeyCacheTestAccess {
+  using Range = std::pair<uint64_t, uint64_t>;
+  static ParameterKeyCache::Key KeyOf(uint32_t parameter) { return {.parameter = parameter}; }
+  // A result for the parameter that read the ranges, stored as Keys stores one.
+  static void Store(ParameterKeyCache &cache, uint32_t parameter, std::vector<Range> ranges) {
+    std::scoped_lock lock(cache.m_mutex);
+    auto &entry = cache.m_entries[KeyOf(parameter)];
+    if (entry.valid) cache.Unwatch(entry);
+    entry = {.keys = {parameter}, .ranges = std::move(ranges)};
+    cache.Watch(entry);
+  }
+  static bool Valid(ParameterKeyCache &cache, uint32_t parameter) {
+    std::scoped_lock lock(cache.m_mutex);
+    const auto found = cache.m_entries.find(KeyOf(parameter));
+    return found != cache.m_entries.end() && found->second.valid;
+  }
+  static size_t EntryCount(ParameterKeyCache &cache) {
+    std::scoped_lock lock(cache.m_mutex);
+    return cache.m_entries.size();
+  }
+  // Each indexed page's address and how many results watch it.
+  static std::vector<std::pair<uint64_t, size_t>> Pages(ParameterKeyCache &cache) {
+    std::scoped_lock lock(cache.m_mutex);
+    std::vector<std::pair<uint64_t, size_t>> pages;
+    for (const auto &[page, entries] : cache.m_pages)
+      pages.emplace_back(page * TRACKER_PAGE_SIZE, entries.size());
+    return pages;
+  }
+  // What Keys does when the cache is full.
+  static void Clear(ParameterKeyCache &cache) {
+    std::scoped_lock lock(cache.m_mutex);
+    cache.Clear();
+  }
+  static PageManager &PageManagerOf(ParameterKeyCache &cache) { return cache.m_page_manager; }
+};
+
 // Guest faults the GPU fault route handled.
 std::atomic<uint64_t> g_handled_gpu_faults{0};
 
@@ -7757,6 +7793,107 @@ public:
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A CPU write invalidates the parameter-key results that watch its tracker page, even outside
+  // their ranges, and no others; the cache's page index forgets every result it unwatches.
+  void CheckParameterKeyPages() {
+    constexpr const char *name = "ParameterKeyPages";
+    constexpr uintptr_t base = 0x0000000236000000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    using Access = ParameterKeyCacheTestAccess;
+    using Pages = std::vector<std::pair<uint64_t, size_t>>;
+    const auto page = [](uint64_t index) { return base + index * TRACKER_PAGE_SIZE; };
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "parameter key allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "parameter key mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &keys = context.GetParameterKeys();
+      const auto write = [&](uint64_t address) {
+        return context.HandleFault(PageFaultAccess::Write, address);
+      };
+      // Exactly these of results 1 to 5 are valid.
+      const auto valid = [&](std::vector<uint32_t> parameters) {
+        for (uint32_t parameter = 1; parameter <= 5u; ++parameter) {
+          if (Access::Valid(keys, parameter) !=
+              (std::ranges::find(parameters, parameter) != parameters.end()))
+            return false;
+        }
+        return true;
+      };
+      // Two results on page 1, one whose two ranges share page 3 and run into page 5, one on all
+      // of page 7 and one over pages 9 to 39.
+      Access::Store(keys, 1u, {{page(1) + 0x100u, 0x200u}});
+      Access::Store(keys, 2u, {{page(1) + 0x800u, 0x10u}});
+      Access::Store(keys, 3u,
+                    {{page(3) + 0x100u, 0x100u}, {page(3) + 0x800u, page(5) + 0x10u - page(3) - 0x800u}});
+      Access::Store(keys, 4u, {{page(7), TRACKER_PAGE_SIZE}});
+      Access::Store(keys, 5u, {{page(9) + 0x10u, page(40) - page(9) - 0x10u}});
+      Pages tail{{page(7), 1u}};
+      for (uint64_t index = 9; index < 40; ++index) tail.emplace_back(page(index), 1u);
+      Pages all{{page(1), 2u}, {page(3), 1u}, {page(4), 1u}, {page(5), 1u}};
+      all.insert(all.end(), tail.begin(), tail.end());
+      Require(name, "index", valid({1u, 2u, 3u, 4u, 5u}) && Access::Pages(keys) == all,
+              "the index did not hold each watched page once per result");
+      Require(name, "page neighbour",
+              write(page(1) + 0xf00u) && valid({3u, 4u, 5u}) &&
+                  Access::Pages(keys) == Pages(all.begin() + 1, all.end()),
+              "a write beside two results on their page left one valid or the page indexed");
+      Require(name, "other pages",
+              write(page(0)) && write(page(2)) && write(page(6) + 0xfffu) && write(page(8)) &&
+                  write(page(40)) && valid({3u, 4u, 5u}),
+              "a write to a page no result watches invalidated one");
+      Require(name, "shared page",
+              write(page(4) + 0x10u) && valid({4u, 5u}) && Access::Pages(keys) == tail,
+              "a write inside a result's ranges left it valid or its pages indexed");
+      Access::Store(keys, 1u, {{page(1) + 0x100u, 0x200u}});
+      Require(name, "watched again", write(page(8)) && valid({1u, 4u, 5u}),
+              "a write invalidated a result an earlier write had hit");
+      Require(name, "host range",
+              context.InvalidateMemory(page(20), 2u * TRACKER_PAGE_SIZE) && valid({1u, 4u}) &&
+                  context.InvalidateMemory(page(6) + 0xff0u, 0x20u) && valid({1u}),
+              "a host write over watched pages left a result valid");
+      Access::Clear(keys);
+      Require(name, "full cache",
+              Access::EntryCount(keys) == 0u && Access::Pages(keys).empty() && write(page(1)),
+              "starting over kept a result or an indexed page");
+      // A cache unwatches its valid results on destruction, or the page manager's teardown fails.
+      {
+        ParameterKeyCache local(context, Access::PageManagerOf(keys));
+        Access::Store(local, 1u, {{page(1), 0x10u}});
+        Access::Store(local, 2u, {{page(1) + 0x20u, TRACKER_PAGE_SIZE}});
+      }
+      Access::Store(keys, 1u, {{page(1) + 0x100u, 0x200u}});
+      Access::Store(keys, 4u, {{page(7), TRACKER_PAGE_SIZE}});
+      context.UnmapMemory(base, allocation_size);
+      Require(name, "unmapped", valid({}) && Access::Pages(keys).empty(),
+              "unmapping the memory left a result valid or a page indexed");
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "parameter key unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "parameter key release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -61719,6 +61856,11 @@ int main(int argc, char **argv) {
     vulkan.CheckImageHeapBcAliases();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--parameter-keys-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckParameterKeyPages();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--memory-residency-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPartialResidency();
@@ -61898,6 +62040,7 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
     vulkan.CheckImageHeapBcAliases();
+    vulkan.CheckParameterKeyPages();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -62096,6 +62239,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
   vulkan.CheckImageHeapBcAliases();
+  vulkan.CheckParameterKeyPages();
   vulkan.CheckPartialResidency();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);

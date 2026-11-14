@@ -418,19 +418,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
-                                  uint32_t view_levels, uint32_t& base_level) {
-	if (!info.IsTiled()) {
-		return false;
-	}
-	ImageInfo physical = info;
-	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
-	// compresses mip 1 through a T# that declares one level).
-	if (base_level >= physical_levels) {
-		const auto mip  = info.MipExtent(base_level);
-		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
-		physical_levels = view_levels;
-	}
+static bool MatchTextureMipView(ImageInfo& info, ImageInfo physical, uint32_t physical_levels,
+                                bool metadata, uint32_t view_levels, uint32_t& base_level) {
 	physical.resources.levels = physical_levels;
 	physical.UpdateSize();
 	info.UpdateSize();
@@ -478,6 +467,26 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 		}
 	}
 	return false;
+}
+
+static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                                  uint32_t view_levels, uint32_t& base_level) {
+	if (!info.IsTiled()) {
+		return false;
+	}
+	const ImageInfo declared = info;
+	if (MatchTextureMipView(info, declared, physical_levels, metadata, view_levels, base_level)) {
+		return true;
+	}
+	if (base_level < physical_levels) {
+		return false;
+	}
+	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
+	// compresses mip 1 through a T# that declares one level).
+	ImageInfo  physical = declared;
+	const auto mip      = declared.MipExtent(base_level);
+	physical.extent     = {mip.width, mip.height, declared.IsVolume() ? mip.depth : 1u};
+	return MatchTextureMipView(info, physical, view_levels, metadata, view_levels, base_level);
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,

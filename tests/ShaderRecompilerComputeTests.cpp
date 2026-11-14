@@ -15980,7 +15980,7 @@ public:
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x1000000;
+    constexpr uint64_t allocation_size = 0x2000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -16823,6 +16823,23 @@ public:
                     past.desc.view_info.level_count == 10,
                 "a view past MAX_MIP of a complete chain changed its stored "
                 "layout");
+      }
+      {
+        constexpr uint64_t address = base + 0x800000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dwords = {static_cast<uint32_t>(address >> 8u),
+                             0xc4700000u, 0x010dc1dfu, 0x91b66facu, 0, 0x00700050u, 0, 0};
+        descriptor.dword_count = 8;
+        const auto store = RenderExecutorTestAccess::ResolveTexture(
+            executor, fixed_storage_resource, descriptor);
+        Require(name, "tail mip view past MAX_MIP",
+                store.desc.info.extent.width == 1920 &&
+                    store.desc.info.extent.height == 1080 &&
+                    store.desc.info.resources.levels == 7 &&
+                    address + store.desc.info.data.size <= base + allocation_size &&
+                    store.desc.view_info.base_level == 6 &&
+                    texture_cache.FindTexture(store.image_id, store.desc) != nullptr,
+                "ASTRO BOT's mip 6 of a six-level 1920x1080 chain left the chain");
       }
       auto plain_mipped_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/sparseBinding.h"
 
 #include <array>
+#include <list>
 #include <map>
 #include <mutex>
 #include <span>
@@ -152,10 +153,31 @@ private:
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
 	                  uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
-	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// The copies publish with the tick's priority operations. With `carried`, only the bytes no
+	// readback in flight carries are copied, and they stay GPU-written for the caller to land.
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        RangeSet* carried = nullptr);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+
+	// A readback in flight: `bytes` are the copied bytes the GPU has not written since, GPU-written
+	// until they land.
+	struct Readback {
+		// Past every tick until its copies are recorded.
+		uint64_t tick  = UINT64_MAX;
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		RangeSet bytes;
+	};
+	// Records and submits the readback of a range; the tick that publishes it, or zero for none.
+	[[nodiscard]] uint64_t BeginReadback(uint64_t vaddr, uint64_t size, bool is_write);
+	// The tick that publishes the GPU-written bytes of the range's pages when readbacks in flight
+	// carry them all; zero otherwise.
+	[[nodiscard]] uint64_t PendingReadback(uint64_t vaddr, uint64_t size) const;
+	// The GPU-written bytes of a range that no readback in flight carries.
+	[[nodiscard]] RangeSet UncarriedBytes(uint64_t vaddr, uint64_t size) const;
+	// Once the tick has published: lands it and leaves the range current in guest memory.
+	void EndReadback(uint64_t vaddr, uint64_t size, bool is_write, uint64_t tick);
+	void LandReadbacks(uint64_t tick);
 
 	// With aliased sparse buffers, guest buffers are not joined. Each region of guest memory has
 	// a window two regions long, so a range lies whole in the window of its first byte, at a
@@ -193,7 +215,6 @@ private:
 	void ForEachResidentPiece(uint64_t vaddr, uint64_t size, Func&& func);
 	// Bytes the buffer holds from `address`, up to `size`: a window holds its resident pages.
 	[[nodiscard]] uint64_t HeldBytes(const Buffer& buffer, uint64_t address, uint64_t size) const;
-	void                   DownloadWindows(uint64_t vaddr, uint64_t size);
 	// For sorted resident pages the GPU holds no newer bytes of. They stay bound for the work
 	// recorded so far; the releases unbind them once it has run.
 	[[nodiscard]] std::vector<PageRelease> ReleasePages(std::span<const uint64_t> pages);
@@ -234,6 +255,7 @@ private:
 	uint64_t                                          m_touched_tick = 0;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	std::list<Readback>                               m_readbacks;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;

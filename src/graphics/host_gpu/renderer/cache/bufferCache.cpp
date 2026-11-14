@@ -393,8 +393,8 @@ void BufferCache::WriteBackPages(std::span<const uint64_t> pages) {
 	ForEachPageRun(pages, [this](uint64_t first, uint64_t last) {
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, first, last - first,
 		                                           "garbage collection");
-		EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(
-		    m_slot_buffers[m_windows.at(Region(first))], first, last - first));
+		EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory(m_slot_buffers[m_windows.at(Region(first))],
+		                                           first, last - first));
 	});
 	// Publish all queued downloads before releasing their tracked pages.
 	const auto completion_tick = m_scheduler.CurrentTick();
@@ -511,8 +511,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       RangeSet* carried) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -520,12 +520,21 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
-		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+		    const auto copy = [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
-		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    };
+		    if (carried != nullptr) {
+			    // One readback in flight per byte: none publishes it after it has landed.
+			    UncarriedBytes(address, bytes).ForEach([&](uint64_t start, uint64_t end) {
+				    copy(start, end);
+				    carried->Add(start, end - start);
+			    });
+		    } else {
+			    m_gpu_modified_ranges.ForEachInRange(address, bytes, copy);
+			    m_gpu_modified_ranges.Subtract(address, bytes);
+		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -574,14 +583,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    download.mapped + (copy.dstOffset - download.offset), copy.size);
 		}
 	};
-	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
-	} else {
-		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
-		publish();
-	}
+	m_scheduler.DeferPriorityOperation(std::move(publish));
 	return true;
 }
 
@@ -692,56 +694,130 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		if (Windowed()) {
-			DownloadWindows(vaddr, size);
-		} else {
-			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-			if (IsRegionGpuModified(vaddr, size)) {
-				const auto start =
-				    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
-				const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
-				                          buffer.CpuAddress() + buffer.Size());
-				if (DownloadBufferMemory<false>(buffer, start, end - start)) {
-					m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
-				}
-			}
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size);
+		if (const auto tick = BeginReadback(vaddr, size, is_write); tick != 0) {
+			m_scheduler.WaitPriorityOperations(tick);
+			EndReadback(vaddr, size, is_write, tick);
 		}
 	});
 }
 
-void BufferCache::DownloadWindows(uint64_t vaddr, uint64_t size) {
-	if (!IsRegionGpuModified(vaddr, size)) {
-		return;
+uint64_t BufferCache::BeginReadback(uint64_t vaddr, uint64_t size, bool is_write) {
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return 0;
 	}
-	// GPU-written bytes are in resident pages, so reading them back takes no new ones.
-	const auto limit      = vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
-	                                                   : LibKernel::Memory::kExtendedMemoryBase +
-	                                                         LibKernel::Memory::kExtendedMemorySize;
-	const auto start      = Common::AlignDown(vaddr, DownloadWindowSize);
-	const auto end        = std::min(std::max(start + DownloadWindowSize, vaddr + size), limit);
-	bool       downloaded = false;
-	for (auto address = start; address < end;) {
-		const auto piece = std::min(end, (Region(address) + 1) << m_region_bits);
-		if (const auto window = m_windows.find(Region(address)); window != m_windows.end()) {
-			downloaded |= DownloadBufferMemory<true>(m_slot_buffers[window->second], address,
-			                                         piece - address);
+	auto* joined = Windowed() ? nullptr : &m_slot_buffers[FindBuffer(vaddr, size)];
+	if (IsRegionGpuModified(vaddr, size)) {
+		if (const auto tick = PendingReadback(vaddr, size); tick != 0) {
+			return tick;
 		}
-		address = piece;
+		// In the list before its copies are recorded: a GPU write among them is not carried.
+		const auto readback = m_readbacks.emplace(m_readbacks.end());
+		auto       begin    = Common::AlignDown(vaddr, DownloadWindowSize);
+		auto       end      = begin;
+		if (joined != nullptr) {
+			begin = std::max(begin, joined->CpuAddress());
+			end   = std::min(std::max(begin + DownloadWindowSize, vaddr + size),
+			                 joined->CpuAddress() + joined->Size());
+			(void)DownloadBufferMemory(*joined, begin, end - begin, &readback->bytes);
+		} else {
+			// GPU-written bytes are in resident pages, so reading them back takes no new ones.
+			const auto limit = vaddr < LOWER_ADDRESS_SIZE
+			                       ? LOWER_ADDRESS_SIZE
+			                       : LibKernel::Memory::kExtendedMemoryBase +
+			                             LibKernel::Memory::kExtendedMemorySize;
+			end              = std::min(std::max(begin + DownloadWindowSize, vaddr + size), limit);
+			for (auto address = begin; address < end;) {
+				const auto piece = std::min(end, (Region(address) + 1) << m_region_bits);
+				if (const auto window = m_windows.find(Region(address));
+				    window != m_windows.end()) {
+					(void)DownloadBufferMemory(m_slot_buffers[window->second], address,
+					                           piece - address, &readback->bytes);
+				}
+				address = piece;
+			}
+		}
+		if (!readback->bytes.Empty()) {
+			readback->begin = begin;
+			readback->end   = end;
+			// Recording a copy can submit: the last one's tick publishes them all.
+			readback->tick = m_scheduler.CurrentTick();
+			m_scheduler.Flush();
+			return readback->tick;
+		}
+		m_readbacks.erase(readback);
 	}
-	if (downloaded) {
-		// The guest has the bytes once the downloads are published.
-		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
-		m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		QueueBdaSync(vaddr, size);
 	}
+	return 0;
+}
+
+uint64_t BufferCache::PendingReadback(uint64_t vaddr, uint64_t size) const {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (!UncarriedBytes(begin, end - begin).Empty()) {
+		return 0;
+	}
+	// The last one recorded publishes after the others.
+	for (auto readback = m_readbacks.rbegin(); readback != m_readbacks.rend(); ++readback) {
+		if (readback->bytes.Intersects(begin, end - begin)) {
+			return readback->tick;
+		}
+	}
+	return 0;
+}
+
+RangeSet BufferCache::UncarriedBytes(uint64_t vaddr, uint64_t size) const {
+	RangeSet bytes;
+	m_gpu_modified_ranges.ForEachInRange(
+	    vaddr, size, [&](uint64_t begin, uint64_t end) { bytes.Add(begin, end - begin); });
+	for (const auto& readback: m_readbacks) {
+		readback.bytes.ForEachInRange(
+		    vaddr, size, [&](uint64_t begin, uint64_t end) { bytes.Subtract(begin, end - begin); });
+	}
+	return bytes;
+}
+
+void BufferCache::EndReadback(uint64_t vaddr, uint64_t size, bool is_write, uint64_t tick) {
+	LandReadbacks(tick);
+	// Written again before it landed: the GPU thread waits for this readback itself.
+	if (IsRegionGpuModified(vaddr, size)) {
+		if (const auto again = BeginReadback(vaddr, size, false); again != 0) {
+			m_scheduler.WaitPriorityOperations(again);
+			LandReadbacks(again);
+		}
+	}
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		QueueBdaSync(vaddr, size);
+	}
+}
+
+void BufferCache::LandReadbacks(uint64_t tick) {
+	std::erase_if(m_readbacks, [&](const Readback& readback) {
+		if (readback.tick > tick) {
+			return false;
+		}
+		readback.bytes.ForEach([this](uint64_t begin, uint64_t end) {
+			m_gpu_modified_ranges.Subtract(begin, end - begin);
+		});
+		// Guest memory is current for the pages left without GPU-written bytes.
+		const auto last  = Common::AlignUp(readback.end, TRACKER_PAGE_SIZE);
+		auto       clean = Common::AlignDown(readback.begin, TRACKER_PAGE_SIZE);
+		m_gpu_modified_ranges.ForEachInRange(
+		    clean, last - clean, [&](uint64_t begin, uint64_t end) {
+			    if (const auto written = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
+			        written > clean) {
+				    m_memory_tracker.UnmarkRegionAsGpuModified(clean, written - clean);
+			    }
+			    clean = std::max(clean, Common::AlignUp(end, TRACKER_PAGE_SIZE));
+		    });
+		if (clean < last) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(clean, last - clean);
+		}
+		return true;
+	});
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -968,6 +1044,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// A readback recorded earlier does not carry these bytes.
+		for (auto& readback: m_readbacks) {
+			readback.bytes.Subtract(vaddr, size);
+		}
 		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -1181,7 +1261,7 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());

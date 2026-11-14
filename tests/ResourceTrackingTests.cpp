@@ -660,6 +660,7 @@ void TestExactUnfilteredImageCandidates() {
     fixture->PlanAndTrack();
     auto plan = ExtractResourcePlan(fixture->program);
     const bool unfiltered = access == ValueOpcode::ImageRead || access == ValueOpcode::ImageWrite;
+    const bool sample = access == ValueOpcode::ImageSampleRaw;
     Check(plan.info.images[0].unfiltered_access_only == unfiltered,
           "image access classification admitted a sample, query or atomic");
     const auto &source = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
@@ -688,8 +689,24 @@ void TestExactUnfilteredImageCandidates() {
                              .read_specialization_memory = ReadLinearTestMemory};
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) == unfiltered,
+    // A sample reads the zero-swizzle placeholder as null, in the last row and then the first.
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == (unfiltered || sample),
           "mixed 1D/2D candidates violated the all-uses access guard");
+    if (sample) {
+      const auto rows = memory.words.begin() + 0x1000u / 4u;
+      for (const uint32_t null_image : {1u, 0u}) {
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  snapshot.images.size() == 2u &&
+                  snapshot.images[null_image].dwords == std::array<uint32_t, 8>{} &&
+                  snapshot.images[1u - null_image].dwords == first &&
+                  specialization.images[null_image].dimension == Decoder::ImageDimension::Dim2D,
+              "a sampled zero-swizzle 1D placeholder did not read null under the 2D class");
+        std::swap_ranges(rows, rows + 8, rows + 31u * 8u);
+      }
+      plan.info.images[0].depth_compare = true;
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "a depth comparison read a zero-swizzle placeholder as null");
+    }
     if (!unfiltered) continue;
     Check(snapshot.images.size() == 2u && snapshot.images[1].dwords == placeholder &&
               specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&

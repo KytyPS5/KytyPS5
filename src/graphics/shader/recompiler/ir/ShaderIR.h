@@ -159,6 +159,7 @@ struct ImageResource {
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
+	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
 	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;

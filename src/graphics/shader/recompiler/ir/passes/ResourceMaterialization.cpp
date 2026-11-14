@@ -1728,7 +1728,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
+				        // A sample of a T# whose channels all select 0 reads 0 at any address.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				            (image.sample_access_only && !image.depth_compare &&
+				             DescriptorImageSwizzle(value) == 0u) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;

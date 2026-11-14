@@ -1,9 +1,11 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "kernel/eventFlag.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -84,6 +86,10 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
 int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 } // namespace Libs::Fiber
+
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+} // namespace Libs
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
@@ -5859,6 +5865,248 @@ void TestTlsStubsPreserveFlags() {
 }
 #endif
 
+struct SignalTarget {
+	Libs::LibKernel::Pthread     thread = nullptr;
+	std::vector<uint8_t>         stack  = std::vector<uint8_t>(1024 * 1024);
+	std::atomic<std::thread::id> id {};
+	std::atomic<uint64_t>        progress {0};
+	std::atomic<bool>            stop {false};
+	uint64_t                     guest_code = 0;
+	std::atomic<uint8_t>         guest_stop {0};
+};
+
+using RaiseExceptionFunc = int(KYTY_SYSV_ABI*)(Libs::LibKernel::Pthread, int);
+
+std::atomic<std::thread::id> g_raised_signal_thread {};
+std::atomic<bool>            g_raised_signal_entered {false};
+std::atomic<bool>            g_raised_signal_release {false};
+std::atomic<bool>            g_raised_signal_polls {false};
+std::atomic<int>             g_raised_signal_depth {0};
+std::atomic<int>             g_raised_signal_max_depth {0};
+std::atomic<int>             g_raised_signal_entries {0};
+
+void* KYTY_SYSV_ABI RunSignalTarget(void* arg) {
+	auto& target = *static_cast<SignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	while (!target.stop) {
+		target.progress++;
+		Libs::LibKernel::KernelUsleep(100);
+	}
+	return nullptr;
+}
+
+void* KYTY_SYSV_ABI RunGuestSpinTarget(void* arg) {
+	using GuestSpin = void(KYTY_SYSV_ABI*)(std::atomic<uint64_t>*, std::atomic<uint8_t>*);
+	auto& target = *static_cast<SignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	reinterpret_cast<GuestSpin>(target.guest_code)(&target.progress, &target.guest_stop);
+	return nullptr;
+}
+
+void KYTY_SYSV_ABI HoldRaisedSignal(int /*signum*/, void* /*context*/) {
+	const int depth = ++g_raised_signal_depth;
+	if (depth > g_raised_signal_max_depth) {
+		g_raised_signal_max_depth = depth;
+	}
+	g_raised_signal_thread = std::this_thread::get_id();
+	g_raised_signal_entries++;
+	g_raised_signal_entered = true;
+	while (!g_raised_signal_release) {
+		if (g_raised_signal_polls) {
+			Libs::LibKernel::KernelUsleep(100);
+		} else {
+			std::this_thread::yield();
+		}
+	}
+	g_raised_signal_depth--;
+}
+
+template <typename Predicate>
+bool WaitUntil(Predicate ready) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ready()) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+RaiseExceptionFunc RaisedSignalSetup(const char* test) {
+	using namespace Libs::LibKernel;
+	static RaiseExceptionFunc raise_exception = nullptr;
+	if (raise_exception != nullptr) {
+		return raise_exception;
+	}
+	Common::Singleton<Loader::RuntimeLinker>::Instance();
+	Initialize();
+	PthreadInitSelfForMainThread();
+	static Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+	const auto* raise_symbol   = symbols.FindByNid("il03nluKfMk", Loader::SymbolType::Func);
+	Check(test, install_symbol != nullptr && raise_symbol != nullptr,
+	      "the exception exports do not resolve");
+	const auto install =
+	    reinterpret_cast<int(KYTY_SYSV_ABI*)(int, void*)>(install_symbol->vaddr);
+	CheckOk(test, install(30, reinterpret_cast<void*>(HoldRaisedSignal)), "install handler");
+	raise_exception = reinterpret_cast<RaiseExceptionFunc>(raise_symbol->vaddr);
+	return raise_exception;
+}
+
+void ResetRaisedSignal(bool polls) {
+	g_raised_signal_thread    = std::thread::id {};
+	g_raised_signal_entered   = false;
+	g_raised_signal_release   = false;
+	g_raised_signal_polls     = polls;
+	g_raised_signal_max_depth = 0;
+	g_raised_signal_entries   = 0;
+}
+
+void StartSignalTarget(const char* test, SignalTarget& target,
+                       Libs::LibKernel::pthread_entry_func_t entry) {
+	using namespace Libs::LibKernel;
+	PthreadAttr attr = nullptr;
+	CheckOk(test, PthreadAttrInit(&attr), "PthreadAttrInit");
+	CheckOk(test, PthreadAttrSetstack(&attr, target.stack.data(), target.stack.size()),
+	        "PthreadAttrSetstack");
+	CheckOk(test, PthreadCreate(&target.thread, &attr, entry, &target, "SignalTarget"),
+	        "PthreadCreate");
+	CheckOk(test, PthreadAttrDestroy(&attr), "PthreadAttrDestroy");
+	Check(test, WaitUntil([&target] { return target.progress.load() != 0; }),
+	      "the target thread did not start");
+}
+
+void TestRaisedSignalHoldsTarget() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalHoldsTarget";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(false);
+	StartSignalTarget(test, target, RunSignalTarget);
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	const auto progress = target.progress.load();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const bool held      = target.progress.load() == progress;
+	const bool on_target = g_raised_signal_thread.load() == target.id.load();
+	g_raised_signal_release = true;
+	target.stop             = true;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, on_target, "the handler ran on another thread than its target");
+	Check(test, held, "the target kept running while its handler held");
+}
+
+void TestGuestCodeRangeFollowsAllocation() {
+	constexpr const char* test        = "GuestCodeRangeFollowsAllocation";
+	constexpr uint64_t    module_step = 0x10000000;
+	constexpr uint64_t    code_size   = 0x4000;
+	const auto            code        = Loader::TestMapGuestCode(code_size, module_step);
+	Check(test, code != 0, "the guest code was not mapped");
+	Check(test, Loader::IsGuestCodeAddress(code) && Loader::IsGuestCodeAddress(code + code_size - 1),
+	      "code mapped past an occupied module address is not guest code");
+}
+
+void TestRaisedSignalInterruptsGuestCode() {
+	using namespace Libs::LibKernel;
+	constexpr const char*             test = "RaisedSignalInterruptsGuestCode";
+	constexpr std::array<uint8_t, 11> spin {0x48, 0xff, 0x07, 0xf3, 0x90, 0x80,
+	                                        0x3e, 0x00, 0x74, 0xf6, 0xc3};
+	const auto                        raise_exception = RaisedSignalSetup(test);
+	static SignalTarget               target;
+	target.guest_code = Loader::TestMapGuestCode(spin.size(), 0);
+	Check(test, target.guest_code != 0, "the guest code was not mapped");
+	std::memcpy(reinterpret_cast<void*>(target.guest_code), spin.data(), spin.size());
+	ResetRaisedSignal(false);
+	StartSignalTarget(test, target, RunGuestSpinTarget);
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	const auto progress = target.progress.load();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const bool held      = target.progress.load() == progress;
+	const bool on_target = g_raised_signal_thread.load() == target.id.load();
+	g_raised_signal_release = true;
+	target.guest_stop       = 1;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, on_target, "the handler ran on another thread than its target");
+	Check(test, held, "the guest code kept running while its handler held");
+}
+
+Libs::LibKernel::EventFlag::KernelEventFlag g_cancel_flag {};
+std::atomic<int>                             g_cancel_wait_result {0};
+std::atomic<int>                             g_cancel_result {1};
+
+void* KYTY_SYSV_ABI WaitOnCancelFlag(void* arg) {
+	auto& target    = *static_cast<SignalTarget*>(arg);
+	target.id       = std::this_thread::get_id();
+	target.progress = 1;
+	uint64_t result = 0;
+	g_cancel_wait_result =
+	    Libs::LibKernel::EventFlag::KernelWaitEventFlag(g_cancel_flag, 1, 0x01, &result, nullptr);
+	return nullptr;
+}
+
+void* KYTY_SYSV_ABI CancelFlag(void* arg) {
+	auto& target    = *static_cast<SignalTarget*>(arg);
+	target.id       = std::this_thread::get_id();
+	target.progress = 1;
+	int waiting     = 0;
+	g_cancel_result = Libs::LibKernel::EventFlag::KernelCancelEventFlag(g_cancel_flag, 0, &waiting);
+	return nullptr;
+}
+
+void TestRaisedSignalReachesCancellingThread() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalReachesCancellingThread";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   waiter;
+	static SignalTarget   canceller;
+	CheckOk(test, EventFlag::KernelCreateEventFlag(&g_cancel_flag, "cancel_drain", 0x20, 0, nullptr),
+	        "KernelCreateEventFlag");
+	ResetRaisedSignal(false);
+	StartSignalTarget(test, waiter, WaitOnCancelFlag);
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	CheckOk(test, raise_exception(waiter.thread, 30), "raise exception on the waiter");
+	Check(test, WaitUntil([] { return g_raised_signal_entries.load() == 1; }),
+	      "the waiter's handler did not run");
+	StartSignalTarget(test, canceller, CancelFlag);
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	CheckOk(test, raise_exception(canceller.thread, 30), "raise exception on the canceller");
+	const bool reached      = WaitUntil([] { return g_raised_signal_entries.load() == 2; });
+	const bool on_canceller = g_raised_signal_thread.load() == canceller.id.load();
+	g_raised_signal_release = true;
+	CheckOk(test, PthreadJoin(waiter.thread, nullptr), "PthreadJoin waiter");
+	CheckOk(test, PthreadJoin(canceller.thread, nullptr), "PthreadJoin canceller");
+	CheckOk(test, EventFlag::KernelDeleteEventFlag(g_cancel_flag), "KernelDeleteEventFlag");
+	Check(test, reached, "a thread cancelling an event flag did not run its handler while it waited for the waiters");
+	Check(test, on_canceller, "the canceller's signal ran on another thread");
+	CheckOk(test, g_cancel_result, "KernelCancelEventFlag");
+	Check(test, g_cancel_wait_result == KERNEL_ERROR_ECANCELED, "the waiter did not see the cancel");
+}
+
+void TestRaisedSignalWaitsForItsHandler() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalWaitsForItsHandler";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(true);
+	StartSignalTarget(test, target, RunSignalTarget);
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception again");
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	g_raised_signal_release = true;
+	const bool delivered    = WaitUntil([] { return g_raised_signal_entries.load() == 2; });
+	target.stop             = true;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, g_raised_signal_max_depth.load() == 1, "a raised signal ran inside its own handler");
+	Check(test, delivered, "the signal raised during its handler was not delivered after it");
+}
+
 int RunTrinityTests();
 
 int main(int argc, char** argv) {
@@ -6062,6 +6310,11 @@ int main(int argc, char** argv) {
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);
 	RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
+	RunTest(TestRaisedSignalHoldsTarget);
+	RunTest(TestGuestCodeRangeFollowsAllocation);
+	RunTest(TestRaisedSignalInterruptsGuestCode);
+	RunTest(TestRaisedSignalWaitsForItsHandler);
+	RunTest(TestRaisedSignalReachesCancellingThread);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

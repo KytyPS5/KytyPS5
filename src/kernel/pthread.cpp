@@ -397,9 +397,11 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic_bool        signal_dispatching {false};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t guest_host_gs8;
-	uintptr_t guest_host_gs10;
+	uintptr_t        guest_host_gs8;
+	uintptr_t        guest_host_gs10;
+	std::atomic_bool signal_apc_queued {false};
 #endif
 };
 
@@ -3077,12 +3079,6 @@ Pthread PthreadSelfOrNull() {
 	return g_pthread_self;
 }
 
-Pthread PthreadSwapSelfForSignal(Pthread thread) {
-	auto* previous = g_pthread_self;
-	g_pthread_self = thread;
-	return previous;
-}
-
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
@@ -3096,7 +3092,28 @@ bool PthreadKillHost(Pthread thread, int host_signal) {
 
 	return ::pthread_kill(thread->p, host_signal) == 0;
 }
+#else
+bool PthreadMarkSignalApcQueued(Pthread thread) {
+	return !thread->signal_apc_queued.exchange(true, std::memory_order_acq_rel);
+}
+
+void PthreadClearSignalApcQueued(Pthread thread) {
+	thread->signal_apc_queued.store(false, std::memory_order_release);
+}
 #endif
+
+bool PthreadBeginSignalDispatch(Pthread thread) {
+	return thread != nullptr &&
+	       !thread->signal_dispatching.exchange(true, std::memory_order_acq_rel);
+}
+
+void PthreadEndSignalDispatch(Pthread thread) {
+	thread->signal_dispatching.store(false, std::memory_order_release);
+}
+
+bool PthreadIsDispatchingSignal(Pthread thread) {
+	return thread != nullptr && thread->signal_dispatching.load(std::memory_order_acquire);
+}
 
 void PthreadQueuePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
@@ -3187,6 +3204,7 @@ static void CleanupThread(void* arg) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	rt->DeleteTlss(thread->unique_id);
 
+	thread->pending_signal_mask.store(0, std::memory_order_release);
 	thread->almost_done = true;
 }
 
@@ -3265,6 +3283,11 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 
 	auto* created_thread = pthread_pool->Create();
 	*thread              = created_thread;
+	created_thread->pending_signal_mask.store(0, std::memory_order_release);
+	created_thread->signal_dispatching.store(false, std::memory_order_release);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	created_thread->signal_apc_queued.store(false, std::memory_order_release);
+#endif
 
 	if (created_thread->attr != nullptr) {
 		PthreadAttrDestroy(&created_thread->attr);

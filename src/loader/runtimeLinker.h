@@ -206,9 +206,11 @@ private:
 };
 
 uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, uint16_t phnum);
+bool     IsGuestCodeAddress(uint64_t address);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-bool TestMainEntryUsesGuestStack();
+bool     TestMainEntryUsesGuestStack();
+uint64_t TestMapGuestCode(uint64_t size, uint64_t occupied);
 bool TestModuleRelocationUsesWritableHostMapping();
 #endif
 

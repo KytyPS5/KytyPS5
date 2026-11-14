@@ -138,6 +138,10 @@ private:
 	// CacheDmaBases() for the guest TLAS of a program (see NativeRayTracing::FindGuestTlasSource()),
 	// with m_mapped_ranges_mutex held.
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
+	// SynchronizeDmaFootprint(): adds the spans a program that works on a table of records reaches
+	// (ShaderInfo::dma_record_reach), read from the table as the guest's CPU wrote it. False when
+	// the host cannot tell them; the caller holds m_mapped_ranges_mutex.
+	[[nodiscard]] bool AddRecordReach(const ShaderStageRuntime& runtime);
 
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;

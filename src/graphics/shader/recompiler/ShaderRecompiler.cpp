@@ -531,6 +531,9 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		source.code.assign(code.begin(), code.end());
 		source.decoded.code = source.code;
 	}
+	if (options.stage == ShaderType::Compute) {
+		(void)Decoder::DeriveRecordReach(source.decoded, options.wave_size, source.decoded.record_reach);
+	}
 	return source;
 }
 

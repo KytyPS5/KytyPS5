@@ -680,6 +680,9 @@ struct ShaderInfo {
 		bool operator==(const SelfSizedBuffer& other) const = default;
 	};
 	std::vector<SelfSizedBuffer>     self_sized_buffers;
+	// Not empty: the program is not dma_bounded, but everything it reaches through device
+	// addresses follows from a table of records the host can read (Decoder::RecordReach::Pack()).
+	std::vector<uint32_t>            dma_record_reach;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;

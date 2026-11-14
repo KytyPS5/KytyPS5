@@ -6,12 +6,14 @@
 #include "common/hackNotice.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 #include "graphics/shader/shaderBindings.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "loader/demonsSoulsPageFree.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
@@ -513,7 +515,10 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 			continue;
 		}
 		if (!program.info.dma_bounded) {
-			return false;
+			if (!AddRecordReach(*stage)) {
+				return false;
+			}
+			continue;
 		}
 		const auto& user_data = stage->resources->user_data;
 		const auto  base_of   = [&](uint32_t reg, uint64_t& base) {
@@ -571,6 +576,139 @@ bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* 
 	}
 	lock.unlock();
 	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);
+	return true;
+}
+
+bool RenderContext::AddRecordReach(const ShaderStageRuntime& runtime) {
+	using Reach = ShaderRecompiler::Decoder::RecordReach;
+	// More records, or larger values, are not what the programs this follows work on: the full
+	// synchronization covers them.
+	constexpr uint64_t MaxRecords = 4096;
+	constexpr uint32_t MaxIndex   = 1u << 20u;
+	constexpr uint32_t MaxOffset  = 1u << 28u;
+	const auto&        program    = runtime.module->info;
+	Reach              reach;
+	if (program.info.dma_record_reach.empty() || !Reach::Unpack(program.info.dma_record_reach, reach)) {
+		return false;
+	}
+	// Memory the CPU wrote last: its current bytes are in guest memory.
+	const auto readable = [this](uint64_t address, uint64_t size) {
+		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
+		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
+		         m_buffer_cache.IsRegionGpuModified(address, size));
+	};
+	const auto& user_data  = runtime.resources->user_data;
+	const auto  descriptor = [&](const Reach::Descriptor& source, ShaderBufferResource& result) {
+		const auto index = uint64_t {source.user_sgpr} - program.user_data_base;
+		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
+			return false;
+		}
+		const auto pointer = user_data[index] | (uint64_t {user_data[index + 1u]} << 32u);
+		if (pointer > UINT64_MAX - source.offset || !readable(pointer + source.offset, sizeof(result.fields))) {
+			return false;
+		}
+		std::memcpy(result.fields, reinterpret_cast<const void*>(pointer + source.offset), sizeof(result.fields));
+		return true;
+	};
+	// What a load of the shader reads at `offset` of a buffer: zero outside it. False when the
+	// bytes are not the CPU's.
+	const auto load = [&](const ShaderBufferResource& buffer, uint64_t offset, void* data, uint64_t size) {
+		std::memset(data, 0, size);
+		const auto bytes = buffer.GetSize();
+		if (buffer.Base48() == 0 || offset > bytes || size > bytes - offset) {
+			return true;
+		}
+		if (!readable(buffer.Base48() + offset, size)) {
+			return false;
+		}
+		std::memcpy(data, reinterpret_cast<const void*>(buffer.Base48() + offset), size);
+		return true;
+	};
+	// Records share the buffers they write, and often the ones they read: once each.
+	const auto first_span = m_dma_spans.size();
+	const auto add        = [&](uint64_t address, uint64_t size) {
+		if (size != 0 && address <= UINT64_MAX - size) {
+			m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) {
+				const std::pair span {start, end};
+				if (std::find(m_dma_spans.begin() + static_cast<ptrdiff_t>(first_span),
+				              m_dma_spans.end(), span) == m_dma_spans.end()) {
+					m_dma_spans.push_back(span);
+				}
+			});
+		}
+	};
+	ShaderBufferResource    header;
+	ShaderBufferResource    records;
+	ShaderBufferResource    pointers;
+	std::array<uint32_t, 2> range {};
+	// The shader indexes the records by their size and by the V#'s stride, and the table by its
+	// stride and by the size of a V#.
+	if (!descriptor(reach.header, header) || !descriptor(reach.records, records) ||
+	    !descriptor(reach.pointers, pointers) || records.Stride() != reach.record_size ||
+	    pointers.Stride() != sizeof(pointers.fields) || reach.record_size > 0x1000u ||
+	    !load(header, reach.header_offset, range.data(), sizeof(range)) || range[1] > MaxRecords ||
+	    range[0] > MaxIndex) {
+		return false;
+	}
+	std::array<uint8_t, 0x1000> record {};
+	const auto                  field = [&](uint32_t offset) {
+        uint32_t value = 0;
+        std::memcpy(&value, record.data() + offset, sizeof(value));
+        return value;
+	};
+	for (uint64_t index = range[0]; index < uint64_t {range[0]} + range[1]; index++) {
+		if (!load(records, index * reach.record_size, record.data(), reach.record_size)) {
+			return false;
+		}
+		// The threads of the record: first <= thread < first + threads, in 32 bits.
+		const auto threads = field(reach.threads_field);
+		const auto first   = field(reach.first_field);
+		if (static_cast<uint32_t>(first + threads) <= first) {
+			continue;
+		}
+		const auto stride = (field(reach.stride_field) >> (reach.stride_byte * 8u)) & 0xffu;
+		const auto last   = uint64_t {threads - 1u} * stride;
+		const auto entry  = field(reach.pointer_field);
+		std::array<uint32_t, 2> pointer {};
+		if (last > MaxOffset || entry > MaxIndex ||
+		    !load(pointers, uint64_t {entry} * sizeof(pointers.fields), pointer.data(), sizeof(pointer))) {
+			return false;
+		}
+		// The base as the shader makes it: the low dword and the low word of the next one, sign
+		// extended. A negative one is no guest memory.
+		const auto high = static_cast<int16_t>(pointer[1]);
+		uint64_t   low_offset  = UINT64_MAX;
+		uint64_t   high_offset = 0;
+		for (const auto& attribute: reach.attributes) {
+			uint32_t value = 0;
+			if (attribute.field != Reach::None) {
+				value = field(attribute.field);
+				if (attribute.byte < 4u) {
+					value = (value >> (attribute.byte * 8u)) & 0xffu;
+				}
+			}
+			if (value > MaxOffset) {
+				return false;
+			}
+			low_offset  = std::min(low_offset, uint64_t {value} & ~uint64_t {3});
+			high_offset = std::max(high_offset, ((value + last) & ~uint64_t {3}) + attribute.end);
+		}
+		if (high >= 0 && low_offset < high_offset) {
+			add((uint64_t {static_cast<uint16_t>(high)} << 32u | pointer[0]) + low_offset,
+			    high_offset - low_offset);
+		}
+		// What its stores write: the buffers of the table entries it names.
+		for (const auto store: reach.store_fields) {
+			const auto           target_entry = field(store);
+			ShaderBufferResource target;
+			if (target_entry > MaxIndex ||
+			    !load(pointers, uint64_t {target_entry} * sizeof(target.fields), target.fields, sizeof(target.fields))) {
+				return false;
+			}
+			const auto written = IndirectWriteTables::TargetRange(target);
+			add(written.address, written.size);
+		}
+	}
 	return true;
 }
 

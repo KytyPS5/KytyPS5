@@ -2511,6 +2511,47 @@ void TestFloatComparisonInputModes() {
   }
 }
 
+void TestNewShaderRecompilerF32CompareFlushSkipsNormalImmediate() {
+  struct Variant {
+    uint32_t src0;
+    size_t flushes;
+    bool has_literal;
+  };
+  for (const auto [src0, flushes, has_literal] :
+       {Variant{240u, 0u, false}, Variant{128u, 1u, false},
+        Variant{256u + 1u, 2u, false}, Variant{255u, 1u, true}}) {
+    std::vector<uint32_t> shader = {
+        EncodeMubuf0(0x0c, 0, false),
+        EncodeMubuf1(0, 12, 0),
+        EncodeMubuf0(0x0c, 4, false),
+        EncodeMubuf1(1, 12, 0),
+        EncodeVopc(0x01, src0, 0),
+        EncodeVop2(0x01, 3, 128, 1),
+        EncodeMubuf0(0x1c, 8, false),
+        EncodeMubuf1(3, 12, 0),
+        EncodeSopp(0x01),
+    };
+    if (has_literal) {
+      shader.insert(shader.begin() + 5, 0x00400000u);
+    }
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    ShaderComputeInputInfo compute{};
+    compute.float_mode = 0xc0;
+    options.input_info.compute = &compute;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t found = 0;
+    for (auto pos = source.find(" FAbs "); pos != std::string::npos;
+         pos = source.find(" FAbs ", pos + 1)) {
+      found++;
+    }
+    Check(
+        found == flushes,
+        "flushed f32 compare did not flush exactly its non-immediate operands");
+  }
+}
+
 void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
                                 const char *family, const char *opcode_name) {
   ShaderRecompiler::Decoder::Program program;
@@ -13575,6 +13616,7 @@ int main() {
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerInteger64CompareEncodings();
   TestFloatComparisonInputModes();
+  TestNewShaderRecompilerF32CompareFlushSkipsNormalImmediate();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();

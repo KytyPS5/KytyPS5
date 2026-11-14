@@ -216,17 +216,36 @@ struct BufferCacheTestAccess {
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
-// barriers whose only destination stage is indirect argument reads.
+// barriers whose only destination stage is indirect argument reads, and keeps the last vertex
+// buffer bindings.
 struct RecordedCommandCounter {
+  struct VertexBuffers {
+    std::vector<VkBuffer> buffers;
+    std::vector<VkDeviceSize> offsets;
+    std::vector<VkDeviceSize> sizes;
+  };
   static inline uint32_t barriers = 0;
   static inline uint32_t indirect_barriers = 0;
   static inline uint32_t copies = 0;
+  static inline VertexBuffers vertex_buffers;
   static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
   static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
+  static inline PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers = nullptr;
 
   RecordedCommandCounter() {
     auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
     barriers = indirect_barriers = copies = 0;
+    vertex_buffers = {};
+    bind_vertex_buffers = std::exchange(
+        dispatcher.vkCmdBindVertexBuffers2,
+        [](VkCommandBuffer command, uint32_t first, uint32_t count, const VkBuffer *buffers,
+           const VkDeviceSize *offsets, const VkDeviceSize *sizes,
+           const VkDeviceSize *strides) {
+          vertex_buffers = {{buffers, buffers + count},
+                            {offsets, offsets + count},
+                            {sizes, sizes + count}};
+          bind_vertex_buffers(command, first, count, buffers, offsets, sizes, strides);
+        });
     pipeline_barrier = std::exchange(dispatcher.vkCmdPipelineBarrier, [](auto... args) {
       ++barriers;
       indirect_barriers += std::get<2>(std::tie(args...)) == VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
@@ -240,6 +259,7 @@ struct RecordedCommandCounter {
   ~RecordedCommandCounter() {
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier = pipeline_barrier;
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer = copy_buffer;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindVertexBuffers2 = bind_vertex_buffers;
   }
 };
 
@@ -21560,6 +21580,74 @@ public:
         check("auto unpatched vertex offset", indirect_vs, false, records_per_kind + 4);
         check("indexed unpatched instance offset", indirect_vs, true, 6);
         check("auto unpatched instance offset", indirect_vs, false, records_per_kind + 6);
+        // Overlapping vertex buffers bind into one merged host range, sized by the buffer
+        // that ends last; an empty buffer binds the null buffer with no bytes.
+        {
+          static const auto merged_fetch = [] {
+            std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)),
+                                  EncodeSmem0(0x02u, 20, 4), EncodeSmem1(0),
+                                  EncodeSmem0(0x02u, 24, 4), EncodeSmem1(16),
+                                  EncodeSmem0(0x02u, 28, 4), EncodeSmem1(32),
+                                  EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                                  EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                                  EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(13, 6, 0),
+                                  EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(17, 7, 0),
+                                  EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12)};
+            code.insert(code.end(), std::ranges::find(native_vertex, EncodeExp0(0x20, 0xf)),
+                        native_vertex.end());
+            return code;
+          }();
+          static ShaderSemantic semantics[]{
+              {.semantic = 0, .hardware_mapping = 9, .size_in_elements = 4},
+              {.semantic = 1, .hardware_mapping = 13, .size_in_elements = 4},
+              {.semantic = 2, .hardware_mapping = 17, .size_in_elements = 4}};
+          constexpr u32 format =
+              DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 12u);
+          constexpr uint64_t second_address = vertices_address + 16;
+          constexpr uint64_t empty_address = vertices_address + 0x1000;
+          // 160 bytes; 192 bytes from offset 16, past the first; no records.
+          static uint32_t buffers[]{
+              static_cast<u32>(vertices_address),
+              static_cast<u32>(vertices_address >> 32u) | (16u << 16u), 10, format,
+              static_cast<u32>(second_address),
+              static_cast<u32>(second_address >> 32u) | (32u << 16u), 6, format,
+              static_cast<u32>(empty_address),
+              static_cast<u32>(empty_address >> 32u) | (16u << 16u), 0, format};
+          constexpr u32 attribute_format =
+              static_cast<u32>(Prospero::VertexAttribFormat::k32_32_32_32Float) << 5u;
+          static const uint32_t attributes[]{attribute_format, attribute_format | 1u,
+                                             attribute_format | 2u};
+          const auto merged_vs = reinterpret_cast<uint64_t>(merged_fetch.data());
+          ShaderMapUserData(merged_vs,
+              {.type = Prospero::ShaderBinaryType::kGs, .user_data = &fetch_user_data,
+               .input_semantics = semantics, .num_input_semantics = 3,
+               .code_size_bytes = static_cast<uint32_t>(merged_fetch.size() * sizeof(u32))});
+          const uint64_t merged_tables[]{reinterpret_cast<uint64_t>(buffers),
+                                         reinterpret_cast<uint64_t>(attributes)};
+          for (u32 i = 0; i < 4; i++) {
+            shaders.SetGsUserSgpr(i, static_cast<u32>(merged_tables[i / 2] >> (i % 2 * 32)));
+          }
+          shaders.SetEsShaderBase(merged_vs);
+          // The draw before binds 64 bytes in the third slot, so a size left unwritten keeps them.
+          buffers[10] = 4;
+          const bool filled = RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+          buffers[10] = 0;
+          const RecordedCommandCounter counter;
+          const bool drawn = filled && RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+          const auto &bound = RecordedCommandCounter::vertex_buffers;
+          const auto null_buffer = static_cast<VkBuffer>(
+              context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle());
+          Require("VertexBufferMerge", "bindings",
+                  drawn && bound.sizes.size() == 3 && bound.buffers[0] == bound.buffers[1] &&
+                      bound.offsets[1] == bound.offsets[0] + 16 && bound.sizes[0] == 160 &&
+                      bound.sizes[1] == 192 && bound.buffers[2] == null_buffer &&
+                      bound.offsets[2] == 0 && bound.sizes[2] == 0,
+                  "overlapping vertex buffers did not share their merged range, or the "
+                  "empty one bound bytes");
+        }
       }
 
       // Mesh (NGG) indirect draws take their records from the GPU copy; the CPU backing holds

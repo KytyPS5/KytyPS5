@@ -509,6 +509,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
+	graphics.denorm_preserve_f32 =
+	    float_controls.shaderDenormPreserveFloat32 == VK_TRUE &&
+	    float_controls.denormBehaviorIndependence != vk::ShaderFloatControlsIndependence::eNone;
 
 	const auto subgroup_stages = subgroup_control.requiredSubgroupSizeStages;
 	graphics.subgroup_size     = properties11.subgroupSize;

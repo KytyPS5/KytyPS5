@@ -465,8 +465,14 @@ public:
 	// Reserves the user address space and extended memory (Regions 1 and 2:
 	// [HOST_USER_MIN, HOST_USER_MAX] and kExtendedMemoryBase).
 	// Must be called after host GPU/DLSS initialization has completed.
-	void ReserveRemainingGuestRegions() {
+	// Returns true if the regions were newly reserved on this call.
+	bool ReserveRemainingGuestRegions() {
+		if (m_remaining_reserved) {
+			return false;
+		}
 		ReserveGuestRegions(1, 3);
+		m_remaining_reserved = true;
+		return true;
 	}
 
 	~GuestAddressSpace() {
@@ -1157,4 +1163,5 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
+	bool                                       m_remaining_reserved = false;
 };

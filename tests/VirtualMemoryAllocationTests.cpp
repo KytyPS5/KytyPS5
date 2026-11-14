@@ -213,6 +213,9 @@ void InitSubsystems() {
 	      "flexible memory does not default to 448 MiB without param.json");
 
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+	// Mirror emulator init order (agc.cpp): Regions 1–2 are reserved after Memory::Initialize,
+	// without requiring GPU init in this host-test harness.
+	Libs::LibKernel::Memory::ReserveGuestAddressSpace();
 
 	initialized = true;
 }

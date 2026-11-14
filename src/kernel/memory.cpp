@@ -973,7 +973,9 @@ void Initialize() {
 
 void ReserveGuestAddressSpace() {
 	EXIT_IF(g_guest_address_space == nullptr);
-	g_guest_address_space->ReserveRemainingGuestRegions();
+	if (!g_guest_address_space->ReserveRemainingGuestRegions()) {
+		return;
+	}
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 }

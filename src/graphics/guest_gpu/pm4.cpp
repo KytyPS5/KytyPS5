@@ -18,11 +18,9 @@ constexpr auto MakeRegisterNames() {
 	}
 
 	names[R_ZERO]           = "R_ZERO";
-	names[R_WAIT_FLIP_DONE] = "R_WAIT_FLIP_DONE";
 	names[R_DISPATCH_RESET] = "R_DISPATCH_RESET";
 	names[R_PUSH_MARKER]    = "R_PUSH_MARKER";
 	names[R_POP_MARKER]     = "R_POP_MARKER";
-	names[R_FLIP]           = "R_FLIP";
 	names[R_CONTEXT_STATE]  = "R_CONTEXT_STATE";
 	return names;
 }

@@ -125,7 +125,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op);
 uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state);
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
                                                         uint32_t       video_out_handle,
-                                                        uint32_t       display_buffer_index);
+                                                        int32_t        display_buffer_index);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count);

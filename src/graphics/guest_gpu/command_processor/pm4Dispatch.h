@@ -68,11 +68,9 @@ uint32_t CpOpIndirectUcRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32
 uint32_t CpOpGetLodStats(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDispatchReset(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem32(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpWaitFlipDone(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPushMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpFlip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPssr(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 
 } // namespace Libs::Graphics

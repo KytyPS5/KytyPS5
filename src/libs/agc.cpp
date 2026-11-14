@@ -2078,32 +2078,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
-                                                        uint32_t       video_out_handle,
-                                                        uint32_t       display_buffer_index) {
-	PRINT_NAME();
-
-	LOGF("\t video_out_handle     = %" PRIu32 "\n"
-	     "\t display_buffer_index = %" PRIu32 "\n",
-	     video_out_handle, display_buffer_index);
-
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	auto* cmd = buf->AllocateDW(7);
-
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
-	cmd[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
-	cmd[1] = video_out_handle;
-	cmd[2] = display_buffer_index;
-	cmd[3] = 0;
-	cmd[4] = 0;
-	cmd[5] = 0;
-	cmd[6] = 0;
-
-	return cmd;
-}
-
 uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count) {
@@ -2467,7 +2441,6 @@ static uint32_t decode_draw_index_initiator(uint64_t modifier) {
 	return (static_cast<uint32_t>(modifier) >> 3u) & 0x20u;
 }
 
-static constexpr uint32_t AGC_INTERNAL_DATA_REGISTER            = 0x342u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG     = 0xc6000008u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
@@ -2481,7 +2454,7 @@ static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
 static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = tag;
 }
 
@@ -3086,7 +3059,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	const auto address_value = reinterpret_cast<uint64_t>(address);
 	const bool signal        = (op == 6u);
 	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
 	cmd[3] = static_cast<uint32_t>(address_value);
@@ -3865,7 +3838,7 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 
 bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_INTERNAL_DATA_REGISTER) {
+	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		return false;
 	}
 
@@ -3926,7 +3899,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	}
 
 	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = (wait32 ? AGC_WAIT_USER_DATA_BEGIN_32_TAG : AGC_WAIT_USER_DATA_BEGIN_64_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
 	cmd[3] = static_cast<uint32_t>(address_value);
@@ -4041,16 +4014,88 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	auto* cmd = buf->AllocateDW(6);
+	int        bus    = 0;
+	auto*      labels = VideoOut::VideoOutGetBufferLabels(static_cast<int>(video_out_handle), &bus);
+	const bool shown  = display_buffer_index >= 0;
+	if (labels == nullptr || display_buffer_index < -2 || display_buffer_index > 15) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(Pm4::FLIP_PACKET_DW);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
 
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	const auto label = (shown ? reinterpret_cast<uint64_t>(labels + display_buffer_index) : 0u);
+	// The tag holds the flip mode and buffer index; bit 16 and bits 0..2 are always set.
+	cmd[0] = KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+	cmd[2] = Pm4::USERDATA_TAG_FLIP | 0x10000u | ((flip_mode & 0xfu) << 8u) |
+	         ((static_cast<uint32_t>(display_buffer_index) & 0x1fu) << 3u) | 0x7u;
+	cmd[3] = static_cast<uint32_t>(bus);
+	// WRITE_DATA puts both flip-argument dwords into SQ_THREAD_TRACE_USERDATA_3, without
+	// incrementing the address.
+	cmd[4] = KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u);
+	cmd[5] = 0x06010000u;
+	cmd[6] = 0xc343u;
+	cmd[7] = 0;
+	cmd[8] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg));
+	cmd[9] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg) >> 32u);
+	// An end-of-pipe CB/DB and GL2 writeback writes 1 to a shown buffer's label, then interrupts
+	// with the port as context id.
+	cmd[10] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u);
+	cmd[11] = 0x06200504u;
+	cmd[12] = (shown ? 0x42010000u : 0x02010000u);
+	cmd[13] = static_cast<uint32_t>(label) & ~0x3u;
+	cmd[14] = static_cast<uint32_t>(label >> 32u);
+	cmd[15] = (shown ? 1u : 0u);
+	cmd[16] = 0;
+	cmd[17] = video_out_handle & 0x0fffffffu;
+	cmd[18] = KYTY_PM4(Pm4::FLIP_PACKET_DW - 18u, Pm4::IT_NOP, 0u);
 
-	cmd[0] = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
-	cmd[1] = video_out_handle;
-	cmd[2] = display_buffer_index;
-	cmd[3] = flip_mode;
-	cmd[4] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg) & 0xffffffffu);
-	cmd[5] = static_cast<uint32_t>((static_cast<uint64_t>(flip_arg) >> 32u) & 0xffffffffu);
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
+                                                        uint32_t       video_out_handle,
+                                                        int32_t        display_buffer_index) {
+	PRINT_NAME();
+
+	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
+	         "\t display_buffer_index = %" PRId32 "\n",
+	         video_out_handle, display_buffer_index);
+
+	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+
+	int        bus    = 0;
+	auto*      labels = VideoOut::VideoOutGetBufferLabels(static_cast<int>(video_out_handle), &bus);
+	const bool shown  = display_buffer_index >= 0;
+	if ((shown && labels == nullptr) || display_buffer_index < -2 || display_buffer_index > 15) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(Pm4::WAIT_FLIP_DONE_PACKET_DW);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	const auto index = static_cast<uint32_t>(display_buffer_index) & 0x1fu;
+	write_agc_internal_data_packet(cmd, Pm4::USERDATA_TAG_WAIT_FLIP_DONE | index);
+	if (shown) {
+		const auto label = reinterpret_cast<uint64_t>(labels + display_buffer_index);
+		// The PFP waits until the buffer's label is 0.
+		cmd[3]  = KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0u);
+		cmd[4]  = wait_reg_mem64_control(3, 1, 3);
+		cmd[5]  = static_cast<uint32_t>(label) & ~0x7u;
+		cmd[6]  = static_cast<uint32_t>(label >> 32u) & 0x3ffffu;
+		cmd[7]  = 0;
+		cmd[8]  = 0;
+		cmd[9]  = 0xffffffffu;
+		cmd[10] = 0xffffffffu;
+		cmd[11] = 0x40u;
+	} else {
+		cmd[3] = KYTY_PM4(9, Pm4::IT_NOP, 0u);
+	}
+	write_agc_internal_data_packet(cmd + 12, Pm4::USERDATA_TAG_WAIT_FLIP_DONE | 0x20u | index);
+	cmd[15] = KYTY_PM4(Pm4::WAIT_FLIP_DONE_PACKET_DW - 15u, Pm4::IT_NOP, 0u);
 
 	return cmd;
 }

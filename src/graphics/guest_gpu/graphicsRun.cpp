@@ -879,11 +879,10 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
 }
 
-void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	m_renderer.GetVideoOut().WaitFlipDone(label);
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,

@@ -72,11 +72,9 @@ constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT  = 0x9F;
 /* Custom codes. Implemented via IT_NOP */
 
 constexpr uint32_t R_ZERO           = 0x00;
-constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_DISPATCH_RESET = 0x09;
 constexpr uint32_t R_PUSH_MARKER    = 0x0B;
 constexpr uint32_t R_POP_MARKER     = 0x0C;
-constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
 constexpr uint32_t R_PSSR           = 0x1B;
 
@@ -896,6 +894,14 @@ constexpr uint32_t GDS_OA_COUNTER           = 0x41E;
 constexpr uint32_t GDS_OA_ADDRESS           = 0x41F;
 
 constexpr uint32_t UC_NOP = 0xA2;
+
+// A tag written to SQ_THREAD_TRACE_USERDATA_2 names an operation in bits 24..31. A flip and a
+// flip-done wait each open a block of fixed size.
+constexpr uint32_t SQ_THREAD_TRACE_USERDATA_2  = 0x342;
+constexpr uint32_t USERDATA_TAG_FLIP           = 0xC7000000;
+constexpr uint32_t USERDATA_TAG_WAIT_FLIP_DONE = 0xCB000000;
+constexpr uint32_t FLIP_PACKET_DW              = 64;
+constexpr uint32_t WAIT_FLIP_DONE_PACKET_DW    = 32;
 
 constexpr uint32_t UC_NUM = 0x3FFF + 1;
 

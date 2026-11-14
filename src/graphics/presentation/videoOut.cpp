@@ -199,6 +199,8 @@ struct VideoOutConfig {
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
+	// The flip and wait packets name a buffer by its label.
+	std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
 };
 
 class FlipQueue {
@@ -266,6 +268,7 @@ public:
 	int             Open(int bus_type, int index);
 	bool            Close(int handle);
 	VideoOutConfig* Get(int handle);
+	VideoOutConfig* GetByLabel(const uint64_t* label);
 	int             SetFlipMaster(int slave_handle, int master_handle);
 
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
@@ -727,6 +730,19 @@ VideoOutConfig* VideoOutDriver::Impl::Get(int handle) {
 	Common::LockGuard lock(m_mutex);
 
 	return IsOpenedLocked(handle) ? m_video_out_ctx + handle : nullptr;
+}
+
+VideoOutConfig* VideoOutDriver::Impl::GetByLabel(const uint64_t* label) {
+	Common::LockGuard lock(m_mutex);
+
+	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+		const auto& labels = m_video_out_ctx[handle].labels;
+		if (IsOpenedLocked(handle) && label >= labels.data() &&
+		    label < labels.data() + labels.size()) {
+			return m_video_out_ctx + handle;
+		}
+	}
+	return nullptr;
 }
 
 int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
@@ -1534,12 +1550,21 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-void VideoOutDriver::WaitFlipDone(int handle, int index) {
-	auto* ctx = m_impl->Get(handle);
+void VideoOutDriver::WaitFlipDone(const uint64_t* label) {
+	auto* ctx = m_impl->GetByLabel(label);
 	EXIT_IF(ctx == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	m_impl->GetFlipQueue().Wait(*ctx, index);
+	m_impl->GetFlipQueue().Wait(*ctx, static_cast<int>(label - ctx->labels.data()));
+}
+
+uint64_t* VideoOutGetBufferLabels(int handle, int* bus) {
+	auto* ctx = DriverState().Get(handle);
+	if (ctx == nullptr) {
+		return nullptr;
+	}
+
+	*bus = ctx->bus;
+	return ctx->labels.data();
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

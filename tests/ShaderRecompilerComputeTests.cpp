@@ -314,7 +314,12 @@ struct ImageHeapTestAccess {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
-    return Element(heap, entry).binding.image_id;
+    return Element(heap, entry).image;
+  }
+  static size_t IndexCount(const ImageHeap &heap) { return heap.m_index.size(); }
+  static size_t HeldCount(const ImageHeap &heap) { return heap.m_held.size(); }
+  static const auto &Slots(const ImageHeap &heap, size_t memory) {
+    return heap.m_memories.at(memory)->views.at(0)->slots;
   }
   // Whether the newest table no longer watches its last page.
   static bool TailPageDirty(const ImageHeap &heap) {
@@ -6005,11 +6010,8 @@ public:
               filtered.slots[0] != 0u && filtered.slots[8] == filtered.slots[0] &&
                   filtered.slots[40] != 0u && filtered.slots[40] != filtered.slots[0] &&
                   filtered.slots[1] == 0u && filtered.slots.back() == 0u &&
-                  ImageHeapTestAccess::ElementCount(heap) == 3u &&
-                  ImageHeapTestAccess::Element(heap, 0u).binding.layout ==
-                      vk::ImageLayout::eShaderReadOnlyOptimal,
-              "probes did not share equal descriptors, left a non-null gap or wrote the null "
-              "element without a sampled layout");
+                  ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "probes did not share equal descriptors or left a non-null gap");
       Require(name, "second view",
               acquire(unfiltered) && views.size() == 2u &&
                   ImageHeapTestAccess::ElementCount(heap) == 5u,
@@ -6020,6 +6022,17 @@ public:
       Require(name, "resident images",
               resident && textures.GetImage(resident).heap_refs.load() == 2u,
               "resolved elements did not pin their image");
+      // A CPU write to a resident image reaches the next draw without rediscovering it.
+      const uint32_t texel = 0xff00ff00u;
+      Libs::LibKernel::Memory::WriteBacking(base + 0x10000u, &texel, sizeof(texel));
+      Require(name, "image write",
+              context.InvalidateMemory(base + 0x10000u, sizeof(texel)) &&
+                  textures.GetImage(resident).IsCpuDirty(),
+              "a CPU write did not dirty the resident image");
+      Require(name, "written image", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "refreshed image", !textures.GetImage(resident).IsCpuDirty(),
+              "a draw sampled a resident image without its CPU write");
 
       // Only acquired views take table changes; the idle one must not allocate.
       const auto idle_slot = idle.slots[40];
@@ -6058,21 +6071,37 @@ public:
               "a view probed descriptors past the guest table bound");
       draw();
 
-      // Only leaving the read state invalidates resident images.
+      // Only leaving the read state queues a change of a resident image.
       auto &image = textures.GetImage(resident);
-      const auto epoch = Libs::Graphics::Image::heap_epoch.load();
+      const auto queued = [&] {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        return std::ranges::count(Libs::Graphics::Image::heap_changes, image.serial,
+                                  &Libs::Graphics::Image::HeapChange::serial);
+      };
+      const auto before = queued();
       for (uint32_t pass = 0; pass < 2u; ++pass) {
         image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
                       scheduler.Current().Handle());
       }
-      Require(name, "write epoch", Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
-              "repeated writes after leaving the read state bumped the heap epoch again");
+      Require(name, "write change", queued() == before + 1,
+              "repeated writes after leaving the read state queued the image again");
       Require(name, "read again", acquire(sampled), "the view was declined");
       draw();
       Require(name, "read layout",
               image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
-                  Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
+                  queued() == 0,
               "commit did not return a resident image to its read layout");
+      // One that leaves it after discovery, as for a download, returns at commit too.
+      Require(name, "late transit", acquire(sampled), "the view was declined");
+      heap.Rebind(executor);
+      image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
+                    scheduler.Current().Handle());
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "late read layout",
+              image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit missed a resident image that left the read layout after discovery");
+      scheduler.Finish();
+      heap.BeginDraw();
 
       // An image freed during a draw's discovery lives until the tick ends, and the draw's
       // slots still select it.
@@ -6087,6 +6116,26 @@ public:
                   textures.GetImage(freed).backing.state.layout ==
                       vk::ImageLayout::eShaderReadOnlyOptimal,
               "commit skipped the read transition of a freed but sampled image");
+      scheduler.Finish();
+      heap.BeginDraw();
+      // So does an earlier one that leaves the read layout and is freed after discovery.
+      write(10, descriptor(14, Format::k8_8_8_8UNorm));
+      Require(name, "earlier image", acquire(sampled), "the view was declined");
+      draw();
+      const auto earlier = ImageHeapTestAccess::ImageOf(heap, filtered.slots[80]);
+      Require(name, "freed after discovery", earlier && acquire(sampled),
+              "the view was declined or its image was not resolved");
+      heap.Rebind(executor);
+      textures.GetImage(earlier).Transit(vk::ImageLayout::eGeneral,
+                                         vk::AccessFlagBits2::eShaderWrite, {},
+                                         scheduler.Current().Handle());
+      textures.UnmapMemory(base + 0x10000u + 14u * 0x1000u, 0x1000u);
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "freed earlier image layout",
+              !textures.GetImage(earlier).registered &&
+                  textures.GetImage(earlier).backing.state.layout ==
+                      vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit skipped the read transition of an image freed after it left the read layout");
       scheduler.Finish();
       heap.BeginDraw();
 
@@ -6106,7 +6155,7 @@ public:
       draw();
       Require(name, "stale rescan",
               filtered.kinds.size() == 2u &&
-                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).value.dwords ==
+                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).key.value.dwords ==
                       descriptor(3, Format::k8_8_8_8UNorm),
               "a stale element's rescan took a kind its view's programs lack");
 
@@ -6226,8 +6275,10 @@ public:
       draw();
       Require(name, "retry", acquire(sampled), "the view was declined");
       draw();
-      Require(name, "reused held element", held != 0u && filtered.slots[424] == held,
-              "a reused element was retried as the held element it replaced");
+      Require(name, "reused held element",
+              held != 0u && filtered.slots[424] == held &&
+                  ImageHeapTestAccess::HeldCount(heap) == 0u,
+              "a reused element was retried or kept as the held element it replaced");
       // A 2D view of a heap-pinned volume is another image type, not another extent.
       auto plane_root = sampled;
       plane_root.heap = true;
@@ -6279,13 +6330,57 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "unmapping the table kept its images pinned");
-      // A smaller table enters once a second draw acquires it and leaves at the suspend point
-      // after a frame that did not acquire it. Larger tables stay.
+      // One element serves a descriptor in every table. A table the guest republishes at a new
+      // base takes over the copy that idled a frame, with its views and slots.
+      constexpr uint64_t copy_table = base + 0x1c0000;
+      constexpr uint64_t republished = base + 0x1e0000;
+      std::memcpy(reinterpret_cast<void *>(copy_table), reinterpret_cast<void *>(table), table_size);
+      std::memcpy(reinterpret_cast<void *>(republished), reinterpret_cast<void *>(table), table_size);
+      Require(name, "original table", acquire(sampled), "the table was declined");
+      const auto indexed = ImageHeapTestAccess::IndexCount(heap);
+      Require(name, "shared elements",
+              acquire(sampled, copy_table) && ImageHeapTestAccess::IndexCount(heap) == indexed &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 2u &&
+                  ImageHeapTestAccess::Slots(heap, 1u) == ImageHeapTestAccess::Slots(heap, 0u),
+              "a second table with the same descriptors interned them again");
+      const auto copy_slots = view.slots;
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "original only", acquire(sampled), "the table was declined");
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "republished table",
+              acquire(sampled, republished) && view.slots == copy_slots &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 2u &&
+                  ImageHeapTestAccess::IndexCount(heap) == indexed,
+              "a republished table did not take over its idle copy");
+      draw();
+      // A copy that buried a word is not taken over: a new table resolves the word.
+      context.UnmapMemory(texture(31), 0x1000u);
+      context.MapMemory(texture(31), 0x1000u);
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "original again", acquire(sampled), "the table was declined");
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "buried copy", acquire(sampled, copy_table), "the table was declined");
+      draw();
+      Require(name, "fresh table",
+              ImageHeapTestAccess::MemoryCount(heap) == 3u &&
+                  ImageHeapTestAccess::ImageOf(heap, ImageHeapTestAccess::Slots(heap, 2u)[248]),
+              "a table took over a copy that buried a word");
+      heap.UnmapMemory(table, table_size);
+      heap.UnmapMemory(republished, table_size);
+      heap.UnmapMemory(copy_table, table_size);
+      // A smaller table leaves at the suspend point after a frame that did not acquire it, a
+      // larger one after 32 such frames.
       const IR::ImageHeapRequest small_request{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
-      Require(name, "first small draw",
-              acquire(sampled, idle_table) && !heap.Acquire(small_request, view) &&
-                  !heap.Acquire(small_request, view),
-              "a smaller table entered on its first draw");
+      Require(name, "small table",
+              acquire(sampled, idle_table) && heap.Acquire(small_request, view),
+              "a smaller table was declined");
       draw();
       Require(name, "second small draw", heap.Acquire(small_request, view),
               "a smaller table was declined on its second draw");
@@ -6298,6 +6393,12 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 1u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "a suspend point kept an idle smaller table pinned or dropped a larger one");
+      for (uint32_t frame = 2; frame < 32u; ++frame) heap.RunGarbageCollector();
+      Require(name, "idle larger table", ImageHeapTestAccess::MemoryCount(heap) == 1u,
+              "a larger table left before 32 idle frames");
+      heap.RunGarbageCollector();
+      Require(name, "aged larger table", ImageHeapTestAccess::MemoryCount(heap) == 0u,
+              "a larger table stayed resident after 32 idle frames");
       // The idle table stays watched; destroying the heap must unwatch it before the page
       // manager fails on live watches.
       Require(name, "idle table",

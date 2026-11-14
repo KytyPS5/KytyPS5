@@ -10,6 +10,7 @@
 #include <atomic>
 #include <compare>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -120,16 +121,23 @@ public:
 		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
 	}
-	// Resident image heaps sample an image without rediscovering it until one changes its
-	// contents, tracking, identity or layout.
-	void HeapChanged() const noexcept {
+	struct HeapChange {
+		GuestRange data;
+		uint64_t   serial = 0;
+	};
+
+	// Resident image heaps sample an image without rediscovering it until it changes its
+	// contents, tracking, identity or layout, which queues a heap change.
+	void HeapChanged() const {
 		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
-			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
+			std::scoped_lock lock {heap_mutex};
+			heap_changes.push_back({info.data, serial});
 		}
 	}
 
-	static inline std::atomic<uint64_t> heap_epoch {0};
-	static inline std::atomic<uint64_t> serials {0};
+	static inline std::mutex              heap_mutex; // After TextureCache::m_lock.
+	static inline std::vector<HeapChange> heap_changes;
+	static inline std::atomic<uint64_t>   serials {0};
 
 	// Unique per image, unlike ImageId: freed slots are reused.
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;

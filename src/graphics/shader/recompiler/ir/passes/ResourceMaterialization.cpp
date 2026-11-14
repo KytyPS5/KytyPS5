@@ -1773,8 +1773,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          std::vector<uint32_t>* unbindable_pcs) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1856,17 +1855,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (WalkedActive(program, base.source)) {
-					bool unbindable = false;
 					if (!MaterializeIndirectDescriptor(
 					        program, base.source, i, 4u, 4u, observed, snapshot, snapshot.buffers,
 					        specialization.buffers, true, [&](DescriptorValue& value) {
-						        unbindable = !NormalizeIndirectBuffer(
+						        return NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base);
-						        return !unbindable;
 					        })) {
-						// A table row the host cannot bind: the access can decode it in the shader.
-						if (unbindable && unbindable_pcs != nullptr)
-							unbindable_pcs->push_back(base.first_use_pc);
 						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
 					}
 				}

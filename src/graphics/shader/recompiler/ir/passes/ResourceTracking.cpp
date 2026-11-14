@@ -4704,15 +4704,6 @@ private:
 		return true;
 	}
 
-	// An access the host could not bind a table row for decodes its descriptor in the shader.
-	bool InShaderBuffer(const Inst& handle) const {
-		const auto& pcs = m_program.in_shader_buffer_pcs;
-		return std::ranges::any_of(handle.Uses(), [&](const Use& use) {
-			return BufferAccessOf(use.user->GetOpcode()) != BufferAccess::None &&
-			       std::ranges::find(pcs, use.user->Flags<MemoryFlags>().pc) != pcs.end();
-		});
-	}
-
 	bool TryMakeIndirectBuffer(Inst& handle, const DescriptorSource& descriptor,
 	                           IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u ||
@@ -4726,6 +4717,14 @@ private:
 			const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
 			if (memory.idxen != indexed) return false;
 		}
+		// The host cannot tell which rows of a table the GPU selects, so loads decode their
+		// descriptor in the shader. A store's target must be bound before the draw.
+		if (std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			    const auto op = use.user->GetOpcode();
+			    return BufferAccessOf(op) == BufferAccess::Read &&
+			           m_program.memory_info[use.user->Flags<MemoryFlags>().index]
+			               .SupportsIndirectBufferLoad(op);
+		    })) return false;
 		DescriptorSource table_source;
 		Value key;
 		uint32_t table_offset = 0;
@@ -5331,9 +5330,6 @@ private:
 				const auto plan_handle = [&](Value value, uint32_t width, uint32_t base, bool sampler) {
 					auto* handle = value.Resolve().TryInstruction();
 					if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) return;
-					if (handle->GetOpcode() == ValueOpcode::GetBufferResource &&
-					    InShaderBuffer(*handle))
-						return;
 					DescriptorSource descriptor;
 					MakeSource(*handle, width, sampler, false, base, descriptor, flags.pc);
 					uint32_t bad_dword = 0;

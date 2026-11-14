@@ -125,8 +125,6 @@ struct ShaderModule {
 	vk::ShaderModule                             module = nullptr;
 	ShaderRecompiler::IR::CompiledShaderInfo     info;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
-	// The GPU-selected accesses decoded in the shader, sorted: they change its bindings.
-	std::vector<uint32_t>                        in_shader_buffer_pcs;
 	std::vector<uint32_t>                        function_code;
 	// VS or LS: the host format of each vertex input attribute.
 	std::vector<vk::Format>                      vertex_formats;
@@ -235,14 +233,7 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
-		// Buffer access pcs decoded in the shader since a table row could not be bound; never
-		// shrinks.
-		std::vector<uint32_t> in_shader_buffer_pcs;
-		// The last materialization demoted an access: the plan must be rebuilt before use.
-		bool needs_rebuild = false;
 
-		// Materializes the plan; false after demoting the accesses of rows the host cannot bind.
-		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>

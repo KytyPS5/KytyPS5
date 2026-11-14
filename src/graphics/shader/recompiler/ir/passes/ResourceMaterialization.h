@@ -62,11 +62,8 @@ std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
-// unbindable_pcs, when given, receives the first use pc of a GPU-selected buffer whose table
-// holds a row the host cannot bind; the shader can decode that access itself.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                          std::vector<uint32_t>* unbindable_pcs = nullptr);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

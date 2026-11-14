@@ -81,10 +81,9 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, in_shader_buffer_pcs, function_code, vertex_formats,
-	       rect_parameters, mesh_task] = stage;
-	IoAll(io, id, info, specialization, in_shader_buffer_pcs, vertex_formats, rect_parameters,
-	      mesh_task);
+	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
+	       mesh_task] = stage;
+	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
 }
 
 } // namespace
@@ -239,29 +238,13 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
-			auto&       state              = program->second;
-			const auto& decoded            = module.in_shader_buffer_pcs;
-			// A program's decoded accesses only grow, so its latest record names them all, and only
-			// modules of the program's own set can be selected again.
-			if (inserted || (decoded.size() > state.in_shader_buffer_pcs.size() &&
-			                 std::ranges::includes(decoded, state.in_shader_buffer_pcs))) {
-				ShaderRecompiler::IR::ResourcePlan learned;
-				if (!ShaderRecompiler::IR::LoadResourcePlan(plan, learned)) {
-					if (inserted) m_program_cache.erase(program);
-					return false;
-				}
-				// The plan was extracted with this module's accesses decoded in the shader.
-				state.resource_plan        = std::move(learned);
-				state.in_shader_buffer_pcs = decoded;
-				for (const auto& stale: state.modules) {
-					m_graphics.device.destroyShaderModule(stale.module, nullptr);
-				}
-				state.modules.clear();
-			} else if (decoded != state.in_shader_buffer_pcs) {
-				break;
+			if (inserted &&
+			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
+				m_program_cache.erase(program);
+				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
-			state.modules.push_back(std::move(module));
+			program->second.modules.push_back(std::move(module));
 			break;
 		}
 		case Record::GraphicsPipeline: {

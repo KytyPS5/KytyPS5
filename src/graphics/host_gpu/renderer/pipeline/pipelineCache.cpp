@@ -304,33 +304,16 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 	return revision != call_source->revision;
 }
 
-bool PipelineCache::Program::Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime) {
-	std::vector<uint32_t> unbindable;
-	if (ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                               specialization, &unbindable))
-		return true;
-	// A GPU-selected row the host cannot bind is decoded in the shader, as the hardware reads it.
-	bool demoted = false;
-	for (const auto pc: unbindable) {
-		if (std::ranges::binary_search(in_shader_buffer_pcs, pc)) continue;
-		in_shader_buffer_pcs.insert(std::ranges::upper_bound(in_shader_buffer_pcs, pc), pc);
-		demoted = true;
-	}
-	EXIT_IF(!demoted);
-	needs_rebuild = true;
-	return false;
-}
-
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
-	if (!Materialize(runtime)) return nullptr;
+	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+	                                                    specialization));
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
 		                                        push_data_cursor, layout.ShaderDataDwords()) ||
-		    candidate.specialization != specialization ||
-		    candidate.in_shader_buffer_pcs != in_shader_buffer_pcs) {
+		    candidate.specialization != specialization) {
 			continue;
 		}
 		if constexpr (HasCalls) {
@@ -340,13 +323,6 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 	}
 	return nullptr;
 }
-
-template ShaderModule*
-PipelineCache::Program::FindModule<false>(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                          uint32_t                                push_data_cursor);
-template ShaderModule*
-PipelineCache::Program::FindModule<true>(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                         uint32_t                                push_data_cursor);
 
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
                                            ShaderRecompiler::CompileOptions  options,
@@ -365,8 +341,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, program.specialization,
-	                            program.in_shader_buffer_pcs);
+	                            info.bindings.push_data_start_dword, program.specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
@@ -374,12 +349,11 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
 	auto& module = program.modules.emplace_back(ShaderModule {
-	    .id                   = id,
-	    .module               = CompileSPV(result.spirv, m_graphics.device),
-	    .info                 = std::move(info),
-	    .specialization       = program.specialization,
-	    .in_shader_buffer_pcs = program.in_shader_buffer_pcs,
-	    .function_code        = {function_code.begin(), function_code.end()},
+	    .id             = id,
+	    .module         = CompileSPV(result.spirv, m_graphics.device),
+	    .info           = std::move(info),
+	    .specialization = program.specialization,
+	    .function_code  = {function_code.begin(), function_code.end()},
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
@@ -463,9 +437,6 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		if (module != nullptr) return bind(*module);
 	}
-	const bool rebuild = entry != m_program_cache.end() && entry->second.needs_rebuild;
-	if (entry != m_program_cache.end())
-		options.in_shader_buffer_pcs = entry->second.in_shader_buffer_pcs;
 
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
@@ -498,7 +469,6 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	} else {
 		translated = ShaderRecompiler::TranslateProgram(params.code, options);
 	}
-	bool materialized = true;
 	if (entry == m_program_cache.end()) {
 		auto retained = !source.calls.empty()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
@@ -507,35 +477,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .call_source   = std::move(retained),
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
-		materialized  = entry->second.Materialize(runtime);
-	} else if (rebuild) {
-		entry->second.needs_rebuild = false;
-		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		materialized                = entry->second.Materialize(runtime);
+		auto& program = entry->second;
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
 			return bind(*module);
 		}
-		materialized = !entry->second.needs_rebuild;
 	}
-	// Each round decodes more accesses in the shader; the set only grows, so this terminates.
-	auto& program = entry->second;
-	while (!materialized) {
-		program.needs_rebuild        = false;
-		options.in_shader_buffer_pcs = program.in_shader_buffer_pcs;
-		if (const auto* linked = program.call_source.get();
-		    linked != nullptr && !linked->calls.empty()) {
-			translated = ShaderRecompiler::TranslateProgram(linked->linked->decoded, options);
-			translated.program.source_reads = linked->reads;
-		} else {
-			translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		}
-		program.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		materialized          = program.Materialize(runtime);
-	}
-	return bind(
-	    CompileModule(program, entry->first, options, std::move(translated), push_data_cursor));
+	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
+	                          push_data_cursor));
 }
 
 const ShaderRecompiler::IR::ResourcePlan*

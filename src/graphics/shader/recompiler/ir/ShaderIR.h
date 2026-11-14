@@ -862,8 +862,6 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
-	// Buffer access pcs whose descriptor stays a GPU value: tracking plans no host table for them.
-	std::vector<uint32_t> in_shader_buffer_pcs;
 };
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);

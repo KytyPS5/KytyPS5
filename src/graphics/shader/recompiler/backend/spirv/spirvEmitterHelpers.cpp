@@ -192,19 +192,12 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
-	const auto low = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, active_ballot, 0);
-	uint32_t mask = low;
-	if (state.program.wave_size == 64u) {
-		const auto high     = state.builder.AllocateId();
-		const auto in_high  = state.builder.AllocateId();
-		const auto selected = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, active_ballot, 1);
-		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), in_high, lane,
-		                          ConstantU32(state, 32));
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, in_high, high, low);
-		mask = selected;
-	}
+	// Ballot word N holds lanes 32N..32N+31: the upper wave of a 64-lane subgroup and the second
+	// emulated half both live in word one.
+	const auto word = EmitNative<spv::OpVectorExtractDynamic, IR::Type::U32>(
+	    state, active_ballot,
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane, ConstantU32(state, 5)));
+	const uint32_t mask = word;
 
 	const auto lane_low = state.builder.AllocateId();
 	const auto bit      = state.builder.AllocateId();

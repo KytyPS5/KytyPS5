@@ -536,9 +536,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::ReadLane: {
 			info.subgroup_ballot  = true;
 			info.subgroup_shuffle = true;
-			if (inst.GetOpcode() == ValueOpcode::DppMoveU32) {
-				info.subgroup_local_invocation_id = true;
-			}
+			// A 32-lane guest wave maps its lanes onto one half of a 64-lane native subgroup.
+			info.subgroup_local_invocation_id = true;
 			break;
 		}
 		case ValueOpcode::DppUpdateU32:

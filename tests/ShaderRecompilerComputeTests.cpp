@@ -14752,6 +14752,61 @@ public:
       context.ShutdownGpu();
       LibKernel::Memory::InstallGpuResources(nullptr);
     }
+    {
+      constexpr uint64_t bc_address = base + 0x20000;
+      constexpr uint64_t bc_metadata = 0x00003f39c0003e00ull;
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      const ShaderTextureResource descriptor{{static_cast<uint32_t>(bc_address >> 8u),
+          0xcae00000u, 0x001fc01fu, 0x91b00facu, 0, 0,
+          0x00200000u | (static_cast<uint32_t>(bc_metadata >> 8u) << 24u),
+          static_cast<uint32_t>(bc_metadata >> 16u)}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "block-compressed metadata ignored",
+              binding.desc.info.extent == vk::Extent3D{128, 128, 1} &&
+                  binding.desc.info.metadata.kind == ImageMetadataKind::None &&
+                  binding.desc.info.metadata.range.size == 0,
+              "a block-compressed texture adopted DCC metadata");
+      Require(name, "block-compressed sampled view",
+              cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+              "a block-compressed MetaCompress texture did not produce a view");
+      auto mipped = value;
+      mipped.dwords[0] = static_cast<uint32_t>((bc_address + 0x100000) >> 8u);
+      mipped.dwords[1] = 0xca900000u;
+      mipped.dwords[2] = 0x00ffc0ffu;
+      mipped.dwords[3] = 0xd051102cu;
+      mipped.dwords[5] = 0x00700000u;
+      const auto mipped_binding =
+          RenderExecutorTestAccess::ResolveTexture(executor, resource, mipped);
+      Require(name, "block-compressed mip view past MAX_MIP",
+              mipped_binding.desc.info.extent == vk::Extent3D{512, 512, 1} &&
+                  mipped_binding.desc.info.resources.levels == 1 &&
+                  mipped_binding.desc.view_info.base_level == 0 &&
+                  mipped_binding.desc.info.metadata.kind == ImageMetadataKind::None &&
+                  cache.FindTexture(mipped_binding.image_id, mipped_binding.desc) != nullptr,
+              "a block-compressed mip view past MAX_MIP kept DCC metadata");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
     Require(name, "unmap",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "captured scene mapping release failed");

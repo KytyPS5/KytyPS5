@@ -215,18 +215,21 @@ struct BufferCacheTestAccess {
   }
 };
 
-// Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives.
+// Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
+// barriers whose only destination stage is indirect argument reads.
 struct RecordedCommandCounter {
   static inline uint32_t barriers = 0;
+  static inline uint32_t indirect_barriers = 0;
   static inline uint32_t copies = 0;
   static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
   static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
 
   RecordedCommandCounter() {
     auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
-    barriers = copies = 0;
+    barriers = indirect_barriers = copies = 0;
     pipeline_barrier = std::exchange(dispatcher.vkCmdPipelineBarrier, [](auto... args) {
       ++barriers;
+      indirect_barriers += std::get<2>(std::tie(args...)) == VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
       pipeline_barrier(args...);
     });
     copy_buffer = std::exchange(dispatcher.vkCmdCopyBuffer, [](auto... args) {
@@ -13079,6 +13082,7 @@ public:
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
         const auto tick = scheduler.CurrentTick();
+        const RecordedCommandCounter counter;
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),
                                          static_cast<u32>(args >> 32u), test.mode};
@@ -13093,6 +13097,9 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
+        // The writers' trailing barriers already cover indirect argument reads.
+        Require(name, "no argument barrier", RecordedCommandCounter::indirect_barriers == 0,
+                "the indirect dispatch recorded its own argument barrier");
         if (test.mode == 0x41u) {
           Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
                   "workgroup-count arguments caused a host submission or readback");

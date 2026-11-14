@@ -1100,6 +1100,13 @@ static bool RetainsCachedDepthLayout(const ImageInfo& requested, const Image& ca
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
 }
 
+// PS5 dynamic resolution moves a depth target's extent within the same guest allocation: the
+// extents of one pitch and height share an address and match as overlaps.
+static bool DepthTargetOutgrows(const ImageInfo& requested, const Image& cached) {
+	return requested.extent.width > cached.info.extent.width ||
+	       requested.extent.height > cached.info.extent.height;
+}
+
 bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, BindingType binding,
                                              const Image& cached) {
 	// Mirrors ResolveDepthOverlap, which leaves other tile modes to the generic overlap path.
@@ -1130,6 +1137,9 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			// The render area follows the requested extent: a target wider or taller than the
+			// cached image would render past its edge.
+			recreate |= DepthTargetOutgrows(requested, cached);
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
@@ -1147,6 +1157,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!DepthOverlapNeedsRecreate(requested, binding, cached)) {
 		return cached_id;
 	}
+	const bool outgrown = binding == BindingType::DepthTarget && cached.info.IsDepth() &&
+	                      DepthTargetOutgrows(requested, cached);
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -1196,7 +1208,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	if (cached.depth_id || cached.backing.samples != 1 || replacement.backing.samples != 1) {
+	// A parked image only returns for the same layout, which an outgrown extent never asks for
+	// again: the larger image serves the smaller extents.
+	if (cached.depth_id || cached.backing.samples != 1 || replacement.backing.samples != 1 ||
+	    outgrown) {
 		FreeImage(cached_id);
 	} else {
 		ParkImage(cached_id);

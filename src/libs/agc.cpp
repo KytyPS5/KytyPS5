@@ -4073,14 +4073,27 @@ int Initialize() {
 	if (result != OK) {
 		return result;
 	}
+	// The binding table below is written at addresses derived from this mapping, so the preferred
+	// address is asked for as fixed. macOS runs the x86_64 build under Rosetta, which reserves
+	// that range and makes a fixed mapping fail outright, so fall back to whatever the kernel can
+	// give and derive everything from the address that is actually returned.
 	void* address = reinterpret_cast<void*>(DriverDmemBase);
 	result = LibKernel::Memory::KernelMapNamedDirectMemory(
-	    &address, DriverDmemSize, 0x33, 0, physical_offset, DriverDmemSize, "SceAgcDriver");
+	    &address, DriverDmemSize, 0x33, 0x10, physical_offset, DriverDmemSize, "SceAgcDriver");
+	if (result != OK) {
+		address = reinterpret_cast<void*>(DriverDmemBase);
+		result  = LibKernel::Memory::KernelMapNamedDirectMemory(
+		    &address, DriverDmemSize, 0x33, 0, physical_offset, DriverDmemSize, "SceAgcDriver");
+	}
 	if (result != OK) {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
 		return result;
 	}
-	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	const auto driver_dmem_base = reinterpret_cast<uint64_t>(address);
+	if (driver_dmem_base != DriverDmemBase) {
+		LOGF("Graphics5Driver: driver DMEM mapped at 0x%016" PRIx64 " instead of 0x%016" PRIx64 "\n",
+		     driver_dmem_base, DriverDmemBase);
+	}
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
 		uint64_t code;
@@ -4094,7 +4107,7 @@ int Initialize() {
 	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
 	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
 	};
-	const auto base = DriverDmemBase + AgcDmemOffset;
+	const auto base = driver_dmem_base + AgcDmemOffset;
 	const auto function_table = base + 0x60;
 	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
 	std::array<FunctionShaderBindings, 8> functions {};

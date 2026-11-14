@@ -30,6 +30,8 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
+	// Metal has no 64-bit atomics; the emitter lowers atomic 64-bit loads to plain loads.
+	bool                               shader_buffer_int64_atomics_enabled   = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
@@ -39,6 +41,12 @@ struct GraphicContext {
 	bool                               r8g8_srgb_views                       = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               sampler_filter_minmax_enabled         = false;
+	// Metal-backed drivers (MoltenVK, KosmicKrisp) have no VK_EXT_image_view_min_lod.
+	bool                               image_view_min_lod_enabled            = false;
+	// Metal cannot rasterize point or line fill; pipelines fall back to filled triangles.
+	bool                               fill_mode_non_solid_enabled           = false;
+	// Metal rejects subgroup builtins in vertex and pixel functions.
+	bool                               graphics_subgroups_enabled            = true;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;

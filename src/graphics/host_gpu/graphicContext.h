@@ -30,7 +30,11 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
+	// VK_EXT_attachment_feedback_loop_layout: a depth target may be sampled while it is attached.
 	bool                               attachment_feedback_loop_enabled      = false;
+	// VK_EXT_attachment_feedback_loop_dynamic_state: enable the loop per draw. Without it, a
+	// pipeline used in a loop is created with the depth-stencil feedback loop flag instead.
+	bool                               attachment_feedback_loop_dynamic_state_enabled = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;

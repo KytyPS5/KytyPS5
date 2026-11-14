@@ -2217,9 +2217,20 @@ u32 EncodeD16AsD32(uint16_t value) {
   return std::bit_cast<u32>(static_cast<float>(value) / 65535.0f);
 }
 
+// The depth-feedback selectors still use null descriptors for unused bindings,
+// but do not need the byte-granular robust-buffer capabilities required by the
+// full suite.
+enum class VulkanHarnessProfile {
+  kStrict,
+  kDepthFeedback,
+};
+
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  explicit VulkanHarness(VulkanHarnessProfile profile = VulkanHarnessProfile::kStrict)
+      : m_profile(profile) {
+    Init();
+  }
   ~VulkanHarness() { Destroy(); }
   // Host float min/max is used on AMD GPUs, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
@@ -20219,10 +20230,25 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  void CheckRasterizationLayoutOnly() {
+    if (!m_runtime_context.attachment_feedback_loop_enabled) {
+      return;
+    }
+    const bool dynamic = m_runtime_context.attachment_feedback_loop_dynamic_state_enabled;
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = false;
+    CheckRasterization(true, Prospero::BufferFormat::k32_32_32_32Float,
+                       "DepthAttachmentFeedbackStatic");
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled = dynamic;
+  }
+
   void CheckRasterization(
       bool depth_feedback,
-      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
-    const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
+      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float,
+      const char *name_override = nullptr) {
+    const char *name = name_override != nullptr
+                           ? name_override
+                           : (depth_feedback ? "DepthAttachmentFeedback"
+                                             : "PolygonModeRasterization");
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
     switch (color_format) {
@@ -20421,7 +20447,11 @@ public:
       DrawRenderState state{.topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
       const DrawTargets targets{.depth = depth, .colors = {color}, .color_count = 1};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
+      const bool static_feedback =
+          depth_feedback &&
+          !m_runtime_context.attachment_feedback_loop_dynamic_state_enabled;
+      return context.GetPipelineCache().GetGraphicsPipeline(
+          scheduler.Current(), state, targets, static_feedback);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,
@@ -20494,7 +20524,9 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_runtime_context.attachment_feedback_loop_dynamic_state_enabled) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23692,7 +23724,13 @@ public:
 #include "RayQueryTraversalGpuTests.inc"
 
 private:
+  [[nodiscard]] bool RequiresRobustAccess() const {
+    return m_profile == VulkanHarnessProfile::kStrict;
+  }
+
+  VulkanHarnessProfile m_profile = VulkanHarnessProfile::kStrict;
   bool m_rasterization_supported = true;
+  bool m_feedback_dynamic_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -23740,6 +23778,8 @@ private:
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_dynamic_state_enabled =
+        m_feedback_dynamic_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
@@ -23911,11 +23951,13 @@ private:
     m_physical_device.getProperties2(&properties2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_robustness2.robustBufferAccess2 == true &&
-                available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
-            "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    if (RequiresRobustAccess()) {
+      Require("VulkanHarness", "dispatch",
+              available_robustness2.robustBufferAccess2 == true &&
+                  available_pipeline_robustness.pipelineRobustness == true &&
+                  robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+              "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -23978,8 +24020,15 @@ private:
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
+#if !defined(__APPLE__)
+    // The production pipeline enables depth clamping on non-Apple platforms.
+    m_rasterization_supported =
+        m_rasterization_supported && available_features.depthClamp;
+#endif
+    m_feedback_dynamic_supported =
+        m_rasterization_supported &&
+        available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -24035,9 +24084,13 @@ private:
       clip_control.depthClipControl = true;
       feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
-      feedback_dynamic.pNext = &feedback_layout;
-      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      if (m_feedback_dynamic_supported) {
+        feedback_dynamic.pNext = &feedback_layout;
+        feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+        provoking_vertex.pNext = &feedback_dynamic;
+      } else {
+        provoking_vertex.pNext = &feedback_layout;
+      }
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -24052,13 +24105,17 @@ private:
     shader_clock.pNext = &min_lod;
     maintenance8.pNext = &shader_clock;
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness{};
-    pipeline_robustness.pipelineRobustness = true;
-    pipeline_robustness.pNext = &maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
-    robustness2.nullDescriptor = true;
-    robustness2.pNext = &pipeline_robustness;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
+    robustness2.nullDescriptor = true;
+    if (RequiresRobustAccess()) {
+      pipeline_robustness.pipelineRobustness = true;
+      pipeline_robustness.pNext = &maintenance8;
+      robustness2.pNext = &pipeline_robustness;
+    } else {
+      robustness2.pNext = &maintenance8;
+    }
     conditional_rendering.pNext = &robustness2;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     mesh.meshShader = mesh.taskShader = true;
@@ -24083,6 +24140,9 @@ private:
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+#if !defined(__APPLE__)
+    device_features.depthClamp = m_rasterization_supported;
+#endif
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
@@ -24092,7 +24152,6 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -24101,12 +24160,17 @@ private:
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_QUERY_EXTENSION_NAME};
+    if (RequiresRobustAccess()) {
+      device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_dynamic_supported) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -55549,9 +55613,18 @@ void CheckDeviceCreation() {
       vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
       vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
   const auto &mesh = features.get<vk::PhysicalDeviceMeshShaderFeaturesEXT>();
-  const bool feedback =
+  const bool feedback_dynamic_extension =
       has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
       has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+  const bool feedback_layout =
+      has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+      features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
+          .attachmentFeedbackLoopLayout;
+  const bool feedback_dynamic =
+      feedback_layout &&
+      has(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) &&
+      features.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
+          .attachmentFeedbackLoopDynamicState;
   const auto properties = graphics.physical_device.getProperties2<
       vk::PhysicalDeviceProperties2, vk::PhysicalDevicePushDescriptorProperties,
       vk::PhysicalDeviceMeshShaderPropertiesEXT>();
@@ -55565,7 +55638,7 @@ void CheckDeviceCreation() {
           command("vkCmdBeginConditionalRenderingEXT") ==
                   has(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) &&
               command("vkCmdDrawMeshTasksEXT") == has(VK_EXT_MESH_SHADER_EXTENSION_NAME) &&
-              command("vkCmdSetAttachmentFeedbackLoopEnableEXT") == feedback &&
+              command("vkCmdSetAttachmentFeedbackLoopEnableEXT") == feedback_dynamic_extension &&
               graphics.memory_budget_ext_enabled == has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME),
           "an optional extension the GPU has was not enabled");
   Require(name, "features",
@@ -55586,12 +55659,8 @@ void CheckDeviceCreation() {
                       features.get<vk::PhysicalDeviceShaderClockFeaturesKHR>().shaderDeviceClock) &&
               matches(graphics.mesh_shader_enabled, VK_EXT_MESH_SHADER_EXTENSION_NAME,
                       mesh.meshShader && mesh.taskShader) &&
-              graphics.attachment_feedback_loop_enabled ==
-                  (feedback &&
-                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>()
-                       .attachmentFeedbackLoopLayout &&
-                   features.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>()
-                       .attachmentFeedbackLoopDynamicState),
+              graphics.attachment_feedback_loop_enabled == feedback_layout &&
+              graphics.attachment_feedback_loop_dynamic_state_enabled == feedback_dynamic,
           "an enabled feature disagrees with the GPU");
   Require(name, "limits",
           graphics.max_push_descriptors ==
@@ -57355,6 +57424,20 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-static-only") == 0) {
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
+    auto &graphics = vulkan.RuntimeContext();
+    if (!vulkan.RasterizationSupported()) {
+      std::fprintf(stderr, "[gpu] rasterization feedback is unavailable\n");
+      return 1;
+    }
+    if (!graphics.attachment_feedback_loop_enabled) {
+      std::fprintf(stderr, "[gpu] attachment feedback layout is unavailable\n");
+      return 1;
+    }
+    vulkan.CheckRasterizationLayoutOnly();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
@@ -57571,6 +57654,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationLayoutOnly();
   } else {
     skipped_device_checks = true;
   }

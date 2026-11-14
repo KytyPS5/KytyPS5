@@ -417,12 +417,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceMeshShaderFeaturesEXT>();
 	}
-	// Feedback loops take both extensions or neither.
-	if (!HasExtension(available_extensions,
-	                  VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) ||
-	    !add(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) ||
-	    !add(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME)) {
+	// The layout extension alone is enough when pipelines carry the feedback loop flag.
+	const bool feedback_layout_extension =
+	    add(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+	const bool feedback_dynamic_extension =
+	    feedback_layout_extension &&
+	    add(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+	if (!feedback_layout_extension) {
 		supported.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>();
+	}
+	if (!feedback_dynamic_extension) {
 		supported.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
 	}
 	if (!add(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
@@ -525,8 +529,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled    = provoking_vertex.provokingVertexLast;
-	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
-	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	graphics.attachment_feedback_loop_enabled = feedback_layout_extension &&
+	                                            feedback_layout.attachmentFeedbackLoopLayout;
+	graphics.attachment_feedback_loop_dynamic_state_enabled =
+	    graphics.attachment_feedback_loop_enabled && feedback_dynamic_extension &&
+	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
 	graphics.ray_query_enabled                = ray_query_enabled;
 	// A coarser alignment rounds the range up past the guest's last byte.
@@ -543,8 +550,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
-	LOGF("Vulkan depth feedback support: %s\n",
-	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	LOGF("Vulkan depth feedback support: %s (dynamic state: %s)\n",
+	     graphics.attachment_feedback_loop_enabled ? "true" : "false",
+	     graphics.attachment_feedback_loop_dynamic_state_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -663,6 +671,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.mesh_shader_enabled) create.unlink<vk::PhysicalDeviceMeshShaderFeaturesEXT>();
 	if (!graphics.attachment_feedback_loop_enabled) {
 		create.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>();
+	}
+	if (!graphics.attachment_feedback_loop_dynamic_state_enabled) {
 		create.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
 	}
 	if (!graphics.provoking_vertex_last_enabled) {

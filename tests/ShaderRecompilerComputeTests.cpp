@@ -22350,6 +22350,40 @@ public:
             "scratch reuse overwrote an earlier result or its live conversion input");
     DestroyBuffer(&scratch_output);
     DestroyBuffer(&scratch_input);
+    // Detile leaves row, slice and level padding unwritten; uploads read only
+    // the copy regions, so padding compares as zero.
+    const auto keep_copied_bytes = [&](std::vector<uint8_t> *linear,
+                                       const ImageInfo &info) {
+      std::vector<uint8_t> copied(linear->size(), 0);
+      const auto &tiling = info.tiling;
+      const uint64_t bpe = tiling.block.bytes_per_element;
+      for (const auto &copy : info.BufferCopies()) {
+        const uint64_t row_bytes =
+            copy.bufferRowLength / tiling.texel_width * bpe;
+        const uint64_t slice_rows =
+            copy.bufferImageHeight / tiling.texel_height;
+        const uint64_t rows =
+            (copy.imageExtent.height + tiling.texel_height - 1u) /
+            tiling.texel_height;
+        const uint64_t bytes =
+            (copy.imageExtent.width + tiling.texel_width - 1u) /
+            tiling.texel_width * bpe;
+        const uint64_t slices =
+            std::max(copy.imageSubresource.layerCount, copy.imageExtent.depth);
+        for (uint64_t slice = 0; slice < slices; ++slice) {
+          for (uint64_t row = 0; row < rows; ++row) {
+            const uint64_t offset =
+                copy.bufferOffset + (slice * slice_rows + row) * row_bytes;
+            Require(name, "copied detile bytes",
+                    offset + bytes <= linear->size(),
+                    "an upload region lies outside the detiled output");
+            std::copy_n(linear->begin() + offset, bytes,
+                        copied.begin() + offset);
+          }
+        }
+      }
+      *linear = std::move(copied);
+    };
     const auto gpu_detile =
         [&](const std::vector<uint8_t> &tiled, std::vector<uint8_t> *linear,
             uint64_t tiled_capacity, uint64_t linear_capacity,
@@ -22365,8 +22399,16 @@ public:
               name, padded_linear, AllFlags,
               std::vector<u32>(static_cast<size_t>(padded_linear / sizeof(u32)),
                                0));
-          const auto result = (manager ? *manager : tile_manager)
-                                  .Detile(input.buffer, source_offset, info);
+          auto &tiler = manager ? *manager : tile_manager;
+          if (info.IsTiled()) {
+            // Poison the scratch Detile reuses, so an unwritten copied byte
+            // shows.
+            const auto scratch =
+                tiler.GetScratchBuffer(info.LinearSize(), input.buffer);
+            scheduler.Current().Handle().fillBuffer(
+                scratch.buffer, scratch.offset, scratch.size, 0xa5a5a5a5u);
+          }
+          const auto result = tiler.Detile(input.buffer, source_offset, info);
           Require(name, "detile capacity", result.size <= padded_linear,
                   "canonical transfer size exceeded the fixture output");
           const vk::BufferCopy copy{result.offset, 0, align_dword(result.size)};
@@ -22377,6 +22419,9 @@ public:
                        vk::AccessFlagBits::eTransferWrite);
           scheduler.Finish();
           *linear = read_bytes(output, linear_capacity);
+          if (info.IsTiled()) {
+            keep_copied_bytes(linear, info);
+          }
           DestroyBuffer(&output);
           DestroyBuffer(&input);
         };

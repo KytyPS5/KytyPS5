@@ -122,7 +122,7 @@ private:
 	                             uint64_t target_offset);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-	                            const Tiling& tiling, bool clear_target);
+	                            const Tiling& tiling);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
 	[[nodiscard]] vk::Pipeline CreatePipeline(std::span<const uint32_t>     code,
 	                                          const vk::SpecializationInfo* specialization) const;

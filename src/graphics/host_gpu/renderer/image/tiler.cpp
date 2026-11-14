@@ -244,7 +244,7 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 
 void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
                          vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-                         const Tiling& tiling, bool clear_target) {
+                         const Tiling& tiling) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -269,9 +269,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	barriers[0].offset              = source_offset;
 	barriers[0].size                = source_capacity;
 	barriers[1]                     = barriers[0];
-	barriers[1].dstAccessMask =
-	    clear_target ? vk::AccessFlagBits::eTransferWrite
-	                 : vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
 	barriers[1].buffer        = target;
 	barriers[1].offset        = target_offset;
 	barriers[1].size          = target_capacity;
@@ -283,17 +281,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	barriers[2].size          = tiling.params_size;
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
-	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
-	    nullptr, 3, barriers, 0, nullptr);
-	if (clear_target) {
-		command.fillBuffer(target, target_offset, target_capacity, 0);
-		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		barriers[1].dstAccessMask =
-		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1,
-		                        &barriers[1], 0, nullptr);
-	}
+	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 3, barriers, 0, nullptr);
 
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
@@ -336,7 +324,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const auto linear_capacity = info.LinearSize();
 	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, tiled_offset, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
-	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
+	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
@@ -345,8 +333,7 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
                        const ImageInfo& info, uint32_t levels) {
 	const auto tiling =
 	    Prepare(true, tiled_capacity, linear_capacity, info, levels, linear_offset, tiled_offset);
-	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling,
-	       false);
+	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
@@ -359,7 +346,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, tiled_offset);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
-	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling, false);
+	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling);
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {

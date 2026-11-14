@@ -433,14 +433,6 @@ public:
 		std::vector<std::pair<const IndirectDescriptorPlan*, Value>> buffer_selections;
 		for (const auto& plan: m_indirect_descriptors) {
 			auto key = plan.key;
-			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
-			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
-				auto* block = plan.handle->Parent();
-				const auto where = std::ranges::find_if(block->Instructions(),
-				    [&](const Inst& inst) { return &inst == plan.handle; });
-				key = Value(&*block->PrependNewInst(
-				    where, ValueOpcode::ShiftLeftLogical32, {key, Value(2u)}));
-			}
 			if (plan.table_read != nullptr) {
 				const auto* anchor = plan.table_indexed ? plan.handle : plan.table_read;
 				auto* block = anchor->Parent();
@@ -465,9 +457,16 @@ public:
 					    {emit(ValueOpcode::ULessThan32, {read.Arg(1), table->Arg(2)}),
 					     emit(ValueOpcode::INotEqual32, {format, Value(0u)})});
 				} else {
+					const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 					const auto dynamic = emit(ValueOpcode::BitwiseAnd32, {read.Arg(1), Value(~3u)});
-					offset = emit(ValueOpcode::IAdd32, {dynamic, Value(memory.offset & ~3u)});
-					valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
+					if (m_sources[indirect.table_source].dword_count == 2u) {
+						// An address table's heap starts at key 0's slot.
+						offset = emit(ValueOpcode::ISub32, {dynamic, Value(indirect.table_offset)});
+						valid = emit(ValueOpcode::ULessThanEqual32, {Value(indirect.table_offset), dynamic});
+					} else {
+						offset = emit(ValueOpcode::IAdd32, {dynamic, Value(memory.offset & ~3u)});
+						valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
+					}
 				}
 				key = emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
 				if (!plan.table_indexed) {
@@ -496,6 +495,14 @@ public:
 				for (uint32_t word = 1; word < plan.handle->NumArgs(); ++word)
 					plan.handle->SetArg(word, Value(0u));
 				continue;
+			}
+			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
+			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
+				auto* block = plan.handle->Parent();
+				const auto where = std::ranges::find_if(block->Instructions(),
+				    [&](const Inst& inst) { return &inst == plan.handle; });
+				key = Value(&*block->PrependNewInst(
+				    where, ValueOpcode::ShiftLeftLogical32, {key, Value(2u)}));
 			}
 			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
 				Value selected;
@@ -3344,7 +3351,17 @@ private:
 				}
 				if (maximum >= MaxIndirectDescriptorProbes)
 					maximum = ClampedTableMaximum(key, table_source, indirect);
-				if (maximum < MaxIndirectDescriptorProbes)
+				// A static key range can cover other operations' slots, so samples keep their GPU key
+				// over an image heap, which reads slots of another type or invalid T#s as null.
+				if (maximum < MaxIndirectDescriptorProbes && !sampler &&
+				    std::ranges::all_of(handle.Uses(), [](const Use& use) {
+					    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw;
+				    })) {
+					indirect.table_maximum = maximum;
+					indirect.table_scalar = true;
+					plan.table_read = plan.reads[0];
+					plan.retain_reads = true;
+				} else if (maximum < MaxIndirectDescriptorProbes)
 					indirect.key_count = Value(maximum + 1u);
 				else if (!ProgramLoopCount(key, indirect))
 					return false;

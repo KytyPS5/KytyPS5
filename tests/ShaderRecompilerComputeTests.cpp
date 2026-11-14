@@ -45320,7 +45320,7 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
         O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     Require(test.name, "bounded image candidates",
-            packed ? compiled.resources.images.size() == 32u
+            packed ? compiled.resources.images.size() == 33u // The null root and every slot.
                    : compiled.resources.images.size() == std::max(count, 1u),
             "descriptor planning escaped its selector domain");
     std::vector<VulkanHarness::Image> images;

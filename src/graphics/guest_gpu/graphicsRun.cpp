@@ -335,21 +335,27 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
-void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset) {
+void CommandProcessor::GetLodStats(uint64_t dst_address, uint32_t size, bool reset) {
 	auto& counters = m_renderer.GetRenderExecutor().m_mip_stats;
 	// Each of up to 256 2-dword slots after the 16-dword header holds the clamped sample count
 	// (dword 0 bits 0-23), the slot id (bits 24-31), the unclamped sample count (dword 1 bits 0-23)
 	// and the finest mip sampled (bits 24-27, 15 for none). A non-zero header dword 0 then marks
-	// the report complete.
-	if (dst != nullptr && size >= 64) {
-		const auto slots = std::min((size - 64) / 8, 256u);
+	// the report complete. Nothing is counted without --lod-stats: every slot reports no samples.
+	if (dst_address != 0 && size >= 64) {
+		const auto                slots = std::min((size - 64) / 8, 256u);
+		std::array<uint32_t, 512> report;
 		for (uint32_t slot = 0; slot < slots; slot++) {
 			const auto& counter = counters[slot];
-			dst[16 + slot * 2]  = (slot << 24u) | uint32_t {counter.clamped};
-			dst[16 + slot * 2 + 1] =
+			report[slot * 2]    = (slot << 24u) | uint32_t {counter.clamped};
+			report[slot * 2 + 1] =
 			    (uint32_t {counter.finest_level} << 24u) | uint32_t {counter.unclamped};
 		}
-		dst[0] = 1;
+		auto& buffers = m_renderer.GetBufferCache();
+		if (slots != 0) {
+			buffers.WriteMemory(dst_address + 64, report.data(), uint64_t {slots} * 8);
+		}
+		const uint32_t complete = 1;
+		buffers.WriteMemory(dst_address, &complete, sizeof(complete));
 	}
 	if (reset) {
 		counters = {};

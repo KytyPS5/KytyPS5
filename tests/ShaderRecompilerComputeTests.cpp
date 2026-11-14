@@ -5091,7 +5091,8 @@ public:
   }
 
   // Games write labels into pages a dispatch just wrote. A store through the guest mapping faulted
-  // and downloaded the page, waiting for the queue; WRITE_DATA takes the store in queue order.
+  // and downloaded the page, waiting for the queue; WRITE_DATA and GET_LOD_STATS take the store in
+  // queue order.
   void CheckBufferCacheOrderedWrite() {
     constexpr const char *name = "BufferCacheOrderedWrite";
     constexpr uintptr_t base = 0x000000020a400000ull;
@@ -5186,6 +5187,46 @@ public:
                   !cache.IsRegionGpuModified(base + clean_offset, sizeof(clean_value)) &&
                   scheduler.CurrentTick() == clean_tick,
               "a store into a CPU-owned page did not go straight to guest memory");
+
+      // A GET_LOD_STATS report: 16 header dwords, then two dwords per slot.
+      constexpr uint64_t report_gpu_offset = 0x10000;
+      constexpr uint64_t report_offset = 0x10040;
+      constexpr uint64_t report_clean_offset = 0x20000;
+      constexpr uint32_t report_slots = 3;
+      const auto get_lod_stats = [&](uint64_t offset) {
+        const std::array<uint32_t, 5> packet{
+            KYTY_PM4(5, Pm4::IT_GET_LOD_STATS, 0), 64 + report_slots * 8,
+            static_cast<uint32_t>(base + offset), static_cast<uint32_t>((base + offset) >> 32u), 0};
+        Pm4Execution execution;
+        return processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+      };
+      const auto reported = [&](uint64_t offset) {
+        for (uint32_t slot = 0; slot < report_slots; slot++) {
+          if (backing(offset + 64 + slot * 8) != slot << 24u ||
+              backing(offset + 68 + slot * 8) != 15u << 24u) {
+            return false;
+          }
+        }
+        return backing(offset) == 1 && backing(offset + 64 + report_slots * 8) == stale;
+      };
+      write_on_gpu(report_gpu_offset, gpu_value);
+      write_on_gpu(report_offset + 68, gpu_value);
+      const auto report_tick = scheduler.CurrentTick();
+      Require(name, "report into a GPU-written page",
+              get_lod_stats(report_offset) && scheduler.CurrentTick() == report_tick &&
+                  backing(report_offset) == stale &&
+                  cache.HasGpuDirtyBytes(base + report_offset, sizeof(uint32_t)),
+              "a GET_LOD_STATS report into a GPU-written page drained the queue");
+      cache.ReadMemory(base + report_gpu_offset, 0x100);
+      Require(name, "report in queue order",
+              reported(report_offset) && backing(report_gpu_offset) == gpu_value,
+              "a GET_LOD_STATS report did not land after the GPU write before it");
+      const auto report_clean_tick = scheduler.CurrentTick();
+      Require(name, "report into a clean page",
+              get_lod_stats(report_clean_offset) && reported(report_clean_offset) &&
+                  !cache.IsRegionGpuModified(base + report_clean_offset, 64) &&
+                  scheduler.CurrentTick() == report_clean_tick,
+              "a GET_LOD_STATS report into a CPU-owned page did not go straight to guest memory");
 
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

@@ -251,6 +251,7 @@ struct BufferCacheTestAccess {
                             uint64_t size) {
     return cache.HeldBytes(buffer, address, size);
   }
+  static size_t ReadbacksInFlight(const BufferCache &cache) { return cache.m_readbacks.size(); }
 };
 
 // Counts the vkCmdPipelineBarrier and vkCmdCopyBuffer calls recorded while it lives, and the
@@ -5241,6 +5242,357 @@ public:
                                                                allocation_size) == 0,
             "ordered-write direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A thread that faults on GPU-written memory waits for the readback itself: the GPU thread
+  // records and submits the copies and goes on. The bytes stay GPU-written until they have
+  // landed, so nothing reads guest memory early and bytes the GPU writes meanwhile are kept.
+  void CheckBufferReadbackWaiter(bool joined_buffers) {
+    constexpr const char *name = "BufferReadbackWaiter";
+    constexpr uint64_t window = 0x80000;
+    constexpr uint64_t size = 16 * window;
+    constexpr u32 gpu_value = 0x11111111u;
+    constexpr u32 later_value = 0x22222222u;
+    constexpr u32 beside_value = 0x33333333u;
+    constexpr u32 guest_value = 0x44444444u;
+    constexpr uint64_t never = std::numeric_limits<uint64_t>::max();
+    const uint64_t base = joined_buffers ? 0x0000000320000000ull : 0x0000000318000000ull;
+    EnsureRuntimeContext();
+    std::optional<JoinedGuestBuffers> joined;
+    if (joined_buffers) {
+      joined.emplace(m_runtime_context);
+    }
+    bool windowed = false;
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      windowed = BufferCacheTestAccess::Windowed(cache);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      auto &gpu = context.GetGpu();
+      const auto direct = MapGuestPattern(name, base, size);
+      context.MapMemory(base, size);
+      const auto pattern = [](uint64_t address) { return static_cast<u32>(address); };
+      const auto guest = [](uint64_t address) {
+        u32 value = 0;
+        LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+        return value;
+      };
+      const auto write_on_gpu = [&](uint64_t address, u32 value) {
+        gpu.SendCommandSync([&] {
+          (void)cache.ObtainBuffer(address, sizeof(value), true, false);
+          cache.FillBuffer(address, sizeof(value), value, false);
+        });
+      };
+      struct State {
+        bool gpu = false;
+        bool cpu = false;
+        bool bytes = false;
+        size_t readbacks = 0;
+      };
+      const auto state = [&](uint64_t address) {
+        State result;
+        gpu.SendCommandSync([&] {
+          result = {cache.IsRegionGpuModified(address, sizeof(u32)),
+                    cache.IsRegionCpuModified(address, sizeof(u32)),
+                    cache.HasGpuDirtyBytes(address, sizeof(u32)),
+                    BufferCacheTestAccess::ReadbacksInFlight(cache)};
+        });
+        return result;
+      };
+      // Priority operations run in queue order: this one holds every publish behind it.
+      struct Hold {
+        std::binary_semaphore entered{0};
+        std::binary_semaphore release{0};
+      };
+      const auto hold_later = [&](Hold &hold) {
+        gpu.SendCommandSync([&] {
+          scheduler.DeferPriorityOperation([&hold] {
+            hold.entered.release();
+            hold.release.acquire();
+          });
+          scheduler.Flush();
+        });
+      };
+      const auto hold_publishes = [&](Hold &hold) {
+        hold_later(hold);
+        hold.entered.acquire();
+        return scheduler.CurrentTick();
+      };
+      // A readback's copies are submitted once the tick has moved on.
+      const auto submitted = [&](uint64_t tick) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (scheduler.CurrentTick() == tick && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        return scheduler.CurrentTick() != tick;
+      };
+      struct Fault {
+        std::binary_semaphore done{0};
+        bool handled = false;
+        std::jthread thread;
+      };
+      const auto fault = [&](Fault &request, PageFaultAccess access, uint64_t address) {
+        request.thread = std::jthread([&request, &context, access, address] {
+          request.handled = context.HandleFault(access, address);
+          request.done.release();
+        });
+      };
+      // Nothing GPU-written is left at the address and no readback is in flight.
+      const auto clean = [&](uint64_t address) {
+        const auto after = state(address);
+        return !after.gpu && !after.bytes && after.readbacks == 0;
+      };
+
+      {
+        const auto address = base + 0x100;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        std::binary_semaphore answered{0};
+        gpu.SendCommand([&] { answered.release(); });
+        const bool went_on = answered.try_acquire_for(std::chrono::seconds(2));
+        const bool waiting = !reader.done.try_acquire();
+        const auto in_flight = went_on ? state(address) : State{};
+        const bool stale = guest(address) == pattern(address);
+        hold.release.release();
+        if (waiting) {
+          reader.done.acquire();
+        }
+        gpu.SendCommandSync([] {});
+        Require(name, "the GPU thread goes on",
+                recorded && went_on && waiting && stale && in_flight.gpu && in_flight.bytes &&
+                    !in_flight.cpu && in_flight.readbacks == 1,
+                "a guest readback held the GPU thread, or its bytes left GPU ownership in flight");
+        Require(name, "landing",
+                reader.handled && guest(address) == gpu_value && clean(address),
+                "a readback did not land its bytes in guest memory");
+      }
+
+      {
+        const auto address = base + window + 0x100;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        write_on_gpu(address, later_value);
+        hold.release.release();
+        reader.done.acquire();
+        Require(name, "written again in flight",
+                recorded && reader.handled && guest(address) == later_value && clean(address),
+                "bytes the GPU wrote after the copy were dropped or left unread");
+      }
+
+      {
+        const auto address = base + 2 * window + 0x100;
+        const auto beside = address + 0x40;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        write_on_gpu(beside, beside_value);
+        hold.release.release();
+        reader.done.acquire();
+        Require(name, "written beside in flight",
+                recorded && reader.handled && guest(address) == gpu_value &&
+                    guest(beside) == beside_value && clean(address) && clean(beside),
+                "a page written beside the copy was released without its newer bytes");
+      }
+
+      {
+        const auto address = base + 3 * window + 0x100;
+        const auto other = address + 0x3000;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        write_on_gpu(other, later_value);
+        hold.release.release();
+        reader.done.acquire();
+        const auto kept = state(other);
+        Require(name, "another page written in flight",
+                recorded && reader.handled && guest(address) == gpu_value && clean(address) &&
+                    kept.gpu && kept.bytes && guest(other) == pattern(other),
+                "landing released a page of the window the GPU wrote meanwhile");
+        Require(name, "the other page's readback",
+                context.HandleFault(PageFaultAccess::Read, other) &&
+                    guest(other) == later_value && clean(other),
+                "the page written meanwhile did not read back on its own fault");
+      }
+
+      {
+        const auto address = base + 4 * window + 0x100;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault first;
+        fault(first, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        Fault second;
+        fault(second, PageFaultAccess::Read, address + 8);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const bool waiting = !second.done.try_acquire();
+        hold.release.release();
+        first.done.acquire();
+        if (waiting) {
+          second.done.acquire();
+        }
+        Require(name, "a second fault in flight",
+                recorded && waiting && first.handled && second.handled &&
+                    scheduler.CurrentTick() == tick + 1 && guest(address) == gpu_value &&
+                    clean(address),
+                "a fault on a page in flight returned early or recorded another readback");
+      }
+
+      {
+        const auto address = base + 5 * window + 0x100;
+        const auto written = address + 0x10;
+        const auto copy = base + 6 * window + 0x100;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault writer;
+        fault(writer, PageFaultAccess::Write, written);
+        const bool recorded = submitted(tick);
+        const auto in_flight = state(written);
+        hold.release.release();
+        writer.done.acquire();
+        const auto after = state(written);
+        std::memcpy(reinterpret_cast<void *>(written), &guest_value, sizeof(guest_value));
+        // The copy runs on the GPU: its destination page is GPU-written.
+        write_on_gpu(copy + 0x100, beside_value);
+        gpu.SendCommandSync([&] { cache.CopyBuffer(copy, address, 0x20, false, false); });
+        Require(name, "write fault",
+                recorded && writer.handled && in_flight.gpu && !in_flight.cpu && !after.gpu &&
+                    after.cpu && context.HandleFault(PageFaultAccess::Read, copy) &&
+                    guest(copy) == gpu_value && guest(copy + 0x10) == guest_value,
+                "a write fault was let through before its page landed, or the next GPU read "
+                "lost the guest's write or the GPU's bytes");
+      }
+
+      {
+        const auto address = base + 7 * window + 0x100;
+        const auto copy = base + 8 * window + 0x100;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        gpu.SendCommandSync([&] { cache.CopyBuffer(copy, address, sizeof(u32), false, false); });
+        hold.release.release();
+        reader.done.acquire();
+        Require(name, "GPU read in flight",
+                recorded && reader.handled && context.HandleFault(PageFaultAccess::Read, copy) &&
+                    guest(copy) == gpu_value && guest(address) == gpu_value,
+                "a GPU read of bytes in flight took stale guest memory");
+      }
+
+      {
+        const auto address = base + 9 * window + 0x100;
+        write_on_gpu(address, gpu_value);
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        std::binary_semaphore read{0};
+        u32 seen = 0;
+        gpu.SendCommand([&] {
+          cache.ReadMemory(address, sizeof(u32));
+          seen = guest(address);
+          read.release();
+        });
+        const bool early = read.try_acquire_for(std::chrono::milliseconds(100));
+        hold.release.release();
+        if (!early) {
+          read.acquire();
+        }
+        reader.done.acquire();
+        Require(name, "GPU-thread read in flight",
+                recorded && !early && seen == gpu_value && reader.handled && clean(address),
+                "the GPU thread's own read of bytes in flight did not wait for them");
+      }
+
+      {
+        const auto address = base + 10 * window + 0x100;
+        write_on_gpu(address, gpu_value);
+        gpu.SendCommandSync([&] {
+          for (uint32_t age = 0; age < 160; ++age) {
+            cache.RunGarbageCollector();
+          }
+        });
+        Hold hold;
+        const auto tick = hold_publishes(hold);
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, address);
+        const bool recorded = submitted(tick);
+        std::binary_semaphore collected{0};
+        gpu.SendCommand([&] {
+          BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+          cache.RunGarbageCollector();
+          BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+          collected.release();
+        });
+        const bool early = collected.try_acquire_for(std::chrono::milliseconds(100));
+        hold.release.release();
+        if (!early) {
+          collected.acquire();
+        }
+        reader.done.acquire();
+        Require(name, "collection in flight",
+                recorded && reader.handled && guest(address) == gpu_value && clean(address),
+                "collecting a page in flight lost its bytes");
+      }
+
+      {
+        // A second readback of the window is recorded while the first is in flight, and
+        // publishes after the first has landed and the guest has written its page.
+        const auto address = base + 11 * window + 0x100;
+        const auto other = address + 0x3000;
+        write_on_gpu(address, gpu_value);
+        Hold first_hold;
+        const auto tick = hold_publishes(first_hold);
+        Fault writer;
+        fault(writer, PageFaultAccess::Write, address);
+        const bool recorded = submitted(tick);
+        Hold second_hold;
+        hold_later(second_hold);
+        write_on_gpu(other, later_value);
+        const auto other_tick = scheduler.CurrentTick();
+        Fault reader;
+        fault(reader, PageFaultAccess::Read, other);
+        const bool other_recorded = submitted(other_tick);
+        first_hold.release.release();
+        writer.done.acquire();
+        second_hold.entered.acquire();
+        std::memcpy(reinterpret_cast<void *>(address), &guest_value, sizeof(guest_value));
+        second_hold.release.release();
+        reader.done.acquire();
+        Require(name, "a later readback of the window",
+                recorded && other_recorded && writer.handled && reader.handled &&
+                    guest(address) == guest_value && guest(other) == later_value && clean(other),
+                "a readback recorded later published over a page that had already landed");
+      }
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      UnmapGuestPattern(name, base, size, direct);
+    }
+    std::printf("[gpu]     %-32s ok (%s)\n", name, windowed ? "windows" : "joined buffers");
   }
 
   // The device budget counts this process's own device-local memory: NVIDIA's reported usage
@@ -62088,6 +62440,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheOrderedWrite();
+    vulkan.CheckBufferReadbackWaiter(false);
+    vulkan.CheckBufferReadbackWaiter(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -62389,6 +62743,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheOrderedWrite();
+    vulkan.CheckBufferReadbackWaiter(false);
+    vulkan.CheckBufferReadbackWaiter(true);
     vulkan.CheckDeviceBudgetPlacement();
     vulkan.CheckSparseBufferPages();
     vulkan.CheckSparsePageTable();

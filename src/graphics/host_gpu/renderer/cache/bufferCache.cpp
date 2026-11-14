@@ -693,12 +693,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		if (const auto tick = BeginReadback(vaddr, size, is_write); tick != 0) {
-			m_scheduler.WaitPriorityOperations(tick);
-			EndReadback(vaddr, size, is_write, tick);
-		}
-	});
+	auto&    gpu  = m_scheduler.Context().GetGpu();
+	uint64_t tick = 0;
+	gpu.SendCommandSync([&] { tick = BeginReadback(vaddr, size, is_write); });
+	if (tick != 0) {
+		// The thread that asked waits for the copies; the GPU thread goes on recording.
+		m_scheduler.WaitPriorityOperations(tick);
+		gpu.SendCommandSync([&] { EndReadback(vaddr, size, is_write, tick); });
+	}
 }
 
 uint64_t BufferCache::BeginReadback(uint64_t vaddr, uint64_t size, bool is_write) {

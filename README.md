@@ -18,7 +18,15 @@ compatibility is limited and behavior may change significantly between builds.
 > not distribute games or copyrighted system software. Use only game files that you have obtained
 > legally.
 
-## Current Status
+## Quick Navigation
+
+- 🚀 **[Getting Started](#current-status--getting-started)** — What works, what doesn't, and how to use it
+- 📚 **[Building](#building)** — Complete setup for Windows, Linux, and macOS
+- 🤝 **[Contributing](#contributing)** — How to report bugs and submit code
+- 👨‍💻 **[Developer Information](#developer-information)** — Key codebase areas and architecture
+- 📄 **[License](#license)** — GPL-2.0 terms and credits
+
+## Current Status & Getting Started
 
 KatyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
 4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
@@ -76,17 +84,17 @@ graphical glitches, low compatibility, and poor performance.
 
 ## Contributing
 
-Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
+**See [`CONTRIBUTING.md`](CONTRIBUTING.md)** for the complete contribution guide.
 
-Code contributions should be focused, build successfully on the platforms they touch, and include
-relevant tests where practical. Windows is the primary target, so a change that alters shared code
-should not regress it; changes confined to a platform's own code paths only need to build there. Because KatyPS5 is still evolving quickly, consider opening an issue before
-starting a large change.
+In brief:
 
-This repo follows a Spec-Driven Development workflow — see [`CLAUDE.md`](CLAUDE.md) and
-[`specs/CONSTITUTION.md`](specs/CONSTITUTION.md) for the non-negotiables (don't break existing
-functionality, keep semver in sync, analyze before fixing) before proposing a non-trivial change.
+- **Testing & bug reports**: Search existing issues, use the **Game Emulation Bug Report** template,
+  attach the complete log file.
+- **Code changes**: Should be focused, build successfully on target platforms, and include tests
+  where practical.
+- **Spec-Driven Development**: This repo follows SDD workflow — see [`CLAUDE.md`](CLAUDE.md) and
+  [`specs/CONSTITUTION.md`](specs/CONSTITUTION.md) for principles (no regressions, keep semver
+  in sync, analyze before fixing).
 
 ### Formatting
 

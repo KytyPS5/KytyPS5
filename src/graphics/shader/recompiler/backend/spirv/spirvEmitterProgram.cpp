@@ -473,6 +473,9 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (EmitSingleLaneGraphics(state)) {
+		return EmitSingleLaneBallot(state, Def(predicate));
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();

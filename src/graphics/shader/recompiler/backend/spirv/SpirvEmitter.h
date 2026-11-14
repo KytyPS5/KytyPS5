@@ -22,6 +22,11 @@ struct Profile {
 	bool r8g8_srgb_views = false;
 	// Native float ops: NaN, signed-zero and denormal results may differ from the guest.
 	bool relaxed_float = false;
+	// The device supports 64-bit atomics; without them atomic 64-bit loads become plain loads.
+	bool int64_atomics = true;
+	// The device carries subgroup builtins in vertex and pixel functions. Metal rejects them, so
+	// those stages fall back to the single-lane model below.
+	bool graphics_subgroups = true;
 };
 
 inline constexpr Profile DefaultProfile {};

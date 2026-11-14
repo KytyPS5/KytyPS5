@@ -103,6 +103,11 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 }
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	// Single-lane graphics stages have exactly one lane, so the id is always zero. Metal would
+	// otherwise reject the vertex or pixel function for using a subgroup builtin.
+	if (EmitSingleLaneGraphics(state)) {
+		return ConstantU32(state, 0);
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -185,10 +190,26 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 	return bits;
 }
 
+uint32_t EmitSingleLaneBallot(EmitterState& state, uint32_t predicate) {
+	const auto bit = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), bit, predicate,
+	                          ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), ballot, bit,
+	                          ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0));
+	return ballot;
+}
+
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	const uint32_t active_ballot =
+	    EmitSingleLaneGraphics(state) ? EmitSingleLaneBallot(state, ConstantBool(state, true))
+	                                  : [&] {
+		    const auto ballot = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+		                              ConstantU32(state, spv::ScopeSubgroup),
+		                              ConstantBool(state, true));
+		    return ballot;
+	    }();
 	return EmitBallotLaneActiveBool(state, active_ballot, lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {

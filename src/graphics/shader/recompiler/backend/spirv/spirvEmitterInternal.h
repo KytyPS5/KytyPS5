@@ -390,6 +390,17 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane);
 
+// Metal rejects every subgroup builtin and intrinsic in vertex and pixel functions, so those
+// stages are emitted with a single-lane model: the wave holds one invocation, so its lane id is 0
+// and a ballot degenerates to bit 0 of the low word. Cross-lane reads then return the caller's own
+// value instead of failing pipeline creation.
+inline bool EmitSingleLaneGraphics(const EmitterState& state) {
+	return !state.profile.graphics_subgroups &&
+	       (state.program.stage == ShaderType::Vertex || state.program.stage == ShaderType::Pixel);
+}
+
+uint32_t EmitSingleLaneBallot(EmitterState& state, uint32_t predicate);
+
 inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);

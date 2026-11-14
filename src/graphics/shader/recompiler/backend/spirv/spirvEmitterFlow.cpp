@@ -118,6 +118,9 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 // Whether EXEC enables a source lane within the caller's 32-lane half.
 uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
 	auto&      state  = ctx.state;
+	if (EmitSingleLaneGraphics(state)) {
+		return EmitBallotLaneActiveBool(state, EmitSingleLaneBallot(state, exec), lane);
+	}
 	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
 	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
 	if (ctx.half != 0) {
@@ -832,6 +835,9 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitLiveMask(EmitterState& state) {
+	if (EmitSingleLaneGraphics(state)) {
+		return EmitSingleLaneBallot(state, ConstantBool(state, true));
+	}
 	const auto helper =
 	    EmitNative<spv::OpLoad, IR::Type::U1>(state, state.helper_invocation_variable);
 	return EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(

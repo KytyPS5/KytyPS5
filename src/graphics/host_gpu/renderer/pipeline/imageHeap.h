@@ -67,8 +67,10 @@ private:
 		TextureBinding  binding;
 		uint32_t        kind   = 0;
 		uint32_t        refs   = 0; // Slots of the owning view that select it.
-		bool            stale  = false;
-		uint64_t        serial = 0; // Image::serial of binding.image_id.
+		bool            stale     = false;
+		uint64_t        serial    = 0; // Image::serial of binding.image_id.
+		uint64_t        last_draw = 0; // Last draw whose commit selected it.
+		uint64_t        last_tick = 0; // Scheduler tick of that draw's command buffer.
 	};
 
 	struct Memory;

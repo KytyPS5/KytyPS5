@@ -590,15 +590,37 @@ void ImageHeap::RedirectDepth(ImageId image_id, ImageId copy_id,
 		return;
 	}
 	// The bindless set is shared by every recorded draw. Rewriting an element while an earlier
-	// draw still references the set could make that draw sample the copy. Submit the preceding
-	// recording and wait for it before changing descriptors; the current draw continues in a
-	// fresh command buffer and binds the redirected set.
+	// draw still references the set could make that draw sample the copy. Only elements used by
+	// an earlier recording need synchronization; new elements and completed work do not.
 	auto& scheduler = m_context.GetCommandScheduler();
 	if (scheduler.Active()) {
-		if (scheduler.HasCommand()) {
-			scheduler.Flush();
+		const auto current_tick = scheduler.CurrentTick();
+		// Refresh first so already-completed draws do not force a wait.
+		scheduler.GetMasterSemaphore().Refresh();
+		uint64_t wait_tick = 0;
+		bool     flush     = false;
+		for (const auto index: redirects) {
+			const auto& element = m_elements[index];
+			if (element.last_draw == 0) {
+				continue;
+			}
+			if (element.last_tick < current_tick &&
+			    scheduler.IsFree(element.last_tick)) {
+				continue;
+			}
+			wait_tick = std::max(wait_tick, element.last_tick);
+			flush |= element.last_tick >= current_tick;
 		}
-		scheduler.Wait(scheduler.CurrentTick() - 1u);
+		if (flush) {
+			if (scheduler.HasCommand()) {
+				scheduler.Flush();
+			} else {
+				wait_tick = 0;
+			}
+		}
+		if (wait_tick != 0) {
+			scheduler.Wait(wait_tick);
+		}
 	}
 	for (const auto index: redirects) {
 		auto&      element = m_elements[index];
@@ -634,7 +656,8 @@ void ImageHeap::RedirectDepth(ImageId image_id, ImageId copy_id,
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();
-	const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
+	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
+	const auto use_tick = m_context.GetCommandScheduler().CurrentTick();
 	for (auto* view: m_active) {
 		if (view->dirty_begin != view->dirty_end) {
 			const auto slots = std::span(view->slots).subspan(view->dirty_begin,
@@ -644,6 +667,10 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			view->buffer->CopyFrom(buffer, stream, offset, view->dirty_begin * sizeof(uint32_t),
 			                       slots.size_bytes());
 			view->dirty_begin = view->dirty_end = 0;
+		}
+		for (const auto& [value, index]: view->elements) {
+			m_elements[index].last_draw = m_draw;
+			m_elements[index].last_tick = use_tick;
 		}
 		Retire(*view);
 		if (view->layout_epoch != epoch) {

@@ -5994,7 +5994,15 @@ public:
       for (uint32_t texture = 2; texture < 4u; ++texture) {
         write(5, descriptor(texture, Format::k8_8_8_8UNorm));
         Require(name, "changed table", acquire(sampled), "a changed table was declined");
+        const auto changed = filtered.slots[40];
+        Require(name, "unused changed element",
+                ImageHeapTestAccess::Element(heap, changed).last_draw == 0u,
+                "a newly interned element claimed an earlier draw");
         draw();
+        const auto &committed = ImageHeapTestAccess::Element(heap, changed);
+        Require(name, "committed changed element",
+                committed.last_draw != 0u && committed.last_tick != 0u,
+                "a committed element did not record its draw and tick");
       }
       Require(name, "idle view",
               idle.slots[40] == idle_slot && ImageHeapTestAccess::ElementCount(heap) <= 6u,

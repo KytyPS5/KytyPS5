@@ -51419,9 +51419,11 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
         {.type = Prospero::ShaderBinaryType::kCs,
          .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
-  // The first two share code and differ only in the buffer stride specialization.
-  struct Case { u32 code, stride; };
-  constexpr std::array<Case, 3> cases{{{0, 4}, {0, 8}, {1, 4}}};
+  // The first two share code and differ only in a plain buffer stride, which a compute program
+  // that no manifest lists reads at run time: they share a module. The third differs from them in
+  // its specialization (ADD_TID).
+  struct Case { u32 code, stride; bool add_tid = false; };
+  constexpr std::array<Case, 4> cases{{{0, 4}, {0, 8}, {0, 8, true}, {1, 4}}};
   const auto compile = [&](PipelineCache &cache, const Case &test) {
     HW::ComputeShaderInfo regs{};
     regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[test.code].data());
@@ -51431,19 +51433,20 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     regs.cs_regs.wave_size = 32;
     regs.cs_regs.user_sgpr = 4;
     const ShaderBufferResource buffer{{0x10000u, test.stride << 16u, 64,
-        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) |
+            (test.add_tid ? 1u << 23u : 0u)}};
     std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
     ShaderComputeInputInfo input{};
     return cache.GetComputeProgram(regs, input)->id;
   };
-  std::array<uint64_t, 3> forward{}, reverse{};
+  std::array<uint64_t, 4> forward{}, reverse{};
   {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);
     for (size_t i = 0; i < cases.size(); i++) forward[i] = compile(cache, cases[i]);
-    // One compute module per case and nothing else.
+    // One compute module per case but the second, and nothing else.
     auto expected = PipelineCacheTestAccess::Compiled(cache);
     expected.fill(0);
-    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size());
+    expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size() - 1);
     Require(name, "compiled modules", PipelineCacheTestAccess::Compiled(cache) == expected,
             "the per-stage compile counts missed or added a module");
   }
@@ -51453,8 +51456,10 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   }
   Require(name, "order independence", forward == reverse,
           "a program's module id depended on the order it was compiled in");
+  Require(name, "run-time stride", forward[0] == forward[1],
+          "two plain strides of one compute program did not share a module");
   const std::set<uint64_t> ids(forward.begin(), forward.end());
-  Require(name, "distinct modules", ids.size() == forward.size(),
+  Require(name, "distinct modules", ids.size() == forward.size() - 1,
           "different code or specialization shared a module id");
   std::printf("[gpu]     %-32s ok\n", name);
 }

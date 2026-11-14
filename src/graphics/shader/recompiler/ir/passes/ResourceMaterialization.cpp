@@ -2122,6 +2122,30 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
+                          const ResourceSpecialization::Buffer& buffer) {
+	// The buffers the program names itself (the candidates of an indirect descriptor share their
+	// accesses, which compare their strides) and reads by element, with a plain stride. A stride
+	// of 0 is one (a shader is given records in one dispatch and a single element in another),
+	// but not with the bounds mode that zero_stride_oob stands for.
+	if (index >= program.info.buffers.size() || index >= program.buffer_vector_access.size() ||
+	    !program.buffer_vector_access[index] || buffer.zero_stride_oob ||
+	    (buffer.packed_stride & (1u << 14u)) != 0u) {
+		return false;
+	}
+	const auto source = program.info.buffers[index].source;
+	return source < program.descriptor_sources.size() &&
+	       !program.descriptor_sources[source].indirect_descriptor.has_value();
+}
+
+void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization) {
+	for (uint32_t i = 0; i < specialization.buffers.size(); i++) {
+		if (ReadsStrideAtRunTime(program, i, specialization.buffers[i])) {
+			specialization.buffers[i].packed_stride |= RuntimeBufferStride;
+		}
+	}
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	t_record_blocks.clear();
@@ -2263,6 +2287,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 		if (i < program.buffer_feeds_descriptors.size() && !program.buffer_feeds_descriptors[i]) {
 			buffer.scalar_empty = false;
+		}
+		if (runtime.runtime_stride && ReadsStrideAtRunTime(program, i, buffer)) {
+			buffer.packed_stride |= RuntimeBufferStride;
 		}
 	}
 	snapshot.images.resize(program.info.images.size());

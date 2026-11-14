@@ -1640,6 +1640,32 @@ uint32_t PipelineCache::UseRank(uint64_t program_hash) const {
 	return m_use_order->mapped.contains(program_hash) ? MappedRank : PipelineHelpers::NoRank;
 }
 
+void PipelineCache::DecideRuntimeStrides(std::span<PipelineManifest*> manifests) {
+	// The compute programs listed, and those with a record whose module reads them at run time:
+	// it was recorded by a session that had no record of the program, and is built as it was.
+	std::unordered_set<uint64_t> listed;
+	std::unordered_set<uint64_t> runtime;
+	for (const auto* manifest: manifests) {
+		for (const auto& module: manifest->modules) {
+			if (module.stage != ShaderType::Compute) {
+				continue;
+			}
+			const auto hash = module.ProgramHash();
+			listed.insert(hash);
+			if (std::ranges::any_of(module.specialization.buffers, [](const auto& buffer) {
+				    return ShaderRecompiler::IR::HasRuntimeStride(buffer.packed_stride);
+			    })) {
+				runtime.insert(hash);
+			}
+		}
+	}
+	for (const auto hash: listed) {
+		if (!runtime.contains(hash)) {
+			m_baked_stride_programs.insert(hash);
+		}
+	}
+}
+
 void PipelineCache::SetHostInput(ManifestModule& module) const {
 	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	if (auto* compute = std::get_if<ShaderComputeInputInfo>(&module.input)) {
@@ -1721,12 +1747,36 @@ void PipelineCache::OpenManifest() {
 	m_manifest.reset(new ManifestState());
 	auto& state = *m_manifest;
 	auto& all   = state.recorded;
+	// Every file is read first: which compute programs read their strides at run time is decided
+	// from all their records.
+	struct ReadManifest {
+		PipelineManifest                      manifest;
+		uint32_t                              skipped = 0;
+		std::vector<std::string>              unlinked;
+		bool                                  read    = false;
+		std::chrono::steady_clock::duration   time {};
+	};
+	std::vector<ReadManifest> read_files(files.size());
+	{
+		std::vector<PipelineManifest*> manifests;
+		for (size_t i = 0; i < files.size(); i++) {
+			auto&      file  = read_files[i];
+			const auto start = std::chrono::steady_clock::now();
+			file.read = LoadManifest(ReadFile(files[i]), file.manifest, &file.skipped, &file.unlinked);
+			file.time = std::chrono::steady_clock::now() - start;
+			if (file.read) {
+				manifests.push_back(&file.manifest);
+			}
+		}
+		DecideRuntimeStrides(manifests);
+	}
 	for (const auto& path: files) {
-		PipelineManifest loaded;
-		uint32_t         skipped = 0;
-		const auto       start   = std::chrono::steady_clock::now();
-		std::vector<std::string> unlinked;
-		if (!LoadManifest(ReadFile(path), loaded, &skipped, &unlinked)) {
+		auto&      file     = read_files[static_cast<size_t>(&path - files.data())];
+		auto&      loaded   = file.manifest;
+		const auto skipped  = file.skipped;
+		const auto start    = std::chrono::steady_clock::now() - file.time;
+		const auto& unlinked = file.unlinked;
+		if (!file.read) {
 			ManifestLog("Pipeline manifest: ignoring {} (another format)",
 			            Common::PathToString(path));
 			continue;
@@ -2518,9 +2568,11 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			BuildManifestModule(index, code, back_code, true);
 		}
 	};
-	const ShaderModule* compiled = nullptr;
+	// The record's, or the one a program that reads its strides at run time has for it.
+	auto                specialization = record.specialization;
+	const ShaderModule* compiled       = nullptr;
 	LockPrograms();
-	compiled = FindCompiledModule(key, record.specialization, record.push_data_cursor);
+	compiled = FindCompiledModule(key, specialization, record.push_data_cursor);
 	UnlockPrograms();
 	if (compiled != nullptr) {
 		finish(compiled, false);
@@ -2541,7 +2593,19 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		return;
 	}
 	auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-	auto module = BuildModule(key, options, std::move(translated), record.specialization, {},
+	// A program that reads its strides at run time may have records with strides, of sessions
+	// that had them compiled in: they all are its one module's.
+	if (record.stage == ShaderType::Compute && RuntimeStride(key.hash)) {
+		ShaderRecompiler::IR::ReadStridesAtRunTime(plan, specialization);
+		LockPrograms();
+		compiled = FindCompiledModule(key, specialization, record.push_data_cursor);
+		UnlockPrograms();
+		if (compiled != nullptr) {
+			finish(compiled, false);
+			return;
+		}
+	}
+	auto module = BuildModule(key, options, std::move(translated), specialization, {},
 	                          record.push_data_cursor, spirv, plain_spirv);
 	bool added  = false;
 	{
@@ -2552,7 +2616,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 			    m_program_cache.try_emplace(key, Program {.resource_plan = std::move(plan)}).first;
 		}
 		auto& program = entry->second;
-		compiled      = FindCompiledModule(key, record.specialization, record.push_data_cursor);
+		compiled      = FindCompiledModule(key, specialization, record.push_data_cursor);
 		if (compiled != nullptr || program.skip_dispatch || program.call_source != nullptr) {
 			DestroyModule(module);
 		} else {

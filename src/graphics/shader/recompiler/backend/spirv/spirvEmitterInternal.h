@@ -115,6 +115,9 @@ struct EmitterState {
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
+	// By buffer binding: the stride read from the shader data, for the buffers whose stride is
+	// read at run time (0 for the others).
+	std::vector<uint32_t>                           memory_strides;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;

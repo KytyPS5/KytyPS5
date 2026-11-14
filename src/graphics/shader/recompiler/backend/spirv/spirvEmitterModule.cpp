@@ -306,6 +306,11 @@ void DefineDescriptors(EmitterState& state) {
 		counts[static_cast<size_t>(Kind::MipStats)] = 1;
 		bindings.mip_stats_count = static_cast<uint32_t>(info.images.size());
 	}
+	if (std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
+		    return buffer.descriptor_index != UINT32_MAX && IR::HasRuntimeStride(buffer.packed_stride);
+	    })) {
+		bindings.stride_count = counts[static_cast<size_t>(Kind::Buffers)];
+	}
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =

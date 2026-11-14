@@ -176,6 +176,7 @@ struct ProgramResolution {
 struct GraphicContext;
 struct ShaderParams;
 struct ManifestModule;
+struct PipelineManifest;
 class CommandBuffer;
 
 namespace HW {
@@ -681,6 +682,21 @@ private:
 	// False when a stage id of the key is not in `modules`.
 	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                            const ModuleMap& modules);
+
+	// Compute programs that no manifest lists read the strides of their buffers at run time
+	// (IR::HasRuntimeStride()), so that one module, and one pipeline, serves the buffers of every
+	// stride a shader is given: each stride otherwise costs a pipeline the driver compiles on the
+	// path of a dispatch. Their modules are recorded as such, and the sessions that list those
+	// records build them as they are. The programs listed with their strides keep them compiled
+	// in, with the modules they were recorded with. By program hash, fixed once the manifest is
+	// open.
+	std::unordered_set<uint64_t> m_baked_stride_programs;
+	[[nodiscard]] bool RuntimeStride(uint64_t program_hash) const {
+		return !m_baked_stride_programs.contains(program_hash);
+	}
+	// Decides it from the records of the title's manifests. (The records of the programs that
+	// read them at run time are given the strides of their modules when they are built.)
+	void DecideRuntimeStrides(std::span<PipelineManifest*> manifests);
 
 	// pipelineManifest.cpp: the title's pipeline manifest, loaded at construction. Its modules
 	// and pipelines are created on background threads once the guest maps their shaders, and with

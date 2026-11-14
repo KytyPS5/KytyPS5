@@ -1121,6 +1121,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		options.input_info.compute = &input_info;
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
+		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
@@ -1870,6 +1871,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		// As GetProgram(): descriptor tables indexed by the workgroup id probe one entry per group.
 		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
+		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
 	t_ahead_unread_load = false;
 	if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, resources,
@@ -2043,6 +2045,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				runtime.workgroup_counts      = input_info.workgroup_counts;
 				runtime.indirect_args_address = input_info.indirect_args_address;
+				runtime.runtime_stride        = RuntimeStride(job.params.hash);
 			}
 			if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
 			                                                *specialization)) {

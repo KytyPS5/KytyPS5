@@ -2207,6 +2207,20 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.uniform_buffers[resource.uniform_index] = view;
 		}
 	}
+	// The strides the module reads at run time: those of the V#s bound now.
+	if (layout.stride_count != 0u) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto index = program.info.buffers[i].descriptor_index;
+			if (index >= layout.stride_count || i >= snapshot.buffers.size() ||
+			    !ShaderRecompiler::IR::HasRuntimeStride(program.info.buffers[i].packed_stride)) {
+				continue;
+			}
+			ShaderBufferResource descriptor;
+			std::copy_n(snapshot.buffers[i].dwords.begin(), std::size(descriptor.fields), descriptor.fields);
+			prepared.shader_data[layout.StrideDword() + index] =
+			    descriptor.PackedStride() & ShaderRecompiler::IR::BufferStrideMask;
+		}
+	}
 	// GET_LOD_STATS: the counting field of each image whose T# the draw supplies.
 	for (uint32_t i = 0; i < layout.mip_stats_count; i++) {
 		const auto& resource = program.info.images[i];

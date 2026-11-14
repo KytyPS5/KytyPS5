@@ -93,8 +93,18 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	// A stride read at run time: the bound buffer's, from the shader data.
+	uint32_t stride_value = 0;
+	if (IR::HasRuntimeStride(packed)) {
+		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
+		stride_value       = binding < state.memory_strides.size() ? state.memory_strides[binding] : 0u;
+		if (stride_value == 0u) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+			                             "the buffer's run-time stride was not prepared");
+		}
+	}
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              stride_value != 0u ? stride_value : ConstantU32(state, stride),
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;

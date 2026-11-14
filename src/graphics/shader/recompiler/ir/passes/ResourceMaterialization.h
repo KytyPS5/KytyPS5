@@ -74,6 +74,14 @@ void SetComputeIndirectFloors(size_t keys, size_t images);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// Whether a module of `program` whose strides are read at run time (SrtRuntime::runtime_stride)
+// reads that of buffer `index`, whose specialization without it is `buffer`.
+bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
+                          const ResourceSpecialization::Buffer& buffer);
+// A specialization with the strides compiled in, as MaterializeResources() gives it for a program
+// that reads them at run time.
+void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);
+
 // Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
 bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
 

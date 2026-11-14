@@ -108,6 +108,9 @@ struct SrtRuntime {
 	// The runtime words of an expanded program (ShaderSource::call_words): they follow the
 	// walked SRT words in the flattened SRT, where ReadCallWord reads them.
 	std::span<const uint32_t> call_words;
+	// The program's modules read the strides of their buffers at run time (HasRuntimeStride()):
+	// the specialization holds RuntimeBufferStride for the buffers that can.
+	bool runtime_stride = false;
 };
 
 class SrtReadCapture {

@@ -179,6 +179,14 @@ void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
+	state.memory_strides.assign(count, 0u);
+	for (const auto& buffer: state.program.info.buffers) {
+		if (buffer.descriptor_index < count && IR::HasRuntimeStride(buffer.packed_stride) &&
+		    state.memory_strides[buffer.descriptor_index] == 0u) {
+			state.memory_strides[buffer.descriptor_index] = EmitShaderDataDwordLoad(
+			    state, state.program.bindings.StrideDword() + buffer.descriptor_index);
+		}
+	}
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
 		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;

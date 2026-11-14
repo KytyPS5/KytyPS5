@@ -129,6 +129,18 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// A buffer's packed stride (ShaderBufferResource::PackedStride()) holds its stride in the low 14
+// bits. This stride says that the module does not have it compiled in: it reads the stride of the
+// bound buffer from its shader data (Bindings::StrideDword()), so that one module serves the
+// buffers of every stride. A shader that reads records of several sizes (Demon's Souls' particle
+// programs: their record sizes are the strides of their V#s) otherwise needs a module, and a
+// pipeline, per combination.
+inline constexpr uint32_t BufferStrideMask    = 0x3fffu;
+inline constexpr uint32_t RuntimeBufferStride = BufferStrideMask;
+[[nodiscard]] constexpr bool HasRuntimeStride(uint32_t packed_stride) {
+	return (packed_stride & BufferStrideMask) == RuntimeBufferStride;
+}
+
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
@@ -582,6 +594,9 @@ struct Bindings {
 	// GET_LOD_STATS field of each image (one dword each, LodStatsReport::ImageField) after the
 	// bound ranges; non-zero only for pixel shaders instrumented for mip statistics.
 	uint32_t mip_stats_count = 0;
+	// The stride of each bound buffer (one dword each, after the mip statistics fields); non-zero
+	// only for programs with a buffer whose stride is read at run time (HasRuntimeStride()).
+	uint32_t stride_count = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
@@ -593,7 +608,8 @@ struct Bindings {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const { return MipStatsDword() + mip_stats_count; }
+	[[nodiscard]] uint32_t StrideDword() const { return MipStatsDword() + mip_stats_count; }
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return StrideDword() + stride_count; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}

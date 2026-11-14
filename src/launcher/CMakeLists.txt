@@ -190,6 +190,7 @@ elseif(LINUX)
 			file(GET_RUNTIME_DEPENDENCIES
 				EXECUTABLES \"${CMAKE_CURRENT_BINARY_DIR}/${launcher_name}\"
 				LIBRARIES \${kyty_plugin_files}
+				DIRECTORIES \"${kyty_qt_libdir}\"
 				RESOLVED_DEPENDENCIES_VAR kyty_resolved
 				POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
 				POST_EXCLUDE_REGEXES \".*\")

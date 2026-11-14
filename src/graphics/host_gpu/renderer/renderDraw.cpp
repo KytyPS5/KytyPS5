@@ -498,15 +498,19 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const bool feedback_loops = m_context.GetGraphics().attachment_feedback_loop_enabled;
 		state.num_layers = std::min(state.num_layers, depth.desc.view_info.layer_count);
 		vk::ImageAspectFlags sampled_aspects;
-		std::vector<ImageViewInfo> heap_views;
+		std::vector<ImageHeap::DepthView> heap_views;
 		m_context.GetImageHeap().DepthViews(depth.image_id, heap_views);
 		if (feedback_loops) {
 			// Heap-sampled depth is not present in PreparedBindings. On a host with feedback
 			// loops it still needs the feedback layout and per-draw state.
-			for (const auto& info: heap_views) {
-				if (const auto feedback =
-				        DepthFeedbackAspects(draw_writes, depth.desc.view_info, info)) {
-					sampled_aspects |= info.aspect;
+			for (const auto& view: heap_views) {
+				auto feedback = DepthFeedbackAspects(draw_writes, depth.desc.view_info, view.base);
+				for (const auto& mip: view.mips) {
+					feedback |= DepthFeedbackAspects(draw_writes, depth.desc.view_info, mip);
+				}
+				if (feedback) {
+					sampled_aspects |= view.base.aspect;
+					for (const auto& mip: view.mips) sampled_aspects |= mip.aspect;
 					feedback_aspects |= feedback;
 				}
 			}
@@ -566,11 +570,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				}
 			}
 			// Heap-sampled depth is not present in PreparedBindings; include those views in the
-			// copy, then redirect the heap entries to it below.
-			for (const auto& info: heap_views) {
-				if (DepthFeedbackAspects(draw_writes, depth.desc.view_info, info)) {
-					include(info);
+			// copy, then redirect the heap entries to it below. If any mip of one entry overlaps,
+			// copy the entry's whole base/mip range so the redirected binding is safe to sample.
+			for (const auto& view: heap_views) {
+				bool overlaps = static_cast<bool>(
+				    DepthFeedbackAspects(draw_writes, depth.desc.view_info, view.base));
+				for (const auto& mip: view.mips) {
+					overlaps |= static_cast<bool>(
+					DepthFeedbackAspects(draw_writes, depth.desc.view_info, mip));
 				}
+				if (!overlaps) continue;
+				include(view.base);
+				for (const auto& mip: view.mips) include(mip);
 			}
 			if (copy_range_set) {
 				const vk::ClearDepthStencilValue clear {depth.depth_clear_value,

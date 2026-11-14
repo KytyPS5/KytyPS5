@@ -547,19 +547,22 @@ void ImageHeap::WriteDescriptors() {
 	m_writes.clear();
 }
 
-void ImageHeap::DepthViews(ImageId image_id, std::vector<ImageViewInfo>& views) const {
+void ImageHeap::DepthViews(ImageId image_id, std::vector<DepthView>& views) const {
 	for (const auto* view: m_active) {
 		for (const auto& [value, index]: view->elements) {
 			const auto& binding = m_elements[index].binding;
 			if (binding.image_id != image_id) continue;
-			views.push_back(binding.desc.view_info);
+			DepthView depth_view;
+			depth_view.base = binding.desc.view_info;
+			depth_view.mips.reserve(binding.mip_views.size());
 			for (uint32_t mip = 0; mip < binding.mip_views.size(); ++mip) {
 				auto info          = binding.desc.view_info;
 				info.base_level   += mip;
 				info.level_count   = 1;
 				info.min_lod       = 0;
-				views.push_back(info);
+				depth_view.mips.push_back(info);
 			}
+			views.push_back(std::move(depth_view));
 		}
 	}
 }
@@ -573,14 +576,23 @@ void ImageHeap::RedirectDepth(ImageId image_id, ImageId copy_id,
 	for (const auto* view: m_active) {
 		for (const auto& [value, index]: view->elements) {
 			const auto& binding = m_elements[index].binding;
-			const auto& info    = binding.desc.view_info;
-			if (binding.image_id != image_id || !(aspects & info.aspect) ||
-			    info.base_level >= range.base_level + range.level_count ||
-			    range.base_level >= info.base_level + info.level_count ||
-			    info.base_layer >= range.base_layer + range.layer_count ||
-			    range.base_layer >= info.base_layer + info.layer_count) {
-				continue;
+			if (binding.image_id != image_id) continue;
+			const auto overlaps = [&](const ImageViewInfo& info) {
+				return (aspects & info.aspect) &&
+				       info.base_level < range.base_level + range.level_count &&
+				       range.base_level < info.base_level + info.level_count &&
+				       info.base_layer < range.base_layer + range.layer_count &&
+				       range.base_layer < info.base_layer + info.layer_count;
+			};
+			bool match = overlaps(binding.desc.view_info);
+			for (uint32_t mip = 0; !match && mip < binding.mip_views.size(); ++mip) {
+				auto info          = binding.desc.view_info;
+				info.base_level   += mip;
+				info.level_count   = 1;
+				info.min_lod       = 0;
+				match              = overlaps(info);
 			}
+			if (!match) continue;
 			if (std::ranges::find(redirects, index) == redirects.end()) {
 				redirects.push_back(index);
 			}
@@ -595,8 +607,6 @@ void ImageHeap::RedirectDepth(ImageId image_id, ImageId copy_id,
 	auto& scheduler = m_context.GetCommandScheduler();
 	if (scheduler.Active()) {
 		const auto current_tick = scheduler.CurrentTick();
-		// Refresh first so already-completed draws do not force a wait.
-		scheduler.GetMasterSemaphore().Refresh();
 		uint64_t wait_tick = 0;
 		bool     flush     = false;
 		for (const auto index: redirects) {

@@ -6640,18 +6640,14 @@ public:
     draw(target0);
 
     const ImageSubresourceRange range{0, 1, 0, 1};
-    const vk::ImageSubresourceRange clear_range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+    // The copy applies the draw's pending load clear itself; the redirect test then reads the
+    // clear value instead of the copied original depth.
     const ImageId copy_id = textures.CopyDepthForFeedback(
-        depth.image_id, range, vk::ImageAspectFlagBits::eDepth, {},
-        vk::ClearDepthStencilValue{}, depth.desc.view_info, {extent, 1}, 1);
+        depth.image_id, range, vk::ImageAspectFlagBits::eDepth,
+        vk::ImageAspectFlagBits::eDepth, vk::ClearDepthStencilValue{copy_depth, 0},
+        depth.desc.view_info, {extent, 1}, 1);
     Require(name, "feedback copy", static_cast<bool>(copy_id),
             "the depth feedback copy was not created");
-    vk::ClearValue clear{};
-    clear.depthStencil = {copy_depth, 0};
-    TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), copy_id, clear_range, clear);
-    auto &copy = textures.GetImage(copy_id);
-    copy.Transit(copy.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range,
-                 scheduler.Current().Handle());
 
     heap.BeginDraw();
     Require(name, "second acquire",

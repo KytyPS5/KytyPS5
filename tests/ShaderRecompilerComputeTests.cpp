@@ -198,7 +198,8 @@ struct BufferCacheTestAccess {
 
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
                                          uint64_t address, uint64_t size) {
-    return cache.SynchronizeBufferFromImage(buffer, address, size);
+    const auto image = cache.m_texture_cache.FindImageFromRange(address, size);
+    return image && cache.SynchronizeBufferFromImage(buffer, image);
   }
 
   static std::mutex &BdaSyncMutex(BufferCache &cache) { return cache.m_bda_sync_mutex; }
@@ -20186,6 +20187,241 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
+  }
+
+  void CheckSmallFormattedImageSync() {
+    constexpr const char *name = "SmallFormattedImageSync";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t size = 0x80000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t large = 2 * page;
+    constexpr uint64_t read_image = base;
+    constexpr uint64_t written_tail_image = base + 0x8000;
+    constexpr uint64_t copy_image = base + 0x10000;
+    constexpr uint64_t large_image = base + 0x20000;
+    constexpr uint64_t copy_target = base + 0x30000;
+    constexpr uint64_t part_read_image = base + 0x40000;
+    constexpr uint64_t part_copy_image = base + 0x50000;
+    constexpr uint64_t part_copy_target = base + 0x60000;
+    constexpr uint64_t stencil_plane = base + 0x70000;
+    constexpr uint64_t stencil_size = 0x1000;
+    constexpr uint64_t depth_image = base + 0x78000;
+    constexpr u32 stale = 0xdeadbeefu;
+    static_assert(page == 0x4000);
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &physical) == 0,
+            "guest allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "guest mapping failed");
+    std::vector<u32> native(large / sizeof(u32));
+    std::iota(native.begin(), native.end(), 0x71000000u);
+    const std::vector<u32> native_page(native.begin(),
+                                       native.begin() + page / sizeof(u32));
+    std::memset(mapped, 0, size);
+    std::memcpy(reinterpret_cast<void *>(read_image), native.data(), page);
+    std::memcpy(reinterpret_cast<void *>(copy_image), native.data(), page);
+    std::memcpy(reinterpret_cast<void *>(large_image), native.data(), large);
+    std::memcpy(reinterpret_cast<void *>(part_read_image), native.data(),
+                large);
+    std::memcpy(reinterpret_cast<void *>(part_copy_image), native.data(),
+                large);
+    std::memcpy(reinterpret_cast<void *>(written_tail_image), native.data(),
+                large);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+
+      const auto WriteGpuImage = [&](uint64_t address, uint64_t bytes) {
+        const auto words = static_cast<u32>(bytes / sizeof(u32));
+        auto desc = MakeLinearDesc(address, bytes, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {words, 1, 1},
+                                   1, sizeof(u32), 1);
+        const auto id = textures.FindImage(desc);
+        (void)textures.FindTexture(id, desc);
+        textures.MarkGpuWritten(id);
+        const std::vector<u32> poison(words, stale);
+        LibKernel::Memory::WriteBacking(address, poison.data(), bytes);
+        std::vector<u32> backing(words);
+        Require(name, "GPU-only image",
+                id && textures.GetImage(id).SafeToDownload() &&
+                    textures.FindImageFromRange(address, bytes) == id &&
+                    LibKernel::Memory::TryReadBacking(address, backing.data(),
+                                                      bytes) &&
+                    backing == poison,
+                "image was not the only GPU-current copy over stale guest "
+                "backing");
+        Require(name, "streamable range",
+                !cache.IsRegionRegistered(address, bytes) &&
+                    !cache.IsRegionGpuModified(address, bytes) &&
+                    cache.IsRegionCpuModified(address, bytes),
+                "range was cached, GPU-modified or CPU-clean before the read");
+      };
+      const auto ReadRange =
+          [&](const std::pair<Libs::Graphics::Buffer *, uint64_t> &binding,
+              uint64_t bytes) {
+            auto readback = CreateHostBuffer(
+                name, bytes, vk::BufferUsageFlagBits::eTransferDst, {});
+            auto &command = scheduler.Current();
+            command.EndRendering();
+            vk::MemoryBarrier before{};
+            before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+            before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+            command.Handle().pipelineBarrier(
+                vk::PipelineStageFlagBits::eAllCommands,
+                vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0,
+                nullptr, 0, nullptr);
+            const vk::BufferCopy copy{binding.second, 0, bytes};
+            command.Handle().copyBuffer(binding.first->Handle(),
+                                        readback.buffer, 1, &copy);
+            vk::MemoryBarrier after{};
+            after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+            after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+            command.Handle().pipelineBarrier(
+                vk::PipelineStageFlagBits::eTransfer,
+                vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0, nullptr, 0,
+                nullptr);
+            scheduler.Finish();
+            auto words = ReadBuffer(name, readback, bytes / sizeof(u32));
+            DestroyBuffer(&readback);
+            return words;
+          };
+      const auto Mismatch = [](const std::vector<u32> &actual,
+                               const std::vector<u32> &expected) {
+        for (size_t i = 0; i < expected.size(); ++i) {
+          if (i >= actual.size() || actual[i] != expected[i]) {
+            return "word " + std::to_string(i) + " expected " +
+                   Hex(expected[i]) + ", got " +
+                   (i < actual.size() ? Hex(actual[i]) : "nothing");
+          }
+        }
+        return std::string("ok");
+      };
+
+      WriteGpuImage(read_image, page);
+      WriteGpuImage(copy_image, page);
+      WriteGpuImage(large_image, large);
+      WriteGpuImage(part_read_image, large);
+      WriteGpuImage(part_copy_image, large);
+      WriteGpuImage(written_tail_image, large);
+
+      const auto large_read = Mismatch(
+          ReadRange(cache.ObtainBuffer(large_image, large, false, true), large),
+          native);
+      const std::vector<u32> native_tail(native.begin() + page / sizeof(u32),
+                                         native.end());
+      const auto large_tail = Mismatch(
+          ReadRange(cache.ObtainBuffer(large_image + page, page, false, false),
+                    page),
+          native_tail);
+      const auto small_read = Mismatch(
+          ReadRange(cache.ObtainBuffer(read_image, page, false, true), page),
+          native_page);
+      cache.CopyBuffer(copy_target, copy_image, page, false, false);
+      cache.ReadMemory(copy_target, page);
+      std::vector<u32> copied(page / sizeof(u32));
+      Require(name, "copy readback",
+              LibKernel::Memory::TryReadBacking(copy_target, copied.data(),
+                                                page),
+              "copy target was unreadable");
+      const auto small_copy = Mismatch(copied, native_page);
+      const auto part_read = Mismatch(
+          ReadRange(cache.ObtainBuffer(part_read_image, page, false, true),
+                    page),
+          native_page);
+      const auto part_tail = Mismatch(
+          ReadRange(
+              cache.ObtainBuffer(part_read_image + page, page, false, false),
+              page),
+          native_tail);
+      cache.CopyBuffer(part_copy_target, part_copy_image, page, false, false);
+      cache.ReadMemory(part_copy_target, page);
+      Require(name, "partial copy readback",
+              LibKernel::Memory::TryReadBacking(part_copy_target, copied.data(),
+                                                page),
+              "partial copy target was unreadable");
+      const auto part_copy = Mismatch(copied, native_page);
+      (void)cache.ObtainBuffer(written_tail_image + page, page, true, false);
+      textures.InvalidateMemoryFromGPU(written_tail_image + page, page);
+      (void)cache.ObtainBuffer(written_tail_image, page, false, true);
+      const auto written_tail = Mismatch(
+          ReadRange(
+              cache.ObtainBuffer(written_tail_image + page, page, false, false),
+              page),
+          std::vector<u32>(page / sizeof(u32), stale));
+
+      auto depth_desc = MakeLinearDesc(
+          depth_image, page, vk::Format::eD32SfloatS8Uint,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {64, 64, 1}, 1, sizeof(u32), 1);
+      depth_desc.type = BindingType::DepthTarget;
+      depth_desc.info.stencil = {stencil_plane, stencil_size};
+      depth_desc.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      depth_desc.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = textures.FindImage(depth_desc);
+      (void)textures.FindDepthTarget(depth_id, depth_desc);
+      textures.MarkGpuWritten(depth_id);
+      const auto stencil_record =
+          textures.FindImageFromRange(stencil_plane, stencil_size, false);
+      Require(
+          name, "stencil plane before its depth image",
+          depth_id && textures.GetImage(depth_id).SafeToDownload() &&
+              stencil_record &&
+              textures.GetImage(stencil_record).depth_id == depth_id &&
+              textures.FindImageFromRange(stencil_plane, stencil_size) ==
+                  depth_id,
+          "the stencil read did not resolve to its GPU-written depth image");
+      const auto stencil_read =
+          cache.ObtainBuffer(stencil_plane, stencil_size, false, true);
+      Require(name, "stencil read stays at the stencil plane",
+              stencil_read.first != nullptr &&
+                  stencil_read.first->IsInBounds(stencil_plane, stencil_size) &&
+                  !stencil_read.first->IsInBounds(depth_image, 1),
+              "a small stencil read grew its buffer to the depth image");
+
+      Require(name, "large formatted read", large_read == "ok", large_read);
+      Require(name, "small formatted read and copy",
+              small_read == "ok" && small_copy == "ok",
+              "read " + small_read + "; copy " + small_copy);
+      Require(name, "partial formatted read and copy",
+              part_read == "ok" && part_copy == "ok",
+              "read " + part_read + "; copy " + part_copy);
+      Require(name, "read behind a whole formatted read", large_tail == "ok",
+              large_tail);
+      Require(name, "read behind a partial formatted read", part_tail == "ok",
+              part_tail);
+      Require(name, "buffer write behind a partial formatted read",
+              written_tail == "ok", written_tail);
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "guest mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckRasterization(
@@ -57012,6 +57248,12 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--small-formatted-image-sync-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSmallFormattedImageSync();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
     return 0;
@@ -57361,6 +57603,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckSmallFormattedImageSync();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();

@@ -1741,14 +1741,9 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
-	if (!selected) {
-		return false;
-	}
-
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId id) {
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
+	auto&            image = m_texture_cache.m_slot_images[id];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!image.SafeToDownload()) {
 		return false;

@@ -2553,7 +2553,8 @@ public:
     ShaderModule vertex_module;
     auto &vertex_program = vertex_module.info;
     vertex_program.stage = ShaderType::Vertex;
-    vertex_program.bindings.push_data_start_dword = 2;
+    vertex_program.bindings.push_data_start_dword =
+        ShaderRecompiler::IR::PushData::DwordCount - 2;
     vertex_program.info.user_data_registers = {0, 1};
     vertex_program.bindings.memory_offset_dword = 2;
     ShaderModule pixel_module;
@@ -16212,7 +16213,9 @@ public:
             program.info.buffers.push_back(resource);
             program.bindings.descriptor_counts[0] = 1;
             program.bindings.descriptor_mask = 1;
-            program.bindings.push_data_start_dword = 0;
+            program.bindings.push_data_start_dword =
+                ShaderRecompiler::IR::PushData::StartFor(
+                    stage, 0, program.bindings.ShaderDataDwords());
             return module;
           };
 
@@ -49517,6 +49520,95 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckVertexPushTopCache(VulkanHarness &vulkan) {
+  constexpr const char *name = "VertexPushTopCache";
+  std::vector<u32> vertex;
+  AppendVMovU32(&vertex, 0, 0);
+  AppendVMovLiteral(&vertex, 1, 0x3f800000u);
+  vertex.push_back(EncodeVop1(0x01, 2, 8));
+  vertex.push_back(EncodeVop2(0x25, 1, Vgpr(1), 2));
+  vertex.push_back(EncodeExp0(0x0c, 0xf));
+  vertex.push_back(EncodeExp1(0, 1, 0, 1));
+  AppendEnd(&vertex);
+  std::vector<u32> pixel_a;
+  for (u32 i = 0; i < 2; i++) pixel_a.push_back(EncodeVop1(0x01, i, i));
+  pixel_a.push_back(EncodeVop2(0x25, 0, Vgpr(0), 1));
+  pixel_a.push_back(EncodeExp0(0x00, 0xf));
+  pixel_a.push_back(EncodeExp1(0, 0, 0, 0));
+  AppendEnd(&pixel_a);
+  std::vector<u32> pixel_b;
+  for (u32 i = 0; i < 7; i++) pixel_b.push_back(EncodeVop1(0x01, i, i));
+  for (u32 i = 1; i < 7; i++) pixel_b.push_back(EncodeVop2(0x25, 0, Vgpr(0), i));
+  pixel_b.push_back(EncodeExp0(0x00, 0xf));
+  pixel_b.push_back(EncodeExp1(0, 0, 0, 0));
+  AppendEnd(&pixel_b);
+  static ShaderUserData vertex_user_data{};
+  const auto map = [](const std::vector<u32> &code, Prospero::ShaderBinaryType type,
+                      ShaderUserData *user_data = nullptr) {
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = type, .user_data = user_data,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+  };
+  map(vertex, Prospero::ShaderBinaryType::kGs, &vertex_user_data);
+  map(pixel_a, Prospero::ShaderBinaryType::kPs);
+  map(pixel_b, Prospero::ShaderBinaryType::kPs);
+  auto context_owner = std::make_unique<RenderContext>(vulkan.RuntimeContext());
+  auto &context = *context_owner;
+  context.InitializeGpu(nullptr);
+  auto &cache = context.GetPipelineCache();
+  context.GetGpu().SendCommandSync([&] {
+    CommandProcessor processor(context, 0);
+    processor.BufferInit();
+    auto &registers = processor.GetCtx();
+    auto &shaders = processor.GetShCtx();
+    registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
+    registers.SetTargetOutputMode(0, 4);
+    registers.SetViewportTransformControl(0x300);
+    processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    shaders.SetEsShaderBase(reinterpret_cast<uint64_t>(vertex.data()));
+    shaders.SetGsShaderResource2({.user_sgpr = 4});
+    for (u32 i = 0; i < 4; i++) shaders.SetGsUserSgpr(i, 0x11111111u + i);
+    const auto lookup = [&] {
+      DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+      cache.GetGraphicsPrograms(context.GetCommandScheduler().Current(), state);
+      return state;
+    };
+    const auto pushes = [](const auto *module, uint32_t dwords) {
+      const auto &bindings = module->info.bindings;
+      return bindings.ShaderDataDwords() == dwords && bindings.UsesPushData();
+    };
+    shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(pixel_a.data()));
+    shaders.SetPsShaderResource2({.user_sgpr = 2});
+    for (u32 i = 0; i < 2; i++) shaders.SetPsUserSgpr(i, 0x22222222u + i);
+    const auto first = lookup();
+    const auto first_vertex = first.vertex_info[0].stage.module->id;
+    const bool first_pixel = pushes(first.ps_input_info.stage.module, 2);
+    shaders.SetPsShaderBase(reinterpret_cast<uint64_t>(pixel_b.data()));
+    shaders.SetPsShaderResource2({.user_sgpr = 7});
+    for (u32 i = 0; i < 7; i++) shaders.SetPsUserSgpr(i, 0x33333333u + i);
+    const auto second = lookup();
+    const auto &vertex_info = second.vertex_info[0].stage.module->info;
+    Require(name, "pixel shader-data sizes",
+            first_pixel && pushes(second.ps_input_info.stage.module, 7) &&
+                PipelineCacheTestAccess::Compiled(cache)[static_cast<size_t>(ShaderType::Pixel)] == 2,
+            "the two pixel shaders did not push 2 and 7 shader-data dwords");
+    Require(name, "one vertex module",
+            first_vertex == second.vertex_info[0].stage.module->id &&
+                PipelineCacheTestAccess::Compiled(cache)[static_cast<size_t>(ShaderType::Vertex)] == 1,
+            "the vertex module depended on the pixel shader-data size");
+    Require(name, "vertex push start",
+            vertex_info.bindings.UsesPushData() &&
+                vertex_info.bindings.push_data_start_dword ==
+                    ShaderRecompiler::IR::PushData::DwordCount -
+                        vertex_info.bindings.ShaderDataDwords(),
+            "the vertex push data did not start at the top of the push block");
+  });
+  context.ShutdownGpu();
+  context_owner.reset();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // The HS wave runs the fused LS and HS and the GS wave runs the TES, so VGT_SHADER_STAGES_EN
 // gives each stage its wave size; a GS that amplifies tessellated primitives stays rejected.
 // The TES gates its vertices on GS_TG_INFO's group vertex count (PPSA02110's prologue) and
@@ -56056,6 +56148,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-cache-only") == 0) {
     VulkanHarness vulkan;
     CheckShaderStore(vulkan);
+    CheckVertexPushTopCache(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
@@ -57349,6 +57442,7 @@ int main(int argc, char **argv) {
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
   CheckShaderStore(vulkan);
+  CheckVertexPushTopCache(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
   vulkan.CheckNullStorageBufferDescriptor();

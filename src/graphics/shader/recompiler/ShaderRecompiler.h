@@ -77,10 +77,11 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);
-[[nodiscard]] CompileResult CompileProgram(TranslateResult translated,
-                                           const CompileOptions& options,
-                                           const IR::ResourceSpecialization& specialization,
-	                                       uint32_t push_data_start_dword = 0);
+[[nodiscard]] CompileResult   CompileProgram(TranslateResult                   translated,
+                                             const CompileOptions&             options,
+                                             const IR::ResourceSpecialization& specialization,
+                                             uint32_t push_data_start_dword = 0,
+                                             uint32_t push_data_ceiling = IR::PushData::DwordCount);
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

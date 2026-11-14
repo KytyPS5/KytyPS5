@@ -493,6 +493,7 @@ public:
 		m_info.dma_base_registers.clear();
 		m_info.dma_windows.clear();
 		m_info.dma_tables.clear();
+		m_info.dma_record_tables.clear();
 		m_info.self_sized_buffers.clear();
 		m_info.dma_record_reach.clear();
 		m_info.ray_query_reach.clear();
@@ -529,6 +530,7 @@ public:
 		if (!m_info.dma_bounded && m_info.ray_query_reach.empty()) {
 			m_info.dma_windows.clear();
 			m_info.dma_tables.clear();
+			m_info.dma_record_tables.clear();
 		}
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
@@ -4940,7 +4942,114 @@ private:
 			}
 			return;
 		}
+		if (NoteDmaRecordTable(handle)) {
+			return;
+		}
 		NoteUnbounded(covered);
+	}
+
+	// A V# of an indirect buffer access whose first three DWORDs are scalar reads of one record of
+	// a buffer of the program, at index * stride + immediate (+4, +8): the buffer is a table of
+	// records that hold a V# each, and the shader reads the buffer of any of them, within its
+	// bounds. The BLAS builds of sce::Psr read the vertices of a geometry so (GTA V's cs
+	// 2adee3faed27c152: the V# of the vertex buffer at +8 of the 120 bytes of each geometry).
+	bool NoteDmaRecordTable(const Inst& handle) {
+		ShaderInfo::DmaRecordTable records;
+		if (handle.NumArgs() != 4u || !MatchDmaRecordTable({handle.Arg(0), handle.Arg(1), handle.Arg(2)}, records, 0)) {
+			return false;
+		}
+		if (std::ranges::none_of(m_info.dma_record_tables, [&](const auto& known) { return known == records; })) {
+			m_info.dma_record_tables.push_back(records);
+		}
+		return true;
+	}
+
+	// The record table of a V# whose first three DWORDs are `dwords` (see NoteDmaRecordTable()). The
+	// offset of the record is index * stride or index << log2(stride); the DWORDs may be Phis of one
+	// block whose operands from each predecessor read one record (GTA V's cs b93ab2ec5c5caf00 picks
+	// one of two entries of its buffer table, at (word >> 8) << 4, on two paths).
+	bool MatchDmaRecordTable(const std::array<Value, 3>& dwords, ShaderInfo::DmaRecordTable& table,
+	                         uint32_t depth) const {
+		// Nested selections of records.
+		constexpr uint32_t MaxDepth = 4;
+		std::array<const Inst*, 3> phis {};
+		for (uint32_t dword = 0; dword < 3u; dword++) {
+			phis[dword] = dwords[dword].Resolve().TryInstruction();
+		}
+		if (phis[0] != nullptr && phis[0]->GetOpcode() == ValueOpcode::Phi) {
+			if (depth >= MaxDepth || phis[0]->NumArgs() == 0) {
+				return false;
+			}
+			for (uint32_t dword = 1; dword < 3u; dword++) {
+				if (phis[dword] == nullptr || phis[dword]->GetOpcode() != ValueOpcode::Phi ||
+				    phis[dword]->Parent() != phis[0]->Parent() || phis[dword]->NumArgs() != phis[0]->NumArgs()) {
+					return false;
+				}
+			}
+			bool found = false;
+			for (size_t arm = 0; arm < phis[0]->NumArgs(); arm++) {
+				std::array<Value, 3> operands {phis[0]->Arg(arm), {}, {}};
+				for (uint32_t dword = 1; dword < 3u; dword++) {
+					size_t same = 0;
+					while (same < phis[dword]->NumArgs() && phis[dword]->PhiBlock(same) != phis[0]->PhiBlock(arm)) {
+						same++;
+					}
+					if (same == phis[dword]->NumArgs()) {
+						return false;
+					}
+					operands[dword] = phis[dword]->Arg(same);
+				}
+				ShaderInfo::DmaRecordTable arm_table;
+				if (!MatchDmaRecordTable(operands, arm_table, depth + 1u) || (found && !(arm_table == table))) {
+					return false;
+				}
+				table = arm_table;
+				found = true;
+			}
+			return found;
+		}
+		const Inst* first_read   = nullptr;
+		uint32_t    first_offset = 0;
+		for (uint32_t dword = 0; dword < 3u; dword++) {
+			const auto* read = phis[dword];
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer || read->NumArgs() != 2u ||
+			    read->Flags<MemoryFlags>().index >= m_program.memory_info.size()) {
+				return false;
+			}
+			const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+			if (memory.data_bits != 32u || memory.data_dwords != 1u) {
+				return false;
+			}
+			if (dword == 0u) {
+				first_read   = read;
+				first_offset = memory.offset;
+			} else if (!EquivalentValue(m_program, read->Arg(0), first_read->Arg(0)) ||
+			           !EquivalentValue(m_program, read->Arg(1), first_read->Arg(1)) ||
+			           memory.offset != first_offset + dword * 4u) {
+				return false;
+			}
+		}
+		// The table is a buffer the program reads (its scalar reads were collected before), and the
+		// offset of the record a multiple of its size.
+		const auto* records = first_read->Arg(0).Resolve().TryInstruction();
+		const auto  patch   = std::ranges::find_if(m_handle_patches,
+		                                           [&](const HandlePatch& known) { return known.handle == records; });
+		const auto* scaled = first_read->Arg(1).Resolve().TryInstruction();
+		uint32_t    stride = 0;
+		uint32_t    shift  = 0;
+		if (scaled != nullptr && scaled->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+		    ImmediateU32(scaled->Arg(1), shift) && shift >= 2u && shift < 16u) {
+			stride = 1u << shift;
+		} else if (scaled == nullptr || scaled->GetOpcode() != ValueOpcode::IMul32 ||
+		           !(ImmediateU32(scaled->Arg(1), stride) || ImmediateU32(scaled->Arg(0), stride))) {
+			return false;
+		}
+		if (records == nullptr || patch == m_handle_patches.end() || (stride & 3u) != 0 || (first_offset & 3u) != 0 ||
+		    uint64_t {first_offset} + 12u > stride) {
+			return false;
+		}
+		table = {patch->resource, stride, first_offset};
+		return true;
 	}
 
 	// A DMA access whose footprint the windows and tables do not bound. `covered`: the record

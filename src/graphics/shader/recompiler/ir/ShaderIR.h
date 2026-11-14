@@ -665,8 +665,19 @@ struct ShaderInfo {
 
 		bool operator==(const DmaDescriptorTable& other) const = default;
 	};
+	// V#s read from the records of a buffer of the program (index into `buffers`): the three
+	// DWORDs at `offset` of every record of `stride` bytes; the shader reads buffer memory through
+	// them, within their bounds.
+	struct DmaRecordTable {
+		uint32_t buffer = 0;
+		uint32_t stride = 0;
+		uint32_t offset = 0;
+
+		bool operator==(const DmaRecordTable& other) const = default;
+	};
 	std::vector<DmaWindow>           dma_windows;
 	std::vector<DmaDescriptorTable>  dma_tables;
+	std::vector<DmaRecordTable>      dma_record_tables;
 	// A buffer whose V# takes its record count from a header at a fixed offset of the buffer's own
 	// base, which the GPU may write just before (GTA V's Psr BVH passes): the host would have to
 	// wait for the GPU to bind its range. Its accesses go through device addresses instead, with

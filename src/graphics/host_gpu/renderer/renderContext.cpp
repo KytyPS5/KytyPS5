@@ -622,6 +622,42 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 				}
 			}
 		}
+		for (const auto& table: program.info.dma_record_tables) {
+			const auto& buffers = stage->resources->buffers;
+			if (table.buffer >= buffers.size()) {
+				return false;
+			}
+			const auto records = DecodeNativeDescriptor<ShaderBufferResource>(buffers[table.buffer]);
+			const auto first   = records.Base48();
+			const auto bytes   = records.GetSize();
+			if (first == 0 || bytes == 0) {
+				continue;
+			}
+			// A table of V#s (GTA V's buffer table: 131 072 entries, the same for every frame) is
+			// decoded again only when its bytes change.
+			if (table.stride == sizeof(records.fields) && table.offset == 0) {
+				if (!AddBufferTable(records)) {
+					return false;
+				}
+				continue;
+			}
+			// The V# of each record, from guest memory that the GPU did not write.
+			if (bytes > MaxBufferBytes || !m_mapped_ranges.Contains(first, bytes) ||
+			    m_buffer_cache.IsRegionGpuModified(first, bytes)) {
+				return false;
+			}
+			for (uint64_t offset = table.offset; offset + 12u <= bytes; offset += table.stride) {
+				ShaderBufferResource descriptor {};
+				std::memcpy(descriptor.fields, reinterpret_cast<const void*>(first + offset), 12);
+				if (descriptor.Base48() == 0 || descriptor.NumRecords() == 0) {
+					continue;
+				}
+				if (descriptor.GetSize() > MaxBufferBytes) {
+					return false;
+				}
+				add(descriptor.Base48(), descriptor.GetSize());
+			}
+		}
 	}
 	lock.unlock();
 	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);

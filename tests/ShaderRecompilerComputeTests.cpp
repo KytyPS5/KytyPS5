@@ -503,8 +503,10 @@ struct RenderExecutorTestAccess {
     if (pixel_active) {
       executor.PrepareBindings(pixel, result.pixel);
     }
-    executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u}, {});
+    const auto active = std::span{stages.data(), pixel_active ? 2u : 1u};
+    executor.PrepareGraphicsBindings(active, {});
+    for (auto *stage : active)
+      executor.RebindBuffers(*stage);
     return result;
   }
 
@@ -512,6 +514,8 @@ struct RenderExecutorTestAccess {
                                       std::span<PreparedBindings *const> stages,
                                       std::span<RenderColorInfo> colors) {
     executor.PrepareGraphicsBindings(stages, colors);
+    for (auto *stage : stages)
+      executor.RebindBuffers(*stage);
   }
 
   static PipelineCache::Pipeline
@@ -20188,6 +20192,227 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  void CheckDrawStorageBufferJoin(bool index_join = false) {
+    const char *name =
+        index_join ? "DrawIndexStorageJoin" : "DrawIndirectStorageJoin";
+    constexpr uintptr_t base = 0x0000000204400000ull;
+    constexpr uint64_t size = 0x40000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t output = base + 0x100;
+    constexpr uint64_t record = base + page - sizeof(u32);
+    constexpr uint64_t color_address = base + 0x10000;
+    constexpr u32 extent = 8;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    constexpr u32 marker = 0x13579bdfu;
+    static_assert(page == 0x4000);
+
+    static const auto vertex_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 9, marker);
+      code.push_back(EncodeVop2(0x1a, 10, InlineU32(2), 5));
+      code.push_back(EncodeMubuf0(0x1c));
+      code.push_back(EncodeMubuf1(9, 2, 10));
+      AppendVMovLiteral(&code, 1, 0xbf800000u);
+      AppendVMovLiteral(&code, 2, 0x40400000u);
+      code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+      code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+      code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+      code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, 0x3f800000u);
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(3, 4, 0, 6));
+      AppendEnd(&code);
+      return code;
+    }();
+    static const auto pixel_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 0, 0x3f800000u);
+      code.push_back(EncodeExp0(0, 0xf));
+      code.push_back(EncodeExp1(0, 0, 0, 0));
+      AppendEnd(&code);
+      return code;
+    }();
+    static ShaderUserData native_user_data{};
+    const auto vs_address = reinterpret_cast<uint64_t>(vertex_code.data());
+    const auto ps_address = reinterpret_cast<uint64_t>(pixel_code.data());
+    ShaderMapUserData(
+        vs_address,
+        {.type = Prospero::ShaderBinaryType::kGs,
+         .user_data = &native_user_data,
+         .code_size_bytes = static_cast<u32>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(
+        ps_address,
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<u32>(pixel_code.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &physical) == 0,
+            "guest allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "guest mapping failed");
+    std::memset(mapped, 0xa5, size);
+    std::memset(reinterpret_cast<void *>(record), 0,
+                sizeof(vk::DrawIndirectCommand));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &registers = processor.GetCtx();
+      auto &shaders = processor.GetShCtx();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &executor = context.GetRenderExecutor();
+
+      registers.Reset();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2,
+                                       extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xf);
+      registers.SetShaderMask(0xf);
+      registers.SetTargetOutputMode(0, 4);
+      registers.SetColorBase(0, {.addr = color_address});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(
+          0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      processor.GetUcfg().SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vs_address);
+      shaders.SetGsShaderResource2({.user_sgpr = 4});
+      shaders.SetPsShaderBase(ps_address);
+
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 3 * sizeof(u32);
+      out.fields[3] =
+          DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) |
+          (3u << 28u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetGsUserSgpr(i, out.fields[i]);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), color, 0);
+      Require(name, "color target", bool(color.image_id),
+              "control attachment was not resolved");
+      TextureCacheTestAccess::ClearImage(
+          context.GetTextureCache(), scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+
+      const auto first_id = cache.FindBuffer(base, page);
+      const auto second_id = cache.FindBuffer(base + page, page);
+      Require(name, "separate allocations",
+              first_id && second_id && first_id != second_id &&
+                  cache.GetBuffer(first_id).CpuAddress() == base &&
+                  cache.GetBuffer(first_id).Size() == page &&
+                  cache.GetBuffer(second_id).CpuAddress() == base + page &&
+                  cache.GetBuffer(second_id).Size() == page &&
+                  cache.GetBuffer(first_id).Handle() !=
+                      cache.GetBuffer(second_id).Handle(),
+              "fixture did not create two separate 16-KiB cache buffers");
+
+      const auto [first, first_offset] = cache.ObtainBuffer(base, page, true);
+      first->Fill(first_offset, page, sentinel);
+      const auto [second, second_offset] =
+          cache.ObtainBuffer(base + page, page, true);
+      second->Fill(second_offset, page, sentinel);
+
+      first->Fill(first_offset + page - sizeof(u32), sizeof(u32),
+                  index_join ? 0u : 3u);
+      second->Fill(second_offset, index_join ? 8u : 12u, 0);
+      second->Fill(second_offset, sizeof(u32), 1);
+      if (index_join)
+        second->Fill(second_offset + sizeof(u32), sizeof(u32), 2);
+
+      const uint64_t record_size =
+          index_join ? 3 * sizeof(u32) : sizeof(vk::DrawIndirectCommand);
+      Require(name, "separate owners before draw",
+              BufferCacheTestAccess::PageOwner(cache, output) == first_id &&
+                  BufferCacheTestAccess::PageOwner(cache, record) == first_id &&
+                  BufferCacheTestAccess::PageOwner(cache, record + sizeof(u32)) ==
+                      second_id &&
+                  cache.IsRegionGpuModified(record, record_size),
+              "crossing record already shared one owner or could be streamed");
+      std::array<u32, 4> stale{};
+      Require(name, "GPU-only record",
+              LibKernel::Memory::TryReadBacking(record, stale.data(),
+                                                record_size) &&
+                  stale == std::array<u32, 4>{},
+              "record setup unexpectedly changed CPU backing");
+
+      const bool drawn =
+          index_join
+              ? RenderExecutorTestAccess::DrawIndex(
+                    executor, scheduler.Current(),
+                    {.index_count = 3,
+                     .index_addr = reinterpret_cast<const void *>(record),
+                     .instance_count = 1,
+                     .index_type_and_size = 1})
+              : RenderExecutorTestAccess::DrawAuto(
+                    executor, scheduler.Current(),
+                    {.indirect = {record, 1, sizeof(vk::DrawIndirectCommand), {}}});
+      Require(name, "draw accepted", drawn,
+              "draw fell back instead of executing the native path");
+
+      const auto merged = BufferCacheTestAccess::PageOwner(cache, output);
+      Require(name, "draw merged both owners",
+              merged && merged != first_id && merged != second_id &&
+                  merged == BufferCacheTestAccess::PageOwner(cache, record) &&
+                  merged == BufferCacheTestAccess::PageOwner(
+                                cache, record + record_size - 1),
+              "draw input acquisition did not merge the storage owner");
+
+      const auto pixels = ReadCachedTexel(name, context, color.image_id, {},
+                                          {extent, extent, 1});
+      Require(name, "draw coverage",
+              pixels.size() == extent * extent * 4 &&
+                  std::ranges::all_of(pixels,
+                                      [](u32 v) { return v == 0x3f800000u; }),
+              "GPU record did not produce the fullscreen control draw");
+
+      cache.ReadMemory(output, 3 * sizeof(u32));
+      std::array<u32, 3> actual{};
+      Require(name, "output readback",
+              LibKernel::Memory::TryReadBacking(output, actual.data(),
+                                                sizeof(actual)),
+              "storage output was unreadable");
+      for (u32 i = 0; i < actual.size(); ++i)
+        Require(name, "VS write visible", actual[i] == marker,
+                "word " + std::to_string(i) + " expected " + Hex(marker) +
+                    ", got " + Hex(actual[i]));
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+                LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "guest mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
@@ -23831,6 +24056,7 @@ private:
                                 available_features.multiDrawIndirect &&
                                 available_features.depthBounds &&
                                 available_features.fragmentStoresAndAtomics &&
+                                available_features.vertexPipelineStoresAndAtomics &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -23940,6 +24166,7 @@ private:
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
+    device_features.vertexPipelineStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -57010,6 +57237,16 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
+    return 0;
+  }
+  if (argc == 2 &&
+      (std::strcmp(argv[1], "--draw-storage-join-only") == 0 ||
+       std::strcmp(argv[1], "--draw-index-storage-join-only") == 0)) {
+    VulkanHarness vulkan;
+    if (!vulkan.RasterizationSupported())
+      return 77;
+    vulkan.CheckDrawStorageBufferJoin(
+        std::strcmp(argv[1], "--draw-index-storage-join-only") == 0);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {

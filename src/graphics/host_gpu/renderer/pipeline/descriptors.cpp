@@ -919,11 +919,6 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
-	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
-	// after image identities are final; attachment layout transitions follow buffer alias copies.
-	for (auto* stage: stages) {
-		RebindBuffers(*stage);
-	}
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

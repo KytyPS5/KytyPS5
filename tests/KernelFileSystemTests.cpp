@@ -6,11 +6,14 @@
 #include "common/file.h"
 #include "ArchiveTestFixture.h"
 #include "FileTimeTestUtil.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
+#include "common/virtualMemory.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -899,6 +902,104 @@ void TestSaveWritev() {
         "append writes retain the original contents and ordered segments");
   Check(FileSystem::KernelClose(append) == OK && FileSystem::KernelClose(fd) == OK,
         "close vectored write fixtures");
+}
+
+std::atomic<uint64_t> g_guard_base{0};
+std::atomic<uint64_t> g_guard_size{0};
+std::atomic<int> g_guard_faults{0};
+
+bool UnprotectGuard(const Common::HostException::ExceptionInfo &info) {
+  const auto base = g_guard_base.load();
+  const auto size = g_guard_size.load();
+  if (info.type != Common::HostException::ExceptionType::AccessViolation ||
+      info.access_violation_vaddr < base ||
+      info.access_violation_vaddr - base >= size) {
+    return false;
+  }
+  g_guard_faults.fetch_add(1);
+  return Common::VirtualMemory::Protect(base, size,
+                                        Common::VirtualMemory::Mode::ReadWrite);
+}
+
+void TestReadsIntoProtectedPages() {
+  constexpr uint64_t Half = 0x10000;
+  std::vector<uint8_t> payload(Half * 2);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>(i * 7 + i / 251);
+  }
+  const int fd =
+      FileSystem::KernelOpen("/savedata0/protected-read.dat", 0x602, 0777);
+  Check(fd >= 3 &&
+            FileSystem::KernelWrite(fd, payload.data(), payload.size()) ==
+                static_cast<int64_t>(payload.size()),
+        "create protected-read fixture");
+  constexpr uint64_t memory = 0x0000000200010000ull;
+  Check(Common::VirtualMemory::AllocFixed(
+            memory, Half * 4, Common::VirtualMemory::Mode::ReadWrite) &&
+            Common::HostException::InstallHandler(UnprotectGuard),
+        "allocate the read target and install the guard handler");
+  g_guard_base = memory + Half;
+  g_guard_size = Half;
+  static uint64_t recoverable_base = 0;
+  recoverable_base = memory;
+  SysFileSetRecoverableDestination([](const void *data, uint64_t size) {
+    const auto address = reinterpret_cast<uint64_t>(data);
+    return size <= 0x20000 && address >= recoverable_base &&
+           address - recoverable_base <= 0x20000 - size;
+  });
+  auto *target = reinterpret_cast<uint8_t *>(memory);
+  const auto guard = [&] {
+    std::memset(target, 0, Half * 2);
+    g_guard_faults = 0;
+    return Common::VirtualMemory::Protect(memory + Half, Half,
+                                          Common::VirtualMemory::Mode::Read);
+  };
+  const auto filled = [&] {
+    return g_guard_faults.load() > 0 &&
+           std::memcmp(target, payload.data(), payload.size()) == 0;
+  };
+  Check(guard() &&
+            FileSystem::KernelPread(fd, target, payload.size(), 0) ==
+                static_cast<int64_t>(payload.size()) &&
+            filled(),
+        "pread fills a buffer that crosses into a write-protected page");
+  Check(guard() && FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelRead(fd, target, payload.size()) ==
+                static_cast<int64_t>(payload.size()) &&
+            filled() &&
+            FileSystem::KernelLseek(fd, 0, 1) ==
+                static_cast<int64_t>(payload.size()),
+        "read fills a write-protected tail and advances by the full count");
+  FileSystem::KernelIovec iov[2] = {{target, Half / 2},
+                                    {target + Half / 2, Half * 2 - Half / 2}};
+  Check(guard() &&
+            FileSystem::KernelPreadv(fd, iov, 2, 0) ==
+                static_cast<int64_t>(payload.size()) &&
+            filled(),
+        "preadv fills vectors that cross into a write-protected page");
+  Check(guard() &&
+            FileSystem::KernelPread(fd, target + Half, Half + 0x1000, Half) ==
+                static_cast<int64_t>(Half) &&
+            g_guard_faults.load() > 0 &&
+            std::memcmp(target + Half, payload.data() + Half, Half) == 0,
+        "pread past EOF recovers the protected bytes the file still supplies");
+  auto *pages = target + Half * 2;
+  Check(Common::VirtualMemory::Protect(memory + Half * 3, Half,
+                                       Common::VirtualMemory::Mode::NoAccess),
+        "make an unresolvable read target");
+  const auto got = FileSystem::KernelPread(fd, pages, Half * 2, 0);
+  Check(got >= 0 && got <= static_cast<int64_t>(Half) &&
+            std::memcmp(pages, payload.data(), static_cast<size_t>(got)) == 0,
+        "pread into an unresolvable tail stays short without crashing");
+  Check(FileSystem::KernelPread(fd, pages + Half, Half, 0) == 0,
+        "pread into an unresolvable destination returns zero without crashing");
+  SysFileSetRecoverableDestination(nullptr);
+  g_guard_size = 0;
+  Check(Common::VirtualMemory::Free(memory, Half * 4),
+        "free protected-read target");
+  Check(FileSystem::KernelClose(fd) == OK &&
+            FileSystem::KernelUnlink("/savedata0/protected-read.dat") == OK,
+        "remove protected-read fixture");
 }
 
 void TestAioBatches() {
@@ -2866,6 +2967,7 @@ int main(int argc, char** argv) {
   TestSaveTruncate();
   TestSaveWritev();
   TestAioBatches();
+  TestReadsIntoProtectedPages();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   CheckSocketWakeup();

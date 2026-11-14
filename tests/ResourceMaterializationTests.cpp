@@ -1204,6 +1204,40 @@ void TestEmptyScalarBufferSpecialization() {
           "empty root folded a scalar read with nonempty candidates");
 }
 
+void TestPlanningReadsSkipBufferFolds(bool vector_table, uint32_t raw_index) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 12u;
+  auto &block = AddValueBlock(program);
+  std::array<Value, 12> user_data;
+  for (uint32_t reg = 0; reg < 12u; ++reg)
+    user_data[reg] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(reg))}));
+  DescriptorSource source;
+  source.dword_count = 4u;
+  for (uint32_t word = 0; word < 4u; ++word) source.dwords[word] = user_data[8u + word];
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0u, .read = true, .scalar = !vector_table});
+  const auto table = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {user_data[0], user_data[1], user_data[2], user_data[3]}));
+  program.memory_info.push_back({.kind = vector_table ? ResourceKind::Buffer : ResourceKind::ScalarBuffer,
+                                 .resource = raw_index, .data_dwords = vector_table ? 4u : 1u, .planning_only = true});
+  auto &read = vector_table
+      ? block.AppendNewInst(ValueOpcode::LoadBufferU32x4, {table, Value(0u), Value(0u), Value(0u), Value(true)})
+      : block.AppendNewInst(ValueOpcode::ReadConstBuffer, {table, Value(0u)});
+  read.SetFlags(MemoryFlags{.index = 0u});
+  auto &use = block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
+  ResourceSpecialization specialization;
+  specialization.buffers.resize(1u);
+  specialization.buffers[0].zero_stride_oob = vector_table;
+  specialization.buffers[0].scalar_empty = !vector_table;
+  ApplyResourceSpecialization(program, specialization);
+  Check(use.Arg(0).Resolve().TryInstruction() == &read,
+        vector_table ? "planning-only descriptor load was folded through an unrelated zero-stride buffer"
+                     : "planning-only table read was folded through an unrelated empty scalar table");
+}
+
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
@@ -1498,6 +1532,8 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
+  for (const bool vector_table : {false, true})
+    for (const uint32_t raw_index : {0u, 2u}) TestPlanningReadsSkipBufferFolds(vector_table, raw_index);
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);

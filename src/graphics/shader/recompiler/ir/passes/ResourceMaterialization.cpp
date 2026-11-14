@@ -1944,7 +1944,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer) continue;
 			const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-			if (memory.kind == ResourceKind::ScalarBuffer &&
+			if (memory.kind == ResourceKind::ScalarBuffer && !memory.planning_only &&
 			    specialization.buffers[memory.resource].scalar_empty &&
 			    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer)
 				inst.ReplaceUsesWith(Value(0u));
@@ -1960,7 +1960,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
 				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-				const bool native_oob = memory.kind == ResourceKind::Buffer &&
+				const bool  native_oob =
+				    memory.kind == ResourceKind::Buffer && !memory.planning_only &&
 				    specialization.buffers[memory.resource].zero_stride_oob &&
 				    buffers[memory.resource].indirect_root == BufferResource::NoIndirectBuffer;
 				const bool null_indirect = memory.kind == ResourceKind::IndirectBuffer &&

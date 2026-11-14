@@ -6206,9 +6206,14 @@ public:
       draw();
       Require(name, "dead after a skipped draw", filtered.slots[160] == 0u,
               "the rescan of a view left acquired resolved a dead descriptor");
-      // A new descriptor over unmapped memory is never resolved.
+      // A new descriptor over unmapped memory is never resolved, even one whose address breaks
+      // its tiling's alignment.
+      auto unmapped = descriptor(23, Format::k8_8_8_8UNorm);
+      unmapped[0] += 1u;
+      unmapped[2] = 255u | (255u << 14u);
+      unmapped[3] |= static_cast<uint32_t>(Prospero::TileMode::kStandard4KB) << 20u;
       context.UnmapMemory(texture(23), 0x1000u);
-      write(23, descriptor(23, Format::k8_8_8_8UNorm));
+      write(23, unmapped);
       Require(name, "unmapped texture", acquire(sampled), "the view was declined");
       draw();
       Require(name, "unmapped descriptor", !textures.IsRegionRegistered(texture(23), 0x1000u),

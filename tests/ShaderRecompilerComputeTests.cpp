@@ -270,6 +270,13 @@ struct ImageHeapTestAccess {
   static const auto &Element(const ImageHeap &heap, uint32_t entry) {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
+  static auto &Element(ImageHeap &heap, uint32_t entry) {
+    return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
+  }
+  static void MarkDescriptorChanged(ImageHeap &heap, uint32_t entry) {
+    heap.m_writes.push_back(entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u));
+  }
+  static void FlushWrites(ImageHeap &heap) { heap.WriteDescriptors(); }
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
     return Element(heap, entry).binding.image_id;
   }
@@ -2159,6 +2166,67 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   }
   b.AddFunction(spv::OpReturn);
   b.AddFunction(spv::OpFunctionEnd);
+  return b.Build();
+}
+
+// Fetches (0, 0) from the selected image in the resident image heap. The heap
+// redirect test relies on the descriptor set being the only depth input.
+std::vector<u32> MakeHeapDepthFetchFragmentSpirv(u32 index) {
+  using ShaderRecompiler::Spirv::Builder;
+
+  Builder b;
+  b.RequireCapability(spv::CapabilityShader);
+  b.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+
+  const auto void_type = b.Type(spv::OpTypeVoid);
+  const auto func_type = b.Type(spv::OpTypeFunction, void_type);
+  const auto uint_type = b.Type(spv::OpTypeInt, 32, 0);
+  const auto int_type = b.Type(spv::OpTypeInt, 32, 1);
+  const auto float_type = b.Type(spv::OpTypeFloat, 32);
+  const auto vec4_type = b.Type(spv::OpTypeVector, float_type, 4);
+  const auto coord_type = b.Type(spv::OpTypeVector, int_type, 2);
+  const auto image_type = b.Type(spv::OpTypeImage, float_type, spv::Dim2D, 0u, 0u,
+                                 0u, 1u, spv::ImageFormatUnknown);
+  const auto count = b.Constant(spv::OpConstant, uint_type, 65536u);
+  const auto array_type = b.Type(spv::OpTypeArray, image_type, count);
+  const auto image_array_ptr =
+      b.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, array_type);
+  const auto image_array = b.DefineGlobalVariable(image_array_ptr, spv::StorageClassUniformConstant);
+  b.AddAnnotation(spv::OpDecorate, image_array, spv::DecorationDescriptorSet, 1u);
+  b.AddAnnotation(spv::OpDecorate, image_array, spv::DecorationBinding, 0u);
+  const auto output_ptr =
+      b.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4_type);
+  const auto output = b.DefineGlobalVariable(output_ptr, spv::StorageClassOutput);
+  b.AddAnnotation(spv::OpDecorate, output, spv::DecorationLocation, 0u);
+
+  const auto zero_int = b.Constant(spv::OpConstant, int_type, 0u);
+  const auto zero_float = b.Constant(spv::OpConstant, float_type, 0u);
+  const auto one_float = b.Constant(spv::OpConstant, float_type, 0x3f800000u);
+  const auto coord = b.Constant(spv::OpConstantComposite, coord_type, zero_int, zero_int);
+
+  const auto main = b.AllocateId();
+  const auto label = b.AllocateId();
+  const auto images = b.AllocateId();
+  const auto image = b.AllocateId();
+  const auto fetched = b.AllocateId();
+  const auto red = b.AllocateId();
+  const auto color = b.AllocateId();
+
+  b.AddEntryPoint(spv::ExecutionModelFragment, main, "main", {output});
+  b.AddExecutionMode(main, spv::ExecutionModeOriginUpperLeft);
+  b.AddFunction(spv::OpFunction, void_type, main, spv::FunctionControlMaskNone, func_type);
+  b.AddFunction(spv::OpLabel, label);
+  b.AddFunction(spv::OpLoad, array_type, images, image_array);
+  b.AddFunction(spv::OpCompositeExtract, image_type, image, images, index);
+  b.AddFunction(spv::OpImageFetch, vec4_type, fetched, image, coord,
+                spv::ImageOperandsLodMask, zero_int);
+  b.AddFunction(spv::OpCompositeExtract, float_type, red, fetched, 0u);
+  b.AddFunction(spv::OpCompositeConstruct, vec4_type, color, red, zero_float, zero_float,
+                one_float);
+  b.AddFunction(spv::OpStore, output, color);
+  b.AddFunction(spv::OpReturn);
+  b.AddFunction(spv::OpFunctionEnd);
+
   return b.Build();
 }
 
@@ -6327,6 +6395,303 @@ public:
                 direct_offset, allocation_size) == 0,
             "image heap release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckHeapDepthRedirect() {
+    constexpr const char *name = "HeapDepthRedirect";
+    constexpr uintptr_t base = 0x0000000204400000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t table = base + 0x20000;
+    constexpr uint64_t table_size = 0x10000;
+    constexpr uint32_t extent = 1;
+    namespace IR = ShaderRecompiler::IR;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "heap depth allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "heap depth mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    constexpr float original_depth = 0.125f;
+    constexpr float copy_depth = 0.75f;
+    std::array<uint32_t, 8> words{};
+    words[0] = static_cast<uint32_t>(base >> 8u);
+    words[1] = (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+               (((extent - 1u) & 3u) << 30u);
+    words[2] = ((extent - 1u) >> 2u) | ((extent - 1u) << 14u);
+    words[3] = DstSel(4, 4, 4, 4) |
+               (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    std::memcpy(reinterpret_cast<void *>(table), words.data(), sizeof(words));
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    auto &heap = context.GetImageHeap();
+    auto &textures = context.GetTextureCache();
+    auto &device = context.GetGraphics().device;
+
+    RenderDepthInfo depth{};
+    depth.desc.type = BindingType::DepthTarget;
+    depth.desc.info.data = {base, 256 * extent};
+    depth.desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth.desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth.desc.info.extent = {extent, extent, 1};
+    depth.desc.info.pitch = 64;
+    depth.desc.info.bytes_per_block = 4;
+    depth.desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth.desc.info.UpdateSize();
+    depth.desc.view_info.format = depth.desc.info.pixel_format;
+    depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    depth.image_id = textures.FindImage(depth.desc);
+    Require(name, "depth image", static_cast<bool>(depth.image_id),
+            "the depth image was not created");
+
+    vk::DescriptorSetLayout empty = nullptr;
+    const vk::DescriptorSetLayoutCreateInfo empty_info{};
+    Require(name, "set 0 layout",
+            device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                vk::Result::eSuccess,
+            "could not create the set 0 layout");
+    vk::PipelineLayout layout = nullptr;
+    const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 2;
+    layout_info.pSetLayouts = set_layouts.data();
+    Require(name, "pipeline layout",
+            device.createPipelineLayout(&layout_info, nullptr, &layout) ==
+                vk::Result::eSuccess,
+            "could not create a pipeline layout with the heap set");
+
+    IR::ImageResource root{};
+    root.resource_class = IR::ImageResourceClass::Sampled;
+    root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    root.numeric_class = Prospero::TextureNumericClass::Float;
+    root.read = true;
+    root.heap = true;
+    root.unfiltered_access_only = false;
+    IR::ImageHeapView view{};
+    heap.BeginDraw();
+    Require(name, "first acquire",
+            heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view) &&
+                !view.kinds.empty() && ImageHeapTestAccess::Views(heap).size() == 1u,
+            "the depth heap table was not kept resident");
+    const auto entry = ImageHeapTestAccess::Views(heap)[0]->slots[0];
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
+    ValidateSpirv(name, vertex_spirv);
+    const auto fragment_spirv = TestSpv::MakeHeapDepthFetchFragmentSpirv(
+        entry & ((1u << IR::ImageHeapKindShift) - 1u));
+    ValidateSpirv(name, fragment_spirv);
+    vk::ShaderModule vertex_module = CreateShaderModule(name, vertex_spirv);
+    vk::ShaderModule fragment_module = CreateShaderModule(name, fragment_spirv);
+    const std::array<float, 18> vertices{-1, -1, 1, 1, 1, 1, 3, -1, 1, 1, 1, 1,
+                                        -1, 3, 1, 1, 1, 1};
+    std::vector<u32> vertex_words(vertices.size());
+    std::memcpy(vertex_words.data(), vertices.data(), sizeof(vertices));
+    auto vertex_buffer =
+        CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
+                         vertex_words);
+    Image target0 = CreateImage2D(name, extent, 1, vk::Format::eR32G32B32A32Sfloat,
+                                  vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                                  vk::ImageLayout::eGeneral);
+    Image target1 = CreateImage2D(name, extent, 1, vk::Format::eR32G32B32A32Sfloat,
+                                  vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                                  vk::ImageLayout::eGeneral);
+
+    vk::PipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[0].stage = vk::ShaderStageFlagBits::eVertex;
+    stages[0].module = vertex_module;
+    stages[0].pName = "main";
+    stages[1].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[1].stage = vk::ShaderStageFlagBits::eFragment;
+    stages[1].module = fragment_module;
+    stages[1].pName = "main";
+    vk::VertexInputBindingDescription vertex_binding{};
+    vertex_binding.binding = 0;
+    vertex_binding.stride = 6u * sizeof(float);
+    vertex_binding.inputRate = vk::VertexInputRate::eVertex;
+    vk::VertexInputAttributeDescription attributes[2] = {};
+    attributes[0].location = 0;
+    attributes[0].binding = 0;
+    attributes[0].format = vk::Format::eR32G32Sfloat;
+    attributes[0].offset = 0;
+    attributes[1].location = 1;
+    attributes[1].binding = 0;
+    attributes[1].format = vk::Format::eR32G32B32A32Sfloat;
+    attributes[1].offset = 2u * sizeof(float);
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 2;
+    vertex_input.pVertexAttributeDescriptions = attributes;
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+    input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    vk::Viewport viewport{};
+    viewport.width = static_cast<float>(extent);
+    viewport.height = 1.0f;
+    viewport.maxDepth = 1.0f;
+    vk::Rect2D scissor{};
+    scissor.extent.width = extent;
+    scissor.extent.height = 1;
+    vk::PipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+    raster.polygonMode = vk::PolygonMode::eFill;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    raster.frontFace = vk::FrontFace::eCounterClockwise;
+    raster.lineWidth = 1.0f;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
+    multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    vk::PipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = vk::ColorComponentFlagBits::eR |
+                           vk::ColorComponentFlagBits::eG |
+                           vk::ColorComponentFlagBits::eB |
+                           vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend;
+    vk::PipelineRenderingCreateInfo rendering_pipeline{};
+    rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+    rendering_pipeline.colorAttachmentCount = 1;
+    rendering_pipeline.pColorAttachmentFormats = &target0.format;
+    vk::GraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+    pipeline_info.pNext = &rendering_pipeline;
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &color_blend;
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "graphics pipeline",
+              device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines");
+
+    const auto point_elements_at_depth = [&] {
+      auto &element = ImageHeapTestAccess::Element(heap, entry);
+      element.binding.desc = depth.desc;
+      element.binding.image_id = depth.image_id;
+      element.binding.image_view = textures.FindDepthTarget(depth.image_id, depth.desc);
+      element.binding.layout = textures.GetImage(depth.image_id).ReadLayout();
+      element.binding.mip_views.clear();
+      element.serial = textures.GetImage(depth.image_id).serial;
+      ImageHeapTestAccess::MarkDescriptorChanged(heap, entry);
+    };
+    point_elements_at_depth();
+    Require(name, "first element depth",
+            ImageHeapTestAccess::ImageOf(heap, entry) == depth.image_id,
+            "the heap element did not select the depth image");
+    vk::ClearValue original_clear{};
+    original_clear.depthStencil = {original_depth, 0};
+    const vk::ImageSubresourceRange depth_range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+    TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), depth.image_id, depth_range,
+                                       original_clear);
+    auto &depth_image = textures.GetImage(depth.image_id);
+    depth_image.Transit(depth_image.ReadLayout(), vk::AccessFlagBits2::eShaderRead,
+                        ImageSubresourceRange{0, 1, 0, 1}, scheduler.Current().Handle());
+
+    const auto draw = [&](Image &target) {
+      auto &command = scheduler.Current();
+      ImageHeapTestAccess::FlushWrites(heap);
+      heap.Commit(command, vk::PipelineBindPoint::eGraphics, layout);
+      vk::RenderingAttachmentInfo color{};
+      color.imageView = target.view;
+      color.imageLayout = vk::ImageLayout::eGeneral;
+      color.loadOp = vk::AttachmentLoadOp::eClear;
+      color.storeOp = vk::AttachmentStoreOp::eStore;
+      color.clearValue.color.float32 = std::array<float, 4>{0, 0, 0, 0};
+      vk::RenderingInfo rendering{};
+      rendering.renderArea.extent = {extent, 1};
+      rendering.layerCount = 1;
+      rendering.colorAttachmentCount = 1;
+      rendering.pColorAttachments = &color;
+      command.Handle().beginRendering(rendering);
+      command.Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      vk::DeviceSize offset = 0;
+      command.Handle().bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+      command.Handle().draw(3, 1, 0, 0);
+      command.Handle().endRendering();
+    };
+    draw(target0);
+
+    const ImageSubresourceRange range{0, 1, 0, 1};
+    const vk::ImageSubresourceRange clear_range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+    const ImageId copy_id = textures.CopyDepthForFeedback(
+        depth.image_id, range, vk::ImageAspectFlagBits::eDepth, {},
+        vk::ClearDepthStencilValue{}, depth.desc.view_info, {extent, 1}, 1);
+    Require(name, "feedback copy", static_cast<bool>(copy_id),
+            "the depth feedback copy was not created");
+    vk::ClearValue clear{};
+    clear.depthStencil = {copy_depth, 0};
+    TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), copy_id, clear_range, clear);
+    auto &copy = textures.GetImage(copy_id);
+    copy.Transit(copy.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range,
+                 scheduler.Current().Handle());
+
+    heap.BeginDraw();
+    Require(name, "second acquire",
+            heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view),
+            "the depth heap table was not reacquired");
+    point_elements_at_depth();
+    heap.RedirectDepth(depth.image_id, copy_id, range, vk::ImageAspectFlagBits::eDepth);
+    Require(name, "redirected element",
+            ImageHeapTestAccess::ImageOf(heap, entry) == copy_id,
+            "the heap element was not redirected to the feedback copy");
+    draw(target1);
+    scheduler.Finish();
+
+    const auto first = ReadImage(name, &target0);
+    const auto second = ReadImage(name, &target1);
+    Require(name, "first draw original depth",
+            !first.empty() &&
+                std::abs(std::bit_cast<float>(first[0]) - original_depth) < 0.000001f,
+            "the first draw read the redirected feedback copy");
+    Require(name, "second draw feedback copy",
+            !second.empty() &&
+                std::abs(std::bit_cast<float>(second[0]) - copy_depth) < 0.000001f,
+            "the second draw did not read the redirected feedback copy");
+
+    device.destroyPipeline(pipeline, nullptr);
+    device.destroyPipelineLayout(layout, nullptr);
+    device.destroyDescriptorSetLayout(empty, nullptr);
+    DestroyImage(&target1);
+    DestroyImage(&target0);
+    DestroyBuffer(&vertex_buffer);
+    device.destroyShaderModule(fragment_module, nullptr);
+    device.destroyShaderModule(vertex_module, nullptr);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                   allocation_size) == 0,
+            "heap depth mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckComputeMetaClearClassification() {
@@ -57160,6 +57525,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-copy-only") == 0) {
     VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
     vulkan.CheckRasterizationWithoutFeedbackLoops();
+    vulkan.CheckHeapDepthRedirect();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--heap-depth-redirect-only") == 0) {
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
+    vulkan.CheckHeapDepthRedirect();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
@@ -57190,6 +57561,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckHeapDepthRedirect();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -57383,6 +57755,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckHeapDepthRedirect();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

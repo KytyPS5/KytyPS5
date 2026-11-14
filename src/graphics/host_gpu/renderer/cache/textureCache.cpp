@@ -1870,6 +1870,26 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	});
 }
 
+void TextureCache::PrepareBufferWrite(uint64_t address, uint64_t size) {
+	std::scoped_lock                lock {m_lock};
+	Common::SmallVector<ImageId, 8> ids;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { ids.push_back(id); });
+	for (const auto id: ids) {
+		auto&       image    = m_slot_images[id];
+		const auto& data     = image.info.data;
+		const bool  readable = !image.depth_id && CanDownload(image);
+		if (!readable && data.address != address) {
+			continue;
+		}
+		const bool covered = address <= data.address && data.End() <= address + size;
+		if (readable && !covered && image.SafeToDownload() && BcAlias::Publish(*this, image)) {
+			continue;
+		}
+		image.ClearGpuModified();
+		image.MarkBufferModified();
+	}
+}
+
 bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	Common::SmallVector<ImageId, 8> targets;

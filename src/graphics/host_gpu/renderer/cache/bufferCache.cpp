@@ -556,7 +556,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	m_texture_cache.PrepareBufferWrite(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 }
@@ -589,7 +589,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
-		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+		m_texture_cache.PrepareBufferWrite(dst_vaddr, size);
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};

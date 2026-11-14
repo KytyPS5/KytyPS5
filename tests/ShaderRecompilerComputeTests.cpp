@@ -15544,6 +15544,157 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckPartialCopyIntoGpuImage() {
+    constexpr const char *name = "PartialCopyIntoGpuImage";
+    constexpr uintptr_t base = 0x0000000204b00000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint32_t side = 64;
+    constexpr uint64_t row_words = side;
+    constexpr uint64_t image_size = row_words * side * sizeof(uint32_t);
+    constexpr uint64_t first_row = 16;
+    constexpr uint64_t part_words = 4 * row_words;
+    constexpr uint64_t part_offset = first_row * row_words * sizeof(uint32_t);
+    constexpr uint64_t part_size = part_words * sizeof(uint32_t);
+    constexpr uint64_t copy_address = base;
+    constexpr uint64_t fill_address = base + image_size;
+    constexpr uint64_t source_address = base + 2 * image_size;
+    constexpr uint64_t clean_address = base + 3 * image_size;
+    constexpr uint32_t guest_value = 0x5e5e5e5eu;
+    constexpr uint32_t gpu_value = 0x600d600du;
+    constexpr uint32_t fill_value = 0xf111f111u;
+    constexpr uint32_t first_source_word = 0x10000000u;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0 &&
+                Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3,
+                                                               0x10, direct_offset,
+                                                               allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "partial-copy mapping failed");
+    std::fill_n(reinterpret_cast<uint32_t *>(base), 2 * image_size / sizeof(uint32_t),
+                guest_value);
+    std::fill_n(reinterpret_cast<uint32_t *>(clean_address), image_size / sizeof(uint32_t),
+                guest_value);
+    auto *source_words = reinterpret_cast<uint32_t *>(source_address);
+    std::iota(source_words, source_words + part_words, first_source_word);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto &buffer_cache = context.GetBufferCache();
+      LibKernel::Memory::InstallGpuResources(&context);
+      const auto gpu_written_image = [&](uint64_t address) {
+        auto desc = MakeLinearDesc(address, image_size, vk::Format::eR32Uint,
+                                   Prospero::BufferFormat::k32UInt,
+                                   Prospero::ImageType::kColor2D, {side, side, 1}, 1,
+                                   sizeof(uint32_t), 1);
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(id, desc);
+        auto &image = texture_cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                      {}, scheduler.Current().Handle());
+        vk::ClearColorValue clear{};
+        clear.uint32.fill(gpu_value);
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+        texture_cache.MarkGpuWritten(id);
+        Require(name, "GPU-written linear image",
+                image.IsGpuModified() && !image.info.IsTiled() &&
+                    image.info.data.address == address && image.info.data.size == image_size,
+                "the image is not a GPU-written linear image CopyToImage rejects");
+        return std::pair{id, desc};
+      };
+      const auto kept_guest_bytes = [&](uint64_t address) {
+        std::vector<uint32_t> words(part_words);
+        return LibKernel::Memory::TryReadBacking(address, words.data(), part_size) &&
+               std::all_of(words.begin(), words.end(),
+                           [&](uint32_t word) { return word == guest_value; });
+      };
+      const auto require_texels = [&](const char *check,
+                                      const std::pair<ImageId, TextureCache::ImageDesc> &image,
+                                      const auto &written, uint32_t untouched) {
+        (void)texture_cache.FindTexture(image.first, image.second);
+        const auto texels = ReadCachedTexel(name, context, image.first, {}, {side, side, 1});
+        for (uint64_t word = 0; word < texels.size(); ++word) {
+          const uint64_t part_word = word - first_row * row_words;
+          const uint32_t expected = part_word < part_words ? written(part_word) : untouched;
+          if (texels[word] != expected) {
+            Require(name, check, false,
+                    "texel word " + std::to_string(word) + " holds " + Hex(texels[word]) +
+                        ", expected " + Hex(expected));
+            return;
+          }
+        }
+      };
+
+      (void)buffer_cache.ObtainBuffer(source_address, part_size, true);
+      const auto copied = gpu_written_image(copy_address);
+      Require(name, "GPU-only copy source",
+              buffer_cache.IsRegionGpuModified(source_address, part_size) &&
+                  !buffer_cache.IsRegionGpuModified(copy_address, image_size),
+              "the copy would not take the GPU path into a clean range");
+      buffer_cache.CopyBuffer(copy_address + part_offset, source_address, part_size, false,
+                              false);
+      Require(name, "copy on the GPU path", kept_guest_bytes(copy_address + part_offset),
+              "the copy into the middle of the image ran on the CPU");
+      require_texels("copy into the middle of a GPU-written image", copied,
+                     [&](uint64_t word) { return static_cast<uint32_t>(first_source_word + word); },
+                     gpu_value);
+
+      (void)buffer_cache.ObtainBuffer(fill_address, image_size, true);
+      const auto filled = gpu_written_image(fill_address);
+      Require(name, "GPU-owned fill range",
+              buffer_cache.IsRegionGpuModified(fill_address + part_offset, part_size),
+              "the fill would not take the GPU path");
+      buffer_cache.FillBuffer(fill_address + part_offset, part_size, fill_value, false);
+      Require(name, "fill on the GPU path", kept_guest_bytes(fill_address + part_offset),
+              "the fill into the middle of the image ran on the CPU");
+      require_texels("fill into the middle of a GPU-written image", filled,
+                     [&](uint64_t) { return fill_value; }, gpu_value);
+
+      auto clean_desc = MakeLinearDesc(clean_address, image_size, vk::Format::eR32Uint,
+                                       Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {side, side, 1}, 1,
+                                       sizeof(uint32_t), 1);
+      const auto clean_id = texture_cache.FindImage(clean_desc);
+      (void)texture_cache.FindTexture(clean_id, clean_desc);
+      const std::pair clean{clean_id, clean_desc};
+      Require(name, "clean linear image",
+              !texture_cache.GetImage(clean_id).IsGpuModified() &&
+                  buffer_cache.IsRegionGpuModified(source_address, part_size) &&
+                  !buffer_cache.IsRegionGpuModified(clean_address, image_size),
+              "the clean image or the copy source is not in the expected state");
+      buffer_cache.CopyBuffer(clean_address + part_offset, source_address, part_size, false,
+                              false);
+      Require(name, "clean copy on the GPU path", kept_guest_bytes(clean_address + part_offset),
+              "the copy into the middle of the clean image ran on the CPU");
+      require_texels("copy into the middle of a clean image", clean,
+                     [&](uint64_t word) { return static_cast<uint32_t>(first_source_word + word); },
+                     guest_value);
+
+      LibKernel::Memory::InstallGpuResources(nullptr);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                   allocation_size) == 0,
+            "partial-copy backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
 
   void CheckCubeFaceStorage() {
     constexpr const char *name = "CubeFaceStorage";
@@ -57016,6 +57167,11 @@ int main(int argc, char **argv) {
     CheckEmbeddedFetchVertexOffset();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--partial-cp-copy-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPartialCopyIntoGpuImage();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
@@ -57364,6 +57520,7 @@ int main(int argc, char **argv) {
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();
+  vulkan.CheckPartialCopyIntoGpuImage();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
     vulkan.CheckRenderExecutorColorDiscovery();

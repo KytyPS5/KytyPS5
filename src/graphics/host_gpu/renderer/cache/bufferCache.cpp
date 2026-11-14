@@ -980,11 +980,29 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	// Within a batch of uploads (see FlushUploadBatch()) the staging buffer must not wait for
 	// the current command buffer: that would submit it without the batched copies. A copy that
 	// does not fit then goes through a buffer of its own.
+	//
+	// The execution thread hands the copies into the staging ring to the host copy thread, as
+	// StreamGuestData() does with what draws stream. The tracker protected the pages again before
+	// this call, so a guest write after it faults and leaves them CPU dirty; the copies read the
+	// backing store, every submission waits for them (CommandScheduler::SubmitRecorded()) and so
+	// does any guest-visible effect or unmap (HostCopyQueue::Drain()). A transfer too large for the
+	// ring is copied here: its buffer is flushed as soon as it is written.
+	auto*      host_copies = m_scheduler.HostCopies();
+	const auto ring        = m_staging_buffer.Mapped();
+	const bool hand_over   = host_copies != nullptr && m_staging_buffer.IsCoherent() &&
+	                         GuestGpu::IsGpuThread();
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
+		const bool in_ring =
+		    hand_over && mapped >= ring.data() && mapped < ring.data() + ring.size();
 		for (auto& copy: copies) {
-			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
+			const auto  address = buffer.CpuAddress() + copy.dstOffset;
+			const void* backing =
+			    in_ring ? LibKernel::Memory::FindBackingPointer(address, copy.size) : nullptr;
+			if (backing != nullptr) {
+				host_copies->Copy(mapped + copy.srcOffset, backing, copy.size);
+			} else if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
+			                                                copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			copy.srcOffset += base_offset;

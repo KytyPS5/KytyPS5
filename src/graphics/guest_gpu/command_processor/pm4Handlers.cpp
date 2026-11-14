@@ -1313,6 +1313,9 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		switch (buffer[1] & 0xff000000u) {
 			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, buffer, dw);
 			case Pm4::USERDATA_TAG_WAIT_FLIP_DONE: return CpWaitFlipDone(cp, buffer, dw);
+			case Pm4::USERDATA_TAG_RESET_QUEUE:
+				cp.ResetQueue(buffer[1]);
+				return KYTY_PM4_LEN(cmd_id) - 1u;
 			default: break;
 		}
 		if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {

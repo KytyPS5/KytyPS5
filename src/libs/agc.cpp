@@ -2058,6 +2058,9 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 	return cmd;
 }
 
+// The marker carries the operations: the CP pops a pushed context and resets the register state.
+// Drains only order GPU work, and the occlusion-query stop and memory mapping masks are not
+// modelled, so they emit nothing.
 uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state) {
 	PRINT_NAME();
 
@@ -2068,12 +2071,32 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0xfffu) != 0);
 
-	auto* cmd = buf->AllocateDW(2);
+	std::array<uint32_t, 29> packets {KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 1u),
+	                                  Pm4::SQ_THREAD_TRACE_USERDATA_2,
+	                                  Pm4::USERDATA_TAG_RESET_QUEUE | op};
+
+	auto*      end  = packets.data() + 3;
+	const auto emit = [&](uint32_t bit, std::initializer_list<uint32_t> dwords) {
+		if ((op & bit) != 0) {
+			end = std::copy(dwords.begin(), dwords.end(), end);
+		}
+	};
+	emit(Pm4::ResetQueueOp::InstanceCount, {KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0u), 1});
+	emit(Pm4::ResetQueueOp::IndexAttributes,
+	     {KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG_INDEX, 0u), 0x20000000u | Pm4::VGT_INDEX_TYPE, 0x480,
+	      KYTY_PM4(3, Pm4::IT_INDEX_BASE, 0u), 0, 0, KYTY_PM4(2, Pm4::IT_INDEX_BUFFER_SIZE, 0u),
+	      0xffffffffu});
+	emit(Pm4::ResetQueueOp::BaseIndirectPointers, {KYTY_PM4(4, Pm4::IT_SET_BASE, 0u) | 2u, 1, 0, 0,
+	                                               KYTY_PM4(4, Pm4::IT_SET_BASE, 0u), 1, 0, 0});
+	// GL2 writeback and invalidation of every cache over the whole address space.
+	emit(Pm4::ResetQueueOp::FlushCaches, {KYTY_PM4(8, Pm4::IT_ACQUIRE_MEM, 0u), 0x86007fc0u,
+	                                      0xfffffffeu, 0xff, 1, 0, 0x19, 0xc3e1});
+
+	auto* cmd = buf->AllocateDW(end - packets.data());
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	cmd[0] = KYTY_PM4(2, Pm4::IT_CLEAR_STATE, 0u);
-	cmd[1] = state & 0xfu;
+	std::copy(packets.data(), end, cmd);
 
 	return cmd;
 }

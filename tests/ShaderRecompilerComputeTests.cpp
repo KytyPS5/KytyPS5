@@ -54568,6 +54568,57 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckPm4ResetQueue(RenderContext &renderer) {
+  constexpr const char *name = "Pm4ResetQueue";
+  namespace Op = Pm4::ResetQueueOp;
+  CommandProcessor processor(renderer, 0);
+  const auto reset = [&](uint32_t op) {
+    std::array<uint32_t, 29> packets{};
+    CommandBufferLayout dcb{packets.data(), packets.data() + packets.size(),
+                            packets.data(), packets.data() + packets.size(),
+                            nullptr, nullptr, 0};
+    Gen5::AgcDcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), op,
+                           0);
+    Pm4Execution execution;
+    Require(name, "processed",
+            processor.Process(execution, {packets.data(), dcb.cursor_up}) ==
+                Pm4ProcessResult::Complete,
+            "the reset packets did not complete");
+    return packets;
+  };
+  // Drains, the occlusion-query stop and the mapping mask emit nothing.
+  const std::array<uint32_t, 29> expected{
+      0xc0017904u, 0x342u, 0xce000fffu, 0xc0002f00u, 1,           0xc0017a00u,
+      0x20000243u, 0x480u, 0xc0012600u, 0,           0,           0xc0001300u,
+      0xffffffffu, 0xc0021102u, 1,      0,           0,           0xc0021100u,
+      1,           0,      0,           0xc0065800u, 0x86007fc0u, 0xfffffffeu,
+      0xffu,       1,      0,           0x19u,       0xc3e1u};
+  Require(name, "native packets", reset(0xfffu) == expected,
+          "the reset packets are not the native ones");
+
+  // Stale state, with a context pushed over primitive reset index 5.
+  auto &ctx = processor.GetCtx();
+  ctx.SetPrimitiveResetIndex(5);
+  processor.ApplyContextStateOperation(ContextStateOperation::Push);
+  ctx.SetPrimitiveResetIndex(7);
+  processor.GetShCtx().SetCsUserSgpr(0, 7);
+  processor.GetUcfg().SetPrimitiveResetControl(7);
+  processor.SetDispatchIndirectArgsBaseAddress(0x1000);
+  reset(Op::ShState | Op::UcState | Op::PopContext);
+  Require(name, "Sh, Uc and pop",
+          ctx.GetPrimitiveResetIndex() == 5 &&
+              processor.GetShCtx().GetCs().cs_user_sgpr.value[0] == 0 &&
+              processor.GetUcfg().GetPrimitiveResetControl() == 0 &&
+              processor.GetDispatchIndirectArgsBaseAddress() == 0x1000,
+          "the reset did not pop the context and reset only Sh and Uc");
+  reset(Op::CxState | Op::BaseIndirectPointers);
+  Require(name, "Cx and indirect bases",
+          ctx.GetPrimitiveResetIndex() == 0xffffffffu &&
+              processor.GetDispatchIndirectArgsBaseAddress() == 0,
+          "the reset did not clear the context and the indirect bases");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4WaitPackets(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
@@ -56816,6 +56867,11 @@ int main(int argc, char **argv) {
     vulkan.CheckHostImageAllocation();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--reset-queue-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4ResetQueue(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
@@ -57452,6 +57508,7 @@ int main(int argc, char **argv) {
   CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
   CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
+  CheckPm4ResetQueue(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());

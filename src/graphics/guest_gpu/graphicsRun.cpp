@@ -182,6 +182,22 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 }
 
+// Pops a pushed context, then resets the register state the operation bits name.
+void CommandProcessor::ResetQueue(uint32_t op) {
+	if ((op & Pm4::ResetQueueOp::PopContext) != 0 && m_saved_ctx.has_value()) {
+		ApplyContextStateOperation(ContextStateOperation::Pop);
+	}
+	if ((op & Pm4::ResetQueueOp::CxState) != 0) {
+		m_ctx.Reset();
+	}
+	if ((op & Pm4::ResetQueueOp::ShState) != 0) {
+		m_sh_ctx.Reset();
+	}
+	if ((op & Pm4::ResetQueueOp::UcState) != 0) {
+		m_ucfg.Reset();
+	}
+}
+
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;

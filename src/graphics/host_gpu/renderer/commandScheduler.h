@@ -52,6 +52,9 @@ public:
 	                    uint64_t size = UINT64_MAX);
 	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint64_t address = 0,
 	                            uint64_t size = UINT64_MAX);
+	// One operation that writes at most the pages of `ranges` (address, size): queued once.
+	void DeferPriorityOperation(Common::UniqueFunction<void>&&                     operation,
+	                            const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 	// Completions that only act on host state (cache bookkeeping, releases, flips, interrupts).
 	void DeferHostOperation(Common::UniqueFunction<void>&& operation, bool priority = false);
 	[[nodiscard]] bool HasPendingPriorityOperations();
@@ -87,6 +90,8 @@ private:
 	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
 	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation,
 	                                                 uint64_t address, uint64_t size);
+	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&&                     operation,
+	                                                 const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 
 	class CommandPool {
 	public:

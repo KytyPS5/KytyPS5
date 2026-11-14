@@ -352,9 +352,26 @@ private:
 	// [vaddr, vaddr + size) were already submitted, submits their copy on the readback queue,
 	// waiting for those writes only, and returns true. The faulting thread then waits for the copy
 	// in FinishReadbackQueueRead() instead of for everything submitted since.
+	// With `followers`, the copy also takes the pages of m_guest_read_pages whose writes are done.
 	[[nodiscard]] bool StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                          uint64_t pages_begin, uint64_t pages_end,
-	                                          ReadbackQueueRead& read);
+	                                          ReadbackQueueRead& read, bool followers);
+	// The pages guest threads read back by fault lately (execution thread). A guest reads the same
+	// GPU results back frame after frame, a fault and two commands of the execution thread a page
+	// (Demon's Souls: ~60 destinations of its GPU copies a frame, one after another from one
+	// thread, which the frame waits for): a readback on the readback queue downloads the others
+	// along whose GPU writes are done, exactly as their own faults would, and they fault no more.
+	// A page leaves the list GuestReadPageLifetime guest readbacks after its last fault: if the
+	// guest still reads it, it faults once and is back.
+	struct GuestReadPage {
+		uint64_t page = 0;
+		uint64_t read = 0;
+	};
+	static constexpr size_t   MaxGuestReadPages     = 512;
+	static constexpr uint64_t GuestReadPageLifetime = 16384;
+	std::vector<GuestReadPage> m_guest_read_pages;
+	uint64_t                   m_guest_reads = 0;
+	void                       NoteGuestReadPages(uint64_t pages_begin, uint64_t pages_end);
 	// The faulting thread: waits for the copy and publishes the bytes.
 	void FinishReadbackQueueRead(ReadbackQueueRead& read);
 	// Before a buffer is destroyed: its copies on the readback queue are done. The copies wait for
@@ -469,6 +486,8 @@ private:
 	struct ReadbackQueueSlot {
 		ReadbackQueue     queue;
 		vk::Buffer        source = nullptr;
+		// The copy reads other buffers too (ReadbackQueueRead::followers).
+		bool              many = false;
 		std::atomic<bool> busy {false};
 	};
 	std::array<ReadbackQueueSlot, 4> m_readback_slots;
@@ -481,6 +500,14 @@ private:
 		uint64_t                           needed   = 0;
 		uint64_t                           recorded = 0;
 		std::shared_ptr<std::atomic<bool>> published;
+		// The other pages the copy downloads (see m_guest_read_pages).
+		struct Follower {
+			uint64_t                    page           = 0;
+			uint64_t                    buffer_address = 0;
+			vk::Buffer                  source         = nullptr;
+			std::vector<vk::BufferCopy> copies;
+		};
+		std::vector<Follower> followers;
 	};
 	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
 	// the command buffer `tick` (0: none since the line's last write) into `slot` of a

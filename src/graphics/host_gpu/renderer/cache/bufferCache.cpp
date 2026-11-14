@@ -496,13 +496,18 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 		// them submit at once (see NoteWrite()), so the GPU is done sooner next time.
 		NoteReadbackWait(pages_begin, pages_end, false,
 		                 m_write_ticks.Latest(pages_begin, pages_end) >= m_scheduler.CurrentTick());
+		const bool guest_read = guest_fault && !is_write;
 		if (tick == 0 && readback_queue &&
-		    StartReadbackQueueRead(buffer, vaddr, read_size, pages_begin, pages_end, queue_read)) {
+		    StartReadbackQueueRead(buffer, vaddr, read_size, pages_begin, pages_end, queue_read,
+		                           guest_read)) {
 			tick = queue_read.recorded;
 		} else if (DownloadBufferMemory<true>(buffer, vaddr, read_size)) {
 			const auto recorded = m_scheduler.CurrentTick();
 			m_inflight_readbacks.push_back({pages_begin, pages_end, recorded});
 			tick = std::max(tick, recorded);
+		}
+		if (guest_read) {
+			NoteGuestReadPages(pages_begin, pages_end);
 		}
 		if (tick == 0) {
 			// Nothing to download or in flight: the pages leave GPU ownership at once.
@@ -532,6 +537,27 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 				m_inflight_readbacks.erase(own);
 			}
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
+			if (!queue_read.followers.empty()) {
+				// The followers' entries in one pass, then each page as ReleaseReadback would.
+				const auto& followers = queue_read.followers;
+				std::vector<uint64_t> pages;
+				pages.reserve(followers.size());
+				for (const auto& follower: followers) {
+					pages.push_back(follower.page);
+				}
+				std::sort(pages.begin(), pages.end());
+				std::erase_if(m_inflight_readbacks, [&](const InFlightReadback& readback) {
+					return readback.tick == queue_read.recorded &&
+					       readback.end - readback.begin == TRACKER_PAGE_SIZE &&
+					       std::binary_search(pages.begin(), pages.end(), readback.begin);
+				});
+				for (const auto& follower: followers) {
+					if (InFlightReadbackTick(follower.page, follower.page + TRACKER_PAGE_SIZE) == 0 &&
+					    !m_gpu_modified_ranges.Intersects(follower.page, TRACKER_PAGE_SIZE)) {
+						m_memory_tracker.UnmarkRegionAsGpuModified(follower.page, TRACKER_PAGE_SIZE);
+					}
+				}
+			}
 		});
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
@@ -541,9 +567,25 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 	}
 }
 
+void BufferCache::NoteGuestReadPages(uint64_t pages_begin, uint64_t pages_end) {
+	const auto read = ++m_guest_reads;
+	for (auto page = pages_begin; page < pages_end; page += TRACKER_PAGE_SIZE) {
+		auto found = std::ranges::find(m_guest_read_pages, page, &GuestReadPage::page);
+		if (found == m_guest_read_pages.end()) {
+			if (m_guest_read_pages.size() >= MaxGuestReadPages) {
+				found = std::ranges::min_element(m_guest_read_pages, {}, &GuestReadPage::read);
+			} else {
+				found = m_guest_read_pages.emplace(m_guest_read_pages.end());
+			}
+			found->page = page;
+		}
+		found->read = read;
+	}
+}
+
 bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, uint64_t size,
                                          uint64_t pages_begin, uint64_t pages_end,
-                                         ReadbackQueueRead& read) {
+                                         ReadbackQueueRead& read, bool followers) {
 	if (!m_graphics.readback_queue || m_device_address_pending) {
 		return false;
 	}
@@ -579,11 +621,64 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 		return false;
 	}
 	read.copies.clear();
+	read.followers.clear();
 	read.total_size = 0;
 	CollectDownloadCopies(buffer, vaddr, size, read.copies, read.total_size);
 	if (read.copies.empty()) {
 		return false;
 	}
+	if (followers) {
+		std::erase_if(m_guest_read_pages, [&](const GuestReadPage& entry) {
+			return entry.read + GuestReadPageLifetime < m_guest_reads;
+		});
+		for (const auto& entry: m_guest_read_pages) {
+			const auto page = entry.page;
+			const auto end  = page + TRACKER_PAGE_SIZE;
+			if ((page < pages_end && pages_begin < end) ||
+			    !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) ||
+			    InFlightReadbackTick(page, end) != 0 ||
+			    m_texture_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				continue;
+			}
+			const auto& other = m_slot_buffers[*owner];
+			if (!other.IsInBounds(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			// As for the faulting pages above; and its writes done, so that the faulting
+			// thread waits no longer for them.
+			uint64_t latest       = m_device_address_tick;
+			bool     page_unknown = false;
+			m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE,
+			                                     [&](uint64_t start, uint64_t finish) {
+				                                     const auto tick = m_write_ticks.Latest(start, finish);
+				                                     page_unknown |= tick == UINT64_MAX;
+				                                     latest = std::max(latest, tick);
+				                                     for (const auto& [pending, bytes]: m_pending_writes) {
+					                                     page_unknown |=
+					                                         pending < finish && start < pending + bytes;
+				                                     }
+			                                     });
+			if (page_unknown || latest > m_scheduler.SubmittedTick() ||
+			    (latest > needed && !m_scheduler.IsFree(latest))) {
+				continue;
+			}
+			auto& follower = read.followers.emplace_back();
+			CollectDownloadCopies(other, page, TRACKER_PAGE_SIZE, follower.copies, read.total_size);
+			if (follower.copies.empty()) {
+				read.followers.pop_back();
+				continue;
+			}
+			follower.page           = page;
+			follower.buffer_address = other.CpuAddress();
+			follower.source         = other.Handle();
+			needed                  = std::max(needed, latest);
+		}
+	}
+	slot->many   = !read.followers.empty();
 	slot->source = buffer.Handle();
 	slot->busy.store(true, std::memory_order_release);
 	auto& queue  = slot->queue;
@@ -619,6 +714,10 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 	(void)command.begin(&begin_info);
 	command.copyBuffer(buffer.Handle(), queue.staging->Handle(),
 	                   static_cast<uint32_t>(read.copies.size()), read.copies.data());
+	for (const auto& follower: read.followers) {
+		command.copyBuffer(follower.source, queue.staging->Handle(),
+		                   static_cast<uint32_t>(follower.copies.size()), follower.copies.data());
+	}
 	vk::BufferMemoryBarrier after {};
 	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
@@ -654,15 +753,29 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 	// Other readers of these pages (the execution thread, another guest thread, an unmap) wait
 	// for the downloads in flight over them up to their tick: this one is published by then.
 	m_inflight_readbacks.push_back({pages_begin, pages_end, read.recorded});
+	if (read.followers.empty()) {
+		m_scheduler.DeferPriorityOperation(
+		    [published = read.published] { published->wait(false, std::memory_order_acquire); },
+		    pages_begin, pages_end - pages_begin);
+		return true;
+	}
+	// (One operation over all the pages, not a queued operation, a notification and a tracked
+	// write per follower page.)
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	ranges.reserve(read.followers.size() + 1);
+	ranges.emplace_back(pages_begin, pages_end - pages_begin);
+	for (const auto& follower: read.followers) {
+		m_inflight_readbacks.push_back({follower.page, follower.page + TRACKER_PAGE_SIZE, read.recorded});
+		ranges.emplace_back(follower.page, TRACKER_PAGE_SIZE);
+	}
 	m_scheduler.DeferPriorityOperation(
-	    [published = read.published] { published->wait(false, std::memory_order_acquire); },
-	    pages_begin, pages_end - pages_begin);
+	    [published = read.published] { published->wait(false, std::memory_order_acquire); }, ranges);
 	return true;
 }
 
 void BufferCache::WaitReadbackQueueCopies(vk::Buffer buffer) {
 	for (auto& slot: m_readback_slots) {
-		if (slot.busy.load(std::memory_order_acquire) && slot.source == buffer) {
+		if (slot.busy.load(std::memory_order_acquire) && (slot.source == buffer || slot.many)) {
 			(void)m_graphics.device.waitForFences(1, &slot.queue.fence, VK_TRUE, UINT64_MAX);
 		}
 	}
@@ -681,6 +794,12 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	for (const auto& copy: read.copies) {
 		Libs::LibKernel::Memory::WriteBacking(read.buffer_address + copy.srcOffset,
 		                                      mapped + copy.dstOffset, copy.size);
+	}
+	for (const auto& follower: read.followers) {
+		for (const auto& copy: follower.copies) {
+			Libs::LibKernel::Memory::WriteBacking(follower.buffer_address + copy.srcOffset,
+			                                      mapped + copy.dstOffset, copy.size);
+		}
 	}
 	read.slot->busy.store(false, std::memory_order_release);
 	read.published->store(true, std::memory_order_release);

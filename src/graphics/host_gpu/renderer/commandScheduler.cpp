@@ -273,6 +273,11 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueuePriorityOperation(TrackGuestOperation(std::move(operation), address, size));
 }
 
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&&                     operation,
+                                              const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	QueuePriorityOperation(TrackGuestOperation(std::move(operation), ranges));
+}
+
 void CommandScheduler::DeferHostOperation(Common::UniqueFunction<void>&& operation,
                                           bool                           priority) {
 	if (priority) {
@@ -301,6 +306,26 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, 
 		                             [id](const GuestWrite& write) { return write.id == id; });
 		EXIT_IF(it == m_guest_writes.end());
 		m_guest_writes.erase(it);
+	};
+}
+
+Common::UniqueFunction<void>
+CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&&                     operation,
+                                      const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	EXIT_IF(!operation);
+	uint64_t id = 0;
+	{
+		std::lock_guard lock(m_guest_writes_mutex);
+		id = ++m_next_guest_write;
+		for (const auto& [address, size]: ranges) {
+			m_guest_writes.push_back(
+			    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
+		}
+	}
+	return [this, id, operation = std::move(operation)]() mutable {
+		operation();
+		std::lock_guard lock(m_guest_writes_mutex);
+		std::erase_if(m_guest_writes, [id](const GuestWrite& write) { return write.id == id; });
 	};
 }
 

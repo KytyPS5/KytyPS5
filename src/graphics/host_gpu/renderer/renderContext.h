@@ -23,6 +23,7 @@
 
 #include <array>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -34,6 +35,8 @@ class VideoOutDriver;
 }
 
 namespace Libs::Graphics {
+
+struct ShaderBufferResource;
 
 class GuestGpu;
 
@@ -129,6 +132,16 @@ public:
 	// operation).
 	void               PrepareBda(bool may_write, bool full_sync = true);
 	void               RunGarbageCollector();
+	// In operation order, when a native build wrote a guest TLAS (CommandProcessor::EmitHleTlas()):
+	// `size` bytes at `header`, its instances referencing the BLASes `blases` (sorted). The
+	// dispatches that trace it synchronize that memory instead of everything (AddRayTracingReach()).
+	void NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases);
+	// In operation order, before passes of the game build the TLAS at `header` themselves (0: a
+	// TLAS not known yet, every one is forgotten).
+	void ForgetHleTlas(uint64_t header);
+	// In operation order, when sce::Psr captures the memory it builds or decompresses a BVH into:
+	// `size` bytes at `address` (CommandProcessor::PsrBlasDispatch()).
+	void NoteGuestBvhMemory(uint64_t address, uint64_t size);
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -138,10 +151,31 @@ private:
 	// CacheDmaBases() for the guest TLAS of a program (see NativeRayTracing::FindGuestTlasSource()),
 	// with m_mapped_ranges_mutex held.
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
+	// SynchronizeDmaFootprint() once the reach of the stages is to be enumerated.
+	[[nodiscard]] bool SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages);
 	// SynchronizeDmaFootprint(): adds the spans a program that works on a table of records reaches
 	// (ShaderInfo::dma_record_reach), read from the table as the guest's CPU wrote it. False when
 	// the host cannot tell them; the caller holds m_mapped_ranges_mutex.
 	[[nodiscard]] bool AddRecordReach(const ShaderStageRuntime& runtime);
+	// SynchronizeDmaFootprint(): adds what a program that traces rays natively reaches beyond its
+	// windows and tables (ShaderInfo::ray_query_reach): the TLAS the host built, the BLASes of its
+	// instances, the BLASes the preparation of the dispatch may walk, and the buffers of its alpha
+	// tests. False when the host cannot tell them (the TLAS is not one it built, the extent of a
+	// BLAS is not known); the caller holds m_mapped_ranges_mutex.
+	[[nodiscard]] bool AddRayTracingReach(const ShaderStageRuntime& runtime);
+	// The V# of a buffer table of ShaderInfo::ray_query_reach.
+	[[nodiscard]] bool RayQueryTableVsharp(const ShaderStageRuntime& runtime, uint32_t table,
+	                                       ShaderBufferResource& vsharp);
+	// The address of the header of the guest TLAS a program traces, and where the program reads
+	// it from when that is guest memory (else 0); false when the host cannot read it.
+	[[nodiscard]] bool GuestTlasHeader(const ShaderStageRuntime& runtime, const NativeRayTracing::TlasSource& source,
+	                                   uint64_t& header, uint64_t& header_at);
+	// The size of the memory of the guest BLAS at `blas` (0 when it is not mapped); false when it
+	// is not known: the GPU wrote its header, in memory the library did not capture.
+	[[nodiscard]] bool GuestBlasMemory(uint64_t blas, uint64_t& size);
+	// AddRayTracingReach(): the buffer table of an alpha test, and the buffers its V#s describe
+	// (m_dma_sets). False when the host cannot read the table.
+	[[nodiscard]] bool AddBufferTable(const ShaderBufferResource& table);
 
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
@@ -175,6 +209,30 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_bda_mapped_since_sync;
 	// SynchronizeDmaFootprint(): the spans of an operation.
 	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
+	// The guest TLASes the native builds wrote (NoteHleTlas()), and the memory sce::Psr captured
+	// for its BVHs (NoteGuestBvhMemory(): size by address). Execution thread.
+	struct HleTlas {
+		uint64_t              header = 0;
+		uint64_t              size   = 0;
+		std::vector<uint64_t> blases;
+	};
+	std::vector<HleTlas>         m_hle_tlases;
+	std::map<uint64_t, uint64_t> m_guest_bvh_memory;
+	// The buffer tables of alpha tests (AddBufferTable()): the bytes of the table its ranges were
+	// decoded from, the memory its V#s describe and what the buffer cache synchronized of it.
+	struct BufferTable {
+		uint64_t                address = 0;
+		// BufferCache::WatchUploads() of the table when it was last compared with its copy and had
+		// no CPU-dirty page (0: it had one).
+		uint64_t                written_at = 0;
+		std::vector<uint8_t>    copy;
+		RangeSet                ranges;
+		BufferCache::SetRegions regions;
+	};
+	std::vector<std::unique_ptr<BufferTable>> m_buffer_tables;
+	// SynchronizeDmaFootprint(): the tables of an operation, and the BLASes its preparation may walk.
+	std::vector<BufferTable*> m_dma_sets;
+	std::vector<uint64_t>     m_walk_blases;
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
 	// synchronization.
 	std::array<uint64_t, 3> m_bda_sync_epochs {UINT64_MAX, UINT64_MAX, UINT64_MAX};
@@ -183,6 +241,15 @@ private:
 	// the CPU tracks (see PrepareBda()).
 	uint64_t m_bda_generation        = 1;
 	uint64_t m_bda_synced_generation = 0;
+	// The operations whose reach was not known (they took the synchronization of everything) and,
+	// for each program that traces rays, their count at its last dispatch and whether one ran
+	// before each of its last 8 dispatches (bit 0: the last) (see SynchronizeDmaFootprint()).
+	uint64_t m_bda_unbounded_ops = 0;
+	struct TracedProgram {
+		uint64_t unbounded_ops = 0;
+		uint8_t  recent        = 0;
+	};
+	std::map<uint64_t, TracedProgram> m_traced_programs;
 	uint64_t m_bda_submit            = UINT64_MAX;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;

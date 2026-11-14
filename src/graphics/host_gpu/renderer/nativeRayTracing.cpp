@@ -1247,6 +1247,33 @@ void NativeRayTracing::ReportAgain(uint64_t blas_va, uint32_t root, uint32_t tab
 	}
 }
 
+void NativeRayTracing::PendingWalks(std::vector<uint64_t>& blases) {
+	Common::LockGuard lock(m_mutex);
+	for (const auto& pending: m_new_slots) {
+		blases.push_back(pending.blas_va);
+	}
+	const auto add = [&](uint32_t index) {
+		if (index < m_slot_list.size() && m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
+			blases.push_back(m_slot_list[index]->blas_va);
+		}
+	};
+	for (const auto index: m_build_queue) {
+		add(index);
+	}
+	for (const auto index: m_dynamic) {
+		add(index);
+	}
+	for (const auto& grow: m_grow) {
+		add(grow[0]);
+	}
+}
+
+void NativeRayTracing::AnnounceWalks(std::span<const uint64_t> blases) {
+	m_announced_walks.assign(blases.begin(), blases.end());
+	std::ranges::sort(m_announced_walks);
+	m_walks_announced = true;
+}
+
 void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	auto&                 readback = m_readbacks[m_readback_index];
 	std::vector<Job>      jobs;
@@ -1312,7 +1339,9 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 			        ? std::min<uint64_t>(uint64_t {slot.leaf_count} + slot.leaf_count / 2 + 64, PoolQueueMax)
 			        : PoolQueueMax;
 			m_build_queue.pop_back();
-			if (pool_use != 0 && pool_use + queue > PoolCapacity / 2) {
+			// Only the memory of the announced BLASes is known to be uploaded (AnnounceWalks()).
+			if ((pool_use != 0 && pool_use + queue > PoolCapacity / 2) ||
+			    (m_walks_announced && !std::ranges::binary_search(m_announced_walks, slot.blas_va))) {
 				deferred.push_back(index);
 				continue;
 			}
@@ -1755,6 +1784,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	// The BVHs of the traversal's layout (Decoder::RayTracingLayout::Pack() word 3).
 	m_blas_flags = ((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u;
 	RecordBuilds(command);
+	m_walks_announced = false;
 
 	command.fillBuffer(m_instances->Handle(), 0, uint64_t {tlas_count} * InstanceStride, 0);
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,

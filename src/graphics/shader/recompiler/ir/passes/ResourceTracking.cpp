@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/hackNotice.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -494,6 +495,7 @@ public:
 		m_info.dma_tables.clear();
 		m_info.self_sized_buffers.clear();
 		m_info.dma_record_reach.clear();
+		m_info.ray_query_reach.clear();
 		m_info.dma_bounded = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
@@ -516,13 +518,17 @@ public:
 			}
 		}
 		m_info.dma_bounded = m_dma_tracked && !m_dma_unbounded && !m_program.has_address_writes;
-		if (!m_info.dma_bounded) {
+		if (!m_info.dma_bounded && m_dma_tracked && !m_dma_uncovered && !m_program.has_address_writes) {
+			if (m_decoded.record_reach.valid) {
+				m_info.dma_record_reach = m_decoded.record_reach.Pack();
+			} else if (!m_decoded.ray_tracing_reach.empty()) {
+				m_info.ray_query_reach = RayQueryReach();
+			}
+		}
+		// The reach of a program that traces rays holds its windows and tables as well.
+		if (!m_info.dma_bounded && m_info.ray_query_reach.empty()) {
 			m_info.dma_windows.clear();
 			m_info.dma_tables.clear();
-		}
-		if (!m_info.dma_bounded && m_dma_tracked && !m_dma_uncovered && !m_program.has_address_writes &&
-		    m_decoded.record_reach.valid) {
-			m_info.dma_record_reach = m_decoded.record_reach.Pack();
 		}
 		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
@@ -4869,7 +4875,8 @@ private:
 		uint32_t    reg    = 0;
 		if (memory.address_is_full || inst.NumArgs() < 2u || handle == nullptr ||
 		    !UserDataBasePair(*handle, reg)) {
-			NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc));
+			NoteUnbounded(InReach(m_decoded.record_reach.read_pcs, inst.Flags<MemoryFlags>().pc) ||
+			              InBvhReach(inst.Flags<MemoryFlags>().pc) || NoteHitDerivedRead(inst, memory));
 			return;
 		}
 		const auto bits = PossibleU32Bits(inst.Arg(1));
@@ -4940,6 +4947,341 @@ private:
 	// reach of the decoded program holds it (see Decoder::RecordReach).
 	static bool InReach(const std::vector<uint32_t>& pcs, uint32_t pc) {
 		return std::ranges::find(pcs, pc) != pcs.end();
+	}
+
+	// The access stays within the guest BVH the program traces (Decoder::Program::ray_tracing_reach).
+	bool InBvhReach(uint32_t pc) const {
+		return std::ranges::binary_search(m_decoded.ray_tracing_reach, pc);
+	}
+
+	// What the base of a device address derives from, for the reads after the traversal loops of
+	// a program that traces rays (see NoteHitDerivedRead()).
+	enum : uint32_t {
+		RootBvh   = 1, // the hit of a site, the TLAS header, what reads within the reach return
+		RootTable = 2, // the base of a V# of a table of records the program reads (the host enumerates them)
+		RootOther = 4, // anything else (user data, other memory, lane values)
+	};
+	struct Roots {
+		uint32_t                                bits = 0;
+		std::vector<ShaderInfo::DmaRecordTable> tables;
+		void Add(const Roots& other) {
+			bits |= other.bits;
+			for (const auto& table: other.tables) {
+				if (std::ranges::none_of(tables, [&](const auto& known) { return known == table; })) {
+					tables.push_back(table);
+				}
+			}
+		}
+	};
+
+	// A device-address read of a program with traversal sites whose address is not within a loop:
+	// it stays within the memory of the program's reach when the high DWORD of its address derives
+	// only from the hit of a site (the registers of its instance record, node and primitive word),
+	// the TLAS header the program traces, the data the reads within the reach return, and the base
+	// of V#s the program reads from a table of records (the host enumerates the buffers of those);
+	// the low DWORD may add anything to it, as the leaf code does. Where the paths of the program
+	// merge, a value takes the base of the paths that have one: the registers of a site's result
+	// hold the hit in the lanes that have one, and what they held before in the others (GTA V's
+	// programs read the record of the hit in the lanes whose primitive word is not -1, and in some
+	// reads ignore what the other lanes load). GTA V's closest hit shaders read so the instance
+	// record of the hit and the geometry of its BLAS (cs 6aeb221de7ff018e), and the
+	// vertices, indices, texture coordinates and colors of the triangle (cs d645a5101b936ce7).
+	bool NoteHitDerivedRead(const Inst& inst, const MemoryInfo& memory) {
+		if (m_decoded.ray_tracing_reach.empty() || !m_decoded.ray_tracing_source.valid) {
+			return false;
+		}
+		// (Again when the reads collected since found more buffers of the program.)
+		if (m_roots_patches != m_handle_patches.size()) {
+			m_roots_patches = m_handle_patches.size();
+			ComputeRoots();
+		}
+		Roots roots;
+		if (m_roots_unstable || m_uncovered_reads.contains(&inst) || !CoveredAddress(inst, memory, roots)) {
+			return false;
+		}
+		for (const auto& table: roots.tables) {
+			if (std::ranges::none_of(m_info.dma_record_tables, [&](const auto& known) { return known == table; })) {
+				m_info.dma_record_tables.push_back(table);
+			}
+		}
+		return true;
+	}
+
+	bool CoveredAddress(const Inst& inst, const MemoryInfo& memory, Roots& roots) const {
+		const Inst* handle = inst.Arg(0).Resolve().TryInstruction();
+		Value       high;
+		if (memory.address_is_full && inst.NumArgs() >= 3u) {
+			high = inst.Arg(2);
+		} else if (!memory.address_is_full && handle != nullptr &&
+		           handle->GetOpcode() == ValueOpcode::GetAddressResource && handle->NumArgs() == 2u) {
+			high = handle->Arg(1);
+		} else {
+			return false;
+		}
+		roots = RootsOf(high);
+		return (roots.bits & RootOther) == 0 && (roots.bits & (RootBvh | RootTable)) != 0;
+	}
+
+	// The TLAS header address the traversal sites read (Decoder::Program::ray_tracing_source).
+	bool IsTlasHeaderRead(const Inst& read, const MemoryInfo& memory) const {
+		const auto& source = m_decoded.ray_tracing_source;
+		const auto* handle = read.Arg(0).Resolve().TryInstruction();
+		uint32_t    reg    = 0;
+		return source.header_vsharp == 0xffffffffu && memory.kind == ResourceKind::ScalarAddress &&
+		       !memory.address_is_full && handle != nullptr && UserDataBasePair(*handle, reg) &&
+		       reg == source.user_sgpr &&
+		       (memory.offset == source.header_offset || memory.offset == source.header_offset + 4u);
+	}
+
+	Roots RootsOf(const Value& value) const {
+		const auto* inst = value.Resolve().TryInstruction();
+		// (Constants, and conditions and carries, which select or add 0 or 1, carry no base.)
+		if (inst == nullptr || inst->GetType() == Type::U1) {
+			return {};
+		}
+		const auto known = m_roots.find(inst);
+		return known != m_roots.end() ? known->second : Roots {};
+	}
+
+	// The roots of every value of the program. The reads after the loops start covered; with them,
+	// the bases of every value (what it derives from; a merge, from any path), then whether
+	// something else is in it (a merge with a base takes it from the paths that have one). A read
+	// whose address that leaves uncovered reads other data, and everything is computed again until
+	// no read changes (the loops of the program carry values around).
+	void ComputeRoots() {
+		constexpr uint32_t MaxRounds = 64;
+		m_roots.clear();
+		m_uncovered_reads.clear();
+		m_roots_unstable = true;
+		const auto merge = [](ValueOpcode op) {
+			return op == ValueOpcode::Phi || op == ValueOpcode::SelectU32 || op == ValueOpcode::SelectF32 ||
+			       op == ValueOpcode::SelectF64;
+		};
+		// (A select's condition carries no base.)
+		const auto first_arg = [&](ValueOpcode op) -> size_t { return merge(op) && op != ValueOpcode::Phi ? 1 : 0; };
+		const auto settle    = [&](auto&& transfer) {
+			for (uint32_t round = 0; round < MaxRounds; round++) {
+				bool changed = false;
+				for (auto* block: m_program.blocks) {
+					for (const auto& inst: *block) {
+						if (inst.GetType() == Type::Void || inst.GetType() == Type::U1) {
+							continue;
+						}
+						auto&      slot          = m_roots[&inst];
+						const auto before_bits   = slot.bits;
+						const auto before_tables = slot.tables.size();
+						transfer(inst, slot);
+						changed |= slot.bits != before_bits || slot.tables.size() != before_tables;
+					}
+				}
+				if (!changed) {
+					return true;
+				}
+			}
+			return false;
+		};
+		for (uint32_t round = 0; round < MaxRounds; round++) {
+			for (auto& [inst, roots]: m_roots) {
+				roots = {};
+			}
+			const bool bases = settle([&](const Inst& inst, Roots& slot) {
+				Roots leaf;
+				if (LeafRoots(inst, leaf)) {
+					leaf.bits &= RootBvh | RootTable;
+					slot.Add(leaf);
+					return;
+				}
+				for (size_t arg = first_arg(inst.GetOpcode()); arg < inst.NumArgs(); arg++) {
+					auto from = RootsOf(inst.Arg(arg));
+					from.bits &= RootBvh | RootTable;
+					slot.Add(from);
+				}
+			});
+			const bool others = settle([&](const Inst& inst, Roots& slot) {
+				Roots leaf;
+				if (LeafRoots(inst, leaf)) {
+					slot.bits |= leaf.bits & RootOther;
+					return;
+				}
+				if (merge(inst.GetOpcode()) && (slot.bits & (RootBvh | RootTable)) != 0) {
+					return;
+				}
+				for (size_t arg = first_arg(inst.GetOpcode()); arg < inst.NumArgs(); arg++) {
+					slot.bits |= RootsOf(inst.Arg(arg)).bits & RootOther;
+				}
+			});
+			if (!bases || !others) {
+				return;
+			}
+			bool changed = false;
+			for (auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					const auto flags = inst.Flags<MemoryFlags>();
+					if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::Read ||
+					    flags.index >= m_program.memory_info.size() || m_uncovered_reads.contains(&inst) ||
+					    InBvhReach(flags.pc) || IsTlasHeaderRead(inst, m_program.memory_info[flags.index])) {
+						continue;
+					}
+					Roots roots;
+					if (!CoveredAddress(inst, m_program.memory_info[flags.index], roots)) {
+						m_uncovered_reads.insert(&inst);
+						changed = true;
+					}
+				}
+			}
+			if (!changed) {
+				m_roots_unstable = false;
+				return;
+			}
+		}
+	}
+
+	// The roots of a value that does not take them from its arguments (false for the others). A
+	// read after the loops is a base while it stays covered, with the tables its address came from.
+	bool LeafRoots(const Inst& inst, Roots& roots) const {
+		const auto op = inst.GetOpcode();
+		if (op == ValueOpcode::RayQueryResult) {
+			roots.bits |= RootBvh;
+			return true;
+		}
+		if (AddressOpcodeInfoOf(op).access == AddressAccess::Read) {
+			const auto  flags  = inst.Flags<MemoryFlags>();
+			const auto* memory = flags.index < m_program.memory_info.size() ? &m_program.memory_info[flags.index] : nullptr;
+			if (memory != nullptr && (InBvhReach(flags.pc) || IsTlasHeaderRead(inst, *memory))) {
+				roots.bits |= RootBvh;
+			} else if (memory != nullptr && !m_uncovered_reads.contains(&inst)) {
+				Roots address;
+				CoveredAddress(inst, *memory, address);
+				roots.tables = std::move(address.tables);
+				roots.bits |= RootBvh;
+			} else {
+				roots.bits |= RootOther;
+			}
+			return true;
+		}
+		if (BufferAccessOf(op) == BufferAccess::Read) {
+			BufferReadRoots(inst, roots);
+			return true;
+		}
+		if (inst.NumArgs() == 0 || BufferAccessOf(op) != BufferAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None || op == ValueOpcode::GetUserData) {
+			roots.bits |= RootOther;
+			return true;
+		}
+		return false;
+	}
+
+	// A read of a buffer: the base of a V# of a table of 16-byte records the program reads (the
+	// buffer table of GTA V's closest hit shaders), data within the buffers such a table describes,
+	// or other data.
+	void BufferReadRoots(const Inst& read, Roots& roots) const {
+		const auto* handle = read.Arg(0).Resolve().TryInstruction();
+		const auto  flags  = read.Flags<MemoryFlags>();
+		if (handle == nullptr || flags.index >= m_program.memory_info.size()) {
+			roots.bits |= RootOther;
+			return;
+		}
+		const auto& memory = m_program.memory_info[flags.index];
+		const auto  patch  = std::ranges::find_if(m_handle_patches,
+		                                          [&](const HandlePatch& known) { return known.handle == handle; });
+		if (patch == m_handle_patches.end()) {
+			ShaderInfo::DmaRecordTable table;
+			const bool                 in_table =
+			    handle->NumArgs() == 4u && MatchDmaRecordTable({handle->Arg(0), handle->Arg(1), handle->Arg(2)}, table, 0);
+			roots.bits |= in_table ? RootBvh : RootOther;
+			if (in_table) {
+				roots.tables.push_back(table);
+			}
+			return;
+		}
+		// The second DWORD of a record (the high DWORD of its V#'s base address): by index into a
+		// buffer of 16-byte records (the host checks the stride of its V#), or at index << 4. Other
+		// reads by index (the rays a program takes from a buffer of the GPU's) are no V#s.
+		constexpr uint32_t RecordBytes = 16;
+		uint32_t           shift       = 0;
+		uint32_t           dwords      = 0;
+		switch (read.GetOpcode()) {
+			case ValueOpcode::LoadBufferU32: dwords = 1; break;
+			case ValueOpcode::LoadBufferU32x2: dwords = 2; break;
+			case ValueOpcode::LoadBufferU32x3: dwords = 3; break;
+			case ValueOpcode::LoadBufferU32x4: dwords = 4; break;
+			default: break;
+		}
+		const auto* scaled   = read.NumArgs() >= 2u ? read.Arg(1).Resolve().TryInstruction() : nullptr;
+		const bool  by_index = dwords != 0 && memory.idxen && !memory.offen && memory.offset % 4u == 0 &&
+		                      memory.offset <= 4u && memory.offset + dwords * 4u >= 8u;
+		const bool  by_offset = read.GetOpcode() == ValueOpcode::ReadConstBuffer && memory.offset == 4u &&
+		                       scaled != nullptr && scaled->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+		                       ImmediateU32(scaled->Arg(1), shift) && shift == 4u;
+		if (!by_index && !by_offset) {
+			roots.bits |= RootOther;
+			return;
+		}
+		roots.bits |= RootTable;
+		const ShaderInfo::DmaRecordTable table {patch->resource, RecordBytes, 0};
+		if (std::ranges::none_of(roots.tables, [&](const auto& known) { return known == table; })) {
+			roots.tables.push_back(table);
+		}
+	}
+
+	// ShaderInfo::ray_query_reach: the buffers of the program that are the material table and the
+	// buffer table of each alpha test, by the V#s the test takes; empty when one is no buffer of
+	// the program (the guest leaf code reads them through the same V#s) or the test is not GTA V's.
+	std::vector<uint32_t> RayQueryReach() const {
+		const auto buffer_of = [&](const Inst& alpha, uint32_t first) {
+			for (uint32_t index = 0; index < m_info.buffers.size(); index++) {
+				const auto& source = m_sources[m_info.buffers[index].source];
+				bool        same   = !source.indirect_descriptor && source.dword_count == 4u;
+				// (The fourth dword holds the format, which a program may patch.)
+				for (uint32_t dword = 0; dword < 3u && same; dword++) {
+					same = EquivalentValue(m_program, source.dwords[dword], alpha.Arg(first + dword));
+				}
+				if (same) {
+					return index;
+				}
+			}
+			return UINT32_MAX;
+		};
+		// A V# the program reads only from the flattened SRT, as four slots in a row (its reads of the
+		// table go through device addresses): ShaderInfo::RayQuerySrtVsharp.
+		const auto srt_vsharp = [&](const Inst& alpha, uint32_t first) {
+			uint32_t first_slot = UINT32_MAX;
+			for (uint32_t dword = 0; dword < 4u; dword++) {
+				const auto* read = alpha.Arg(first + dword).Resolve().TryInstruction();
+				const auto* srt  = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst && read->NumArgs() >= 2u
+				                       ? read->Arg(0).Resolve().TryInstruction()
+				                       : nullptr;
+				uint32_t    slot = 0;
+				if (srt == nullptr || srt->GetOpcode() != ValueOpcode::GetSrtResource ||
+				    !ImmediateU32(read->Arg(1), slot) || (dword != 0 && slot != first_slot + dword)) {
+					return UINT32_MAX;
+				}
+				first_slot = dword == 0 ? slot : first_slot;
+			}
+			return first_slot < ShaderInfo::RayQuerySrtVsharp ? ShaderInfo::RayQuerySrtVsharp | first_slot : UINT32_MAX;
+		};
+		std::vector<uint32_t> reach {0u};
+		for (const auto* alpha: m_ray_query_alphas) {
+			const auto material = buffer_of(*alpha, 3);
+			auto       table    = buffer_of(*alpha, 7);
+			if (table == UINT32_MAX) {
+				table = srt_vsharp(*alpha, 7);
+			}
+			if ((RayQueryVariant(alpha->Flags<uint32_t>()) & RayQueryAlphaEntry) != 0 || material == UINT32_MAX ||
+			    table == UINT32_MAX) {
+				return {};
+			}
+			bool known = false;
+			for (size_t at = 1; at + 1 < reach.size(); at += 2) {
+				known |= reach[at] == material && reach[at + 1] == table;
+			}
+			if (!known) {
+				reach.push_back(material);
+				reach.push_back(table);
+				reach[0]++;
+			}
+		}
+		return reach;
 	}
 
 	void NoteUnbounded(bool covered = false) {
@@ -5235,9 +5577,14 @@ private:
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect ||
 		    op == ValueOpcode::RayQueryInit) {
-			// Device addresses: the BVH nodes, or the native ray tracing context.
+			// Device addresses: the BVH nodes, or the native ray tracing context. The node tests of
+			// a program with a known reach are all in its traversal loops.
 			m_dma_tracked = true;
-			NoteUnbounded();
+			NoteUnbounded(!m_decoded.ray_tracing_reach.empty());
+			return;
+		}
+		if (op == ValueOpcode::RayQueryAlpha) {
+			m_ray_query_alphas.push_back(&inst);
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);
@@ -5311,7 +5658,8 @@ private:
 				m_dma_tracked                           = true;
 				if (handle != nullptr) {
 					NoteDmaDescriptorTable(
-					    *handle, indirect_store && InReach(m_decoded.record_reach.store_pcs, flags.pc));
+					    *handle, (indirect_store && InReach(m_decoded.record_reach.store_pcs, flags.pc)) ||
+					                 (!indirect_store && InBvhReach(flags.pc)));
 				} else {
 					NoteUnbounded();
 				}
@@ -5463,6 +5811,14 @@ private:
 	bool                                       m_dma_unbounded = false;
 	// One of them is not in the record reach of the decoded program either.
 	bool                                       m_dma_uncovered = false;
+	// The RayQueryAlpha instructions of the program (see RayQueryReach()).
+	std::vector<const Inst*>                   m_ray_query_alphas;
+	// ComputeRoots(): the roots of each value, whether they did not settle, and how many buffers of
+	// the program the reads collected before had found.
+	std::unordered_map<const Inst*, Roots> m_roots;
+	bool                                   m_roots_unstable = false;
+	std::unordered_set<const Inst*>        m_uncovered_reads;
+	size_t                                 m_roots_patches  = SIZE_MAX;
 	// A DMA access this pass saw. uses_dma comes later, from the live IR (ShaderInfoCollection):
 	// a DMA access this pass did not see leaves the shader unbounded.
 	bool                                       m_dma_tracked = false;

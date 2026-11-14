@@ -118,6 +118,11 @@ public:
 	[[nodiscard]] GuestTlas ReadGuestTlas(uint64_t header, const TlasSource& source,
 	                                      const std::function<bool(uint64_t, uint64_t)>& readable,
 	                                      std::vector<std::pair<uint64_t, uint64_t>>& blases);
+	// The guest BLASes that the next Prepare() may walk or gather to build them (appended).
+	void PendingWalks(std::vector<uint64_t>& blases);
+	// The caller uploaded the CPU writes of the memory of `blases` only (not of all cached
+	// memory): the next Prepare() builds no other BLAS; the others wait for the one after.
+	void AnnounceWalks(std::span<const uint64_t> blases);
 	// The instance count of the TLAS that the next Prepare() walks, read on the CPU (0: not known):
 	// the host TLAS of a TLAS the walks have not seen yet has room for all its instances.
 	void NoteTlasInstances(uint32_t count) noexcept { m_next_instances = count; }
@@ -485,6 +490,9 @@ private:
 	std::vector<uint32_t>     m_moved_slots;
 	// Slots whose layout build did not match: evicted at the next preparation.
 	std::vector<uint32_t> m_give_up;
+	// AnnounceWalks(): the BLASes (sorted) the next preparation may build, when announced.
+	std::vector<uint64_t> m_announced_walks;
+	bool                  m_walks_announced = false;
 
 };
 

@@ -2092,6 +2092,8 @@ void CommandProcessor::EmitHleTlas() {
 			const auto size = NativeRayTracing::HleTlasHeader(build.count, build.format, header);
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
+			// The dispatches that trace the TLAS reach its memory and the BLASes of the list.
+			context.NoteHleTlas(build.header, size, build.count != 0 ? blases : std::vector<uint64_t> {});
 		}
 		// The builds read and store through device addresses: everything they reach is in cached
 		// buffers now (PrepareBda() uploads nothing more).
@@ -2172,6 +2174,9 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 			m_psr_captured.clear();
 		}
 		m_psr_captured[address(0)] = user[2];
+		// What the library builds or decompresses a BVH into: the host learns the extent of the
+		// BLASes the GPU writes.
+		EmitHostCommand([this, memory = address(0), size = user[2]] { m_renderer.NoteGuestBvhMemory(memory, size); });
 		return;
 	}
 	if (shader == Shader::DecompressHeaderBase || shader == Shader::DecompressComputeFanNode) {
@@ -2241,6 +2246,23 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 	m_psr_blas_built = std::move(build);
 }
 
+void CommandProcessor::GuestTlasDispatch(uint64_t data_addr) {
+	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+		return;
+	}
+	using Psr::Shader;
+	const auto shader = ComputePsrShader(data_addr);
+	if (shader == Shader::MortonComputeBoundingBoxForInstances) {
+		// The first pass of a build: the TLAS it writes is known only at its last pass.
+		EmitHostCommand([this] { m_renderer.ForgetHleTlas(0); });
+	} else if (shader == Shader::CollapseToQbvhSimpleTop) {
+		const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+		EmitHostCommand([this, header = (uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) & 0xffffffffffffull] {
+			m_renderer.ForgetHleTlas(header);
+		});
+	}
+}
+
 void CommandProcessor::EmitPsrBlasBuilt() {
 	if (m_psr_decompressed != 0) {
 		EmitHostCommand([this, blas = m_psr_decompressed, size = m_psr_decompressed_size] {
@@ -2264,6 +2286,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
 	}
+	GuestTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchDirect);
 	operation.dispatch = {.thread_group_x = thread_group_x,
@@ -2298,6 +2321,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	    HleBlasDispatch(GetShCtx().GetCs().cs_regs.data_addr)) {
 		return;
 	}
+	GuestTlasDispatch(GetShCtx().GetCs().cs_regs.data_addr);
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	GetShCtx().SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	auto operation     = MakeOperation(GpuOperationKind::DispatchIndirect);

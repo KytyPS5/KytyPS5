@@ -1033,6 +1033,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
+		    NoteUpload(address, bytes);
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); }, m_device_sync_pass);
 	RecordBufferUpload(buffer, copies, source);
@@ -1091,6 +1092,7 @@ void BufferCache::SynchronizeBuffers(std::span<Buffer* const>                   
 		    m_span_copies[index].emplace_back(m_span_sizes[index], buffers[index]->Offset(address),
 		                                      bytes);
 		    m_span_sizes[index] += bytes;
+		    NoteUpload(address, bytes);
 	    },
 	    [&]() noexcept {
 		    for (size_t index = 0; index < buffers.size(); index++) {
@@ -2582,6 +2584,7 @@ void BufferCache::GrowRegionTables(uint64_t region) {
 	m_synced_region_epochs.resize(words * 64, 0);
 	m_buffer_region_bits.resize(words, 0);
 	m_forced_region_bits.resize(words, 0);
+	m_region_forces.resize(words * 64, 0);
 }
 
 void BufferCache::NoteBufferRegions(const Buffer& buffer, bool insert) {
@@ -2595,6 +2598,7 @@ void BufferCache::NoteBufferRegions(const Buffer& buffer, bool insert) {
 			m_region_buffer_count[index]++;
 			m_buffer_region_bits[index / 64] |= bit;
 			m_forced_region_bits[index / 64] |= bit;
+			m_region_forces[index]++;
 		} else {
 			EXIT_IF(m_region_buffer_count[index] == 0);
 			if (--m_region_buffer_count[index] == 0) {
@@ -2612,7 +2616,57 @@ void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
 	const auto last  = std::min<uint64_t>((vaddr + size - 1) / TRACKER_REGION_SIZE, m_region_buffer_count.size() - 1);
 	for (auto index = first; index <= last; index++) {
 		m_forced_region_bits[index / 64] |= uint64_t {1} << (index % 64);
+		m_region_forces[index]++;
 	}
+}
+
+uint64_t BufferCache::WatchUploads(uint64_t vaddr, uint64_t size) {
+	for (const auto& watch: m_upload_watches) {
+		if (watch.begin == vaddr && watch.end == vaddr + size) {
+			return watch.uploads;
+		}
+	}
+	// Uploads start at 1: never the count of a range that was not watched.
+	m_upload_watches[m_upload_watch_next++ % m_upload_watches.size()] = {vaddr, vaddr + size, 1};
+	return 0;
+}
+
+void BufferCache::SynchronizeBuffersInSet(const RangeSet& set, SetRegions& state) {
+	const UploadBatch batch {*this};
+	// The uploads of this pass leave the pages the guest keeps writing CPU dirty, as those of a
+	// pass over everything; the next pass over the set uploads them again.
+	const auto sync = ++m_device_syncs;
+	m_device_sync_pass = sync;
+	struct EndPass {
+		BufferCache& cache;
+		~EndPass() {
+			cache.m_device_sync_pass = 0;
+			cache.m_kept_pages       = cache.m_memory_tracker.TakeKeptPages() || cache.m_kept_pages;
+		}
+	} end_pass {*this};
+	auto& regions = state.regions;
+	if (regions.size() < m_region_buffer_count.size()) {
+		regions.resize(m_region_buffer_count.size());
+	}
+	for (size_t word = 0; word < m_buffer_region_bits.size(); word++) {
+		for (auto bits = m_buffer_region_bits[word]; bits != 0; bits &= bits - 1) {
+			const auto index = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
+			// Read before the scan: pages dirtied during or after it advance the epoch again.
+			const auto epoch  = m_memory_tracker.RegionCpuDirtyEpoch(index);
+			const auto forces = m_region_forces[index] + 1;
+			auto&      synced = regions[index];
+			const auto kept   = m_memory_tracker.RegionKeptSync(index);
+			// (An untracked region, epoch 0, has no pending write under a buffer unless forced.)
+			if (synced.second == forces && (epoch == 0 || synced.first == epoch) &&
+			    (kept == 0 || kept < state.pass)) {
+				continue;
+			}
+			set.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
+			                   [this](uint64_t start, uint64_t end) { SynchronizeBuffersInRange(start, end - start); });
+			synced = {epoch, forces};
+		}
+	}
+	state.pass = sync;
 }
 
 void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
@@ -2642,9 +2696,10 @@ void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
 			// Synchronizing a buffer tracks its pages, so an untracked region (epoch 0) has no
 			// pending write under a buffer unless the region was forced. A region whose pages the
 			// last pass left dirty has them to upload again.
+			const auto kept = m_memory_tracker.RegionKeptSync(index);
 			if (!all && (forced & (uint64_t {1} << (index % 64))) == 0 &&
 			    (epoch == 0 || m_synced_region_epochs[index] == epoch) &&
-			    m_memory_tracker.RegionKeptSync(index) + 1 != sync) {
+			    (kept == 0 || kept < m_device_full_pass)) {
 				continue;
 			}
 			m_sync_regions.emplace_back(index, epoch);
@@ -2657,6 +2712,7 @@ void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
 		                      });
 		m_synced_region_epochs[index] = epoch;
 	}
+	m_device_full_pass = sync;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

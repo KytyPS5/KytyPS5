@@ -133,6 +133,9 @@ public:
 	// sce::Psr's BLAS builds, seen (not replaced) so the native ray tracing follows them (see
 	// graphicsRun.cpp).
 	void PsrBlasDispatch(uint64_t data_addr);
+	// Before a dispatch that is not dropped: passes of the game that build a TLAS themselves make
+	// the host forget what it knew of the TLAS (RenderContext::ForgetHleTlas()).
+	void GuestTlasDispatch(uint64_t data_addr);
 	// After the dispatch that wrote it: the BLAS PsrBlasDispatch() saw built.
 	void EmitPsrBlasBuilt();
 	// The sce::Psr shader at `data_addr` (see psrShaders.h).

@@ -224,6 +224,25 @@ public:
 	// Uploads the pending CPU writes of the buffers within each [first, second) span, recorded
 	// together as SynchronizeBuffersInRanges() records them.
 	void SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans);
+	// What SynchronizeBuffersInSet() left of a set: per tracking region, its CPU-dirty epoch and
+	// its count of forced synchronizations (+ 1) when a pass over the set last visited it, and
+	// the number of the last pass over the set.
+	struct SetRegions {
+		std::vector<std::pair<uint64_t, uint64_t>> regions;
+		uint32_t                                   pass = 0;
+	};
+	// Uploads the pending CPU writes of the buffers within `set`, a set that stays the same from
+	// call to call (`regions` starts empty for a new set). A pass of the device-address
+	// synchronization as SynchronizeBuffersInRanges(), over the set only: visits the tracking
+	// regions with a buffer whose pages became CPU dirty, or that were forced, since the pass
+	// that last visited them, or where a pass left pages CPU dirty since: that pass left no other
+	// pending write under a buffer in their part of the set.
+	void SynchronizeBuffersInSet(const RangeSet& set, SetRegions& regions);
+	// How often a synchronization uploaded CPU writes of the range since it is watched (the first
+	// call for a range starts to watch it; a few ranges at a time). With IsRegionCpuModified(),
+	// tells whether the guest's CPU may have written the range: a write makes a page CPU dirty, and
+	// the page stays so until a synchronization uploads it.
+	[[nodiscard]] uint64_t WatchUploads(uint64_t vaddr, uint64_t size);
 	void FlushUploadBatch();
 	// FlushUploadBatch() as one dispatch; false when the batch does not fit it.
 	bool ScatterUploadBatch(const CommandRecorder& native);
@@ -630,6 +649,21 @@ private:
 	std::vector<uint32_t>                      m_region_buffer_count;
 	std::vector<uint64_t>                      m_buffer_region_bits;
 	std::vector<uint64_t>                      m_forced_region_bits;
+	// How often each region was forced (see SynchronizeBuffersInSet()).
+	std::vector<uint64_t>                      m_region_forces;
+	// WatchUploads(): the ranges ([begin, end)) and their uploads.
+	struct UploadWatch {
+		uint64_t begin   = 0;
+		uint64_t end     = 0;
+		uint64_t uploads = 0;
+	};
+	std::array<UploadWatch, 4> m_upload_watches {};
+	uint32_t                   m_upload_watch_next = 0;
+	void NoteUpload(uint64_t address, uint64_t bytes) noexcept {
+		for (auto& watch: m_upload_watches) {
+			watch.uploads += address < watch.end && address + bytes > watch.begin ? 1 : 0;
+		}
+	}
 	std::vector<uint64_t>                      m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
 	// The buffers of a CPU-dirty span (see SynchronizeBuffersInRange()) and their copies.
@@ -641,6 +675,8 @@ private:
 	// whether the last one left pages CPU dirty.
 	uint32_t m_device_syncs     = 0;
 	uint32_t m_device_sync_pass = 0;
+	// The last pass over everything (SynchronizeBuffersInRanges()).
+	uint32_t m_device_full_pass = 0;
 	bool     m_kept_pages       = false;
 };
 

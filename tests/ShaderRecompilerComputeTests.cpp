@@ -36030,6 +36030,78 @@ TestCase RobustBufferAtomicOutOfRange() {
   return test;
 }
 
+TestCase BufferAtomicOnPhiOfTwoDescriptors(bool second, bool equal_strides) {
+  using O = ShaderOpcode;
+  constexpr u32 no_offset_register = 125;
+  constexpr u32 first_descriptor_offset = 16;
+  constexpr u32 second_descriptor_offset = 32;
+  constexpr u32 first_stride = 4;
+  constexpr u32 other_stride = 8;
+  const u32 second_stride = equal_strides ? first_stride : other_stride;
+  constexpr u32 buffer_bytes = 32;
+  constexpr u32 first_base = 256;
+  constexpr u32 second_base = 512;
+  constexpr u32 table_base = 768;
+  constexpr u32 record = 1;
+  constexpr u32 addend = 5;
+  constexpr u32 old_value_dword = 1;
+  constexpr u32 second_load_words = 2;
+  TestCase test;
+  test.name =
+      equal_strides
+          ? (second ? "BufferAtomicOnPhiOfTwoEqualStrideDescriptorsSecond"
+                    : "BufferAtomicOnPhiOfTwoEqualStrideDescriptorsFirst")
+          : (second ? "BufferAtomicOnPhiOfTwoDescriptorsSecond"
+                    : "BufferAtomicOnPhiOfTwoDescriptorsFirst");
+  auto &code = test.code;
+  code.insert(code.end(), {EncodeSmem0(0x02, 20),
+                           EncodeSmem1(first_descriptor_offset, no_offset_register)});
+  AppendVMovU32(&code, 30, 0);
+  code.insert(code.end(), {EncodeMubuf0(0x0cu), EncodeMubuf1(2, 12, 30),
+                           EncodeVopc(0xc1, InlineU32(0), 2),
+                           EncodeSopp(0x06, second_load_words), EncodeSmem0(0x02, 20),
+                           EncodeSmem1(second_descriptor_offset, no_offset_register)});
+  AppendVMovU32(&code, 0, addend);
+  AppendVMovU32(&code, 21, record);
+  code.insert(code.end(), {EncodeMubuf0(0x32u, 0, true, false, true), EncodeMubuf1(0, 5, 21)});
+  AppendStoreVgpr(&code, 0, old_value_dword);
+  AppendEnd(&code);
+  auto first_buffer = MakeStructuredStorageBufferData(first_stride, buffer_bytes / first_stride);
+  auto second_buffer = MakeStructuredStorageBufferData(second_stride, buffer_bytes / second_stride);
+  first_buffer[0] = first_base;
+  second_buffer[0] = second_base;
+  test.initial.resize((table_base + second_descriptor_offset) / 4 + 4);
+  test.initial[0] = second;
+  for (u32 i = 0; i < buffer_bytes / 4; ++i) {
+    test.initial[first_base / 4 + i] = 0xa0u + i;
+    test.initial[second_base / 4 + i] = 0xb0u + i;
+  }
+  std::copy_n(first_buffer.begin(), 4,
+              test.initial.begin() + (table_base + first_descriptor_offset) / 4);
+  std::copy_n(second_buffer.begin(), 4,
+              test.initial.begin() + (table_base + second_descriptor_offset) / 4);
+  const u32 target = second ? (second_base + record * second_stride) / 4
+                            : (first_base + record * first_stride) / 4;
+  test.expected = test.initial;
+  test.expected[old_value_dword] = test.initial[target];
+  test.expected[target] += addend;
+  const auto output = MakeStructuredStorageBufferData(0, buffer_bytes);
+  test.user_data[0] = table_base;
+  std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+  test.has_user_data = true;
+  test.storage_buffer_ranges = {{0, buffer_bytes},
+                                {first_base, buffer_bytes},
+                                {second_base, buffer_bytes}};
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_LOAD_DWORDX4,   O::V_MOV_B32,      O::BUFFER_LOAD_DWORD,
+                  O::V_CMP_LT_U32,     O::S_CBRANCH_VCCZ, O::BUFFER_ATOMIC_ADD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 // Guest offsets near 2^32 index past the end of every view: they read zero and drop stores
 // instead of wrapping onto the bytes before the descriptor offset or onto the host prefix.
 TestCase RobustBufferWrappedAddresses(u32 prefix) {
@@ -49101,6 +49173,9 @@ std::vector<TestCase> MakeCases() {
   }
   for (const u32 prefix : {0u, 4u}) cases.push_back(RobustBufferWrappedAddresses(prefix));
   AddCase(RobustBufferAtomicOutOfRange);
+  for (const bool equal_strides : {false, true})
+    for (const bool second : {false, true})
+      cases.push_back(BufferAtomicOnPhiOfTwoDescriptors(second, equal_strides));
   cases.push_back(BufferOffsetsUsePackedWords(false));
   cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
@@ -56695,6 +56770,14 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-atomic-phi-only") == 0) {
+    VulkanHarness vulkan;
+    for (const bool equal_strides : {false, true})
+      for (const bool second : {false, true})
+        RunCase(&vulkan,
+                BufferAtomicOnPhiOfTwoDescriptors(second, equal_strides));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-cmpswap-only") == 0) {

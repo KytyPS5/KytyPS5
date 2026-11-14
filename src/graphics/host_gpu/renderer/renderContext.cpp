@@ -622,6 +622,24 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 				}
 			}
 		}
+		// A buffer that takes its size from a header the GPU writes (ShaderInfo::SelfSizedBuffer)
+		// lies in the memory sce::Psr captured for the BVH at its base (GTA V's BLAS passes).
+		for (const auto& buffer: program.info.self_sized_buffers) {
+			uint64_t low  = 0;
+			uint64_t high = 0;
+			if (!base_of(buffer.base_low_register, low) || !base_of(buffer.base_high_register, high)) {
+				return false;
+			}
+			const auto base = (low & 0xffffffffu) | ((high & 0xffffu) << 32u);
+			if (base == 0) {
+				continue;
+			}
+			auto memory = m_guest_bvh_memory.upper_bound(base);
+			if (memory == m_guest_bvh_memory.begin() || base - (--memory)->first >= memory->second) {
+				return false;
+			}
+			add(base, memory->first + memory->second - base);
+		}
 		for (const auto& table: program.info.dma_record_tables) {
 			const auto& buffers = stage->resources->buffers;
 			if (table.buffer >= buffers.size()) {

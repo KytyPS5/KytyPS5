@@ -5777,8 +5777,9 @@ private:
 			if (indirect == nullptr && TryMakeSelfSizedBuffer(*handle)) {
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;
-				// The record count bounds the reach, and the host does not know it.
-				NoteUnbounded();
+				// The record count bounds the reach, and the host does not know it: it bounds the
+				// buffer by the memory it knows the buffer lies in, or synchronizes everything
+				// (RenderContext::SynchronizeDmaFootprint()).
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);

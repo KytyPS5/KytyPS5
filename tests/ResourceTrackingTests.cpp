@@ -5631,8 +5631,7 @@ void TestSelfSizedBuffers() {
     const auto store_kind = fixture.program.memory_info[store_flags.index].kind;
     if (self) {
       Check(load_kind == ResourceKind::IndirectBuffer &&
-                store_kind == ResourceKind::IndirectBuffer && info.buffers.empty() &&
-                !info.dma_bounded,
+                store_kind == ResourceKind::IndirectBuffer && info.buffers.empty(),
             "a self-sized buffer was bound instead of reached through device addresses");
       Check(info.self_sized_buffers.size() == 1u &&
                 info.self_sized_buffers[0].base_low_register == 6u &&

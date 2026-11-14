@@ -16,6 +16,10 @@ struct Program;
 
 namespace Libs {
 
+namespace Fiber {
+void FiberExitThread(void* value, void (*run_destructors)());
+}
+
 namespace LibKernel {
 
 void Initialize();

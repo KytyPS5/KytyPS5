@@ -169,16 +169,24 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		       candidate->limit == limit && candidate->profile == profile;
 	});
 	if (view == views.end()) {
-		const auto epoch   = Image::heap_epoch.load(std::memory_order_relaxed);
+		auto pool = std::ranges::find_if(
+		    m_pools, [&](const auto& candidate) { return candidate->profile == profile; });
+		if (pool == m_pools.end()) {
+			const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
+			pool             = m_pools.insert(m_pools.end(),
+			                                  std::make_unique<Pool>(Pool {.profile       = profile,
+			                                                               .resolve_epoch = epoch,
+			                                                               .layout_epoch  = epoch}));
+		}
 		const auto count   = std::min(limit, Probes(bytes, request.first, request.step));
-		auto       created = std::make_unique<View>(View {.memory        = **memory,
-		                                                  .step          = request.step,
-		                                                  .first         = request.first,
-		                                                  .count         = count,
-		                                                  .limit         = limit,
-		                                                  .profile       = profile,
-		                                                  .resolve_epoch = epoch,
-		                                                  .layout_epoch  = epoch});
+		auto       created = std::make_unique<View>(View {.memory   = **memory,
+		                                                  .pool     = **pool,
+		                                                  .step     = request.step,
+		                                                  .first    = request.first,
+		                                                  .count    = count,
+		                                                  .limit    = limit,
+		                                                  .profile  = profile,
+		                                                  .renewals = (*pool)->renewals});
 		created->slots.resize(bytes / 4u + 1u);
 		created->buffer = SlotBuffer(m_context, bytes);
 		UpdateProbes(*created, 0u, bytes);
@@ -311,24 +319,29 @@ void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 
 void ImageHeap::Bury() {
 	if (m_unmapped.empty()) return;
-	for (const auto& memory: m_memories) {
-		for (const auto& view: memory->views) {
-			bool buried = false;
-			for (const auto& [value, index]: view->elements) {
-				const auto& binding = m_elements[index].binding;
-				if (binding.image_id && std::ranges::any_of(m_unmapped, [&](GuestRange range) {
-					    return ImageRangeOverlaps(binding.desc.info.data, range);
-				    })) {
-					m_elements[index].stale = buried = true;
+	m_buried.assign(m_elements.size(), uint8_t {0});
+	bool buried = false;
+	for (size_t index = 1; index < m_elements.size(); ++index) {
+		auto&       element = m_elements[index];
+		const auto& binding = element.binding;
+		if (element.refs != 0u && binding.image_id &&
+		    std::ranges::any_of(m_unmapped, [&](GuestRange range) {
+			    return ImageRangeOverlaps(binding.desc.info.data, range);
+		    })) {
+			element.stale = buried = true;
+			m_buried[index]        = 1u;
+		}
+	}
+	if (buried) {
+		for (const auto& memory: m_memories) {
+			for (const auto& view: memory->views) {
+				for (uint64_t probe = 0; probe < view->count; ++probe) {
+					const auto slot  = (view->first + probe * view->step) / 4u;
+					const auto index = view->slots[slot] & ElementMask;
+					if (m_buried[index] == 0u) continue;
+					memory->dead[slot] = DescriptorHash {}(m_elements[index].value);
+					Assign(*view, slot, 0u);
 				}
-			}
-			if (!buried) continue;
-			for (uint64_t probe = 0; probe < view->count; ++probe) {
-				const auto  slot    = (view->first + probe * view->step) / 4u;
-				const auto& element = m_elements[view->slots[slot] & ElementMask];
-				if (!element.stale) continue;
-				memory->dead[slot] = DescriptorHash {}(element.value);
-				Assign(*view, slot, 0u);
 			}
 		}
 	}
@@ -342,13 +355,13 @@ uint32_t ImageHeap::Intern(View& view, uint32_t kind, const DescriptorValue& val
 		view.kind_keys.push_back(kind);
 		view.kinds.push_back(value);
 	}
-	auto [found, inserted] = view.elements.try_emplace(value, 0u);
+	auto [found, inserted] = view.pool.elements.try_emplace(value, 0u);
 	if (inserted) {
 		found->second    = Allocate();
 		auto& element    = m_elements[found->second];
 		element.value    = value;
 		element.kind     = kind;
-		view.pending.push_back(found->second);
+		view.pool.pending.push_back(found->second);
 	}
 	++m_elements[found->second].refs;
 	return arm << IR::ImageHeapKindShift | found->second;
@@ -358,12 +371,12 @@ void ImageHeap::Release(View& view, uint32_t entry) {
 	const auto index = entry & ElementMask;
 	if (index == 0u || --m_elements[index].refs != 0u) return;
 	auto& element = m_elements[index];
-	if (const auto found = view.elements.find(element.value);
-	    found != view.elements.end() && found->second == index) {
-		view.elements.erase(found);
+	if (const auto found = view.pool.elements.find(element.value);
+	    found != view.pool.elements.end() && found->second == index) {
+		view.pool.elements.erase(found);
 	}
 	Unreference(element);
-	view.released.push_back(index);
+	view.pool.released.push_back(index);
 }
 
 void ImageHeap::Unreference(Element& element) {
@@ -397,13 +410,26 @@ uint32_t ImageHeap::Allocate() {
 	return index;
 }
 
-void ImageHeap::Retire(View& view) {
-	if (view.released.empty()) return;
+void ImageHeap::Retire(Pool& pool) {
+	if (pool.released.empty()) return;
 	// A retired index is reused once its tick ends, so no held entry may keep it.
-	std::erase_if(view.held, [&](uint32_t index) { return m_elements[index].refs == 0u; });
+	const auto free = [&](uint32_t index) { return m_elements[index].refs == 0u; };
+	std::erase_if(pool.pending, free);
+	std::erase_if(pool.held, free);
+	std::erase_if(pool.dcc, free);
+	std::erase_if(pool.away, free);
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
-	for (const auto index: view.released) m_retired.emplace_back(tick, index);
-	view.released.clear();
+	for (const auto index: pool.released) m_retired.emplace_back(tick, index);
+	pool.released.clear();
+}
+
+void ImageHeap::CollectPools() {
+	m_active_pools.clear();
+	for (auto* view: m_active) {
+		if (std::ranges::find(m_active_pools, &view->pool) == m_active_pools.end()) {
+			m_active_pools.push_back(&view->pool);
+		}
+	}
 }
 
 void ImageHeap::Resize(Memory& memory, uint64_t size) {
@@ -448,12 +474,13 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	auto&      textures = m_context.GetTextureCache();
 	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
 	const auto serial   = Image::serials.load(std::memory_order_relaxed);
-	for (auto* view: m_active) {
+	CollectPools();
+	for (auto* pool: m_active_pools) {
 		bool       stale = false;
 		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
-		if (view->resolve_epoch != epoch) {
-			view->resolve_epoch = epoch;
-			for (const auto& [value, index]: view->elements) {
+		if (pool->resolve_epoch != epoch) {
+			pool->resolve_epoch = epoch;
+			for (const auto& [value, index]: pool->elements) {
 				const auto& binding = m_elements[index].binding;
 				if (!binding.image_id) continue;
 				const auto* image = ImageOf(m_elements[index]);
@@ -466,10 +493,10 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			}
 		}
 		// Discovery applies the color metadata clears written since the last draw.
-		std::erase_if(view->dcc, [&](uint32_t index) {
+		std::erase_if(pool->dcc, [&](uint32_t index) {
 			const auto& element = m_elements[index];
 			if (element.refs == 0u || element.stale) return true;
-			if (executor.ResolveTexture(IR::ImageHeapResource(view->profile, element.kind),
+			if (executor.ResolveTexture(IR::ImageHeapResource(pool->profile, element.kind),
 			                            element.value).image_id == element.binding.image_id) {
 				return false;
 			}
@@ -477,13 +504,13 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			return true;
 		});
 		// Held elements retry once an image is created, such as a render target of their extent.
-		if (view->held_serial != serial) {
-			view->held_serial = serial;
-			std::erase_if(view->held, [&](uint32_t index) {
+		if (pool->held_serial != serial) {
+			pool->held_serial = serial;
+			std::erase_if(pool->held, [&](uint32_t index) {
 				const auto& element = m_elements[index];
 				if (element.refs == 0u || element.stale) return true;
 				const auto binding = executor.ResolveTexture(
-				    IR::ImageHeapResource(view->profile, element.kind), element.value);
+				    IR::ImageHeapResource(pool->profile, element.kind), element.value);
 				if (binding.image_id) mark(index);
 				// An unmapped texture stays null.
 				return binding.image_id || binding.desc.info.data.Empty();
@@ -492,20 +519,27 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		if (stale) {
 			// A changed image needs a new element; pending draws still read the old one. The new
 			// element keeps the old value, since a view takes table changes only when acquired.
-			std::erase_if(view->elements,
+			std::erase_if(pool->elements,
 			              [&](const auto& item) { return m_elements[item.second].stale; });
-			for (uint64_t probe = 0; probe < view->count; ++probe) {
-				const auto  slot    = (view->first + probe * view->step) / 4u;
-				const auto& element = m_elements[view->slots[slot] & ElementMask];
-				if (!element.stale) continue;
-				const auto value = element.value; // Intern may grow m_elements.
-				Assign(*view, slot, Intern(*view, element.kind, value));
-			}
+			++pool->renewals;
 		}
-		for (const auto index: view->pending) {
+	}
+	for (auto* view: m_active) {
+		if (view->renewals == view->pool.renewals) continue;
+		view->renewals = view->pool.renewals;
+		for (uint64_t probe = 0; probe < view->count; ++probe) {
+			const auto  slot    = (view->first + probe * view->step) / 4u;
+			const auto& element = m_elements[view->slots[slot] & ElementMask];
+			if (!element.stale) continue;
+			const auto value = element.value; // Intern may grow m_elements.
+			Assign(*view, slot, Intern(*view, element.kind, value));
+		}
+	}
+	for (auto* pool: m_active_pools) {
+		for (const auto index: pool->pending) {
 			if (m_elements[index].refs == 0u) continue;
 			auto binding = executor.ResolveTexture(
-			    IR::ImageHeapResource(view->profile, m_elements[index].kind),
+			    IR::ImageHeapResource(pool->profile, m_elements[index].kind),
 			    m_elements[index].value);
 			if (binding.image_id) {
 				auto& image = textures.GetImage(binding.image_id);
@@ -514,16 +548,16 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				binding.layout     = image.ReadLayout();
 				binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 				if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
-					view->dcc.push_back(index);
+					pool->dcc.push_back(index);
 				}
-				view->away.push_back(index);
+				pool->away.push_back(index);
 			} else if (!binding.desc.info.data.Empty()) {
-				view->held.push_back(index);
+				pool->held.push_back(index);
 			}
 			m_elements[index].binding = std::move(binding);
 			m_writes.push_back(index);
 		}
-		view->pending.clear();
+		pool->pending.clear();
 	}
 	WriteDescriptors();
 }
@@ -561,15 +595,18 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			                       slots.size_bytes());
 			view->dirty_begin = view->dirty_end = 0;
 		}
-		Retire(*view);
-		if (view->layout_epoch != epoch) {
-			view->layout_epoch = epoch;
-			view->away.clear();
-			for (const auto& [value, index]: view->elements) view->away.push_back(index);
+	}
+	CollectPools();
+	for (auto* pool: m_active_pools) {
+		Retire(*pool);
+		if (pool->layout_epoch != epoch) {
+			pool->layout_epoch = epoch;
+			pool->away.clear();
+			for (const auto& [value, index]: pool->elements) pool->away.push_back(index);
 		}
 		// This draw's own bindings own the layouts of its attachments and storage images. An image
 		// this draw's discovery replaced lives until the tick ends, and its slots still select it.
-		std::erase_if(view->away, [&](uint32_t index) {
+		std::erase_if(pool->away, [&](uint32_t index) {
 			const auto& element = m_elements[index];
 			auto*       image   = ImageOf(element);
 			if (element.refs == 0u || image == nullptr) return true;
@@ -624,11 +661,10 @@ void ImageHeap::Drop(Memory& memory) {
 	Unwatch(memory);
 	for (auto& view: memory.views) {
 		std::erase(m_active, view.get());
-		for (const auto& [value, index]: view->elements) {
-			Unreference(m_elements[index]);
-			view->released.push_back(index);
+		for (uint64_t probe = 0; probe < view->count; ++probe) {
+			Assign(*view, (view->first + probe * view->step) / 4u, 0u);
 		}
-		Retire(*view);
+		Retire(view->pool);
 		if (scheduler.Active()) {
 			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
 		}

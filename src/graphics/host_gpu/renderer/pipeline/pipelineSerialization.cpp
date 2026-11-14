@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -44,6 +45,15 @@ struct Frame {
 // Changes with every build, so records never meet code that encodes them differently. Zero when
 // the executable cannot be found.
 uint64_t BuildStamp() {
+	// KYTY_SHADER_CACHE_STAMP=N replaces the executable's time: a rebuild that does not change how
+	// shaders are translated keeps the cache. Change N whenever the shader recompiler changes
+	// (a main update, a shader patch), or the stored programs no longer match the code.
+	if (const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP"); env != nullptr && env[0] != 0) {
+		const auto value = std::strtoull(env, nullptr, 10);
+		if (value != 0) {
+			return value;
+		}
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::array<wchar_t, 32768> name {};
 	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));

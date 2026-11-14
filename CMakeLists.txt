@@ -1,23 +1,28 @@
 cmake_minimum_required(VERSION 3.12...4.3)
 
+# Enforce minimum policy version for bundled dependencies (3rdparty)
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
 endif()
 
 project(Katy)
 
+# Directory paths for source, tests, and third-party dependencies
 set(KATY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KATY_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 set(KATY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
 
+# Detect Linux platform (distinguish from cross-compilation scenarios)
 if(CMAKE_SYSTEM_NAME MATCHES ".*Linux")
 	set(LINUX TRUE)
 endif()
 
+# KatyPS5 supports Windows, Linux, and macOS with Rosetta 2 on Apple Silicon
 if (NOT (WIN32 OR LINUX OR APPLE))
     message(FATAL_ERROR "only Windows, Linux, and macOS builds are supported")
 endif()
 
+# C++ standard: C++20 required for std::ranges, std::format, and other modern features
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -28,6 +33,7 @@ include(CTest)
 
 option(KATY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
 
+# Build provenance: "Source" (development), "Official" (erickson558/KatyPS5), or "Fork" (other forks)
 set(KATY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
 set_property(CACHE KATY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
 if(NOT KATY_BUILD_ORIGIN STREQUAL "Source" AND NOT KATY_BUILD_ORIGIN STREQUAL "Official" AND
@@ -35,6 +41,7 @@ if(NOT KATY_BUILD_ORIGIN STREQUAL "Source" AND NOT KATY_BUILD_ORIGIN STREQUAL "O
 	message(FATAL_ERROR "KATY_BUILD_ORIGIN must be Source, Official, or Fork")
 endif()
 
+# Official builds embed the release tag; fork builds embed the repository name
 set(KATY_RELEASE_TAG "" CACHE STRING "Release tag embedded in official builds")
 set(KATY_BUILD_REPOSITORY "" CACHE STRING "GitHub repository embedded in fork builds")
 set(KATY_OFFICIAL_BUILD OFF)
@@ -55,6 +62,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 include(TestBigEndian)
 
+# KatyPS5 is a 64-bit only emulator (for both guest PS5 and host platforms)
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 	message(FATAL_ERROR "only 64-bit builds are supported")
 endif()

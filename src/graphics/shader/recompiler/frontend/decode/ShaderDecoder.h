@@ -277,6 +277,7 @@ enum class Opcode {
 	V_BFI_B32,
 	V_ALIGNBIT_B32,
 	V_ALIGNBYTE_B32,
+	V_PERM_B32,
 	V_MIN3_F32,
 	V_MIN3_I32,
 	V_MIN3_U32,

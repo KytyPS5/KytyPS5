@@ -29396,6 +29396,56 @@ TestCase VectorAlignByteUsesTwoBitByteOffset() {
   return test;
 }
 
+TestCase VectorPermSelectsBytesSignsAndFills() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  // Bytes 7..0 = 7f 80 c0 11 88 33 7f 44: the top bits of bytes 1, 3, 5, 7 are 0, 1, 1, 0.
+  AppendVMovLiteral(&code, 0, 0x7f80c011u);
+  AppendVMovLiteral(&code, 1, 0x88337f44u);
+  const std::vector<u32> selectors = {0x03020100u, 0x07060504u, 0x0b0a0908u,
+                                      0xff0d0c05u, 0x00070104u, 0x80402010u};
+  for (u32 i = 0; i < static_cast<u32>(std::size(selectors)); i++) {
+    AppendVMovU32(&code, 2, i * sizeof(u32));
+    AppendBufferLoadDword(&code, 2, 2);
+    AppendVop3(&code, 0x344, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorPermSelectsBytesSignsAndFills",
+          code,
+          selectors,
+          {0x88337f44u, 0x7f80c011u, 0x00ffff00u, 0xffff00c0u, 0x447f7f11u,
+           0xffffffffu},
+          {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_PERM_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorPermLiteralSelectorFoldsSelection() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 vgpr = 0; vgpr < 2; vgpr++) {
+    AppendVMovU32(&code, 30, vgpr * sizeof(u32));
+    AppendBufferLoadDword(&code, vgpr, 30);
+  }
+  AppendVop3(&code, 0x344, 10, Vgpr(0), Vgpr(1), 255);
+  code.push_back(0x0c0c0302u);
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  TestCase test{"VectorPermLiteralSelectorFoldsSelection",
+                code,
+                {0x7f80c011u, 0x88337f44u},
+                {0x00008833u},
+                {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_PERM_B32,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.forbidden_spirv = {"OpIEqual", "OpBitFieldSExtract",
+                          "OpBitFieldInsert %uint %uint_0"};
+  return test;
+}
+
 TestCase VectorCarryAndBitCountOps() {
   using O = ShaderOpcode;
 
@@ -48861,6 +48911,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorBfmDropsMaskBitsPastBit31);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
+  AddCase(VectorPermSelectsBytesSignsAndFills);
+  AddCase(VectorPermLiteralSelectorFoldsSelection);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorMbcntUsesThreadMask);
@@ -56752,6 +56804,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorMadU64U32CarryMasksInactiveLanes());
     RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
     RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--perm-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorPermSelectsBytesSignsAndFills());
+    RunCase(&vulkan, VectorPermLiteralSelectorFoldsSelection());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {

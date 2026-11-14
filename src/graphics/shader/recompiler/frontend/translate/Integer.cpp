@@ -490,6 +490,37 @@ void Translator::V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset)
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(lo_part, hi_part));
 }
 
+void Translator::V_PERM_B32(const Decoder::Instruction& inst) {
+	const auto high      = ReadU32(inst.src0);
+	const auto low       = ReadU32(inst.src1);
+	const auto selectors = ReadU32(inst.src2);
+	const auto imm       = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+	const auto extract   = [&](IR::ValueOpcode op, IR::U32 value, IR::U32 offset, uint32_t count) {
+		return IR::U32(ir.Emit(op, {value, offset, imm(count)}));
+	};
+	// {high, low} holds bytes 7..0. Selectors 0-7 copy a byte, 8-11 replicate the top bit of
+	// byte 1, 3, 5 or 7, 12 writes 0x00 and larger selectors write 0xff.
+	const auto byte_at = [&](uint32_t i) {
+		const auto sel  = extract(IR::ValueOpcode::BitFieldUExtract, selectors, imm(i * 8u), 8u);
+		const auto byte = extract(IR::ValueOpcode::BitFieldUExtract,
+		                          ir.Select(ir.ULessThan(sel, imm(4u)), low, high),
+		                          ir.ShiftLeftLogical(ir.BitwiseAnd(sel, imm(3u)), imm(3u)), 8u);
+		const auto sign = extract(
+		    IR::ValueOpcode::BitFieldSExtract, ir.Select(ir.ULessThan(sel, imm(10u)), low, high),
+		    ir.IAdd(ir.ShiftLeftLogical(ir.BitwiseAnd(sel, imm(1u)), imm(4u)), imm(15u)), 1u);
+		const auto fill = ir.Select(ir.IEqual(sel, imm(12u)), imm(0u), imm(0xffu));
+		const auto rest = ir.Select(ir.ULessThan(sel, imm(12u)), sign, fill);
+		return ir.Select(ir.ULessThan(sel, imm(8u)), byte, rest);
+	};
+	// The inserts of bytes 1-3 overwrite bits 8-31, so byte 0 needs none.
+	auto result = byte_at(0);
+	for (uint32_t i = 1; i < 4; i++) {
+		result = IR::U32(
+		    ir.Emit(IR::ValueOpcode::BitFieldInsert, {result, byte_at(i), imm(i * 8u), imm(8u)}));
+	}
+	WriteOperand(DestinationOperand(inst), result);
+}
+
 void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
 	const auto condition =
 	    ReadMask(inst.src_count >= 3u ? inst.src2 : ConditionOperand(Decoder::OperandKind::VccLo));

@@ -228,6 +228,7 @@ private:
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
+	void    V_PERM_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 

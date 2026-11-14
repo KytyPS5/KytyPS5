@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -48,15 +49,23 @@
 
 #if defined(__linux__)
 #include <asm/prctl.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
 #endif
 
 #if defined(__APPLE__)
+#include <climits>
+#include <csignal>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -5861,9 +5870,125 @@ void TestTlsStubsPreserveFlags() {
 
 int RunTrinityTests();
 
+[[noreturn]] void ReportFaultTo(const char* log_path) {
+	static Common::Subsystems subsystems;
+	subsystems.Initialize<Config::Lifecycle>();
+	Config::ConfigOptions options;
+	options.printf_direction   = Config::LogDirection::File;
+	options.printf_output_file = std::filesystem::path(log_path);
+	Config::Load(options);
+	subsystems.Initialize<Log::Lifecycle>();
+	static std::array<uint8_t, 96>       code {};
+	static std::array<uint64_t, 32>      stack {};
+	Common::HostException::ExceptionInfo info {};
+	code[48]               = 0xc3;
+	stack[0]               = 0x1122334455667788ull;
+	info.type              = Common::HostException::ExceptionType::AccessViolation;
+	info.exception_address = reinterpret_cast<uint64_t>(code.data()) + 48;
+	info.rsp               = reinterpret_cast<uint64_t>(stack.data());
+	info.rax               = 0x0123456789abcdefull;
+	Loader::ReportUnhandledHostException(info);
+}
+
+constexpr std::chrono::milliseconds FaultReportChildTimeout {30000};
+
+int RunFaultReportChild(const char* test, const std::filesystem::path& log_path) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	char self[MAX_PATH] {};
+	Check(test, GetModuleFileNameA(nullptr, self, MAX_PATH) != 0, "GetModuleFileName failed");
+	std::string command =
+	    std::string("\"") + self + "\" --fault-report \"" + log_path.string() + "\"";
+	STARTUPINFOA        startup {sizeof(startup)};
+	PROCESS_INFORMATION process {};
+	Check(test,
+	      CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+	                     nullptr, nullptr, &startup, &process) != 0,
+	      "CreateProcess failed");
+	const auto timeout = static_cast<DWORD>(FaultReportChildTimeout.count());
+	const bool exited  = WaitForSingleObject(process.hProcess, timeout) == WAIT_OBJECT_0;
+	if (!exited) {
+		TerminateProcess(process.hProcess, 1);
+		WaitForSingleObject(process.hProcess, INFINITE);
+	}
+	DWORD exit_code = 0;
+	GetExitCodeProcess(process.hProcess, &exit_code);
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	Check(test, exited, "the fault report child timed out");
+	return static_cast<int>(exit_code);
+#else
+#if defined(__APPLE__)
+	std::vector<char> self(PATH_MAX);
+	uint32_t          self_size = static_cast<uint32_t>(self.size());
+	if (_NSGetExecutablePath(self.data(), &self_size) != 0) {
+		self.resize(self_size);
+		Check(test, _NSGetExecutablePath(self.data(), &self_size) == 0,
+		      "_NSGetExecutablePath failed");
+	}
+	const char* self_path = self.data();
+#else
+	const char* self_path = "/proc/self/exe";
+#endif
+	const pid_t pid = ::fork();
+	Check(test, pid >= 0, "fork failed");
+	if (pid == 0) {
+		const int null_fd = ::open("/dev/null", O_WRONLY);
+		::dup2(null_fd, STDOUT_FILENO);
+		::dup2(null_fd, STDERR_FILENO);
+		::execl(self_path, self_path, "--fault-report", log_path.c_str(), nullptr);
+		std::_Exit(0x7e);
+	}
+	const auto deadline = std::chrono::steady_clock::now() + FaultReportChildTimeout;
+	int        status   = 0;
+	pid_t      waited   = 0;
+	while ((waited = ::waitpid(pid, &status, WNOHANG)) == 0 &&
+	       std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	if (waited == 0) {
+		::kill(pid, SIGKILL);
+		::waitpid(pid, &status, 0);
+	}
+	Check(test, waited == pid, "the fault report child timed out");
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+void TestFaultReportReachesTheLogFile() {
+	const char* test      = "FaultReportReachesTheLogFile";
+	const auto  stamp     = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto  log_path  = std::filesystem::temp_directory_path() /
+	                       ("kyty_fault_report_" + std::to_string(stamp) + ".txt");
+	const int   exit_code = RunFaultReportChild(test, log_path);
+	std::string text;
+	{
+		Common::File log(log_path, Common::File::Mode::Read);
+		if (!log.IsInvalid()) {
+			const auto data = log.ReadWholeBuffer();
+			text.assign(reinterpret_cast<const char*>(data.data()), data.size());
+		}
+	}
+	std::error_code ec;
+	std::filesystem::remove(log_path, ec);
+	Check(test, exit_code == 321 || exit_code == (321 & 0xff),
+	      "the fault report did not end in EXIT");
+	Check(test, text.find("Unhandled host exception") != std::string::npos,
+	      "the fault report is missing from the log file");
+	Check(test,
+	      text.find("--- Guest fault context ---\nthread: (host thread)\nrax=0123456789abcdef") !=
+	              std::string::npos &&
+	          text.find("\n c3 00 00") != std::string::npos &&
+	          text.find("stack:\n  1122334455667788 0000000000000000") != std::string::npos,
+	      "the guest fault context is missing from the log file");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
+	}
+	if (argc == 3 && std::strcmp(argv[1], "--fault-report") == 0) {
+		ReportFaultTo(argv[2]);
 	}
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
@@ -6058,6 +6183,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif
+	RunTest(TestFaultReportReachesTheLogFile);
 	// Memory callbacks remain registered for the rest of the process.
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);

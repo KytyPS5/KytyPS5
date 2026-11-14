@@ -120,6 +120,24 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+// A depth-stencil image goes from attachment use to attachment use with shader reads, or back, in
+// a layout that keeps every aspect shaders can read there read-only (depth read-only with a
+// stencil attachment, or the reverse): the shader reads and the attachment writes are of different
+// aspects, so the draws need no barrier between them, nor the render pass break it takes. The
+// image keeps both accesses. Demon's Souls' deferred decals alternate a stencil mark with a decal
+// that samples depth, ~750 times a frame at Boletaria.
+static bool AttachmentKeepsShaderRead(vk::ImageLayout layout, vk::AccessFlags2 access,
+                                      vk::ImageLayout destination_layout,
+                                      vk::AccessFlags2 destination_access) {
+	constexpr auto attachment = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+	                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	return layout == destination_layout &&
+	       (layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+	        layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal) &&
+	       (access & attachment) == attachment && (destination_access & attachment) == attachment &&
+	       (access ^ destination_access) == vk::AccessFlagBits2::eShaderRead;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -165,6 +183,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
+				if (AttachmentKeepsShaderRead(subresource_state.layout, subresource_state.access_mask,
+				                              destination_layout, destination_access)) {
+					subresource_state.access_mask |= destination_access;
+					subresource_state.pl_stage |= destination_stage;
+					continue;
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -198,6 +222,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		if (AttachmentKeepsShaderRead(state.layout, state.access_mask, destination_layout,
+		                              destination_access)) {
+			state.access_mask |= destination_access;
+			state.pl_stage |= destination_stage;
 			return {};
 		}
 

@@ -330,7 +330,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
+	// Only devices with VK_EXT_image_view_min_lod honour the struct; elsewhere the view starts at
+	// its base level and sampling clamps to level 0 as before.
+	if (normalized.min_lod != 0 && m_graphics.image_view_min_lod_enabled) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;

@@ -246,7 +246,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		provoking_vertex.pNext = rasterizer.pNext;
 		rasterizer.pNext = &provoking_vertex;
 	}
-	rasterizer.polygonMode = static_params.polygon_mode;
+	// Metal cannot rasterize point or line fill: MoltenVK rejects the pipeline without
+	// fillModeNonSolid and KosmicKrisp never reports it, so fall back to filled triangles.
+	rasterizer.polygonMode = graphics.fill_mode_non_solid_enabled
+	                             ? static_params.polygon_mode
+	                             : vk::PolygonMode::eFill;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;

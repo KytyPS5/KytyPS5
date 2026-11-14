@@ -895,6 +895,17 @@ bool BufferCache::NoImageStartsAt(uint64_t vaddr) const noexcept {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	// A read-only use of a range without CPU-dirty pages has nothing to upload. The tracker
+	// answers that only for a region without any, and takes the lock of a region with dirty
+	// pages elsewhere, which the guest's fault handlers hold for every write fault. The pages are
+	// read without the lock, as the other queries of the lookups: a CPU write racing with the
+	// check is one that lands after the synchronization.
+	if (!is_written && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		if (is_texel_buffer && !NoImageStartsAt(vaddr)) {
+			return SynchronizeBufferFromImage(buffer, vaddr, size);
+		}
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;

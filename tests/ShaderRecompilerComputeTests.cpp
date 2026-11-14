@@ -289,6 +289,13 @@ struct ImageHeapTestAccess {
   static const auto &Element(const ImageHeap &heap, uint32_t entry) {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
+  static auto &Element(ImageHeap &heap, uint32_t entry) {
+    return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
+  }
+  static void MarkDescriptorChanged(ImageHeap &heap, uint32_t entry) {
+    heap.m_writes.push_back(entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u));
+  }
+  static void FlushWrites(ImageHeap &heap) { heap.WriteDescriptors(); }
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
     return Element(heap, entry).binding.image_id;
   }
@@ -2181,6 +2188,67 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   return b.Build();
 }
 
+// Fetches (0, 0) from the selected image in the resident image heap. The heap
+// redirect test relies on the descriptor set being the only depth input.
+std::vector<u32> MakeHeapDepthFetchFragmentSpirv(u32 index) {
+  using ShaderRecompiler::Spirv::Builder;
+
+  Builder b;
+  b.RequireCapability(spv::CapabilityShader);
+  b.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+
+  const auto void_type = b.Type(spv::OpTypeVoid);
+  const auto func_type = b.Type(spv::OpTypeFunction, void_type);
+  const auto uint_type = b.Type(spv::OpTypeInt, 32, 0);
+  const auto int_type = b.Type(spv::OpTypeInt, 32, 1);
+  const auto float_type = b.Type(spv::OpTypeFloat, 32);
+  const auto vec4_type = b.Type(spv::OpTypeVector, float_type, 4);
+  const auto coord_type = b.Type(spv::OpTypeVector, int_type, 2);
+  const auto image_type = b.Type(spv::OpTypeImage, float_type, spv::Dim2D, 0u, 0u,
+                                 0u, 1u, spv::ImageFormatUnknown);
+  const auto count = b.Constant(spv::OpConstant, uint_type, 65536u);
+  const auto array_type = b.Type(spv::OpTypeArray, image_type, count);
+  const auto image_array_ptr =
+      b.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, array_type);
+  const auto image_array = b.DefineGlobalVariable(image_array_ptr, spv::StorageClassUniformConstant);
+  b.AddAnnotation(spv::OpDecorate, image_array, spv::DecorationDescriptorSet, 1u);
+  b.AddAnnotation(spv::OpDecorate, image_array, spv::DecorationBinding, 0u);
+  const auto output_ptr =
+      b.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4_type);
+  const auto output = b.DefineGlobalVariable(output_ptr, spv::StorageClassOutput);
+  b.AddAnnotation(spv::OpDecorate, output, spv::DecorationLocation, 0u);
+
+  const auto zero_int = b.Constant(spv::OpConstant, int_type, 0u);
+  const auto zero_float = b.Constant(spv::OpConstant, float_type, 0u);
+  const auto one_float = b.Constant(spv::OpConstant, float_type, 0x3f800000u);
+  const auto coord = b.Constant(spv::OpConstantComposite, coord_type, zero_int, zero_int);
+
+  const auto main = b.AllocateId();
+  const auto label = b.AllocateId();
+  const auto images = b.AllocateId();
+  const auto image = b.AllocateId();
+  const auto fetched = b.AllocateId();
+  const auto red = b.AllocateId();
+  const auto color = b.AllocateId();
+
+  b.AddEntryPoint(spv::ExecutionModelFragment, main, "main", {output});
+  b.AddExecutionMode(main, spv::ExecutionModeOriginUpperLeft);
+  b.AddFunction(spv::OpFunction, void_type, main, spv::FunctionControlMaskNone, func_type);
+  b.AddFunction(spv::OpLabel, label);
+  b.AddFunction(spv::OpLoad, array_type, images, image_array);
+  b.AddFunction(spv::OpCompositeExtract, image_type, image, images, index);
+  b.AddFunction(spv::OpImageFetch, vec4_type, fetched, image, coord,
+                spv::ImageOperandsLodMask, zero_int);
+  b.AddFunction(spv::OpCompositeExtract, float_type, red, fetched, 0u);
+  b.AddFunction(spv::OpCompositeConstruct, vec4_type, color, red, zero_float, zero_float,
+                one_float);
+  b.AddFunction(spv::OpStore, output, color);
+  b.AddFunction(spv::OpReturn);
+  b.AddFunction(spv::OpFunctionEnd);
+
+  return b.Build();
+}
+
 } // namespace TestSpv
 
 // D16 depth as the D24 and D32 fallback attachments store it.
@@ -2193,9 +2261,20 @@ u32 EncodeD16AsD32(uint16_t value) {
   return std::bit_cast<u32>(static_cast<float>(value) / 65535.0f);
 }
 
+// The depth-feedback selectors still use null descriptors for unused bindings,
+// but do not need the byte-granular robust-buffer capabilities required by the
+// full suite.
+enum class VulkanHarnessProfile {
+  kStrict,
+  kDepthFeedback,
+};
+
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  explicit VulkanHarness(VulkanHarnessProfile profile = VulkanHarnessProfile::kStrict)
+      : m_profile(profile) {
+    Init();
+  }
   ~VulkanHarness() { Destroy(); }
   // Host float min/max is used on AMD GPUs, as in Kyty.
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
@@ -6002,7 +6081,15 @@ public:
       for (uint32_t texture = 2; texture < 4u; ++texture) {
         write(5, descriptor(texture, Format::k8_8_8_8UNorm));
         Require(name, "changed table", acquire(sampled), "a changed table was declined");
+        const auto changed = filtered.slots[40];
+        Require(name, "unused changed element",
+                ImageHeapTestAccess::Element(heap, changed).last_draw == 0u,
+                "a newly interned element claimed an earlier draw");
         draw();
+        const auto &committed = ImageHeapTestAccess::Element(heap, changed);
+        Require(name, "committed changed element",
+                committed.last_draw != 0u && committed.last_tick != 0u,
+                "a committed element did not record its draw and tick");
       }
       Require(name, "idle view",
               idle.slots[40] == idle_slot && ImageHeapTestAccess::ElementCount(heap) <= 6u,
@@ -6327,6 +6414,307 @@ public:
                 direct_offset, allocation_size) == 0,
             "image heap release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckHeapDepthRedirect() {
+    constexpr const char *name = "HeapDepthRedirect";
+    constexpr uintptr_t base = 0x0000000204400000ull;
+    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t table = base + 0x20000;
+    constexpr uint64_t table_size = 0x10000;
+    constexpr uint32_t extent = 1;
+    namespace IR = ShaderRecompiler::IR;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "heap depth allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "heap depth mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    constexpr float original_depth = 0.125f;
+    constexpr float copy_depth = 0.75f;
+    std::array<uint32_t, 8> words{};
+    words[0] = static_cast<uint32_t>(base >> 8u);
+    words[1] = (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+               (((extent - 1u) & 3u) << 30u);
+    words[2] = ((extent - 1u) >> 2u) | ((extent - 1u) << 14u);
+    words[3] = DstSel(4, 4, 4, 4) |
+               (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    std::memcpy(reinterpret_cast<void *>(table), words.data(), sizeof(words));
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, allocation_size);
+    auto &heap = context.GetImageHeap();
+    auto &textures = context.GetTextureCache();
+    auto &device = context.GetGraphics().device;
+
+    RenderDepthInfo depth{};
+    depth.desc.type = BindingType::DepthTarget;
+    depth.desc.info.data = {base, 256 * extent};
+    depth.desc.info.pixel_format = vk::Format::eD32Sfloat;
+    depth.desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    depth.desc.info.extent = {extent, extent, 1};
+    depth.desc.info.pitch = 64;
+    depth.desc.info.bytes_per_block = 4;
+    depth.desc.info.tile_mode = Prospero::TileMode::kLinear;
+    depth.desc.info.UpdateSize();
+    depth.desc.view_info.format = depth.desc.info.pixel_format;
+    depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    depth.image_id = textures.FindImage(depth.desc);
+    Require(name, "depth image", static_cast<bool>(depth.image_id),
+            "the depth image was not created");
+
+    vk::DescriptorSetLayout empty = nullptr;
+    const vk::DescriptorSetLayoutCreateInfo empty_info{};
+    Require(name, "set 0 layout",
+            device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                vk::Result::eSuccess,
+            "could not create the set 0 layout");
+    vk::PipelineLayout layout = nullptr;
+    const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 2;
+    layout_info.pSetLayouts = set_layouts.data();
+    Require(name, "pipeline layout",
+            device.createPipelineLayout(&layout_info, nullptr, &layout) ==
+                vk::Result::eSuccess,
+            "could not create a pipeline layout with the heap set");
+
+    IR::ImageResource root{};
+    root.resource_class = IR::ImageResourceClass::Sampled;
+    root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    root.numeric_class = Prospero::TextureNumericClass::Float;
+    root.read = true;
+    root.heap = true;
+    root.unfiltered_access_only = false;
+    IR::ImageHeapView view{};
+    heap.BeginDraw();
+    Require(name, "first acquire",
+            heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view) &&
+                !view.kinds.empty() && ImageHeapTestAccess::Views(heap).size() == 1u,
+            "the depth heap table was not kept resident");
+    const auto entry = ImageHeapTestAccess::Views(heap)[0]->slots[0];
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
+    ValidateSpirv(name, vertex_spirv);
+    const auto fragment_spirv = TestSpv::MakeHeapDepthFetchFragmentSpirv(
+        entry & ((1u << IR::ImageHeapKindShift) - 1u));
+    ValidateSpirv(name, fragment_spirv);
+    vk::ShaderModule vertex_module = CreateShaderModule(name, vertex_spirv);
+    vk::ShaderModule fragment_module = CreateShaderModule(name, fragment_spirv);
+    const std::array<float, 18> vertices{-1, -1, 1, 1, 1, 1, 3, -1, 1, 1, 1, 1,
+                                        -1, 3, 1, 1, 1, 1};
+    std::vector<u32> vertex_words(vertices.size());
+    std::memcpy(vertex_words.data(), vertices.data(), sizeof(vertices));
+    auto vertex_buffer =
+        CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer,
+                         vertex_words);
+    Image target0 = CreateImage2D(name, extent, 1, vk::Format::eR32G32B32A32Sfloat,
+                                  vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                                  vk::ImageLayout::eGeneral);
+    Image target1 = CreateImage2D(name, extent, 1, vk::Format::eR32G32B32A32Sfloat,
+                                  vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+                                  vk::ImageLayout::eGeneral);
+
+    vk::PipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[0].stage = vk::ShaderStageFlagBits::eVertex;
+    stages[0].module = vertex_module;
+    stages[0].pName = "main";
+    stages[1].sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stages[1].stage = vk::ShaderStageFlagBits::eFragment;
+    stages[1].module = fragment_module;
+    stages[1].pName = "main";
+    vk::VertexInputBindingDescription vertex_binding{};
+    vertex_binding.binding = 0;
+    vertex_binding.stride = 6u * sizeof(float);
+    vertex_binding.inputRate = vk::VertexInputRate::eVertex;
+    vk::VertexInputAttributeDescription attributes[2] = {};
+    attributes[0].location = 0;
+    attributes[0].binding = 0;
+    attributes[0].format = vk::Format::eR32G32Sfloat;
+    attributes[0].offset = 0;
+    attributes[1].location = 1;
+    attributes[1].binding = 0;
+    attributes[1].format = vk::Format::eR32G32B32A32Sfloat;
+    attributes[1].offset = 2u * sizeof(float);
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
+    vertex_input.vertexBindingDescriptionCount = 1;
+    vertex_input.pVertexBindingDescriptions = &vertex_binding;
+    vertex_input.vertexAttributeDescriptionCount = 2;
+    vertex_input.pVertexAttributeDescriptions = attributes;
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+    input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    vk::Viewport viewport{};
+    viewport.width = static_cast<float>(extent);
+    viewport.height = 1.0f;
+    viewport.maxDepth = 1.0f;
+    vk::Rect2D scissor{};
+    scissor.extent.width = extent;
+    scissor.extent.height = 1;
+    vk::PipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+    raster.polygonMode = vk::PolygonMode::eFill;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    raster.frontFace = vk::FrontFace::eCounterClockwise;
+    raster.lineWidth = 1.0f;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
+    multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    vk::PipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = vk::ColorComponentFlagBits::eR |
+                           vk::ColorComponentFlagBits::eG |
+                           vk::ColorComponentFlagBits::eB |
+                           vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo color_blend{};
+    color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
+    color_blend.attachmentCount = 1;
+    color_blend.pAttachments = &blend;
+    vk::PipelineRenderingCreateInfo rendering_pipeline{};
+    rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+    rendering_pipeline.colorAttachmentCount = 1;
+    rendering_pipeline.pColorAttachmentFormats = &target0.format;
+    vk::GraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+    pipeline_info.pNext = &rendering_pipeline;
+    pipeline_info.stageCount = 2;
+    pipeline_info.pStages = stages;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.pColorBlendState = &color_blend;
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "graphics pipeline",
+              device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "vkCreateGraphicsPipelines");
+
+    const auto point_elements_at_depth = [&] {
+      auto &element = ImageHeapTestAccess::Element(heap, entry);
+      element.binding.desc = depth.desc;
+      element.binding.image_id = depth.image_id;
+      element.binding.image_view = textures.FindDepthTarget(depth.image_id, depth.desc);
+      element.binding.layout = textures.GetImage(depth.image_id).ReadLayout();
+      element.binding.mip_views.clear();
+      element.serial = textures.GetImage(depth.image_id).serial;
+      ImageHeapTestAccess::MarkDescriptorChanged(heap, entry);
+    };
+    point_elements_at_depth();
+    Require(name, "first element depth",
+            ImageHeapTestAccess::ImageOf(heap, entry) == depth.image_id,
+            "the heap element did not select the depth image");
+    vk::ClearValue original_clear{};
+    original_clear.depthStencil = {original_depth, 0};
+    const vk::ImageSubresourceRange depth_range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+    TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), depth.image_id, depth_range,
+                                       original_clear);
+    auto &depth_image = textures.GetImage(depth.image_id);
+    depth_image.Transit(depth_image.ReadLayout(), vk::AccessFlagBits2::eShaderRead,
+                        ImageSubresourceRange{0, 1, 0, 1}, scheduler.Current().Handle());
+
+    const auto draw = [&](Image &target) {
+      auto &command = scheduler.Current();
+      ImageHeapTestAccess::FlushWrites(heap);
+      heap.Commit(command, vk::PipelineBindPoint::eGraphics, layout);
+      vk::RenderingAttachmentInfo color{};
+      color.imageView = target.view;
+      color.imageLayout = vk::ImageLayout::eGeneral;
+      color.loadOp = vk::AttachmentLoadOp::eClear;
+      color.storeOp = vk::AttachmentStoreOp::eStore;
+      color.clearValue.color.float32 = std::array<float, 4>{0, 0, 0, 0};
+      vk::RenderingInfo rendering{};
+      rendering.renderArea.extent = {extent, 1};
+      rendering.layerCount = 1;
+      rendering.colorAttachmentCount = 1;
+      rendering.pColorAttachments = &color;
+      command.Handle().beginRendering(rendering);
+      command.Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      vk::DeviceSize offset = 0;
+      command.Handle().bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+      command.Handle().draw(3, 1, 0, 0);
+      command.Handle().endRendering();
+    };
+    draw(target0);
+
+    // A skipped draw can leave a view active without committing it. The redirect must still
+    // serialize with the previous draw's use of that view before rewriting its heap elements.
+    heap.BeginDraw();
+    Require(name, "skipped acquire",
+            heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view),
+            "the skipped draw did not reacquire the depth heap table");
+    point_elements_at_depth();
+
+    const ImageSubresourceRange range{0, 1, 0, 1};
+    // The copy applies the draw's pending load clear itself; the redirect test then reads the
+    // clear value instead of the copied original depth.
+    const ImageId copy_id = textures.CopyDepthForFeedback(
+        depth.image_id, range, vk::ImageAspectFlagBits::eDepth,
+        vk::ImageAspectFlagBits::eDepth, vk::ClearDepthStencilValue{copy_depth, 0},
+        depth.desc.view_info, {extent, 1}, 1);
+    Require(name, "feedback copy", static_cast<bool>(copy_id),
+            "the depth feedback copy was not created");
+
+    heap.BeginDraw();
+    Require(name, "second acquire",
+            heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view),
+            "the depth heap table was not reacquired");
+    point_elements_at_depth();
+    heap.RedirectDepth(depth.image_id, copy_id, range, vk::ImageAspectFlagBits::eDepth);
+    Require(name, "redirected element",
+            ImageHeapTestAccess::ImageOf(heap, entry) == copy_id,
+            "the heap element was not redirected to the feedback copy");
+    draw(target1);
+    scheduler.Finish();
+
+    const auto first = ReadImage(name, &target0);
+    const auto second = ReadImage(name, &target1);
+    Require(name, "first draw original depth",
+            !first.empty() &&
+                std::abs(std::bit_cast<float>(first[0]) - original_depth) < 0.000001f,
+            "the first draw read the redirected feedback copy");
+    Require(name, "second draw feedback copy",
+            !second.empty() &&
+                std::abs(std::bit_cast<float>(second[0]) - copy_depth) < 0.000001f,
+            "the second draw did not read the redirected feedback copy");
+
+    device.destroyPipeline(pipeline, nullptr);
+    device.destroyPipelineLayout(layout, nullptr);
+    device.destroyDescriptorSetLayout(empty, nullptr);
+    DestroyImage(&target1);
+    DestroyImage(&target0);
+    DestroyBuffer(&vertex_buffer);
+    device.destroyShaderModule(fragment_module, nullptr);
+    device.destroyShaderModule(vertex_module, nullptr);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                   allocation_size) == 0,
+            "heap depth mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckComputeMetaClearClassification() {
@@ -15979,6 +16367,7 @@ public:
 
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
+    const bool feedback_loops = m_runtime_context.attachment_feedback_loop_enabled;
     constexpr uintptr_t base = 0x0000000203600000ull;
     constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -17478,14 +17867,15 @@ public:
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), disjoint_binding));
       const auto &disjoint_image = texture_cache.GetImage(disjoint_depth_id);
+      const auto disjoint_layout = feedback_loops
+          ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+          : vk::ImageLayout::eGeneral;
       Require(name, "disjoint depth sampling during depth writes",
               !disjoint_feedback &&
                   disjoint_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
-                  disjoint_binding.images[0].layout ==
-                      disjoint_rendering.depth_stencil_attachment.image_layout &&
-                  disjoint_image.backing.state.layout ==
-                      disjoint_rendering.depth_stencil_attachment.image_layout &&
+                      disjoint_layout &&
+                  disjoint_binding.images[0].layout == disjoint_layout &&
+                  disjoint_image.backing.state.layout == disjoint_layout &&
                   disjoint_image.backing.subresource_states.empty(),
               "disjoint sampling used inconsistent image layouts or enabled feedback");
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -17520,15 +17910,28 @@ public:
           depth_views_stages, &depth_views_feedback);
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), depth_views_binding));
+      const bool depth_views_copied = !feedback_loops;
+      const auto depth_views_layout = feedback_loops
+          ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+          : vk::ImageLayout::eGeneral;
+      const auto overlapping_binding_layout = depth_views_copied
+          ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+          : depth_views_layout;
+      const auto disjoint_binding_layout = depth_views_layout;
       Require(name, "overlapping and disjoint depth views",
               overlapping_view != nullptr &&
-                  depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
+                  depth_views_feedback == (feedback_loops
+                                               ? vk::ImageAspectFlagBits::eDepth
+                                               : vk::ImageAspectFlags{}) &&
                   depth_views_rendering.depth_stencil_attachment.image_layout ==
-                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                      depth_views_layout &&
                   MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
-                      depth_views_rendering.depth_stencil_attachment.image_layout &&
+                      overlapping_binding_layout &&
                   MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
-                      depth_views_rendering.depth_stencil_attachment.image_layout,
+                      disjoint_binding_layout &&
+                  (!depth_views_copied ||
+                   (depth_views_binding.images[0].image_id != disjoint_depth_id &&
+                    depth_views_binding.images[1].image_id == disjoint_depth_id)),
               "two depth views chose different descriptor layouts or feedback aspects");
 
       Libs::LibKernel::Memory::WriteBacking(
@@ -17922,24 +18325,33 @@ public:
             bounds_bindings.pixel));
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
         const auto &pixel_depth = bounds_bindings.pixel.images[0];
+        const bool bounds_copied = pass == 0 && !feedback_loops;
         const auto expected_layout = pass == 0
-            ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+            ? (feedback_loops ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                              : vk::ImageLayout::eDepthAttachmentOptimal)
             : vk::ImageLayout::eDepthReadOnlyOptimal;
+        const auto expected_binding_layout = bounds_copied
+            ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+            : expected_layout;
+        const auto expected_image_id = bounds_copied
+            ? bounds_bindings.pixel.images[0].image_id
+            : depth_only.image_id;
         Require(name, "deferred clear with sampled depth bounds",
                 bounds_depth.image_id == depth_only.image_id &&
                     bounds_depth.depth_bounds_test_enable &&
                     !bounds_depth.depth_write_enable &&
                     static_cast<bool>(bounds_depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) == (pass == 0) &&
                     !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
-                    bounds_feedback == (pass == 0
+                    bounds_feedback == (pass == 0 && feedback_loops
                                             ? vk::ImageAspectFlagBits::eDepth
                                             : vk::ImageAspectFlags{}) &&
                     bounds_rendering.depth_stencil_attachment.image_layout == expected_layout &&
                     bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
-                    vertex_depth.image_id == depth_only.image_id &&
-                    pixel_depth.image_id == depth_only.image_id &&
-                    MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
-                    MakeImageInfo(pixel_depth).imageLayout == expected_layout,
+                    vertex_depth.image_id == expected_image_id &&
+                    pixel_depth.image_id == expected_image_id &&
+                    (!bounds_copied || expected_image_id != depth_only.image_id) &&
+                    MakeImageInfo(vertex_depth).imageLayout == expected_binding_layout &&
+                    MakeImageInfo(pixel_depth).imageLayout == expected_binding_layout,
                 "a deferred clear sampled by vertex and pixel stages missed depth feedback");
         scheduler.Current().BeginRendering(bounds_rendering);
         scheduler.EndRendering();
@@ -18366,10 +18778,22 @@ public:
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), shared_bindings.vertex[0],
             shared_bindings.pixel));
-        const auto expected_layout =
-            stencil_write
-                ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-                : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+        const bool copied = !feedback_loops && stencil_write;
+        const auto expected_layout = stencil_write
+            ? (feedback_loops ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                              : vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal)
+            : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+        const auto expected_vertex_layout = expected_layout;
+        const auto expected_pixel_layout = copied
+            ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+            : expected_layout;
+        const auto expected_vertex_id = shared_depth.image_id;
+        const auto expected_pixel_id = copied
+            ? shared_bindings.pixel.images[0].image_id
+            : shared_depth.image_id;
+        const auto expected_stencil_view = copied
+            ? texture_cache.GetImage(expected_pixel_id).FindView(stencil_view_info)
+            : stencil_view;
         const auto expected_access =
             vk::AccessFlagBits2::eShaderRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
@@ -18378,14 +18802,15 @@ public:
         Require(name, "sampled depth and stencil attachment layout",
                 shared_depth.image_id == phased_depth.image_id &&
                     stencil_view != nullptr &&
-                    shared_feedback == (stencil_write
+                    shared_feedback == (stencil_write && !copied
                                             ? vk::ImageAspectFlagBits::eStencil
                                             : vk::ImageAspectFlags{}) &&
-                    vertex_image.image_id == shared_depth.image_id &&
-                    pixel_image.image_id == shared_depth.image_id &&
-                    pixel_image.image_view == stencil_view &&
-                    MakeImageInfo(vertex_image).imageLayout == expected_layout &&
-                    MakeImageInfo(pixel_image).imageLayout == expected_layout &&
+                    vertex_image.image_id == expected_vertex_id &&
+                    pixel_image.image_id == expected_pixel_id &&
+                    (!copied || expected_pixel_id != shared_depth.image_id) &&
+                    pixel_image.image_view == expected_stencil_view &&
+                    MakeImageInfo(vertex_image).imageLayout == expected_vertex_layout &&
+                    MakeImageInfo(pixel_image).imageLayout == expected_pixel_layout &&
                     shared_rendering.depth_stencil_attachment.image_layout ==
                         expected_layout &&
                     shared_image.backing.state.layout == expected_layout &&
@@ -20188,9 +20613,22 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  // Hosts without attachment feedback loops: the same depth read/write draws through a copy.
+  void CheckRasterizationWithoutFeedbackLoops() {
+    auto &graphics = RuntimeContext();
+    const bool enabled = graphics.attachment_feedback_loop_enabled;
+    graphics.attachment_feedback_loop_enabled = false;
+    CheckRasterization(true);
+    graphics.attachment_feedback_loop_enabled = enabled;
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
+    if (!RasterizationSupported()) {
+      SkipRasterizationCases(1);
+      return;
+    }
     const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
@@ -20209,6 +20647,7 @@ public:
     }
     const bool packed_vertex_color = color_format != Prospero::BufferFormat::k32_32_32_32Float;
     const uint32_t extent = depth_feedback ? 8 : 32;
+    const bool feedback_loops = m_runtime_context.attachment_feedback_loop_enabled;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
@@ -20419,12 +20858,23 @@ public:
           executor, command, &color, 1, depth, stages, &feedback_aspects);
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+      const bool depth_read_write = depth_feedback && depth.depth_write_enable;
+      const bool has_sampled = !bindings.pixel.images.empty();
+      const ImageId sampled_id = has_sampled ? bindings.pixel.images[0].image_id : ImageId{};
+      const bool copied = depth_read_write && !feedback_loops;
       Require(name, "per-draw depth feedback",
-              feedback_enabled == (depth_feedback && depth.depth_write_enable) &&
+              feedback_enabled == (feedback_loops && depth_read_write) &&
                   feedback_aspects == (feedback_enabled
                                           ? vk::ImageAspectFlagBits::eDepth
-                                          : vk::ImageAspectFlags{}),
+                                          : vk::ImageAspectFlags{}) &&
+                  (!copied || (has_sampled && sampled_id != depth.image_id)),
               "feedback was not selected only for an overlapping fragment depth read/write");
+      Require(name, "host-only depth feedback copy",
+              !copied ||
+                  (has_sampled && !cache.GetImage(sampled_id).registered &&
+                   cache.GetImage(sampled_id).info.data.Empty() &&
+                   cache.GetImage(sampled_id).info.IsDepth()),
+              "the unsupported feedback path did not sample a host-only depth copy");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], bindings.pixel);
       command.BeginRendering(rendering);
@@ -20463,7 +20913,13 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_feedback_dynamic_supported) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      } else {
+        Require(name, "attachment feedback dynamic state",
+                feedback_aspects == vk::ImageAspectFlags{},
+                "the host cannot select attachment feedback aspects without the dynamic state extension");
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23548,7 +24004,13 @@ public:
 #include "RayQueryTraversalGpuTests.inc"
 
 private:
+  [[nodiscard]] bool RequiresRobustAccess() const {
+    return m_profile == VulkanHarnessProfile::kStrict;
+  }
+
+  VulkanHarnessProfile m_profile = VulkanHarnessProfile::kStrict;
   bool m_rasterization_supported = true;
+  bool m_feedback_dynamic_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -23595,7 +24057,10 @@ private:
     m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.sampler_filter_minmax_enabled = true;
-    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    // Attachment feedback needs both the layout and the dynamic-state command; the
+    // copy fallback covers hosts that only expose the layout.
+    m_runtime_context.attachment_feedback_loop_enabled =
+        m_rasterization_supported && m_feedback_dynamic_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
@@ -23767,11 +24232,13 @@ private:
     m_physical_device.getProperties2(&properties2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_robustness2.robustBufferAccess2 == true &&
-                available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
-            "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    if (RequiresRobustAccess()) {
+      Require("VulkanHarness", "dispatch",
+              available_robustness2.robustBufferAccess2 == true &&
+                  available_pipeline_robustness.pipelineRobustness == true &&
+                  robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+              "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -23825,6 +24292,8 @@ private:
             available_acceleration_structure.accelerationStructure == true &&
                 available_ray_query.rayQuery == true,
             "acceleration structures and ray queries are not supported");
+    m_feedback_dynamic_supported =
+        available_feedback_dynamic.attachmentFeedbackLoopDynamicState;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.drawIndirectFirstInstance &&
@@ -23834,8 +24303,12 @@ private:
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
                                 available_provoking_vertex.provokingVertexLast;
+#if !defined(__APPLE__)
+    // The production pipeline enables depth clamping on non-Apple platforms.
+    m_rasterization_supported =
+        m_rasterization_supported && available_features.depthClamp;
+#endif
     if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable, rasterization cases "
@@ -23891,9 +24364,13 @@ private:
       clip_control.depthClipControl = true;
       feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
-      feedback_dynamic.pNext = &feedback_layout;
-      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      if (m_feedback_dynamic_supported) {
+        feedback_dynamic.pNext = &feedback_layout;
+        feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+        provoking_vertex.pNext = &feedback_dynamic;
+      } else {
+        provoking_vertex.pNext = &feedback_layout;
+      }
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -23908,13 +24385,17 @@ private:
     shader_clock.pNext = &min_lod;
     maintenance8.pNext = &shader_clock;
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness{};
-    pipeline_robustness.pipelineRobustness = true;
-    pipeline_robustness.pNext = &maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
-    robustness2.nullDescriptor = true;
-    robustness2.pNext = &pipeline_robustness;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
+    robustness2.nullDescriptor = true;
+    if (RequiresRobustAccess()) {
+      pipeline_robustness.pipelineRobustness = true;
+      pipeline_robustness.pNext = &maintenance8;
+      robustness2.pNext = &pipeline_robustness;
+    } else {
+      robustness2.pNext = &maintenance8;
+    }
     conditional_rendering.pNext = &robustness2;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     mesh.meshShader = mesh.taskShader = true;
@@ -23939,6 +24420,9 @@ private:
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+#if !defined(__APPLE__)
+    device_features.depthClamp = m_rasterization_supported;
+#endif
     device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
@@ -23948,7 +24432,6 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -23957,12 +24440,17 @@ private:
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_QUERY_EXTENSION_NAME};
+    if (RequiresRobustAccess()) {
+      device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_dynamic_supported) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     device_info.enabledExtensionCount =
@@ -49646,6 +50134,10 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
 void CheckShaderStore(VulkanHarness &vulkan) {
   constexpr const char *name = "ShaderStore";
+  if (!vulkan.RasterizationSupported()) {
+    vulkan.SkipRasterizationCases(1);
+    return;
+  }
   constexpr uintptr_t base = 0x0000000205000000ull;
   constexpr uint64_t allocation_size = 0x10000;
   constexpr u32 value = 0x2a;
@@ -57111,6 +57603,17 @@ int main(int argc, char **argv) {
     vulkan.CheckSamplerFilterMode();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-copy-only") == 0) {
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
+    vulkan.CheckHeapDepthRedirect();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--heap-depth-redirect-only") == 0) {
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
+    vulkan.CheckHeapDepthRedirect();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -57118,6 +57621,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
@@ -57138,6 +57642,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckHeapDepthRedirect();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     CheckSamplerCandidateTables(vulkan);
@@ -57166,7 +57671,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-rebind-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -57196,7 +57701,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(VulkanHarnessProfile::kDepthFeedback);
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
@@ -57238,6 +57743,7 @@ int main(int argc, char **argv) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();
     vulkan.CheckRasterization(true);
+    vulkan.CheckRasterizationWithoutFeedbackLoops();
   } else {
     skipped_device_checks = true;
   }
@@ -57330,6 +57836,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckHeapDepthRedirect();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

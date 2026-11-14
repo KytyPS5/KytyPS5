@@ -249,6 +249,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 
 void TextureCache::DeleteImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	ReleaseDepthFeedbackCopy(id);
 	if (!image.registered) {
 		return;
 	}
@@ -274,6 +275,120 @@ void TextureCache::DeleteImage(ImageId id) {
 	} else {
 		m_slot_images.erase(id);
 	}
+}
+
+void TextureCache::ReleaseDepthFeedbackCopy(ImageId depth_id) {
+	const auto found = m_depth_feedback_copies.find(depth_id);
+	if (found == m_depth_feedback_copies.end()) {
+		return;
+	}
+	const auto copy_id = found->second;
+	m_depth_feedback_copies.erase(found);
+	const auto copy_bytes =
+	    m_graphics.CanReportMemoryUsage() ? 0 : m_slot_images[copy_id].BackingSize();
+	// The copy is never registered: queued work may still sample it.
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation([this, copy_id, copy_bytes] {
+			m_total_used_memory -= copy_bytes;
+			m_slot_images.erase(copy_id);
+		});
+	} else {
+		m_total_used_memory -= copy_bytes;
+		m_slot_images.erase(copy_id);
+	}
+}
+
+ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
+                                           vk::ImageAspectFlags aspects,
+                                           vk::ImageAspectFlags clear_aspects,
+                                           const vk::ClearDepthStencilValue& clear,
+                                           const ImageViewInfo& attachment_view,
+                                           vk::Extent2D render_area, uint32_t render_layers) {
+	EXIT_IF(render_layers == 0);
+	if (const auto found = m_depth_feedback_copies.find(depth_id);
+	    found != m_depth_feedback_copies.end()) {
+		const auto& depth = m_slot_images[depth_id].backing;
+		const auto& copy  = m_slot_images[found->second].backing;
+		if (copy.format != depth.format || copy.extent != depth.extent ||
+		    copy.mip_levels != depth.mip_levels || copy.layers != depth.layers ||
+		    copy.samples != depth.samples) {
+			ReleaseDepthFeedbackCopy(depth_id);
+		}
+	}
+	auto [entry, inserted] = m_depth_feedback_copies.try_emplace(depth_id);
+	if (inserted) {
+		// Same layout as the depth image, without guest memory: never registered or tracked.
+		auto info     = m_slot_images[depth_id].info;
+		info.data     = {};
+		info.stencil  = {};
+		info.metadata = {};
+		entry->second = m_slot_images.insert(m_graphics, m_scheduler, info);
+		if (!m_graphics.CanReportMemoryUsage()) {
+			m_total_used_memory += m_slot_images[entry->second].BackingSize();
+		}
+	}
+	// References after the insertion: it may allocate a new image chunk.
+	auto& depth = m_slot_images[depth_id];
+	auto& copy  = m_slot_images[entry->second];
+	EXIT_IF(range.level_count == 0 || range.layer_count == 0 ||
+	        range.base_level + range.level_count > depth.backing.mip_levels ||
+	        range.base_layer + range.layer_count > depth.backing.layers);
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	depth.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
+	              command);
+	copy.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range,
+	             command);
+	std::vector<vk::ImageCopy> copies;
+	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {
+		if (!(aspects & aspect)) {
+			continue;
+		}
+		for (uint32_t level = range.base_level; level < range.base_level + range.level_count;
+		     level++) {
+			vk::ImageCopy region {};
+			region.srcSubresource = {aspect, level, range.base_layer, range.layer_count};
+			region.dstSubresource = region.srcSubresource;
+			region.extent = vk::Extent3D {std::max(depth.backing.extent.width >> level, 1u),
+			                              std::max(depth.backing.extent.height >> level, 1u), 1u};
+			copies.push_back(region);
+		}
+	}
+	if (!copies.empty()) {
+		command.copyImage(depth.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                  static_cast<uint32_t>(copies.size()), copies.data());
+	}
+	// The draw's pending loadOp clear has not run yet, so apply it to the copy before the
+	// shader reads it; otherwise the first feedback draw samples the previous contents.
+	// The clear uses the attachment view and render area, so copied samples outside the
+	// attachment subresources or render area keep their copied values.
+	const auto cleared_aspects = clear_aspects & aspects & attachment_view.aspect;
+	if (cleared_aspects && render_area.width != 0 && render_area.height != 0) {
+		copy.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		             vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command);
+		RenderState state {};
+		state.width              = render_area.width;
+		state.height             = render_area.height;
+		state.num_layers         = render_layers;
+		auto& attachment         = state.depth_stencil_attachment;
+		attachment.image_view   = copy.FindView(attachment_view);
+		attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+		attachment.has_depth    = static_cast<bool>(attachment_view.aspect & vk::ImageAspectFlagBits::eDepth);
+		attachment.has_stencil  = static_cast<bool>(attachment_view.aspect & vk::ImageAspectFlagBits::eStencil);
+		auto& clear_buffer      = m_scheduler.Current();
+		clear_buffer.BeginRendering(state);
+		vk::ClearAttachment clear_attachment {};
+		clear_attachment.aspectMask           = cleared_aspects;
+		clear_attachment.clearValue.depthStencil = clear;
+		vk::ClearRect clear_rect {};
+		clear_rect.rect        = vk::Rect2D {{0, 0}, render_area};
+		clear_rect.layerCount  = render_layers;
+		clear_buffer.Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+		clear_buffer.EndRendering();
+	}
+	copy.Transit(copy.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, command);
+	return entry->second;
 }
 
 void TextureCache::FreeImage(ImageId id) {

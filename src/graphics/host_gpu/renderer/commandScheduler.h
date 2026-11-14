@@ -42,6 +42,7 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	[[nodiscard]] bool HasCommand() const noexcept { return !m_command.IsInvalid(); }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }

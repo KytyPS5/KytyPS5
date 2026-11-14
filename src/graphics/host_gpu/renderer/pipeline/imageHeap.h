@@ -44,6 +44,17 @@ public:
 	void Rebind(RenderExecutor& executor);
 	// Recording: uploads slots, moves resident images to their read layout and binds the array.
 	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
+	// One resident heap entry that samples `image_id`, with its base and dynamic-mip views.
+	struct DepthView {
+		ImageViewInfo             base;
+		std::vector<ImageViewInfo> mips;
+	};
+	// Views this draw's heap selects from an image, for the depth-feedback copy range.
+	void DepthViews(ImageId image_id, std::vector<DepthView>& views) const;
+	// Redirects heap elements sampling the writable depth image to its host-only copy. `range`
+	// must cover every base and mip view of a redirected element.
+	void RedirectDepth(ImageId image_id, ImageId copy_id, const ImageSubresourceRange& range,
+	                   vk::ImageAspectFlags aspects);
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -62,8 +73,10 @@ private:
 		TextureBinding  binding;
 		uint32_t        kind   = 0;
 		uint32_t        refs   = 0; // Slots of the owning view that select it.
-		bool            stale  = false;
-		uint64_t        serial = 0; // Image::serial of binding.image_id.
+		bool            stale     = false;
+		uint64_t        serial    = 0; // Image::serial of binding.image_id.
+		uint64_t        last_draw = 0; // Last draw whose commit selected it.
+		uint64_t        last_tick = 0; // Scheduler tick of that draw's command buffer.
 	};
 
 	struct Memory;

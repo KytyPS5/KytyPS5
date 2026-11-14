@@ -186,6 +186,17 @@ struct EmitterState {
 	uint32_t                                         mip_stats_variable      = 0;
 	bool                                             mip_stats_records       = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Table mode (IR::Program::table_mode, EmitTableMode): the block's device address, each slot the shader reads (0:
+	// not given), and each buffer's device address and size in dwords.
+	uint32_t                                         table_block             = 0;
+	std::vector<uint32_t>                            table_slot_values;
+	std::vector<uint32_t>                            table_bases;
+	std::vector<uint32_t>                            table_lengths;
+	// Each buffer's stride, from its V# (the renderer gives a pair's program the V#s of other strides).
+	std::vector<uint32_t>                            table_strides;
+	// The buffer words (the V#s' fourth dwords) of the buffers whose format is decoded at run time
+	// (IR::TablePlan::runtime_formats), else 0.
+	std::vector<uint32_t>                            table_buffer_words;
 	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	// Per-invocation memory (scratch and function-local LDS) lives in Function variables of
@@ -489,7 +500,17 @@ struct MemoryResourceAccess {
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Table mode: object_pointer is a physical storage buffer pointer (EmitTableMode); loads and stores through it
+	// carry their alignment (EmitAccessLoad, EmitAccessStore).
+	bool                  physical         = false;
 };
+
+// A load or store through a buffer access's element pointer (with the alignment a physical pointer needs).
+uint32_t EmitAccessLoad(EmitterState& state, uint32_t type, uint32_t pointer, const MemoryResourceAccess& access);
+void     EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, const MemoryResourceAccess& access);
+// Table mode, at the function's entry (state.table_*).
+void EmitTableMode(EmitterState& state);
+uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);

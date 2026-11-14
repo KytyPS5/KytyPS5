@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -866,7 +867,11 @@ bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void NoteEmulatorWrite(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources != nullptr) g_gpu_resources->GetBufferCache().NoteHostWrite(vaddr, size);
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->GetBufferCache().NoteHostWrite(vaddr, size);
+		g_gpu_resources->GetTextureCache().NoteMetadataWrite(vaddr, size);
+	}
+	Graphics::Scout::NoteHostWriteIfOn(vaddr, size);
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {

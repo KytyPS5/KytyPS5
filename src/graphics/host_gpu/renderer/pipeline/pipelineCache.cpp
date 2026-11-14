@@ -757,6 +757,100 @@ bool GuestReadLog::OnlyRefreshableBitsChanged(const Entry& entry) const {
 	return true;
 }
 
+bool GuestReadLog::DwordAligned() const {
+	return std::ranges::all_of(m_entries, [](const Entry& entry) {
+		return entry.address % 4u == 0 && entry.size % 4u == 0 && entry.offset % 4u == 0;
+	});
+}
+
+bool GuestReadLog::FirstMismatch(uint32_t& index, uint64_t& address, uint32_t& size, uint32_t& old_value,
+                                 uint32_t& new_value) const {
+	static thread_local std::vector<uint8_t> now;
+	for (uint32_t i = 0; i < m_entries.size(); ++i) {
+		const auto& entry = m_entries[i];
+		const auto* recorded = m_bytes.data() + entry.offset;
+		if (entry.zero_test) {
+			if (!ZeroTestHolds(entry)) {
+				index = i; address = entry.address; size = entry.size;
+				std::memcpy(&old_value, recorded, 4);
+				ReadNow(entry, reinterpret_cast<uint8_t*>(&new_value));
+				return true;
+			}
+			continue;
+		}
+		now.resize(entry.size);
+		if (entry.strict) {
+			if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, now.data(), entry.size)) now.assign(entry.size, 0xcd);
+		} else {
+			ReadNow(entry, now.data());
+		}
+		if (std::memcmp(now.data(), recorded, entry.size) == 0) continue;
+		if (entry.words_begin != entry.words_end && OnlyRefreshableBitsChanged(entry)) continue;
+		index = i; address = entry.address; size = entry.size;
+		for (uint32_t at = 0; at + 4 <= entry.size; at += 4) {
+			std::memcpy(&old_value, recorded + at, 4);
+			std::memcpy(&new_value, now.data() + at, 4);
+			if (old_value != new_value) break;
+		}
+		return true;
+	}
+	return false;
+}
+
+uint32_t GuestReadLog::WordAt(size_t index) const {
+	uint32_t value = 0;
+	std::memcpy(&value, m_bytes.data() + index * 4u, 4);
+	return value;
+}
+
+void GuestReadLog::SetWord(size_t index, uint32_t value) {
+	std::memcpy(m_bytes.data() + index * 4u, &value, 4);
+}
+
+bool GuestReadLog::SameReads(const GuestReadLog& other) const {
+	return m_entries.size() == other.m_entries.size() &&
+	       std::ranges::equal(m_entries, other.m_entries, [](const Entry& a, const Entry& b) {
+		       return a.address == b.address && a.size == b.size && a.offset == b.offset &&
+		              a.strict == b.strict && a.zero_test == b.zero_test;
+	       });
+}
+
+bool GuestReadLog::CollectChanges(std::vector<std::pair<uint32_t, uint32_t>>& changed) const {
+	if (m_failed) {
+		return false;
+	}
+	static thread_local std::vector<uint8_t> current;
+	for (const auto& entry: m_entries) {
+		if (entry.address % 4u != 0 || entry.size % 4u != 0 || entry.offset % 4u != 0) {
+			return false;
+		}
+		const auto* recorded = m_bytes.data() + entry.offset;
+		current.resize(entry.size);
+		if (entry.strict) {
+			if (!Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, current.data(),
+			                                                     entry.size)) {
+				return false;
+			}
+		} else {
+			// As StillValid(): bytes the GPU did not write compare from the backing store on
+			// GPU-owned pages; other pages take a plain load.
+			ReadNow(entry, current.data());
+		}
+		if (std::memcmp(current.data(), recorded, entry.size) == 0) {
+			continue;
+		}
+		for (uint32_t at = 0; at < entry.size; at += 4u) {
+			uint32_t now = 0, before = 0;
+			std::memcpy(&now, current.data() + at, 4);
+			std::memcpy(&before, recorded + at, 4);
+			if (now != before) {
+				changed.emplace_back((entry.offset + at) / 4u, now);
+			}
+		}
+	}
+	return true;
+}
+
 void GuestReadLog::RefreshDescriptorWords(
     std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
     std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const {
@@ -977,7 +1071,8 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                                        std::span<const uint32_t> function_code,
                                        uint32_t push_data_cursor, std::vector<uint32_t>& spirv,
-                                       std::vector<uint32_t>& plain_spirv) const {
+                                       std::vector<uint32_t>& plain_spirv,
+                                       std::string* table_refusal) const {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
@@ -987,6 +1082,11 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	compile_options.plain_mip_stats_variant = key.stage == ShaderType::Pixel;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), compile_options,
 	                                               specialization, push_data_cursor);
+	if (compile_options.table_mode && result.spirv.empty()) {
+		// Table mode cannot serve the program.
+		if (table_refusal != nullptr) *table_refusal = std::move(result.table_refusal);
+		return {};
+	}
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
@@ -1086,6 +1186,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	auto& module = program.modules.emplace_back(
 	    BuildModule(key, options, std::move(translated), program.specialization,
 	                program.FunctionCode(), push_data_cursor, spirv, plain_spirv));
+	module.plan = &program.resource_plan;
 	AddedModule(key, program, module, spirv, plain_spirv, options, code, push_data_cursor);
 	return module;
 }
@@ -1287,12 +1388,25 @@ PipelineCache::~PipelineCache() {
 		}
 	};
 	destroy(m_graphics_pipelines);
+	destroy(m_native_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	destroy(m_async_ready);
 	destroy(m_async_ready_compute);
+	for (const auto& native: m_async_native | std::views::values) {
+		m_graphics.device.destroyPipeline(native.pipeline.pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(native.pipeline.pipeline_layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(native.pipeline.descriptor_set_layout, nullptr);
+	}
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			DestroyModule(module);
+		}
+	}
+	for (const auto& variants: m_table_programs | std::views::values) {
+		for (const auto& variant: variants) {
+			if (variant.module) {
+				DestroyModule(*variant.module);
+			}
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -1928,6 +2042,8 @@ struct PipelineCache::CompileJob {
 	std::unique_ptr<ShaderComputeInputInfo>                     compute;
 	uint32_t                                                    push_data_cursor = 0;
 	std::optional<ShaderRecompiler::IR::ResourceSpecialization> specialization;
+	// A table program of this variant (see GetComputeProgramTable()).
+	TableVariant*                                               table = nullptr;
 };
 
 void PipelineCache::LockPrograms() {
@@ -2076,6 +2192,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			DestroyModule(*module);
 		} else {
 			auto& added = modules.emplace_back(std::move(*module));
+			added.plan  = &entry->second.resource_plan;
 			AddedModule(job.key, entry->second, added, spirv, plain_spirv, options, job.params.code,
 			            job.push_data_cursor);
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
@@ -2105,7 +2222,15 @@ void PipelineCache::CompileWorker() {
 			job = std::move(m_jobs.front());
 			m_jobs.pop_front();
 		}
-		if (job->vertex != nullptr) {
+		if (job->table != nullptr) {
+			if (job->vertex != nullptr) {
+				RunTableJob(*job, *job->vertex);
+			} else if (job->pixel != nullptr) {
+				RunTableJob(*job, *job->pixel);
+			} else {
+				RunTableJob(*job, *job->compute);
+			}
+		} else if (job->vertex != nullptr) {
 			RunCompileJob(*job, *job->vertex);
 		} else if (job->pixel != nullptr) {
 			RunCompileJob(*job, *job->pixel);
@@ -2197,6 +2322,7 @@ void PipelineCache::AsyncPipelineWorker() {
 			jobs.pop_front();
 		}
 		Pipeline   pipeline;
+		pipeline.native_bindings = job.native;
 		const auto started = std::chrono::steady_clock::now();
 		if (job.compute) {
 			CreatePipelineInternal(m_graphics, pipeline, *job.module, m_driver_cache);
@@ -2208,7 +2334,13 @@ void PipelineCache::AsyncPipelineWorker() {
 			NoteCreatedPipeline(started);
 		}
 		std::lock_guard lock(m_async_mutex);
-		if (job.compute) {
+		if (job.native) {
+			auto& native = m_async_native.at(job.key);
+			if (created) {
+				native.pipeline = pipeline;
+			}
+			native.done->store(true, std::memory_order_release);
+		} else if (job.compute) {
 			if (created) {
 				m_async_ready_compute.try_emplace(job.module->id, pipeline);
 			}
@@ -2370,6 +2502,167 @@ void PipelineCache::PublishComputePipeline(const ShaderModule& module, const Pip
 	m_async_pending_compute.erase(module.id);
 }
 
+std::pair<const ShaderRecompiler::IR::ResourcePlan*, const ShaderRecompiler::IR::ResourceSpecialization*>
+PipelineCache::ProgramPlanOf(const ShaderModule& module) const {
+	if (module.plan == nullptr) {
+		return {nullptr, nullptr};
+	}
+	return {module.plan, &module.specialization};
+}
+
+bool PipelineCache::SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
+                                              ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+                                              ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	const ProgramLockGuard lock(m_program_lock);
+	return ShaderRecompiler::IR::SpecializeDirectResources(plan, snapshot, specialization);
+}
+
+namespace {
+
+// Marks the keys of table programs: their module ids differ from the normal program's.
+constexpr uint32_t TableKeyMarker = 0x54424c45u;
+
+} // namespace
+
+template <typename InputInfo>
+PipelineCache::TableProgram PipelineCache::GetTableProgram(
+    const ShaderParams& params, const InputInfo& input_info,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t push_data_cursor) {
+	ProgramKey key;
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		key.stage = input_info.logical_stage;
+	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+		key.stage = ShaderType::Pixel;
+	} else {
+		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+		key.stage = ShaderType::Compute;
+	}
+	key.hash            = params.hash;
+	key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, key.static_state);
+	key.static_state.push_back(TableKeyMarker);
+	const ProgramLockGuard lock(m_program_lock);
+	auto&                  variants = m_table_programs[key];
+	for (auto& variant: variants) {
+		if (variant.push_data_cursor != push_data_cursor || !(variant.specialization == specialization)) {
+			continue;
+		}
+		if (!variant.done) {
+			return {.status = TableStatus::Pending, .waiting = variant.waiting};
+		}
+		if (!variant.module) {
+			return {.status = TableStatus::Refused, .refusal = &variant.refusal};
+		}
+		return {.module = &*variant.module, .status = TableStatus::Ready};
+	}
+	auto& variant            = variants.emplace_back();
+	variant.specialization   = specialization;
+	variant.push_data_cursor = push_data_cursor;
+	auto job                 = std::make_unique<CompileJob>();
+	job->key                 = key;
+	job->params              = params;
+	job->push_data_cursor    = push_data_cursor;
+	job->specialization      = specialization;
+	job->table               = &variant;
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		job->vertex = std::make_unique<ShaderVertexInputInfo>(input_info);
+	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+		job->pixel = std::make_unique<ShaderPixelInputInfo>(input_info);
+	} else {
+		job->compute = std::make_unique<ShaderComputeInputInfo>(input_info);
+	}
+	{
+		std::lock_guard job_lock(m_job_mutex);
+		m_jobs.push_back(std::move(job));
+	}
+	m_job_available.notify_one();
+	return {.status = TableStatus::Pending, .waiting = variant.waiting};
+}
+
+template <typename InputInfo>
+void PipelineCache::RunTableJob(CompileJob& job, InputInfo& input_info) {
+	std::optional<ShaderModule> module;
+	std::string                 refusal;
+	std::vector<uint32_t>       spirv;
+	std::vector<uint32_t>       plain_spirv;
+	[&] {
+		ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
+		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			options.stage             = input_info.logical_stage;
+			options.input_info.vertex = &input_info;
+			options.user_data_base    = 8;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			options.stage            = ShaderType::Pixel;
+			options.input_info.pixel = &input_info;
+		} else {
+			options.stage              = ShaderType::Compute;
+			options.input_info.compute = &input_info;
+		}
+		if (options.stage == ShaderType::Mesh || options.stage == ShaderType::TessellationControl ||
+		    options.stage == ShaderType::Local || options.stage == ShaderType::TessellationEvaluation) {
+			refusal = "mesh and tessellation stages are not served";
+			return;
+		}
+		options.shader_hash        = job.params.hash;
+		options.user_data          = user_data;
+		options.back_code          = job.params.back_code;
+		options.dump_ir            = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
+		options.native_ray_tracing = false;
+		options.table_mode         = true;
+		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
+		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
+			refusal = "GPU-selected calls";
+			return;
+		}
+		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		auto built      = BuildModule(job.key, options, std::move(translated), *job.specialization, {},
+		                              job.push_data_cursor, spirv, plain_spirv, &refusal);
+		if (built.module != nullptr) {
+			module = std::move(built);
+		}
+	}();
+	LockPrograms();
+	job.table->module  = std::move(module);
+	job.table->refusal = job.table->module ? std::string {} : std::move(refusal);
+	job.table->done    = true;
+	job.table->waiting->store(true, std::memory_order_release);
+	UnlockPrograms();
+}
+
+PipelineCache::TableProgram PipelineCache::GetComputeProgramTable(
+    const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	const auto params             = PrepareProgram(regs, input_info);
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	const uint32_t push_data_cursor =
+	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
+	return GetTableProgram(params, input_info, specialization, push_data_cursor);
+}
+
+PipelineCache::TableProgram PipelineCache::GetVertexProgramTable(
+    const ShaderParams& params, const ShaderVertexInputInfo& input_info,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t& push_data_cursor) {
+	const auto result = GetTableProgram(params, input_info, specialization, push_data_cursor);
+	if (result.module != nullptr) {
+		result.module->info.bindings.AdvancePushData(push_data_cursor);
+	}
+	return result;
+}
+
+PipelineCache::TableProgram PipelineCache::GetPixelProgramTable(
+    const ShaderParams& params, const ShaderPixelInputInfo& input_info,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t& push_data_cursor) {
+	const auto result = GetTableProgram(params, input_info, specialization, push_data_cursor);
+	if (result.module != nullptr) {
+		result.module->info.bindings.AdvancePushData(push_data_cursor);
+	}
+	return result;
+}
+
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
@@ -2473,7 +2766,8 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets,
-                                                            bool                   allow_async) {
+                                                            bool                   allow_async,
+                                                            bool                   native_bindings) {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -2643,6 +2937,40 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+	if (native_bindings) {
+		// The native XPR variant: the same key in its own map, created here.
+		if (auto iter = m_native_graphics_pipelines.find(key); iter != m_native_graphics_pipelines.end()) {
+			return &iter->second;
+		}
+		if (allow_async && !m_async_threads.empty()) {
+			std::unique_lock lock(m_async_mutex);
+			auto             found = m_async_native.find(key);
+			if (found == m_async_native.end()) {
+				found = m_async_native.try_emplace(key).first;
+				m_async_jobs.push_back({.native = true, .key = key, .stages = stages});
+				m_pipeline_waiting = found->second.done;
+				lock.unlock();
+				m_async_available.notify_one();
+				return nullptr;
+			}
+			if (!found->second.done->load(std::memory_order_acquire)) {
+				m_pipeline_waiting = found->second.done;
+				return nullptr;
+			}
+			const auto created = found->second.pipeline;
+			m_async_native.erase(found);
+			lock.unlock();
+			if (created.pipeline != nullptr && created.pipeline_layout != nullptr) {
+				return &m_native_graphics_pipelines.try_emplace(key, created).first->second;
+			}
+			// (The driver refused it on the background thread: created here, where the error is reported.)
+		}
+		auto& cached           = m_native_graphics_pipelines[key];
+		cached.native_bindings = true;
+		CreatePipelineInternal(m_graphics, cached, key, stages, m_driver_cache);
+		EXIT_NOT_IMPLEMENTED(cached.pipeline == nullptr || cached.pipeline_layout == nullptr);
+		return &cached;
+	}
 	// Consecutive draws mostly use the pipeline of the draw before.
 	if (m_last_graphics_pipeline != nullptr && key == m_last_graphics_key) {
 		return m_last_graphics_pipeline;
@@ -2724,7 +3052,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			// (the queue may hold many pipelines of skipped draws), or waits for the thread
 			// creating it.
 			if (TakeQueuedAsyncPipeline([&](const AsyncPipelineJob& job) {
-				    return !job.compute && job.key == key;
+				    return !job.compute && !job.native && job.key == key;
 			    })) {
 				m_async_pending_graphics.erase(key);
 				ClaimPipeline(key);
@@ -2764,6 +3092,33 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	m_last_graphics_pipeline = &pipeline;
 
 	return &pipeline;
+}
+
+PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info) {
+	const auto& module = *input_info.stage.module;
+	if (const auto found = m_compute_pipelines.find(module.id); found != m_compute_pipelines.end()) {
+		return &found->second;
+	}
+	if (m_async_threads.empty()) {
+		return &GetComputePipeline(input_info);
+	}
+	{
+		std::unique_lock lock(m_async_mutex);
+		if (!m_async_ready_compute.contains(module.id)) {
+			if (m_async_pending_compute.contains(module.id)) {
+				return nullptr;
+			}
+			// (Asked before and neither pending nor made: the thread failed, and the lookup reports the error.)
+			if (m_async_asked_compute.insert(module.id).second) {
+				m_async_pending_compute.insert(module.id);
+				ClaimComputePipeline(module.id);
+				lock.unlock();
+				QueueAsyncPipeline({.compute = true, .module = &module});
+				return nullptr;
+			}
+		}
+	}
+	return &GetComputePipeline(input_info);
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {

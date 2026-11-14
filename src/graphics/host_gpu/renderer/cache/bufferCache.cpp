@@ -9,6 +9,7 @@
 #include "common/profiler.h"
 #include "common/spscQueue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -118,6 +119,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 			m_page_table[page] = {};
 		}
 	}
+	{
+		const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
+		for (auto region = buffer.CpuAddress() / TRACKER_REGION_SIZE,
+		          last   = (buffer.CpuAddress() + buffer.Size() - 1) / TRACKER_REGION_SIZE;
+		     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
+			m_region_registrations[region].store(epoch, std::memory_order_release);
+		}
+		m_registration_epoch.store(epoch, std::memory_order_release);
+	}
 	const auto size_pages = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
@@ -144,6 +154,20 @@ void BufferCache::ChangeRegister(BufferId id) {
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
+}
+
+bool BufferCache::TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size) {
+	auto* buffer = GetBufferIfLive(id);
+	if (buffer == nullptr || buffer->Handle() != handle || !buffer->IsInBounds(vaddr, size)) {
+		return false;
+	}
+	TouchBuffer(*buffer);
+	return true;
+}
+
+void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
@@ -1175,6 +1199,20 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	}
 }
 
+StreamBuffer& BufferCache::GetTableUploadBuffer() {
+	if (!m_table_upload) {
+		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB);
+	}
+	return *m_table_upload;
+}
+
+vk::DeviceAddress BufferCache::TableUpload(const void* data, uint64_t size) {
+	if (!m_table_upload) {
+		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB);
+	}
+	return m_table_upload->BufferDeviceAddress() + m_table_upload->Copy(data, size, 16);
+}
+
 uint64_t BufferCache::StreamUpload(const void* data, uint64_t size, uint64_t alignment) {
 	auto* copies = m_scheduler.HostCopies();
 	if (copies == nullptr || !m_stream_buffer.IsCoherent() || !GuestGpu::IsGpuThread()) {
@@ -1960,6 +1998,8 @@ void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 	for (auto& checked: m_checked_color_metadata) {
 		checked.Subtract(vaddr, size);
 	}
+	// (Color metadata a table draw found settled is looked at again: TextureCache::ColorClearSettled.)
+	m_texture_cache.NoteMetadataWrite(vaddr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {

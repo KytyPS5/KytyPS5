@@ -2620,7 +2620,9 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		if (compiled != nullptr || program.skip_dispatch || program.call_source != nullptr) {
 			DestroyModule(module);
 		} else {
-			compiled = &program.modules.emplace_back(std::move(module));
+			auto& added_module = program.modules.emplace_back(std::move(module));
+			added_module.plan  = &program.resource_plan;
+			compiled           = &added_module;
 			StoreModule(key, program, *compiled, spirv, plain_spirv);
 			added = true;
 		}

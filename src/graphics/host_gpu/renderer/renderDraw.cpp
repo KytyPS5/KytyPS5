@@ -1,4 +1,9 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/shader/shaderCompiler.h"
+#include "graphics/host_gpu/renderer/cxCompat.h"
+#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/guest_gpu/scout.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -18,11 +23,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/meshDrawSplit.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/systemContent.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -35,6 +42,9 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <immintrin.h>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -44,6 +54,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <xxhash.h>
 #include <new>
 #include <optional>
 #include <span>
@@ -51,9 +63,15 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+bool NativeXprVertexBuffersEnabled(); // nativeXpr.inc
+uint32_t TableXprMode();               // tableDraw.inc
+} // namespace
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -1818,6 +1836,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	dynamic_state.MoveGeneration(); // (its pipeline, descriptors and index buffer replace a table draw's)
 
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
@@ -1880,6 +1899,22 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.DeferShaderWriteBarrier(shader_write_stages);
 		m_shader_write_queue    = m_guest_queue;
 		m_shader_write_deferred = true;
+	}
+	// After the draw is recorded: storing may clean buffer owners (copies) and so may end
+	// rendering or restart the scheduler.
+	if (std::exchange(m_table_store, false)) {
+		TableStore(buffer, state, state.topology, primitive_restart_enable, rendering, dynamic_state,
+		           !mesh_active && draw.indexed && (emit.indirect.address != 0 || index_source.host_data == nullptr) &&
+		               draw_dwords == 0 && vertex_bindings.count == 0);
+	}
+	if (std::exchange(m_native_xpr_store, false)) {
+		if (!mesh_active && draw.indexed && (emit.indirect.address != 0 || index_source.host_data == nullptr) &&
+		    (vertex_bindings.count == 0 || NativeXprVertexBuffersEnabled()) && draw_dwords == 0) {
+			NativeXprStore(buffer, state, state.topology, primitive_restart_enable, rendering, stages,
+			               dynamic_state);
+		} else {
+			NativeXprRefuseStore(buffer);
+		}
 	}
 }
 
@@ -2137,5 +2172,8 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer) {
 	                    {dst.desc.view_info.base_level, 1, dst.desc.view_info.base_layer, 1});
 	return true;
 }
+
+#include "graphics/host_gpu/renderer/nativeXpr.inc"
+#include "graphics/host_gpu/renderer/tableXpr.inc"
 
 } // namespace Libs::Graphics

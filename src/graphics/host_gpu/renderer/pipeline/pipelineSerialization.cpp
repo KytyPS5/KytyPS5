@@ -83,7 +83,8 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle and the SPIR-V size come from the SPIR-V; stored programs have no function code.
 	// The plain variant is stored as its SPIR-V.
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task, spirv_words, plain, guest_traversal] = stage;
+	       mesh_task, spirv_words, plain, guest_traversal, plan] = stage;
+	(void)plan;
 	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task, guest_traversal);
 }
 
@@ -306,6 +307,7 @@ bool PipelineCache::AddRecord(StoreRecord& record) {
 				program->second.resource_plan = std::move(record.plan);
 			}
 			program->second.modules.push_back(std::move(record.module));
+			program->second.modules.back().plan = &program->second.resource_plan;
 			break;
 		}
 		case Record::GraphicsPipeline: {

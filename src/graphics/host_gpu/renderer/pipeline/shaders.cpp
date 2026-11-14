@@ -157,15 +157,21 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
+// native_bindings: the native XPR variant. The same SPIR-V; the flattened SRT and the shader
+// data are dynamic storage buffers in an ordinary set (the record's constants go into the upload
+// ring at each draw, at the dynamic offsets).
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits              stage) {
+                              vk::ShaderStageFlagBits stage, bool native_bindings) {
+	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
 	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 		const auto index = std::countr_zero(mask);
-		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
-		     program.bindings.descriptor_counts[index], stage, nullptr});
+		const auto kind = static_cast<Kind>(index);
+		const auto type = native_bindings && (kind == Kind::FlattenedSrt || kind == Kind::ShaderData)
+		                      ? vk::DescriptorType::eStorageBufferDynamic
+		                      : NativeDescriptorType(kind);
+		descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(program.stage, kind), type,
+		                               program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
@@ -179,7 +185,8 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
-		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
+		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer ||
+		                     binding.descriptorType == vk::DescriptorType::eStorageBufferDynamic;
 		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
 		if (storage) storage_buffers += binding.descriptorCount;
 		if (sampler) samplers += binding.descriptorCount;
@@ -226,7 +233,8 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		     sampled_images, max_stage_sampled, limits.maxDescriptorSetSampledImages,
 		     limits.maxPerStageDescriptorSampledImages, DescriptorHeap::MaxSampledImages);
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.uses_push_descriptors =
+	    !pipeline.native_bindings && descriptor_count <= graphics.max_push_descriptors;
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -236,7 +244,7 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	create.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
-	if (!pipeline.uses_push_descriptors) {
+	if (!pipeline.uses_push_descriptors && !pipeline.native_bindings) {
 		DescriptorHeap::RegisterLayout(pipeline.descriptor_set_layout, bindings);
 	}
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
@@ -407,7 +415,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
 			const auto native_stage = NativeShaderStage(stage->info.stage);
-			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
+			AddLayoutBindings(descriptor_bindings, stage->info, native_stage, pipeline.native_bindings);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
 			pipeline.push_stages |= native_stage;
 		}
@@ -511,7 +519,10 @@ static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache:
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
+	// A table program's descriptor sets are ordinary sets the renderer allocates (RenderExecutor::TableDispatch), as a
+	// table draw's: no push descriptors.
+	pipeline.native_bindings = module.info.table_mode;
+	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute, module.info.table_mode);
 	pipeline.uses_image_heap = module.info.info.uses_image_heap;
 	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
 	CreateLayouts(graphics, pipeline, descriptor_bindings);

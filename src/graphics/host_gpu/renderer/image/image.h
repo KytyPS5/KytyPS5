@@ -71,7 +71,14 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
+	// Advances whenever an image becomes (maybe) CPU dirty or GPU-buffer modified: images found
+	// clean stay so while it does not move (native XPR records' proofs).
+	[[nodiscard]] static uint64_t CpuDirtyEpoch() noexcept {
+		return s_cpu_dirty_epoch.load(std::memory_order_relaxed);
+	}
+
 	void MarkCpuDirty() {
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
 		DropPartialDirty();
@@ -95,6 +102,7 @@ public:
 			m_dirty_ranges.clear();
 		}
 		AddRange(m_dirty_ranges, begin, end);
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		HeapChanged();
 	}
 	[[nodiscard]] bool IsPartiallyCpuDirty() const noexcept { return m_cpu_dirty && m_partial_dirty; }
@@ -130,6 +138,7 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
+			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 			HeapChanged();
 		}
 	}
@@ -162,6 +171,7 @@ public:
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		m_buffer_modified = true;
 		HeapChanged();
 	}
@@ -195,10 +205,15 @@ public:
 	// Advances the image's version (see TextureCache::ImageVersion()): what a binding of one of
 	// its views, as it was bound, depends on changed.
 	void StateChanged() const noexcept {
+		state_epoch.fetch_add(1u, std::memory_order_relaxed);
 		if (version != nullptr) {
 			version->fetch_add(1u, std::memory_order_release);
 		}
 	}
+	// Advances at every StateChanged of any image (chenxiao07's ImageStateEpoch): images found in place stay so while it
+	// does not move (TextureCache::ImagesEpoch).
+	static inline std::atomic<uint64_t> state_epoch {0};
+	[[nodiscard]] static uint64_t       StateEpoch() noexcept { return state_epoch.load(std::memory_order_relaxed); }
 	// Resident image heaps sample an image without rediscovering it until it changes its
 	// contents, tracking, identity or layout, which queues a heap change.
 	void HeapChanged() const {
@@ -215,6 +230,9 @@ public:
 
 	// Unique per image, unlike ImageId: freed slots are reused.
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	// chenxiao07's Image::validity (tableXpr.inc's proofs of an image's use): not moved here yet, so the proofs that read
+	// it stay off (KYTY_TABLE_SET_PROOFS=0).
+	uint64_t         validity = 0;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -246,6 +264,8 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
+	// Times the image was registered (TextureCache::RegisterImage()).
+	uint32_t         registrations      = 0;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
@@ -282,6 +302,9 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+
+	inline static std::atomic<uint64_t> s_next_serial {0};
+	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
 };
 
 namespace ImageOps {

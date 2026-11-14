@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/scout.h"
 
 #include <array>
 #include <atomic>
@@ -96,6 +97,7 @@ private:
 		bool                      blocked         = false;
 		bool                      yielded         = false;
 		uint64_t                  flip_request_id = 0;
+		uint64_t                  scout_sequence  = 0; // queue 0's command submissions, numbered (scout.h)
 	};
 
 	void              Enqueue(Submission submission);
@@ -133,6 +135,8 @@ private:
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
+	uint64_t        m_scout_sequence = 0;
+	bool            m_scout_reset    = false;
 
 	// Command processor thread: the guest memory the blocked front submission of each queue
 	// waits on (empty when it does not wait on memory).
@@ -159,6 +163,11 @@ private:
 	const bool                      m_resolving;
 	Common::SpscQueue<GpuOperation> m_operations;
 	Common::SpscQueue<GpuOperation> m_resolved;
+	// KYTY_SCOUT=3: the table evaluations the resolve thread makes ahead, each carried by its draw operation until it
+	// executed (at most the resolved queue's operations are between the two threads: the ring is several times that).
+	static constexpr size_t         TableTicketRing = 1024;
+	std::unique_ptr<Scout::Ticket[]> m_table_tickets = std::make_unique<Scout::Ticket[]>(TableTicketRing);
+	uint64_t                        m_table_ticket_next = 0;
 	Common::ProgressCounter         m_executed;
 	uint64_t                        m_emitted = 0;
 	// Command processor thread: a ring of the writes of operations that may not have executed

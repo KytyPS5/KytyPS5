@@ -456,6 +456,14 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	// A dispatch of a shader pair that learned its table program (tableXpr.inc; KYTY_TABLE_DISPATCH).
+	if (!use_thread_dimensions &&
+	    TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, mode, async_compute)) {
+		TableNoteDispatched(cs_regs, true);
+		m_resolved_draw = nullptr;
+		return;
+	}
+	TableNoteDispatched(cs_regs, false);
 	m_context.GetImageHeap().BeginDraw();
 	const ShaderModule* compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
@@ -477,6 +485,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		ResetBindings();
 		return;
 	}
+
+	// The shader pair of a plain dispatch learns its table program (the dispatches after it go through the table).
+	if (!use_thread_dimensions && mode == 0x41u) TableDispatchLearn(cs_regs, *compute_module, async_compute);
 
 	if (use_thread_dimensions) {
 		thread_group_x = input_info.workgroup_counts[0];

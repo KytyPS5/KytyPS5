@@ -29,9 +29,10 @@ struct CompileOptions {
 	// Replace known guest BVH traversal loops with host ray queries (see
 	// IR::TraceNativeTraversals).
 	bool                        native_ray_tracing         = false;
-	// With native_ray_tracing: patched traversals count the rays they send back to the guest
+	// With native_ray_tracing: native traversals count the rays they send back to the guest
 	// walk in the fault buffer (BufferCache::HACK_MARK_GUEST_RAYS; --rt-stats).
 	bool                        ray_stats                  = false;
+	bool                        table_mode                 = false; // IR::EnterTableMode
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
@@ -46,7 +47,8 @@ struct TranslateResult {
 };
 
 struct CompileResult {
-	std::vector<uint32_t>  spirv;
+	std::vector<uint32_t>  spirv; // empty when table mode was asked for and refused (table_refusal)
+	std::string            table_refusal;
 	// The same program without the GET_LOD_STATS recording (Spirv::UsesMipStats): for draws in
 	// which no image has a mip-statistics counter. Empty unless requested and instrumented.
 	std::vector<uint32_t>  spirv_plain;

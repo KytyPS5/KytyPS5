@@ -146,6 +146,8 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .wave_size          = wave_size,
 	    .user_data_base     = user_data_base,
 	    .has_address_writes = has_address_writes,
+	    .table_mode         = table_mode,
+	    .table_plan         = std::move(table_plan),
 	    .info               = std::move(info),
 	    .bindings           = std::move(bindings),
 	};

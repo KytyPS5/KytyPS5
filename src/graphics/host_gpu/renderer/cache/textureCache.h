@@ -144,6 +144,99 @@ public:
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// Moves with any image's barrier state or GPU-written state (Image::StateEpoch), registration, surface metadata
+	// or CPU-written bytes: images found in place (a table draw's targets and set) stay so while it does not.
+	[[nodiscard]] uint64_t ImagesEpoch() const {
+		return Image::StateEpoch() + m_image_set_epoch + m_meta_epoch.load(std::memory_order_relaxed) +
+		       Image::CpuDirtyEpoch();
+	}
+	std::atomic<uint64_t> m_meta_epoch {0};
+	// Color metadata ranges ColorClearSettled found with no fast clear pending (any thread reads the span first).
+	void                    ForgetSettledMetadata(uint64_t vaddr, uint64_t size);
+	void                    NoteSettledMetadata(GuestRange range);
+	static constexpr size_t MaxSettledMetadata = 256;
+	std::mutex              m_settled_lock;
+	std::vector<GuestRange> m_settled_ranges;
+	std::atomic<uint64_t>   m_settled_begin {UINT64_MAX};
+	std::atomic<uint64_t>   m_settled_end {0};
+	std::atomic<uint64_t>   m_color_clear_epoch {1};
+	// The 64 KiB granules of the settled ranges, hashed into 4096 bits (never cleared but with the ranges): most GPU
+	// writes fall between them, inside the span.
+	static constexpr uint32_t                 SettledGranuleBits = 16;
+	std::array<std::atomic<uint64_t>, 64> m_settled_granules {};
+	[[nodiscard]] bool MaybeSettled(uint64_t vaddr, uint64_t size) const {
+		const auto first = vaddr >> SettledGranuleBits;
+		const auto last  = (vaddr + size - 1) >> SettledGranuleBits;
+		if (last - first >= 64) return true;
+		for (auto granule = first; granule <= last; ++granule) {
+			const auto bit = granule & 4095u;
+			if (((m_settled_granules[bit >> 6u].load(std::memory_order_acquire) >> (bit & 63u)) & 1u) != 0) return true;
+		}
+		return false;
+	}
+	// chenxiao07's names for what table draws ask (tableXpr.inc), answered conservatively until the epochs of his
+	// texture cache are ported: ResolutionEpoch and StartEpoch move with any registration, a registration log that
+	// does not reach back says so (known false), depth sets are never proven here.
+	[[nodiscard]] uint64_t ResolutionEpoch() const { return m_image_set_epoch; }
+	[[nodiscard]] uint64_t StartEpoch() const { return m_image_set_epoch; }
+	[[nodiscard]] uint64_t GcTick() const noexcept { return m_gc_tick; }
+	[[nodiscard]] uint64_t CurrentFrame() const noexcept { return m_gc_tick; }
+	[[nodiscard]] bool     RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) {
+        return ImageEpochInRegion(address, size) > epoch;
+	}
+	[[nodiscard]] bool RegistrationsOverlapSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) {
+		known  = ForEachImageSetChangeSince(epoch, [](uint64_t, uint64_t) {});
+		if (!known) return true;
+		bool overlap = false;
+		(void)ForEachImageSetChangeSince(epoch, [&](uint64_t begin, uint64_t length) {
+			overlap = overlap || (begin < address + size && address < begin + length);
+		});
+		return overlap;
+	}
+	// chenxiao07's form for table image sets: also a storage binding, and an image with DCC metadata that keeps the
+	// surface its lookup gave it (sampled, or with `storage_dcc` written as storage): its user checks the pending
+	// fast clears at every use (RenderExecutor::TableTransit).
+	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc);
+	// Whether a lookup with `desc` would find no fast clear to apply in its color metadata (MaterializeColorClear): the
+	// metadata's keys were checked since the GPU last wrote them, or the guest's own bytes hold no clear key. A
+	// settled range is kept until a write reaches it (NoteMetadataWrite).
+	[[nodiscard]] bool ColorClearSettled(const ImageDesc& desc);
+	// The same, not looked at again while no write reached color metadata found settled since `memo` was set (a table
+	// draw's target or texture: RenderExecutor::NativeXprEmitTargets, TableTransit).
+	[[nodiscard]] bool ColorClearSettled(const ImageDesc& desc, uint64_t& memo) {
+		const auto epoch = m_color_clear_epoch.load(std::memory_order_acquire);
+		if (memo == epoch) return true;
+		const bool settled = ColorClearSettled(desc);
+		if (settled) memo = epoch;
+		return settled;
+	}
+	// A write to guest memory by the emulator (any thread: a CP fill of clear keys), a GPU write or a download
+	// (BufferCache::ForgetColorMetadataChecks): one that reaches color metadata ColorClearSettled found settled moves
+	// the color clear epoch and ImagesEpoch (the images found in place are looked at again).
+	void NoteMetadataWrite(uint64_t vaddr, uint64_t size) {
+		if (vaddr < m_settled_end.load(std::memory_order_acquire) &&
+		    vaddr + size > m_settled_begin.load(std::memory_order_acquire) && MaybeSettled(vaddr, size)) {
+			ForgetSettledMetadata(vaddr, size);
+		}
+	}
+	[[nodiscard]] bool IsSampledDepthCurrent(ImageId, const ImageDesc&, uint64_t) { return false; }
+	[[nodiscard]] static bool ViewFitsImage(const ImageDesc&) { return true; }
+	void                      NoteMetaUse(uint64_t, uint32_t) {}
+	// Native XPR records (RenderExecutor::NativeXpr*) keep sampled images across image
+	// registrations elsewhere: the image is still registered, not being rebound, and has the
+	// backing and resources of `desc` (a plain color texture: no depth, stencil or metadata).
+	[[nodiscard]] bool IsSampledImageCurrent(ImageId id, const ImageDesc& desc);
+	// Whether FindTexture with `desc` would upload anything first (guest bytes the CPU or a GPU
+	// buffer write changed).
+	[[nodiscard]] static bool RefreshPending(const Image& image) {
+		return image.IsBufferModified() || image.IsCpuDirty();
+	}
+	// Whether a registered image starts exactly at `address` (a texel buffer there is refreshed
+	// from it: BufferCache::SynchronizeBufferFromImage).
+	[[nodiscard]] bool HasImageStartingAt(uint64_t address);
+	// Whether a render target lookup of `requested` still finds `id`: it is the last registered
+	// image over the range with the requested backing (what FindImageImpl() takes).
+	[[nodiscard]] bool IsTargetCurrent(ImageId id, const ImageInfo& requested);
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
 	// range's pages: while it is unchanged, a lookup in the range finds the same images.
 	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);

@@ -27,6 +27,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <span>
+#include <deque>
 #include <utility>
 #include <vector>
 
@@ -117,6 +118,11 @@ public:
 	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept {
 		return m_page_manager.WatchedSpan(vaddr, size, first, end);
 	}
+	// Execution thread: the guest frames (suspend points) executed so far.
+	[[nodiscard]] uint64_t FrameNumber() const noexcept { return m_frame_number; }
+	// Whether part of the range was unmapped after MappedRangesVersion() was `version` (true
+	// when the log of unmaps no longer reaches back that far).
+	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
@@ -207,6 +213,13 @@ private:
 	// Ranges mapped since the last BDA synchronization (under m_mapped_ranges_mutex): that
 	// synchronization forces their regions (BufferCache::ForceSynchronization()).
 	std::vector<std::pair<uint64_t, uint64_t>> m_bda_mapped_since_sync;
+	// The latest unmaps (under m_mapped_ranges_mutex): the version each moved to, and the range.
+	struct UnmapEntry {
+		uint64_t version = 0, vaddr = 0, size = 0;
+	};
+	std::deque<UnmapEntry> m_unmap_log;
+	uint64_t               m_unmap_log_floor = 0; // the version of the newest unmap dropped
+	uint64_t               m_frame_number    = 0;
 	// SynchronizeDmaFootprint(): the spans of an operation.
 	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	// The guest TLASes the native builds wrote (NoteHleTlas()), and the memory sce::Psr captured

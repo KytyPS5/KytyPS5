@@ -164,6 +164,13 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 	return buffer->element_pointer_type;
 }
 
+// Table mode: a pointer to a buffer of `bits`-bit elements at a device address.
+uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits) {
+	const uint32_t alias = bits == 8u ? 0u : bits == 16u ? 1u : bits == 64u ? 3u : 2u;
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+	                   StorageBufferType(state, state.storage_buffers[alias], bits));
+}
+
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
@@ -246,8 +253,10 @@ void DefineDescriptors(EmitterState& state) {
 	auto& bindings = state.program.bindings;
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
+	// Table mode reads its buffers through their device addresses (EmitTableMode): no buffer descriptors.
+	const bool table = state.program.table_mode;
 	for (auto& buffer: info.buffers) {
-		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
 	}
 	// Constant buffers read through the constant cache: one load, bounds checked by the device
 	// (robustBufferAccess2), where a storage buffer read computes and checks the address.
@@ -292,7 +301,7 @@ void DefineDescriptors(EmitterState& state) {
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
+	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
@@ -311,6 +320,8 @@ void DefineDescriptors(EmitterState& state) {
 	    })) {
 		bindings.stride_count = counts[static_cast<size_t>(Kind::Buffers)];
 	}
+	// The block's device address, after the user data.
+	bindings.table_block_dwords = table ? 2u : 0u;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
@@ -842,7 +853,8 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
-	    state.program.info.uses_device_address || state.program.info.ray_query_mirror;
+	    state.program.info.uses_device_address || state.program.info.ray_query_mirror ||
+	    state.program.table_mode;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);

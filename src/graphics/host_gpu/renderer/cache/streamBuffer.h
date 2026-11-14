@@ -117,6 +117,10 @@ public:
 	void                                        Commit();
 	[[nodiscard]] Download                      MapDownload(uint64_t size, uint64_t alignment);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// chenxiao07's TryCopy: Copy without waiting for the GPU; here it is Copy (the ring waits for its tick).
+	[[nodiscard]] std::optional<uint64_t> TryCopy(const void* source, uint64_t size, uint64_t alignment = 0) {
+		return Copy(source, size, alignment);
+	}
 	// Advances whenever Map() wraps around to the start: data committed in the current lap stays
 	// in place until it changes.
 	[[nodiscard]] uint64_t Lap() const noexcept { return m_lap; }

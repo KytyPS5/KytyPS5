@@ -94,12 +94,46 @@ struct DynamicState {
 	std::array<float, 4> blend_constants {};
 	float                line_width {};
 	vk::ImageAspectFlags feedback_loop_aspects {};
+	uint64_t             generation {}; // see Generation()
 
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, CommandRecorder cmdbuf);
 
+	/// Takes the values of `values` (a copy captured after a draw set them): only those that
+	/// differ are marked for the next Commit() (native XPR draws, RenderExecutor::NativeXprEmit).
+	void Assign(const DynamicState& values) {
+		SetViewports(std::span(values.viewports).first(values.num_viewports));
+		SetScissors(std::span(values.scissors).first(values.num_scissors));
+		SetDepthTestEnabled(values.depth_test_enabled);
+		SetDepthWriteEnabled(values.depth_write_enabled);
+		SetDepthCompareOp(values.depth_compare_op);
+		SetDepthBoundsTestEnabled(values.depth_bounds_test_enabled);
+		SetDepthBounds(values.depth_bounds_min, values.depth_bounds_max);
+		SetDepthBiasEnabled(values.depth_bias_enabled);
+		SetDepthBias(values.depth_bias_constant, values.depth_bias_clamp, values.depth_bias_slope);
+		SetStencilTestEnabled(values.stencil_test_enabled);
+		SetStencilOps(values.stencil_front_ops, values.stencil_back_ops);
+		SetStencilReferences(values.stencil_front_reference, values.stencil_back_reference);
+		SetStencilWriteMasks(values.stencil_front_write_mask, values.stencil_back_write_mask);
+		SetStencilCompareMasks(values.stencil_front_compare_mask, values.stencil_back_compare_mask);
+		SetBlendConstants(values.blend_constants);
+		SetCullMode(values.cull_mode);
+		SetFrontFace(values.front_face);
+		SetLineWidth(values.line_width);
+		SetAttachmentFeedbackLoopAspects(values.feedback_loop_aspects);
+	}
+
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
-	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+	void Invalidate() {
+		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+		++generation;
+	}
+
+	/// Advances at every Invalidate() (a new command buffer, a helper pipeline) and whenever a draw binds its
+	/// pipeline, descriptors and index buffer (MoveGeneration): a path that binds graphics state itself (table
+	/// draws, RenderExecutor::TableDraw) can tell whether anything else bound state since.
+	[[nodiscard]] uint64_t Generation() const noexcept { return generation; }
+	void                   MoveGeneration() noexcept { ++generation; }
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

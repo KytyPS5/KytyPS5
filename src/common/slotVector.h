@@ -63,6 +63,11 @@ public:
 		return id.index < m_stored.size() && m_stored[id.index] != 0;
 	}
 
+	// The slot's object loading into the cache, for a lookup soon (chenxiao07's SlotVector::prefetch).
+	void prefetch(SlotId id) const noexcept {
+		if (id.index < m_stored.size()) __builtin_prefetch(&(*this)[id]);
+	}
+
 	template <typename... Args>
 	[[nodiscard]] SlotId insert(Args&&... args) {
 		if (m_free_list.empty()) {

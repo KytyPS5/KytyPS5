@@ -24,6 +24,8 @@ struct GpuRegisterState {
 	// Unique per snapshot of the context registers (0: live registers, not a snapshot):
 	// operations with the same id see the same context registers.
 	uint64_t context_id = 0;
+	// The same for the user configuration registers.
+	uint64_t user_config_id = 0;
 };
 
 // NUM_INSTANCES as the command processor last set it. Indirect draws also set the persistent
@@ -108,10 +110,20 @@ struct GpuOperation {
 	// The guest ordered the operation after the earlier work of its queue (ACQUIRE_MEM or
 	// WAIT_REG_MEM since the operation before).
 	bool guest_sync = true;
+	// Indexed draws (KYTY_TABLE_XPR=2, DrawStateObserver): no graphics register but user data changed since the
+	// indexed draw before, so RenderExecutor::TableXprTry continues the last table draw.
+	bool clean = false;
 	// Draws and dispatches: the next operation is not a draw, so it waits for the host copies of
 	// this one before it executes (HostCopyQueue::Drain()); this one copies the guest data it
 	// streams into the copy queue's ring right away instead (BufferCache::StreamGuestData()).
 	bool stream_in_place = false;
+	// Draws of queue 0 (KYTY_SCOUT, scout.h): the draw packet the operation executes, the graphics submission it is in
+	// (Scout::Feed's number) and the packet's number in it. The execution thread tells the scout where it is by them.
+	// Draws (KYTY_SCOUT=3): the table evaluation the resolve thread made ahead (a Scout::Ticket of the pipeline's ring).
+	const void*     table_ticket   = nullptr;
+	const uint32_t* scout_packet   = nullptr;
+	uint64_t        scout_sequence = 0;
+	uint32_t        scout_ordinal  = 0;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

@@ -351,6 +351,9 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Moves whenever a shader is mapped, and the code hash of the shader mapped at `addr` (0: none).
+[[nodiscard]] uint64_t ShaderMapGeneration();
+[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
 // The binary of the shader mapped at `addr` as the game gave it (code, metadata and the footer
 // that ends it), or an empty span when no shader is mapped there.
 std::span<const uint32_t> ShaderMappedBinary(uint64_t addr);

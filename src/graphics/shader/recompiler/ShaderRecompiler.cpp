@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/TableMode.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
@@ -739,6 +740,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
 	IR::ApplyResourceSpecialization(ir, specialization);
+	// Table mode plans from the descriptor sources and SRT reads, which the clean-up below drops.
+	if (options.table_mode) {
+		CompileResult refused;
+		if (!IR::EnterTableMode(ir, refused.table_refusal)) {
+			return refused;
+		}
+	}
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {

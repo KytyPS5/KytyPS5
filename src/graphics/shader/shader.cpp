@@ -24,6 +24,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <string>
@@ -54,6 +55,8 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Moves whenever a shader is mapped: code mapped over an address changes what a pair of shader addresses means.
+static std::atomic<uint64_t> g_shader_map_generation {0};
 // Taken before g_shader_map_mutex when both are held.
 static std::mutex        g_shader_listener_mutex;
 static ShaderMapListener g_shader_listener          = nullptr;
@@ -98,12 +101,24 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	{
 		std::scoped_lock lock(g_shader_map_mutex);
 		(*g_shader_map)[addr] = {mapped, hash};
+		g_shader_map_generation.fetch_add(1, std::memory_order_release);
 	}
 	std::scoped_lock listener_lock(g_shader_listener_mutex);
 	if (g_shader_listener != nullptr) {
 		g_shader_listener(g_shader_listener_userdata, hash,
 		                  std::span(binary, mapped.code_size_bytes / sizeof(uint32_t)));
 	}
+}
+
+uint64_t ShaderMapGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
+uint64_t ShaderHashAt(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
+	std::scoped_lock lock(g_shader_map_mutex);
+	const auto       found = g_shader_map->find(addr);
+	return found != g_shader_map->end() ? found->second.hash : 0;
 }
 
 void ShaderSetMapListener(ShaderMapListener listener, void* userdata) {

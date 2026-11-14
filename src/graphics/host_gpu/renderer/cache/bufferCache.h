@@ -96,6 +96,17 @@ public:
 	// Before a host write of all of [vaddr, vaddr + size) (any thread): as InvalidateMemory, but the GPU-written bytes the
 	// write replaces are dropped, not read back (only those of its first and last page outside it are).
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
+	// Moves when a buffer is registered or unregistered.
+	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
+	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a V# resolved before
+	// it, whose range lies in regions none of which changed since, still finds its buffer.
+	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
+		const auto region = vaddr / TRACKER_REGION_SIZE;
+		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? m_region_registrations[region].load(std::memory_order_acquire)
+		                                                           : 0;
+	}
+	// (This tree applies no write protection later than the upload that asks for it.)
+	[[nodiscard]] bool DeferredProtectionPending(uint64_t) const { return false; }
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	// RenderContext::UnmapMemory, after InvalidateMemory: the buffers the unmapped range holds whole go (nothing the guest
@@ -159,6 +170,9 @@ public:
 	// Copies host data into the stream buffer (on the host copy thread from the execution thread)
 	// and returns its offset there.
 	[[nodiscard]] uint64_t StreamUpload(const void* data, uint64_t size, uint64_t alignment);
+	// A copy of table blocks in a ring whose buffers have device addresses (table draws read their slots and the
+	// buffers' addresses through the address pushed with the user data); valid for the command buffer being recorded.
+	[[nodiscard]] vk::DeviceAddress TableUpload(const void* data, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	// Writes destination[i] = source[i % pattern] (dwords, i < count) in guest memory when neither
 	// range holds GPU writes; false otherwise (the caller lets the GPU do it).
@@ -184,6 +198,23 @@ public:
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	// Native XPR records (RenderExecutor::NativeXpr*) bind cached buffers across frames.
+	// The buffer `id` names while it is registered, else null.
+	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
+		return IsBufferInvalid(id) ? nullptr : &m_slot_buffers[id];
+	}
+	// Whether `id` is still the registered buffer with `handle` over the range; touches it for
+	// the garbage collector as a use would.
+	[[nodiscard]] bool TouchLiveBuffer(BufferId id, vk::Buffer handle, uint64_t vaddr, uint64_t size);
+	// Uploads the CPU writes of the range into the buffer that holds it (ObtainBuffer() would
+	// stream a small CPU-dirty range instead): afterwards the range is CPU clean, and a later CPU
+	// write marks it dirty again.
+	void EnsureBufferContents(uint64_t vaddr, uint64_t size);
+	// Advances whenever a buffer is registered or unregistered.
+	[[nodiscard]] uint64_t BufferSetEpoch() const noexcept { return m_buffer_set_epoch; }
+	// (The BDA page table never grows here.)
+	[[nodiscard]] static uint64_t BdaTableGeneration() noexcept { return 0; }
+	[[nodiscard]] StreamBuffer& GetTableUploadBuffer();
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
 	// Counts the buffers that shaders reached through device addresses since the last call as
@@ -461,6 +492,10 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	RenderContext*                                    m_resources = nullptr;
+	std::atomic<uint64_t>                             m_registration_epoch {1};
+	// Per tracker region, see RegionRegistrationEpoch.
+	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
+	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
@@ -608,6 +643,7 @@ private:
 	uint64_t                                          m_register_epoch     = 0;
 	// Advances whenever a buffer is registered or unregistered.
 	uint64_t m_buffer_set_epoch = 0;
+	std::unique_ptr<StreamBuffer> m_table_upload;
 	// The buffer a read-only binding of a range found, while no buffer was registered or
 	// unregistered and no page of the range became CPU dirty since (see ObtainBuffer()).
 	struct ObtainMemo {

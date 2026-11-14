@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/guest_gpu/psrShaders.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -24,6 +25,8 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
+
+#include <xxhash.h>
 
 #include <algorithm>
 #include <array>
@@ -58,6 +61,15 @@ constexpr size_t OperationQueueSize = 4096;
 constexpr size_t ResolvedQueueSize = 256;
 // How long a command processor whose queues all wait spins before it retries them.
 constexpr auto BlockedRetryInterval = std::chrono::microseconds(20);
+
+// KYTY_TABLE_XPR=2: table draws continue runs of clean draws (DrawStateObserver, RenderExecutor::TableXprTry).
+static bool TableContinueEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_XPR");
+		return value == nullptr || value[0] == 0 || value[0] == '2';
+	}();
+	return enabled;
+}
 
 static bool IsDrawOperation(GpuOperationKind kind) {
 	return kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
@@ -107,6 +119,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 			m_resolver = std::jthread([this] { ResolveThread(); });
 		}
 	}
+	Scout::Start(renderer);
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -129,6 +142,7 @@ void GuestGpu::Shutdown() {
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
+	Scout::Stop();
 	m_shutdown_complete = true;
 }
 
@@ -433,8 +447,41 @@ void GuestGpu::ResolveThread() {
 		} else {
 			PipelineCache::RetireAheadGuestWrites(m_executed.Load());
 		}
-		if (operation->kind == GpuOperationKind::DrawIndex ||
-		    operation->kind == GpuOperationKind::DrawAuto) {
+		// A draw whose shader pair's last table try drew it gets its table evaluation ahead (KYTY_SCOUT=3), and no
+		// resolution unless a try of the pair was refused lately.
+		uint32_t table_hint = 0;
+		if (operation->kind == GpuOperationKind::DrawIndex || operation->kind == GpuOperationKind::DrawIndirect) {
+			table_hint = executor.TableHint(*operation->state.shaders);
+			if ((table_hint & 1u) != 0 && Scout::Mode() == 3 && Scout::Running()) {
+				const auto& shaders = *operation->state.shaders;
+				const auto& vs      = shaders.GetVs();
+				const auto& ps      = shaders.GetPs();
+				int32_t     start   = -1;
+				if (operation->kind == GpuOperationKind::DrawIndirect) {
+					ShaderIndirectOffsets offsets;
+					if (IndirectDrawOffsets(operation->draw_indirect.registers, offsets) &&
+					    (offsets.vertex != ShaderIndirectOffsets::None || offsets.instance != ShaderIndirectOffsets::None))
+						start = static_cast<int32_t>(uint32_t {offsets.instance} << 8u | offsets.vertex);
+				}
+				const std::array<uint64_t, 3> key {vs.es_regs.data_addr, ps.ps_regs.data_addr, static_cast<uint32_t>(start)};
+				auto& ticket = m_table_tickets[m_table_ticket_next & (TableTicketRing - 1)];
+				if (Scout::EvaluateAhead(
+				        key, XXH3_64bits(key.data(), sizeof(key)),
+				        {vs.gs_user_sgpr.value, std::min<uint32_t>(vs.gs_regs.rsrc2.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)},
+				        {ps.ps_user_sgpr.value, std::min<uint32_t>(ps.ps_regs.rsrc2.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)},
+				        ticket)) {
+					operation->table_ticket = &ticket;
+					m_table_ticket_next++;
+				}
+			}
+		}
+		if ((operation->kind == GpuOperationKind::DrawIndex ||
+		     operation->kind == GpuOperationKind::DrawIndirect) &&
+		    (table_hint == 1u || executor.NativeXprLikely(*operation->state.shaders))) {
+			// A native XPR record draws it, most likely: its resolution would go unused, and the
+			// resolutions of the other operations wait behind it.
+		} else if (operation->kind == GpuOperationKind::DrawIndex ||
+		           operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
@@ -447,6 +494,20 @@ void GuestGpu::ResolveThread() {
 				operation->resolved = executor.ResolveDrawAhead(
 				    *operation->state.context, *operation->state.user_config,
 				    *operation->state.shaders, offsets, true);
+			}
+		} else if (operation->kind == GpuOperationKind::DispatchDirect && operation->dispatch.mode == 0x41u &&
+		           Scout::Mode() == 3 && Scout::Running() &&
+		           executor.TableDispatchHint(operation->state.shaders->GetCs())) {
+			// A dispatch the table serves, most likely: its table evaluation ahead (as a table draw's) and no
+			// resolution.
+			const auto&                   cs  = operation->state.shaders->GetCs();
+			const std::array<uint64_t, 3> key {cs.cs_regs.data_addr, 0, 0xffffffffu};
+			auto& ticket = m_table_tickets[m_table_ticket_next & (TableTicketRing - 1)];
+			if (Scout::EvaluateAhead(key, XXH3_64bits(key.data(), sizeof(key)),
+			                         {cs.cs_user_sgpr.value, std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)},
+			                         {}, ticket)) {
+				operation->table_ticket = &ticket;
+				m_table_ticket_next++;
 			}
 		} else if (operation->kind == GpuOperationKind::DispatchDirect) {
 			const uint32_t groups[] = {operation->dispatch.thread_group_x,
@@ -500,6 +561,10 @@ void CommandProcessor::Reset() {
 	m_predicate_skip                   = false;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	if (TableContinueEnabled()) {
+		if (m_draw_observer == nullptr) m_draw_observer = std::make_unique<DrawStateObserver>();
+		m_draw_observer->Invalidate();
+	}
 }
 
 // Pops a pushed context, then resets the register state the operation bits name.
@@ -547,6 +612,15 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.num_instances = m_num_instances;
 	operation.after_wait    = std::exchange(m_wait_since_operation, false);
 	operation.guest_sync    = std::exchange(m_acquire_since_operation, false) || operation.after_wait;
+	operation.clean         = m_draw_observer != nullptr &&
+	                          (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawIndirect) &&
+	                          m_draw_observer->LastClean();
+	if (m_scout_packet != nullptr && (kind == GpuOperationKind::DrawIndex || kind == GpuOperationKind::DrawAuto ||
+	                                  kind == GpuOperationKind::DrawIndirect)) {
+		operation.scout_packet   = m_scout_packet;
+		operation.scout_sequence = m_scout_sequence;
+		operation.scout_ordinal  = m_scout_ordinal;
+	}
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -588,7 +662,7 @@ const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& 
 GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 	GpuRegisterState state;
 	state.context     = Snapshot(m_ctx_snapshots, m_ctx, m_ctx_dirty, sequence, &state.context_id);
-	state.user_config = Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence);
+	state.user_config = Snapshot(m_ucfg_snapshots, m_ucfg, m_ucfg_dirty, sequence, &state.user_config_id);
 	state.shaders     = Snapshot(m_sh_ctx_snapshots, m_sh_ctx, m_sh_ctx_dirty, sequence);
 	return state;
 }
@@ -607,6 +681,8 @@ uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
                                       const void* value) {
 	YieldIfWaitedOn(address, size);
+	// (A write of the stream's own: a wait on it that the scout meets is passed.)
+	if (m_interrupt_event_id == 0 && size != 0 && Scout::Running()) Scout::NoteWrite(reinterpret_cast<const void*>(address), static_cast<uint32_t>(std::min<uint64_t>(size, UINT32_MAX)), value);
 	if (m_pipeline != nullptr && size != 0) {
 		m_pipeline->NoteGuestWrite(sequence, address, size, value);
 	}
@@ -634,10 +710,13 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWr
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	if (operation.scout_packet != nullptr && Scout::Running())
+		Scout::NoteDrawAt(operation.scout_packet, operation.scout_sequence, operation.scout_ordinal);
 	BindState(operation.state);
+	m_renderer.GetRenderExecutor().SetTableTicket(operation.table_ticket);
 	m_renderer.NoteOperation(operation.submit_id, operation.after_wait);
 	auto& executor = m_renderer.GetRenderExecutor();
-	executor.UseContextId(operation.state.context_id);
+	executor.UseContextId(operation.state.context_id, operation.state.user_config_id);
 	executor.BeginGuestOperation(static_cast<uint32_t>(m_interrupt_event_id),
 	                             operation.kind == GpuOperationKind::DispatchDirect ||
 	                                 operation.kind == GpuOperationKind::DispatchIndirect,
@@ -993,6 +1072,17 @@ void CommandProcessor::ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offs
 void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	// The scout follows queue 0's command submissions, each with the reset the command processor makes before it (a
+	// suspend point's, a flip preparation's).
+	if (submission.queue_id == 0 && submission.type == SubmissionType::Commands) {
+		if (Scout::Running()) {
+			submission.scout_sequence = ++m_scout_sequence;
+			Scout::Feed(submission.scout_sequence, submission.commands, false, m_scout_reset);
+		}
+		m_scout_reset = false;
+	} else if (submission.queue_id == 0) {
+		m_scout_reset = true;
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_epoch.fetch_add(1, std::memory_order_release);
@@ -1223,6 +1313,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	switch (submission.type) {
 		case SubmissionType::Commands: {
+			if (submission.scout_sequence != 0) submission.execution.SetScoutSequence(submission.scout_sequence);
 			const auto result  = cp.Process(submission.execution, submission.commands);
 			complete           = result == Pm4ProcessResult::Complete;
 			submission.yielded = result == Pm4ProcessResult::Yielded;
@@ -1324,12 +1415,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, packet, packet_dw, true);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
+			// (The scout numbers the draw packets of the stream, the predicated ones too.)
+			if (execution.m_scout_sequence != 0 && Scout::IsDraw(opcode)) execution.m_scout_ordinal++;
 			continue;
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		if (m_draw_observer != nullptr) {
+			m_draw_observer->ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw), false);
+		}
 
 		if (handler == nullptr) {
 			const auto offset = cursor.offset_dw;
@@ -1346,9 +1443,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
+		const bool scout_draw = execution.m_scout_sequence != 0 && Scout::IsDraw(opcode);
+		if (scout_draw) {
+			m_scout_packet   = packet;
+			m_scout_sequence = execution.m_scout_sequence;
+			m_scout_ordinal  = execution.m_scout_ordinal;
+			m_scout_skipped  = 0;
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
+		if (scout_draw) {
+			m_scout_packet = nullptr;
+			if (!execution.m_suspended) execution.m_scout_ordinal += 1 + std::exchange(m_scout_skipped, 0u);
+		}
 		if (execution.m_suspended) {
 			return;
 		}
@@ -1512,7 +1620,18 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	if (args.instance_count == 0) {
 		args.instance_count = ResolveNumInstances(operation);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(CurrentBuffer(), args);
+	auto& executor = m_renderer.GetRenderExecutor();
+	// A direct draw of an object may come from its native XPR record (nativeXpr.inc); indirect
+	// ones are offered in ExecuteDrawIndirect().
+	if (args.indirect.address == 0 &&
+	    (executor.TableXprTry(CurrentBuffer(), 0, 1, 0, 0, 0, vk::IndexType::eUint16, &args, operation.clean) ||
+	     (!executor.TableStoreRequested() && executor.NativeXprTryDirect(CurrentBuffer(), args)))) {
+		return;
+	}
+	executor.DrawIndex(CurrentBuffer(), args);
+	if (args.indirect.address == 0) {
+		executor.NativeXprEndDraw();
+	}
 }
 
 const void* CommandProcessor::IndexAddress(uint64_t base, uint32_t type_and_size,
@@ -1680,14 +1799,36 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		m_has_indirect_instances      = true;
 		NoteRecordedWork();
 		auto& executor = m_renderer.GetRenderExecutor();
-		if (indirect.indexed
+		// The draws of an object (a run of records one after another: chenxiao07's native XPR runs) may come from its
+		// shader pair's table programs (tableXpr.inc), a single draw also from its native XPR record (nativeXpr.inc).
+		if (indirect.indexed && count_address == 0 && indirect.max_count <= 64 &&
+		    indirect.stride >= sizeof(vk::DrawIndexedIndirectCommand) && (indirect.stride & 3u) == 0 &&
+		    (indirect.index_type == 0 || indirect.index_type == 1) &&
+		    (executor.TableXprTry(CurrentBuffer(), args_addr, indirect.max_count, indirect.stride,
+		                          indirect.index_base,
+		                          uint64_t {indirect.index_buffer_size} * (indirect.index_type == 0 ? 2u : 4u),
+		                          indirect.index_type == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
+		                          nullptr, operation.clean, records.offsets) ||
+		     (indirect.max_count == 1 && !executor.TableStoreRequested() &&
+		      executor.NativeXprTry(CurrentBuffer(), args_addr, indirect.index_base,
+		                            uint64_t {indirect.index_buffer_size} *
+		                                (indirect.index_type == 0 ? 2u : 4u),
+		                            indirect.index_type == 0 ? vk::IndexType::eUint16
+		                                                     : vk::IndexType::eUint32)))) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, indirect.max_count);
+			return;
+		}
+		const bool drawn =
+		    indirect.indexed
 		        ? executor.DrawIndex(CurrentBuffer(),
 		                             {.index_count         = indirect.index_buffer_size,
 		                              .index_addr          = IndexAddress(indirect.index_base,
 		                                                                  indirect.index_type, 0),
 		                              .index_type_and_size = indirect.index_type,
 		                              .indirect            = records})
-		        : executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
+		        : executor.DrawAuto(CurrentBuffer(), {.indirect = records});
+		executor.NativeXprEndDraw();
+		if (drawn) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws,
 			                           indirect.max_count);
 			return;

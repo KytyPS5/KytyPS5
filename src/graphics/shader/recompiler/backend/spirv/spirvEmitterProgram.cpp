@@ -1473,6 +1473,7 @@ void EmitProgram(EmitterState& state) {
 		                          ConstantU32(state, 1));
 	}
 	InitializeRayQueryVariables(state);
+	EmitTableMode(state);
 	EmitMemoryBindings(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);

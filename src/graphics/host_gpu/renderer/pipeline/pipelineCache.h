@@ -90,6 +90,27 @@ public:
 	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
 	                      bool gpu_copies = false) const;
 
+	// Native XPR records (RenderExecutor::NativeXpr*) keep a log and compare it word by word.
+	// Whether every read is whole dwords (the log's bytes are then words, in read order).
+	[[nodiscard]] bool     DwordAligned() const;
+	[[nodiscard]] size_t   WordCount() const { return m_bytes.size() / 4u; }
+	[[nodiscard]] uint32_t WordAt(size_t index) const;
+	void                   SetWord(size_t index, uint32_t value);
+	// The same reads at the same addresses, in the same order.
+	[[nodiscard]] bool     SameReads(const GuestReadLog& other) const;
+	// Execution thread: appends (word index, value now) for every logged word whose value changed,
+	// read as StillValid() reads it. False when a read fails (or the log is not DwordAligned()).
+	[[nodiscard]] bool     CollectChanges(std::vector<std::pair<uint32_t, uint32_t>>& changed) const;
+	// Diagnostics (DSP-INSTR): the first entry StillValid() would refuse.
+	[[nodiscard]] bool     FirstMismatch(uint32_t& index, uint64_t& address, uint32_t& size, uint32_t& old_value,
+	                                     uint32_t& new_value) const;
+	template <typename Function>
+	void ForEachRead(Function&& function) const {
+		for (const auto& entry: m_entries) {
+			function(entry.address, uint64_t {entry.size});
+		}
+	}
+
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
 	struct Entry {
@@ -287,6 +308,9 @@ struct ShaderModule {
 	// A compute program built without the native ray tracing patch while it is on: the program of
 	// a dispatch without a TLAS (see PipelineCache::GetComputeProgram()).
 	bool                                         guest_traversal = false;
+	// The resource plan of the program the module belongs to (null for table modules, see
+	// PipelineCache::GetComputeProgramTable()); it lives as long as the cache.
+	const ShaderRecompiler::IR::ResourcePlan*    plan = nullptr;
 };
 
 // ShaderModule::plain of `module` from the variant's SPIR-V; null when the module fails.
@@ -393,6 +417,9 @@ public:
 		bool                    uses_image_heap       = false;
 		// Its shaders are in the title's order of use (NoteUse()).
 		bool                    use_noted             = false;
+		// Native XPR variant (RenderExecutor::NativeXpr*): the same shaders with an ordinary
+		// descriptor set, the flattened SRT and shader data as dynamic storage buffers.
+		bool                    native_bindings       = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -422,9 +449,60 @@ public:
 	// With `allow_async`, a pipeline that does not exist yet is created on a background thread
 	// and the lookup returns null until it is there (the draw can be skipped meanwhile);
 	// otherwise the lookup creates the pipeline, or waits for a background thread creating it.
+	// A native-bindings variant (a table pair's, stored after its draw went the normal way) never
+	// waits with `allow_async`: null, and PipelineWaiting() is set once it is there.
 	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              const DrawTargets& targets, bool allow_async = false);
+	                              const DrawTargets& targets, bool allow_async = false,
+	                              bool native_bindings = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// A table dispatch's pipeline (RenderExecutor::TableDispatchLearn): the pipeline if it exists or a background
+	// thread made it; otherwise null, and a background thread creates it (the normal path dispatches meanwhile).
+	// Without background threads, or when one failed to create it, GetComputePipeline().
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// When the last native-bindings GetGraphicsPipeline() returned null: the completion of that
+	// pipeline (chenxiao07's PipelineWaiting).
+	[[nodiscard]] const std::shared_ptr<const std::atomic<bool>>& PipelineWaiting() const {
+		return m_pipeline_waiting;
+	}
+
+	// Table mode (chenxiao07's KytyPS5 fork, RenderExecutor::TableDispatch): a program translated so that it
+	// reads its SRT slots and buffers from a block the renderer writes for each dispatch or draw (see
+	// ShaderRecompiler::IR::EnterTableMode), for one specialization of its resources. Table programs compile on the
+	// workers that compile the others: a lookup that finds none queues it and answers Pending until it is there.
+	enum class TableStatus : uint8_t {
+		Ready,   // `module` is the table program
+		Pending, // being compiled: the caller takes the normal path meanwhile
+		Refused, // table mode cannot serve this program, or this specialization: for good
+	};
+	struct TableProgram {
+		const ShaderModule* module = nullptr; // info.table_mode, info.table_plan, specialization
+		TableStatus         status = TableStatus::Refused;
+		// Refused: why (for the logs).
+		const std::string*  refusal = nullptr;
+		// Pending: set once the compile is done (chenxiao07's TableWaiting).
+		std::shared_ptr<const std::atomic<bool>> waiting;
+	};
+	// The resource plan and the specialization of a normal program's module (null for a table module), both of
+	// which live as long as the cache.
+	std::pair<const ShaderRecompiler::IR::ResourcePlan*, const ShaderRecompiler::IR::ResourceSpecialization*>
+	ProgramPlanOf(const ShaderModule& module) const;
+	// IR::SpecializeDirectResources() under the program lock (the other threads evaluate the same plans): the
+	// specialization of descriptors the caller evaluated (a table program's TablePlan lists the words).
+	bool SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
+	                               ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
+	                               ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	// The table program of a dispatch for `specialization`. Prepares `input_info` as GetComputeProgram() does
+	// (thread counts, wave size, LDS); the caller sets input_info.stage to the module and its resources.
+	TableProgram GetComputeProgramTable(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
+	                                    const ShaderRecompiler::IR::ResourceSpecialization& specialization);
+	// The table program of a draw's stage for `specialization`. `push_data_cursor` is where the stage's shader data
+	// starts in the push constants, as the draw's normal lookup gets it (in and out as in GetProgram()).
+	TableProgram GetVertexProgramTable(const ShaderParams& params, const ShaderVertexInputInfo& input_info,
+	                                   const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                   uint32_t& push_data_cursor);
+	TableProgram GetPixelProgramTable(const ShaderParams& params, const ShaderPixelInputInfo& input_info,
+	                                  const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                  uint32_t& push_data_cursor);
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -489,6 +567,8 @@ private:
 	std::chrono::steady_clock::time_point m_driver_cache_posted;
 	bool                          m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
+	// Native XPR variants of graphics pipelines, created on demand (never asynchronously).
+	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_native_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
@@ -537,7 +617,8 @@ private:
 	                         ShaderRecompiler::TranslateResult                   translated,
 	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                         std::span<const uint32_t> function_code, uint32_t push_data_cursor,
-	                         std::vector<uint32_t>& spirv, std::vector<uint32_t>& plain_spirv) const;
+	                         std::vector<uint32_t>& spirv, std::vector<uint32_t>& plain_spirv,
+	                         std::string* table_refusal = nullptr) const;
 	// Under the program lock: counts a module added to `program` and records it in the store and
 	// the manifest. `options`, `code` and `push_data_cursor` are those it was compiled with.
 	void AddedModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
@@ -562,6 +643,25 @@ private:
 	void CompileWorker();
 	void StopWorkers();
 
+	// Table programs (see GetComputeProgramTable()), by the key of the normal program. Under the program lock.
+	struct TableVariant {
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		uint32_t                                     push_data_cursor = 0;
+		bool                                         done             = false;
+		// Set with `done`, for the pairs that wait for this program without the program lock.
+		std::shared_ptr<std::atomic<bool>>           waiting = std::make_shared<std::atomic<bool>>(false);
+		std::optional<ShaderModule>                  module; // empty when done and refused
+		std::string                                  refusal;
+	};
+	// Deques: a lookup's pointers stay valid while variants are added.
+	std::unordered_map<ProgramKey, std::deque<TableVariant>, ProgramKeyHash> m_table_programs;
+	template <typename InputInfo>
+	TableProgram GetTableProgram(const ShaderParams& params, const InputInfo& input_info,
+	                             const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                             uint32_t push_data_cursor);
+	template <typename InputInfo>
+	void RunTableJob(CompileJob& job, InputInfo& input_info);
+
 	// Pipelines new to the session, created on background threads instead of stalling the
 	// execution thread: graphics pipelines of draws that may be skipped until they are there,
 	// and compute pipelines of modules the compile workers compiled ahead of their dispatch.
@@ -569,6 +669,7 @@ private:
 	// under m_async_mutex.
 	struct AsyncPipelineJob {
 		bool                               compute = false;
+		bool                               native  = false; // a native-bindings variant (m_async_native)
 		GraphicsPipelineKey                key {};
 		std::array<const ShaderModule*, 4> stages {};
 		const ShaderModule*                module = nullptr;
@@ -578,7 +679,17 @@ private:
 	// Keys a background thread failed to create: their draws create them and report the error.
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_failed_graphics;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_async_ready;
+	// Native-bindings variants a background thread creates or created (under m_async_mutex): the
+	// flag is set when the pipeline is in `pipeline` (null handles: the driver refused it, and the
+	// next lookup creates it and reports the error).
+	struct AsyncNativePipeline {
+		std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
+		Pipeline                           pipeline;
+	};
+	std::unordered_map<GraphicsPipelineKey, AsyncNativePipeline, GraphicsPipelineKeyHash> m_async_native;
+	std::shared_ptr<const std::atomic<bool>>                                   m_pipeline_waiting;
 	std::unordered_map<uint64_t, Pipeline>                                     m_async_ready_compute;
+	std::unordered_set<uint64_t>                                               m_async_asked_compute; // (TryGetComputePipeline)
 	std::mutex                                                       m_async_mutex;
 	std::condition_variable                                          m_async_available;
 	std::deque<AsyncPipelineJob>                                     m_async_jobs;

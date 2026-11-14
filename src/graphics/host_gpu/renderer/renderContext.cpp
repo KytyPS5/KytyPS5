@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hackNotice.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
@@ -302,6 +303,22 @@ uint64_t RenderContext::MappedRangesVersion() const noexcept {
 	return m_mapped_ranges_version;
 }
 
+bool RenderContext::UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	if (version == m_mapped_ranges_version) {
+		return false;
+	}
+	if (version < m_unmap_log_floor) {
+		return true; // unmaps since then left the log
+	}
+	for (auto it = m_unmap_log.rbegin(); it != m_unmap_log.rend() && it->version > version; ++it) {
+		if (vaddr < it->vaddr + it->size && it->vaddr < vaddr + size) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
@@ -365,6 +382,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_mapped_ranges_version++;
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
+		if (m_unmap_log.size() >= 4096) {
+			m_unmap_log_floor = m_unmap_log.front().version;
+			m_unmap_log.pop_front();
+		}
+		m_unmap_log.push_back({m_mapped_ranges_version, vaddr, size});
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -1110,6 +1132,7 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 }
 
 void RenderContext::RunGarbageCollector() {
+	m_frame_number++;
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

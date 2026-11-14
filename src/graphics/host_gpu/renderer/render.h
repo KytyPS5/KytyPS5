@@ -34,6 +34,7 @@ struct GraphicContext;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
+struct DynamicState;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -100,6 +101,12 @@ struct DrawAutoArgs {
 	uint32_t         first_instance = 0;
 	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
 	DrawIndirectArgs indirect;
+};
+
+// The hash of the context and user configuration registers under the snapshot ids it was made for
+// (NativeXprStateKeyOf).
+struct StateKeyCache {
+	uint64_t context_id = 0, user_config_id = 0, hash = 0;
 };
 
 struct SubmitInfo {
@@ -248,7 +255,10 @@ public:
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
 	// live registers); operations with the same id see the same context registers.
-	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
+	void UseContextId(uint64_t context_id, uint64_t user_config_id = 0) noexcept {
+		m_context_id     = context_id;
+		m_user_config_id = user_config_id;
+	}
 	// Execution thread: an operation of guest queue `queue` is about to execute. The barrier
 	// after a dispatch (direct or indirect) is deferred to the next operation, unless that is a
 	// dispatch of the same queue the guest did not order after it (see DispatchDirect()).
@@ -281,7 +291,85 @@ public:
 	                                            bool        table_candidate = false,
 	                                            GuestRange* examined        = nullptr);
 
+	// Native XPR draws (nativeXpr.inc; KYTY_NATIVE_XPR=0 turns them off): an indexed indirect
+	// draw whose arguments the host GPU reads, drawn from a record of its object when the record
+	// is proven current. False when the normal path draws it (and, when that helps, stores a
+	// record).
+	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
+	                                uint64_t index_bytes, vk::IndexType index_type);
+	// The same for a direct indexed draw.
+	[[nodiscard]] bool NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args);
+	// The draw a try offered is done (drawn or skipped by the normal path).
+	void NativeXprEndDraw() noexcept {
+		m_native_xpr_store = false;
+		m_table_store      = false;
+	}
+	// Table draws (tableDraw.inc; KYTY_TABLE_XPR=1, =2 also continues runs): an indexed draw of one object (an
+	// indirect one whose arguments the host GPU reads at `args_addr`, or `direct`), drawn from its shader pair's table
+	// programs and its image set; `clean`: no graphics register but user data changed since the draw before (the
+	// command processor's DrawStateObserver). False when the normal path draws it.
+	// (`count` records of a run `stride` bytes apart from `args_addr`: his native XPR runs; direct: count 1.)
+	// The last try asked the normal path to draw and store the pair's table variant (TableStore): nothing may draw the
+	// draw before that (a native XPR record would, and the pair would never get its variant).
+	[[nodiscard]] bool TableStoreRequested() const noexcept { return m_table_store; }
+	// The last table try of the draw's shader pair drew it: the resolve thread skips its resolution ahead, which the
+	// table draw does not use (a draw the table then refuses resolves itself, as one without a resolution ahead).
+	[[nodiscard]] bool TableLikely(const HW::Shader& shaders) const noexcept;
+	// Bit 0: the pair's last table try drew it; bit 1: a try of the pair was refused lately (its draws keep their
+	// resolution ahead).
+	[[nodiscard]] uint32_t TableHint(const HW::Shader& shaders) const noexcept;
+	// The executing draw's table evaluation, made ahead by the resolve thread (KYTY_SCOUT=3; null: none).
+	void SetTableTicket(const void* ticket) noexcept { m_table_ticket = ticket; }
+	// The resolve thread: whether a plain dispatch of `cs` most likely goes through the table (tableXpr.inc).
+	[[nodiscard]] bool TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept;
+	void               TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept;
+	[[nodiscard]] bool TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint32_t count, uint32_t stride,
+	                               uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                               const DrawIndexArgs* direct, bool clean,
+	                               const ShaderIndirectOffsets& offsets = {});
+	// Resolve thread: whether the last native XPR try of the draw's shader pair drew it. Its
+	// resolution ahead is then likely wasted (KYTY_XPR_RESOLVE_SKIP=0 resolves them all the same).
+	[[nodiscard]] bool NativeXprLikely(const HW::Shader& shaders) const noexcept;
+
 private:
+	struct NativeXprCache;
+	struct NativeXprRecord;
+	struct NativeXprDrawState;
+	NativeXprCache&   NativeXprState();
+	vk::DescriptorSet NativeXprAllocateSet(vk::DescriptorSetLayout layout, vk::DescriptorPool& pool_out);
+	void              NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set);
+	void              NativeXprRetire(std::unique_ptr<NativeXprRecord> record);
+	void              NativeXprCollect();
+	bool              NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
+	bool              NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
+	const char*       NativeXprBindResources(NativeXprRecord& record, std::span<PreparedBindings* const> stages,
+	                                         const PipelineCache::Pipeline& pipeline);
+	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
+	                    bool primitive_restart_enable, const RenderState& rendering,
+	                    std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state);
+	bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
+	bool NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken);
+	bool NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots);
+	NativeXprRecord* NativeXprRelocated(uint64_t frame, bool& store);
+	void             NativeXprRefuseStore(CommandBuffer& buffer);
+	void             NativeXprDropRelocated(NativeXprRecord& record);
+	void NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> record, CommandBuffer& buffer,
+	                          const DrawRenderState& state, vk::PrimitiveTopology topology,
+	                          bool primitive_restart_enable, const RenderState& rendering,
+	                          std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state,
+	                          const GuestReadLog* reads);
+	void NativeXprCaptureState(const DrawRenderState& state, const RenderState& rendering, uint64_t state_key,
+	                           const DynamicState& dynamic_state);
+	struct TableImageSet;
+	bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer,
+	                          const TableImageSet* reading = nullptr);
+	bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
+	void NativeXprEmitDynamic(NativeXprCache& cache, CommandRecorder vk_buffer, const NativeXprDrawState& draw_state,
+	                          bool same_command);
+	bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
+	                   const PipelineCache::Pipeline& pipeline, uint64_t args_addr, uint64_t index_base,
+	                   uint64_t index_bytes, vk::IndexType index_type);
+
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -659,6 +747,8 @@ private:
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	uint64_t                                                       m_context_id    = 0;
+	uint64_t                                                       m_user_config_id = 0;
+	StateKeyCache                                                  m_state_key_cache;
 	// The context snapshot whose registers hw_check() last accepted.
 	uint64_t m_checked_context_id = 0;
 	// The last color-target descriptions per slot; see ResolveRenderColorTarget().
@@ -675,6 +765,100 @@ private:
 	uint64_t m_draw_window           = 0;
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};
+	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
+	// Table draws (tableXpr.inc, chenxiao07's GPU-driven XPR draws; KYTY_TABLE_XPR).
+	struct TableXpr;
+	struct TablePair;
+	struct TableVariant;
+	struct TableImageSet;
+	struct TableFlatStage;
+	// Deferred: the pair's table variant is on its way (TableTry): the normal path draws, storing no native record.
+	enum class TableResult { Drawn, Native, Store, Deferred };
+	std::unique_ptr<TableXpr, void (*)(TableXpr*)> m_table_xpr {nullptr, nullptr};
+	// The draw's try asked the normal path to store its table variant (TableStore).
+	bool m_table_store = false;
+	const void* m_table_ticket = nullptr;
+	TableXpr&   OwnTable();
+	// (The speculation's catalog of chenxiao07's tree is not ported: this executor's table is the only one.)
+	[[nodiscard]] static constexpr uint32_t Role() noexcept { return 0; }
+	static constexpr uint32_t               Roles = 1;
+	[[nodiscard]] RenderExecutor&           Catalog() noexcept { return *this; }
+	[[nodiscard]] TableXpr*                 CatalogTable() noexcept { return m_table_xpr.get(); }
+	struct CatalogLock {
+		CatalogLock() noexcept {}
+		~CatalogLock() {}
+	};
+	[[nodiscard]] static CatalogLock CatalogWrite() noexcept { return {}; }
+	[[nodiscard]] static CatalogLock CatalogRead() noexcept { return {}; }
+	void TableMemoRetired(); // KYTY_TABLE_MEMO: a set left service (memo_epoch moves)
+	void DropStaleCatalog() {}
+	void ForgetStaleCatalog() {}
+	void TableForgetStates();
+	void TableSweepPairs();
+	const DrawIndexArgs* m_native_xpr_direct = nullptr; // the direct draw a try is for
+public:
+	// A direct indexed draw (DRAW_INDEX_2 / DRAW_INDEX_OFFSET_2): its indices, count and instances; or a direct draw
+	// of vertices (not `indexed`: the count is of vertices; table draws only). `indirect` (not `indexed`): a draw of
+	// vertices whose arguments the GPU reads (his KYTY_SPEC_DRAW_INDIRECT; not used here).
+	struct NativeXprDirectDraw {
+		uint64_t index_address  = 0;
+		uint32_t index_count    = 0;
+		uint32_t instance_count = 1;
+		int32_t  base_vertex    = 0;
+		bool     indexed        = true;
+		bool     indirect       = false;
+	};
+private:
+	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	bool        TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
+	                          uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
+	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
+	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
+	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                      const NativeXprDirectDraw* direct);
+	void        TableReset(TablePair& pair);
+	void        TableRuns(TablePair& pair);
+	void        TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat_forms);
+	bool        TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	void        TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
+	                        const NativeXprDrawState* draw_state);
+	TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
+	                               const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
+	bool        TableValidateSet(TableImageSet& set);
+	bool        TableTransit(const TableImageSet& set, CommandRecorder vk_buffer, const NativeXprDrawState* draw_state);
+	void        TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
+	bool        TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
+	                        std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
+	// After a normal draw a table try asked to store (`storable`: one a table variant can draw): the pair's table
+	// programs (compiled by a worker) and this draw state's pipeline, and the draw state.
+	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
+	                bool primitive_restart_enable, const RenderState& rendering, const DynamicState& dynamic_state,
+	                bool storable);
+	// Table dispatches (KYTY_TABLE_DISPATCH): the normal path's plain dispatch teaches the shader pair its table
+	// program (TableDispatchLearn); later dispatches of the pair go through the table (TableDispatch).
+	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute);
+	bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, uint32_t mode,
+	                   bool async_compute);
+	// The shader access a table image set adds to target `id` (KYTY_TABLE_TARGET_READ; none: empty).
+	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
+	// The try of the executing draw asked the normal path to store a record.
+	bool m_native_xpr_store = false;
+	// Per hashed object key: its last native XPR try drew it from its record (NativeXprLikely()).
+	std::array<std::atomic<uint64_t>, 65536> m_native_xpr_drawn {};
+	// Per hashed shader pair (the stages' code addresses): its last table try drew it (TableLikely()), and the frame
+	// until which its draws are resolved ahead all the same (a try of the pair was refused lately: some of its draws
+	// take the normal path, which is several times slower without the resolution ahead).
+	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
+	// The compute stages whose last plain dispatch went through the table (TableDispatchHint).
+	std::array<std::atomic<uint64_t>, 4096> m_table_dispatched {};
+	std::array<std::atomic<uint64_t>, 16384> m_table_mixed_until {};
+	// Per hashed shader pair and start instance: its table try was refused for good (TableTry: the pair refused) under
+	// that shader map generation. Its draws take the normal path without the try (TableXprTry).
+	std::array<uint64_t, 4096> m_table_refused {};
+	std::array<uint64_t, 4096> m_table_refused_generation {};
+	bool                       m_table_try_refused = false;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

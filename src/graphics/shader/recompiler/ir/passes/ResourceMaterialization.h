@@ -81,6 +81,11 @@ bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
 // A specialization with the strides compiled in, as MaterializeResources() gives it for a program
 // that reads them at run time.
 void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);
+// The specialization of resources whose descriptors the caller evaluated itself (table mode, chenxiao07's
+// KytyPS5 fork): snapshot.buffers, images and samplers hold one descriptor per resource of the plan. False for
+// a plan with indirect descriptors, or descriptors no specialization takes.
+bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                               ResourceSpecialization& specialization);
 
 // Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
 bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);

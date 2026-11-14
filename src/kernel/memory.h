@@ -204,7 +204,7 @@ bool                   TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 bool                   TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 bool                   TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
 // The emulator wrote [vaddr, vaddr + size) of guest memory itself (any thread, after the write): the epochs proofs of
-// unchanged bytes hold on move (MemoryTracker::NoteHostWrite).
+// unchanged bytes hold on move (MemoryTracker::NoteHostWrite) and the scout's host-write clock does (Scout::NoteHostWrite).
 void                   NoteEmulatorWrite(uint64_t vaddr, uint64_t size);
 // chenxiao07's names for the backing reads of host destinations (the scout and the table draws read the tables
 // through them): the backing store's bytes, and the backing store's bytes when no GPU work wrote the range.

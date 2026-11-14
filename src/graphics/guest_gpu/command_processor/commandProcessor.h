@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "graphics/guest_gpu/command_processor/drawStateObserver.h"
 #include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -53,6 +54,13 @@ private:
 	bool                      m_suspended     = false;
 	bool                      m_yield         = false;
 	bool                      m_made_progress = false;
+	// queue 0 (KYTY_SCOUT): this submission's number for the scout (0: not followed) and the draw packets the command
+	// processor passed in it.
+	uint64_t                  m_scout_sequence = 0;
+	uint32_t                  m_scout_ordinal  = 0;
+
+public:
+	void SetScoutSequence(uint64_t sequence) noexcept { m_scout_sequence = sequence; }
 };
 
 class CommandProcessor {
@@ -173,6 +181,9 @@ public:
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// A handler that took more draw packets than the one it was called for (a run of indirect draws) tells the scout's
+	// numbering how many.
+	void ScoutSkipDraws(uint32_t count) noexcept { m_scout_skipped += count; }
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
@@ -259,7 +270,14 @@ private:
 	SnapshotRing<HW::Shader>     m_sh_ctx_snapshots;
 
 	uint64_t m_submit_id      = 0;
+	// The draw packet being processed (queue 0 of a followed submission) and the draws its handler took besides it.
+	const uint32_t* m_scout_packet   = nullptr;
+	uint64_t        m_scout_sequence = 0;
+	uint32_t        m_scout_ordinal  = 0;
+	uint32_t        m_scout_skipped  = 0;
 	bool     m_predicate_skip = false;
+	// KYTY_TABLE_XPR=2: which indexed draws are clean (null otherwise).
+	std::unique_ptr<DrawStateObserver> m_draw_observer;
 	// A ZPASS predication waits for host occlusion query results it asked for.
 	bool     m_occlusion_wait_requested = false;
 	// RELEASE_MEM labels queued behind occlusion counters and not written yet.

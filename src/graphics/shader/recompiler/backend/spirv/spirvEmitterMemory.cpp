@@ -93,9 +93,12 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
-	// A stride read at run time: the bound buffer's, from the shader data.
+	// A stride read at run time: the bound buffer's, from the shader data. In table mode an unswizzled buffer's is
+	// its V#'s, from the block (EmitTableMode): the renderer gives a pair's program the V#s of every stride.
 	uint32_t stride_value = 0;
-	if (IR::HasRuntimeStride(packed)) {
+	if (state.program.table_mode && !swizzle && mem.resource < state.table_strides.size()) {
+		stride_value = state.table_strides[mem.resource];
+	} else if (IR::HasRuntimeStride(packed)) {
 		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
 		stride_value       = binding < state.memory_strides.size() ? state.memory_strides[binding] : 0u;
 		if (stride_value == 0u) {
@@ -417,7 +420,11 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
                      uint32_t prefix = 0) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
-		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
+		// (Table mode addresses each buffer from its V#'s base: EmitTableMode.)
+		if (prefix == 0u) {
+			prefix = ctx.state.program.table_mode ? ConstantU32(ctx.state, 0)
+			                                      : ctx.state.memory_byte_offsets[resource];
+		}
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -586,22 +593,16 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
-	const auto value   = ctx.state.builder.AllocateId();
-	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
-	                              resource.memory_access);
-	return value;
+	return EmitAccessLoad(ctx.state, TypeU32(ctx.state), EmitMemoryElementPointer(ctx.state, resource, index),
+	                      resource);
 }
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits) {
 	uint32_t value;
 	if (resource.element_bits < 32u) {
-		const auto loaded = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad,
-		                              ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, loaded,
-		                              EmitMemoryElementPointer(ctx.state, resource, index),
-		                              resource.memory_access);
+		const auto loaded = EmitAccessLoad(ctx.state, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
+		                                   EmitMemoryElementPointer(ctx.state, resource, index), resource);
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
@@ -698,11 +699,10 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           uint32_t bits, uint32_t data) {
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (resource.element_bits < 32u) {
-		ctx.state.builder.AddFunction(
-		    spv::OpStore, pointer,
-		    Unary(ctx.state, spv::OpUConvert,
-		          ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, data),
-		    resource.memory_access);
+		EmitAccessStore(ctx.state, pointer,
+		                Unary(ctx.state, spv::OpUConvert, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
+		                      data),
+		                resource);
 		return;
 	}
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
@@ -757,9 +757,7 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	EmitAccessStore(ctx.state, EmitMemoryElementPointer(ctx.state, resource, index), data, resource);
 }
 
 // The per invocation arrays of a program with outlined call targets (Private variables) are read
@@ -1466,6 +1464,69 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+// Table mode: a formatted buffer specialized for no format takes it from its buffer word (IR::TablePlan::runtime_formats).
+bool UsesRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return state.program.table_mode && mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed &&
+	       mem.resource < 32u && ((state.program.table_plan.runtime_formats >> mem.resource) & 1u) != 0 &&
+	       mem.resource < state.table_buffer_words.size() && state.table_buffer_words[mem.resource] != 0u;
+}
+
+// A formatted load whose format and dst_sel are the buffer word's (the V#'s fourth dword, as a load through a V# selected
+// at run time decodes it: LoadIndirectFormattedComponent): the values LoadFormattedPrepared gives for that format, raw
+// dwords for no format.
+uint32_t LoadRuntimeFormatted(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                              const MemoryResourceAccess& resource, uint32_t components) {
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto word  = state.table_buffer_words[mem.resource];
+	const auto bits  = [&](uint32_t value, uint32_t offset, uint32_t count) {
+		return EmitBitFieldUExtract(state, value, ConstantU32(state, offset), ConstantU32(state, count));
+	};
+	const auto format   = bits(word, 12, 7);
+	const auto geometry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
+	                          state.indirect_format_geometry_function, format);
+	const auto field = [&](uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, value, geometry, index);
+		return value;
+	};
+	const auto bytes   = field(0);
+	const auto unknown = Binary(state, spv::OpIEqual, TypeBool(state), bytes, ConstantU32(state, 0));
+	// The whole, unaligned element in bounds, then its aligned address (PrepareFormattedMemory).
+	const auto start = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto end   = Binary(state, spv::OpIAdd, u32, start,
+	                          Binary(state, spv::OpISub, u32,
+	                                 Select(state, u32, unknown, ConstantU32(state, 1), bytes), ConstantU32(state, 1)));
+	const auto in_bounds = BufferIndexInBounds(
+	    ctx, inst, mem, resource,
+	    AndCondition(state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), end, start),
+	                 EmitMemoryElementInBounds(
+	                     state, resource, Binary(state, spv::OpShiftRightLogical, u32, end, ConstantU32(state, 2)))));
+	const auto base = Binary(state, spv::OpBitwiseAnd, u32, start, Unary(state, spv::OpNot, u32, field(3)));
+	std::array<uint32_t, 4> values {};
+	for (uint32_t output = 0; output < components; output++) {
+		const auto selector  = bits(word, output * 3u, 3);
+		const auto component = Binary(state, spv::OpUMod, u32,
+		                              Binary(state, spv::OpISub, u32, selector, ConstantU32(state, 4)), field(1));
+		const auto address   = Binary(state, spv::OpIAdd, u32, base, Binary(state, spv::OpIMul, u32, component, field(2)));
+		const auto memory    = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector, ConstantU32(state, 4));
+		const auto dword     = EmitValueOrZeroIfCondition(state, AndCondition(state, memory, in_bounds), [&]() {
+			return LoadWordInBounds(ctx, resource, Binary(state, spv::OpShiftRightLogical, u32, address, ConstantU32(state, 2)));
+		});
+		const auto raw = Binary(state, spv::OpShiftRightLogical, u32, dword,
+		                        Binary(state, spv::OpShiftLeftLogical, u32,
+		                               Binary(state, spv::OpBitwiseAnd, u32, address, ConstantU32(state, 3)),
+		                               ConstantU32(state, 3)));
+		const auto decoded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, u32, decoded, state.indirect_format_function, format, selector,
+		                          component, raw);
+		const auto plain = LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, output), resource);
+		values[output]   = Select(state, u32, unknown, plain, decoded);
+	}
+	return ConstructU32Composite(state, components, values);
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
@@ -1489,6 +1550,9 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 				    return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
 			    }
 			    if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
+			    if (UsesRuntimeFormat(state, selected)) {
+				    return LoadRuntimeFormatted(ctx, inst, selected, resource, components);
+			    }
 			    return LoadRawBuffer(ctx, inst, selected, resource, components);
 		    });
 	    });
@@ -1711,6 +1775,17 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
+	// Table mode decodes the formats of its runtime format buffers with the same functions (LoadRuntimeFormatted).
+	if (state.program.table_mode && state.indirect_format_function == 0u) {
+		const auto& buffers = state.program.info.buffers;
+		for (size_t i = 0; i < buffers.size() && i < 32; ++i) {
+			if (((state.program.table_plan.runtime_formats >> i) & 1u) != 0 &&
+			    buffers[i].descriptor_format == Prospero::BufferFormat::kInvalid) {
+				DefineIndirectBufferFormats(ctx);
+				break;
+			}
+		}
+	}
 	// The native ray tracing alpha test reads index buffers through runtime V#s.
 	if (state.program.info.ray_query) {
 		for (const auto* block: state.program.blocks) {
@@ -2308,6 +2383,14 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
+	if (state.program.table_mode) {
+		// A slot the block does not give the shader only addresses planning-only loads (IR::EnterTableMode), which
+		// emit nothing.
+		const auto slot = inst.Arg(1).Resolve().U32();
+		return slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
+		           ? state.table_slot_values[slot]
+		           : ConstantU32(state, 0);
+	}
 	if (state.flattened_srt_variable == 0) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
@@ -2366,8 +2449,8 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto condition = EmitStorageElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           return EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element),
+		                                 access);
 	           }));
 }
 

@@ -4806,6 +4806,257 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBufferCacheReadHotPublish() {
+    constexpr const char *name = "BufferCacheReadHotPublish";
+    constexpr uintptr_t base = 0x000000020a000000ull;
+    constexpr uint64_t allocation_size = 0x800000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t hot_offset = 0x10000;
+    constexpr uint64_t cold_offset = 0x80000;
+    constexpr uint32_t stale = 0x0badf00du;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "read-hot direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "read-hot fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + hot_offset, &stale, sizeof(stale));
+    std::memcpy(memory + cold_offset, &stale, sizeof(stale));
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto GpuWrite = [&](uint64_t offset, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(uint32_t), true, false);
+        cache.FillBuffer(base + offset, sizeof(uint32_t), value, false);
+      };
+      const auto Backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, &value,
+                                                sizeof(value));
+        return value;
+      };
+      const auto Clean = [&](uint64_t offset) {
+        return !cache.HasGpuDirtyBytes(base + offset, sizeof(uint32_t)) &&
+               !cache.IsRegionGpuModified(base + offset, sizeof(uint32_t));
+      };
+      const auto Dirty = [&](uint64_t offset) {
+        return cache.HasGpuDirtyBytes(base + offset, sizeof(uint32_t)) &&
+               cache.IsRegionGpuModified(base + offset, sizeof(uint32_t));
+      };
+
+      GpuWrite(hot_offset, 0x11111111u);
+      scheduler.Flush();
+      cache.ReadMemory(base + hot_offset, sizeof(uint32_t));
+      Require(name, "first download",
+              Backing(hot_offset) == 0x11111111u && Clean(hot_offset),
+              "the guest read did not publish the submitted GPU fill");
+
+      GpuWrite(hot_offset, 0x22222222u);
+      GpuWrite(cold_offset, 0x33333333u);
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "hot page publish",
+              Backing(hot_offset) == 0x22222222u && Clean(hot_offset),
+              "PublishReadHot did not write the hot page to backing memory");
+      Require(name, "cold page untouched",
+              Backing(cold_offset) == stale && Dirty(cold_offset),
+              "a page that was never read was published or cleaned");
+
+      GpuWrite(hot_offset, 0x44444444u);
+      cache.PublishReadHot();
+      GpuWrite(hot_offset, 0x55555555u);
+      scheduler.Finish();
+      Require(name, "superseded publish", Dirty(hot_offset),
+              "a publish superseded by a newer GPU write cleaned the page");
+      cache.ReadMemory(base + hot_offset, sizeof(uint32_t));
+      Require(name, "newest value after supersede",
+              Backing(hot_offset) == 0x55555555u && Clean(hot_offset),
+              "the guest read after a superseded publish missed the newest GPU write");
+
+      cache.ReadMemory(base + cold_offset, sizeof(uint32_t));
+
+      constexpr uint64_t decay_offset = 0x310000;
+      std::memcpy(memory + decay_offset, &stale, sizeof(stale));
+      GpuWrite(decay_offset, 0x10203040u);
+      scheduler.Flush();
+      cache.ReadMemory(base + decay_offset, sizeof(uint32_t));
+      for (int flip = 0; flip != 8; ++flip) {
+        cache.DecayReadHot();
+      }
+      GpuWrite(decay_offset, 0x50607080u);
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "hot for eight flips",
+              Backing(decay_offset) == 0x50607080u && Clean(decay_offset),
+              "a page read eight flips ago was not published");
+      cache.DecayReadHot();
+      GpuWrite(decay_offset, 0x91a2b3c4u);
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "cold after nine flips",
+              Backing(decay_offset) == 0x50607080u && Dirty(decay_offset),
+              "a page read nine flips ago was still published");
+      cache.ReadMemory(base + decay_offset, sizeof(uint32_t));
+
+      constexpr uint64_t owner_offset = 0x540000;
+      constexpr uint64_t neighbor_offset = owner_offset + 0x1000;
+      (void)cache.ObtainBuffer(base + owner_offset, 0x2000, true, false);
+      cache.FillBuffer(base + owner_offset, 0x2000, 0x2468ace0u, false);
+      scheduler.Flush();
+      cache.ReadMemory(base + owner_offset, sizeof(uint32_t));
+      const auto neighbor_before = Backing(neighbor_offset);
+      GpuWrite(owner_offset, 0x2468ace1u);
+      GpuWrite(neighbor_offset, 0x2468ace1u);
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "only the hot page of a buffer",
+              Backing(owner_offset) == 0x2468ace1u && Clean(owner_offset) &&
+                  Backing(neighbor_offset) == neighbor_before &&
+                  Dirty(neighbor_offset),
+              "a publish crossed into a page that was never read");
+      cache.ReadMemory(base + neighbor_offset, sizeof(uint32_t));
+
+      constexpr uint64_t race_offset = 0x780000;
+      constexpr uint32_t cpu_value = 0x0badc0deu;
+      GpuWrite(race_offset, 0x13579bdfu);
+      scheduler.Flush();
+      cache.ReadMemory(base + race_offset, sizeof(uint32_t));
+      GpuWrite(race_offset, 0x2468ace0u);
+      cache.PublishReadHot();
+      cache.ReadMemory(base + race_offset, sizeof(uint32_t), true);
+      std::memcpy(memory + race_offset, &cpu_value, sizeof(cpu_value));
+      scheduler.Finish();
+      Require(name, "cpu write after a queued publish",
+              Backing(race_offset) == cpu_value && Clean(race_offset),
+              "a queued publish overwrote a newer CPU write");
+      constexpr uint64_t budget_offset = 0x314000;
+      constexpr uint64_t budget_stride = 0x20000;
+      constexpr uint64_t budget_size = 0x10000;
+      constexpr uint32_t budget_blocks = 17;
+      constexpr uint64_t last_budget_offset =
+          budget_offset + (budget_blocks - 2) * budget_stride;
+      constexpr uint64_t over_budget_offset =
+          budget_offset + (budget_blocks - 1) * budget_stride;
+      constexpr uint32_t budget_first = 0x71572468u;
+      constexpr uint32_t budget_second = 0xace15715u;
+      const auto GpuFill = [&](uint64_t offset, uint64_t size, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, size, true, false);
+        cache.FillBuffer(base + offset, size, value, false);
+      };
+      for (uint32_t block = 0; block != budget_blocks; ++block) {
+        GpuFill(budget_offset + block * budget_stride, budget_size,
+                budget_first);
+        scheduler.Flush();
+        cache.ReadMemory(base + budget_offset + block * budget_stride,
+                         budget_size);
+      }
+      for (uint32_t block = 0; block != budget_blocks; ++block) {
+        GpuFill(budget_offset + block * budget_stride, budget_size,
+                budget_second);
+      }
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "publish budget",
+              Backing(last_budget_offset) == budget_second &&
+                  Clean(last_budget_offset) &&
+                  Backing(over_budget_offset) == budget_first &&
+                  Dirty(over_budget_offset),
+              "PublishReadHot ignored the publish budget");
+      cache.PublishReadHot();
+      scheduler.Finish();
+      Require(name, "publish budget remainder",
+              Backing(over_budget_offset) == budget_second &&
+                  Clean(over_budget_offset),
+              "unpublished read-hot ranges were dropped");
+
+      constexpr uint64_t image_offset = 0x600000;
+      constexpr uint64_t image_neighbor_offset = 0x620000;
+      constexpr uint32_t image_first = 0x0a1b2c3du;
+      constexpr uint32_t image_second = 0x4d5e6f70u;
+      for (const auto offset : {image_offset, image_neighbor_offset}) {
+        GpuWrite(offset, image_first);
+        scheduler.Flush();
+        cache.ReadMemory(base + offset, sizeof(uint32_t));
+        Require(name, "image page read-hot setup",
+                Backing(offset) == image_first && Clean(offset),
+                "the image page was not downloaded before queuing a publish");
+        GpuWrite(offset, image_second);
+      }
+      cache.PublishReadHot();
+      auto &texture_cache = context.GetTextureCache();
+      auto image_desc =
+          MakeLinearDesc(base + image_offset, sizeof(uint32_t),
+                         vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                         Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      const auto image_write = texture_cache.FindImage(image_desc);
+      texture_cache.MarkGpuWritten(image_write);
+      scheduler.Finish();
+      Require(name, "image write supersedes queued publish",
+              Backing(image_offset) == image_second && Dirty(image_offset),
+              "an image GPU write did not supersede a queued publish");
+      Require(name, "image write keeps other queued publishes",
+              Backing(image_neighbor_offset) == image_second &&
+                  Clean(image_neighbor_offset),
+              "an image GPU write superseded a publish outside its range");
+
+      constexpr std::array<uint64_t, 3> supersede_offsets = {0x700000, 0x720000,
+                                                             0x740000};
+      constexpr uint32_t supersede_first = 0x6e6e6e6eu;
+      constexpr uint32_t supersede_second = 0x7f7f7f7fu;
+      for (const auto offset : supersede_offsets) {
+        GpuWrite(offset, supersede_first);
+        scheduler.Flush();
+        cache.ReadMemory(base + offset, sizeof(uint32_t));
+        Require(name, "global supersede read-hot setup",
+                Backing(offset) == supersede_first && Clean(offset),
+                "a page was not downloaded before queuing a global supersede");
+      }
+      GpuWrite(supersede_offsets[0], supersede_second);
+      GpuWrite(supersede_offsets[1], supersede_second);
+      cache.PublishReadHot();
+      GpuWrite(supersede_offsets[2], supersede_second);
+      cache.PublishReadHot();
+      cache.SupersedeAllPublishes();
+      scheduler.Finish();
+      for (const auto offset : supersede_offsets) {
+        Require(name, "supersede all queued publishes",
+                Backing(offset) == supersede_second && Dirty(offset),
+                "SupersedeAllPublishes missed a queued publish");
+      }
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -57104,6 +57355,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-hot-publish-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheReadHotPublish();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -57361,6 +57617,7 @@ int main(int argc, char **argv) {
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckBufferCacheReadHotPublish();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();

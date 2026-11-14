@@ -8220,6 +8220,90 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+void TestLoopExitAtomicBindsCarriedBuffer() {
+  enum class Variant { Bound, Unbound, Ambiguous, Indirect };
+  const auto make = [](Variant variant) {
+    auto fixture = std::make_unique<Fixture>();
+    auto &f = *fixture;
+    auto *entry = f.block;
+    auto *header = f.AddBlock();
+    auto *body = f.AddBlock();
+    auto *latch = f.AddBlock();
+    auto *exit = f.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(body);
+    header->AddBranch(latch);
+    body->AddBranch(latch);
+    latch->AddBranch(header);
+    latch->AddBranch(exit);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    const auto atomic = [&](Value handle, uint32_t pc) {
+      return f.Emit(ValueOpcode::BufferAtomicIAdd32,
+                    {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                    f.AddMemory(memory, pc));
+    };
+    atomic(f.Buffer({f.UserData(8), f.UserData(9), f.UserData(10), f.UserData(11)}), 0x08u);
+    // The pre-loop SGPRs hold data; the body loads the V# its atomic and the exit undo use.
+    std::array<Value, 4> data, descriptor, merged;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      data[word] = variant == Variant::Indirect ? Value(0u) : f.UserData(word);
+      descriptor[word] = f.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(4u + word))}, 0, body);
+    }
+    if (variant == Variant::Ambiguous) atomic(f.Buffer(data), 0x10u);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    if (variant == Variant::Indirect) {
+      // A V# read from a lane-selected table entry binds an indirect buffer with zero words.
+      std::array<Value, 4> table, selector, entry_words;
+      for (uint32_t word = 0; word < 4u; ++word) {
+        table[word] = f.UserData(12u + word);
+        selector[word] = f.UserData(16u + word);
+      }
+      const auto key = f.Emit(ValueOpcode::ReadConstBuffer,
+          {f.Buffer(selector), f.Emit(ValueOpcode::IMul32, {lane, Value(12u)})},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer}, 0x40u));
+      const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(192u)});
+      for (uint32_t word = 0; word < 4u; ++word)
+        entry_words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {f.Buffer(table), offset},
+            f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 176u + word * 4u,
+                         .component_index = word, .component_count = 4u}, 0x44u));
+      f.Emit(ValueOpcode::StoreBufferU8,
+          {f.Buffer(entry_words), lane, Value(0u), Value(0u), Value(uint8_t{42u}), Value(true)},
+          f.AddMemory({.kind = ResourceKind::Buffer, .data_bits = 8u, .idxen = true}, 0x48u));
+    }
+    header->condition = f.Emit(ValueOpcode::IEqual32, {lane, Value(0u)}, 0, header);
+    latch->condition = f.Emit(ValueOpcode::IEqual32, {lane, Value(1u)}, 0, latch);
+    for (uint32_t word = 0; word < 4u; ++word) {
+      auto &loop = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      auto &merge = latch->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      loop.AddPhiOperand(entry, data[word]);
+      loop.AddPhiOperand(latch, Value(&merge));
+      merge.AddPhiOperand(header, Value(&loop));
+      merge.AddPhiOperand(body, descriptor[word]);
+      merged[word] = Value(&merge);
+    }
+    f.block = body;
+    if (variant == Variant::Bound || variant == Variant::Ambiguous)
+      atomic(f.Buffer(descriptor), 0x20u);
+    f.block = exit;
+    const auto undo = atomic(f.Buffer(merged), 0x30u);
+    return std::make_pair(std::move(fixture), undo);
+  };
+  auto [fixture, undo] = make(Variant::Bound);
+  fixture->PlanAndTrack();
+  const auto &program = fixture->program;
+  Check(program.info.buffers.size() == 2u &&
+            program.memory_info[undo.Instruction()->Flags<MemoryFlags>().index].resource == 1u,
+        "loop-exit atomic was not bound to the buffer its descriptor web carries");
+  for (const auto variant : {Variant::Unbound, Variant::Ambiguous, Variant::Indirect}) {
+    auto invalid = make(variant).first;
+    CheckFatal([&] { invalid->PlanAndTrack(); },
+               "pc=0x00000030 buffer descriptor is not a valid runtime value",
+               "loop-exit atomic was bound without exactly one carried buffer");
+  }
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestDescriptorBehindLongPhiChain() {
   // The descriptor word passes through far more loop phis than a 64 KiB stack
@@ -9189,6 +9273,7 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("loop-exit atomic binds carried buffer", TestLoopExitAtomicBindsCarriedBuffer);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     Run("descriptor behind a long phi chain", TestDescriptorBehindLongPhiChain);
 #endif

@@ -545,6 +545,19 @@ private:
 		// NoImageStartsAt()).
 		bool texel = false;
 	};
+	// What the read-only bindings of ranges within one caching page found: its buffer and the
+	// tracker pages of it (one bit each) that had nothing to upload, while no buffer was registered
+	// or unregistered and no page of its tracking region became CPU dirty since (see
+	// ObtainBuffer()).
+	struct PageMemo {
+		uint64_t page           = UINT64_MAX;
+		uint64_t buffer_epoch   = 0;
+		uint64_t cpu_epoch      = 0;
+		uint64_t buffer_address = 0;
+		BufferId id;
+		uint32_t clean = 0;
+	};
+	static constexpr uint32_t AllPageBits = (1u << (CACHING_PAGESIZE / TRACKER_PAGE_SIZE)) - 1u;
 	// The last synchronization of a range bound as written (see ObtainBuffer()).
 	struct WrittenMemo {
 		uint64_t vaddr        = 0;
@@ -570,6 +583,9 @@ private:
 	static constexpr size_t                                  ObtainMemoSlots = 4096;
 	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
 	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
+	static constexpr size_t                              PageMemoSlots = 4096;
+	std::unique_ptr<std::array<PageMemo, PageMemoSlots>> m_page_memo =
+	    std::make_unique<std::array<PageMemo, PageMemoSlots>>();
 	static constexpr size_t                                    WrittenMemoSlots = 1024;
 	std::unique_ptr<std::array<WrittenMemo, WrittenMemoSlots>> m_written_memo =
 	    std::make_unique<std::array<WrittenMemo, WrittenMemoSlots>>();

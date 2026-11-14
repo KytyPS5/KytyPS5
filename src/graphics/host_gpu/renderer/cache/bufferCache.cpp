@@ -1097,16 +1097,39 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	const bool  plain_read = !is_written;
 	ObtainMemo* memo       = nullptr;
 	uint64_t    cpu_epoch  = 0;
+	// Most ranges do not repeat: each draw binds its own piece of the vertex and index data and
+	// constants at new addresses, next to those of the draws before it. A range within one caching
+	// page is answered by what the lookups of that page found: its buffer, and which of its
+	// tracker pages had nothing to upload. While the epochs stand, those pages are still clean.
+	const auto  page       = vaddr >> CACHING_PAGEBITS;
+	const bool  in_page    = plain_read && size != 0 &&
+	                         ((vaddr + size - 1) >> CACHING_PAGEBITS) == page;
+	PageMemo*   page_memo  = nullptr;
+	uint32_t    page_bits  = 0;
 	if (plain_read) {
-		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
-		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
-		cpu_epoch       = CpuDirtyEpoch(vaddr, size);
-		if (memo->vaddr == vaddr && memo->size == size && memo->texel == is_texel_buffer &&
-		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch &&
-		    (!is_texel_buffer || NoImageStartsAt(vaddr))) {
-			auto& buffer = m_slot_buffers[memo->id];
-			TouchBuffer(buffer);
-			return {&buffer, memo->offset};
+		cpu_epoch = CpuDirtyEpoch(vaddr, size);
+		if (in_page) {
+			page_memo = &(*m_page_memo)[(page * 0x9e3779b97f4a7c15ull >> 32u) % PageMemoSlots];
+			const auto first = (vaddr & (CACHING_PAGESIZE - 1)) / TRACKER_PAGE_SIZE;
+			const auto last  = ((vaddr + size - 1) & (CACHING_PAGESIZE - 1)) / TRACKER_PAGE_SIZE;
+			page_bits        = ((2u << last) - 1u) & ~((1u << first) - 1u);
+			if (page_memo->page == page && page_memo->buffer_epoch == m_buffer_set_epoch &&
+			    page_memo->cpu_epoch == cpu_epoch && (page_memo->clean & page_bits) == page_bits &&
+			    (!is_texel_buffer || NoImageStartsAt(vaddr))) {
+				auto& buffer = m_slot_buffers[page_memo->id];
+				TouchBuffer(buffer);
+				return {&buffer, vaddr - page_memo->buffer_address};
+			}
+		} else {
+			const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
+			memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
+			if (memo->vaddr == vaddr && memo->size == size && memo->texel == is_texel_buffer &&
+			    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch &&
+			    (!is_texel_buffer || NoImageStartsAt(vaddr))) {
+				auto& buffer = m_slot_buffers[memo->id];
+				TouchBuffer(buffer);
+				return {&buffer, memo->offset};
+			}
 		}
 	}
 
@@ -1171,7 +1194,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		            .gpu_epoch    = written_gpu_epoch,
 		            .id           = id};
 	}
-	if (plain_read && (!is_texel_buffer || NoImageStartsAt(vaddr))) {
+	if (page_memo != nullptr && (!is_texel_buffer || NoImageStartsAt(vaddr))) {
+		// The range has nothing left to upload. The other tracker pages of a caching page seen for
+		// the first time since the epochs moved count when the whole page has nothing either.
+		const auto page_address = page << CACHING_PAGEBITS;
+		if (page_memo->page == page && page_memo->buffer_epoch == m_buffer_set_epoch &&
+		    page_memo->cpu_epoch == cpu_epoch && page_memo->id == id) {
+			page_memo->clean |= page_bits;
+		} else if (buffer.IsInBounds(page_address, CACHING_PAGESIZE)) {
+			const bool all_clean =
+			    !m_memory_tracker.IsRegionCpuModified(page_address, CACHING_PAGESIZE);
+			*page_memo = {.page           = page,
+			              .buffer_epoch   = m_buffer_set_epoch,
+			              .cpu_epoch      = cpu_epoch,
+			              .buffer_address = buffer.CpuAddress(),
+			              .id             = id,
+			              .clean          = all_clean ? AllPageBits : page_bits};
+		}
+	} else if (memo != nullptr && (!is_texel_buffer || NoImageStartsAt(vaddr))) {
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,
 		         .buffer_epoch = m_buffer_set_epoch,

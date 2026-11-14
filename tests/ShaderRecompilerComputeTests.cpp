@@ -8175,10 +8175,9 @@ public:
                   native_volume.backing.state.access_mask ==
                       vk::AccessFlagBits2::eTransferRead &&
                   native_array.backing.state.layout ==
-                      vk::ImageLayout::eGeneral &&
+                      vk::ImageLayout::eTransferDstOptimal &&
                   native_array.backing.state.access_mask ==
-                      (vk::AccessFlagBits2::eShaderRead |
-                       vk::AccessFlagBits2::eTransferRead),
+                      vk::AccessFlagBits2::eTransferWrite,
               "Image::CopyImage did not retain pinned "
               "source/destination states");
 
@@ -51488,8 +51487,21 @@ void CheckImageTransitionState(RenderContext &renderer) {
   source_copies[1].imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0,
                                        1};
   source_copies[1].imageExtent = {2, 2, 1};
+  // Transfers end in the transfer-write state that readers transition from.
+  const auto RequireTransferWritten = [&](const Image &target,
+                                          const char *stage) {
+    Require(name, stage,
+            target.backing.state.layout ==
+                    vk::ImageLayout::eTransferDstOptimal &&
+                target.backing.state.access_mask ==
+                    vk::AccessFlagBits2::eTransferWrite &&
+                target.backing.subresource_states.empty(),
+            "a transfer ended with an extra layout transition");
+  };
   source.Upload(source_copies, upload.Handle(), upload_offset, 128);
+  RequireTransferWritten(source, "upload end state");
   destination.CopyMip(source, 1, 0);
+  RequireTransferWritten(destination, "mip copy end state");
 
   const auto [download_data, download_offset] = download.Map(128, 4);
   Require(name, "depth/stencil download map", download_data != nullptr,
@@ -51528,11 +51540,13 @@ void CheckImageTransitionState(RenderContext &renderer) {
   buffered_region.imageExtent = buffered_info.extent;
   buffered_source.Upload(std::span{&buffered_region, 1}, upload.Handle(),
                          buffered_upload_offset, buffered_expected.size());
+  RequireTransferWritten(buffered_source, "buffered upload end state");
   Buffer copy_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                       16);
   StreamBuffer copy_parameters(context, scheduler, MemoryUsage::Stream, 4096);
   TileManager copy_tiler(context, scheduler, copy_parameters);
   buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch, copy_tiler);
+  RequireTransferWritten(buffered_destination, "buffered copy end state");
   const auto [buffered_download_data, buffered_download_offset] =
       download.Map(buffered_expected.size(), 4);
   Require(name, "buffered-copy download map", buffered_download_data != nullptr,

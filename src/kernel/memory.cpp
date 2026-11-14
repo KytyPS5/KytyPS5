@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -2185,6 +2186,45 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+// Console direct memory is physically backed, but a host view of the backing
+// section gets its 4 KiB pages only on first touch. Games that stream into
+// fresh direct memory then pay one host page fault per page on a hot thread.
+// Hades II (PPSA36082) does this: its texture streamer falls behind, the 16 MiB
+// upload buffers pile up in a 512 MiB pool, the guest allocator returns NULL
+// and the loader crashes in memcpy. Touching large writable views once at map
+// time moves that cost to load time. Set KYTY_NO_PREFAULT to disable it.
+// (Linux: see KytyPS5 PR #1104, which uses MADV_POPULATE_WRITE.)
+static void PrefaultDirectMapping(uint64_t addr, size_t len, VirtualMemory::Mode mode) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr size_t PREFAULT_MIN_SIZE = static_cast<size_t>(64) * 1024 * 1024;
+	constexpr size_t HOST_PAGE_SIZE    = 0x1000;
+
+	static const bool disabled = (std::getenv("KYTY_NO_PREFAULT") != nullptr);
+	if (disabled || len < PREFAULT_MIN_SIZE || mode != VirtualMemory::Mode::ReadWrite) {
+		return;
+	}
+
+	// A read is enough: a section page becomes a resident zero page on first access, and
+	// reading cannot race with writes made through other views of the same memory.
+	const auto* bytes = reinterpret_cast<const volatile uint8_t*>(addr);
+	const auto  start = std::chrono::steady_clock::now();
+	uint8_t     sink  = 0;
+	for (size_t offset = 0; offset < len; offset += HOST_PAGE_SIZE) {
+		sink ^= bytes[offset];
+	}
+	(void)sink;
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                    std::chrono::steady_clock::now() - start)
+	                    .count();
+	LOGF("\t prefault = 0x%016" PRIx64 " + 0x%016" PRIx64 " in %lld ms\n", addr,
+	     static_cast<uint64_t>(len), static_cast<long long>(ms));
+#else
+	(void)addr;
+	(void)len;
+	(void)mode;
+#endif
+}
+
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
                            int64_t direct_memory_start, size_t alignment, const char* name,
@@ -2311,6 +2351,8 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	if (out_addr == 0) {
 		return KERNEL_ERROR_ENOMEM;
 	}
+
+	PrefaultDirectMapping(out_addr, len, mode);
 
 	MapGpuRange(out_addr, len);
 

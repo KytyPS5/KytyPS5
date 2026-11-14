@@ -526,7 +526,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.subgroup_vote |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
-		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
+		case ValueOpcode::Ballot:
+		case ValueOpcode::LaneBound: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
 		case ValueOpcode::SubgroupUMinU32:
 		case ValueOpcode::SubgroupUMaxU32:

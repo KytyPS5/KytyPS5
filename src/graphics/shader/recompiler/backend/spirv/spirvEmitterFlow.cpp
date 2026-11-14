@@ -827,6 +827,19 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+uint32_t EmitLaneBound(EmitterState& state) {
+	if (state.lane_count != 1u) {
+		EXIT("LaneBound has no form for a subgroup split into two lane halves\n");
+	}
+	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
+	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(
+	    state, scope, ConstantBool(state, true));
+	const auto highest =
+	    EmitNative<spv::OpGroupNonUniformBallotFindMSB, IR::Type::U32>(state, scope, ballot);
+	return EmitUMin32(state, EmitIAdd32(state, highest, ConstantU32(state, 1u)),
+	                  ConstantU32(state, state.program.wave_size));
+}
+
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 	return ctx.Ballot(predicate);
 }

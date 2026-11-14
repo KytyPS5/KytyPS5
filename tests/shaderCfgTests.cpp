@@ -1937,6 +1937,63 @@ void TestNggVertexEntryState() {
   }
 }
 
+void TestVertexEntryMaskCoversRunningLanes() {
+  constexpr uint32_t exec = 126;
+  constexpr uint32_t vcc_lo = 106;
+  constexpr uint32_t zero = 128;
+  constexpr uint32_t one = 129;
+  constexpr uint32_t all_ones = 193;
+  constexpr uint32_t s_sub_i32 = 0x03;
+  constexpr uint32_t s_lshr_b64 = 0x21;
+  constexpr uint32_t s_mov_b64 = 0x04;
+  constexpr uint32_t v_mov_b32 = 0x01;
+  constexpr uint32_t packed_vertex_count = 3;
+  constexpr uint32_t one_float = 242;
+  static_assert(EncodeSop2(s_sub_i32, vcc_lo, zero, packed_vertex_count) ==
+                0x81ea0380u);
+  static_assert(EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo) == 0x90fe6ac1u);
+  const auto compile = [&](uint32_t wave_size, uint32_t count_base,
+                           uint32_t value,
+                           std::initializer_list<uint32_t> later_exec = {}) {
+    std::vector<uint32_t> shader = {
+        0xbefe04c1u,
+        0x906a8803u,
+        0x81ea6a80u,
+        0x90fe6ac1u,
+        EncodeVop1(v_mov_b32, 1, one_float),
+        EncodeSop2(s_sub_i32, vcc_lo, count_base, packed_vertex_count),
+        EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo)};
+    shader.insert(shader.end(), later_exec);
+    shader.insert(shader.end(),
+                  {EncodeVop1(v_mov_b32, 0, value), EncodeExp0(0x0c, 0xf),
+                   EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01)});
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.wave_size = wave_size;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv);
+  };
+  const auto reads_lane = [](const std::string &source) {
+    return source.find("gl_SubgroupInvocationID") != std::string::npos;
+  };
+  for (const uint32_t wave_size : {32u, 64u}) {
+    const auto captured = compile(wave_size, zero, one_float);
+    Check(!reads_lane(captured) &&
+              captured.find("OpGroupNonUniform") == std::string::npos,
+          "a running vertex lane stayed predicated by the entry mask of its "
+          "own lane bound");
+    Check(compile(wave_size, zero, packed_vertex_count)
+                  .find("OpGroupNonUniformBallotFindMSB") != std::string::npos,
+          "the packed vertex count lost its lane bound");
+    Check(reads_lane(compile(wave_size, one, one_float)),
+          "an entry mask one lane short of the lane bound was taken as "
+          "covering it");
+    Check(reads_lane(compile(wave_size, zero, one_float,
+                             {EncodeSop1(s_mov_b64, exec, one)})),
+          "an EXEC write after the vertex entry mask stopped predicating");
+  }
+}
+
 void TestNativeDataCacheInvalidation() {
   using namespace ShaderRecompiler;
   // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT. The S_DCACHE_INV
@@ -9504,6 +9561,53 @@ void TestLaneMaskProjection() {
     const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
     const auto different_lane = thread_bit(e, active_mask, false);
     const auto high_half = thread_bit(e, ballot(e, active, 1u));
+    const auto bound = U32(e.Emit(ValueOpcode::LaneBound));
+    const auto bound_bit = [&](uint64_t lanes, U32 shift,
+                               uint32_t low_lanes = 32u) {
+      const auto prefix =
+          e.Emit(ValueOpcode::ShiftRightLogical64, {Value(lanes), shift});
+      const auto word = [&](uint32_t index) {
+        return U32(
+            e.Emit(ValueOpcode::CompositeExtractU64, {prefix, Value(index)}));
+      };
+      const auto in_low_word =
+          e.ULessThan(U32(e.Emit(ValueOpcode::LaneId)), U32(Value(low_lanes)));
+      return thread_bit(e, wave_size == 64u
+                               ? e.Select(in_low_word, word(0u), word(1u))
+                               : word(0u));
+    };
+    const auto negated_bound = e.ISub(zero, bound);
+    const auto bounded = bound_bit(UINT64_MAX, negated_bound);
+    const auto packed_bound = e.BitwiseOr(bound, U32(Value(1u << 28u)));
+    const auto second_count = U32(e.Emit(ValueOpcode::BitFieldUExtract,
+                                         {packed_bound, Value(8u), Value(8u)}));
+    const auto prefix_of = [&](U32 count) {
+      return bound_bit(UINT64_MAX, e.ISub(U32(Value(64u)), count));
+    };
+    const auto extract_bound = [&](uint32_t offset, uint32_t count = 8u) {
+      return U32(e.Emit(ValueOpcode::BitFieldUExtract,
+                        {bound, Value(offset), Value(count)}));
+    };
+    const auto second_count_bounded = prefix_of(second_count);
+    const auto extracted_bounded = prefix_of(extract_bound(0u));
+    const auto extracted_half_bounded = prefix_of(extract_bound(1u));
+    const auto extracted_bit_bounded = prefix_of(extract_bound(0u, 1u));
+    const auto other_bound = U32(e.Emit(ValueOpcode::LaneBound));
+    const auto two_bounds =
+        bound_bit(UINT64_MAX, e.ISub(zero, e.ISub(bound, other_bound)));
+    auto deep_shift = negated_bound;
+    for (uint32_t step = 0; step < 80u; step++) {
+      deep_shift = e.ISub(deep_shift, U32(Value(64u)));
+    }
+    const auto deep_bounded = bound_bit(UINT64_MAX, deep_shift);
+    const auto shifted_half_bounded = prefix_of(
+        U32(e.Emit(ValueOpcode::ShiftRightLogical32, {bound, Value(1u)})));
+    const auto first_bound_uncovered =
+        bound_bit(UINT64_MAX >> 1u, e.ISub(bound, U32(Value(2u))));
+    const auto last_bound_uncovered = wave_size == 64u
+                                          ? mask_bit(UINT32_MAX, 0x7fffffffu)
+                                          : mask_bit(0x7fffffffu, 0u);
+    const auto wrong_word = bound_bit(UINT64_MAX, negated_bound, 31u);
     const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
     const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
     const auto initial_predicate = e.LogicalAnd(active, selected);
@@ -9543,6 +9647,28 @@ void TestLaneMaskProjection() {
           "constant EXEC mask retained lane extraction or register predication");
     Check(partial.Resolve().TryInstruction() != nullptr,
           "partial mask was incorrectly folded to a constant predicate");
+    Check(bounded.Resolve() == Value(true) &&
+              second_count_bounded.Resolve() == Value(true) &&
+              extracted_bounded.Resolve() == Value(true),
+          "a prefix mask of the lane bound still predicated a running lane");
+    Check(extracted_half_bounded.Resolve().TryInstruction() != nullptr &&
+              shifted_half_bounded.Resolve().TryInstruction() != nullptr,
+          "a prefix mask of half the lane bound was taken as covering it");
+    Check(extracted_bit_bounded.Resolve().TryInstruction() != nullptr,
+          "a prefix mask of the lane bound's lowest bit was taken as covering "
+          "it");
+    Check(two_bounds.Resolve().TryInstruction() != nullptr,
+          "a mask of two different lane bounds was evaluated as one bound");
+    Check(deep_bounded.Resolve().TryInstruction() != nullptr,
+          "a lane bound mask behind a long chain was evaluated without a "
+          "bound on the work");
+    Check(
+        first_bound_uncovered.Resolve().TryInstruction() != nullptr &&
+            last_bound_uncovered.Resolve().TryInstruction() != nullptr,
+        "a mask that misses one lane bound was taken as covering every bound");
+    Check(wave_size == 32u || wrong_word.Resolve().TryInstruction() != nullptr,
+          "wave64 lane bound projection accepted a word selected at the wrong "
+          "lane");
     if (wave_size == 32u) {
       Check(low_only.Resolve() == Value(true) && high_only.Resolve() == Value(false),
             "wave32 constant mask incorrectly consumed the high half");
@@ -13538,6 +13664,7 @@ int main() {
   TestVertexBufferGrouping();
   TestShaderProgramHash();
   TestNggVertexEntryState();
+  TestVertexEntryMaskCoversRunningLanes();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();

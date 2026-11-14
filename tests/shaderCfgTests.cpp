@@ -11439,7 +11439,11 @@ void TestGpuProducedWritableDescriptor() {
       EncodeMubuf0(0x1c), EncodeMubuf1(0, 2, 0),
       EncodeSopp(0x01),
   };
-  const std::array<uint32_t, 4> user_data{0u, 0u, 0x00315000u, 3u};
+  const FakeGuestAddressSpace address_space;
+  const uint32_t table_low = 0x00315000u;
+  const uint64_t table = address_space.AddressWithLowWord(table_low);
+  const auto table_high = static_cast<uint32_t>(table >> 32u);
+  const std::array<uint32_t, 4> user_data{0u, 0u, table_low, table_high};
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   auto translated = ShaderRecompiler::TranslateProgram(shader, options);
@@ -11448,16 +11452,17 @@ void TestGpuProducedWritableDescriptor() {
             !plan.capture_specialization_reads && plan.srt_reads.size() == 3,
         "native GPU-built writable descriptor acquired an unnecessary alias proof");
   struct Reads {
+    uint64_t table = 0;
     std::array<uint32_t, 3> header{0x26c0u, 0u, 151u};
     uint32_t count = 0;
-  } reads;
+  } reads{.table = table};
   FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
         auto &reads = *static_cast<Reads *>(data);
         uint32_t index = 0;
-        switch (address) {
-        case 0x300315028ull: index = 0u; break;
-        case 0x30031502cull: index = 1u; break;
-        case 0x300315074ull: index = 2u; break;
+        switch (address - reads.table) {
+        case 0x28u: index = 0u; break;
+        case 0x2cu: index = 1u; break;
+        case 0x74u: index = 2u; break;
         default: return false;
         }
         ++reads.count;
@@ -11478,10 +11483,11 @@ void TestGpuProducedWritableDescriptor() {
               snapshot.specialization_reads.empty() && reads.count == reads_expected,
           "GPU-produced descriptor lost current scalar data or repeated its reads");
   };
-  check(0x003176c0u, 0x00800003u, 151u, 3u);
+  const uint32_t stride_128 = 0x00800000u;
+  check(0x003176c0u, stride_128 | table_high, 151u, 3u);
   const auto previous_specialization = specialization;
   reads.header = {0xffd00000u, 0u, 302u}; // Exercise the low-address carry on refresh.
-  check(0x00015000u, 0x00800004u, 302u, 6u);
+  check(0x00015000u, stride_128 | (table_high + 1u), 302u, 6u);
   Check(specialization == previous_specialization,
         "GPU-updated address or record count created a shader permutation");
 }

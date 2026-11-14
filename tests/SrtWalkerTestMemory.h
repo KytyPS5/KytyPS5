@@ -13,8 +13,10 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <sys/mman.h>
 #include <ucontext.h>
 #elif defined(__APPLE__)
+#include <sys/mman.h>
 #include <sys/ucontext.h>
 #elif defined(_WIN32)
 #include <windows.h>
@@ -96,6 +98,39 @@ private:
   }
   void *m_handler = nullptr;
 #endif
+};
+
+class FakeGuestAddressSpace {
+public:
+  FakeGuestAddressSpace() {
+#if defined(_WIN32)
+    m_base = VirtualAlloc(nullptr, kSize, MEM_RESERVE, PAGE_NOACCESS);
+#else
+    void *mapped = mmap(nullptr, kSize, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    m_base = mapped == MAP_FAILED ? nullptr : mapped;
+#endif
+    if (m_base == nullptr) std::abort();
+  }
+  ~FakeGuestAddressSpace() {
+#if defined(_WIN32)
+    VirtualFree(m_base, 0, MEM_RELEASE);
+#else
+    munmap(m_base, kSize);
+#endif
+  }
+  FakeGuestAddressSpace(const FakeGuestAddressSpace &) = delete;
+  FakeGuestAddressSpace &operator=(const FakeGuestAddressSpace &) = delete;
+
+  uint64_t AddressWithLowWord(uint32_t low) const {
+    const auto base = reinterpret_cast<uint64_t>(m_base);
+    const auto address = (base & ~0xffffffffull) | low;
+    return address >= base ? address : address + kLowWordSpan;
+  }
+
+private:
+  static constexpr uint64_t kLowWordSpan = 1ull << 32u;
+  static constexpr size_t kSize = 2u * kLowWordSpan;
+  void *m_base = nullptr;
 };
 
 // Evaluates one value through a walker compiled for it, keeping the plan's resource walker.

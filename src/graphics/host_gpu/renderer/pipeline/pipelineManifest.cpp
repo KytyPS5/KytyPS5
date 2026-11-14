@@ -1680,7 +1680,10 @@ const ShaderModule* PipelineCache::FindCompiledModule(
 
 void PipelineCache::OpenManifest() {
 	const bool warm   = Config::PipelineManifestEnabled();
-	const bool record = Config::PipelineManifestRecord();
+	// A session that uses manifests also records its own: what it creates that no manifest lists
+	// is listed for the next sessions of this computer, which compile it ahead with the rest. A
+	// title that came with no manifest has one after its first session.
+	const bool record = Config::PipelineManifestRecord() || warm;
 	const auto title  = PipelineCacheTitleId();
 	if ((!warm && !record) || title.empty()) {
 		return;

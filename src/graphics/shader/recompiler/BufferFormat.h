@@ -238,6 +238,35 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	}
 }
 
+constexpr FormattedSource ResolveVertexFetchSource(const BufferFormatInfo& info, uint32_t selector,
+                                                   uint32_t component) {
+	auto source = ResolveFormattedSource(info, selector);
+	if (info.component_count != 0u && component >= info.component_count && component < 4u &&
+	    source.kind == (component == 3u ? FormattedSourceKind::One : FormattedSourceKind::Zero)) {
+		source = {FormattedSourceKind::Memory, component};
+	}
+	return source;
+}
+
+constexpr uint32_t VertexFetchSignature(uint32_t word) {
+	const auto info = GetFormatInfo(static_cast<Prospero::BufferFormat>((word >> 12u) & 0x7fu));
+	if (info.component_count == 0u) return word & 0x7ffffu;
+	const auto kind      = info.type == ComponentType::Uint   ? 1u
+	                       : info.type == ComponentType::Sint ? 2u
+	                                                          : 0u;
+	uint32_t   signature = 0x80000000u | (kind << 12u);
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto source =
+		    ResolveVertexFetchSource(info, (word >> (component * 3u)) & 7u, component);
+		if (source.kind == FormattedSourceKind::Invalid) return word & 0x7ffffu;
+		const auto selector = source.kind == FormattedSourceKind::Memory ? 4u + source.component
+		                      : source.kind == FormattedSourceKind::One  ? 1u
+		                                                                 : 0u;
+		signature |= selector << (component * 3u);
+	}
+	return signature;
+}
+
 constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, uint32_t component) {
 	if (component >= info.component_count) {
 		return 0;

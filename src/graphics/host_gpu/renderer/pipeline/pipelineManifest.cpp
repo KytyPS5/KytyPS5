@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineManifest.h"
 
+#include "common/alignment.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -12,6 +13,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "kernel/fileSystem.h"
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
@@ -22,6 +24,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -40,6 +43,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <xxhash.h>
+#include <zstd.h>
 
 // Buffer formats go up to the FMASK formats.
 template <>
@@ -1406,6 +1410,8 @@ struct PipelineCache::ManifestState {
 	struct Code {
 		std::shared_ptr<const std::vector<uint32_t>> words;
 		std::vector<uint32_t>                        waiting;     // Module records it unblocks.
+		// The records it unblocked while the guest had not mapped it.
+		std::vector<uint32_t>                        early;
 		uint32_t                                     readers = 0; // Records not started yet.
 		bool                                         mapped  = false;
 	};
@@ -1443,6 +1449,17 @@ struct PipelineCache::ManifestState {
 
 	std::vector<std::jthread> threads;
 	std::jthread              saver;
+
+	// The shader code store (CodeStoreThread()). Under `code_mutex`: the hashes the listener has
+	// passed on in this session, and the code its thread has not looked at yet.
+	std::filesystem::path                                   code_path;
+	std::mutex                                              code_mutex;
+	std::unordered_set<uint64_t>                            code_seen;
+	std::deque<std::pair<uint64_t, std::vector<uint32_t>>> code_queue;
+	std::condition_variable_any                             code_available;
+	std::jthread                                            code_thread;
+	// Until the store is read and the game's files are searched: code still arrives from them.
+	std::atomic<bool>                                       scanning {true};
 
 	// Queues a module whose code is there: after those the game used before it.
 	void QueueModule(uint32_t index) {
@@ -1510,6 +1527,9 @@ struct PipelineCache::UseOrder {
 	std::unordered_set<uint64_t> noted;
 	std::string                  pending;
 	bool                         session_started = false;
+	// The code the guest mapped in this session, by hash.
+	std::mutex                   mapped_mutex;
+	std::unordered_set<uint64_t> mapped;
 	std::jthread                 writer;
 
 	void Write() {
@@ -1613,8 +1633,11 @@ uint32_t PipelineCache::UseRank(uint64_t program_hash) const {
 	if (m_use_order == nullptr) {
 		return PipelineHelpers::NoRank;
 	}
-	const auto found = m_use_order->rank.find(program_hash);
-	return found != m_use_order->rank.end() ? found->second : PipelineHelpers::NoRank;
+	if (const auto found = m_use_order->rank.find(program_hash); found != m_use_order->rank.end()) {
+		return found->second;
+	}
+	std::scoped_lock lock(m_use_order->mapped_mutex);
+	return m_use_order->mapped.contains(program_hash) ? MappedRank : PipelineHelpers::NoRank;
 }
 
 void PipelineCache::SetHostInput(ManifestModule& module) const {
@@ -1819,6 +1842,8 @@ void PipelineCache::OpenManifest() {
 	for (size_t i = 0; i < Common::ParallelThreads(); i++) {
 		state.threads.emplace_back([this](const std::stop_token& stop) { ManifestWorker(stop); });
 	}
+	state.code_path   = folders.back() / (stem + ".code");
+	state.code_thread = std::jthread([this](const std::stop_token& stop) { CodeStoreThread(stop); });
 	// Shaders the guest mapped before are taken at once.
 	ShaderSetMapListener(OnShaderMapped, this);
 }
@@ -1830,6 +1855,7 @@ void PipelineCache::CloseManifest() {
 	auto& state = *m_manifest;
 	if (m_manifest_warm) {
 		ShaderSetMapListener(nullptr, nullptr);
+		state.code_thread = {};
 		for (auto& thread: state.threads) {
 			thread.request_stop();
 		}
@@ -1845,24 +1871,493 @@ void PipelineCache::OnShaderMapped(void* userdata, uint64_t hash, std::span<cons
 	auto& cache = *static_cast<PipelineCache*>(userdata);
 	auto& state = *cache.m_manifest;
 	{
+		std::scoped_lock lock(state.code_mutex);
+		if (state.code_seen.insert(hash).second) {
+			state.code_queue.emplace_back(hash, std::vector<uint32_t>(code.begin(), code.end()));
+		}
+	}
+	state.code_available.notify_all();
+	{
+		std::scoped_lock lock(cache.m_use_order->mapped_mutex);
+		cache.m_use_order->mapped.insert(hash);
+	}
+	cache.ProvideCode(hash, code, true);
+}
+
+bool PipelineCache::ProvideCode(uint64_t hash, std::span<const uint32_t> code, bool from_guest) {
+	auto& state = *m_manifest;
+	{
 		std::scoped_lock lock(state.mutex);
 		const auto       found = state.code.find(hash);
-		if (found == state.code.end() || found->second.mapped) {
-			return;
+		if (found == state.code.end()) {
+			return false;
+		}
+		auto& entry = found->second;
+		// What the guest maps goes before what only its files hold.
+		const auto mapped_first = [&](uint32_t index) {
+			if (state.module_rank[index] != PipelineHelpers::NoRank) {
+				return false;
+			}
+			state.module_rank[index] = MappedRank;
+			return true;
+		};
+		if (entry.mapped) {
+			// Its code came from the store or from the files before: the records of it that are
+			// still queued move up.
+			for (const auto index: from_guest ? std::exchange(entry.early, {}) : std::vector<uint32_t> {}) {
+				if (!mapped_first(index)) {
+					continue;
+				}
+				if (const auto queued = std::ranges::find(state.module_jobs, index);
+				    queued != state.module_jobs.end()) {
+					state.module_jobs.erase(queued);
+					state.QueueModule(index);
+				}
+			}
+			return false;
 		}
 		// The guest may unmap or reuse the memory later: the threads read a copy.
-		auto& entry  = found->second;
 		entry.words  = std::make_shared<const std::vector<uint32_t>>(code.begin(), code.end());
 		entry.mapped = true;
 		for (const auto index: entry.waiting) {
+			if (from_guest) {
+				mapped_first(index);
+			}
 			if (--state.missing_code[index] == 0) {
 				state.QueueModule(index);
 			}
+		}
+		if (!from_guest) {
+			entry.early = entry.waiting;
 		}
 		entry.waiting     = {};
 		state.logged_idle = false;
 	}
 	state.available.notify_all();
+	return true;
+}
+
+namespace {
+
+// The code store: CodeStoreMagic, then a record per shader, a CodeRecord followed by the zstd
+// frame of its code. The hash of a record is that of its code, which a reader checks. A record
+// with hash 0 is not a shader: its words are ScanMark and ScanVersion, then the hashes of the
+// listed code that the last scan of the game's files did not find (ScanGameFiles()); the last such
+// record counts, unless an older scan, which searched less, wrote it.
+constexpr uint64_t CodeStoreMagic = 0x3145444F4359544Bull; // "KTYCODE1"
+constexpr uint32_t ScanMark       = 0xffffffffu;
+constexpr uint32_t ScanVersion    = 2;
+struct CodeRecord {
+	uint64_t hash;
+	uint32_t words;
+	uint32_t compressed_bytes;
+};
+
+bool ReadCodeRecord(const CodeRecord& record, const uint8_t* compressed, std::vector<uint32_t>& words) {
+	words.resize(record.words);
+	const auto bytes = words.size() * sizeof(uint32_t);
+	return ZSTD_getFrameContentSize(compressed, record.compressed_bytes) == bytes &&
+	       ZSTD_decompress(words.data(), bytes, compressed, record.compressed_bytes) == bytes;
+}
+
+// A shader binary ends with a 0x30-byte footer (shader.cpp, ShaderProgramSize()): its magic, a
+// version and the sizes of the code, of the literal buffer after it and of the section between
+// those and the footer. Calls `found` with the program (what ShaderMapUserData() hashes) of every
+// footer in `data` whose program lies in it; returns how many.
+template <typename Found>
+uint32_t FindShaderPrograms(std::span<const uint8_t> data, Found&& found) {
+	constexpr std::string_view Magic      = "barefoot";
+	constexpr size_t           FooterSize = 0x30;
+	const std::string_view     text(reinterpret_cast<const char*>(data.data()), data.size());
+	uint32_t                   count = 0;
+	for (size_t at = text.find(Magic); at != std::string_view::npos; at = text.find(Magic, at + 1)) {
+		if (data.size() - at < FooterSize) {
+			break;
+		}
+		std::array<uint32_t, 8> footer {};
+		std::memcpy(footer.data(), data.data() + at, sizeof(footer));
+		const auto program = Common::AlignUp(uint64_t {footer[5]}, 16) + footer[6];
+		const auto before  = program + Common::AlignUp(uint64_t {footer[7]}, 16);
+		if (footer[4] != 1 || footer[5] == 0 || program % 4 != 0 || before > at) {
+			continue;
+		}
+		count++;
+		found(data.subspan(at - before, program));
+	}
+	return count;
+}
+
+} // namespace
+
+// The code of the listed shaders that neither the store nor the guest has given yet, from the
+// game's files: every file is searched for shader binaries, whatever its format (a game keeps
+// them in packages of its own, mostly as they are; those inside compressed packages are not
+// found, and wait until the guest maps them). First, a kind of file (by extension) is left out
+// after a sample in a row without shaders, and a file after as many bytes without one, so that a
+// game's textures, audio and video, and what follows the shaders in a large package, are not read
+// whole. Then, while listed code is still missing, what that left out is probed with a small
+// window every few MB, and the stretch around a window with shaders is read whole: a game can
+// keep its shaders in one package of a kind whose first packages hold none, or deep inside a
+// package of several GB. A kind is not probed any more after many files in a row that gave no
+// missing code (a game can have tens of thousands of small files of a kind, and its shader
+// packages hold more shaders than the manifest lists). It ends as soon as nothing listed is
+// missing. `append` stores each program found that a record waited for. False when there are no
+// files to search.
+bool PipelineCache::ScanGameFiles(const std::stop_token&                                          stop,
+                                  const std::function<void(uint64_t, std::span<const uint32_t>)>& append) {
+	auto& state = *m_manifest;
+	// The game's folder is mounted after the renderer starts.
+	std::filesystem::path root;
+	for (uint32_t tries = 0; tries < 200 && !stop.stop_requested(); tries++) {
+		root = LibKernel::FileSystem::GetRealFilename("/app0");
+		if (!root.empty()) {
+			break;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	if (root.empty()) {
+		return false;
+	}
+	// A kind of file is left out after this many files, or bytes, in a row without a shader.
+	constexpr uint32_t SampleFiles = 32;
+	constexpr uint64_t SampleBytes = 256ull << 20u;
+	// Large files are read in pieces that overlap by more than a shader binary takes.
+	constexpr uint32_t Piece   = 64u << 20u;
+	constexpr uint32_t Overlap = 4u << 20u;
+	// The probes: a window every so many bytes; around a window with shaders, pieces until this
+	// many bytes hold none.
+	constexpr uint32_t ProbeBytes  = 1u << 20u;
+	constexpr uint64_t ProbeStride = 32ull << 20u;
+	constexpr uint32_t RunPiece    = 8u << 20u;
+	constexpr uint64_t RunQuiet    = 16ull << 20u;
+	// A kind of file is not probed any more after this many files in a row that gave no missing
+	// code.
+	constexpr uint32_t ProbeFiles = 256;
+	const auto         start      = std::chrono::steady_clock::now();
+	size_t             listed     = 0;
+	{
+		std::scoped_lock lock(state.mutex);
+		listed = state.code.size();
+	}
+	std::unordered_set<uint64_t> found;        // Every program found.
+	std::unordered_set<uint64_t> found_listed; // Those of them the manifest lists.
+	uint32_t                     provided = 0;
+	uint32_t                     files    = 0;
+	uint64_t                     bytes    = 0;
+	std::vector<uint8_t>         data;
+	std::vector<uint32_t>        code;
+	// Searches `data`; returns how many shader binaries it holds.
+	const auto search = [&](std::span<const uint8_t> chunk) {
+		return FindShaderPrograms(chunk, [&](std::span<const uint8_t> program) {
+			const auto hash = XXH3_64bits(program.data(), program.size());
+			if (!found.insert(hash).second) {
+				return;
+			}
+			{
+				std::scoped_lock lock(state.mutex);
+				const auto       entry = state.code.find(hash);
+				if (entry == state.code.end()) {
+					return;
+				}
+				found_listed.insert(hash);
+				if (entry->second.mapped) {
+					return;
+				}
+			}
+			code.resize(program.size() / sizeof(uint32_t));
+			std::memcpy(code.data(), program.data(), program.size());
+			if (ProvideCode(hash, code, false)) {
+				provided++;
+				append(hash, code);
+			}
+		});
+	};
+	// Whether no listed code is missing any more (the guest maps code meanwhile too); counted
+	// now and then.
+	auto       next_count      = start;
+	bool       missing         = true;
+	const auto nothing_missing = [&] {
+		if (const auto now = std::chrono::steady_clock::now(); now >= next_count) {
+			next_count = now + std::chrono::milliseconds(250);
+			std::scoped_lock lock(state.mutex);
+			missing = std::ranges::any_of(state.code | std::views::values,
+			                              [](const auto& entry) { return !entry.mapped; });
+		}
+		return !missing;
+	};
+	// Reads `file` from `from` in pieces and searches them. Stops at `end`, or past `reach` once
+	// `quiet` bytes in a row held no shader (`quiet_after` once one was found, when not 0).
+	struct Run {
+		uint64_t end;
+		uint32_t shaders;
+		uint64_t silent; // Bytes at the end without a shader.
+	};
+	const auto read_run = [&](Common::File& file, uint64_t from, uint64_t reach, uint64_t quiet,
+	                          uint64_t end, uint32_t piece, uint64_t quiet_after) {
+		Run    run {from, 0, 0};
+		size_t kept = 0;
+		if (!file.Seek(from)) {
+			return run;
+		}
+		while (run.end < end && !stop.stop_requested()) {
+			const auto size = static_cast<uint32_t>(std::min<uint64_t>(end - run.end, piece));
+			data.resize(kept + size);
+			uint32_t read = 0;
+			file.Read(data.data() + kept, size, &read);
+			if (read != size) {
+				break;
+			}
+			run.end += size;
+			bytes += size;
+			const auto shaders = search(data);
+			run.shaders += shaders;
+			run.silent = shaders != 0 ? 0 : run.silent + size;
+			if (shaders != 0 && quiet_after != 0) {
+				quiet = quiet_after;
+			}
+			if (run.end >= reach && run.silent >= quiet) {
+				break;
+			}
+			kept = std::min<size_t>(data.size(), Overlap);
+			std::memmove(data.data(), data.data() + data.size() - kept, kept);
+		}
+		return run;
+	};
+	// Files and bytes of each kind in a row without a shader, and files probed in a row that gave
+	// no missing code.
+	struct Kind {
+		uint32_t files  = 0;
+		uint64_t bytes  = 0;
+		uint32_t probed = 0;
+	};
+	std::unordered_map<std::string, Kind> kinds;
+	std::vector<std::filesystem::path>    folders {root};
+	// The files the sampling left out, and where it cut others short.
+	struct Later {
+		std::filesystem::path path;
+		uint64_t              from;
+		Kind*                 kind;
+	};
+	std::vector<Later> later;
+	while (!folders.empty() && !stop.stop_requested() && !nothing_missing()) {
+		const auto folder = std::move(folders.back());
+		folders.pop_back();
+		for (const auto& entry: Common::File::GetDirEntries(folder)) {
+			if (stop.stop_requested() || nothing_missing()) {
+				break;
+			}
+			if (entry.name == "." || entry.name == "..") {
+				continue;
+			}
+			const auto path = folder / Common::PathFromUtf8(entry.name);
+			if (!entry.is_file) {
+				folders.push_back(path);
+				continue;
+			}
+			auto extension = Common::PathToString(path.extension());
+			std::ranges::transform(extension, extension.begin(),
+			                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			auto& kind = kinds[extension];
+			if (kind.files >= SampleFiles || kind.bytes >= SampleBytes) {
+				later.push_back({path, 0, &kind});
+				continue;
+			}
+			Common::File file;
+			if (!file.Open(path, Common::File::Mode::Read)) {
+				continue;
+			}
+			files++;
+			// The end of the kind's sample ends the file too, and after a shader, as many bytes
+			// without one.
+			const auto size = file.Size();
+			const auto run  = read_run(file, 0, 0, SampleBytes - kind.bytes, size, Piece, SampleBytes);
+			if (run.shaders != 0) {
+				kind.files = 0;
+				kind.bytes = run.silent;
+			} else {
+				kind.files++;
+				kind.bytes += run.end;
+			}
+			if (run.end < size) {
+				later.push_back({path, run.end, &kind});
+			}
+		}
+	}
+	for (const auto& [path, from, kind]: later) {
+		if (stop.stop_requested() || nothing_missing()) {
+			break;
+		}
+		if (kind->probed >= ProbeFiles) {
+			continue;
+		}
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) {
+			continue;
+		}
+		files += from == 0 ? 1 : 0;
+		// The shaders around a window that holds some begin after the window before it.
+		const auto size   = file.Size();
+		const auto before = provided;
+		uint64_t   read   = from;
+		for (uint64_t at = from; at < size && !stop.stop_requested() && !nothing_missing();) {
+			const auto window = std::min<uint64_t>(size, at + ProbeBytes);
+			if (read_run(file, at, window, 0, window, ProbeBytes, 0).shaders == 0) {
+				at += ProbeStride;
+				continue;
+			}
+			const auto begin = std::max(read, at >= from + ProbeStride ? at - ProbeStride + ProbeBytes : from);
+			read             = read_run(file, begin, window, RunQuiet, size, RunPiece, 0).end;
+			at               = std::max(at + ProbeStride, read);
+		}
+		kind->probed = provided != before ? 0 : kind->probed + 1;
+	}
+	ManifestLog("[ShaderScan] game files: {} shaders found ({} of {} listed by the manifest, {} new), {:.1f} s "
+	            "({} files, {:.0f} MB read)",
+	            found.size(), found_listed.size(), listed, provided,
+	            Seconds(std::chrono::steady_clock::now() - start), files,
+	            static_cast<double>(bytes) / (1024.0 * 1024.0));
+	return true;
+}
+
+void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
+	KYTY_PROFILER_THREAD("Thread_PipelineManifestCode");
+	auto& state = *m_manifest;
+	// The records of the file: those that do not read end it (a session that was killed while it
+	// wrote one), and the next record is written in their place.
+	std::unordered_set<uint64_t> stored;
+	std::unordered_set<uint64_t> not_in_files;
+	uint64_t                     valid = 0;
+	{
+		const auto bytes = ReadFile(state.code_path);
+		uint64_t   magic = 0;
+		if (bytes.size() >= sizeof(magic)) {
+			std::memcpy(&magic, bytes.data(), sizeof(magic));
+		}
+		uint32_t              provided = 0;
+		std::vector<uint32_t> code;
+		for (size_t at = sizeof(magic); magic == CodeStoreMagic;) {
+			CodeRecord record {};
+			if (bytes.size() - at < sizeof(record)) {
+				break;
+			}
+			std::memcpy(&record, bytes.data() + at, sizeof(record));
+			if (record.words == 0 || bytes.size() - at - sizeof(record) < record.compressed_bytes) {
+				break;
+			}
+			const auto* compressed = bytes.data() + at + sizeof(record);
+			at += sizeof(record) + record.compressed_bytes;
+			valid = at;
+			if (record.hash == 0) {
+				not_in_files.clear();
+				if (ReadCodeRecord(record, compressed, code) && code.size() >= 2 && code[0] == ScanMark &&
+				    code[1] == ScanVersion) {
+					for (size_t i = 2; i + 1 < code.size(); i += 2) {
+						not_in_files.insert(code[i] | (uint64_t {code[i + 1]} << 32u));
+					}
+				}
+				continue;
+			}
+			stored.insert(record.hash);
+			bool wanted = false;
+			{
+				std::scoped_lock lock(state.mutex);
+				const auto       found = state.code.find(record.hash);
+				wanted = found != state.code.end() && !found->second.mapped;
+			}
+			if (wanted && !stop.stop_requested() && ReadCodeRecord(record, compressed, code) &&
+			    XXH3_64bits(code.data(), code.size() * sizeof(uint32_t)) == record.hash) {
+				provided += ProvideCode(record.hash, code, false) ? 1u : 0u;
+			}
+		}
+		if (provided != 0) {
+			ManifestLog("Pipeline manifest: the code of {} shaders comes from {} ({} shaders)", provided,
+			            Common::PathToString(state.code_path), stored.size());
+		}
+	}
+	Common::File file;
+	bool         opened = false;
+	const auto   append = [&](uint64_t hash, std::span<const uint32_t> code) {
+		if (hash != 0 && !stored.insert(hash).second) {
+			return;
+		}
+		if (!opened) {
+			opened = true;
+			Common::File::CreateDirectories(state.code_path.parent_path());
+			if (valid != 0 && file.Open(state.code_path, Common::File::Mode::ReadWrite)) {
+				file.Truncate(valid);
+				file.Seek(valid);
+			} else if (file.Create(state.code_path)) {
+				file.Write(&CodeStoreMagic, sizeof(CodeStoreMagic));
+			}
+		}
+		if (file.IsInvalid()) {
+			return;
+		}
+		std::vector<uint8_t> bytes(sizeof(CodeRecord) + ZSTD_compressBound(code.size_bytes()));
+		const auto size = ZSTD_compress(bytes.data() + sizeof(CodeRecord), bytes.size() - sizeof(CodeRecord),
+		                                code.data(), code.size_bytes(), 3);
+		if (ZSTD_isError(size)) {
+			return;
+		}
+		const CodeRecord record {.hash             = hash,
+		                         .words            = static_cast<uint32_t>(code.size()),
+		                         .compressed_bytes = static_cast<uint32_t>(size)};
+		std::memcpy(bytes.data(), &record, sizeof(record));
+		file.Write(bytes.data(), static_cast<uint32_t>(sizeof(record) + size));
+		file.Flush();
+	};
+	const auto listed_code = [&] {
+		std::scoped_lock lock(state.mutex);
+		return state.code.size();
+	};
+	// The listed code still missing: the game's files are searched for it, unless the last search
+	// missed all of it already.
+	const auto missing = [&] {
+		std::vector<uint64_t> hashes;
+		std::scoped_lock      lock(state.mutex);
+		for (const auto& [hash, entry]: state.code) {
+			if (!entry.mapped) {
+				hashes.push_back(hash);
+			}
+		}
+		std::ranges::sort(hashes);
+		return hashes;
+	};
+	if (const auto still = missing();
+	    std::ranges::any_of(still, [&](uint64_t hash) { return !not_in_files.contains(hash); })) {
+		if (ScanGameFiles(stop, append) && !stop.stop_requested()) {
+			std::vector<uint32_t> words {ScanMark, ScanVersion};
+			for (const auto hash: missing()) {
+				words.push_back(static_cast<uint32_t>(hash));
+				words.push_back(static_cast<uint32_t>(hash >> 32u));
+			}
+			append(0, words);
+		}
+	} else if (still.empty()) {
+		ManifestLog("[ShaderScan] game files: not searched (the code store has all {} shaders the manifest lists)",
+		            listed_code());
+	} else {
+		ManifestLog("[ShaderScan] game files: not searched ({} of the {} shaders the manifest lists are missing, "
+		            "and the last search did not find them)",
+		            still.size(), listed_code());
+	}
+	state.scanning.store(false, std::memory_order_release);
+	// From here on it only writes what the guest maps.
+	Common::Thread::LowerCurrentPriority();
+	for (;;) {
+		std::pair<uint64_t, std::vector<uint32_t>> job;
+		{
+			std::unique_lock lock(state.code_mutex);
+			// What is queued is written before the thread stops.
+			state.code_available.wait(lock, stop, [&] { return !state.code_queue.empty(); });
+			if (state.code_queue.empty()) {
+				return;
+			}
+			job = std::move(state.code_queue.front());
+			state.code_queue.pop_front();
+		}
+		append(job.first, job.second);
+	}
 }
 
 void PipelineCache::ManifestWorker(const std::stop_token& stop) {
@@ -2172,6 +2667,7 @@ PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
 	backlog.modules   = static_cast<uint32_t>(state.module_jobs.size());
 	backlog.pipelines = static_cast<uint32_t>(state.pipeline_jobs.size());
 	backlog.running   = state.running;
+	backlog.scanning  = state.scanning.load(std::memory_order_acquire);
 	for (const auto index: state.module_jobs) {
 		backlog.compute_modules += state.warm.modules[index].stage == ShaderType::Compute ? 1u : 0u;
 	}

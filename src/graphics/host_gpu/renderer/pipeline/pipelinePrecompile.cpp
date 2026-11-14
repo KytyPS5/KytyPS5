@@ -154,7 +154,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		e.shaders        = backlog.modules;
 		e.driver_seconds = helpers + graphics;
 		e.seconds_left   = std::max(helpers, graphics + modules);
-		e.drained = jobs == 0 && backlog.modules == 0 && backlog.pipelines == 0 && backlog.running == 0;
+		e.drained = jobs == 0 && backlog.modules == 0 && backlog.pipelines == 0 && backlog.running == 0 &&
+		            !backlog.scanning;
 		return e;
 	};
 
@@ -253,7 +254,9 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 				              "background)",
 				              e.pending);
 				play();
-			} else if (e.driver_seconds < threshold) {
+			} else if (e.driver_seconds < threshold || !LibKernel::GuestPause::GuestStarted()) {
+				// (With the code of earlier sessions or of the game's files, the pipelines are known
+				// before the game is loaded: it is stopped once it starts.)
 				if (grace && now >= grace_end) {
 					PrecompileLog("Pipeline precompile: notice closed after {:.1f} s: {} pipelines compiled while "
 					              "the game was stopped {} times",

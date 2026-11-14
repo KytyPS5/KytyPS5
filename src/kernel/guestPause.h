@@ -21,6 +21,9 @@ public:
 	KYTY_CLASS_NO_COPY(GuestPause);
 
 	[[nodiscard]] static bool Supported() noexcept;
+	// Whether the guest runs: before its first thread starts there is nothing to stop, and its
+	// programs are not loaded yet.
+	[[nodiscard]] static bool GuestStarted();
 
 	// Suspends the guest threads that run guest code now. Call it often while paused: threads
 	// leave the emulator, and the guest may have started others.

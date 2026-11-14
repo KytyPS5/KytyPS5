@@ -25,7 +25,9 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <functional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -697,6 +699,19 @@ private:
 	void RecordPipeline(const GraphicsPipelineKey& key);
 	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
+	// Gives the records that wait for the code of `hash` their code; false when none does.
+	// `from_guest`: the guest mapped the shader (the code does not come from the code store or
+	// from the game's files).
+	bool ProvideCode(uint64_t hash, std::span<const uint32_t> code, bool from_guest);
+	// The title's shader code store (<title>_<version>.code next to its recorded manifest): the
+	// code of its shaders, kept on this computer. A game maps many of its shaders only when it
+	// loads the place that uses them, and until then the manifest cannot build their modules: the
+	// thread gives the manifest the code of every listed shader it finds in the store and in the
+	// game's files, so that all of the manifest is built from the start (and compiled in one
+	// precompilation pause), and then stores what the guest maps.
+	void CodeStoreThread(const std::stop_token& stop);
+	bool ScanGameFiles(const std::stop_token&                                          stop,
+	                   const std::function<void(uint64_t, std::span<const uint32_t>)>& append);
 	void ManifestWorker(const std::stop_token& stop);
 	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
 	                         std::span<const uint32_t> back_code, bool guest_traversal = false);
@@ -721,6 +736,8 @@ private:
 		uint32_t pipelines       = 0;
 		// Records the threads build or create now.
 		uint32_t running         = 0;
+		// Code of listed shaders still arrives from the code store or the game's files.
+		bool     scanning        = false;
 		uint64_t pipelines_done  = 0;
 		uint32_t threads         = 0;
 		// PrecompileMean of a module build and of a graphics pipeline creation.
@@ -742,9 +759,11 @@ private:
 	void OpenUseOrder(const std::filesystem::path& path);
 	// The threads that run the game's GPU work: a pipeline is used for the first time.
 	void NoteUse(Pipeline& pipeline, std::span<const ShaderModule* const> stages);
-	// The place of a program (by its hash) in the order of use; PipelineHelpers::NoRank when no
-	// earlier session used it.
-	[[nodiscard]] uint32_t UseRank(uint64_t program_hash) const;
+	// The place of a program (by its hash) in the order of use. Of those no earlier session used,
+	// the ones the guest has mapped (MappedRank) go before the ones only its files hold
+	// (PipelineHelpers::NoRank).
+	static constexpr uint32_t MappedRank = PipelineHelpers::NoRank - 1;
+	[[nodiscard]] uint32_t    UseRank(uint64_t program_hash) const;
 };
 
 // Compute programs compiled with native ray tracing on (see IR::TraceNativeTraversals: the

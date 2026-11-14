@@ -50,6 +50,10 @@ bool GuestPause::Supported() noexcept {
 	return true;
 }
 
+bool GuestPause::GuestStarted() {
+	return !PthreadGuestHostThreadIds().empty();
+}
+
 void GuestPause::Poll() {
 	const auto self = static_cast<uint64_t>(::GetCurrentThreadId());
 	for (const auto id: PthreadGuestHostThreadIds()) {
@@ -90,6 +94,10 @@ GuestPause::GuestPause(): m_impl(std::make_unique<Impl>()) {}
 GuestPause::~GuestPause() = default;
 
 bool GuestPause::Supported() noexcept {
+	return false;
+}
+
+bool GuestPause::GuestStarted() {
 	return false;
 }
 

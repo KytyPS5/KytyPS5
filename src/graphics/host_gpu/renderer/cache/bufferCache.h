@@ -230,6 +230,10 @@ public:
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
+	// The last SynchronizeBuffersInRanges() left pages CPU dirty that it uploads every time (see
+	// RegionManager::ConsumeCpuDirtyRangesKeepingBusy()): the next one must run even if no page
+	// became CPU dirty since.
+	[[nodiscard]] bool HasKeptPages() const noexcept { return m_kept_pages; }
 	// Advances whenever recorded work may write cached buffers (written bindings, fills, copies,
 	// device-address stores).
 	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
@@ -590,6 +594,11 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_span_ranges;
 	std::vector<std::vector<vk::BufferCopy>>   m_span_copies;
 	std::vector<uint64_t>                      m_span_sizes;
+	// The SynchronizeBuffersInRanges() calls so far, the number of the one running (0: none) and
+	// whether the last one left pages CPU dirty.
+	uint32_t m_device_syncs     = 0;
+	uint32_t m_device_sync_pass = 0;
+	bool     m_kept_pages       = false;
 };
 
 } // namespace Libs::Graphics

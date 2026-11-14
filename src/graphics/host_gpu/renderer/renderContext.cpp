@@ -595,7 +595,9 @@ void RenderContext::PrepareBda(bool may_write, bool full_sync) {
 	// unless the execution thread itself wrote them for the command stream (labels, CP writes)
 	// or the buffers or mappings changed.
 	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
-	if (full_sync && epochs != m_bda_sync_epochs &&
+	// (Pages the last synchronization left CPU dirty take no fault when the guest writes them:
+	// see BufferCache::HasKeptPages().)
+	if (full_sync && (epochs != m_bda_sync_epochs || m_buffer_cache.HasKeptPages()) &&
 	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
 		m_bda_synced_generation = m_bda_generation;
 		// A new buffer or mapped range may cover CPU-dirty pages that earlier passes skipped: the

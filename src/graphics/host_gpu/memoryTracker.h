@@ -86,6 +86,33 @@ public:
 		});
 	}
 
+	// The last device-address synchronization that left pages of the tracking region `index` CPU
+	// dirty (see RegionManager::ConsumeCpuDirtyRangesKeepingBusy()); 0 when none did.
+	[[nodiscard]] uint32_t RegionKeptSync(uint64_t index) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->KeptSync() : 0;
+	}
+
+	// A guest write faulted on the page of `vaddr`.
+	void NoteGuestWriteFault(uint64_t vaddr) {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (index >= REGION_COUNT) {
+			return;
+		}
+		if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
+			std::scoped_lock lock(manager->lock);
+			manager->NoteGuestWriteFault(vaddr % TRACKER_REGION_SIZE);
+		}
+	}
+
+	// Whether a device-address synchronization left pages CPU dirty since the last call.
+	[[nodiscard]] bool TakeKeptPages() {
+		return m_kept_pages.exchange(false, std::memory_order_relaxed);
+	}
+
 	// The CPU-dirty epoch of the tracking region `index` (address / TRACKER_REGION_SIZE), which
 	// advances whenever its pages become CPU dirty; 0 while the region is untracked.
 	[[nodiscard]] uint64_t RegionCpuDirtyEpoch(uint64_t index) const {
@@ -194,9 +221,11 @@ public:
 		}
 	}
 
+	// `device_sync`: not 0 for the uploads of the device-address synchronization, the number of
+	// the synchronization (see RegionManager::ConsumeCpuDirtyRangesKeepingBusy()).
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
-	                        UploadFunc&& upload_func) {
+	                        UploadFunc&& upload_func, uint32_t device_sync = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -205,6 +234,16 @@ public:
 			// one of a range without CPU-dirty pages in a region with some elsewhere.
 			if (!is_written && (!manager->HasCpuDirty() ||
 			                    !manager->IsModified<DirtySource::Cpu>(offset, bytes))) {
+				return;
+			}
+			if (!is_written && device_sync != 0) {
+				const std::pair<uint64_t, uint64_t> range {offset, bytes};
+				std::scoped_lock                    lock(manager->lock);
+				if (manager->ConsumeCpuDirtyRangesKeepingBusy(
+				        std::span(&range, 1), device_sync,
+				        [&](size_t, uint64_t address, uint64_t run) noexcept { range_func(address, run); })) {
+					m_kept_pages.store(true, std::memory_order_relaxed);
+				}
 				return;
 			}
 			manager->lock.lock();
@@ -228,7 +267,8 @@ public:
 	// each region are taken with one protection update (RegionManager::ConsumeCpuDirtyRanges()).
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRanges(std::span<const std::pair<uint64_t, uint64_t>> ranges,
-	                         RangeFunc&& range_func, UploadFunc&& upload_func) {
+	                         RangeFunc&& range_func, UploadFunc&& upload_func,
+	                         uint32_t device_sync = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, size_t, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		struct Piece {
@@ -262,11 +302,16 @@ public:
 					offsets.emplace_back(pieces[piece].offset, pieces[piece].size);
 				}
 				std::scoped_lock lock(manager->lock);
-				manager->ConsumeCpuDirtyRanges(
-				    std::span<const std::pair<uint64_t, uint64_t>>(offsets),
-				    [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
-					    range_func(pieces[first + piece].range, address, bytes);
-				    });
+				const auto piece_func = [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
+					range_func(pieces[first + piece].range, address, bytes);
+				};
+				const std::span<const std::pair<uint64_t, uint64_t>> region_ranges(offsets);
+				if (device_sync == 0) {
+					manager->ConsumeCpuDirtyRanges(region_ranges, piece_func);
+				} else if (manager->ConsumeCpuDirtyRangesKeepingBusy(region_ranges, device_sync,
+				                                                    piece_func)) {
+					m_kept_pages.store(true, std::memory_order_relaxed);
+				}
 			}
 			first = last;
 		}
@@ -308,6 +353,8 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+
+	std::atomic<bool> m_kept_pages {false};
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;

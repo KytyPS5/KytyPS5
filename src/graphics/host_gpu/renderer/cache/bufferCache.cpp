@@ -415,6 +415,7 @@ void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	static constexpr uint64_t FaultBlockSize = 64 * 1024;
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
 	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	m_memory_tracker.NoteGuestWriteFault(page);
 	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
 	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
@@ -903,7 +904,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); }, m_device_sync_pass);
 	RecordBufferUpload(buffer, copies, source);
 	if (is_texel_buffer && !is_written && !NoImageStartsAt(vaddr)) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -967,7 +968,8 @@ void BufferCache::SynchronizeBuffers(std::span<Buffer* const>                   
 			        UploadCopies(*buffers[index], m_span_copies[index], m_span_sizes[index]);
 			    RecordBufferUpload(*buffers[index], m_span_copies[index], source);
 		    }
-	    });
+	    },
+	    m_device_sync_pass);
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
@@ -2445,6 +2447,18 @@ void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
 	const UploadBatch batch {*this};
+	// The uploads of this pass leave the pages the guest keeps writing CPU dirty (see
+	// RegionManager::ConsumeCpuDirtyRangesKeepingBusy()).
+	const auto sync    = ++m_device_syncs;
+	m_device_sync_pass = sync;
+	(void)m_memory_tracker.TakeKeptPages();
+	struct EndPass {
+		BufferCache& cache;
+		~EndPass() {
+			cache.m_device_sync_pass = 0;
+			cache.m_kept_pages       = cache.m_memory_tracker.TakeKeptPages();
+		}
+	} end_pass {*this};
 	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
 	// it again, and the next call visits the region again. Regions without buffers have nothing
 	// to upload; a buffer registered later forces its regions.
@@ -2456,9 +2470,11 @@ void BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool all) {
 			const auto index = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
 			const auto epoch = m_memory_tracker.RegionCpuDirtyEpoch(index);
 			// Synchronizing a buffer tracks its pages, so an untracked region (epoch 0) has no
-			// pending write under a buffer unless the region was forced.
+			// pending write under a buffer unless the region was forced. A region whose pages the
+			// last pass left dirty has them to upload again.
 			if (!all && (forced & (uint64_t {1} << (index % 64))) == 0 &&
-			    (epoch == 0 || m_synced_region_epochs[index] == epoch)) {
+			    (epoch == 0 || m_synced_region_epochs[index] == epoch) &&
+			    m_memory_tracker.RegionKeptSync(index) + 1 != sync) {
 				continue;
 			}
 			m_sync_regions.emplace_back(index, epoch);

@@ -6,7 +6,10 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <thread>
@@ -203,6 +206,8 @@ public:
 			if constexpr (!enable) {
 				m_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_gpu_clean_epoch.fetch_add(1, std::memory_order_acq_rel);
+			} else {
+				m_gpu_written.SetRange(start, end);
 			}
 			UpdateProtection<enable, true>(changed);
 		}
@@ -263,6 +268,92 @@ public:
 		}
 	}
 
+	// ConsumeCpuDirtyRanges() for the synchronization of everything device addresses may read
+	// (RenderContext::PrepareBda()), the `sync`-th one. That synchronization uploads every CPU
+	// write under a cached buffer, and cleaning a page protects it, so the guest's next write to
+	// it faults. The guest rewrites the data of each frame (the constants its draws stream)
+	// every frame: synchronized, each of those pages costs a protection call here and a fault on
+	// a guest thread per frame. A page that faulted again within MaxGap synchronizations of its
+	// last visit, MinWrites times in a row, stays CPU dirty: it is uploaded with every
+	// synchronization without being protected, as long as nothing else cleans it; that is the
+	// state of a page the guest wrote right after a synchronization. Every RevalidatePeriod
+	// synchronizations it is cleaned once, and stays dirty again only if the guest writes it soon
+	// after. Pages the GPU ever wrote do not stay dirty: their uploads would overwrite what the
+	// GPU stored, which the guest's memory only gets when a fault reads it back.
+	// Returns whether pages stayed dirty. Callers hold the lock.
+	template <typename Func>
+	bool ConsumeCpuDirtyRangesKeepingBusy(std::span<const std::pair<uint64_t, uint64_t>> ranges,
+	                                      uint32_t sync, Func&& func) {
+		constexpr uint32_t MaxGap           = 3;
+		constexpr uint8_t  MinWrites        = 3;
+		constexpr uint32_t RevalidatePeriod = 12;
+		RegionBits mask;
+		for (const auto& [offset, size]: ranges) {
+			const auto [start, end] = GetPageRange(offset, size);
+			if (m_cpu_dirty.FirstRangeFrom(start).first < end) {
+				mask |= RegionBits(m_cpu_dirty, start, end);
+			}
+		}
+		if (mask.None()) {
+			return false;
+		}
+		if (m_busy == nullptr) {
+			m_busy = std::make_unique<BusyPages>();
+		}
+		auto&      busy = *m_busy;
+		RegionBits clean;
+		bool       kept = false;
+		for (const auto [first, last]: mask) {
+			for (auto page = first; page < last; page++) {
+				// Only a page that faulted is known to have been written: the pages a fault releases
+				// with it (BufferCache::InvalidateFaultedPage()) are dirty too, and one left dirty
+				// does not fault.
+				if (busy.faulted.Get(page)) {
+					busy.faulted.Unset(page);
+					const bool soon   = busy.seen[page] != 0 && sync - busy.seen[page] <= MaxGap;
+					busy.writes[page] = soon ? static_cast<uint8_t>(std::min(busy.writes[page] + 1, 255)) : 1;
+				}
+				busy.seen[page] = sync;
+				if (busy.writes[page] >= MinWrites && sync - busy.cleaned[page] < RevalidatePeriod &&
+				    !m_gpu_written.Get(page)) {
+					kept = true;
+				} else {
+					// Cleaned, it must fault again to stay dirty the next time.
+					busy.writes[page]  = std::min(busy.writes[page], static_cast<uint8_t>(MinWrites - 1));
+					busy.cleaned[page] = sync;
+					clean.Set(page);
+					m_cpu_dirty.Unset(page);
+				}
+			}
+		}
+		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
+		UpdateProtection<true, false>(clean);
+		if (kept) {
+			m_kept_sync.store(sync, std::memory_order_relaxed);
+		}
+		for (size_t index = 0; index < ranges.size(); index++) {
+			const auto [start, end] = GetPageRange(ranges[index].first, ranges[index].second);
+			for (const auto [first, last]: RegionBits(mask, start, end)) {
+				func(index, m_cpu_addr + first * TRACKER_PAGE_SIZE,
+				     (last - first) * TRACKER_PAGE_SIZE);
+			}
+		}
+		return kept;
+	}
+
+	// A guest write faulted on the page at `offset` (see ConsumeCpuDirtyRangesKeepingBusy()).
+	// Callers hold the lock.
+	void NoteGuestWriteFault(uint64_t offset) {
+		if (m_busy != nullptr) {
+			m_busy->faulted.Set(static_cast<size_t>(offset / TRACKER_PAGE_SIZE));
+		}
+	}
+
+	// The last synchronization that left pages of the region CPU dirty (see
+	// ConsumeCpuDirtyRangesKeepingBusy()), 0 when none did: the next one visits the region even
+	// if no page faulted since.
+	[[nodiscard]] uint32_t KeptSync() const { return m_kept_sync.load(std::memory_order_relaxed); }
+
 	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
 	// the previous call over them, or are still CPU dirty (further writes to a dirty page do not
 	// fault), and forgets the former. Callers hold the lock.
@@ -282,6 +373,7 @@ public:
 	template <typename Func>
 	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(offset, size);
+		m_gpu_written.SetRange(start, end);
 		RegionBits mask(~m_cpu_dirty, start, end);
 		if (mask.None()) {
 			return;
@@ -360,6 +452,19 @@ private:
 	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
 	std::atomic<uint64_t> m_gpu_clean_epoch {1};
+	// See ConsumeCpuDirtyRangesKeepingBusy(). Pages the GPU wrote, or was noted to write, at any
+	// time; and per page: the synchronization that last visited it dirty and the one that last
+	// cleaned it, its write faults in a row soon after a visit, and whether a guest write faulted
+	// on it since its last visit.
+	struct BusyPages {
+		std::array<uint32_t, TRACKER_REGION_PAGES> seen {};
+		std::array<uint32_t, TRACKER_REGION_PAGES> cleaned {};
+		std::array<uint8_t, TRACKER_REGION_PAGES>  writes {};
+		RegionBits                                 faulted;
+	};
+	RegionBits                 m_gpu_written;
+	std::unique_ptr<BusyPages> m_busy;
+	std::atomic<uint32_t>      m_kept_sync {0};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 	inline static std::atomic<uint64_t> s_gpu_clean_epoch {0};

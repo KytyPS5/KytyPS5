@@ -454,8 +454,19 @@ public:
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
-		ReserveGuestRegions();
+		// Reserve the fixed system regions (Region 0: 0x40000 - 0x1000000000) first.
+		// This protects fixed system bases like DriverDmemBase (0xfe0000000) and thread
+		// stacks from host libraries, while leaving the high address space open for host
+		// drivers (such as NVIDIA Vulkan DLSS/NGX) to make their allocations without failing.
+		ReserveGuestRegions(0, 1);
 		m_backing = new GuestBackingStore(backing_size);
+	}
+
+	// Reserves the user address space and extended memory (Regions 1 and 2:
+	// [HOST_USER_MIN, HOST_USER_MAX] and kExtendedMemoryBase).
+	// Must be called after host GPU/DLSS initialization has completed.
+	void ReserveRemainingGuestRegions() {
+		ReserveGuestRegions(1, 3);
 	}
 
 	~GuestAddressSpace() {
@@ -875,7 +886,7 @@ private:
 	}
 #endif
 
-	void ReserveGuestRegions() {
+	void ReserveGuestRegions(size_t first_region = 0, size_t last_region = 3) {
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
@@ -885,7 +896,8 @@ private:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();
-		for (const auto& [guest_start, guest_end]: regions) {
+		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
+			const auto [guest_start, guest_end] = regions[i];
 			auto next_addr = guest_start;
 			while (next_addr < guest_end) {
 				MEMORY_BASIC_INFORMATION info {};
@@ -966,7 +978,8 @@ private:
 			}
 		};
 
-		for (const auto& [region_start, region_end]: regions) {
+		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
+			const auto [region_start, region_end] = regions[i];
 			auto current = region_start;
 
 			for (const auto& [mapping_start, mapping_end]: occupied) {
@@ -992,7 +1005,8 @@ private:
 			}
 		}
 #else
-		for (const auto& [start, end]: regions) {
+		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
+			const auto [start, end] = regions[i];
 			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
 			flags |= MAP_FIXED;

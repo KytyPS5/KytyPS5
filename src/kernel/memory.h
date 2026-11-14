@@ -13,6 +13,9 @@ enum class PageFaultAccess;
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
+// Reserves the host virtual address ranges that the PS5 guest uses. Must be called after
+// all host subsystems that allocate address space (e.g. Graphics / DLSS) are initialised.
+void ReserveGuestAddressSpace();
 void Shutdown();
 
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never

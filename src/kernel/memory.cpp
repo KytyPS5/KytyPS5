@@ -967,6 +967,13 @@ void Initialize() {
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
+	// SelfTest and SelfTestSub64SharedPlaceholderAlias require the guest regions to be
+	// reserved first; they are therefore deferred to ReserveGuestAddressSpace().
+}
+
+void ReserveGuestAddressSpace() {
+	EXIT_IF(g_guest_address_space == nullptr);
+	g_guest_address_space->ReserveRemainingGuestRegions();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 }

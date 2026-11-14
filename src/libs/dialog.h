@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <string>
+
 namespace Libs::Dialog {
 
 namespace CommonDialog {
@@ -65,6 +67,8 @@ int KYTY_SYSV_ABI MsgDialogClose();
 int KYTY_SYSV_ABI MsgDialogProgressBarInc(int target, uint32_t delta);
 int KYTY_SYSV_ABI MsgDialogProgressBarSetValue(int target, uint32_t rate);
 int KYTY_SYSV_ABI MsgDialogProgressBarSetMsg(int target, const char* msg);
+
+std::string UserMessageText(const void* param);
 
 } // namespace MsgDialog
 

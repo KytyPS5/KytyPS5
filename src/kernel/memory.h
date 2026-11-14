@@ -5,6 +5,11 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+#include <utility>
+#include <vector>
+#endif
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -216,9 +221,6 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-#include <utility>
-#include <vector>
-
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);

@@ -5991,7 +5991,7 @@ int main(int argc, char** argv) {
 		RunTest(TestMemoryPoolMultiRangeDecommit);
 		RunTest(TestFragmentedPoolDecommitOnSmallStack);
 		// Memory callbacks remain registered for the rest of the process.
-		RunTest(TestAsanShadowUpdatesAcrossRangeEdits);
+		RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 		RunTest(TestAsanAliasedPhysicalRelease);
 		RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
 		return g_failed_tests == 0 ? 0 : 1;

@@ -1110,10 +1110,15 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto pointer = EmitStorageBufferElementPointer(
 	    state, wide, index, TypeStorageBufferElementPointer(state, 64));
 	const auto snapshot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAtomicLoad, TypeU64(state), snapshot, pointer,
-	                          ConstantU32(state, spv::ScopeDevice),
-	                          ConstantU32(state, spv::MemorySemanticsAcquireMask |
-	                                                 spv::MemorySemanticsUniformMemoryMask));
+	if (state.profile.int64_atomics) {
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU64(state), snapshot, pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsAcquireMask |
+		                                                 spv::MemorySemanticsUniformMemoryMask));
+	} else {
+		// Metal cannot carry 64-bit atomics; the pair is still read at once, without atomicity.
+		state.builder.AddFunction(spv::OpLoad, TypeU64(state), snapshot, pointer);
+	}
 	const std::array<uint32_t, 4> words {
 	    EmitCompositeExtractU64(state, snapshot, IR::Value(0u)),
 	    EmitCompositeExtractU64(state, snapshot, IR::Value(1u))};
@@ -1418,7 +1423,101 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+namespace {
+
+// One 32-bit atomic on a word of the 64-bit element: Metal carries no 64-bit atomics.
+uint32_t EmitAtomicWord(EmitterState& state, spv::Op opcode, uint32_t pointer, uint32_t value) {
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(opcode, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+	return old;
+}
+
+// Without 64-bit atomics the element is two 32-bit words: bitwise ops split exactly, and the
+// arithmetic ones carry or borrow between the halves. Min, max, swap and compare-swap mix both
+// halves, so they read the pair, merge, and write both words back.
+uint32_t EmitEmulatedBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto& mem    = ctx.Memory(inst);
+	auto&       state  = ctx.state;
+	const auto  opcode = SpirvAtomicOpcode(inst.GetOpcode());
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
+		    const auto resource =
+		        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[2]);
+		    const auto byte_address = ByteAddress(ctx, inst, mem);
+		    const auto dword = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
+		                              ConstantU32(state, 2u));
+		    return EmitValueOrDefaultIfCondition(
+		        state, EmitMemoryElementInBounds(state, resource, dword), TypeU64(state),
+		        ConstantU64(state, 0), [&]() {
+			        const auto word         = TypeStorageBufferElementPointer(state, 32u);
+			        const auto low_pointer  = EmitStorageBufferElementPointer(state, resource, dword, word);
+			        const auto high_pointer = EmitStorageBufferElementPointer(
+			            state, resource, EmitAddU32(state, dword, ConstantU32(state, 1u)), word);
+			        const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+			        auto low_new  = EmitCompositeExtractU64(state, value, IR::Value(0u));
+			        auto high_new = EmitCompositeExtractU64(state, value, IR::Value(1u));
+			        uint32_t low_old  = 0u;
+			        uint32_t high_old = 0u;
+			        switch (opcode) {
+			        case spv::OpAtomicAnd:
+			        case spv::OpAtomicOr:
+			        case spv::OpAtomicXor:
+				        low_old  = EmitAtomicWord(state, opcode, low_pointer, low_new);
+				        high_old = EmitAtomicWord(state, opcode, high_pointer, high_new);
+				        break;
+			        case spv::OpAtomicIAdd:
+			        case spv::OpAtomicISub: {
+				        low_old = EmitAtomicWord(state, opcode, low_pointer, low_new);
+				        // A wrap of the low word carries into (add) or borrows from (subtract) the high.
+				        const auto carry = Select(
+				            state, TypeU32(state),
+				            Binary(state, spv::OpULessThan, TypeBool(state), low_old, low_new),
+				            ConstantU32(state, 1u), ConstantU32(state, 0u));
+				        high_old = EmitAtomicWord(state, opcode, high_pointer,
+				                                  EmitAddU32(state, high_new, carry));
+				        break;
+			        }
+			        default: {
+				        const auto low_read  = state.builder.AllocateId();
+				        const auto high_read = state.builder.AllocateId();
+				        state.builder.AddFunction(spv::OpLoad, TypeU32(state), low_read, low_pointer);
+				        state.builder.AddFunction(spv::OpLoad, TypeU32(state), high_read, high_pointer);
+				        const auto old = PackU64(state, low_read, high_read);
+				        auto merged    = value;
+				        if (opcode == spv::OpAtomicUMin || opcode == spv::OpAtomicUMax) {
+					        merged = Select(
+					            state, TypeU64(state),
+					            Binary(state, opcode == spv::OpAtomicUMin ? spv::OpULessThan
+					                                                     : spv::OpUGreaterThan,
+					                   TypeBool(state), old, value),
+					            old, value);
+				        } else if (opcode == spv::OpAtomicCompareExchange) {
+					        const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+					        const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+					        merged = Select(
+					            state, TypeU64(state),
+					            Binary(state, spv::OpIEqual, TypeBool(state), old, comparator), desired,
+					            old);
+				        }
+				        low_new  = EmitCompositeExtractU64(state, merged, IR::Value(0u));
+				        high_new = EmitCompositeExtractU64(state, merged, IR::Value(1u));
+				        low_old  = EmitAtomicWord(state, spv::OpAtomicExchange, low_pointer, low_new);
+				        high_old = EmitAtomicWord(state, spv::OpAtomicExchange, high_pointer, high_new);
+				        break;
+			        }
+			        }
+			        EmitAtomicMemoryBarrier(state, mem.kind);
+			        return PackU64(state, low_old, high_old);
+		        });
+	    });
+}
+
+} // namespace
+
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (!ctx.state.profile.int64_atomics) return EmitEmulatedBufferAtomic64(ctx, inst);
 	const auto& mem   = ctx.Memory(inst);
 	auto&       state = ctx.state;
 	return EmitValueOrDefaultIfCondition(

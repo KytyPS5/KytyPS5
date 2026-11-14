@@ -87,8 +87,12 @@ uint32_t ZeroF32(EmitterState& state) {
 	return ConstantF32(state, 0);
 }
 
+// The mip an explicit-LOD gather reads. `last_lod` and `last_mip` give the view's last mip, as a
+// float and as an integer, where the selection uses them.
+template <typename LastLod, typename LastMip>
 uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-                   const IR::Inst& address, const ImageSampleLayout& layout, uint32_t mip_count) {
+                   const IR::Inst& address, const ImageSampleLayout& layout,
+                   const LastLod& last_lod, const LastMip& last_mip) {
 	auto& state = ctx.state;
 	const auto Extract = [&](uint32_t word, uint32_t first, uint32_t count) {
 		return EmitBitFieldUExtract(state, word, ConstantU32(state, first),
@@ -120,7 +124,7 @@ uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memory
 	                        Extract(ctx.Arg(inst, 4), 12, 4));
 	const auto minimum = Binary(state, spv::OpFSub, TypeF32(state),
 	                            LodFixed(ctx.Arg(inst, 3), 8), base);
-	const auto last = ConstantF32Value(state, static_cast<float>(mip_count - 1u));
+	const auto last     = last_lod();
 	const auto biased =
 	    Binary(state, spv::OpFAdd, TypeF32(state), AddressF32(ctx, mem, address, layout.lod), bias);
 	auto lod = Binary(state, spv::OpFAdd, TypeF32(state), biased,
@@ -133,11 +137,20 @@ uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memory
 	lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
 	             Select(state, TypeF32(state), preclamp, zero, rounding));
 	// The clamped value is nonnegative, so conversion performs the integer mip rounding.
-	const auto mip = EmitUMin32(state, Unary(state, spv::OpConvertFToU, TypeU32(state), lod),
-	                           ConstantU32(state, mip_count - 1u));
+	const auto mip =
+	    EmitUMin32(state, Unary(state, spv::OpConvertFToU, TypeU32(state), lod), last_mip());
 	const auto mip_none = Binary(state, spv::OpIEqual, TypeBool(state),
 	                            mip_filter, ConstantU32(state, 0));
 	return Select(state, TypeU32(state), mip_none, ConstantU32(state, 0), mip);
+}
+
+uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                   const IR::Inst& address, const ImageSampleLayout& layout, uint32_t mip_count) {
+	auto& state = ctx.state;
+	return GatherMip(
+	    ctx, inst, mem, address, layout,
+	    [&] { return ConstantF32Value(state, static_cast<float>(mip_count - 1u)); },
+	    [&] { return ConstantU32(state, mip_count - 1u); });
 }
 
 uint32_t CubeAxis(EmitterState& state, uint32_t value) {
@@ -730,9 +743,13 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return texel;
 }
 
-template <typename Emit>
+// For an access that selects no mip.
+struct NoCandidateMip {};
+
+// `mip` gives the mip an access reads of a table candidate whose last mip it is passed.
+template <typename Emit, typename Mip = NoCandidateMip>
 auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t result_type,
-                     const Emit& emit) {
+                     const Emit& emit, const Mip& mip = {}) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
@@ -755,20 +772,37 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Emit, uint32_t, uint32_t>>;
 		const auto     word = EmitIndirectResourceIndex(state, key, image.indirect_mapping_slot,
 		                                                image.indirect_searched, 0u);
-		const auto     slot = EmitAddU32(
+		// A table that selects mips keeps the candidate's last mip above a narrower slot, and
+		// the candidate's mips follow each other from the slot.
+		const bool mips = image.mip_mode == IR::ImageMipMode::Dynamic;
+		const auto slot = EmitAddU32(
 		    state,
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), word,
-		           ConstantU32(state, (1u << IR::CandidateClassShift) - 1u)),
+		    Binary(
+		        state, spv::OpBitwiseAnd, TypeU32(state), word,
+		        ConstantU32(state,
+		                    (1u << (mips ? IR::CandidateMipShift : IR::CandidateClassShift)) - 1u)),
 		    EmitShaderDataDwordLoad(state, state.program.bindings.candidate_image_dword));
 		const auto arms     = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
 		const auto selected = [&]() {
-			if (arms == 1u) return emit(image.indirect_resources[1], slot);
+			auto index = slot;
+			if (mips) {
+				if constexpr (std::is_invocable_r_v<uint32_t, const Mip&, uint32_t>) {
+					index = EmitAddU32(
+					    state, slot,
+					    mip(EmitBitFieldUExtract(
+					        state, word, ConstantU32(state, IR::CandidateMipShift),
+					        ConstantU32(state, IR::CandidateClassShift - IR::CandidateMipShift))));
+				} else {
+					ctx.Fail(inst, "selects a mip of an image table without a level");
+				}
+			}
+			if (arms == 1u) return emit(image.indirect_resources[1], index);
 			const auto arm = Binary(state, spv::OpISub, TypeU32(state),
 			                        Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
 			                               ConstantU32(state, IR::CandidateClassShift)),
 			                        ConstantU32(state, 1u));
 			return EmitIndexSwitch(state, arm, arms, result_type, [&](uint32_t item) {
-				return emit(image.indirect_resources[item + 1u], slot);
+				return emit(image.indirect_resources[item + 1u], index);
 			});
 		};
 		const auto valid =
@@ -853,8 +887,9 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	                             result_type, EmitGroup);
 }
 
-template <typename Emit>
-uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit) {
+template <typename Emit, typename Mip = NoCandidateMip>
+uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit& emit,
+                         const Mip& mip = {}) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images[mem.resource];
@@ -888,7 +923,8 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	    [&](uint32_t resource, uint32_t array_index) {
 		    const auto native = emit(resource, array_index, native_type(resource));
 		    return mixed ? result_bits(resource, native) : native;
-	    });
+	    },
+	    mip);
 	return mixed ? value : result_bits(mem.resource, value);
 }
 
@@ -1168,7 +1204,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          gathered, 3u, 2u, 2u, 3u);
 				return result;
 			};
-			ctx.Define(inst, EmitImageResult(ctx, inst, EmitGather));
+			// A table's candidates differ in mip count; the selected one's is in its mapping word.
+			const auto CandidateMip = [&](uint32_t last) {
+				return GatherMip(
+				    ctx, inst, mem, *address, layout,
+				    [&] { return Unary(state, spv::OpConvertUToF, TypeF32(state), last); },
+				    [&] { return last; });
+			};
+			ctx.Define(inst, EmitImageResult(ctx, inst, EmitGather, CandidateMip));
 			return;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||

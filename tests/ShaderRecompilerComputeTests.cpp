@@ -16180,6 +16180,150 @@ public:
                   "a record loaded another record's image or its class read the texel wrongly");
         }
 
+        // A table read by an explicit-LOD gather: each record's texture binds a view per mip its
+        // T# views, the LOD selects among those, and other records with other views reuse the
+        // module.
+        {
+          constexpr auto gather_textures = base + 0xea000;
+          constexpr auto gather_parameters = base + 0xef000;
+          constexpr auto gather_table = base + 0xef100;
+          constexpr auto gather_lods = base + 0xef800;
+          constexpr auto gather_output = base + 0xefc00;
+          constexpr u32 texture_stride = 0x1000;
+          struct Texture {
+            u32 levels; // Mips the texture holds.
+            u32 first;  // The mips its T# views.
+            u32 last;
+          };
+          struct Record {
+            u32 texture;
+            float lod;
+          };
+          constexpr std::array records{Record{0, 0.0f}, Record{0, 1.0f}, Record{0, 5.0f},
+                                       Record{1, 0.0f}, Record{1, 3.0f}, Record{2, 0.0f},
+                                       Record{2, 1.0f}, Record{3, 2.0f}, Record{3, 3.0f},
+                                       Record{4, 1.0f}};
+          const auto texel_of = [](u32 texture, u32 mip) {
+            return std::bit_cast<u32>(static_cast<float>((texture + 1u) * 16u + mip));
+          };
+          // WorkGroupID.z selects the record and its LOD; the first of the four texels it
+          // gathers into v2..v5 goes to the output record.
+          std::vector<u32> gather_shader{
+              EncodeSop2(0x26, 8, 4, 255), 32,
+              EncodeSmem0(0x02, 16), EncodeSmem1(0, 125),
+              EncodeSmem0(0x02, 20), EncodeSmem1(16, 125),
+              EncodeSmem0(0x02, 24), EncodeSmem1(32, 125),
+              EncodeSmem0(0x02, 28), EncodeSmem1(48, 125),
+              EncodeSmem0(0x0b, 32, 8), EncodeSmem1(0, 8),
+              EncodeVop1(0x01, 8, 4),
+              EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(22, 7, 8), EncodeSopp(0x0c, 0)};
+          AppendVMovLiteral(&gather_shader, 20, std::bit_cast<u32>(0.5f));
+          AppendVMovLiteral(&gather_shader, 21, std::bit_cast<u32>(0.5f));
+          gather_shader.insert(gather_shader.end(),
+              {EncodeMimg0(0x44, 1), EncodeMimg1(2, 20, 8, 6), EncodeSopp(0x0c, 0),
+               EncodeMubuf0(0x1c, 0, true, false), EncodeMubuf1(2, 5, 8)});
+          AppendEnd(&gather_shader);
+          ShaderMapUserData(reinterpret_cast<uint64_t>(gather_shader.data()),
+              {.type = Prospero::ShaderBinaryType::kCs,
+               .code_size_bytes = static_cast<u32>(gather_shader.size() * sizeof(u32))});
+          const ShaderModule *gather_module = nullptr;
+          for (const bool reversed : {false, true}) {
+            // The second pass reverses the records and narrows two views.
+            const std::array textures{Texture{3u, 0u, reversed ? 1u : 2u}, Texture{1u, 0u, 0u},
+                                      Texture{3u, 1u, 2u}, Texture{4u, reversed ? 1u : 0u, 3u},
+                                      Texture{2u, 0u, 1u}};
+            Require(name, "gather table fixture reset",
+                    context.InvalidateMemory(gather_textures, 0x6000),
+                    "gather table fixtures escaped the existing mapped allocation");
+            for (u32 texture = 0; texture < textures.size(); ++texture) {
+              const auto layout = MakeTilingImage(Prospero::BufferFormat::k32Float, 8, 8,
+                  textures[texture].levels, 1, Prospero::TileMode::kLinear, 0, false);
+              Require(name, "gather table fixture", layout.data.size <= texture_stride,
+                      "a gather fixture texture outgrew its place");
+              for (u32 mip = 0; mip < textures[texture].levels; ++mip) {
+                const std::vector<u32> texels(layout.mip_layout[mip].size / 4u, texel_of(texture, mip));
+                LibKernel::Memory::WriteBacking(
+                    gather_textures + texture * texture_stride + layout.mip_layout[mip].offset,
+                    texels.data(), texels.size() * 4u);
+              }
+            }
+            std::vector<u32> table(records.size() * 8u);
+            std::vector<u32> lods(records.size());
+            std::vector<u32> expected(records.size());
+            for (u32 row = 0; row < records.size(); ++row) {
+              const auto &record = records[reversed ? records.size() - 1u - row : row];
+              const auto &texture = textures[record.texture];
+              const auto address = gather_textures + record.texture * texture_stride;
+              const ShaderTextureResource descriptor{{static_cast<u32>(address >> 8u),
+                  (static_cast<u32>(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u),
+                  1u | (7u << 14u),
+                  DstSel(4, 5, 6, 7) | (texture.first << 12u) | (texture.last << 16u) |
+                      (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                      (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+                  0, 0x00700000u | ((texture.levels - 1u) << 4u), 0, 0}};
+              std::copy_n(descriptor.fields, 8, table.begin() + row * 8u);
+              lods[row] = std::bit_cast<u32>(record.lod);
+              // The point filter reads the mip nearest the LOD, within the record's own view.
+              const auto mip = std::min(static_cast<u32>(record.lod), texture.last - texture.first);
+              expected[row] = texel_of(record.texture, texture.first + mip);
+            }
+            const auto rows = static_cast<u32>(records.size());
+            const auto view = [](uint64_t address, u32 stride, u32 count) {
+              return std::array<u32, 4>{static_cast<u32>(address),
+                  static_cast<u32>(address >> 32u) | (stride << 16u), count, 0x5204u};
+            };
+            const std::array<std::array<u32, 4>, 4> parameters{
+                view(gather_table, 32u, rows), view(gather_output, 4u, rows),
+                // A point mip filter over the whole LOD range.
+                std::array<u32, 4>{0u, 0xfffu << 12u,
+                    static_cast<u32>(Prospero::SamplerMipFilter::kPoint) << 26u, 0u},
+                view(gather_lods, 4u, rows)};
+            const std::vector<u32> untouched(rows, sentinel);
+            LibKernel::Memory::WriteBacking(gather_parameters, parameters.data(), sizeof(parameters));
+            LibKernel::Memory::WriteBacking(gather_table, table.data(), table.size() * 4u);
+            LibKernel::Memory::WriteBacking(gather_lods, lods.data(), lods.size() * 4u);
+            LibKernel::Memory::WriteBacking(gather_output, untouched.data(), untouched.size() * 4u);
+            shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(gather_shader.data()),
+                                 .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                                 .wave_size = 64, .user_sgpr = 2, .tgid_x_en = true,
+                                 .tgid_y_en = true, .tgid_z_en = true});
+            shaders.SetCsUserSgpr(0, static_cast<u32>(gather_parameters));
+            shaders.SetCsUserSgpr(1, static_cast<u32>(gather_parameters >> 32u));
+            ShaderComputeInputInfo input{};
+            input.workgroup_counts[0] = input.workgroup_counts[1] = 1;
+            input.workgroup_counts[2] = rows;
+            (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), input);
+            const auto &info = input.stage.module->info.info;
+            const auto &candidates = input.stage.resources->candidate_images;
+            // Records of one texture share a candidate; each takes its view's mips from its slot.
+            bool placed = info.uses_candidate_images && info.images.size() == 2u &&
+                          info.images[0].candidate && info.images[1].mip_count == 1u &&
+                          info.images[1].mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+                          candidates.size() == textures.size();
+            u32 next = 0;
+            for (u32 index = 0; placed && index < candidates.size(); ++index) {
+              const auto texture = static_cast<u32>(
+                  ((uint64_t{candidates[index].value.dwords[0]} << 8u) - gather_textures) / texture_stride);
+              placed = texture < textures.size() && candidates[index].slot == next &&
+                       candidates[index].mips == textures[texture].last - textures[texture].first + 1u;
+              next += candidates[index].mips;
+            }
+            Require(name, "gather table candidates", placed,
+                    "a gather record is not a slot of one class with its own view's mips");
+            Require(name, "one gather table module for every candidate set",
+                    gather_module == nullptr || gather_module == input.stage.module,
+                    "the order of a gather table's records or their mip counts rebuilt its module");
+            gather_module = input.stage.module;
+            processor.DispatchDirect(1, 1, rows, 0x41u);
+            cache.ReadMemory(gather_output, rows * 4u);
+            std::vector<u32> actual(rows);
+            Require(name, "gather table mips",
+                    LibKernel::Memory::TryReadBacking(gather_output, actual.data(),
+                                                      actual.size() * 4u) && actual == expected,
+                    "a gather record read another record's texture or another mip than its LOD's");
+          }
+        }
+
         // The stages of a draw take consecutive blocks of its candidate image array.
         struct Stage {
           ShaderModule module;
@@ -16206,7 +16350,8 @@ public:
           program.bindings.memory_offset_dword = 1u;
           stage.snapshot.images.assign(2u, {.dword_count = 8u});
           for (const auto texture : stage_textures[index]) {
-            ShaderRecompiler::IR::Candidate candidate{.resource = 1u};
+            ShaderRecompiler::IR::Candidate candidate{
+                .resource = 1u, .slot = static_cast<u32>(stage.snapshot.candidate_images.size())};
             candidate.value.dword_count = 8u;
             const auto descriptor = texture_descriptor(texture);
             std::copy_n(descriptor.fields, 8u, candidate.value.dwords.begin());
@@ -19806,6 +19951,87 @@ public:
                       gather_binding.image_id, single_mip),
                   "the gather mip view reapplied the shader's streaming clamp");
         }
+        {
+          // A gather table's candidates take a view per mip in the draw's candidate array, each
+          // its own count from its slot, whatever the class they are read as holds; the stages
+          // of a draw follow each other.
+          auto narrow_descriptor = lod_descriptor;
+          narrow_descriptor.dwords[3] |= 1u << 12u;
+          auto table = gather_info.info.images[0];
+          table.mip_count = 1;
+          table.candidate = true;
+          table.indirect_root = 0u;
+          struct Stage {
+            ShaderModule module;
+            ShaderRecompiler::IR::ResourceSnapshot snapshot;
+            ShaderStageRuntime runtime;
+            PreparedBindings prepared;
+          };
+          std::array<Stage, 2> draw;
+          for (uint32_t index = 0; index < draw.size(); ++index) {
+            auto &stage = draw[index];
+            auto &program = stage.module.info;
+            program.stage = index == 0u ? ShaderType::Vertex : ShaderType::Pixel;
+            program.info.images = {table, table};
+            program.info.uses_candidate_images = true;
+            program.bindings.candidate_image_dword = 0u;
+            program.bindings.memory_offset_dword = 1u;
+            stage.snapshot.images.assign(2u, {.dword_count = 8u});
+            if (index == 0u) stage.snapshot.candidate_images.push_back({lod_descriptor, 1u, 0u, 4u});
+            stage.snapshot.candidate_images.push_back(
+                {narrow_descriptor, 1u, index == 0u ? 4u : 0u, 3u});
+            stage.runtime = {&stage.module, &stage.snapshot};
+          }
+          auto &graphics = context.GetGraphics();
+          PipelineCache::Pipeline pipeline{};
+          const vk::DescriptorSetLayoutCreateInfo empty_layout{};
+          Require(lod_test.name, "gather table pipeline",
+                  graphics.device.createDescriptorSetLayout(&empty_layout, nullptr,
+                                                            &pipeline.descriptor_set_layout) ==
+                      vk::Result::eSuccess,
+                  "the empty stage set layout was rejected");
+          const std::array set_layouts{pipeline.descriptor_set_layout, pipeline.descriptor_set_layout,
+                                       pipeline.descriptor_set_layout, graphics.candidate_image_layout};
+          pipeline.push_stages = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+          const vk::PushConstantRange push_range{pipeline.push_stages, 0,
+                                                 ShaderRecompiler::IR::NativePushConstantSize};
+          vk::PipelineLayoutCreateInfo layout_info{};
+          layout_info.setLayoutCount = static_cast<uint32_t>(set_layouts.size());
+          layout_info.pSetLayouts = set_layouts.data();
+          layout_info.pushConstantRangeCount = 1;
+          layout_info.pPushConstantRanges = &push_range;
+          Require(lod_test.name, "gather table pipeline",
+                  graphics.device.createPipelineLayout(&layout_info, nullptr,
+                                                       &pipeline.pipeline_layout) ==
+                      vk::Result::eSuccess,
+                  "the candidate image pipeline layout was rejected");
+          pipeline.uses_candidate_images = true;
+          std::array<PreparedBindings *, 2> stages{&draw[0].prepared, &draw[1].prepared};
+          for (auto &stage : draw) executor.PrepareBindings(stage.runtime, stage.prepared);
+          RenderExecutorTestAccess::PrepareGraphicsBindings(executor, stages, {});
+          RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(), pipeline,
+                                                   draw[0].prepared, draw[1].prepared);
+          const auto bound = RenderExecutorTestAccess::CandidateImages(executor);
+          bool placed = bound.size() == 10u && draw[0].prepared.candidate_image_base == 0u &&
+                        draw[1].prepared.candidate_image_base == 7u &&
+                        draw[0].prepared.shader_data[0] == 0u && draw[1].prepared.shader_data[0] == 7u;
+          for (uint32_t mip = 0; placed && mip < 4u; ++mip) {
+            auto single_mip = gather_binding.desc;
+            single_mip.view_info.base_level = mip;
+            single_mip.view_info.level_count = 1;
+            single_mip.view_info.min_lod = 0;
+            const auto view = texture_cache.FindTexture(gather_binding.image_id, single_mip);
+            // The narrow view starts a mip later, in each stage's block.
+            placed = bound[mip].imageView == view &&
+                     (mip == 0u || (bound[3u + mip].imageView == view &&
+                                    bound[6u + mip].imageView == view));
+          }
+          Require(lod_test.name, "gather table candidate mip views", placed,
+                  "a gather table's candidates left their mip views' places in the draw's array");
+          RenderExecutorTestAccess::ResetBindings(executor);
+          scheduler.Finish();
+          RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, std::span{&pipeline, 1u});
+        }
         DestroyBuffer(&output);
         RenderExecutorTestAccess::ResetBindings(executor);
       }
@@ -22531,13 +22757,16 @@ public:
     // A sampled image table's candidates bind in the next set, from the same block base.
     const auto &image_candidates = compiled.resources.candidate_images;
     const bool uses_image_candidates = compiled.program.info.uses_candidate_images;
+    // A candidate takes a descriptor per mip view.
+    const u32 image_candidate_slots = image_candidates.empty()
+        ? 0u : image_candidates.back().slot + image_candidates.back().mips;
     vk::DescriptorSetLayout candidate_image_layout = nullptr;
     if (uses_image_candidates) {
       Require(test.name, "dispatch", !image_candidates.empty(),
               "an image table module was compiled without a candidate");
       const vk::DescriptorSetLayoutBinding candidate_binding{
           ShaderRecompiler::IR::CandidateImageBinding, vk::DescriptorType::eSampledImage,
-          static_cast<u32>(image_candidates.size()) + candidate_base,
+          image_candidate_slots + candidate_base,
           vk::ShaderStageFlagBits::eCompute, nullptr};
       vk::DescriptorSetLayoutCreateInfo candidate_info{};
       candidate_info.bindingCount = 1;
@@ -22614,7 +22843,7 @@ public:
     }
     if (uses_image_candidates) {
       add_pool_size(vk::DescriptorType::eSampledImage,
-                    static_cast<u32>(image_candidates.size()) + candidate_base);
+                    image_candidate_slots + candidate_base);
     }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
@@ -22791,10 +23020,31 @@ public:
       Require(test.name, "dispatch", image_resources.size() == first + image_candidates.size(),
               "table candidates need an image each, after the logical images");
       shader_data[layout.candidate_image_dword] = candidate_base;
-      candidate_image_infos.assign(candidate_base, {nullptr, nullptr, vk::ImageLayout::eUndefined});
-      for (u32 slot = 0; slot < image_candidates.size(); ++slot) {
-        const auto &source = image_resources[first + slot];
-        candidate_image_infos.push_back({nullptr, source.view, source.layout});
+      candidate_image_infos.assign(candidate_base + image_candidate_slots,
+                                   {nullptr, nullptr, vk::ImageLayout::eUndefined});
+      for (u32 index = 0; index < image_candidates.size(); ++index) {
+        const auto &candidate = image_candidates[index];
+        const auto &source = image_resources[first + index];
+        const bool mips = compiled.program.info.images[candidate.resource].mip_mode ==
+                          ShaderRecompiler::IR::ImageMipMode::Dynamic;
+        for (u32 mip_index = 0; mip_index < candidate.mips; ++mip_index) {
+          auto &info = candidate_image_infos[candidate_base + candidate.slot + mip_index];
+          info = {nullptr, source.view, source.layout};
+          if (!mips) continue;
+          // A table that selects mips reads a view of each, from the descriptor's base level.
+          const auto mip = ((candidate.value.dwords[3] >> 12u) & 0xfu) + mip_index;
+          Require(test.name, "dispatch", mip < source.mip_levels,
+                  "candidate mip descriptor exceeds the supplied image");
+          vk::ImageViewCreateInfo view{};
+          view.image = source.image;
+          view.viewType = test.sampled_image_view_type;
+          view.format = source.format;
+          view.subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, source.layers};
+          RequireVk(test.name, "dispatch",
+                    m_device.createImageView(&view, nullptr, &info.imageView),
+                    "vkCreateImageView(candidate mip)");
+          sampled_mip_views.push_back(info.imageView);
+        }
       }
       vk::WriteDescriptorSet write{};
       write.dstSet = candidate_image_set;
@@ -49098,6 +49348,144 @@ void CheckMixedDimensionImageTable(VulkanHarness &vulkan) {
   }
 }
 
+// A table read by an explicit-LOD gather. Each row binds a view per mip it holds, from its
+// slot, as a slot of its shape's class, and the LOD selects among the row's own mips. Rows in
+// another order with other mip counts read through the same module.
+void CheckGatherImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u;
+  struct Texture {
+    u32 levels; // Mips the fixture's image holds.
+    u32 first;  // The mips its T# views.
+    u32 last;
+    bool integer;
+  };
+  struct Row {
+    int texture; // -1 is a null row.
+    float lod;
+  };
+  constexpr std::array rows{Row{0, 0.0f}, Row{0, 1.0f}, Row{0, 2.0f}, Row{0, 3.0f},
+                            Row{1, 0.0f}, Row{1, 2.0f}, Row{2, 0.0f}, Row{2, 1.0f},
+                            Row{2, 3.0f}, Row{-1, 1.0f}, Row{3, 0.0f}, Row{3, 1.0f},
+                            Row{3, 2.0f}, Row{4, 1.0f}, Row{4, 3.0f}, Row{4, 9.0f}};
+  const auto texel = [](u32 texture, u32 mip, bool integer) {
+    const auto value = (texture + 1u) * 16u + mip;
+    return integer ? value : std::bit_cast<u32>(static_cast<float>(value));
+  };
+  std::vector<u32> module;
+  for (const bool reordered : {false, true}) {
+    // The second pass reverses the rows and narrows two views.
+    const std::array textures{Texture{3u, 0u, reordered ? 1u : 2u, false},
+                              Texture{1u, 0u, 0u, false}, Texture{3u, 1u, 2u, false},
+                              Texture{2u, 0u, 1u, true},
+                              Texture{4u, reordered ? 1u : 0u, 3u, false}};
+    TestCase test;
+    test.name = reordered ? "GatherImageTableReordered" : "GatherImageTable";
+    test.dispatch_x = rows.size();
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table_offset + rows.size() * 32u) / 4u);
+    std::vector<u32> expected;
+    for (u32 index = 0; index < rows.size(); ++index) {
+      const auto &row = rows[reordered ? rows.size() - 1u - index : index];
+      test.initial[index] = std::bit_cast<u32>(row.lod);
+      if (row.texture < 0) {
+        expected.push_back(0u);
+        continue;
+      }
+      const auto &texture = textures[row.texture];
+      auto image = MakeSampledTextureData(texture.integer ? Prospero::BufferFormat::k32UInt
+                                                          : Prospero::BufferFormat::k32Float);
+      image[0] = static_cast<u32>(row.texture) + 1u;
+      image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u) |
+                 (texture.first << 12u) | (texture.last << 16u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + index * 32u) / 4u);
+      // The point filter reads the mip nearest the LOD, within the row's own view.
+      const auto mip = std::min(static_cast<u32>(row.lod), texture.last - texture.first);
+      expected.push_back(texel(row.texture, texture.first + mip, texture.integer));
+    }
+    test.user_data[0] = base;
+    const auto output = MakeStructuredStorageBufferData(0u, static_cast<u32>(rows.size()) * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.user_data[52] = 0x92u;
+    test.user_data[53] = 0xfffu << 12u;
+    test.user_data[54] = 1u << 26u;
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = 64u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1u;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44u;
+    // The workgroup selects the row, and loads its LOD from the word its result goes to.
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 10, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&code, 11, std::bit_cast<u32>(0.5f));
+    code.insert(code.end(), {EncodeSop2(0x1e, 25, 44, InlineU32(2)), EncodeVop1(0x01, 30, 25),
+        EncodeMubuf0(0x0c), EncodeMubuf1(12, 12, 30),
+        EncodeSop2(0x1e, 23, 44, InlineU32(5)), EncodeSop2(0x02, 23, 23, 255), table_offset,
+        EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
+        EncodeMimg0(0x44, 1), EncodeMimg1(5, 10, 2, 13)});
+    AppendBufferStoreDword(&code, 5, 30);
+    AppendEnd(&code);
+    test.opcodes = {O::V_MOV_B32, O::S_LSHL_B32, O::BUFFER_LOAD_DWORD, O::S_ADD_I32,
+                    O::S_LOAD_DWORDX8, O::IMAGE_GATHER4, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    const auto &images = compiled.program.info.images;
+    const auto table = std::ranges::find_if(images, [&](const auto &image) {
+      return image.candidate && &images[image.indirect_root] == &image;
+    });
+    Require(test.name, "classes", table != images.end() && table->indirect_resources.size() == 3u &&
+                std::ranges::all_of(images, [](const auto &image) { return image.mip_count == 1u; }),
+            "the table does not read its rows as a float and an integer class without mip counts");
+    // Rows of one descriptor share a candidate; each takes its own mips from its slot.
+    const auto &candidates = compiled.resources.candidate_images;
+    bool placed = candidates.size() == textures.size();
+    u32 next = 0;
+    for (u32 index = 0; placed && index < candidates.size(); ++index) {
+      const auto &texture = textures[candidates[index].value.dwords[0] - 1u];
+      placed = candidates[index].slot == next && candidates[index].mips == texture.last - texture.first + 1u;
+      next += candidates[index].mips;
+    }
+    Require(test.name, "candidate mips", placed,
+            "a row does not take a descriptor per mip of its own view from its slot");
+    u32 gathers = 0;
+    for (size_t offset = 5; offset < compiled.spirv.size(); offset += compiled.spirv[offset] >> 16u)
+      gathers += (compiled.spirv[offset] & 0xffffu) == spv::OpImageGather;
+    const auto halves = test.compute_info.wave_size > vulkan.SubgroupSize() ? 2u : 1u;
+    Require(test.name, "one gather per class", gathers == 2u * halves,
+            "the gather was emitted per mip or per row instead of per class");
+    if (reordered) {
+      Require(test.name, "module", compiled.spirv == module,
+              "the order of a table's rows or their mip counts changed the module");
+    } else {
+      module = compiled.spirv;
+    }
+    std::vector<VulkanHarness::Image> fixtures;
+    for (const auto &descriptor : ImageDescriptors(compiled)) {
+      // A table's own entries are null; they take a placeholder.
+      const bool null = descriptor.dwords[0] == 0u;
+      const auto index = null ? 0u : descriptor.dwords[0] - 1u;
+      const auto levels = null ? 1u : textures[index].levels;
+      const bool integer = !null && textures[index].integer;
+      std::vector<std::vector<u32>> mips;
+      for (u32 mip = 0; mip < levels; ++mip)
+        mips.emplace_back((8u >> mip) * (8u >> mip), texel(index, mip, integer));
+      fixtures.push_back(vulkan.CreateImageMips(test.name, 8, 8,
+          integer ? vk::Format::eR32Uint : vk::Format::eR32Sfloat, vk::ImageUsageFlagBits::eSampled,
+          mips, 1, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+          vk::ImageViewType::e2D, 1));
+    }
+    const auto sampler = vulkan.CreateSampler(test.name, 4);
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, fixtures);
+    CompareWords(test, "each row's own mip at its LOD", expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : fixtures) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s ok\n", test.name);
+  }
+}
+
 void CheckClampedSiblingImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 base = 256u, table_offset = 0x100u, lanes = 64u;
@@ -62314,6 +62702,7 @@ int main(int argc, char **argv) {
     CheckWorkgroupDividedImageTable(vulkan);
     CheckWaterfallFloorImageTable(vulkan);
     CheckMixedDimensionImageTable(vulkan);
+    CheckGatherImageTable(vulkan);
     CheckClampedSiblingImageTable(vulkan);
     CheckLaneCountedImageTable(vulkan);
     CheckGuardedSelectorImageTable(vulkan);
@@ -62513,6 +62902,7 @@ int main(int argc, char **argv) {
   CheckWorkgroupDividedImageTable(vulkan);
   CheckWaterfallFloorImageTable(vulkan);
   CheckMixedDimensionImageTable(vulkan);
+  CheckGatherImageTable(vulkan);
   CheckClampedSiblingImageTable(vulkan);
   CheckLaneCountedImageTable(vulkan);
   CheckGuardedSelectorImageTable(vulkan);

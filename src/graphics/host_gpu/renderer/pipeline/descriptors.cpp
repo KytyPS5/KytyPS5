@@ -815,6 +815,14 @@ StageImageRef StageImage(const ShaderStageRuntime& runtime, uint32_t index) {
 	const auto& candidate = runtime.resources->candidate_images[index - images.size()];
 	return {images[candidate.resource], candidate.value};
 }
+
+// The mip views a stage binds of the image at `index` when its instructions select a mip: a
+// candidate has its own count.
+uint32_t StageImageMips(const ShaderStageRuntime& runtime, uint32_t index) {
+	const auto& images = runtime.module->info.info.images;
+	return index < images.size() ? images[index].mip_count
+	                             : runtime.resources->candidate_images[index - images.size()].mips;
+}
 } // namespace
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
@@ -954,7 +962,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		prepared.candidate_image_base = image_candidates;
 		prepared.candidate_sources.clear();
 		if (program.info.uses_candidate_images) {
-			image_candidates += static_cast<uint32_t>(snapshot.candidate_images.size());
+			// A candidate takes a descriptor per mip view, from its slot.
+			if (!snapshot.candidate_images.empty()) {
+				const auto& last = snapshot.candidate_images.back();
+				image_candidates += last.slot + last.mips;
+			}
 			prepared.shader_data[layout.candidate_image_dword] = prepared.candidate_image_base;
 		}
 		if (!program.info.uses_candidate_buffers) continue;
@@ -1033,10 +1045,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
-			binding.mip_views.reserve(resource.mip_count);
-			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
+			const auto mips = StageImageMips(*prepared.runtime, i);
+			EXIT_IF(mips == 0u || mips != binding.desc.view_info.level_count);
+			binding.mip_views.reserve(mips);
+			for (uint32_t mip = 0; mip < mips; mip++) {
 				auto desc = binding.desc;
 				desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
@@ -1241,10 +1253,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
 			}
 		}
-		for (auto slot = program.info.images.size(); slot < descriptors.images.size(); ++slot) {
-			m_candidate_images[descriptors.candidate_image_base + slot -
-			                   program.info.images.size()] =
-			    MakeImageInfo(descriptors.images[slot], 0u);
+		const auto& candidates = prepared->runtime->resources->candidate_images;
+		for (size_t index = 0; index < candidates.size(); ++index) {
+			const auto& texture = descriptors.images[program.info.images.size() + index];
+			const auto  first   = descriptors.candidate_image_base + candidates[index].slot;
+			for (uint32_t mip = 0; mip < candidates[index].mips; ++mip) {
+				m_candidate_images[first + mip] = MakeImageInfo(texture, mip);
+			}
 		}
 
 		if (program.bindings.UsesPushData()) {

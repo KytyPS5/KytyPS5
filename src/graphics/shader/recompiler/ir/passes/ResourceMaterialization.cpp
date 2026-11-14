@@ -967,7 +967,18 @@ static ResourceSpecialization::Image CandidateShape(ResourceSpecialization::Imag
 	image.indirect_root         = ImageResource::NoIndirectImage;
 	image.indirect_mapping_slot = NoIndirectMappingSlot;
 	image.indirect_searched     = false;
+	// A candidate's mip count is in its mapping word.
+	image.mip_count = 1u;
 	return image;
+}
+
+// The descriptors a candidate takes: an image's mip views.
+static uint32_t CandidateMips(const ResourceSpecialization::Buffer&) {
+	return 1u;
+}
+
+static uint32_t CandidateMips(const ResourceSpecialization::Image& image) {
+	return image.mip_count;
 }
 
 static auto ShapeOrder(const ResourceSpecialization::Buffer& shape) {
@@ -984,13 +995,16 @@ static auto ShapeOrder(const ResourceSpecialization::Image& shape) {
 
 // Regroups the children of each table `uses_classes` names into a class per shape, in shape
 // order, and its candidates into slots: a module depends on the shapes a table selects, not on
-// their count or order. In place, so a warm materialization allocates nothing.
-template <typename Specialization, typename UsesClasses>
+// their count, order or mip counts. A table `selects_mips` names keeps each candidate's mip
+// count in its mapping words. In place, so a warm materialization allocates nothing.
+template <typename Specialization, typename UsesClasses, typename SelectsMips>
 static bool GroupCandidates(uint32_t roots, std::vector<Specialization>& resources,
                             std::vector<DescriptorValue>& descriptors,
                             std::vector<Candidate>& slots, ResourceSnapshot& snapshot,
-                            const UsesClasses& uses_classes) {
+                            const UsesClasses& uses_classes, const SelectsMips& selects_mips) {
 	slots.clear();
+	// The block's first free descriptor.
+	uint32_t   next     = 0;
 	const auto children = static_cast<uint32_t>(resources.size());
 	const auto grouped  = [&](uint32_t child) {
 		return uses_classes(resources[child].indirect_root);
@@ -1028,12 +1042,19 @@ static bool GroupCandidates(uint32_t roots, std::vector<Specialization>& resourc
 			return static_cast<uint32_t>(
 			    std::ranges::find(classes, CandidateShape(resources[child])) - classes.begin());
 		};
+		// A word that carries a mip count has a narrower slot.
+		const bool by_mip     = selects_mips(root);
 		const auto first_slot = static_cast<uint32_t>(slots.size());
 		for (uint32_t child = begin; child < end; ++child) {
-			slots.push_back({descriptors[child], first + class_of(child) - removed});
+			// A valid T# has one to sixteen levels in view.
+			const auto mips = CandidateMips(resources[child]);
+			EXIT_IF(mips == 0u ||
+			        mips > (by_mip ? 1u << (CandidateClassShift - CandidateMipShift) : 1u));
+			slots.push_back({descriptors[child], first + class_of(child) - removed, next, mips});
+			next += mips;
 		}
-		if (slots.size() > (1u << CandidateClassShift)) {
-			return SpecializationFail(fmt::format("tables select {} candidates", slots.size()));
+		if (next > 1u << (by_mip ? CandidateMipShift : CandidateClassShift)) {
+			return SpecializationFail(fmt::format("tables select {} candidate descriptors", next));
 		}
 		const auto&  table   = resources[root];
 		auto&        flat    = snapshot.flattened_srt;
@@ -1045,8 +1066,10 @@ static bool GroupCandidates(uint32_t roots, std::vector<Specialization>& resourc
 			auto& word = flat[mapping + stride + entry * stride];
 			if (word == 0u) continue;
 			EXIT_IF(word > end - begin);
+			const auto& candidate = slots[first_slot + word - 1u];
+			// A table without mips has candidates of one, so its slot keeps the field's bits.
 			word = (class_of(begin + word - 1u) + 1u) << CandidateClassShift |
-			       (first_slot + word - 1u);
+			       (candidate.mips - 1u) << CandidateMipShift | candidate.slot;
 		}
 		for (auto& shape: classes)
 			shape.indirect_root = root;
@@ -1299,11 +1322,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
-	if (!GroupCandidates(static_cast<uint32_t>(program.info.images.size()), specialization.images,
-	                     snapshot.images, snapshot.candidate_images, snapshot, [&](uint32_t root) {
-		                     return !specialization.images[root].heap &&
-		                            SelectsCandidateImages(program.info.images[root]);
-	                     })) {
+	if (!GroupCandidates(
+	        static_cast<uint32_t>(program.info.images.size()), specialization.images,
+	        snapshot.images, snapshot.candidate_images, snapshot,
+	        [&](uint32_t root) {
+		        return !specialization.images[root].heap &&
+		               SelectsCandidateImages(program.info.images[root]);
+	        },
+	        [&](uint32_t root) {
+		        return program.info.images[root].mip_mode == ImageMipMode::Dynamic;
+	        })) {
 		return false;
 	}
 	// Candidates name their class as the compiled program numbers it.
@@ -1893,9 +1921,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
-	if (!GroupCandidates(static_cast<uint32_t>(program.info.buffers.size()), specialization.buffers,
-	                     snapshot.buffers, snapshot.candidate_buffers, snapshot,
-	                     [](uint32_t) { return true; })) {
+	if (!GroupCandidates(
+	        static_cast<uint32_t>(program.info.buffers.size()), specialization.buffers,
+	        snapshot.buffers, snapshot.candidate_buffers, snapshot, [](uint32_t) { return true; },
+	        [](uint32_t) { return false; })) {
 		return false;
 	}
 	snapshot.images.resize(program.info.images.size());

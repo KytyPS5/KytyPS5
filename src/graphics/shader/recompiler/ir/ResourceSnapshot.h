@@ -30,10 +30,13 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
-// A descriptor a GPU-selected table can select, read as the class resource of its shape.
+// A descriptor a GPU-selected table can select, read as the class resource of its shape. It
+// takes `mips` descriptors of the stage's block, from `slot`.
 struct Candidate {
 	DescriptorValue value;
 	uint32_t        resource = 0;
+	uint32_t        slot     = 0;
+	uint32_t        mips     = 1;
 
 	bool operator==(const Candidate&) const = default;
 };

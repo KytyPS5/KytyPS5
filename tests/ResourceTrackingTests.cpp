@@ -792,8 +792,16 @@ void TestExactUnfilteredImageCandidates() {
     second[3] |= 1u << 16u;
     fill();
     plan.info.images[0].mip_mode = ImageMipMode::Dynamic;
+    // A storage table's children keep their mip counts; a sampled table's classes have none, and
+    // each candidate takes a descriptor per mip from its slot.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              specialization.images[0].mip_count == 1u && specialization.images[1].mip_count == 2u,
+              specialization.images[0].mip_count == 1u &&
+              (classes ? specialization.images[resource(1u)].mip_count == 1u &&
+                             snapshot.candidate_images[0].slot == 0u &&
+                             snapshot.candidate_images[0].mips == 1u &&
+                             snapshot.candidate_images[1].slot == 1u &&
+                             snapshot.candidate_images[1].mips == 2u
+                       : specialization.images[1].mip_count == 2u),
           "mixed-dimension candidates lost their individual mip counts");
   }
   // The same image may be merged from several uses; one query keeps the guard strict.
@@ -4778,21 +4786,15 @@ void TestIndexedMaterialImageKeys() {
                            .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  // The descriptors the three tables reach: the sampled table reads its two as slots of one
-  // class, the two dynamic-mip tables list theirs as children.
-  const auto listed = [&] {
-    const auto classes = std::count_if(
-        specialization.images.begin() + 3, specialization.images.end(),
-        [](const auto &image) { return image.indirect_root == 0u; });
-    return snapshot.images.size() - 3u - classes + snapshot.candidate_images.size();
-  };
+  // The descriptors the three tables reach: each table reads its two as slots of one class.
+  const auto listed = [&] { return snapshot.candidate_images.size(); };
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.selectors == 2u && memory.descriptors == 6u && listed() == 6u &&
-            snapshot.images.size() == 8u && snapshot.candidate_images.size() == 2u,
+            snapshot.images.size() == 6u,
         "indexed selector scanned the broad heap or did not share its captured keys");
   ApplyResourceSpecialization(program, specialization);
   Check(program.info.images[0].indirect_resources.size() == 2u && program.info.images[0].candidate &&
-            program.info.images[1].indirect_resources.size() == 3u && !program.info.images[1].candidate,
+            program.info.images[1].indirect_resources.size() == 2u && program.info.images[1].candidate,
         "indirect dimension query lost its specialized candidates");
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &image = specialization.images[root];
@@ -4802,9 +4804,38 @@ void TestIndexedMaterialImageKeys() {
               snapshot.flattened_srt[offset + 3u] == (root == 2u ? 12996u : 12994u) * 32u,
           "byte-key selector lost native OOB zero, sorted offsets, or the null default");
   }
-  Check(std::ranges::count_if(specialization.images, [](const auto &image) {
-          return image.mip_count == 8u;
-        }) == 2u, "indirect gathers lost candidate-specific mip counts");
+  // A gather table's candidate takes a descriptor per mip from its slot and its mapping word
+  // carries the count; the class it is read as has none of its own.
+  const auto placed = [&](std::initializer_list<std::pair<uint32_t, uint32_t>> places) {
+    return std::ranges::equal(snapshot.candidate_images, places,
+                              [](const auto &candidate, const auto &place) {
+                                return candidate.slot == place.first && candidate.mips == place.second;
+                              });
+  };
+  const auto words = [&](uint32_t root) {
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[root].indirect_mapping_slot);
+    return std::pair{snapshot.flattened_srt[offset + 2u], snapshot.flattened_srt[offset + 4u]};
+  };
+  constexpr uint32_t first_class = 1u << CandidateClassShift;
+  Check(placed({{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 8u}, {11u, 1u}, {12u, 8u}}) &&
+            std::ranges::all_of(specialization.images, [](const auto &image) { return image.mip_count == 1u; }) &&
+            words(0u) == std::pair{first_class | 0u, first_class | 1u} &&
+            words(1u) == std::pair{first_class | 2u, first_class | 7u << CandidateMipShift | 3u} &&
+            words(2u) == std::pair{first_class | 11u, first_class | 7u << CandidateMipShift | 12u},
+        "indirect gathers lost candidate-specific mip counts");
+  {
+    // Another mip count is the same class: the candidates behind it move, the module does not.
+    const auto before = specialization;
+    put(12994u, 3u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == before &&
+              placed({{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 3u}, {6u, 1u}, {7u, 8u}}) &&
+              words(1u) == std::pair{first_class | 2u, first_class | 2u << CandidateMipShift | 3u} &&
+              words(2u) == std::pair{first_class | 6u, first_class | 7u << CandidateMipShift | 7u},
+          "a gather table's module depends on a candidate's mip count");
+    put(12994u, 8u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == before,
+          "the original mip counts did not restore the specialization");
+  }
   for (const uint32_t field : {64u, 68u})
     Check(std::ranges::find(snapshot.specialization_reads,
               std::pair<uint64_t, uint64_t>{base + field, 868u}) != snapshot.specialization_reads.end(),

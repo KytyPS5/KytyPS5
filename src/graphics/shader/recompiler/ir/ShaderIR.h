@@ -179,10 +179,9 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
-// A sampled table without dynamic mips selects among a draw's candidates, read by shape class.
+// A sampled table selects among a draw's candidates, read by shape class.
 [[nodiscard]] constexpr bool SelectsCandidateImages(const ImageResource& root) {
-	return root.resource_class == ImageResourceClass::Sampled &&
-	       root.mip_mode != ImageMipMode::Dynamic;
+	return root.resource_class == ImageResourceClass::Sampled;
 }
 
 [[nodiscard]] constexpr Prospero::BufferFormat
@@ -366,9 +365,12 @@ inline constexpr uint32_t CandidateRecordBinding = 0u;
 inline constexpr uint32_t CandidateBufferBinding = 1u;
 inline constexpr uint32_t CandidateClassShift    = 20u;
 inline constexpr uint32_t CandidateRecordDwords  = 2u;
-// Sampled image tables read a per-draw set of their own: one array of the images.
+// Sampled image tables read a per-draw set of their own: one array of the images. A table
+// whose instructions select a mip gives a candidate a descriptor per mip; its mapping words
+// keep the candidate's last mip from CandidateMipShift up, below the class.
 inline constexpr uint32_t CandidateImageSet     = 3u;
 inline constexpr uint32_t CandidateImageBinding = 0u;
+inline constexpr uint32_t CandidateMipShift     = 16u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,

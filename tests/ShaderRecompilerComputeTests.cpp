@@ -8692,6 +8692,70 @@ public:
         if (viewed) (void)texture_cache.FindTexture(raw_image, raw);
       }
 
+      {
+        constexpr uint64_t bc_store_offset = 0x2f00000;
+        constexpr uint64_t bc_store_size = 0x10000;
+        constexpr uint32_t stored_value = 0x99887766u;
+        std::vector<uint32_t> uploaded(bc_store_size / sizeof(uint32_t));
+        std::iota(uploaded.begin(), uploaded.end(), 0x81000000u);
+        std::memcpy(memory + bc_store_offset, uploaded.data(), bc_store_size);
+        auto bc = MakeLinearDesc(base + bc_store_offset, bc_store_size,
+            vk::Format::eBc5UnormBlock, Prospero::BufferFormat::kBc5UNorm,
+            Prospero::ImageType::kColor2D, {256, 256, 1}, 1, 16, 1);
+        auto raw = MakeLinearDesc(base + bc_store_offset, bc_store_size,
+            vk::Format::eR32G32B32A32Uint, Prospero::BufferFormat::k32_32_32_32UInt,
+            Prospero::ImageType::kColor2D, {64, 64, 1}, 1, 16, 1);
+        raw.type = BindingType::Storage;
+        raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        const auto bc_image = texture_cache.FindImage(bc);
+        (void)texture_cache.FindTexture(bc_image, bc);
+        texture_cache.GetImage(bc_image).backing.usage &= ~vk::ImageUsageFlagBits::eStorage;
+        const auto raw_image = texture_cache.FindImage(raw);
+        const bool raw_storable =
+            raw_image != bc_image &&
+            static_cast<bool>(texture_cache.GetImage(raw_image).backing.usage &
+                              vk::ImageUsageFlagBits::eStorage);
+        Require(name, "storage alias of a BC image without storage usage", raw_storable,
+                "a storage binding reused a BC image whose backing has no storage usage");
+        if (raw_storable) {
+          auto read_back = [&](ImageId id, vk::Extent3D extent) {
+            vk::BufferImageCopy whole{};
+            whole.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            whole.imageExtent = extent;
+            const std::array<vk::BufferImageCopy, 1> copies{whole};
+            auto readback = CreateHostBuffer(name, bc_store_size,
+                vk::BufferUsageFlagBits::eTransferDst,
+                std::vector<uint32_t>(uploaded.size()));
+            texture_cache.GetImage(id).Download(copies, readback.buffer, 0, readback.size);
+            HostReadBarrier(readback.buffer, readback.size,
+                            vk::PipelineStageFlagBits::eTransfer,
+                            vk::AccessFlagBits::eTransferWrite);
+            scheduler.Finish();
+            auto words = ReadBuffer(name, readback, uploaded.size());
+            DestroyBuffer(&readback);
+            return words;
+          };
+          Require(name, "storage alias keeps the BC upload", read_back(raw_image, {64, 64, 1}) == uploaded,
+                  "the storage image lost the uploaded BC blocks");
+          (void)texture_cache.FindTexture(raw_image, raw);
+          vk::ClearValue stored{};
+          std::fill_n(stored.color.uint32.data(), 4, stored_value);
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), raw_image,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, stored);
+          const auto sampled = texture_cache.FindImage(bc);
+          (void)texture_cache.FindTexture(sampled, bc);
+          const std::vector<uint32_t> stored_words(uploaded.size(), stored_value);
+          Require(name, "BC sample after a storage write",
+                  read_back(sampled, {256, 256, 1}) == stored_words,
+                  "sampled BC blocks missed the guest's storage write");
+          texture_cache.GetImage(sampled).backing.usage &= ~vk::ImageUsageFlagBits::eStorage;
+          const auto rebound = texture_cache.FindImage(raw);
+          Require(name, "storage rebind after a BC sample",
+                  rebound != sampled && read_back(rebound, {64, 64, 1}) == stored_words,
+                  "the storage image lost blocks that only the GPU held");
+        }
+      }
+
       // A write through a separate buffer must not replace untouched image
       // texels with stale backing bytes. Exact-base writes still refresh it.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;

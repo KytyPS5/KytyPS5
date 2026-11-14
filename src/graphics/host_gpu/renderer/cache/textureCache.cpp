@@ -814,6 +814,13 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.type != cached.info.type) {
 			return {merged_id};
 		}
+		const bool storage_without_usage =
+		    binding == BindingType::Storage && !merged_id &&
+		    !(cached.backing.usage & vk::ImageUsageFlagBits::eStorage);
+		if (storage_without_usage &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;

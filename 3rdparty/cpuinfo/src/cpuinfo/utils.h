@@ -2,6 +2,12 @@
 
 #include <stdint.h>
 
+#ifdef _MSC_VER
+// _BitScanReverse is an MSVC intrinsic; clang-cl defines _MSC_VER but does not declare it
+// implicitly, so the header has to be pulled in explicitly.
+#include <intrin.h>
+#endif
+
 
 inline static uint32_t bit_length(uint32_t n) {
 	const uint32_t n_minus_1 = n - 1;

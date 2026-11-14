@@ -21,14 +21,14 @@ void Shutdown();
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
-	uint64_t direct_total        = 0;
-	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
-	uint64_t pooled_allocated    = 0; // Memory pool expansions.
-	uint64_t automatic_allocated = 0; // Extended memory.
-	uint64_t direct_mapped       = 0;
-	uint64_t flexible_total      = 0;
-	uint64_t flexible_used       = 0;
-	uint64_t pool_committed      = 0;
+	uint64_t direct_total           = 0;
+	uint64_t direct_allocated       = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated       = 0; // Memory pool expansions.
+	uint64_t automatic_allocated    = 0; // Extended memory.
+	uint64_t direct_mapped          = 0;
+	uint64_t flexible_total         = 0;
+	uint64_t flexible_used          = 0;
+	uint64_t pool_committed         = 0;
 	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
 	uint64_t gpu_page_entries       = 0;
 	uint64_t cpu_page_entries_total = 0;
@@ -45,8 +45,8 @@ struct Lifecycle {
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
-constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
-constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
+constexpr uint64_t kExtendedMemoryBase        = 0x080000000000ull;
+constexpr uint64_t kExtendedMemorySize        = 512ull * 1024 * 1024 * 1024;
 
 struct VirtualQueryInfo {
 	uintptr_t start;
@@ -128,16 +128,16 @@ struct KernelMemoryPoolBlockStats {
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
-void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
-                         int memory_type, int64_t* phys_addr_out, bool automatic = false);
-int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
-int UnmapAmmMemory(uint64_t vaddr, size_t size);
-bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+int  AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
+                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
+int  MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+int  UnmapAmmMemory(uint64_t vaddr, size_t size);
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -216,6 +216,9 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+#include <utility>
+#include <vector>
+
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
@@ -229,6 +232,11 @@ uint64_t TestDirectMappingCount();
 uint64_t TestFlexibleMappingCount();
 uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
+// Pure helper used by POSIX guest-region reservation; [start, end) occupied, aligned free out.
+std::vector<std::pair<uint64_t, uint64_t>>
+TestAlignedFreeRangesInRegion(uint64_t region_start, uint64_t region_end,
+                              const std::vector<std::pair<uint64_t, uint64_t>>& occupied,
+                              uint64_t                                          alignment);
 #endif
 
 } // namespace Libs::LibKernel::Memory

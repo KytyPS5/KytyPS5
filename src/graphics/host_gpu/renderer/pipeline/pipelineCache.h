@@ -667,7 +667,11 @@ private:
 
 	// pipelineSerialization.cpp
 	void WarmUp(const std::filesystem::path& path);
-	bool LoadRecord(std::span<const uint8_t>& records);
+	// A record of the store: read from its frame (on any thread), then added to the cache.
+	struct StoreRecord;
+	bool ReadRecord(std::span<const uint8_t> frame, StoreRecord& record) const;
+	// False, with nothing kept of it, for a record the cache cannot take.
+	bool AddRecord(StoreRecord& record);
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);

@@ -2139,12 +2139,34 @@ void PipelineCache::QueueAsyncPipeline(const AsyncPipelineJob& job) {
 
 template <typename Matches>
 bool PipelineCache::TakeQueuedAsyncPipeline(Matches&& matches) {
-	const auto job = std::ranges::find_if(m_async_jobs, matches);
-	if (job == m_async_jobs.end()) {
-		return false;
+	for (auto* jobs: {&m_async_jobs, &m_async_sibling_jobs}) {
+		const auto job = std::ranges::find_if(*jobs, matches);
+		if (job != jobs->end()) {
+			jobs->erase(job);
+			return true;
+		}
 	}
-	m_async_jobs.erase(job);
-	return true;
+	return false;
+}
+
+void PipelineCache::QueueSiblingPipeline(const GraphicsPipelineKey&                key,
+                                         const std::array<const ShaderModule*, 4>& stages,
+                                         const ShaderModule*                       pixel) {
+	if (m_async_threads.empty() || pixel == nullptr || pixel->plain == nullptr || stages[3] == nullptr) {
+		return;
+	}
+	AsyncPipelineJob job {.key = key, .stages = stages};
+	job.stages[3]        = stages[3] == pixel ? pixel->plain.get() : pixel;
+	job.key.stage_ids[3] = job.stages[3]->id;
+	if (m_graphics_pipelines.contains(job.key) || m_async_ready.contains(job.key) ||
+	    m_async_failed_graphics.contains(job.key) ||
+	    (m_manifest_warm && m_claimed_graphics.contains(job.key)) ||
+	    !m_async_pending_graphics.insert(job.key).second) {
+		return;
+	}
+	ClaimPipeline(job.key);
+	m_async_sibling_jobs.push_back(job);
+	m_async_available.notify_one();
 }
 
 void PipelineCache::StopAsyncPipelines() {
@@ -2152,6 +2174,7 @@ void PipelineCache::StopAsyncPipelines() {
 		std::lock_guard lock(m_async_mutex);
 		m_async_stopping = true;
 		m_async_jobs.clear();
+		m_async_sibling_jobs.clear();
 	}
 	m_async_available.notify_all();
 	m_async_threads.clear();
@@ -2163,12 +2186,15 @@ void PipelineCache::AsyncPipelineWorker() {
 		AsyncPipelineJob job;
 		{
 			std::unique_lock lock(m_async_mutex);
-			m_async_available.wait(lock, [&] { return m_async_stopping || !m_async_jobs.empty(); });
+			m_async_available.wait(lock, [&] {
+				return m_async_stopping || !m_async_jobs.empty() || !m_async_sibling_jobs.empty();
+			});
 			if (m_async_stopping) {
 				return;
 			}
-			job = m_async_jobs.front();
-			m_async_jobs.pop_front();
+			auto& jobs = !m_async_jobs.empty() ? m_async_jobs : m_async_sibling_jobs;
+			job        = jobs.front();
+			jobs.pop_front();
 		}
 		Pipeline   pipeline;
 		const auto started = std::chrono::steady_clock::now();
@@ -2664,12 +2690,14 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			if (!m_async_pending_graphics.contains(key)) {
 				if (!allow_async || m_async_failed_graphics.contains(key)) {
 					ClaimPipeline(key);
+					QueueSiblingPipeline(key, stages, ps_active ? ps_input_info.stage.module : nullptr);
 					break;
 				}
 				// The driver compiles a new pipeline for up to half a second: the draws that need
 				// it are skipped until a background thread created it.
 				m_async_pending_graphics.insert(key);
 				ClaimPipeline(key);
+				QueueSiblingPipeline(key, stages, ps_active ? ps_input_info.stage.module : nullptr);
 				lock.unlock();
 				QueueAsyncPipeline({.key = key, .stages = stages});
 				wait_until = std::chrono::steady_clock::now() + PipelineWait;
@@ -2677,6 +2705,13 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				continue;
 			}
 			if (allow_async) {
+				// One queued as the other variant of a pipeline is now one draws wait for.
+				if (const auto sibling = std::ranges::find(m_async_sibling_jobs, key, &AsyncPipelineJob::key);
+				    sibling != m_async_sibling_jobs.end()) {
+					m_async_jobs.push_back(*sibling);
+					m_async_sibling_jobs.erase(sibling);
+					m_async_available.notify_one();
+				}
 				if (!wait_until || std::chrono::steady_clock::now() >= *wait_until) {
 					return nullptr;
 				}

@@ -582,6 +582,15 @@ private:
 	std::mutex                                                       m_async_mutex;
 	std::condition_variable                                          m_async_available;
 	std::deque<AsyncPipelineJob>                                     m_async_jobs;
+	// Pipelines no draw has asked for (QueueSiblingPipeline()): created once m_async_jobs is empty.
+	std::deque<AsyncPipelineJob>                                     m_async_sibling_jobs;
+	// Under m_async_mutex, on the thread that draws. A draw has asked for a pipeline whose pixel
+	// program has a plain variant (ShaderModule::plain): the same pipeline with the other of the
+	// two is queued behind those draws wait for. A game's draws use both, as the textures they
+	// sample have a mip statistics counter or not: of the 1158 pipelines of a first session of
+	// Demon's Souls, 522 were the other variant of one used before.
+	void QueueSiblingPipeline(const GraphicsPipelineKey& key, const std::array<const ShaderModule*, 4>& stages,
+	                          const ShaderModule* pixel);
 	bool                                                             m_async_stopping = false;
 	std::vector<std::jthread>                                        m_async_threads;
 	// Lookups take the pipelines background threads created from the m_async_ready maps: with

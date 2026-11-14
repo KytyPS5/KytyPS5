@@ -356,11 +356,17 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	SharedMemory,
+	// A width variant of the buffer or shared memory array gets its own descriptor, bound to the
+	// same resource: Metal drivers reject two variables that alias one binding.
+	BuffersU8,
+	BuffersU16,
+	BuffersU64,
+	SharedMemoryU64,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 62u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

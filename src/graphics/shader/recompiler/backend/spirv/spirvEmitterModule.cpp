@@ -255,6 +255,16 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
+	counts[static_cast<size_t>(Kind::SharedMemoryU64)] =
+	    counts[static_cast<size_t>(Kind::SharedMemory)] != 0 && info.shared_int64_atomics;
+	// A driver without binding aliasing needs one descriptor per element width; the host binds the
+	// same buffer views to each of them.
+	counts[static_cast<size_t>(Kind::BuffersU8)] =
+	    info.buffer_u8 ? counts[static_cast<size_t>(Kind::Buffers)] : 0;
+	counts[static_cast<size_t>(Kind::BuffersU16)] =
+	    info.buffer_u16 ? counts[static_cast<size_t>(Kind::Buffers)] : 0;
+	counts[static_cast<size_t>(Kind::BuffersU64)] =
+	    info.buffer_int64_atomics ? counts[static_cast<size_t>(Kind::Buffers)] : 0;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
@@ -295,22 +305,22 @@ void DefineDescriptors(EmitterState& state) {
 			    ConstantU32(state, counts[index]));
 		};
 		switch (kind) {
-			case IR::DescriptorBindingKind::Buffers: {
-				const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
+			case IR::DescriptorBindingKind::Buffers:
+			case IR::DescriptorBindingKind::BuffersU8:
+			case IR::DescriptorBindingKind::BuffersU16:
+			case IR::DescriptorBindingKind::BuffersU64: {
+				const uint32_t alias = kind == IR::DescriptorBindingKind::BuffersU8    ? 0u
+				                       : kind == IR::DescriptorBindingKind::BuffersU16 ? 1u
+				                       : kind == IR::DescriptorBindingKind::Buffers    ? 2u
+				                                                                      : 3u;
 				constexpr std::array names {"buffers_u8", "buffers_u16", "buffers", "buffers_u64"};
-				for (uint32_t alias = 0; alias < used.size(); ++alias) {
-					if (!used[alias]) continue;
-					auto& buffer = state.storage_buffers[alias];
-					const auto type = StorageBufferType(state, buffer, 8u << alias);
-					buffer.variable = Define(ArrayType(type), names[alias]);
-					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
-						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
-					}
-					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
-					// must participate in visibility for cache-bypassing polling loads.
-					if (info.coherent_buffers) {
-						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
-					}
+				auto& buffer = state.storage_buffers[alias];
+				const auto type = StorageBufferType(state, buffer, 8u << alias);
+				buffer.variable = Define(ArrayType(type), names[alias]);
+				// RDNA2 stores publish to L2 even without GLC; every width of the buffer must
+				// participate in visibility for cache-bypassing polling loads.
+				if (info.coherent_buffers) {
+					state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
 				}
 				break;
 			}
@@ -343,14 +353,11 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::SharedMemory:
 				state.lds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "lds_dwords");
 				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
-				if (state.program.info.shared_int64_atomics) {
-					state.lds_u64_variable =
-					    Define(StorageBufferType(state, state.storage_buffers[3], 64), "lds_qwords");
-					state.builder.AddAnnotation(spv::OpDecorate, state.lds_u64_variable, spv::DecorationCoherent);
-					for (const auto variable: {state.lds_variable, state.lds_u64_variable}) {
-						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
-					}
-				}
+				break;
+			case IR::DescriptorBindingKind::SharedMemoryU64:
+				state.lds_u64_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "lds_qwords");
+				state.builder.AddAnnotation(spv::OpDecorate, state.lds_u64_variable, spv::DecorationCoherent);
 				break;
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
@@ -570,7 +577,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	if (state.program.info.subgroup_local_invocation_id && !EmitSingleLaneGraphics(state)) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -772,7 +779,9 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.info.buffer_int64_atomics || state.program.info.shared_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
-		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+		if (state.profile.int64_atomics) {
+			state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+		}
 	}
 	if (state.program.info.shared_int64_atomics &&
 	    state.lds_storage_class == spv::StorageClassWorkgroup) {

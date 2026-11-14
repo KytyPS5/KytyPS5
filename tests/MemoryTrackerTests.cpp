@@ -889,6 +889,9 @@ void TestQueriesSkipRegionLock() {
       RunDuringParkedUpload(tracker, address, [&] {
         cpu_modified = tracker.IsRegionCpuModified(address, page_size);
         gpu_modified = tracker.IsRegionGpuModified(address, page_size);
+        tracker.ForEachUploadRange(
+            address, page_size, false, [](uint64_t, uint64_t) noexcept {},
+            []() noexcept {});
       });
 
   const bool marked = tracker.IsRegionGpuModified(address, page_size);
@@ -897,7 +900,7 @@ void TestQueriesSkipRegionLock() {
   Release(memory);
   Check(completed_while_upload_blocked && !cpu_modified && !gpu_modified &&
             marked,
-        "dirty queries waited for an upload holding the region lock");
+        "dirty queries or a clean read-only upload waited for the region lock");
 }
 
 void TestDownloadDoesNotSerializeDisjointRegion() {

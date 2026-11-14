@@ -75,6 +75,9 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (!is_written && !manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
+				return;
+			}
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
 			if (!is_written) {

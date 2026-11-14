@@ -130,13 +130,13 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 					auto* indirect_buffer = reinterpret_cast<const uint32_t*>(
 					    (static_cast<uint64_t>(cmd[0]) & 0xfffffffcu) |
 					    (static_cast<uint64_t>(cmd[1]) << 32u));
-					const uint32_t indirect_num_regs = cmd[3] & 0x3fffu;
+					const uint32_t        indirect_num_regs = cmd[3] & 0x3fffu;
+					const LoadedRegisters registers {indirect_buffer, cmd[2]};
 
-					for (uint32_t i = 0; indirect_buffer != nullptr && i < indirect_num_regs;
-					     i++, indirect_buffer += 2) {
+					for (uint32_t i = 0; indirect_buffer != nullptr && i < indirect_num_regs; i++) {
 						file->Printf("      |            | offset = 0x%08" PRIx32
 						             ", value = 0x%08" PRIx32 "\n",
-						             indirect_buffer[0], indirect_buffer[1]);
+						             registers.RawOffset(i), registers.Value(i));
 					}
 				}
 				break;

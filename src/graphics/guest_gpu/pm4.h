@@ -899,6 +899,24 @@ constexpr uint32_t UC_NOP = 0xA2;
 
 constexpr uint32_t UC_NUM = 0x3FFF + 1;
 
+constexpr uint32_t LOAD_REG_INDEX_OFFSET_AND_DATA = 0x80000000u;
+constexpr uint32_t LOAD_REG_INDEX_REG_OFFSET_MASK = 0xffffu;
+
+struct LoadedRegisters {
+	const uint32_t* data;
+	uint32_t        control;
+
+	[[nodiscard]] bool Interleaved() const {
+		return (control & LOAD_REG_INDEX_OFFSET_AND_DATA) != 0;
+	}
+	[[nodiscard]] uint32_t RawOffset(uint32_t i) const {
+		return Interleaved() ? data[i * 2] : (control & LOAD_REG_INDEX_REG_OFFSET_MASK) + i;
+	}
+	[[nodiscard]] uint32_t Value(uint32_t i) const {
+		return Interleaved() ? data[i * 2 + 1] : data[i];
+	}
+};
+
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw);
 

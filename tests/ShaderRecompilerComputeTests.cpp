@@ -54057,6 +54057,66 @@ void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4IndirectUconfigRegisters");
 }
 
+void CheckPm4ConsecutiveIndirectRegisters(RenderContext &renderer) {
+  constexpr const char *name = "Pm4ConsecutiveIndirectRegisters";
+  constexpr uint32_t offset_and_size = 0u;
+  CommandProcessor processor(renderer, 0);
+  const auto command = [](uint32_t opcode, const uint32_t *values,
+                          uint32_t first, uint32_t count) {
+    const auto address = reinterpret_cast<uint64_t>(values);
+    return std::array<uint32_t, 5>{
+        KYTY_PM4(5, opcode, Pm4::R_ZERO), static_cast<uint32_t>(address),
+        static_cast<uint32_t>(address >> 32u), offset_and_size | first, count};
+  };
+
+  const std::array<uint32_t, 4> depth_values{0x4070078du, 0x00000032u, 0u, 0u};
+  Pm4Execution depth_execution;
+  const bool depth_complete =
+      processor.Process(depth_execution,
+                        command(Pm4::IT_SET_CONTEXT_REG_INDIRECT,
+                                depth_values.data(), Pm4::DB_DEPTH_CONTROL,
+                                2u)) == Pm4ProcessResult::Complete;
+  const auto &depth = processor.GetCtx().GetDepthControl();
+  const auto &eqaa = processor.GetCtx().GetEqaaControl();
+  Require(name, "context registers",
+          depth_complete && depth.stencil_enable && !depth.z_enable &&
+              depth.z_write_enable && depth.depth_bounds_enable &&
+              depth.zfunc == 0u && depth.backface_enable &&
+              depth.stencilfunc == 7u && depth.stencilfunc_bf == 7u &&
+              eqaa.max_anchor_samples == 2u && eqaa.ps_iter_samples == 3u,
+          "LOAD_CONTEXT_REG_INDEX values were not written from the first "
+          "register on");
+
+  const std::array<uint32_t, 4> index_values{0x00001234u, 0x00000001u, 0u, 0u};
+  Pm4Execution index_execution;
+  const bool index_complete =
+      processor.Process(index_execution,
+                        command(Pm4::IT_SET_UCONFIG_REG_INDIRECT,
+                                index_values.data(), Pm4::GE_INDX_OFFSET,
+                                2u)) == Pm4ProcessResult::Complete;
+  Require(name, "user config registers",
+          index_complete && processor.GetUcfg().GetIndexOffset() == 0x1234u &&
+              processor.GetUcfg().GetPrimitiveResetControl() == 1u,
+          "LOAD_UCONFIG_REG_INDEX values were not written from the first "
+          "register on");
+
+  const std::array<uint32_t, 8> pixel_values{
+      0x05000104u, 0x00000012u, 0x022c018du, 0x0000003cu, 0u, 0u, 0u, 0u};
+  Pm4Execution pixel_execution;
+  const bool pixel_complete =
+      processor.Process(pixel_execution,
+                        command(Pm4::IT_SET_SH_REG_INDIRECT,
+                                pixel_values.data(), Pm4::SPI_SHADER_PGM_LO_PS,
+                                4u)) == Pm4ProcessResult::Complete;
+  const auto &ps = processor.GetShCtx().GetPs().ps_regs;
+  Require(name, "shader registers",
+          pixel_complete && ps.data_addr == 0x120500010400ull &&
+              ps.rsrc1.vgprs == 13u && ps.rsrc2.user_sgpr == 30u,
+          "LOAD_SH_REG_INDEX values were not written from the first "
+          "register on");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t shader_address = 0x0000123456789a00ull;
@@ -56950,6 +57010,7 @@ int main(int argc, char **argv) {
     CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
     CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
     CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
+    CheckPm4ConsecutiveIndirectRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
@@ -57281,6 +57342,7 @@ int main(int argc, char **argv) {
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
   CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
+  CheckPm4ConsecutiveIndirectRegisters(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());

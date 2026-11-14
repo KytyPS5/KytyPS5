@@ -6639,6 +6639,14 @@ public:
     };
     draw(target0);
 
+    // A skipped draw can leave a view active without committing it. The redirect must still
+    // serialize with the previous draw's use of that view before rewriting its heap elements.
+    heap.BeginDraw();
+    Require(name, "skipped acquire",
+            heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view),
+            "the skipped draw did not reacquire the depth heap table");
+    point_elements_at_depth();
+
     const ImageSubresourceRange range{0, 1, 0, 1};
     // The copy applies the draw's pending load clear itself; the redirect test then reads the
     // clear value instead of the copied original depth.

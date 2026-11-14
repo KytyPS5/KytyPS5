@@ -88,6 +88,14 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
+uint64_t SubmittedGpuWork() {
+	return g_renderer != nullptr ? g_renderer->GetGpu().SubmittedWork() : 0;
+}
+
+bool WaitForGpuWork(uint64_t marker, const std::atomic_bool& cancel) {
+	return g_renderer == nullptr || marker == 0 || g_renderer->GetGpu().WaitForWork(marker, cancel);
+}
+
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 

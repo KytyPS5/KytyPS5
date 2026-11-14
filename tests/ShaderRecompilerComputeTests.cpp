@@ -2245,7 +2245,10 @@ public:
     return m_rasterization_supported;
   }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  void SkipComputeCase() { ++m_skipped_compute_cases; }
+  [[nodiscard]] bool RobustPipelinesSupported() const { return m_robust_pipelines; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
+  [[nodiscard]] u32 SkippedComputeCaseCount() const { return m_skipped_compute_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -23549,7 +23552,9 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_robust_pipelines = true;
   u32   m_skipped_cases          = 0;
+  u32   m_skipped_compute_cases  = 0;
 
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
@@ -23767,11 +23772,30 @@ private:
     m_physical_device.getProperties2(&properties2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
-    Require("VulkanHarness", "dispatch",
-            available_robustness2.robustBufferAccess2 == true &&
-                available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
-            "byte-granular per-pipeline robustBufferAccess2 is not supported");
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   nullptr),
+              "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> extensions(extension_count);
+    RequireVk("VulkanHarness", "dispatch",
+              m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count,
+                                                                   extensions.data()),
+              "vkEnumerateDeviceExtensionProperties");
+    m_robust_pipelines =
+        std::ranges::any_of(extensions,
+                            [](const vk::ExtensionProperties &extension) {
+                              return std::strcmp(extension.extensionName.data(),
+                                                 VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME) == 0;
+                            }) &&
+        available_robustness2.robustBufferAccess2 == true &&
+        available_pipeline_robustness.pipelineRobustness == true &&
+        robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
+    if (!m_robust_pipelines) {
+      std::printf(
+          "[host]    RobustBufferPipelines     unavailable, robust buffer cases "
+          "will be skipped\n");
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -23912,7 +23936,8 @@ private:
     pipeline_robustness.pNext = &maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
-    robustness2.pNext = &pipeline_robustness;
+    robustness2.pNext = m_robust_pipelines ? static_cast<void *>(&pipeline_robustness)
+                                           : static_cast<void *>(&maintenance8);
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
@@ -23948,7 +23973,6 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -23957,6 +23981,9 @@ private:
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_QUERY_EXTENSION_NAME};
+    if (m_robust_pipelines) {
+      device_extensions.push_back(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -24365,6 +24392,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   }
   if (test.compile_only) {
     std::printf("[compute] %-32s ok\n", test.name);
+    return;
+  }
+  if (test.profile->robust_buffer_access && vulkan != nullptr &&
+      !vulkan->RobustPipelinesSupported()) {
+    std::printf("[compute] %-32s skipped, no byte-granular robustBufferAccess2\n", test.name);
+    vulkan->SkipComputeCase();
     return;
   }
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -57406,6 +57439,10 @@ int main(int argc, char **argv) {
   if (vulkan.SkippedCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
                 vulkan.SkippedCaseCount());
+  }
+  if (vulkan.SkippedComputeCaseCount() > 0) {
+    std::printf("ShaderRecompilerComputeTests: %u compute cases skipped\n",
+                vulkan.SkippedComputeCaseCount());
   }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

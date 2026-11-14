@@ -2356,8 +2356,9 @@ void PipelineCache::CodeStoreThread(const std::stop_token& stop) {
 		                         .words            = static_cast<uint32_t>(code.size()),
 		                         .compressed_bytes = static_cast<uint32_t>(size)};
 		std::memcpy(bytes.data(), &record, sizeof(record));
+		// Not flushed: a record a crash cuts short does not read and ends the file (above), and
+		// flushing every record made a scan that finds thousands of shaders take minutes.
 		file.Write(bytes.data(), static_cast<uint32_t>(sizeof(record) + size));
-		file.Flush();
 	};
 	const auto listed_code = [&] {
 		std::scoped_lock lock(state.mutex);

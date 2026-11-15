@@ -625,6 +625,17 @@ private:
 	std::array<DrawBufferView, 16> m_draw_buffer_views {};
 	uint32_t                       m_draw_buffer_view_count = 0;
 	bool                           m_draw_buffer_views_on   = false;
+	// KYTY_DRAW_BUFFERS=1: the small read-only ranges of the draw being bound, copied to the stream
+	// buffer before its stages bind them (see StreamDrawReads()), with their stream offsets
+	// (UINT64_MAX: the range binds as before).
+	struct DrawStreamRead {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t offset  = UINT64_MAX;
+	};
+	std::array<DrawStreamRead, 32> m_draw_stream_reads {};
+	uint32_t                       m_draw_stream_read_count = 0;
+	void                           StreamDrawReads(std::span<PreparedBindings* const> stages);
 	// Resolves the programs of a draw into `draw`; false when the draw resolves them itself.
 	bool ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
 	                         const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,

@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -164,6 +165,15 @@ public:
 	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
 	// CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
+	// Copies [vaddr, vaddr + size) into the stream buffer when the GPU modified none of it and one
+	// run of backing holds it, from the 256-byte boundary at or below vaddr, so that the offsets of
+	// its bytes keep the alignment of their addresses: the stream offset of vaddr, or none.
+	[[nodiscard]] std::optional<uint64_t> StreamGuestRange(uint64_t vaddr, uint64_t size);
+	// The stream offset of a copy of the read-only range [vaddr, vaddr + size) made in the current
+	// draw window that is still valid (see ObtainBuffer()), or none.
+	[[nodiscard]] std::optional<uint64_t> FindStreamCopy(uint64_t vaddr, uint64_t size);
+	// Notes that the stream buffer holds a copy of [vaddr, vaddr + size), made now, at `offset`.
+	void NoteStreamCopy(uint64_t vaddr, uint64_t size, uint64_t offset);
 	// Execution thread: whether the operation about to execute streams its guest data through the
 	// host copy queue's ring (see GpuOperation::stream_in_place).
 	void SetStreamInPlace(bool in_place) noexcept { m_stream_in_place = in_place; }

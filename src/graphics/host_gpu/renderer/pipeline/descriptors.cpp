@@ -190,6 +190,22 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
+// A read-only range StreamDrawReads() copied to the stream buffer at `offset`.
+static vk::DescriptorBufferInfo StreamedStorageBuffer(RenderContext& context, uint64_t offset, uint64_t size,
+                                                      const ShaderRecompiler::IR::BufferResource& resource,
+                                                      uint32_t&                                   buffer_offset) {
+	const auto& graphics  = context.GetGraphics();
+	const auto  alignment = resource.uniform_index == UINT32_MAX
+	                            ? graphics.StorageMinAlignment()
+	                            : std::max<vk::DeviceSize>(
+	                                  graphics.StorageMinAlignment(),
+	                                  graphics.GetPhysicalDeviceProperties().limits.minUniformBufferOffsetAlignment);
+	const auto aligned_offset = Common::AlignDown(offset, alignment);
+	buffer_offset             = static_cast<uint32_t>(offset - aligned_offset);
+	const auto& stream        = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	return {stream.Handle(), aligned_offset, size + buffer_offset};
+}
+
 // Reserved and unsupported T# fields must be zero; perf_mod only scales sampler state and the
 // mip-stats counter only counts sampling.
 static bool IsCanonicalTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
@@ -2566,8 +2582,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const uint32_t flags = (resource.uniform_index != UINT32_MAX ? 1u : 0u) |
 		                       (resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()) ? 2u : 0u);
 		const bool     share = m_draw_buffer_views_on && !resource.written && source.address != 0 && source.size != 0;
+		const DrawStreamRead* streamed = nullptr;
+		if (m_draw_stream_read_count != 0 && !resource.written && (flags & 2u) == 0) {
+			for (uint32_t i = 0; i < m_draw_stream_read_count; i++) {
+				const auto& read = m_draw_stream_reads[i];
+				if (read.address == source.address && read.size == source.size && read.offset != UINT64_MAX) {
+					streamed = &read;
+					break;
+				}
+			}
+		}
 		const DrawBufferView* shared = nullptr;
-		if (share) {
+		if (share && streamed == nullptr) {
 			for (uint32_t i = 0; i < m_draw_buffer_view_count; i++) {
 				const auto& view = m_draw_buffer_views[i];
 				if (view.address == source.address && view.size == source.size && view.flags == flags) {
@@ -2576,7 +2602,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				}
 			}
 		}
-		if (shared != nullptr) {
+		if (streamed != nullptr) {
+			prepared.buffers[index] = StreamedStorageBuffer(m_context, streamed->offset, source.size, resource, buffer_offset);
+		} else if (shared != nullptr) {
 			prepared.buffers[index] = shared->view;
 			buffer_offset           = shared->offset;
 		} else {
@@ -2818,12 +2846,102 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	if (DrawBuffersEnabled()) {
+		StreamDrawReads(stages);
+	}
 	m_draw_buffer_view_count = 0;
 	m_draw_buffer_views_on   = DrawStateTemplatesEnabled();
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}
-	m_draw_buffer_views_on = false;
+	m_draw_buffer_views_on   = false;
+	m_draw_stream_read_count = 0;
+}
+
+void RenderExecutor::StreamDrawReads(std::span<PreparedBindings* const> stages) {
+	// In GTA V a draw binds ~4 distinct small read-only ranges (constants), mostly CPU-written at
+	// addresses next to each other: one copy of the span they cover replaces a stream upload (or a
+	// memo lookup) of each. Ranges a stage of the draw writes, that occlusion counters may reach
+	// (PrepareRead()), or that formatted reads take (they may read an image's data), bind as before.
+	// So do ranges without CPU-dirty pages, which ObtainBuffer() binds in their cached buffer: that
+	// buffer can hold GPU writes the backing store does not have, as device-address stores make their
+	// pages GPU modified only once the write bitmap is scanned, after they ran.
+	constexpr uint64_t MaxRange = 16384;
+	constexpr uint64_t MaxGap   = 4096;
+	constexpr uint64_t MaxSpan  = 65536;
+	m_draw_stream_read_count    = 0;
+	std::array<std::pair<uint64_t, uint64_t>, 8> written {};
+	uint32_t                                     written_count = 0;
+	auto&                                        queries       = m_context.GetOcclusionQueries();
+	auto&                                        cache         = m_context.GetBufferCache();
+	for (const auto* stage: stages) {
+		const auto& program = stage->runtime->module->info;
+		for (const auto& resource: program.info.buffers) {
+			if (resource.descriptor_index == UINT32_MAX) continue;
+			const auto& source = stage->buffer_sources[resource.descriptor_index];
+			if (source.address == 0 || source.size == 0) continue;
+			if (resource.written) {
+				if (written_count == written.size()) {
+					m_draw_stream_read_count = 0;
+					return;
+				}
+				written[written_count++] = {source.address, source.address + source.size};
+				continue;
+			}
+			if (source.size > MaxRange || m_draw_stream_read_count == m_draw_stream_reads.size() ||
+			    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()) ||
+			    queries.MayPrepareRead(source.address, source.size) ||
+			    !cache.IsRegionCpuModified(source.address, source.size)) {
+				continue;
+			}
+			const auto same = [&](const DrawStreamRead& read) {
+				return read.address == source.address && read.size == source.size;
+			};
+			if (std::none_of(m_draw_stream_reads.begin(), m_draw_stream_reads.begin() + m_draw_stream_read_count, same)) {
+				m_draw_stream_reads[m_draw_stream_read_count++] = {source.address, source.size, UINT64_MAX};
+			}
+		}
+	}
+	// Drop the reads that overlap a write of the draw. Those an earlier draw of the window copied
+	// (the frame and pass constants) go first, with nothing to copy; the rest follow, by address.
+	uint32_t copied = 0;
+	uint32_t count  = 0;
+	for (uint32_t i = 0; i < m_draw_stream_read_count; i++) {
+		auto       read     = m_draw_stream_reads[i];
+		const bool overlaps = std::any_of(written.begin(), written.begin() + written_count, [&](const auto& range) {
+			return read.address < range.second && range.first < read.address + read.size;
+		});
+		if (overlaps) continue;
+		if (const auto offset = cache.FindStreamCopy(read.address, read.size)) {
+			read.offset                   = *offset;
+			m_draw_stream_reads[count++]  = m_draw_stream_reads[copied];
+			m_draw_stream_reads[copied++] = read;
+		} else {
+			m_draw_stream_reads[count++] = read;
+		}
+	}
+	std::sort(m_draw_stream_reads.begin() + copied, m_draw_stream_reads.begin() + count,
+	          [](const DrawStreamRead& a, const DrawStreamRead& b) { return a.address < b.address; });
+	m_draw_stream_read_count = count;
+	for (uint32_t first = copied; first < count;) {
+		uint64_t begin = m_draw_stream_reads[first].address;
+		uint64_t end   = begin + m_draw_stream_reads[first].size;
+		uint32_t last  = first + 1;
+		for (; last < count; last++) {
+			const auto& read = m_draw_stream_reads[last];
+			const auto  next = std::max(end, read.address + read.size);
+			if (read.address > end + MaxGap || next - begin > MaxSpan) break;
+			end = next;
+		}
+		if (const auto offset = cache.StreamGuestRange(begin, end - begin)) {
+			for (uint32_t i = first; i < last; i++) {
+				m_draw_stream_reads[i].offset = *offset + (m_draw_stream_reads[i].address - begin);
+				cache.NoteStreamCopy(m_draw_stream_reads[i].address, m_draw_stream_reads[i].size,
+				                     m_draw_stream_reads[i].offset);
+			}
+		}
+		first = last;
+	}
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

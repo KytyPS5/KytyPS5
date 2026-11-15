@@ -166,6 +166,8 @@ public:
 	// when dumps the GPU may not have finished are under it, and then NoteReadTarget() gives the
 	// copy the operation reads, which WriteForReaders() fills before the operation's commands.
 	[[nodiscard]] bool PrepareRead(uint64_t address, uint64_t size);
+	// Whether PrepareRead() may find counters under the range (it changes nothing).
+	[[nodiscard]] bool MayPrepareRead(uint64_t address, uint64_t size) const;
 	void               NoteReadTarget(uint64_t address, uint64_t size, const Buffer& buffer,
 	                                  uint64_t offset);
 	void               WriteForReaders();

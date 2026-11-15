@@ -182,6 +182,9 @@ private:
 // takes the pipeline and the render targets from them.
 [[nodiscard]] bool DrawTemplatesEnabled();
 [[nodiscard]] bool DrawStateTemplatesEnabled();
+// KYTY_DRAW_BUFFERS=1 copies the small read-only buffer ranges of a draw to the stream buffer
+// together, before its stages bind them (see RenderExecutor::StreamDrawReads()).
+[[nodiscard]] bool DrawBuffersEnabled();
 
 } // namespace Libs::Graphics
 

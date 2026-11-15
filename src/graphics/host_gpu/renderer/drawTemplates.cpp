@@ -125,4 +125,12 @@ bool DrawStateTemplatesEnabled() {
 	return DrawTemplatesMode() == 2;
 }
 
+bool DrawBuffersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_BUFFERS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 } // namespace Libs::Graphics

@@ -410,6 +410,10 @@ void OcclusionQueries::WaitAndPublish(uint64_t tick) {
 	PublishCompleted(true);
 }
 
+bool OcclusionQueries::MayPrepareRead(uint64_t address, uint64_t size) const {
+	return m_pool != nullptr && MayReadPendingDump(address, size);
+}
+
 bool OcclusionQueries::PrepareRead(uint64_t address, uint64_t size) {
 	if (m_pool == nullptr || !MayReadPendingDump(address, size)) {
 		return false;

@@ -1485,6 +1485,57 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	}
 }
 
+std::optional<uint64_t> BufferCache::StreamGuestRange(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return std::nullopt;
+	}
+	const uint64_t base   = vaddr & ~uint64_t {255};
+	const uint64_t bytes  = vaddr + size - base;
+	const void*    source = Libs::LibKernel::Memory::FindBackingPointer(base, bytes);
+	if (source == nullptr) {
+		return std::nullopt;
+	}
+	auto [mapped, offset] = m_stream_buffer.Map(bytes, 256, false);
+	if (mapped == nullptr) {
+		return std::nullopt;
+	}
+	auto* copies = m_scheduler.HostCopies();
+	if (copies != nullptr && m_stream_buffer.IsCoherent() && GuestGpu::IsGpuThread()) {
+		if (m_stream_in_place) {
+			copies->CopyInline(mapped, source, bytes);
+		} else {
+			copies->Copy(mapped, source, bytes);
+		}
+	} else {
+		std::memcpy(mapped, source, bytes);
+	}
+	m_stream_buffer.Commit();
+	return offset + (vaddr - base);
+}
+
+std::optional<uint64_t> BufferCache::FindStreamCopy(uint64_t vaddr, uint64_t size) {
+	if (m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return std::nullopt;
+	}
+	const auto& stream = (*m_stream_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) % StreamMemoSlots];
+	if (stream.vaddr == vaddr && stream.size == size &&
+	    stream.window == m_scheduler.Context().GetRenderExecutor().DrawWindow() &&
+	    stream.lap == m_stream_buffer.Lap() && stream.write_generation == m_gpu_write_generation) {
+		return stream.offset;
+	}
+	return std::nullopt;
+}
+
+void BufferCache::NoteStreamCopy(uint64_t vaddr, uint64_t size, uint64_t offset) {
+	(*m_stream_memo)[((vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull >> 32u) % StreamMemoSlots] = {
+	    .vaddr            = vaddr,
+	    .size             = size,
+	    .window           = m_scheduler.Context().GetRenderExecutor().DrawWindow(),
+	    .lap              = m_stream_buffer.Lap(),
+	    .write_generation = m_gpu_write_generation,
+	    .offset           = offset};
+}
+
 StreamBuffer& BufferCache::GetTableUploadBuffer() {
 	if (!m_table_upload) {
 		m_table_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, 32 * MiB);

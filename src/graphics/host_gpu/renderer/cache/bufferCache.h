@@ -180,6 +180,10 @@ public:
 	                                   uint64_t pattern);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// KYTY_COPY_FEEDBACK. Called after an identified small GPU copy into guest memory: a snapshot of its destination
+	// is copied into a download slot behind it, so a later guest read of those bytes, once the copy is done, is served
+	// from the snapshot instead of a readback. It never submits, waits or publishes guest data itself.
+	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -418,6 +422,17 @@ private:
 	// them again since, and a guest write marks them CPU-modified.
 	void ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
 	                     uint64_t tick, bool is_write);
+	// Copy feedback (KYTY_COPY_FEEDBACK, see ScheduleCopyFeedback()): the snapshots by guest address in download slots.
+	struct CopyFeedback;
+	std::unique_ptr<CopyFeedback> m_copy_feedback;
+	size_t                        m_copy_feedback_entries = 0; // the snapshots indexed (0: nothing to invalidate)
+	void                          InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) noexcept;
+	// Execution thread: the GPU-written bytes of the pages of [vaddr, vaddr + size) published from complete snapshots
+	// (all of them, or nothing), the pages released as a readback's are.
+	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// Execution thread: a guest access to bytes a complete snapshot holds is served from it, the whole snapshot with
+	// it; false when a readback in flight covers the pages or the snapshots do not cover them.
+	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
 	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
 	// queue waits for those submissions only, not for the work queued after them.
 	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
@@ -458,6 +473,8 @@ private:
 	// earlier submissions only, so the timeline does not cover them.
 	void WaitReadbackQueueCopies(vk::Buffer buffer);
 	void NoteWrite(uint64_t vaddr, uint64_t size) {
+		// (A GPU write over a copy-feedback snapshot: it no longer holds the bytes.)
+		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);
 		// Draws bind the same written ranges again and again.
 		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
 			m_pending_writes.emplace_back(vaddr, size);
@@ -726,6 +743,7 @@ private:
 	std::array<UploadWatch, 4> m_upload_watches {};
 	uint32_t                   m_upload_watch_next = 0;
 	void NoteUpload(uint64_t address, uint64_t bytes) noexcept {
+		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(address, bytes);
 		for (auto& watch: m_upload_watches) {
 			watch.uploads += address < watch.end && address + bytes > watch.begin ? 1 : 0;
 		}

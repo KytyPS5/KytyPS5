@@ -246,8 +246,21 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		    !m_context.IsMapped(source.Base48(), pattern * 4u) ||
 		    cache.IsRegionRegistered(destination.Base48(), count * 4u))
 			return false;
-		return m_context.GetBufferCache().ReplicateBuffer(destination.Base48(), count,
-		                                                  source.Base48(), pattern);
+		auto& buffers = m_context.GetBufferCache();
+		if (buffers.ReplicateBuffer(destination.Base48(), count, source.Base48(), pattern)) {
+			return true;
+		}
+		// The source holds GPU writes (the CPU cannot copy it): when its period covers the count the program copies
+		// count dwords, which a GPU copy does without the dispatch, and a snapshot of the destination taken behind it
+		// serves the guest's read of the result (Demon's Souls' cs_memset32: ~60 of its ~1 KB results a frame, each a
+		// fault and a readback). Overlapping ranges keep the program (its order of reads and writes).
+		const uint64_t bytes = count * 4u;
+		if (pattern < count || (destination.Base48() < source.Base48() + bytes &&
+		                        source.Base48() < destination.Base48() + bytes))
+			return false;
+		buffers.CopyBuffer(destination.Base48(), source.Base48(), bytes, false, false);
+		buffers.ScheduleCopyFeedback(destination.Base48(), bytes);
+		return true;
 	}
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
 		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||

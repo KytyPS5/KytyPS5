@@ -3033,6 +3033,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		return false;
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
+	InvalidateCopyFeedback(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
 	return true;
 }

@@ -2392,9 +2392,10 @@ bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& 
 // The code of the listed shaders that neither the store nor the guest has given yet, from the
 // game's files: every file is searched for shader binaries, whatever its format (a game keeps
 // them in packages of its own, mostly as they are; those inside compressed packages are not
-// found, and wait until the guest maps them, but for the shader archives of Unreal Engine, each
-// shader compressed with LZ4, which are read from the packages that hold them as they are). First, a
-// kind of file (by extension) is left out
+// found, and wait until the guest maps them, but for the shaders of Unreal Engine, each one
+// compressed with LZ4 in an archive or an asset, which are read from the packages that hold them as
+// they are or compressed with zlib, and zstd frames, which are decompressed where they are found).
+// First, a kind of file (by extension) is left out
 // after a sample in a row without shaders, and a file after as many bytes without one, so that a
 // game's textures, audio and video, and what follows the shaders in a large package, are not read
 // whole. Then, while listed code is still missing, what that left out is probed with a small
@@ -2494,6 +2495,34 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		uint32_t shaders;
 		uint64_t silent; // Bytes at the end without a shader.
 	};
+	// The zstd frames that begin and end in `chunk` (a package can compress its entries with zstd, as
+	// the .rpf packages of Red Dead Redemption do with its shaders), decompressed and searched.
+	const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> frames(ZSTD_createDCtx(), &ZSTD_freeDCtx);
+	std::vector<uint8_t>                                       frame;
+	const auto search_frames = [&](std::span<const uint8_t> chunk) {
+		constexpr std::string_view Magic("\x28\xb5\x2f\xfd", 4);
+		constexpr uint64_t         MaxFrame = 64u << 20u;
+		const std::string_view     text(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+		uint32_t                   shaders = 0;
+		for (size_t at = text.find(Magic); at != std::string_view::npos && frames != nullptr;
+		     at        = text.find(Magic, at + 1)) {
+			const auto stored = ZSTD_findFrameCompressedSize(chunk.data() + at, chunk.size() - at);
+			if (ZSTD_isError(stored) != 0) {
+				continue;
+			}
+			const auto size = ZSTD_getFrameContentSize(chunk.data() + at, stored);
+			if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR || size > MaxFrame) {
+				continue;
+			}
+			frame.resize(size);
+			const auto done = ZSTD_decompressDCtx(frames.get(), frame.data(), frame.size(), chunk.data() + at, stored);
+			if (ZSTD_isError(done) == 0) {
+				shaders += search(std::span<const uint8_t>(frame).first(done));
+				at += stored - 1;
+			}
+		}
+		return shaders;
+	};
 	const auto read_run = [&](Common::File& file, uint64_t from, uint64_t reach, uint64_t quiet,
 	                          uint64_t end, uint32_t piece, uint64_t quiet_after) {
 		Run    run {from, 0, 0};
@@ -2511,7 +2540,7 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			}
 			run.end += size;
 			bytes += size;
-			const auto shaders = search(data);
+			const auto shaders = search(data) + search_frames(data);
 			run.shaders += shaders;
 			run.silent = shaders != 0 ? 0 : run.silent + size;
 			if (shaders != 0 && quiet_after != 0) {

@@ -610,11 +610,14 @@ void TestRegionGpuCleanEpoch() {
 }
 
 std::vector<std::pair<uint64_t, uint64_t>>
-ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size) {
+ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size,
+                 Libs::Graphics::CpuWriteConsumer consumer =
+                     Libs::Graphics::CpuWriteConsumer::IndirectWriteTables) {
   std::vector<std::pair<uint64_t, uint64_t>> runs;
-  tracker.ConsumeCpuWrites(address, size, [&](uint64_t run, uint64_t bytes) {
-    runs.emplace_back(run, bytes);
-  });
+  tracker.ConsumeCpuWrites(consumer, address, size,
+                           [&](uint64_t run, uint64_t bytes) {
+                             runs.emplace_back(run, bytes);
+                           });
   return runs;
 }
 
@@ -645,6 +648,8 @@ void TestConsumeCpuWrites() {
   Check(runs.empty(), "clean pages were reported as CPU written");
 
   // A write after the upload is reported once the page is clean again.
+  const auto tables = Libs::Graphics::CpuWriteConsumer::BufferTables;
+  ConsumeCpuWrites(tracker, address, page_size * 4, tables);
   tracker.MarkRegionAsCpuModified(address + page_size, 8);
   upload();
   runs = ConsumeCpuWrites(tracker, address, page_size * 4);
@@ -653,6 +658,11 @@ void TestConsumeCpuWrites() {
         "a CPU write between uploads was not reported");
   runs = ConsumeCpuWrites(tracker, address, page_size * 4);
   Check(runs.empty(), "a consumed CPU write was reported twice");
+  // Each consumer has its own record of the written pages.
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4, tables);
+  Check(runs.size() == 1 && runs[0].first == address + page_size &&
+            runs[0].second == page_size,
+        "a CPU write consumed by one user was lost for another");
 
   // A write outside the query stays pending for a later query over it.
   tracker.MarkRegionAsCpuModified(address + page_size * 3, 8);

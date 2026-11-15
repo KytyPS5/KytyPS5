@@ -704,10 +704,15 @@ bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* cons
 			}
 		}
 	}
+	const auto reach_layout = ReachLayout();
 	lock.unlock();
 	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);
-	// The buffers that the V#s of the buffer tables describe.
+	// The buffers that the V#s of the buffer tables describe, once a BDA generation.
 	for (auto* table: m_dma_sets) {
+		if (table->synced_in == reach_layout) {
+			continue;
+		}
+		table->synced_in = reach_layout;
 		m_buffer_cache.SynchronizeBuffersInSet(table->ranges, table->regions);
 	}
 	return true;
@@ -970,18 +975,45 @@ bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
 	auto&       entries = **cached;
 	const auto* memory  = reinterpret_cast<const uint8_t*>(address);
 	// The table changes when the game streams geometry in or out: its V#s are decoded again then.
-	// While its pages stay clean and none was uploaded, the guest's CPU did not write it since it
-	// was last compared with the copy.
-	const auto uploads = m_buffer_cache.WatchUploads(address, size);
-	const bool dirty   = m_buffer_cache.IsRegionCpuModified(address, size);
-	const bool same    = uploads != 0 && entries.written_at == uploads && !dirty && entries.copy.size() == size;
-	entries.written_at = dirty ? 0 : uploads;
-	if (same) {
-		// (Nothing to decode.)
-	} else if (entries.copy.size() != size || std::memcmp(entries.copy.data(), memory, size) != 0) {
+	// Only the pages the guest's CPU wrote since the last comparison can differ from the copy
+	// (GTA V writes a page of its 2 MB table now and then, and other buffers on its pages). Within
+	// the BDA generation of the last comparison, what the CPU writes waits for the next one (the
+	// operations of GTA V's Fidelity mode that trace rays take the same table several times in
+	// one).
+	const auto layout = ReachLayout();
+	bool       same   = entries.copy.size() == size;
+	if (entries.compared_in != layout || !same) {
+		entries.compared_in = layout;
+		const auto compare  = [&](uint64_t run, uint64_t bytes) {
+			const auto begin = std::max(run, address);
+			const auto end   = std::min(run + bytes, address + size);
+			if (same && begin < end) {
+				same = std::memcmp(entries.copy.data() + (begin - address), memory + (begin - address),
+				                   end - begin) == 0;
+			}
+		};
+		m_buffer_cache.ConsumeCpuWrites(CpuWriteConsumer::BufferTables, address, size, [&](uint64_t run, uint64_t bytes) {
+			compare(run, bytes);
+			// The other tables on these pages compare them at their next comparison.
+			const auto first = run & ~(TRACKER_PAGE_SIZE - 1);
+			const auto last  = (run + bytes + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			for (const auto& other: m_buffer_tables) {
+				if (other.get() != &entries && other->address < last &&
+				    first < other->address + other->copy.size()) {
+					other->written.emplace_back(first, last - first);
+				}
+			}
+		});
+		for (const auto& [run, bytes]: entries.written) {
+			compare(run, bytes);
+		}
+		entries.written.clear();
+	}
+	if (!same) {
 		entries.copy.assign(memory, memory + size);
 		entries.ranges.Clear();
-		entries.regions = {};
+		entries.regions   = {};
+		entries.synced_in = {};
 		for (uint64_t offset = 0; offset < size; offset += EntryBytes) {
 			ShaderBufferResource buffer;
 			std::memcpy(buffer.fields, entries.copy.data() + offset, EntryBytes);

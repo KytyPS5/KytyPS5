@@ -201,15 +201,15 @@ public:
 	}
 
 	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
-	// have written since the previous call over them: pages that became CPU dirty since then, or
-	// are still CPU dirty. Untracked pages start tracking as written. A single consumer owns the
-	// written state.
+	// have written since the consumer's previous call over them: pages that became CPU dirty
+	// since then, or are still CPU dirty. Untracked pages start tracking as written. Each
+	// consumer has its own record of the written pages.
 	template <typename Func>
-	void ConsumeCpuWrites(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ConsumeCpuWrites(CpuWriteConsumer consumer, uint64_t vaddr, uint64_t size, Func&& func) {
 		std::vector<std::pair<uint64_t, uint64_t>> runs;
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
-			manager->ConsumeCpuWritten(offset, bytes,
+			manager->ConsumeCpuWritten(consumer, offset, bytes,
 			                           [&](uint64_t address, uint64_t length) {
 				                           if (!runs.empty() &&
 				                               runs.back().first + runs.back().second == address) {

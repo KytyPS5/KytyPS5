@@ -2948,17 +2948,6 @@ void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-uint64_t BufferCache::WatchUploads(uint64_t vaddr, uint64_t size) {
-	for (const auto& watch: m_upload_watches) {
-		if (watch.begin == vaddr && watch.end == vaddr + size) {
-			return watch.uploads;
-		}
-	}
-	// Uploads start at 1: never the count of a range that was not watched.
-	m_upload_watches[m_upload_watch_next++ % m_upload_watches.size()] = {vaddr, vaddr + size, 1};
-	return 0;
-}
-
 void BufferCache::SynchronizeBuffersInSet(const RangeSet& set, SetRegions& state) {
 	const UploadBatch batch {*this};
 	// The uploads of this pass leave the pages the guest keeps writing CPU dirty, as those of a

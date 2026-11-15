@@ -130,7 +130,8 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 	}
 	std::vector<GuestRange> targets;
 	// Pages the CPU did not write since the last scan still hold the snapshot's entries.
-	buffer_cache.ConsumeCpuWrites(address, bytes, [&](uint64_t run, uint64_t run_size) {
+	buffer_cache.ConsumeCpuWrites(CpuWriteConsumer::IndirectWriteTables, address, bytes,
+	                              [&](uint64_t run, uint64_t run_size) {
 		if (!full) {
 			const auto first = (run - address) / EntrySize;
 			const auto last  = std::min(Common::AlignUp(run + run_size - address, EntrySize) /

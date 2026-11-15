@@ -235,13 +235,22 @@ private:
 	// decoded from, the memory its V#s describe and what the buffer cache synchronized of it.
 	struct BufferTable {
 		uint64_t                address = 0;
-		// BufferCache::WatchUploads() of the table when it was last compared with its copy and had
-		// no CPU-dirty page (0: it had one).
-		uint64_t                written_at = 0;
 		std::vector<uint8_t>    copy;
 		RangeSet                ranges;
 		BufferCache::SetRegions regions;
+		// ReachLayout() when the copy was last compared with the table and when the buffers of
+		// `ranges` were last synchronized.
+		std::array<uint64_t, 3> compared_in {};
+		std::array<uint64_t, 3> synced_in {};
+		// Pages the CPU wrote that the comparison of another table took from the record of the
+		// written pages (tables may share pages).
+		std::vector<std::pair<uint64_t, uint64_t>> written;
 	};
+	// The BDA generation, buffer registration epoch and mapped range version (see PrepareBda()):
+	// within one, what the guest's CPU writes after a synchronization waits for the next one.
+	[[nodiscard]] std::array<uint64_t, 3> ReachLayout() const {
+		return {m_bda_generation, m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
+	}
 	std::vector<std::unique_ptr<BufferTable>> m_buffer_tables;
 	// SynchronizeDmaFootprint(): the tables of an operation, and the BLASes its preparation may walk.
 	std::vector<BufferTable*> m_dma_sets;

@@ -144,7 +144,9 @@ public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
 	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
 		m_cpu_dirty.Fill();
-		m_cpu_written.Fill();
+		for (auto& written: m_cpu_written) {
+			written.Fill();
+		}
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 	}
 
@@ -221,7 +223,9 @@ public:
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			if constexpr (enable) {
-				m_cpu_written.SetRange(start, end);
+				for (auto& written: m_cpu_written) {
+					written.SetRange(start, end);
+				}
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 			}
@@ -380,14 +384,15 @@ public:
 	[[nodiscard]] uint32_t KeptSync() const { return m_kept_sync.load(std::memory_order_relaxed); }
 
 	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
-	// the previous call over them, or are still CPU dirty (further writes to a dirty page do not
-	// fault), and forgets the former. Callers hold the lock.
+	// the consumer's previous call over them, or are still CPU dirty (further writes to a dirty
+	// page do not fault), and forgets the former for it. Callers hold the lock.
 	template <typename Func>
-	void ConsumeCpuWritten(uint64_t offset, uint64_t size, Func&& func) {
+	void ConsumeCpuWritten(CpuWriteConsumer consumer, uint64_t offset, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(offset, size);
-		RegionBits mask(m_cpu_written, start, end);
+		auto&      written      = m_cpu_written[static_cast<size_t>(consumer)];
+		RegionBits mask(written, start, end);
 		mask |= RegionBits(m_cpu_dirty, start, end);
-		m_cpu_written.UnsetRange(start, end);
+		written.UnsetRange(start, end);
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
@@ -469,8 +474,8 @@ private:
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
-	// Pages that became CPU dirty since ConsumeCpuWritten last visited them.
-	RegionBits   m_cpu_written;
+	// Per consumer: pages that became CPU dirty since its ConsumeCpuWritten() last visited them.
+	std::array<RegionBits, CPU_WRITE_CONSUMERS> m_cpu_written;
 	RegionBits   m_gpu_dirty;
 	// A new region starts with every page CPU dirty.
 	std::atomic_bool      m_has_cpu_dirty {true};

@@ -3160,8 +3160,21 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 				continue;
 			}
 			const auto begin = std::max(read, at >= from + ProbeStride ? at - ProbeStride + ProbeBytes : from);
+			const auto floor = read;
+			const auto known = found_listed.size();
 			read             = read_run(file, begin, window, RunQuiet, size, RunPiece, 0).end;
-			at               = std::max(at + ProbeStride, read);
+			// A group of shaders can end between the window before and this one, apart from the
+			// group the window hit (NHL 27 keeps the shaders of a bundle 23 MB before the next).
+			// When the run found listed code, pieces back from it until as many bytes hold none.
+			for (uint64_t end = begin, silent = 0; found_listed.size() != known && end > floor &&
+			                                       silent < RunQuiet && !stop.stop_requested();) {
+				const auto back = std::max(floor, end - RunPiece);
+				const auto run  = read_run(file, back, 0, 0, std::min(size, end + Overlap),
+				                           RunPiece + Overlap, 0);
+				silent          = run.shaders != 0 ? 0 : silent + (end - back);
+				end             = back;
+			}
+			at = std::max(at + ProbeStride, read);
 		}
 		kind->probed = provided != before ? 0 : kind->probed + 1;
 	}

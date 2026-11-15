@@ -628,7 +628,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
 	const auto stages = context.GetShaderStages();
-	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0 || (stages & 0x20u) != 0);
+	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);

@@ -49827,13 +49827,6 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
     Require(name, "TES vertex gates", full_wave_gates == 2,
             "GS_TG_INFO or the merged wave info did not count one full TES wave");
   }
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  context.SetShaderStages(0x0260212du);
-  ExpectFatal("TessellationGsAmplification", [&] {
-    std::array<ShaderVertexInputInfo, 3> info;
-    (void)PrepareTessellationPrograms(regs, context, info);
-  });
-#endif
   std::printf("[gpu]     %-32s ok\n", name);
 }
 

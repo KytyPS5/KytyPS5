@@ -33,11 +33,13 @@
 #include <fmt/ranges.h>
 #include <locale>
 #include <magic_enum.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <sstream>
 #include <stop_token>
 #include <thread>
@@ -2762,6 +2764,299 @@ bool ForEachIoStoreShaderGroup(std::span<const uint8_t> toc, Read&& read, Decomp
 	return true;
 }
 
+// Frostbite keeps a game's data in .cas files that the tables of contents of its superbundles
+// (.toc) index; Data/layout.toc (and Patch/layout.toc, for what a patch replaced) lists the
+// superbundles and the install chunks, the folders of the .cas files. A .toc and a layout.toc can
+// begin with a signature of this size.
+constexpr std::string_view FrostbiteSignature("\x00\xd1\xce\x01", 4);
+constexpr size_t           FrostbiteSignatureSize = 0x22c;
+
+std::span<const uint8_t> FrostbiteUnsigned(std::span<const uint8_t> data) {
+	if (data.size() >= FrostbiteSignatureSize &&
+	    std::memcmp(data.data(), FrostbiteSignature.data(), FrostbiteSignature.size()) == 0) {
+		return data.subspan(FrostbiteSignatureSize);
+	}
+	return data;
+}
+
+// A field of a DbObject, Frostbite's binary objects: a type (the low 5 bits; with the high bit
+// set, the field has no name), the name, and the value: of a list (1) or an object (2), its fields
+// up to a 0, of a string (7, with its terminator) or a blob (19), its bytes, each after a size in 7
+// bits a byte; booleans, integers, floats, GUIDs and SHA-1s have a fixed size.
+struct DbField {
+	std::string_view         name;
+	uint8_t                  type = 0;
+	std::span<const uint8_t> value;
+};
+
+// The field at `reader`; false at the end of its parent or when it cannot be read.
+bool ReadDbField(SpanReader& reader, DbField& field) {
+	const auto type = reader.Get<uint8_t>();
+	if (!reader.ok || type == 0) {
+		return false;
+	}
+	field.type = type & 0x1fu;
+	field.name = {};
+	if ((type & 0x80u) == 0) {
+		const auto* begin = reinterpret_cast<const char*>(reader.data.data() + reader.at);
+		const auto  name  = std::string_view(begin, strnlen(begin, reader.data.size() - reader.at));
+		if (!reader.Skip(name.size() + 1)) {
+			return false;
+		}
+		field.name = name;
+	}
+	uint64_t size = 0;
+	switch (field.type) {
+		case 0x01:
+		case 0x02:
+		case 0x07:
+		case 0x13:
+			for (uint32_t shift = 0; shift < 35; shift += 7) {
+				const auto byte = reader.Get<uint8_t>();
+				size |= uint64_t {byte & 0x7fu} << shift;
+				if ((byte & 0x80u) == 0) {
+					break;
+				}
+			}
+			break;
+		case 0x06: size = 1; break;
+		case 0x08:
+		case 0x0b: size = 4; break;
+		case 0x09:
+		case 0x0c: size = 8; break;
+		case 0x0f: size = 16; break;
+		case 0x10: size = 20; break;
+		default: return false;
+	}
+	const auto at = reader.at;
+	if (!reader.ok || !reader.Skip(size)) {
+		return false;
+	}
+	field.value = reader.data.subspan(at, size);
+	return true;
+}
+
+// Calls `f(field)` for each field of the list or object `value`.
+template <typename F>
+void ForEachDbField(std::span<const uint8_t> value, F&& f) {
+	SpanReader reader {value};
+	DbField    field;
+	while (ReadDbField(reader, field)) {
+		f(field);
+	}
+}
+
+std::string_view DbString(const DbField& field) {
+	return field.type == 0x07 && !field.value.empty()
+	           ? std::string_view(reinterpret_cast<const char*>(field.value.data()),
+	                              field.value.size() - 1)
+	           : std::string_view();
+}
+
+// What a layout.toc lists: the platform (the folder of the superbundles and the install chunks),
+// the superbundles, and the folder of each install chunk by its persistent index, which names the
+// chunk of every .cas file in the tables of contents.
+struct FrostbiteLayout {
+	std::string                               platform;
+	std::vector<std::string>                  superbundles;
+	std::unordered_map<uint32_t, std::string> chunks;
+};
+
+bool ReadFrostbiteLayout(std::span<const uint8_t> data, FrostbiteLayout& layout) {
+	SpanReader reader {FrostbiteUnsigned(data)};
+	DbField    root;
+	if (!ReadDbField(reader, root) || root.type != 0x02) {
+		return false;
+	}
+	ForEachDbField(root.value, [&](const DbField& field) {
+		if (field.name == "superBundles" && field.type == 0x01) {
+			ForEachDbField(field.value, [&](const DbField& superbundle) {
+				ForEachDbField(superbundle.value, [&](const DbField& item) {
+					if (item.name == "name" && !DbString(item).empty()) {
+						layout.superbundles.emplace_back(DbString(item));
+					}
+				});
+			});
+		}
+		if (field.name != "installManifest" || field.type != 0x02) {
+			return;
+		}
+		ForEachDbField(field.value, [&](const DbField& item) {
+			if (item.name == "platform") {
+				layout.platform = DbString(item);
+			}
+			if (item.name != "installChunks" || item.type != 0x01) {
+				return;
+			}
+			ForEachDbField(item.value, [&](const DbField& chunk) {
+				std::string_view name;
+				uint32_t         index = 0;
+				bool             known = false;
+				ForEachDbField(chunk.value, [&](const DbField& key) {
+					if (key.name == "name") {
+						name = DbString(key);
+					} else if (key.name == "persistentIndex" && key.type == 0x08) {
+						std::memcpy(&index, key.value.data(), 4);
+						known = true;
+					}
+				});
+				if (known && !name.empty()) {
+					layout.chunks.emplace(index, name);
+				}
+			});
+		});
+	});
+	return !layout.platform.empty() && !layout.chunks.empty();
+}
+
+// An entry of a bundle: its .cas file (the patch's or not, the install chunk, the file's number)
+// and its place in it.
+struct FrostbiteEntry {
+	bool     patch;
+	uint32_t chunk;
+	uint32_t cas;
+	uint64_t offset;
+	uint32_t size;
+};
+
+// The shader entries of the bundles of the superbundles' tables of contents `tocs`. A table of
+// contents (big-endian, after its signature) begins with 15 words: its size (0x3c), where the
+// bundles are and how many, then the chunks'. A bundle (16 bytes: a word, its size with flags,
+// where it is) is kept in the table of contents itself with the flag 0x40: 9 words (where the
+// entries' flags are, how many entries, where the entries are...), then the entries (the .cas file,
+// 8 bytes, when the entry's flag has 0x80, then the offset and the size), then a flag a byte. Its
+// first entry is the bundle's metadata: its size (big-endian), then, little-endian, a magic, the
+// entries it describes (ebx, res and chunks), where its names are, the SHA-1s, the ebx and res
+// entries (name and size), the res entries' types... The other entries follow in that order. The
+// shaders are the res entries of the type whose entries are named shaders/bytecode/. The bundles
+// with most entries go first; `read(entry, offset, size, out)` reads part of an entry's .cas file,
+// `found(entries)` the shader entries of a bundle and returns whether they gave missing code. Ends
+// after `quiet` bundles in a row that gave none, or when `stop()`.
+template <typename Read, typename Found, typename Stop>
+void ForEachFrostbiteShaderEntry(const std::vector<std::vector<uint8_t>>& tocs, uint32_t quiet,
+                                 Read&& read, Found&& found, Stop&& stop) {
+	const auto big = [](std::span<const uint8_t> data, size_t at, uint32_t bytes) {
+		uint64_t value = 0;
+		for (uint32_t i = 0; i < bytes; i++) {
+			value = (value << 8u) | data[at + i];
+		}
+		return value;
+	};
+	struct Bundle {
+		std::span<const uint8_t> data;
+		uint32_t                 entries;
+	};
+	std::vector<Bundle> bundles;
+	for (const auto& file: tocs) {
+		const auto toc = FrostbiteUnsigned(file);
+		if (toc.size() < 0x3c || big(toc, 0, 4) != 0x3c) {
+			continue;
+		}
+		const auto at    = big(toc, 4, 4);
+		const auto count = big(toc, 8, 4);
+		for (uint64_t i = 0; i < count && at + (i + 1) * 16 <= toc.size(); i++) {
+			const auto         size   = big(toc, at + i * 16 + 4, 4);
+			const auto         offset = big(toc, at + i * 16 + 8, 8);
+			constexpr uint32_t InToc  = 0x40000000;
+			if ((size & InToc) == 0 || offset > toc.size() ||
+			    (size & 0xffffffu) > toc.size() - offset || (size & 0xffffffu) < 0x24) {
+				continue;
+			}
+			const auto data = toc.subspan(offset, size & 0xffffffu);
+			bundles.push_back({data, static_cast<uint32_t>(big(data, 12, 4))});
+		}
+	}
+	std::ranges::stable_sort(bundles, std::ranges::greater {}, &Bundle::entries);
+	std::unordered_map<uint32_t, bool> shader_type; // Whether a res type's entries are shaders.
+	std::vector<FrostbiteEntry>        entries, shaders;
+	std::vector<uint8_t>               head, table, name;
+	uint32_t                           silent = 0;
+	for (const auto& bundle: bundles) {
+		if (silent >= quiet || stop()) {
+			break;
+		}
+		silent++;
+		const auto flags_at = big(bundle.data, 8, 4);
+		const auto count    = big(bundle.data, 12, 4);
+		auto       at       = big(bundle.data, 16, 4);
+		if (count < 2 || flags_at > bundle.data.size() || count > bundle.data.size() - flags_at) {
+			continue;
+		}
+		entries.clear();
+		FrostbiteEntry cas {};
+		bool           named = false;
+		for (uint64_t i = 0; i < count; i++) {
+			const bool next = (bundle.data[flags_at + i] & 0x80u) != 0;
+			if (at + (next ? 16 : 8) > flags_at) {
+				break;
+			}
+			if (next) {
+				cas = {bundle.data[at + 1] != 0, static_cast<uint32_t>(big(bundle.data, at + 2, 4)),
+				       static_cast<uint32_t>(big(bundle.data, at + 6, 2)), 0, 0};
+				named = true;
+				at += 8;
+			}
+			if (!named) {
+				break;
+			}
+			cas.offset = big(bundle.data, at, 4);
+			cas.size   = static_cast<uint32_t>(big(bundle.data, at + 4, 4));
+			entries.push_back(cas);
+			at += 8;
+		}
+		if (entries.size() != count) {
+			continue;
+		}
+		// The metadata: its size, the magic, the entries, the ebx, res and chunk entries, and where
+		// its names are (from its fifth byte).
+		const auto& meta = entries[0];
+		if (!read(meta, meta.offset, 0x24, head) || head.size() != 0x24 ||
+		    big(head, 0, 4) + 4 != meta.size) {
+			continue;
+		}
+		uint32_t counts[5] = {};
+		std::memcpy(counts, head.data() + 8, sizeof(counts));
+		const auto [total, ebx, res, chunk_count, names_at] = counts;
+		if (uint64_t {ebx} + res + chunk_count != total || uint64_t {total} + 1 != count ||
+		    res == 0) {
+			continue;
+		}
+		const auto res_at = uint64_t {0x24} + uint64_t {total} * 20 + uint64_t {ebx} * 8;
+		if (res_at + uint64_t {res} * 12 > meta.size ||
+		    !read(meta, meta.offset + res_at, uint64_t {res} * 12, table) ||
+		    table.size() != uint64_t {res} * 12) {
+			continue;
+		}
+		shaders.clear();
+		for (uint32_t i = 0; i < res; i++) {
+			uint32_t type = 0;
+			std::memcpy(&type, table.data() + uint64_t {res} * 8 + i * 4, 4);
+			auto known = shader_type.find(type);
+			if (known == shader_type.end()) {
+				constexpr std::string_view Shaders("shaders/bytecode/");
+				uint32_t                   name_at = 0;
+				std::memcpy(&name_at, table.data() + i * 8, 4);
+				const auto from = uint64_t {4} + names_at + name_at;
+				known = shader_type
+				            .emplace(type,
+				                     from + Shaders.size() <= meta.size &&
+				                         read(meta, meta.offset + from, Shaders.size(), name) &&
+				                         std::ranges::equal(name, Shaders,
+				                                            [](uint8_t a, char b) {
+					                                            return a == static_cast<uint8_t>(b);
+				                                            }))
+				            .first;
+			}
+			if (known->second) {
+				shaders.push_back(entries[1 + ebx + i]);
+			}
+		}
+		if (!shaders.empty() && found(std::span<const FrostbiteEntry>(shaders))) {
+			silent = 0;
+		}
+	}
+}
+
 } // namespace
 
 // The code of the listed shaders that neither the store nor the guest has given yet, from the
@@ -2772,7 +3067,9 @@ bool ForEachIoStoreShaderGroup(std::span<const uint8_t> toc, Read&& read, Decomp
 // they are or compressed with zlib, those of Unreal Engine 5, groups compressed with Oodle in the
 // shader libraries of its IoStore containers, which the game's own decoder decompresses, those of
 // Unity, compressed with LZ4 in Shader objects, which are read from its serialized files and
-// bundles, and zstd frames, which are decompressed where they are found).
+// bundles, and zstd frames, which are decompressed where they are found). Frostbite's .cas files
+// are not searched whole: only the entries of its shaders, which the tables of contents of its
+// superbundles locate.
 // First, a kind of file (by extension) is left out
 // after a sample in a row without shaders, and a file after as many bytes without one, so that a
 // game's textures, audio and video, and what follows the shaders in a large package, are not read
@@ -3061,6 +3358,99 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		return ForEachIoStoreShaderGroup(toc, read, decompress,
 		                                 [&](std::span<const uint8_t> group) { search(group); });
 	};
+	// Frostbite: its .cas files are read through the superbundles' tables of contents that the
+	// layout.toc of Data/ and Patch/ list, and only the entries of its shaders. The bundles'
+	// metadata is read until this many bundles in a row gave no listed code.
+	constexpr uint32_t FrostbiteQuiet   = 256;
+	const auto         search_frostbite = [&] {
+		FrostbiteLayout      layout;
+		std::vector<uint8_t> text;
+		for (const char* folder: {"Patch", "Data"}) {
+			Common::File file;
+			if (file.Open(root / folder / "layout.toc", Common::File::Mode::Read) &&
+			    read_file(file, 0, file.Size(), text)) {
+				files++;
+				ReadFrostbiteLayout(text, layout);
+			}
+		}
+		if (layout.chunks.empty()) {
+			return false;
+		}
+		std::vector<std::vector<uint8_t>> tocs;
+		std::unordered_set<std::string>   superbundles;
+		for (const char* folder: {"Patch", "Data"}) {
+			for (const auto& name: layout.superbundles) {
+				Common::File file;
+				if (superbundles.insert(std::string(folder) + "/" + name).second &&
+				    file.Open(root / folder / Common::PathFromUtf8(name + ".toc"),
+				              Common::File::Mode::Read) &&
+				    read_file(file, 0, file.Size(), text)) {
+					files++;
+					tocs.push_back(std::move(text));
+				}
+			}
+		}
+		if (tocs.empty()) {
+			return false;
+		}
+		using Cas = std::tuple<bool, uint32_t, uint32_t>;
+		std::map<Cas, std::unique_ptr<Common::File>> cas_files;
+		const auto read = [&](const FrostbiteEntry& entry, uint64_t offset, uint64_t size,
+		                      std::vector<uint8_t>& out) {
+			auto& file = cas_files[{entry.patch, entry.chunk, entry.cas}];
+			if (file == nullptr) {
+				file             = std::make_unique<Common::File>();
+				const auto chunk = layout.chunks.find(entry.chunk);
+				if (chunk == layout.chunks.end() ||
+				    !file->Open(root / (entry.patch ? "Patch" : "Data") /
+				                    Common::PathFromUtf8(layout.platform) /
+				                    Common::PathFromUtf8(chunk->second) /
+				                    Common::PathFromUtf8(fmt::format("cas_{:02}.cas", entry.cas)),
+				                Common::File::Mode::Read)) {
+					return false;
+				}
+				files++;
+			}
+			return !file->IsInvalid() && read_file(*file, offset, size, out);
+		};
+		// Entries one after the other in a .cas file are read together.
+		std::set<std::tuple<bool, uint32_t, uint32_t, uint64_t>> seen;
+		std::vector<FrostbiteEntry>                              todo;
+		std::vector<uint8_t>                                     run;
+		ForEachFrostbiteShaderEntry(
+		    tocs, FrostbiteQuiet, read,
+		    [&](std::span<const FrostbiteEntry> shaders) {
+			    const auto known = found_listed.size();
+			    todo.clear();
+			    for (const auto& entry: shaders) {
+				    if (seen.emplace(entry.patch, entry.chunk, entry.cas, entry.offset).second) {
+					    todo.push_back(entry);
+				    }
+			    }
+			    const auto order = [](const FrostbiteEntry& e) {
+				    return std::tuple(e.patch, e.chunk, e.cas, e.offset);
+			    };
+			    std::ranges::sort(todo, {}, order);
+			    for (size_t i = 0; i < todo.size() && !stop.stop_requested();) {
+				    auto end  = todo[i].offset + todo[i].size;
+				    auto next = i + 1;
+				    for (; next < todo.size() && todo[next].patch == todo[i].patch &&
+				           todo[next].chunk == todo[i].chunk && todo[next].cas == todo[i].cas &&
+				           todo[next].offset == end && end - todo[i].offset < RunPiece;
+				         next++) {
+					    end += todo[next].size;
+				    }
+				    if (read(todo[i], todo[i].offset, end - todo[i].offset, run)) {
+					    search(run);
+				    }
+				    i = next;
+			    }
+			    return found_listed.size() != known;
+		    },
+		    [&] { return stop.stop_requested() || nothing_missing(); });
+		return true;
+	};
+	const bool frostbite = search_frostbite();
 	// Files and bytes of each kind in a row without a shader, and files probed in a row that gave
 	// no missing code.
 	struct Kind {
@@ -3095,6 +3485,9 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			auto extension = Common::PathToString(path.extension());
 			std::ranges::transform(extension, extension.begin(),
 			                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			if (frostbite && (extension == ".cas" || extension == ".toc")) {
+				continue; // Read through the tables of contents.
+			}
 			if ((extension == ".pak" || extension == ".ushaderbytecode") && search_unreal(path, extension)) {
 				continue; // Read through its index instead of sampled.
 			}

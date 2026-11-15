@@ -51,13 +51,19 @@ struct GpuDrawIndirectArgs {
 	const volatile uint32_t* count_addr        = nullptr;
 	uint32_t                 stride            = 0;
 	uint32_t                 draw_initiator    = 0;
-	uint32_t                 index_type        = 0;
 	uint32_t                 index_buffer_size = 0;
-	uint64_t                 index_base        = 0;
+	uint8_t                  index_type        = 0;
 	bool                     indexed           = false;
 	bool                     multi             = false;
+	uint64_t                 index_base        = 0;
 	IndirectDrawRegisters    registers {};
+	// A run of DRAW_INDEX_INDIRECT packets with the same other words and any data offsets (chenxiao07's native XPR
+	// runs): the i-th draw's record is at args_base + run_offsets[5 * i], the packets in the command buffer, which
+	// stays valid until the operation executed. Null for the records of one packet, or a constant stride.
+	const uint32_t*          run_offsets       = nullptr;
 };
+// (No larger than the other draw arguments: the operations of every draw carry them.)
+static_assert(sizeof(GpuDrawIndirectArgs) <= sizeof(DrawIndexArgs));
 
 struct GpuDispatchArgs {
 	uint32_t thread_group_x = 0;

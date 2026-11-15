@@ -3130,7 +3130,8 @@ bool RenderExecutor::TableLikely(const HW::Shader& shaders) const noexcept {
 
 bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint32_t count, uint32_t stride,
                                  uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
-                                 const DrawIndexArgs* direct, bool clean, const ShaderIndirectOffsets& offsets) {
+                                 const DrawIndexArgs* direct, bool clean, const ShaderIndirectOffsets& offsets,
+                                 const uint32_t* run_offsets) {
 	bool drawn = false;
 	// (A pair whose try was refused after one that drew keeps its resolutions ahead for TableMixedFrames.)
 	static constexpr uint64_t TableMixedFrames = 120;
@@ -3149,6 +3150,13 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	const auto      likely_tag  = TableLikelyTag(buffer.GetShaders());
 	const auto      likely_slot = (likely_tag >> 40u) & (m_table_drawn.size() - 1);
 	const DrawnHint hint {m_table_drawn[likely_slot], m_table_mixed_until[likely_slot], likely_tag, m_context.FrameNumber(), drawn};
+	struct DrewDraws {
+		std::atomic<bool>& flag;
+		const bool&        drawn;
+		~DrewDraws() {
+			if (drawn && !flag.load(std::memory_order_relaxed)) flag.store(true, std::memory_order_relaxed);
+		}
+	} const drew_draws {m_table_drew_draws, drawn};
 	if (m_table_store) Spec::Refuse("store: lost (the draw never reached TableStore)");
 	m_table_store = false;
 	// The user SGPRs the CP patches with the records' vertex and instance offsets (his START_INST_LOC): the draw's
@@ -3196,7 +3204,9 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	std::array<uint64_t, 64> run;
 	if (direct == nullptr) {
 		count = std::min<uint32_t>(std::max<uint32_t>(count, 1u), 64u);
-		for (uint32_t i = 0; i < count; ++i) run[i] = args_addr + uint64_t {i} * stride;
+		// (A run of packets: each record at its packet's data offset, GpuDrawIndirectArgs::run_offsets.)
+		for (uint32_t i = 0; i < count; ++i)
+			run[i] = run_offsets != nullptr ? args_addr - run_offsets[0] + run_offsets[5 * i] : args_addr + uint64_t {i} * stride;
 	}
 	const std::span<const uint64_t> commands = direct == nullptr ? std::span<const uint64_t> {run.data(), count}
 	                                                              : std::span<const uint64_t> {};

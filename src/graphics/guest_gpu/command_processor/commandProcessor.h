@@ -111,7 +111,15 @@ public:
 	void DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
+	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed,
+	                       const uint32_t* run_offsets = nullptr);
+	// Whether the current shader pair's draws go to its table programs: a run of its DRAW_INDEX_INDIRECT packets
+	// with any data offsets is then one operation (DrawIndirectRun).
+	[[nodiscard]] bool TakesDrawRuns() const;
+	// `count` DRAW_INDEX_INDIRECT packets with the same other words, from the first one's data offset (`packets`,
+	// the first packet after its header): one operation (GpuDrawIndirectArgs::run_offsets).
+	void DrawIndirectRun(const uint32_t* packets, uint32_t count, IndirectDrawRegisters registers,
+	                     uint32_t draw_initiator);
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id, bool gl2_writeback);
 	void WriteBackImages();

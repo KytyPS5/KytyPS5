@@ -776,6 +776,26 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 		}
 		count++;
 	}
+	// chenxiao07's native XPR runs: following packets with the same other words draw the same object whatever their
+	// data offsets (nothing written between them). A shader pair whose draws its table programs take draws such a run
+	// in one operation: one table evaluation, the records grouped into multi-draws where they follow one another.
+	// (Demon's Souls, Boletaria: ~6,600 such packets a frame, ~3,460 operations by the constant stride, ~2,700 by
+	// runs.) Other pairs keep the constant stride, whose draws the normal path takes in one operation.
+	if (indexed && cp.TakesDrawRuns()) {
+		constexpr uint32_t MaxRun = 64;
+		uint32_t           run    = count;
+		for (uint32_t at = 4 + packet_dw * (count - 1); run < MaxRun && at + packet_dw < dw; at += packet_dw) {
+			const auto* next = buffer + at;
+			if (next[0] != cmd_id || next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) {
+				break;
+			}
+			run++;
+		}
+		if (run > count) {
+			cp.DrawIndirectRun(buffer, run, registers, draw_initiator);
+			return 4 + packet_dw * (run - 1);
+		}
+	}
 	cp.DrawIndirectMulti(data_offset, count, nullptr, stride, registers, draw_initiator, indexed);
 
 	return 4 + packet_dw * (count - 1);

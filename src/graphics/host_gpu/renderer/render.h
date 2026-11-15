@@ -335,6 +335,8 @@ public:
 	// Bit 0: the pair's last table try drew it; bit 1: a try of the pair was refused lately (its draws keep their
 	// resolution ahead).
 	[[nodiscard]] uint32_t TableHint(const HW::Shader& shaders) const noexcept;
+	// Whether a table try ever drew a draw (any thread).
+	[[nodiscard]] bool TableDrewDraws() const noexcept { return m_table_drew_draws.load(std::memory_order_relaxed); }
 	// The executing draw's table evaluation, made ahead by the resolve thread (KYTY_SCOUT=3; null: none).
 	void SetTableTicket(const void* ticket) noexcept { m_table_ticket = ticket; }
 	// The resolve thread: whether a plain dispatch of `cs` most likely goes through the table (tableXpr.inc).
@@ -343,7 +345,7 @@ public:
 	[[nodiscard]] bool TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint32_t count, uint32_t stride,
 	                               uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                               const DrawIndexArgs* direct, bool clean,
-	                               const ShaderIndirectOffsets& offsets = {});
+	                               const ShaderIndirectOffsets& offsets = {}, const uint32_t* run_offsets = nullptr);
 	// Resolve thread: whether the last native XPR try of the draw's shader pair drew it. Its
 	// resolution ahead is then likely wasted (KYTY_XPR_RESOLVE_SKIP=0 resolves them all the same).
 	[[nodiscard]] bool NativeXprLikely(const HW::Shader& shaders) const noexcept;
@@ -939,6 +941,7 @@ private:
 	// until which its draws are resolved ahead all the same (a try of the pair was refused lately: some of its draws
 	// take the normal path, which is several times slower without the resolution ahead).
 	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
+	std::atomic<bool>                        m_table_drew_draws {false};
 	// The compute stages whose last plain dispatch went through the table (TableDispatchHint).
 	std::array<std::atomic<uint64_t>, 4096> m_table_dispatched {};
 	std::array<std::atomic<uint64_t>, 16384> m_table_mixed_until {};

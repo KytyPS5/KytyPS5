@@ -129,6 +129,15 @@ uint32_t EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& in
 	});
 }
 
+uint32_t EmitRayQueryCandidateFrontFace(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& s = ctx.state;
+	return EmitValueOrDefaultIfCondition(
+	    s, ctx.Arg(inst, 0), TypeBool(s), ConstantBool(s, false), [&] {
+		    return Binary(s, spv::OpRayQueryGetIntersectionFrontFaceKHR, TypeBool(s), RayQuery(s),
+			              ConstantU32(s, Candidate));
+	    });
+}
+
 void EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	EmitIfCondition(s, ctx.Arg(inst, 0), [&] {

@@ -348,6 +348,7 @@ void                  EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::In
 uint32_t              EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidateFrontFace(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;

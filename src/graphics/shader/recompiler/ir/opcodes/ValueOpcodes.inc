@@ -325,13 +325,14 @@ VALUE_OPCODE(Bvh8Intersect, Bvh8Result, U32x4, ImageAddress, U1)
 VALUE_OPCODE(Bvh8Extract, U32, Bvh8Result, U32)
 VALUE_OPCODE(BvhStack, U32x2, U32, U32, U32x4, U32x4, U1)
 // A ray query over the mirror of the dispatch's guest TLAS: whether its context is valid; origin
-// xyz, direction xyz, t_max and cull mask; then per candidate {t, u, v, guest prim record} and the
-// guest address of its instance.
+// xyz, direction xyz, t_max and cull mask; then per candidate {t, u, v, guest prim record}, the
+// guest address of its instance and whether it faces the ray.
 VALUE_OPCODE(RayQueryValid, U1)
 VALUE_OPCODE(RayQueryInitialize, Void, U32, U32, U32, U32, U32, U32, U32, U32, U1)
 VALUE_OPCODE(RayQueryProceed, U1, U1)
 VALUE_OPCODE(RayQueryCandidate, U32x4, U1)
 VALUE_OPCODE(RayQueryCandidateInstance, U64, U1)
+VALUE_OPCODE(RayQueryCandidateFrontFace, U1, U1)
 VALUE_OPCODE(RayQueryConfirm, Void, U1)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)

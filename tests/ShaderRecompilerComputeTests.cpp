@@ -2478,48 +2478,53 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
-  // The video-out layer shader converts PQ and linear-nit main-bus frames for an SDR swapchain.
-  void CheckVideoOutHdr10ToSdr() {
-    constexpr const char *name = "VideoOutHdr10ToSdr";
-    const auto vertex = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_device);
-    const auto fragment = CompileSPV(GPU_VIDEO_OUT_OVERLAY_SPV, m_device);
-    const auto sampler = CreateSampler(name);
+  // The video-out layer pipeline as the swapchain builds it.
+  struct VideoOutLayer {
+    vk::ShaderModule vertex = nullptr;
+    vk::ShaderModule fragment = nullptr;
+    vk::Sampler sampler = nullptr;
+    vk::DescriptorSetLayout descriptors = nullptr;
+    vk::PipelineLayout layout = nullptr;
+    vk::Pipeline pipeline = nullptr;
+  };
+
+  VideoOutLayer CreateVideoOutLayer(const char *name) {
+    VideoOutLayer layer;
+    layer.vertex = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, m_device);
+    layer.fragment = CompileSPV(GPU_VIDEO_OUT_OVERLAY_SPV, m_device);
+    layer.sampler = CreateSampler(name, 1, vk::Filter::eLinear);
     const vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eCombinedImageSampler,
                                                  1, vk::ShaderStageFlagBits::eFragment};
     vk::DescriptorSetLayoutCreateInfo descriptors{};
     descriptors.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
     descriptors.bindingCount = 1;
     descriptors.pBindings = &binding;
-    vk::DescriptorSetLayout descriptor_layout = nullptr;
     RequireVk(name, "descriptors",
-              m_device.createDescriptorSetLayout(&descriptors, nullptr, &descriptor_layout),
+              m_device.createDescriptorSetLayout(&descriptors, nullptr, &layer.descriptors),
               "vkCreateDescriptorSetLayout");
-    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eFragment, 0, sizeof(u32)};
+    // Flags, then the layer's width and height on the target.
+    const vk::PushConstantRange push{vk::ShaderStageFlagBits::eFragment, 0, 3 * sizeof(u32)};
     vk::PipelineLayoutCreateInfo layout_info{};
     layout_info.setLayoutCount = 1;
-    layout_info.pSetLayouts = &descriptor_layout;
+    layout_info.pSetLayouts = &layer.descriptors;
     layout_info.pushConstantRangeCount = 1;
     layout_info.pPushConstantRanges = &push;
-    vk::PipelineLayout layout = nullptr;
-    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_info, nullptr, &layout),
+    RequireVk(name, "layout",
+              m_device.createPipelineLayout(&layout_info, nullptr, &layer.layout),
               "vkCreatePipelineLayout");
     std::array<vk::PipelineShaderStageCreateInfo, 2> stages{};
     stages[0].stage = vk::ShaderStageFlagBits::eVertex;
-    stages[0].module = vertex;
+    stages[0].module = layer.vertex;
     stages[0].pName = "main";
     stages[1].stage = vk::ShaderStageFlagBits::eFragment;
-    stages[1].module = fragment;
+    stages[1].module = layer.fragment;
     stages[1].pName = "main";
     vk::PipelineVertexInputStateCreateInfo vertex_input{};
     vk::PipelineInputAssemblyStateCreateInfo assembly{};
     assembly.topology = vk::PrimitiveTopology::eTriangleList;
-    const vk::Viewport viewport{0.0f, 0.0f, 4.0f, 1.0f, 0.0f, 1.0f};
-    const vk::Rect2D scissor{{0, 0}, {4, 1}};
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.viewportCount = 1;
-    viewport_state.pViewports = &viewport;
     viewport_state.scissorCount = 1;
-    viewport_state.pScissors = &scissor;
     vk::PipelineRasterizationStateCreateInfo rasterization{};
     rasterization.lineWidth = 1.0f;
     vk::PipelineMultisampleStateCreateInfo multisample{};
@@ -2530,6 +2535,10 @@ public:
     vk::PipelineColorBlendStateCreateInfo blend{};
     blend.attachmentCount = 1;
     blend.pAttachments = &attachment;
+    const std::array dynamic_states{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamic{};
+    dynamic.dynamicStateCount = static_cast<u32>(dynamic_states.size());
+    dynamic.pDynamicStates = dynamic_states.data();
     const auto target_format = vk::Format::eR8G8B8A8Unorm;
     vk::PipelineRenderingCreateInfo rendering_format{};
     rendering_format.colorAttachmentCount = 1;
@@ -2544,60 +2553,92 @@ public:
     create.pRasterizationState = &rasterization;
     create.pMultisampleState = &multisample;
     create.pColorBlendState = &blend;
-    create.layout = layout;
-    vk::Pipeline pipeline = nullptr;
+    create.pDynamicState = &dynamic;
+    create.layout = layer.layout;
     RequireVk(name, "pipeline",
-              m_device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+              m_device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &layer.pipeline),
               "vkCreateGraphicsPipelines");
+    return layer;
+  }
 
-    auto target = CreateImage2D(name, 4, 1, target_format,
+  void DestroyVideoOutLayer(VideoOutLayer *layer) {
+    m_device.destroyPipeline(layer->pipeline, nullptr);
+    m_device.destroyPipelineLayout(layer->layout, nullptr);
+    m_device.destroyDescriptorSetLayout(layer->descriptors, nullptr);
+    m_device.destroySampler(layer->sampler, nullptr);
+    m_device.destroyShaderModule(layer->fragment, nullptr);
+    m_device.destroyShaderModule(layer->vertex, nullptr);
+    *layer = {};
+  }
+
+  // Draws `source` as a width x height layer into an RGBA8 target and returns its pixels.
+  std::vector<u32> DrawVideoOutLayer(const char *name, const VideoOutLayer &layer, Image &source,
+                                     u32 flags, u32 width, u32 height) {
+    auto target = CreateImage2D(name, width, height, vk::Format::eR8G8B8A8Unorm,
                                 vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
-                                vk::ImageLayout::eTransferSrcOptimal);
-    const auto render = [&](Image &source, u32 flags) {
-      vk::CommandBuffer cmd = BeginCommands(name, "draw");
-      AddImageBarrier(cmd, target.image, target.layout,
-                      vk::ImageLayout::eColorAttachmentOptimal,
-                      vk::PipelineStageFlagBits::eTransfer,
-                      vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                      vk::AccessFlagBits::eTransferRead,
-                      vk::AccessFlagBits::eColorAttachmentWrite);
-      target.layout = vk::ImageLayout::eColorAttachmentOptimal;
-      vk::RenderingAttachmentInfo color{};
-      color.imageView = target.view;
-      color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-      color.loadOp = vk::AttachmentLoadOp::eClear;
-      color.storeOp = vk::AttachmentStoreOp::eStore;
-      vk::RenderingInfo rendering{};
-      rendering.renderArea.extent = scissor.extent;
-      rendering.layerCount = 1;
-      rendering.colorAttachmentCount = 1;
-      rendering.pColorAttachments = &color;
-      const vk::DescriptorImageInfo image{sampler, source.view,
-                                          vk::ImageLayout::eShaderReadOnlyOptimal};
-      vk::WriteDescriptorSet write{};
-      write.descriptorCount = 1;
-      write.descriptorType = vk::DescriptorType::eCombinedImageSampler;
-      write.pImageInfo = &image;
-      cmd.beginRendering(rendering);
-      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-      cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0, 1, &write);
-      cmd.pushConstants(layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(flags), &flags);
-      cmd.draw(3, 1, 0, 0);
-      cmd.endRendering();
-      EndSubmitAndFree(name, "draw", cmd);
-      return ReadImage(name, &target);
-    };
-    const auto pixelsMatch = [](const std::vector<u32> &actual, const std::vector<u32> &expected) {
-      for (size_t i = 0; i < expected.size(); i++) {
-        for (u32 shift = 0; shift < 32; shift += 8) {
-          if (std::abs(static_cast<int>((actual[i] >> shift) & 0xffu) -
-                       static_cast<int>((expected[i] >> shift) & 0xffu)) > 1) {
-            return false;
-          }
+                                vk::ImageLayout::eColorAttachmentOptimal);
+    vk::CommandBuffer cmd = BeginCommands(name, "draw");
+    AddImageBarrier(cmd, target.image, target.layout,
+                    vk::ImageLayout::eColorAttachmentOptimal,
+                    vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eColorAttachmentOutput, {},
+                    vk::AccessFlagBits::eColorAttachmentWrite);
+    const vk::Viewport viewport{0.0f, 0.0f, static_cast<float>(width),
+                                static_cast<float>(height), 0.0f, 1.0f};
+    const vk::Rect2D scissor{{0, 0}, {width, height}};
+    vk::RenderingAttachmentInfo color{};
+    color.imageView = target.view;
+    color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    color.loadOp = vk::AttachmentLoadOp::eClear;
+    color.storeOp = vk::AttachmentStoreOp::eStore;
+    vk::RenderingInfo rendering{};
+    rendering.renderArea.extent = scissor.extent;
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    const vk::DescriptorImageInfo image{layer.sampler, source.view,
+                                        vk::ImageLayout::eShaderReadOnlyOptimal};
+    vk::WriteDescriptorSet write{};
+    write.descriptorCount = 1;
+    write.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    write.pImageInfo = &image;
+    const std::array<u32, 3> push{flags, width, height};
+    cmd.beginRendering(rendering);
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, layer.pipeline);
+    cmd.setViewport(0, 1, &viewport);
+    cmd.setScissor(0, 1, &scissor);
+    cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layer.layout, 0, 1, &write);
+    cmd.pushConstants(layer.layout, vk::ShaderStageFlagBits::eFragment, 0,
+                      static_cast<u32>(push.size() * sizeof(u32)), push.data());
+    cmd.draw(3, 1, 0, 0);
+    cmd.endRendering();
+    EndSubmitAndFree(name, "draw", cmd);
+    auto pixels = ReadImage(name, &target);
+    DestroyImage(&target);
+    return pixels;
+  }
+
+  // Whether every channel of every pixel is within `tolerance` of the expected one.
+  static bool PixelsNear(const std::vector<u32> &actual, const std::vector<u32> &expected,
+                         int tolerance) {
+    if (actual.size() < expected.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < expected.size(); i++) {
+      for (u32 shift = 0; shift < 32; shift += 8) {
+        if (std::abs(static_cast<int>((actual[i] >> shift) & 0xffu) -
+                     static_cast<int>((expected[i] >> shift) & 0xffu)) > tolerance) {
+          return false;
         }
       }
-      return true;
-    };
+    }
+    return true;
+  }
+
+  // The video-out layer shader converts PQ and linear-nit main-bus frames for an SDR swapchain.
+  void CheckVideoOutHdr10ToSdr() {
+    constexpr const char *name = "VideoOutHdr10ToSdr";
+    auto layer = CreateVideoOutLayer(name);
 
     // Black, 100-nit and 250-nit gray, then a color; every source alpha is zero. Flags:
     // premultiplied (1), HDR target (2), PQ source (4), linear source (8), opaque main bus (16).
@@ -2607,8 +2648,8 @@ public:
         {pq(0, 0, 0), pq(520, 520, 520), pq(616, 616, 616), pq(560, 500, 440)}, 1,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "PQ source",
-            pixelsMatch(render(pq_source, 4u | 16u),
-                        {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}),
+            PixelsNear(DrawVideoOutLayer(name, layer, pq_source, 4u | 16u, 4, 1),
+                       {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff6e95e3u}, 1),
             "PQ pixels were not converted to opaque sRGB");
     // Half-float nits: 0, 100, 250 and (150, 90, 40).
     auto nit_source = CreateImage2D(
@@ -2616,12 +2657,12 @@ public:
         {0, 0, 0x56405640u, 0x5640u, 0x5bd05bd0u, 0x5bd0u, 0x55a058b0u, 0x5100u}, 2,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "linear source",
-            pixelsMatch(render(nit_source, 4u | 8u | 16u),
-                        {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
+            PixelsNear(DrawVideoOutLayer(name, layer, nit_source, 4u | 8u | 16u, 4, 1),
+                       {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}, 1),
             "linear-nit pixels were not converted to opaque sRGB");
     Require(name, "linear-nit HDR target",
-            pixelsMatch(render(nit_source, 2u | 4u | 8u | 16u),
-                        {0xff000000u, 0xff828282u, 0xff9a9a9au, 0xff6b7f8cu}),
+            PixelsNear(DrawVideoOutLayer(name, layer, nit_source, 2u | 4u | 8u | 16u, 4, 1),
+                        {0xff000000u, 0xff828282u, 0xff9a9a9au, 0xff6b7f8cu}, 1),
             "linear-nit pixels were not converted to opaque HDR10 PQ");
 
     // Linear SDR with alpha 0x80.
@@ -2630,12 +2671,12 @@ public:
         {0x80000000u, 0x80808080u, 0x80ffffffu, 0x804080c0u}, 1,
         vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "SDR linear source",
-            pixelsMatch(render(sdr_source, 8u | 16u),
-                        {0xff000000u, 0xffbcbcbcu, 0xffffffffu, 0xff89bce1u}),
+            PixelsNear(DrawVideoOutLayer(name, layer, sdr_source, 8u | 16u, 4, 1),
+                        {0xff000000u, 0xffbcbcbcu, 0xffffffffu, 0xff89bce1u}, 1),
             "SDR linear pixels were not converted to opaque sRGB");
     Require(name, "premultiplied SDR linear source",
-            pixelsMatch(render(sdr_source, 1u | 8u),
-                        {0x80000000u, 0x80808080u, 0x80808080u, 0x805e8080u}),
+            PixelsNear(DrawVideoOutLayer(name, layer, sdr_source, 1u | 8u, 4, 1),
+                        {0x80000000u, 0x80808080u, 0x80808080u, 0x805e8080u}, 1),
             "premultiplied linear pixels were not converted to premultiplied sRGB");
     // PQ with alpha 1/3 and color up to three times the alpha.
     auto bright_pq_source = CreateImage2D(
@@ -2643,21 +2684,175 @@ public:
         {1u << 30u, pq(341, 341, 341) | 1u << 30u, pq(716, 716, 716) | 1u << 30u,
          pq(1023, 1023, 1023) | 1u << 30u}, 1, vk::ImageLayout::eShaderReadOnlyOptimal);
     Require(name, "premultiplied PQ above alpha",
-            pixelsMatch(render(bright_pq_source, 1u | 4u),
-                        {0x55000000u, 0x55555555u, 0x55555555u, 0x55555555u}),
+            PixelsNear(DrawVideoOutLayer(name, layer, bright_pq_source, 1u | 4u, 4, 1),
+                        {0x55000000u, 0x55555555u, 0x55555555u, 0x55555555u}, 1),
             "premultiplied PQ pixels above alpha did not saturate to SDR white");
 
     DestroyImage(&bright_pq_source);
     DestroyImage(&sdr_source);
     DestroyImage(&nit_source);
     DestroyImage(&pq_source);
-    DestroyImage(&target);
-    m_device.destroyPipeline(pipeline, nullptr);
-    m_device.destroyPipelineLayout(layout, nullptr);
-    m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
-    m_device.destroySampler(sampler, nullptr);
-    m_device.destroyShaderModule(fragment, nullptr);
-    m_device.destroyShaderModule(vertex, nullptr);
+    DestroyVideoOutLayer(&layer);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A layer shown smaller than its source gives every target pixel the mean of the source pixels
+  // under it; a linear filter reads two per axis. An opaque layer's mean is taken in linear
+  // light, a blended layer's of the values it blends.
+  void CheckVideoOutShrunkLayer() {
+    constexpr const char *name = "VideoOutShrunkLayer";
+    constexpr u32 opaque = 16u;
+    auto layer = CreateVideoOutLayer(name);
+    const auto to_linear = [](double value) {
+      return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+    };
+    const auto to_srgb = [](double value) {
+      return value <= 0.0031308 ? value * 12.92 : 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
+    };
+    // The share of source texel `texel` in target pixel `pixel` along an axis of `size` texels
+    // shown in `shown` pixels: its overlap, or a linear filter's blend where the axis is not
+    // shrunk.
+    const auto share = [](u32 texel, u32 pixel, u32 size, u32 shown) {
+      const double scale = static_cast<double>(size) / shown;
+      if (shown < size) {
+        const double low = std::max<double>(texel, pixel * scale);
+        const double high = std::min<double>(texel + 1.0, (pixel + 1.0) * scale);
+        return std::max(high - low, 0.0) / scale;
+      }
+      const double centre = (pixel + 0.5) * scale - 0.5;
+      const double first = std::floor(centre);
+      const double last_texel = size - 1.0;
+      double result = 0.0;
+      if (std::clamp(first, 0.0, last_texel) == texel) {
+        result += 1.0 - (centre - first);
+      }
+      if (std::clamp(first + 1.0, 0.0, last_texel) == texel) {
+        result += centre - first;
+      }
+      return result;
+    };
+    const auto reference = [&](const std::vector<u32> &source, u32 source_width,
+                               u32 source_height, u32 width, u32 height) {
+      std::vector<u32> pixels(width * height, 0xff000000u);
+      for (u32 y = 0; y < height; y++) {
+        for (u32 x = 0; x < width; x++) {
+          std::array<double, 3> mean{};
+          for (u32 v = 0; v < source_height; v++) {
+            for (u32 u = 0; u < source_width; u++) {
+              const double weight =
+                  share(u, x, source_width, width) * share(v, y, source_height, height);
+              for (u32 c = 0; c < 3; c++) {
+                mean[c] += weight *
+                           to_linear(((source[v * source_width + u] >> (8 * c)) & 0xffu) / 255.0);
+              }
+            }
+          }
+          for (u32 c = 0; c < 3; c++) {
+            pixels[y * width + x] |= static_cast<u32>(std::lround(to_srgb(mean[c]) * 255.0))
+                                     << (8 * c);
+          }
+        }
+      }
+      return pixels;
+    };
+    const auto shrink = [&](const char *step, const std::vector<u32> &texels, u32 source_width,
+                            u32 source_height, u32 width, u32 height,
+                            const std::vector<u32> &expected, const char *message) {
+      auto source = CreateImage2D(name, source_width, source_height,
+                                  vk::Format::eR8G8B8A8Unorm, vk::ImageUsageFlagBits::eSampled,
+                                  texels, 1, vk::ImageLayout::eShaderReadOnlyOptimal);
+      Require(name, step,
+              PixelsNear(DrawVideoOutLayer(name, layer, source, opaque, width, height),
+                         expected, 1),
+              message);
+      DestroyImage(&source);
+    };
+    const auto colors = [](u32 count) {
+      std::vector<u32> texels(count);
+      u32 state = 0x2545f491u;
+      for (auto &texel : texels) {
+        state = state * 1664525u + 1013904223u;
+        texel = state >> 8u;
+      }
+      return texels;
+    };
+
+    // One white pixel in each 3x3 block, at a different place in every block; all source alpha
+    // is zero. A third of each axis leaves a ninth of the light everywhere.
+    std::vector<u32> dots(12 * 6, 0);
+    for (u32 block = 0; block < 8; block++) {
+      dots[((block / 4) * 3 + block / 3) * 12 + (block % 4) * 3 + block % 3] = 0x00ffffffu;
+    }
+    shrink("one pixel in nine", dots, 12, 6, 4, 2, std::vector<u32>(8, 0xff5e5e5eu),
+           "a third-size layer did not show the mean of each 3x3 block");
+    shrink("whole pixels", dots, 12, 6, 4, 2, reference(dots, 12, 6, 4, 2),
+           "the reference disagrees with the mean of each 3x3 block");
+    const auto uneven = colors(7 * 5);
+    shrink("part pixels", uneven, 7, 5, 3, 2, reference(uneven, 7, 5, 3, 2),
+           "pixels covered in part were not weighted by the part covered");
+    shrink("under half", uneven, 7, 5, 5, 4, reference(uneven, 7, 5, 5, 4),
+           "a layer shrunk by less than half was not weighted by coverage");
+    // Three source columns per target column, half a source row per target row.
+    const auto wide = colors(6 * 2);
+    shrink("one axis", wide, 6, 2, 2, 4, reference(wide, 6, 2, 2, 4),
+           "a layer shrunk along one axis did not blend linearly along the other");
+
+    // Four pixels of a blended layer, premultiplied and not: the mean of the values the blend
+    // adds, and of their alpha.
+    auto veil = CreateImage2D(
+        name, 2, 2, vk::Format::eR8G8B8A8Unorm, vk::ImageUsageFlagBits::eSampled,
+        {0xff4080c0u, 0x80204060u, 0x00000000u, 0x40102030u}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "premultiplied layer",
+            PixelsNear(DrawVideoOutLayer(name, layer, veil, 1u, 1, 1), {0x701c3854u}, 1),
+            "a shrunk premultiplied layer did not show the mean of its pixels");
+    Require(name, "blended layer",
+            PixelsNear(DrawVideoOutLayer(name, layer, veil, 0u, 1, 1), {0x70152a3fu}, 1),
+            "a shrunk blended layer did not show the mean of its pixels times their alpha");
+    DestroyImage(&veil);
+
+    // Black and 250-nit gray: the mean is taken of what an SDR target shows, then of the nits
+    // an HDR target shows.
+    const auto pq = [](u32 code) { return code | (code << 10u) | (code << 20u); };
+    auto pq_source = CreateImage2D(
+        name, 2, 1, vk::Format::eA2B10G10R10UnormPack32, vk::ImageUsageFlagBits::eSampled,
+        {pq(0), pq(616)}, 1, vk::ImageLayout::eShaderReadOnlyOptimal);
+    const auto converted = DrawVideoOutLayer(name, layer, pq_source, 4u | opaque, 2, 1);
+    Require(name, "converted first",
+            PixelsNear(DrawVideoOutLayer(name, layer, pq_source, 4u | opaque, 1, 1),
+                       reference(converted, 2, 1, 1, 1), 2),
+            "a shrunk PQ layer was not converted for the SDR target before the mean");
+    const auto pq_to_nits = [](double code) {
+      const double powered = std::pow(code, 32.0 / 2523.0);
+      return 10000.0 * std::pow(std::max(powered - 3424.0 / 4096.0, 0.0) /
+                                    (2413.0 / 128.0 - (2392.0 / 128.0) * powered),
+                                16384.0 / 2610.0);
+    };
+    const auto nits_to_pq = [](double nits) {
+      const double powered = std::pow(nits / 10000.0, 2610.0 / 16384.0);
+      return std::pow((3424.0 / 4096.0 + (2413.0 / 128.0) * powered) /
+                          (1.0 + (2392.0 / 128.0) * powered),
+                      2523.0 / 32.0);
+    };
+    const auto half_nits = static_cast<u32>(
+        std::lround(nits_to_pq((pq_to_nits(0.0) + pq_to_nits(616.0 / 1023.0)) / 2.0) * 255.0));
+    Require(name, "HDR target",
+            PixelsNear(DrawVideoOutLayer(name, layer, pq_source, 2u | 4u | opaque, 1, 1),
+                       {0xff000000u | half_nits * 0x010101u}, 1),
+            "a shrunk PQ layer on an HDR target did not show the mean of its nits");
+
+    // A layer shown larger keeps the linear filter on its encoded values.
+    auto steps = CreateImage2D(
+        name, 2, 1, vk::Format::eR8G8B8A8Unorm, vk::ImageUsageFlagBits::eSampled,
+        {0x00000000u, 0x00ffffffu}, 1, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "enlarged layer",
+            PixelsNear(DrawVideoOutLayer(name, layer, steps, opaque, 4, 1),
+                       {0xff000000u, 0xff404040u, 0xffbfbfbfu, 0xffffffffu}, 1),
+            "an enlarged layer was not filtered linearly");
+    DestroyImage(&steps);
+
+    DestroyImage(&pq_source);
+    DestroyVideoOutLayer(&layer);
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -60630,6 +60825,31 @@ void CheckHmd2() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// The presenter shows a frame larger than the window through the layer shader and blits one that
+// is not.
+void CheckPresentScaledFrames() {
+  constexpr const char *name = "PresentScaledFrames";
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window = SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &presenter = *window.presenter;
+  const auto presented = [&] { return window.loop.presented_frames.load(); };
+  // Wider and taller than the 64x64 window, its size, and smaller.
+  constexpr std::array<std::array<uint32_t, 2>, 4> sizes{
+      {{192, 108}, {200, 200}, {64, 64}, {32, 16}}};
+  for (const auto &size : sizes) {
+    const auto before = presented();
+    presenter.Present(presenter.PrepareBlankFrame(size[0], size[1], true));
+    Require(name, "present", presented() == before + 1, "a scaled frame was not presented");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // A flip rate is the shortest flip interval, counted from the last flip.
 void CheckFlipRate() {
   namespace EventQueue = LibKernel::EventQueue;
@@ -62284,6 +62504,10 @@ int main(int argc, char **argv) {
     CheckPm4Flip();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--present-scale-only") == 0) {
+    CheckPresentScaledFrames();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
     CheckFlipRate();
     return 0;
@@ -62303,6 +62527,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--video-out-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckVideoOutHdr10ToSdr();
+    vulkan.CheckVideoOutShrunkLayer();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
@@ -62929,6 +63154,7 @@ int main(int argc, char **argv) {
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckVideoOutHdr10ToSdr();
+  vulkan.CheckVideoOutShrunkLayer();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();

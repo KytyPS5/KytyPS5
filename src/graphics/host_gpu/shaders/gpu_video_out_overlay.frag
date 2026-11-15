@@ -3,6 +3,11 @@
 
 layout(location = 0) out vec4 color;
 
+vec3 SrgbToLinear(vec3 rgb) {
+	return mix(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3(2.4)),
+	           greaterThan(rgb, vec3(0.04045)));
+}
+
 vec3 LinearToPq(vec3 normalized) {
 	vec3 powered = pow(clamp(normalized, 0.0, 1.0), vec3(2610.0 / 16384.0));
 	return pow((3424.0 / 4096.0 + (2413.0 / 128.0) * powered) /
@@ -11,9 +16,7 @@ vec3 LinearToPq(vec3 normalized) {
 
 vec3 SdrToHdr10(vec3 rgb, bool source_linear) {
 	rgb = clamp(rgb, 0.0, 1.0);
-	vec3 linear = source_linear ? rgb :
-	    mix(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3(2.4)),
-	        greaterThan(rgb, vec3(0.04045)));
+	vec3 linear = source_linear ? rgb : SrgbToLinear(rgb);
 	// Convert primaries and scale 250-nit reference white relative to 10,000 nits.
 	const mat3 to_rec2020 = (250.0 / 10000.0) *
 	    mat3(0.627404, 0.069097, 0.016391,
@@ -36,14 +39,18 @@ void main() {
 
 layout(location = 0) in vec2 uv;
 layout(binding = 0) uniform sampler2D source;
-layout(push_constant) uniform AlphaControl {
+layout(push_constant) uniform Layer {
 	uint flags; // bit 0: premultiplied, 1: HDR target, 2: PQ source, 3: linear source, 4: opaque
+	// The layer's size on the target.
+	int width;
+	int height;
 };
 
-void main() {
-	const uint HDR_TARGET = 2u;
-	const uint PQ_SOURCE = 4u;
-	vec4 sampled = texture(source, uv);
+const uint HDR_TARGET = 2u;
+const uint PQ_SOURCE = 4u;
+
+// A source pixel as the layer shows it.
+vec4 Shown(vec4 sampled) {
 	if ((flags & 16u) != 0u) {
 		sampled.a = 1.0;
 	}
@@ -65,6 +72,62 @@ void main() {
 	if (!premultiplied || convert) {
 		sampled.rgb *= sampled.a;
 	}
-	color = sampled;
+	return sampled;
+}
+
+// The source texels of a target pixel along one axis: those it covers, or a linear filter's two.
+void Footprint(int pixel, int size, int shown, out int first, out int last) {
+	if (shown < size) {
+		first = pixel * size / shown;
+		last  = ((pixel + 1) * size - 1) / shown;
+	} else {
+		first = ((2 * pixel + 1) * size + shown) / (2 * shown) - 1;
+		last  = first + 1;
+	}
+}
+
+// The share of one of them.
+float Weight(int texel, int pixel, int size, int shown) {
+	if (shown < size) {
+		int low  = max(texel * shown, pixel * size);
+		int high = min((texel + 1) * shown, (pixel + 1) * size);
+		return float(high - low) / float(size);
+	}
+	int   centre = (2 * pixel + 1) * size + shown;
+	float second = float(centre % (2 * shown)) / float(2 * shown);
+	return texel == centre / (2 * shown) - 1 ? 1.0 - second : second;
+}
+
+void main() {
+	ivec2 size  = textureSize(source, 0);
+	ivec2 shown = ivec2(width, height);
+	if (all(greaterThanEqual(shown, size))) {
+		color = Shown(texture(source, uv));
+		return;
+	}
+	// A linear filter reads two source pixels per axis. A layer shown smaller takes the mean of
+	// those each pixel covers: of their light when opaque, else of the values the target blends.
+	ivec2 pixel  = ivec2(uv * vec2(shown));
+	bool  opaque = (flags & 16u) != 0u;
+	bool  pq     = (flags & HDR_TARGET) != 0u;
+	ivec2 first;
+	ivec2 last;
+	Footprint(pixel.x, size.x, shown.x, first.x, last.x);
+	Footprint(pixel.y, size.y, shown.y, first.y, last.y);
+	vec4 mean = vec4(0.0);
+	for (int y = first.y; y <= last.y; y++) {
+		float row = Weight(y, pixel.y, size.y, shown.y);
+		for (int x = first.x; x <= last.x; x++) {
+			vec4 texel = Shown(texelFetch(source, clamp(ivec2(x, y), ivec2(0), size - 1), 0));
+			if (opaque) {
+				texel.rgb = pq ? PqToNits(texel.rgb) : SrgbToLinear(texel.rgb);
+			}
+			mean += row * Weight(x, pixel.x, size.x, shown.x) * texel;
+		}
+	}
+	if (opaque) {
+		mean = vec4(pq ? LinearToPq(mean.rgb / 10000.0) : LinearToSrgb(mean.rgb), 1.0);
+	}
+	color = mean;
 }
 #endif

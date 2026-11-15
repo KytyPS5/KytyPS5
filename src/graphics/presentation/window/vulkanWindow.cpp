@@ -71,7 +71,9 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 }
 
 vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noexcept {
-	return {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
+	return {.shaderDemoteToHelperInvocation = VK_TRUE,
+	        .synchronization2               = VK_TRUE,
+	        .dynamicRendering               = VK_TRUE};
 }
 
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
@@ -258,6 +260,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering");
 		check_feature(features13.synchronization2, "synchronization2");
+		check_feature(features13.shaderDemoteToHelperInvocation, "shaderDemoteToHelperInvocation");
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");

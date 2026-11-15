@@ -75,8 +75,10 @@ struct PipelineStaticParameters {
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 	HostSamplePattern          sample_pattern;
+	// Without a pixel shader, a host fragment shader applies the draw's PA_SC_AA_MASK.
+	bool aa_mask_fragment = false;
 	// Keys are hashed as bytes, so the key's tail must hold no padding.
-	uint8_t sample_pattern_padding[3] = {};
+	uint8_t sample_pattern_padding[2] = {};
 };
 
 struct PipelineRenderingState {
@@ -157,6 +159,8 @@ struct DrawRenderState {
 	bool                                 indirect_draw = false;
 	// Output: the vertex stage exports straight to the pixel inputs.
 	bool parameters_linked = false;
+	// Output: the quad pixels PA_SC_AA_MASK covers, bit (y & 1) * 2 + (x & 1).
+	uint32_t aa_quad_mask = 0xf;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -238,7 +242,7 @@ private:
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         uint32_t push_data_cursor, uint32_t push_data_end);
 	};
 
 	struct ProgramKey {
@@ -300,8 +304,9 @@ private:
 	ShaderStoreWriter m_store;
 
 	template <typename InputInfo>
-	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	const ShaderModule*
+	GetProgram(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	           uint32_t push_data_end = ShaderRecompiler::IR::PushData::DwordCount);
 	// The resource plan of a vertex stage without calls, translating it if need be.
 	const ShaderRecompiler::IR::ResourcePlan* VertexPlan(const ShaderParams&    params,
 	                                                     ShaderVertexInputInfo& input_info);

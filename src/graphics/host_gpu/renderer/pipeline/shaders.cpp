@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_aa_mask_spv.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -166,6 +167,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 	const auto       task_module =
 	    vertex.mesh_task ? CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device) : vk::ShaderModule {};
+	const auto mask_module = static_params.aa_mask_fragment
+	                             ? CompileSPV(GPU_AA_MASK_SPV, graphics.device)
+	                             : vk::ShaderModule {};
 
 	if (rect_list) {
 		std::span<const RectListParameter> parameters;
@@ -188,6 +192,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
 		                                       .module = task_module,
 		                                       .pName  = "main"};
+	}
+	if (mask_module) {
+		shader_stages[shader_stage_count++] = {
+		    .stage = vk::ShaderStageFlagBits::eFragment, .module = mask_module, .pName = "main"};
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =
@@ -387,6 +395,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	graphics.device.destroyShaderModule(task_module, nullptr);
+	graphics.device.destroyShaderModule(mask_module, nullptr);
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,

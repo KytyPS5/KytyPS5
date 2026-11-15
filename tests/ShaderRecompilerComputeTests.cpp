@@ -24031,6 +24031,352 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // PA_SC_AA_MASK on single-sample targets: Death Stranding 2 fades LODs through 2x2 stipples
+  // with four raster samples configured and multisampling off.
+  void CheckAaMask() {
+    constexpr const char *name = "AaMask";
+    EnsureRuntimeContext();
+    if (!m_rasterization_supported) {
+      std::printf("[host]    %-32s SKIP (no rasterization)\n", name);
+      return;
+    }
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint32_t width = 8;
+    constexpr uint32_t height = 4;
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetTextureCache();
+    auto &executor = context.GetRenderExecutor();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct_offset) == 0,
+            "allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    context.MapMemory(base, allocation_size);
+
+    registers.Reset();
+    registers.SetViewportTransformControl(0x300);
+    registers.SetViewportScaleOffset(0, width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f,
+                                     1, 0);
+    registers.SetViewportZMax(0, 1);
+    registers.SetScreenScissor(0, 0, width, height);
+    registers.SetWindowScissor(0, 0, width, height, false);
+    registers.SetGenericScissor(0, 0, width, height, false);
+    registers.SetViewportScissorTL(0, 0, 0, false);
+    registers.SetViewportScissorBR(0, width, height);
+    registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
+    registers.SetPsInControl(0x8000);
+    registers.SetTargetOutputMode(0, 4);
+    registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                               .channel_type = Prospero::ChannelType::kFloat,
+                               .channel_order = Prospero::ChannelOrder::kStandard});
+    registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+    registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    HW::AaConfig aa{};
+    aa.msaa_num_samples = 2;
+    registers.SetAaConfig(aa);
+
+    static ShaderUserData user_data{};
+    static std::deque<std::vector<u32>> programs;
+    const auto literal = [](float value) { return std::bit_cast<u32>(value); };
+    // One triangle over the whole target at depth z, or at the depth in user SGPR 15 after
+    // reading all sixteen.
+    const auto vertex_shader = [&](float z, bool user_depth = false) {
+      auto &code = programs.emplace_back();
+      const std::array<std::array<float, 3>, 2> axes{{{-1.0f, 3.0f, -1.0f}, {-1.0f, -1.0f, 3.0f}}};
+      for (u32 axis = 0; axis < 2; axis++) {
+        const auto destination = 3 + axis;
+        AppendVMovLiteral(&code, 1, literal(axes[axis][0]));
+        AppendVMovLiteral(&code, 2, literal(axes[axis][1]));
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+        code.push_back(EncodeVop2(0x01, destination, Vgpr(1), 2));
+        AppendVMovLiteral(&code, 2, literal(axes[axis][2]));
+        code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+        code.push_back(EncodeVop2(0x01, destination, Vgpr(destination), 2));
+      }
+      if (user_depth) {
+        // v7 = s8 + ... + s23: the first fifteen are zero.
+        code.push_back(EncodeVop1(0x01, 7, 8));
+        for (u32 reg = 9; reg < 24; reg++) {
+          code.push_back(EncodeVop2(0x03, 7, reg, 7));
+        }
+      } else {
+        AppendVMovLiteral(&code, 7, literal(z));
+      }
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, literal(1.0f));
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(3, 4, 7, 6));
+      for (u32 parameter = 0; parameter < 8; parameter++) {
+        code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+        code.push_back(EncodeExp1(0, 0, 0, 0));
+      }
+      AppendEnd(&code);
+      const auto address = reinterpret_cast<uint64_t>(code.data());
+      ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kGs, .user_data = &user_data,
+                                  .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return address;
+    };
+    // Exports a constant, or the sum of the sixteen user SGPRs.
+    const auto pixel_shader = [&](float value, bool user_color = false) {
+      auto &code = programs.emplace_back();
+      if (user_color) {
+        code.push_back(EncodeVop1(0x01, 0, 0));
+        for (u32 reg = 1; reg < 16; reg++) {
+          code.push_back(EncodeVop2(0x03, 0, reg, 0));
+        }
+      } else {
+        AppendVMovLiteral(&code, 0, literal(value));
+      }
+      code.push_back(EncodeExp0(0, 0xf));
+      code.push_back(EncodeExp1(0, 0, 0, 0));
+      AppendEnd(&code);
+      const auto address = reinterpret_cast<uint64_t>(code.data());
+      ShaderMapUserData(address, {.type = Prospero::ShaderBinaryType::kPs,
+                                  .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+      return address;
+    };
+    const auto near_vs = vertex_shader(0.25f);
+    const auto far_vs = vertex_shader(0.5f);
+    const auto one = pixel_shader(1.0f);
+    const auto two = pixel_shader(2.0f);
+    const u32 f1 = literal(1.0f);
+    const u32 f2 = literal(2.0f);
+
+    // Sixteen sample bits per quad pixel; `quad` bit (y & 1) * 2 + (x & 1) keeps that pixel.
+    const auto set_mask = [&](u32 quad, u32 kept = 0xffffu, u32 dropped = 0) {
+      const auto field = [&](u32 pixel) { return (quad >> pixel) & 1u ? kept : dropped; };
+      registers.SetAaMask({field(0) | (field(1) << 16u), field(2) | (field(3) << 16u)});
+    };
+    const auto covered = [](u32 quad, u32 x, u32 y) {
+      return ((quad >> ((y & 1u) * 2u + (x & 1u))) & 1u) != 0;
+    };
+    // Whether the draw was recorded.
+    Common::DebugCounters::SetEnabled(true);
+    const auto draw = [&](uint64_t color_address, uint64_t vs, uint64_t ps) {
+      registers.SetColorBase(0, {.addr = color_address});
+      shaders.SetEsShaderBase(vs);
+      shaders.SetPsShaderBase(ps);
+      const auto before = Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws);
+      Require(name, "draw",
+              RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                 {.vertex_count = 3, .instance_count = 1}),
+              "the draw was refused");
+      return Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws) != before;
+    };
+    const auto read_red = [&](uint64_t color_address) {
+      registers.SetColorBase(0, {.addr = color_address});
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      cache.UpdateImage(color.image_id);
+      const auto texels = ReadCachedTexel(name, context, color.image_id, {}, {width, height, 1});
+      std::vector<u32> red(width * height);
+      for (uint32_t i = 0; i < red.size(); i++) {
+        red[i] = texels[i * 4];
+      }
+      return red;
+    };
+    // Every pixel the quad mask keeps holds `kept`, every other one `dropped`.
+    const auto check = [&](const char *label, const std::vector<u32> &pixels, u32 quad, u32 kept,
+                           u32 dropped) {
+      for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+          const auto expected = covered(quad, x, y) ? kept : dropped;
+          if (pixels[y * width + x] != expected) {
+            std::fprintf(stderr, "%s: quad mask %x, pixel (%u, %u): %08x, expected %08x\n", label,
+                         quad, x, y, pixels[y * width + x], expected);
+            Require(name, label, false, "the AA mask did not select the draw's pixels");
+          }
+        }
+      }
+    };
+
+    // A second draw under each mask writes the pixels the mask keeps and no others; a mask that
+    // keeps none draws nothing.
+    for (u32 quad = 0; quad < 16; quad++) {
+      const uint64_t address = base + quad * 0x10000ull;
+      set_mask(0xf);
+      Require(name, "unmasked draw", draw(address, far_vs, one), "the draw was skipped");
+      set_mask(quad);
+      Require(name, "masked draw", draw(address, far_vs, two) == (quad != 0),
+              "a draw under an empty mask was not skipped, or one under a mask was");
+      check("colour under the mask", read_red(address), quad, f2, f1);
+    }
+    // Sample 0 decides a pixel.
+    set_mask(0xf);
+    Require(name, "unmasked draw", draw(base + 0x100000, far_vs, one), "the draw was skipped");
+    set_mask(0x6, 0x0001u, 0xfffeu);
+    Require(name, "masked draw", draw(base + 0x100000, far_vs, two), "the draw was skipped");
+    check("sample 0 of the mask", read_red(base + 0x100000), 0x6, f2, f1);
+
+    // Depth is written where colour is, although the guest asked for early depth tests.
+    HW::DepthRenderTarget z{};
+    z.z_info.format = Prospero::DepthFormat::kZ32F;
+    z.stencil_info.format = Prospero::StencilFormat::kInvalid;
+    z.size = {static_cast<uint16_t>(width - 1), static_cast<uint16_t>(height - 1), true};
+    const auto read_depth = [&](uint64_t address) {
+      z.z_read_base_addr = z.z_write_base_addr = address;
+      registers.SetDepthRenderTarget(z);
+      RenderDepthInfo depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      cache.UpdateImage(depth.image_id);
+      return ReadCachedTexel(name, context, depth.image_id, {}, {width, height, 1});
+    };
+    registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                               .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+    registers.SetDepthShaderControl({.shader_z_behavior = 1});
+    z.z_read_base_addr = z.z_write_base_addr = base + 0x200000;
+    registers.SetDepthRenderTarget(z);
+    set_mask(0x9);
+    Require(name, "masked depth draw", draw(base + 0x110000, far_vs, two), "the draw was skipped");
+    check("colour with depth", read_red(base + 0x110000), 0x9, f2, 0);
+    check("depth under the mask", read_depth(base + 0x200000), 0x9, literal(0.5f), 0);
+    // The same pixels fail a depth test against what the masked draw left.
+    registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                               .zfunc = static_cast<uint8_t>(vk::CompareOp::eGreater)});
+    set_mask(0xf);
+    Require(name, "depth-tested draw", draw(base + 0x110000, near_vs, one), "the draw was skipped");
+    check("depth test after the mask", read_red(base + 0x110000), 0x9, f2, f1);
+    registers.SetDepthShaderControl({});
+
+    // A draw without a pixel shader takes the mask through the host's fragment shader.
+    registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                               .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+    registers.SetTargetOutputMode(0, 0);
+    for (const u32 quad : {0x6u, 0x2u, 0xdu}) {
+      const uint64_t address = base + 0x210000 + quad * 0x10000ull;
+      z.z_read_base_addr = z.z_write_base_addr = address;
+      registers.SetDepthRenderTarget(z);
+      set_mask(quad);
+      Require(name, "masked depth-only draw", draw(base + 0x120000, near_vs, one),
+              "the draw was skipped");
+      check("depth-only draw under the mask", read_depth(address), quad, literal(0.25f), 0);
+    }
+    set_mask(0);
+    z.z_read_base_addr = z.z_write_base_addr = base + 0x300000;
+    registers.SetDepthRenderTarget(z);
+    Require(name, "empty depth-only draw", !draw(base + 0x120000, near_vs, one),
+            "a depth-only draw under an empty mask was not skipped");
+    registers.SetTargetOutputMode(0, 4);
+    registers.SetDepthRenderTarget({});
+    registers.SetDepthControl({});
+
+    // The mask dword is the last of the push block: stage data that would end on it moves out.
+    // The pixel stage takes sixteen dwords for its user SGPRs and the vertex stage the other
+    // sixteen, the last of which is the depth it draws at.
+    {
+      const auto user_vs = vertex_shader(0, true);
+      const auto user_ps = pixel_shader(0, true);
+      shaders.SetGsShaderResource2({.user_sgpr = 16});
+      shaders.SetPsShaderResource2({.user_sgpr = 16});
+      for (u32 reg = 0; reg < 16; reg++) {
+        shaders.SetPsUserSgpr(reg, reg == 3 ? f2 : 0);
+        shaders.SetGsUserSgpr(reg, reg == 15 ? literal(0.75f) : 0);
+      }
+      registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                                 .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+      const auto modules = [&] {
+        const auto compiled = PipelineCacheTestAccess::Compiled(context.GetPipelineCache());
+        return std::pair{compiled[static_cast<size_t>(ShaderType::Vertex)],
+                         compiled[static_cast<size_t>(ShaderType::Pixel)]};
+      };
+      const auto before = modules();
+      for (const u32 quad : {0xfu, 0x9u, 0x6u, 0xfu}) {
+        const uint64_t address = base + 0x310000 + (quad & 3u) * 0x10000ull;
+        const uint64_t color_address = base + 0x150000 + (quad & 3u) * 0x10000ull;
+        z.z_read_base_addr = z.z_write_base_addr = address;
+        registers.SetDepthRenderTarget(z);
+        set_mask(quad);
+        Require(name, "full push block draw", draw(color_address, user_vs, user_ps),
+                "the draw was skipped");
+        check("stage data beside the mask dword", read_depth(address), quad, literal(0.75f), 0);
+        check("colour beside the mask dword", read_red(color_address), quad, f2, 0);
+      }
+      // Both stages once without a mask, and once with their data clear of its dword.
+      Require(name, "modules beside the mask dword",
+              modules() == std::pair{before.first + 2, before.second + 2},
+              "the stages of the masked draws were not compiled once each");
+      shaders.SetGsShaderResource2({});
+      shaders.SetPsShaderResource2({});
+      registers.SetDepthRenderTarget({});
+      registers.SetDepthControl({});
+    }
+
+    // Multisampled draws keep every pixel: their per-sample masks are not applied.
+    {
+      set_mask(0x9);
+      const auto every_pixel = [&](const char *label, uint64_t address) {
+        Require(name, label, draw(address, far_vs, two), "the draw was skipped");
+        check(label, read_red(address), 0xf, f2, 0);
+      };
+      // Two colour samples with multisampling off.
+      registers.SetColorAttrib(0, {.num_samples = 1, .num_fragments = 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1});
+      every_pixel("2x colour, multisampling off", base + 0x140000);
+      // Two depth samples and no colour with multisampling off.
+      registers.SetTargetOutputMode(0, 0);
+      z.z_info.num_samples = 1;
+      z.z_read_base_addr = z.z_write_base_addr = base + 0x380000;
+      registers.SetDepthRenderTarget(z);
+      registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                                 .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+      Require(name, "2x depth, multisampling off", draw(base + 0x140000, near_vs, one),
+              "the draw was skipped");
+      z.z_info.num_samples = 0;
+      registers.SetDepthRenderTarget({});
+      registers.SetDepthControl({});
+      registers.SetTargetOutputMode(0, 4);
+      // Two raster samples.
+      HW::AaConfig two_samples{};
+      two_samples.msaa_num_samples = 1;
+      two_samples.max_sample_dist = 4;
+      two_samples.msaa_exposed_samples = 1;
+      registers.SetAaConfig(two_samples);
+      auto scan = registers.GetScanModeControl();
+      scan.msaa_enable = true;
+      registers.SetScanModeControl(scan);
+      HW::AaSampleControl locations{};
+      for (uint32_t quad = 0; quad < 4; quad++) {
+        locations.locations[quad * 4] = 0xcc44u;
+      }
+      registers.SetAaSampleControl(locations);
+      every_pixel("2x colour, multisampling on", base + 0x190000);
+      // One colour sample under them: the host renders into a multisampled shadow.
+      if (m_runtime_context.sample_locations_enabled &&
+          (m_runtime_context.sample_location_counts & vk::SampleCountFlagBits::e2)) {
+        registers.SetColorAttrib(0, {});
+        registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        locations.locations[0] = locations.locations[4] = 0x0c04u;
+        locations.locations[8] = locations.locations[12] = 0x040cu;
+        registers.SetAaSampleControl(locations);
+        every_pixel("1x colour, multisampling on", base + 0x1a0000);
+      }
+    }
+
+    Common::DebugCounters::SetEnabled(false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
@@ -58729,9 +59075,10 @@ void CheckVulkan13FeatureRequirements() {
       "Vulkan13FeatureRequirements", "production requirements",
       features.sType == vk::StructureType::ePhysicalDeviceVulkan13Features &&
           features.pNext == nullptr && features.dynamicRendering == VK_TRUE &&
-          features.synchronization2 == VK_TRUE,
-      "production device creation did not require dynamic rendering and "
-      "synchronization2 from one feature declaration");
+          features.synchronization2 == VK_TRUE &&
+          features.shaderDemoteToHelperInvocation == VK_TRUE,
+      "production device creation did not require dynamic rendering, "
+      "synchronization2 and helper demotion from one feature declaration");
   std::printf("[host]    %-32s ok\n", "Vulkan13FeatureRequirements");
 }
 
@@ -62849,6 +63196,8 @@ int main(int argc, char **argv) {
     }
     RunGraphicsCase(&vulkan, GraphicsAaMaskSkipsHelperLanes(false));
     RunGraphicsCase(&vulkan, GraphicsAaMaskSkipsHelperLanes(true));
+    vulkan.CheckAaMask();
+    CheckVulkan13FeatureRequirements();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eqaa-only") == 0) {
@@ -63259,6 +63608,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    vulkan.CheckAaMask();
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheOrderedWrite();
     vulkan.CheckBufferReadbackWaiter(false);

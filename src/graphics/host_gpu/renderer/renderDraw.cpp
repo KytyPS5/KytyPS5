@@ -863,6 +863,13 @@ static void DisableEqaaShadow(DrawTargets& targets, EqaaFallbackReason reason) {
 	targets.depth.attachment_samples = 0;
 }
 
+// Buffer, image or GDS writes of a draw's pixel stage.
+static bool PixelStageWritesMemory(const ShaderStageRuntime& stage) {
+	const auto& info = stage.module->info.info;
+	return HasShaderBufferWrites(stage) || info.uses_gds ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; });
+}
+
 void RenderExecutor::PlanDrawEqaa(CommandBuffer& buffer, const DrawRenderState& state) {
 	const auto& ctx     = buffer.GetRegisters();
 	auto&       targets = m_targets;
@@ -934,15 +941,20 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
-	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
-	// writes would remain (PPSA02110 ends mip reductions with a 0x0 pass past the last level).
+	// An empty screen scissor rasterizes nothing in any viewport, and neither does an AA mask
+	// that covers no pixel, so only vertex-stage buffer writes would remain (PPSA02110 ends mip
+	// reductions with a 0x0 pass past the last level; PPSA02015 fades a LOD out to an empty mask).
 	const auto& vp = buffer.GetRegisters().GetScreenViewport();
 	if ((vp.screen_scissor_right <= vp.screen_scissor_left ||
-	     vp.screen_scissor_bottom <= vp.screen_scissor_top) &&
+	     vp.screen_scissor_bottom <= vp.screen_scissor_top || state.aa_quad_mask == 0) &&
 	    std::ranges::none_of(state.VertexStages(), HasShaderBufferWrites,
 	                         &ShaderVertexInputInfo::stage)) {
 		return false;
 	}
+	// The shader applies the mask after the early depth test its memory writes rely on.
+	EXIT_NOT_IMPLEMENTED(state.ps_active && state.ps_input_info.ps_aa_mask &&
+	                     state.ps_input_info.ps_early_z &&
+	                     PixelStageWritesMemory(state.ps_input_info.stage));
 	auto& targets       = m_targets;
 	targets.color_count = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -1311,6 +1323,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());
+	}
+	if (state.aa_quad_mask != 0xf) {
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+		                        PushData::AaMaskDword * sizeof(uint32_t), sizeof(uint32_t),
+		                        &state.aa_quad_mask);
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();

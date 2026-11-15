@@ -17,6 +17,7 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <stb_image.h>
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -2040,12 +2041,360 @@ uint32_t FindShaderPrograms(std::span<const uint8_t> data, Found&& found) {
 	return count;
 }
 
+// LZ4 block format (what Unreal Engine compresses each shader with): sequences of literals and of
+// copies from up to 64 KB back. False unless `src` fills `dst` exactly.
+bool Lz4Decompress(std::span<const uint8_t> src, std::span<uint8_t> dst) {
+	size_t     s      = 0;
+	size_t     d      = 0;
+	const auto length = [&](size_t& value) {
+		for (uint8_t more = 255; more == 255;) {
+			if (s == src.size()) {
+				return false;
+			}
+			more = src[s++];
+			value += more;
+		}
+		return true;
+	};
+	while (s < src.size()) {
+		const auto token    = src[s++];
+		size_t     literals = token >> 4u;
+		if ((literals == 15 && !length(literals)) || literals > src.size() - s || literals > dst.size() - d) {
+			return false;
+		}
+		std::memcpy(dst.data() + d, src.data() + s, literals);
+		s += literals;
+		d += literals;
+		if (s == src.size()) {
+			break; // The last sequence has only literals.
+		}
+		if (src.size() - s < 2) {
+			return false;
+		}
+		const size_t offset = src[s] | (size_t {src[s + 1]} << 8u);
+		s += 2;
+		size_t match = token & 15u;
+		if (offset == 0 || offset > d || (match == 15 && !length(match)) || match + 4 > dst.size() - d) {
+			return false;
+		}
+		for (const auto end = d + match + 4; d < end; d++) {
+			dst[d] = dst[d - offset]; // The copy can overlap what it writes.
+		}
+	}
+	return d == dst.size();
+}
+
+// Shaders that Unreal Engine keeps in its packages (FShaderMapResourceCode), each one an array of
+// its code compressed with LZ4 (the size, then the bytes), then its size and its stage. The
+// footer's magic survives the compression in the literals near the end of the code: for every
+// magic in `data` that is not a footer in place, the array whose bytes end a little past the footer
+// (44 to 112 bytes after the magic, as found in the packages of GTA III), followed by a plausible size
+// and stage, is decompressed into `shader` and `found` called with it.
+template <typename Found>
+void FindCompressedShaders(std::span<const uint8_t> data, std::vector<uint8_t>& shader, Found&& found) {
+	constexpr std::string_view Magic      = "barefoot";
+	constexpr size_t           FooterSize = 0x30;
+	constexpr uint32_t         MaxSize    = 4u << 20u;
+	constexpr uint64_t         MaxStored  = 256u << 10u;
+	const std::string_view     text(reinterpret_cast<const char*>(data.data()), data.size());
+	const auto                 word = [&](uint64_t at) {
+		uint32_t value = 0;
+		std::memcpy(&value, data.data() + at, sizeof(value));
+		return value;
+	};
+	uint64_t done = 0; // Where the last array found ends.
+	for (size_t at = text.find(Magic); at != std::string_view::npos; at = text.find(Magic, at + 1)) {
+		if (at < done) {
+			continue;
+		}
+		if (data.size() - at >= FooterSize) {
+			const auto program = Common::AlignUp(uint64_t {word(at + 20)}, 16) + word(at + 24);
+			const auto before  = program + Common::AlignUp(uint64_t {word(at + 28)}, 16);
+			if (word(at + 16) == 1 && word(at + 20) != 0 && program % 4 == 0 && before <= at) {
+				continue; // A footer in place.
+			}
+		}
+		for (uint64_t end = at + FooterSize - 4; end <= at + FooterSize + 64 && end + 5 <= data.size(); end++) {
+			const auto size = word(end);
+			if (data[end + 4] >= 8 || size < 64 || size > MaxSize) {
+				continue;
+			}
+			// The array's size, `stored` with stored <= size <= 16 * stored, just before its bytes.
+			const auto most = std::min({uint64_t {size}, end - 4, MaxStored});
+			for (uint64_t stored = std::max<uint64_t>(size / 16, end - at); stored <= most; stored++) {
+				if (word(end - 4 - stored) != stored) {
+					continue;
+				}
+				shader.resize(size);
+				if (Lz4Decompress(data.subspan(end - stored, stored), shader)) {
+					found(std::span<const uint8_t>(shader));
+					done = end;
+					break;
+				}
+			}
+			if (done == end) {
+				break;
+			}
+		}
+	}
+}
+
+// Little-endian values and Unreal Engine strings from a span; `ok` turns false past its end.
+struct SpanReader {
+	std::span<const uint8_t> data;
+	size_t                   at = 0;
+	bool                     ok = true;
+
+	bool Skip(uint64_t bytes) {
+		if (data.size() - at < bytes) {
+			ok = false;
+			at = data.size();
+		} else {
+			at += bytes;
+		}
+		return ok;
+	}
+	template <typename T>
+	T Get() {
+		T value {};
+		const auto from = at;
+		if (Skip(sizeof(T))) {
+			std::memcpy(&value, data.data() + from, sizeof(T));
+		}
+		return value;
+	}
+	// A length with the terminator, negative for UTF-16 (of which only the low bytes are kept).
+	std::string String() {
+		const auto  length = Get<int32_t>();
+		const auto  units  = length < 0 ? -int64_t {length} : int64_t {length};
+		const auto  unit   = length < 0 ? 2u : 1u;
+		const auto  from   = at;
+		std::string text;
+		if (units > 0 && Skip(units * unit)) {
+			for (int64_t i = 0; i + 1 < units; i++) {
+				text.push_back(static_cast<char>(data[from + i * unit]));
+			}
+		}
+		return text;
+	}
+};
+
+// An Unreal Engine shader archive (.ushaderbytecode, version 2): hashes, shader maps, a table of
+// shaders (offset, stored size, size, stage), preload entries and indices, then their code. Calls
+// `found` with the stored bytes and the size of every shader.
+template <typename Found>
+void ForEachUnrealShader(std::span<const uint8_t> archive, Found&& found) {
+	SpanReader reader {archive};
+	const auto array = [&](uint32_t element) {
+		const auto count = reader.Get<uint32_t>();
+		return reader.Skip(uint64_t {count} * element) ? count : 0;
+	};
+	if (reader.Get<uint32_t>() != 2) {
+		return;
+	}
+	array(20);
+	array(20);
+	array(16);
+	const auto table   = reader.at + 4;
+	const auto shaders = array(17);
+	array(16);
+	array(4);
+	if (!reader.ok) {
+		return;
+	}
+	const auto code = archive.subspan(reader.at);
+	for (uint32_t i = 0; i < shaders; i++) {
+		SpanReader entry {archive, table + i * 17};
+		const auto offset = entry.Get<uint64_t>();
+		const auto stored = entry.Get<uint32_t>();
+		const auto size   = entry.Get<uint32_t>();
+		if (offset <= code.size() && stored <= code.size() - offset) {
+			found(code.subspan(offset, stored), size);
+		}
+	}
+}
+
+// What an Unreal Engine package (.pak, versions 3 to 7 and 10 to 11, index not encrypted) holds that
+// has shaders: `read(offset, size, out)` reads the package, of `size` bytes. Calls `archive` with
+// each shader archive (.ushaderbytecode) stored as it is, and `assets` with each asset (.uexp,
+// .uasset, .umap) and each .bin (the global shaders) compressed with zlib, inflated, or stored as it
+// is (assets up to 1 MB, the materials, and maps whole, with the materials of their level: these
+// keep their shaders inline, the textures and meshes do not). Its shaders are found compressed by
+// FindCompressedShaders(), but not inside the zlib streams. Returns whether the index was read.
+template <typename Read, typename Archive, typename Assets>
+bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& assets) {
+	// The footer: (from version 7, encryption key) whether the index is encrypted (from version
+	// 4), the magic, the version, the index's offset and size, its hash and (from version 8) the
+	// names of the compression methods.
+	constexpr uint32_t   Magic    = 0x5A6F12E1u;
+	constexpr uint64_t   MaxAsset = 1u << 20u;
+	std::vector<uint8_t> data;
+	const auto           tail = std::min<uint64_t>(size, 1024);
+	if (!read(size - tail, tail, data)) {
+		return false;
+	}
+	size_t magic = 0;
+	for (size_t at = data.size() >= 24 ? data.size() - 24 : 0; at > 17 && magic == 0; at--) {
+		if (std::memcmp(data.data() + at, &Magic, 4) == 0) {
+			magic = at;
+		}
+	}
+	SpanReader footer {data, magic + 4};
+	const auto version      = footer.Get<uint32_t>();
+	const auto index_offset = footer.Get<uint64_t>();
+	const auto index_size   = footer.Get<uint64_t>();
+	footer.Skip(20);
+	// The compression methods: by index from 1 from version 8, flags before (zlib is 1).
+	std::array<bool, 6> zlib {false, version < 8};
+	for (size_t method = 1; version >= 8 && method < zlib.size() && footer.Skip(0) &&
+	                        footer.data.size() - footer.at >= 32;
+	     method++) {
+		const auto* name = reinterpret_cast<const char*>(data.data() + footer.at);
+		zlib[method]     = std::string_view(name, strnlen(name, 32)) == "Zlib";
+		footer.Skip(32);
+	}
+	const bool legacy = version >= 3 && version <= 7;
+	if (magic == 0 || (version >= 4 && data[magic - 1] != 0) || (!legacy && version != 10 && version != 11) ||
+	    index_offset > size || index_size > size - index_offset || index_size > (256u << 20u) ||
+	    !read(index_offset, index_size, data)) {
+		return false;
+	}
+	std::vector<uint8_t> entry_data;
+	std::vector<uint8_t> inflated;
+	// An entry: its name, the offset of its header, its size, stored size, compression method
+	// and number of blocks.
+	const auto visit = [&](std::string name, uint64_t offset, uint64_t length, uint64_t stored, uint32_t method,
+	                       uint64_t blocks) {
+		std::ranges::transform(name, name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		const bool is_archive = name.ends_with(".ushaderbytecode");
+		const bool is_global  = name.ends_with(".bin");
+		const bool is_map     = name.ends_with(".umap");
+		const bool is_asset   = is_map || name.ends_with(".uexp") || name.ends_with(".uasset");
+		// The data follows the entry's header: offset, sizes, method, hash, the blocks (start
+		// and end, from the header from version 5, from the package's start before) when
+		// compressed, flags and block size.
+		const uint64_t header = 8 + 8 + 8 + 4 + 20 + (method != 0 ? 4 + 16 * blocks : 0) + 1 + 4;
+		const bool     stored_archive = is_archive && method == 0;
+		const bool     readable_asset = (is_global || (is_asset && (method != 0 || is_map || length <= MaxAsset))) &&
+		                            (method == 0 || (method < zlib.size() && zlib[method]));
+		if ((!stored_archive && !readable_asset) || offset > size || stored > size - offset ||
+		    header > size - offset - stored || length > (256u << 20u) || !read(offset, header + stored, entry_data)) {
+			return;
+		}
+		SpanReader copy {entry_data, 8};
+		if (copy.Get<uint64_t>() != stored || copy.Get<uint64_t>() != length) {
+			return;
+		}
+		if (method == 0) {
+			const auto stored_data = std::span<const uint8_t>(entry_data).subspan(header);
+			is_archive ? archive(stored_data) : assets(stored_data);
+			return;
+		}
+		copy.Skip(4 + 20 + 4);
+		inflated.resize(length);
+		const uint64_t base   = version < 5 ? offset : 0;
+		uint64_t       filled = 0;
+		for (uint64_t block = 0; block < blocks && copy.ok; block++) {
+			const auto start = copy.Get<uint64_t>() - base;
+			const auto end   = copy.Get<uint64_t>() - base;
+			if (start < header || end < start || end > entry_data.size() || end - start > INT32_MAX) {
+				break;
+			}
+			const auto out = stbi_zlib_decode_buffer(
+			    reinterpret_cast<char*>(inflated.data() + filled), static_cast<int>(length - filled),
+			    reinterpret_cast<const char*>(entry_data.data() + start), static_cast<int>(end - start));
+			if (out <= 0) {
+				break;
+			}
+			filled += static_cast<uint64_t>(out);
+		}
+		assets(std::span<const uint8_t>(inflated).first(filled));
+	};
+	SpanReader index {data};
+	index.String();
+	if (legacy) {
+		// The index: mount point and entries, each its name, then as in its header (offset,
+		// sizes, method, hash, the blocks when compressed, flags and block size).
+		const auto entries = index.Get<uint32_t>();
+		for (uint32_t entry = 0; entry < entries && index.ok; entry++) {
+			auto           name   = index.String();
+			const auto     offset = index.Get<uint64_t>();
+			const auto     stored = index.Get<uint64_t>();
+			const auto     length = index.Get<uint64_t>();
+			const auto     method = index.Get<uint32_t>();
+			uint64_t       blocks = 0;
+			index.Skip(20);
+			if (method != 0) {
+				blocks = index.Get<uint32_t>();
+				index.Skip(16 * blocks);
+			}
+			const bool encrypted = index.Get<uint8_t>() != 0;
+			index.Skip(4);
+			if (index.ok && !encrypted && method < zlib.size()) {
+				visit(std::move(name), offset, length, stored, method, blocks);
+			}
+		}
+		return index.ok;
+	}
+	// The index: mount point, entries, path hash index, full directory index (where the names
+	// are), and the entries, encoded.
+	index.Skip(4 + 8);
+	if (index.Get<uint32_t>() != 0) {
+		index.Skip(8 + 8 + 20);
+	}
+	if (index.Get<uint32_t>() == 0) {
+		return false;
+	}
+	const auto directory_offset = index.Get<uint64_t>();
+	const auto directory_size   = index.Get<uint64_t>();
+	index.Skip(20);
+	const auto           encoded_size = index.Get<uint32_t>();
+	const auto           encoded_at   = index.at;
+	std::vector<uint8_t> directory;
+	if (!index.Skip(encoded_size) || directory_offset > size || directory_size > size - directory_offset ||
+	    directory_size > (256u << 20u) || !read(directory_offset, directory_size, directory)) {
+		return false;
+	}
+	const auto encoded = std::span<const uint8_t>(data).subspan(encoded_at, encoded_size);
+	SpanReader names {directory};
+	const auto folders = names.Get<uint32_t>();
+	for (uint32_t folder = 0; folder < folders && names.ok; folder++) {
+		names.String();
+		const auto files = names.Get<uint32_t>();
+		for (uint32_t file = 0; file < files && names.ok; file++) {
+			auto       name  = names.String();
+			const auto entry = names.Get<int32_t>();
+			if (entry < 0) {
+				continue;
+			}
+			// An encoded entry: flags (compression method, encryption, block count, and which
+			// of the offset and sizes take 32 bits), the offset of the entry's header, the size
+			// and, compressed, the stored size.
+			SpanReader     reader {encoded, static_cast<size_t>(entry)};
+			const auto     flags  = reader.Get<uint32_t>();
+			const auto     method = (flags >> 23u) & 0x3fu;
+			const uint64_t offset = (flags & (1u << 31u)) != 0 ? reader.Get<uint32_t>() : reader.Get<uint64_t>();
+			const uint64_t length = (flags & (1u << 30u)) != 0 ? reader.Get<uint32_t>() : reader.Get<uint64_t>();
+			uint64_t       stored = length;
+			if (method != 0) {
+				stored = (flags & (1u << 29u)) != 0 ? reader.Get<uint32_t>() : reader.Get<uint64_t>();
+			}
+			if (reader.ok && (flags & (1u << 22u)) == 0) {
+				visit(std::move(name), offset, length, stored, method, (flags >> 6u) & 0xffffu);
+			}
+		}
+	}
+	return names.ok;
+}
+
 } // namespace
 
 // The code of the listed shaders that neither the store nor the guest has given yet, from the
 // game's files: every file is searched for shader binaries, whatever its format (a game keeps
 // them in packages of its own, mostly as they are; those inside compressed packages are not
-// found, and wait until the guest maps them). First, a kind of file (by extension) is left out
+// found, and wait until the guest maps them, but for the shader archives of Unreal Engine, each
+// shader compressed with LZ4, which are read from the packages that hold them as they are). First, a
+// kind of file (by extension) is left out
 // after a sample in a row without shaders, and a file after as many bytes without one, so that a
 // game's textures, audio and video, and what follows the shaders in a large package, are not read
 // whole. Then, while listed code is still missing, what that left out is probed with a small
@@ -2176,6 +2525,52 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		}
 		return run;
 	};
+	// Unreal Engine: the shader archives in a package, or a loose one.
+	std::vector<uint8_t> shader;
+	const auto           search_archive = [&](std::span<const uint8_t> archive) {
+		ForEachUnrealShader(archive, [&](std::span<const uint8_t> stored, uint32_t size) {
+			if (stored.size() == size) {
+				search(stored);
+				return;
+			}
+			if (size > (16u << 20u)) {
+				return;
+			}
+			shader.resize(size);
+			if (Lz4Decompress(stored, shader)) {
+				search(shader);
+			}
+		});
+	};
+	// Whether the package's index (or the whole loose archive) was read.
+	const auto search_unreal = [&](const std::filesystem::path& path, const std::string& extension) {
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) {
+			return false;
+		}
+		const auto read = [&](uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
+			uint32_t done = 0;
+			if (size > (1u << 30u) || !file.Seek(offset)) {
+				return false;
+			}
+			out.resize(size);
+			file.Read(out.data(), static_cast<uint32_t>(size), &done);
+			bytes += done;
+			return done == size;
+		};
+		std::vector<uint8_t> archive;
+		if (extension == ".pak") {
+			return ForEachUnrealEntry(file.Size(), read, search_archive, [&](std::span<const uint8_t> asset) {
+				search(asset);
+				FindCompressedShaders(asset, archive, [&](std::span<const uint8_t> shader) { search(shader); });
+			});
+		}
+		if (!read(0, file.Size(), archive)) {
+			return false;
+		}
+		search_archive(archive);
+		return true;
+	};
 	// Files and bytes of each kind in a row without a shader, and files probed in a row that gave
 	// no missing code.
 	struct Kind {
@@ -2210,6 +2605,9 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			auto extension = Common::PathToString(path.extension());
 			std::ranges::transform(extension, extension.begin(),
 			                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			if (extension == ".pak" || extension == ".ushaderbytecode") {
+				search_unreal(path, extension);
+			}
 			auto& kind = kinds[extension];
 			if (kind.files >= SampleFiles || kind.bytes >= SampleBytes) {
 				later.push_back({path, 0, &kind});

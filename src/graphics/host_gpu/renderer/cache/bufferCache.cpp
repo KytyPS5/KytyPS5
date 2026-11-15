@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -2898,8 +2899,51 @@ struct BufferCache::UploadBatch {
 
 void BufferCache::SynchronizeBuffersInSpans(std::span<const std::pair<uint64_t, uint64_t>> spans) {
 	const UploadBatch batch {*this};
-	for (const auto& [first, last]: spans) {
-		SynchronizeBuffersInRange(first, last - first);
+	// The spans in order, those that overlap or touch as one: the reach of an operation that
+	// traces rays lists ~150 of them (the BLASes of its TLAS, mostly next to each other).
+	m_sync_spans.assign(spans.begin(), spans.end());
+	std::ranges::sort(m_sync_spans);
+	size_t merged = 0;
+	for (const auto& span: m_sync_spans) {
+		if (merged != 0 && span.first <= m_sync_spans[merged - 1].second) {
+			m_sync_spans[merged - 1].second = std::max(m_sync_spans[merged - 1].second, span.second);
+		} else {
+			m_sync_spans[merged++] = span;
+		}
+	}
+	m_sync_spans.resize(merged);
+	// The buffers over their CPU-dirty pages, read once a region, synchronized together (see
+	// SynchronizeBuffersInSet()).
+	m_span_buffers.clear();
+	m_span_ranges.clear();
+	RegionBits dirty;
+	uint64_t   dirty_region = UINT64_MAX;
+	bool       region_dirty = false;
+	for (const auto& [first, last]: m_sync_spans) {
+		for (auto at = first; at < last;) {
+			const auto index = at / TRACKER_REGION_SIZE;
+			const auto base  = index * TRACKER_REGION_SIZE;
+			const auto end   = std::min(last, base + TRACKER_REGION_SIZE);
+			if (index != dirty_region) {
+				dirty_region = index;
+				region_dirty = m_memory_tracker.CopyRegionCpuDirty(index, dirty);
+			}
+			const auto end_page = (end - base + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+			for (auto page = (at - base) / TRACKER_PAGE_SIZE; region_dirty && page < end_page;) {
+				const auto [run, after] = dirty.FirstRangeFrom(page);
+				if (run >= end_page) {
+					break;
+				}
+				const auto begin  = std::max(base + run * TRACKER_PAGE_SIZE, at);
+				const auto finish = std::min(base + std::min<uint64_t>(after, end_page) * TRACKER_PAGE_SIZE, end);
+				CollectSpanBuffers(begin, finish - begin, m_span_buffers, m_span_ranges);
+				page = after;
+			}
+			at = end;
+		}
+	}
+	if (!m_span_buffers.empty()) {
+		SynchronizeBuffers(m_span_buffers, m_span_ranges);
 	}
 }
 
@@ -2965,23 +3009,103 @@ void BufferCache::SynchronizeBuffersInSet(const RangeSet& set, SetRegions& state
 	if (regions.size() < m_region_buffer_count.size()) {
 		regions.resize(m_region_buffer_count.size());
 	}
+	// The pages of each region that the set covers: the CPU-dirty pages outside it have nothing
+	// to synchronize for the set (most of those the game writes in the regions of GTA V's buffer
+	// table), and looking each run of them up in the set cost more than the rest of a pass.
+	if (state.version != set.Version()) {
+		state.version = set.Version();
+		state.covered.clear();
+		state.covered_pages.clear();
+		set.ForEach([&](uint64_t begin, uint64_t end) {
+			for (auto at = begin; at < end;) {
+				const auto index = at / TRACKER_REGION_SIZE;
+				const auto base  = index * TRACKER_REGION_SIZE;
+				const auto stop  = std::min(end, base + TRACKER_REGION_SIZE);
+				if (state.covered.empty() || state.covered.back() != index) {
+					state.covered.push_back(index);
+					state.covered_pages.emplace_back();
+				}
+				state.covered_pages.back().SetRange((at - base) / TRACKER_PAGE_SIZE,
+				                                    (stop - base + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
+				at = stop;
+			}
+		});
+	}
+	// The regions with buffers that the set covers.
+	m_set_visits.clear();
+	size_t covered = 0;
 	for (size_t word = 0; word < m_buffer_region_bits.size(); word++) {
 		for (auto bits = m_buffer_region_bits[word]; bits != 0; bits &= bits - 1) {
 			const auto index = word * 64 + static_cast<uint64_t>(std::countr_zero(bits));
-			// Read before the scan: pages dirtied during or after it advance the epoch again.
-			const auto epoch  = m_memory_tracker.RegionCpuDirtyEpoch(index);
-			const auto forces = m_region_forces[index] + 1;
-			auto&      synced = regions[index];
-			const auto kept   = m_memory_tracker.RegionKeptSync(index);
-			// (An untracked region, epoch 0, has no pending write under a buffer unless forced.)
-			if (synced.second == forces && (epoch == 0 || synced.first == epoch) &&
-			    (kept == 0 || kept < state.pass)) {
-				continue;
+			while (covered < state.covered.size() && state.covered[covered] < index) {
+				covered++;
 			}
-			set.ForEachInRange(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE,
-			                   [this](uint64_t start, uint64_t end) { SynchronizeBuffersInRange(start, end - start); });
-			synced = {epoch, forces};
+			if (covered != state.covered.size() && state.covered[covered] == index) {
+				m_set_visits.emplace_back(index, covered);
+			}
 		}
+	}
+	// A visit reads the region's pages that became CPU dirty, or were forced, since the pass that
+	// last visited it (or that a pass left CPU dirty since) once, and collects the buffers of the
+	// set's pieces over them: GTA V's buffer table has thousands of pieces, a few hundred of them
+	// dirty, and each would take the region's lock and synchronize its buffers on its own (~1 us
+	// each). The helpers visit regions too (their state, which the guest's threads write, is
+	// mostly cache misses); the buffers found are synchronized together after the scan.
+	const auto visit = [&](const std::pair<uint64_t, size_t>& region, SetChunk& chunk) {
+		const auto index = region.first;
+		// Read before the scan: pages dirtied during or after it advance the epoch again.
+		const auto epoch  = m_memory_tracker.RegionCpuDirtyEpoch(index);
+		const auto forces = m_region_forces[index] + 1;
+		auto&      synced = regions[index];
+		const auto kept   = m_memory_tracker.RegionKeptSync(index);
+		// (An untracked region, epoch 0, has no pending write under a buffer unless forced.)
+		if (synced.second == forces && (epoch == 0 || synced.first == epoch) &&
+		    (kept == 0 || kept < state.pass)) {
+			return;
+		}
+		RegionBits dirty;
+		if (m_memory_tracker.CopyRegionCpuDirty(index, dirty)) {
+			dirty &= state.covered_pages[region.second];
+			const auto base = index * TRACKER_REGION_SIZE;
+			for (size_t page = 0; page < TRACKER_REGION_PAGES;) {
+				const auto [first, after] = dirty.FirstRangeFrom(page);
+				if (first >= TRACKER_REGION_PAGES) {
+					break;
+				}
+				set.ForEachInRange(base + first * TRACKER_PAGE_SIZE, (after - first) * TRACKER_PAGE_SIZE,
+				                   [&](uint64_t start, uint64_t end) {
+					                   CollectSpanBuffers(start, end - start, chunk.buffers, chunk.ranges);
+				                   });
+				page = after;
+			}
+		}
+		synced = {epoch, forces};
+	};
+	constexpr uint32_t Grain  = 8;
+	const auto         count  = static_cast<uint32_t>(m_set_visits.size());
+	const auto         chunks = (count + Grain - 1) / Grain;
+	if (m_set_chunks.size() < chunks) {
+		m_set_chunks.resize(chunks);
+	}
+	GetExecHelpers().ParallelFor(count, Grain, [&](uint32_t begin, uint32_t end) {
+		auto& chunk = m_set_chunks[begin / Grain];
+		chunk.buffers.clear();
+		chunk.ranges.clear();
+		for (auto visited = begin; visited < end; visited++) {
+			visit(m_set_visits[visited], chunk);
+		}
+	});
+	m_span_buffers.clear();
+	m_span_ranges.clear();
+	for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+		const auto& collected = m_set_chunks[chunk];
+		m_span_buffers.insert(m_span_buffers.end(), collected.buffers.begin(), collected.buffers.end());
+		m_span_ranges.insert(m_span_ranges.end(), collected.ranges.begin(), collected.ranges.end());
+	}
+	// One pass of the page tracker over every region: it protects the pages of each region with
+	// one call per run through them.
+	if (!m_span_buffers.empty()) {
+		SynchronizeBuffers(m_span_buffers, m_span_ranges);
 	}
 	state.pass = sync;
 }
@@ -3046,20 +3170,7 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, MaxGap, [&](uint64_t span, uint64_t bytes) {
 		m_span_buffers.clear();
 		m_span_ranges.clear();
-		const auto end = span + bytes;
-		auto       it  = m_buffers.upper_bound(span);
-		if (it != m_buffers.begin()) {
-			--it;
-		}
-		for (; it != m_buffers.end() && it->first < end; ++it) {
-			auto&      buffer = m_slot_buffers[it->second];
-			const auto start  = std::max(buffer.CpuAddress(), span);
-			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-			if (start < finish) {
-				m_span_buffers.push_back(&buffer);
-				m_span_ranges.emplace_back(start, finish - start);
-			}
-		}
+		CollectSpanBuffers(span, bytes, m_span_buffers, m_span_ranges);
 		if (m_span_buffers.size() == 1) {
 			(void)SynchronizeBuffer(*m_span_buffers[0], m_span_ranges[0].first,
 			                        m_span_ranges[0].second, false, false);
@@ -3067,6 +3178,24 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			SynchronizeBuffers(m_span_buffers, m_span_ranges);
 		}
 	});
+}
+
+void BufferCache::CollectSpanBuffers(uint64_t span, uint64_t bytes, std::vector<Buffer*>& buffers,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	const auto end = span + bytes;
+	auto       it  = m_buffers.upper_bound(span);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), span);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			buffers.push_back(&buffer);
+			ranges.emplace_back(start, finish - start);
+		}
+	}
 }
 
 } // namespace Libs::Graphics

@@ -265,6 +265,11 @@ public:
 	struct SetRegions {
 		std::vector<std::pair<uint64_t, uint64_t>> regions;
 		uint32_t                                   pass = 0;
+		// The tracking regions the set covers, in order, and the pages of each it covers, for the
+		// set's RangeSet::Version() `version`.
+		std::vector<uint64_t>                      covered;
+		std::vector<RegionBits>                    covered_pages;
+		uint64_t                                   version = UINT64_MAX;
 	};
 	// Uploads the pending CPU writes of the buffers within `set`, a set that stays the same from
 	// call to call (`regions` starts empty for a new set). A pass of the device-address
@@ -736,11 +741,26 @@ private:
 	}
 	std::vector<uint64_t>                      m_synced_region_epochs;
 	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
-	// The buffers of a CPU-dirty span (see SynchronizeBuffersInRange()) and their copies.
+	// Appends the buffers within a span and their ranges there to `buffers` and `ranges` (it only
+	// reads the cache: the helpers of SynchronizeBuffersInSet() call it too).
+	void CollectSpanBuffers(uint64_t span, uint64_t bytes, std::vector<Buffer*>& buffers,
+	                        std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+	// The buffers of a CPU-dirty span (see SynchronizeBuffersInRange()), or of the CPU-dirty parts
+	// of a set (see SynchronizeBuffersInSet()), and their copies.
 	std::vector<Buffer*>                       m_span_buffers;
 	std::vector<std::pair<uint64_t, uint64_t>> m_span_ranges;
 	std::vector<std::vector<vk::BufferCopy>>   m_span_copies;
 	std::vector<uint64_t>                      m_span_sizes;
+	// The spans of SynchronizeBuffersInSpans(), sorted and merged.
+	std::vector<std::pair<uint64_t, uint64_t>> m_sync_spans;
+	// SynchronizeBuffersInSet(): the regions to visit (with their index in SetRegions::covered)
+	// and what each chunk of them collects.
+	struct SetChunk {
+		std::vector<Buffer*>                       buffers;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	std::vector<std::pair<uint64_t, size_t>> m_set_visits;
+	std::vector<SetChunk>                    m_set_chunks;
 	// The SynchronizeBuffersInRanges() calls so far, the number of the one running (0: none) and
 	// whether the last one left pages CPU dirty.
 	uint32_t m_device_syncs     = 0;

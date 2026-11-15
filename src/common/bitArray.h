@@ -197,6 +197,13 @@ public:
 		return *this;
 	}
 
+	BitArray& operator&=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) & other.Load(word));
+		}
+		return *this;
+	}
+
 	[[nodiscard]] BitArray operator~() const {
 		BitArray result;
 		for (size_t word = 0; word < WORD_COUNT; word++) {

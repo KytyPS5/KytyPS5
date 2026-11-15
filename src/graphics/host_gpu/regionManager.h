@@ -421,6 +421,13 @@ public:
 		}
 	}
 
+	// Copies the CPU-dirty pages into `pages`; returns whether any is. Callers hold the lock.
+	bool CopyCpuDirty(RegionBits& pages) const {
+		pages.Clear();
+		pages |= m_cpu_dirty;
+		return !pages.None();
+	}
+
 	// Whether any page holds CPU writes not yet uploaded. Read without the lock: a concurrent
 	// CPU write that is not observed yet is equivalent to one that lands after the read.
 	[[nodiscard]] bool HasCpuDirty() const {

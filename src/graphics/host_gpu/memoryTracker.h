@@ -200,6 +200,25 @@ public:
 		}
 	}
 
+	// The pages of the tracking region `index` that may hold CPU writes not yet uploaded, as
+	// ForEachCpuDirtySpan() finds them (all of an untracked region), into `pages`; returns
+	// whether any may.
+	bool CopyRegionCpuDirty(uint64_t index, RegionBits& pages) {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			pages.Fill();
+			return true;
+		}
+		if (!manager->HasCpuDirty()) {
+			return false;
+		}
+		std::scoped_lock lock(manager->lock);
+		return manager->CopyCpuDirty(pages);
+	}
+
 	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
 	// have written since the consumer's previous call over them: pages that became CPU dirty
 	// since then, or are still CPU dirty. Untracked pages start tracking as written. Each

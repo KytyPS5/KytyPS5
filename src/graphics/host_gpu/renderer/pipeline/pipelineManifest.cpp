@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/fileSystem.h"
+#include "loader/guestOodle.h"
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
@@ -2563,6 +2564,203 @@ void ForEachUnityShaderFile(uint64_t size, Read&& read, Found&& found) {
 	}
 }
 
+// Unreal Engine 5 keeps its shaders in IoStore containers: a table of contents (.utoc, versions 3
+// to 8, not encrypted), then the chunks it lists in blocks of a fixed size, each stored as it is or
+// compressed (.ucas, split from a size on into partitions: _s1.ucas...). A shader library is a
+// chunk (type 8) that lists groups of shaders, each another chunk (type 9) compressed as a whole
+// (with Oodle in the games seen) unless that would not shrink it. `read(partition, offset, size,
+// out)` reads the container; `decompress(method, stored, out)` a compressed block (`method`: the
+// name the table of contents gives) or group (`method` empty), filling `out` exactly. Calls
+// `found` with the shaders of every group, decompressed. False when the table of contents cannot
+// be read.
+template <typename Read, typename Decompress, typename Found>
+bool ForEachIoStoreShaderGroup(std::span<const uint8_t> toc, Read&& read, Decompress&& decompress,
+                               Found&& found) {
+	constexpr std::string_view Magic("-==--==--==--==-");
+	constexpr uint64_t         MaxChunk = 64u << 20u;
+	if (toc.size() < 144 || std::memcmp(toc.data(), Magic.data(), Magic.size()) != 0) {
+		return false;
+	}
+	// The header: the magic, the version, its size, the chunks, the blocks, the size of a block's
+	// entry, the compression methods (count and length of a name), the block size, the directory
+	// index's size, the partitions, the container's id, the encryption key, flags, the perfect
+	// hash's seeds, the partition size and the chunks outside the perfect hash.
+	SpanReader header {toc, Magic.size()};
+	const auto version = header.Get<uint8_t>();
+	header.Skip(3);
+	const auto header_size   = header.Get<uint32_t>();
+	const auto chunks        = header.Get<uint32_t>();
+	const auto blocks        = header.Get<uint32_t>();
+	const auto block_entry   = header.Get<uint32_t>();
+	const auto method_count  = header.Get<uint32_t>();
+	const auto method_length = header.Get<uint32_t>();
+	const auto block_size    = header.Get<uint32_t>();
+	header.Skip(4);
+	const auto partitions = header.Get<uint32_t>();
+	header.Skip(8 + 16);
+	const auto flags = header.Get<uint8_t>();
+	header.Skip(3);
+	const auto        seeds          = header.Get<uint32_t>();
+	auto              partition_size = header.Get<uint64_t>();
+	const auto        unhashed       = header.Get<uint32_t>();
+	constexpr uint8_t Encrypted      = 2;
+	if (!header.ok || version < 3 || version > 8 || (flags & Encrypted) != 0 || block_entry != 12 ||
+	    block_size == 0) {
+		return false;
+	}
+	if (partitions <= 1 || partition_size == 0) {
+		partition_size = UINT64_MAX;
+	}
+	// Then the chunks' ids, their offsets and lengths (5 bytes each, big-endian), the perfect hash,
+	// the blocks (offset, stored size, size and method: 5, 3, 3 and 1 bytes) and the methods'
+	// names.
+	SpanReader body {toc, header_size};
+	const auto ids_at = body.at;
+	body.Skip(uint64_t {chunks} * 12);
+	const auto spans_at = body.at;
+	body.Skip(uint64_t {chunks} * 10);
+	body.Skip((version >= 4 ? uint64_t {seeds} * 4 : 0) +
+	          (version >= 5 ? uint64_t {unhashed} * 4 : 0));
+	const auto blocks_at = body.at;
+	body.Skip(uint64_t {blocks} * 12);
+	const auto methods_at = body.at;
+	body.Skip(uint64_t {method_count} * method_length);
+	if (!body.ok) {
+		return false;
+	}
+	const auto number = [&](size_t at, uint32_t bytes, bool big_endian) {
+		uint64_t value = 0;
+		for (uint32_t i = 0; i < bytes; i++) {
+			value |= uint64_t {toc[at + i]} << (8u * (big_endian ? bytes - 1 - i : i));
+		}
+		return value;
+	};
+	const auto id = [&](uint32_t chunk) {
+		return std::string_view(reinterpret_cast<const char*>(toc.data() + ids_at + chunk * 12),
+		                        12);
+	};
+	std::vector<uint8_t> stored;
+	const auto           read_chunk = [&](uint32_t chunk, std::vector<uint8_t>& out) {
+		const auto offset = number(spans_at + chunk * 10, 5, true);
+		const auto length = number(spans_at + chunk * 10 + 5, 5, true);
+		out.clear();
+		if (length > MaxChunk) {
+			return false;
+		}
+		const auto last = (offset + length + block_size - 1) / block_size;
+		for (uint64_t block = offset / block_size; block < last;) {
+			if (block >= blocks) {
+				return false;
+			}
+			const auto entry  = blocks_at + block * 12;
+			const auto at     = number(entry, 5, false);
+			const auto size   = number(entry + 8, 3, false);
+			const auto method = toc[entry + 11];
+			if (method == 0) {
+				// A run of blocks stored as they are, one after the other.
+				auto end   = block;
+				auto bytes = uint64_t {0};
+				for (; end < last && end < blocks; end++) {
+					const auto next = blocks_at + end * 12;
+					if (toc[next + 11] != 0 || number(next, 5, false) != at + bytes ||
+					    number(next + 5, 3, false) != number(next + 8, 3, false) ||
+					    (at + bytes) / partition_size != at / partition_size) {
+						break;
+					}
+					bytes += number(next + 8, 3, false);
+				}
+				if (end == block || !read(static_cast<uint32_t>(at / partition_size),
+				                          at % partition_size, bytes, stored)) {
+					return false;
+				}
+				out.insert(out.end(), stored.begin(), stored.end());
+				block = end;
+				continue;
+			}
+			if (method > method_count ||
+			    !read(static_cast<uint32_t>(at / partition_size), at % partition_size,
+			          number(entry + 5, 3, false), stored)) {
+				return false;
+			}
+			const auto* name = reinterpret_cast<const char*>(toc.data() + methods_at +
+			                                                 (method - 1u) * method_length);
+			const auto  from = out.size();
+			out.resize(from + size);
+			if (!decompress(std::string_view(name, strnlen(name, method_length)),
+			                std::span<const uint8_t>(stored),
+			                std::span<uint8_t>(out).subspan(from))) {
+				return false;
+			}
+			block++;
+		}
+		const auto skip = offset % block_size;
+		if (out.size() < skip + length) {
+			return false;
+		}
+		out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(skip));
+		out.resize(length);
+		return true;
+	};
+	constexpr uint8_t                              LibraryChunk = 8, GroupChunk = 9;
+	std::unordered_map<std::string_view, uint32_t> groups;
+	for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+		if (static_cast<uint8_t>(id(chunk)[11]) == GroupChunk) {
+			groups.emplace(id(chunk), chunk);
+		}
+	}
+	std::vector<uint8_t> library, group, shaders;
+	for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+		if (static_cast<uint8_t>(id(chunk)[11]) != LibraryChunk || !read_chunk(chunk, library)) {
+			continue;
+		}
+		// The library (version 1): the hashes of its shader maps and its shaders, the ids of the
+		// groups' chunks, the shader maps, the shaders, the groups (first index, shaders, size and
+		// stored size) and the indices.
+		SpanReader reader {library};
+		const auto array = [&](uint32_t element) {
+			const auto count = reader.Get<uint32_t>();
+			const auto at    = reader.at;
+			reader.Skip(uint64_t {count} * element);
+			return std::pair {at, count};
+		};
+		if (reader.Get<uint32_t>() != 1) {
+			continue;
+		}
+		array(20);
+		array(20);
+		const auto [ids, id_count] = array(12);
+		array(8);
+		array(8);
+		const auto [entries, group_count] = array(16);
+		array(4);
+		if (!reader.ok || id_count != group_count) {
+			continue;
+		}
+		for (uint32_t i = 0; i < group_count; i++) {
+			const auto chunk_of = groups.find(
+			    std::string_view(reinterpret_cast<const char*>(library.data() + ids + i * 12), 12));
+			uint32_t size   = 0;
+			uint32_t length = 0;
+			std::memcpy(&size, library.data() + entries + i * 16 + 8, 4);
+			std::memcpy(&length, library.data() + entries + i * 16 + 12, 4);
+			if (chunk_of == groups.end() || size > MaxChunk ||
+			    !read_chunk(chunk_of->second, group) || group.size() != length) {
+				continue;
+			}
+			if (length == size) {
+				found(std::span<const uint8_t>(group));
+				continue;
+			}
+			shaders.resize(size);
+			if (decompress(std::string_view(), std::span<const uint8_t>(group),
+			               std::span<uint8_t>(shaders))) {
+				found(std::span<const uint8_t>(shaders));
+			}
+		}
+	}
+	return true;
+}
+
 } // namespace
 
 // The code of the listed shaders that neither the store nor the guest has given yet, from the
@@ -2570,9 +2768,10 @@ void ForEachUnityShaderFile(uint64_t size, Read&& read, Found&& found) {
 // them in packages of its own, mostly as they are; those inside compressed packages are not
 // found, and wait until the guest maps them, but for the shaders of Unreal Engine, each one
 // compressed with LZ4 in an archive or an asset, which are read from the packages that hold them as
-// they are or compressed with zlib, those of Unity, compressed with LZ4 in Shader objects, which are
-// read from its serialized files and bundles, and zstd frames, which are decompressed where they
-// are found).
+// they are or compressed with zlib, those of Unreal Engine 5, groups compressed with Oodle in the
+// shader libraries of its IoStore containers, which the game's own decoder decompresses, those of
+// Unity, compressed with LZ4 in Shader objects, which are read from its serialized files and
+// bundles, and zstd frames, which are decompressed where they are found).
 // First, a kind of file (by extension) is left out
 // after a sample in a row without shaders, and a file after as many bytes without one, so that a
 // game's textures, audio and video, and what follows the shaders in a large package, are not read
@@ -2795,6 +2994,72 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			FindUnityShaders(serialized, shader, [&](std::span<const uint8_t> code) { search(code); });
 		});
 	};
+	// Unreal Engine 5: the shader libraries of an IoStore container, by its table of contents
+	// (the .utoc of a .ucas or of one of its partitions, _s1.ucas...). Oodle, which these games
+	// compress their shaders with, is decoded by the game's own decoder.
+	const auto iostore_toc = [](const std::filesystem::path& path) {
+		auto toc = path;
+		toc.replace_extension(".utoc");
+		const auto stem = Common::PathToString(path.stem());
+		const auto cut  = stem.rfind("_s");
+		if (path.extension() == ".ucas" && !Common::File::IsFileExisting(toc) &&
+		    cut != std::string::npos && cut + 2 < stem.size() &&
+		    std::all_of(stem.begin() + static_cast<std::ptrdiff_t>(cut + 2), stem.end(),
+		                [](unsigned char c) { return std::isdigit(c) != 0; })) {
+			toc.replace_filename(Common::PathFromUtf8(stem.substr(0, cut) + ".utoc"));
+		}
+		return toc;
+	};
+	std::unordered_set<std::string> iostore_read;
+	std::vector<uint8_t>            toc;
+	const auto                      search_iostore = [&](const std::filesystem::path& toc_path) {
+		Common::File toc_file;
+		if (!toc_file.Open(toc_path, Common::File::Mode::Read) ||
+		    !read_file(toc_file, 0, toc_file.Size(), toc)) {
+			return false;
+		}
+		std::vector<std::unique_ptr<Common::File>> partitions;
+		const auto read = [&](uint32_t partition, uint64_t offset, uint64_t size,
+		                      std::vector<uint8_t>& out) {
+			while (partitions.size() <= partition && partitions.size() < 64) {
+				auto path = toc_path;
+				path.replace_extension(".ucas");
+				if (!partitions.empty()) {
+					path.replace_filename(Common::PathFromUtf8(fmt::format(
+					    "{}_s{}.ucas", Common::PathToString(toc_path.stem()), partitions.size())));
+				}
+				auto file = std::make_unique<Common::File>();
+				if (!file->Open(path, Common::File::Mode::Read)) {
+					file.reset();
+				} else if (partitions.empty()) {
+					files++;
+				}
+				partitions.push_back(std::move(file));
+			}
+			return partition < partitions.size() && partitions[partition] != nullptr &&
+			       read_file(*partitions[partition], offset, size, out);
+		};
+		const auto named = [](std::string_view method, std::string_view name) {
+			return std::ranges::equal(
+			    method, name, [](char a, char b) { return std::tolower(a) == std::tolower(b); });
+		};
+		const auto decompress = [&](std::string_view method, std::span<const uint8_t> stored,
+		                            std::span<uint8_t> out) {
+			if (method.empty() ? stored.size() >= 2 && (stored[0] & 0x0fu) == 0x0c
+			                   : named(method, "Oodle")) {
+				return Loader::GuestOodle::Decompress(stored, out, stop);
+			}
+			if (named(method, "Zlib")) {
+				return stbi_zlib_decode_buffer(
+				           reinterpret_cast<char*>(out.data()), static_cast<int>(out.size()),
+				           reinterpret_cast<const char*>(stored.data()),
+				           static_cast<int>(stored.size())) == static_cast<int>(out.size());
+			}
+			return (method.empty() || named(method, "LZ4")) && Lz4Decompress(stored, out);
+		};
+		return ForEachIoStoreShaderGroup(toc, read, decompress,
+		                                 [&](std::span<const uint8_t> group) { search(group); });
+	};
 	// Files and bytes of each kind in a row without a shader, and files probed in a row that gave
 	// no missing code.
 	struct Kind {
@@ -2831,6 +3096,16 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 			if ((extension == ".pak" || extension == ".ushaderbytecode") && search_unreal(path, extension)) {
 				continue; // Read through its index instead of sampled.
+			}
+			if (extension == ".ucas" || extension == ".utoc") {
+				const auto toc_path = iostore_toc(path);
+				if (iostore_read.contains(Common::PathToString(toc_path))) {
+					continue;
+				}
+				if (search_iostore(toc_path)) {
+					iostore_read.insert(Common::PathToString(toc_path));
+					continue;
+				}
 			}
 			if (extension == ".bundle" || extension == ".unity3d" || extension == ".assets") {
 				search_unity(path);

@@ -28,6 +28,7 @@
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/demonsSoulsGpuPages.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/guestOodle.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -1423,6 +1424,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
+	GuestOodle::SetPrograms(m_programs);
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 

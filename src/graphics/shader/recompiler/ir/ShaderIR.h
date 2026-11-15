@@ -531,6 +531,7 @@ struct ShaderInfo {
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
+	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;

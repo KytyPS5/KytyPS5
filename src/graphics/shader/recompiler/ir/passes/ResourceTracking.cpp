@@ -99,15 +99,31 @@ uint32_t PossibleU32Bits(Value value) {
 	return PossibleU32Bits(value, [](Value at) { return at.Resolve(); });
 }
 
-bool IsNoncanonicalFlatAddress(Value high, Value active) {
-	high = high.Resolve();
+// A predicated VGPR write supplies its new value on exactly the lanes which
+// execute an access under `active`. Do not discard a selection under a different mask.
+Value ActiveValue(Value value, Value active) {
+	value  = value.Resolve();
 	active = active.Resolve();
-	// A predicated VGPR write supplies its new value on exactly the lanes which
-	// execute this access. Do not discard a selection under a different mask.
-	while (const auto* select = high.TryInstruction()) {
+	while (const auto* select = value.TryInstruction()) {
 		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) break;
-		high = select->Arg(1).Resolve();
+		value = select->Arg(1).Resolve();
 	}
+	return value;
+}
+
+// The scalar read a global base dword comes from; FLAT adds its VGPR offset to it.
+const Inst* AddressBaseRead(Value word, Value active) {
+	const auto* inst = ActiveValue(word, active).TryInstruction();
+	if (inst != nullptr && inst->GetOpcode() == ValueOpcode::IAdd32) {
+		inst = inst->Arg(0).Resolve().TryInstruction();
+	}
+	const bool scalar = inst != nullptr && (inst->GetOpcode() == ValueOpcode::ReadConst ||
+	                                        inst->GetOpcode() == ValueOpcode::GetUserData);
+	return scalar ? inst : nullptr;
+}
+
+bool IsNoncanonicalFlatAddress(Value high, Value active) {
+	high = ActiveValue(high, active);
 	uint32_t lower = 0, upper = UINT32_MAX;
 	if (high.IsImmediate() && high.GetType() == Type::U32) {
 		lower = upper = high.U32();
@@ -403,6 +419,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
+		m_info.user_address_bases.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -4314,8 +4331,9 @@ private:
 			if (!IsAddressResourceKind(memory.kind)) {
 				Fail(flags.pc, "address operation has invalid resource kind");
 			}
+			const auto active = inst.Arg(inst.NumArgs() - 1);
 			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
-			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
+			    IsNoncanonicalFlatAddress(inst.Arg(2), active)) {
 				ValidateAddressHandle(inst.Arg(0), flags.pc);
 				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
 					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
@@ -4338,18 +4356,18 @@ private:
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 			}
-			handle = inst.Arg(0).Resolve().TryInstruction();
-			std::array<uint32_t, 2> base {};
-			for (uint32_t word = 0; word < base.size(); ++word) {
-				const auto* read = handle->Arg(word).Resolve().TryInstruction();
-				base[word]       = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst
-				                       ? read->Arg(1).Resolve().U32()
-				                       : UINT32_MAX;
-			}
-			auto& bases = m_info.address_bases;
-			if (std::ranges::max(base) != UINT32_MAX &&
-			    std::ranges::find(bases, base) == bases.end())
-				bases.push_back(base);
+			handle           = inst.Arg(0).Resolve().TryInstruction();
+			const auto* low  = AddressBaseRead(handle->Arg(0), active);
+			const auto* high = AddressBaseRead(handle->Arg(1), active);
+			if (low == nullptr || high == nullptr || low->GetOpcode() != high->GetOpcode()) return;
+			const bool user = low->GetOpcode() == ValueOpcode::GetUserData;
+			const auto slot = [&](const Inst* read) {
+				return user ? RegIndex(read->Arg(0).ScalarRegister()) - m_program.user_data_base
+				            : read->Arg(1).Resolve().U32();
+			};
+			const std::array base {slot(low), slot(high)};
+			auto&            bases = user ? m_info.user_address_bases : m_info.address_bases;
+			if (std::ranges::find(bases, base) == bases.end()) bases.push_back(base);
 			return;
 		}
 

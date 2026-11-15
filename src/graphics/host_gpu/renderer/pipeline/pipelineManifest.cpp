@@ -2387,6 +2387,182 @@ bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& 
 	return names.ok;
 }
 
+// Unity's Shader objects (2021.3 and later) keep each platform's code compressed with LZ4 in a blob,
+// in chunks: the offsets, compressed sizes and sizes of one platform's chunks (each a vector of
+// vectors of 32-bit values), then the blob (its size, then its bytes). Finds them in `data` (a
+// serialized file, whose fields are aligned to 4 bytes from its start), decompresses each chunk
+// into `shader` and calls `found` with it.
+template <typename Found>
+void FindUnityShaders(std::span<const uint8_t> data, std::vector<uint8_t>& shader, Found&& found) {
+	constexpr uint32_t MaxChunks = 64;
+	constexpr uint32_t MaxSize   = 64u << 20u;
+	const auto         word      = [&](uint64_t at) {
+		uint32_t value = 0;
+		std::memcpy(&value, data.data() + at, sizeof(value));
+		return value;
+	};
+	for (uint64_t at = 0; at + 16 <= data.size(); at += 4) {
+		const auto chunks = word(at + 4);
+		if (word(at) != 1 || chunks == 0 || chunks > MaxChunks) {
+			continue;
+		}
+		// One platform: [1][chunks][offsets], [1][chunks][compressed sizes], [1][chunks][sizes].
+		const uint64_t list = 8 + 4 * uint64_t {chunks};
+		const uint64_t blob = at + 3 * list;
+		if (blob + 4 > data.size() || word(at + list) != 1 || word(at + list + 4) != chunks ||
+		    word(at + 2 * list) != 1 || word(at + 2 * list + 4) != chunks) {
+			continue;
+		}
+		const uint64_t blob_size = word(blob);
+		if (blob_size > data.size() - blob - 4) {
+			continue;
+		}
+		for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+			const uint64_t offset = word(at + 8 + 4 * chunk);
+			const uint64_t stored = word(at + list + 8 + 4 * chunk);
+			const auto     size   = word(at + 2 * list + 8 + 4 * chunk);
+			if (stored == 0 || size < stored || size > MaxSize || offset > blob_size || stored > blob_size - offset) {
+				break;
+			}
+			shader.resize(size);
+			if (Lz4Decompress(data.subspan(blob + 4 + offset, stored), shader)) {
+				found(std::span<const uint8_t>(shader));
+			}
+		}
+	}
+}
+
+// The serialized files with Shader objects (class 48) of a Unity file: the file itself (a serialized
+// file, .assets) or, in a bundle (UnityFS) whose blocks are stored as they are, each serialized file
+// it holds. `read(offset, size, out)` reads the file, of `size` bytes; calls `found` with each.
+template <typename Read, typename Found>
+void ForEachUnityShaderFile(uint64_t size, Read&& read, Found&& found) {
+	const auto big = [](std::span<const uint8_t> data, uint64_t at, uint32_t bytes) {
+		uint64_t value = 0;
+		for (uint32_t i = 0; i < bytes && at + i < data.size(); i++) {
+			value = (value << 8u) | data[at + i];
+		}
+		return value;
+	};
+	const auto text = [](SpanReader& reader) {
+		const auto rest = reader.data.subspan(reader.at);
+		const auto end  = std::ranges::find(rest, uint8_t {0});
+		reader.Skip(static_cast<uint64_t>(end - rest.begin()) + 1);
+	};
+	// Whether a serialized file, from its start in `head`, has Shader objects (nothing when its types
+	// go past `head`): its header (big-endian: sizes, version, data offset, endianness and, from
+	// version 22, 64-bit sizes), then its metadata: the engine's version, the platform, whether it
+	// has type trees, and its types.
+	const auto has_shaders = [&](std::span<const uint8_t> head) -> std::optional<bool> {
+		const auto version = big(head, 8, 4);
+		if (head.size() < 48 || version < 19 || version > 23 || head[16] != 0) {
+			return false;
+		}
+		SpanReader reader {head, version >= 22 ? 48u : 20u};
+		text(reader);
+		reader.Skip(4);
+		const bool trees = reader.Get<uint8_t>() != 0;
+		const auto types = reader.Get<uint32_t>();
+		for (uint32_t type = 0; type < types && reader.ok; type++) {
+			const auto id = reader.Get<int32_t>();
+			if (id == 48 && reader.ok) {
+				return true;
+			}
+			reader.Skip(1 + 2 + (id == 114 ? 16 : 0) + 16);
+			if (trees) {
+				const auto nodes   = reader.Get<uint32_t>();
+				const auto strings = reader.Get<uint32_t>();
+				reader.Skip(32 * uint64_t {nodes} + strings);
+				if (version >= 21) {
+					reader.Skip(4 * uint64_t {reader.Get<uint32_t>()});
+				}
+			}
+		}
+		return reader.ok ? std::optional<bool>(false) : std::nullopt;
+	};
+	std::vector<uint8_t> head;
+	std::vector<uint8_t> serialized;
+	const auto           search = [&](uint64_t offset, uint64_t length) {
+		// The types usually take less than 256 KB; 4 MB at most.
+		for (const uint64_t most: {uint64_t {256u << 10u}, uint64_t {4u << 20u}}) {
+			if (!read(offset, std::min(length, most), head)) {
+				return;
+			}
+			const auto shaders = has_shaders(head);
+			if (shaders.has_value() || length <= most) {
+				if (shaders.value_or(false) && read(offset, length, serialized)) {
+					found(std::span<const uint8_t>(serialized));
+				}
+				return;
+			}
+		}
+	};
+	if (!read(0, std::min<uint64_t>(size, 4u << 10u), head)) {
+		return;
+	}
+	if (std::string_view(reinterpret_cast<const char*>(head.data()), std::min<size_t>(head.size(), 8)) !=
+	    std::string_view("UnityFS\0", 8)) {
+		search(0, size);
+		return;
+	}
+	// A bundle: version, two engine versions, size, the compressed and uncompressed sizes of the
+	// blocks' table and the flags (compression of the table, the table at the end, padding).
+	SpanReader reader {head, 8};
+	const auto version = big(head, reader.at, 4);
+	reader.Skip(4);
+	text(reader);
+	text(reader);
+	reader.Skip(8);
+	const auto table_stored = big(head, reader.at, 4);
+	const auto table_size   = big(head, reader.at + 4, 4);
+	const auto flags        = big(head, reader.at + 8, 4);
+	reader.Skip(12);
+	uint64_t table_at = version >= 7 ? Common::AlignUp(uint64_t {reader.at}, 16) : reader.at;
+	uint64_t data_at  = table_at + table_stored;
+	if ((flags & 0x80u) != 0) {
+		data_at  = table_at;
+		table_at = size - table_stored;
+	}
+	if ((flags & 0x200u) != 0) {
+		data_at = Common::AlignUp(data_at, 16);
+	}
+	std::vector<uint8_t> stored;
+	std::vector<uint8_t> table(table_size);
+	if (!reader.ok || table_at > size || table_stored > size - table_at || table_size > (64u << 20u) ||
+	    !read(table_at, table_stored, stored)) {
+		return;
+	}
+	const auto method = flags & 0x3fu;
+	if (method == 0 && table_stored == table_size) {
+		table = stored;
+	} else if ((method != 2 && method != 3) || !Lz4Decompress(stored, table)) {
+		return;
+	}
+	// The table (big-endian): a hash, the blocks (size, stored size, flags) and the files in them
+	// (offset, size, flags, name). Only bundles whose blocks are all stored as they are.
+	uint64_t   at     = 16;
+	const auto blocks = big(table, at, 4);
+	at += 4;
+	for (uint64_t block = 0; block < blocks && at + 10 <= table.size(); block++, at += 10) {
+		if (big(table, at, 4) != big(table, at + 4, 4) || (big(table, at + 8, 2) & 0x3fu) != 0) {
+			return;
+		}
+	}
+	const auto files = big(table, at, 4);
+	at += 4;
+	for (uint64_t file = 0; file < files && at + 20 < table.size(); file++) {
+		const auto offset     = big(table, at, 8);
+		const auto length     = big(table, at + 8, 8);
+		const auto file_flags = big(table, at + 16, 4);
+		SpanReader name {table, static_cast<size_t>(at + 20)};
+		text(name);
+		at = name.at;
+		if ((file_flags & 4u) != 0 && offset <= size - data_at && length <= size - data_at - offset) {
+			search(data_at + offset, length);
+		}
+	}
+}
+
 } // namespace
 
 // The code of the listed shaders that neither the store nor the guest has given yet, from the
@@ -2394,7 +2570,9 @@ bool ForEachUnrealEntry(uint64_t size, Read&& read, Archive&& archive, Assets&& 
 // them in packages of its own, mostly as they are; those inside compressed packages are not
 // found, and wait until the guest maps them, but for the shaders of Unreal Engine, each one
 // compressed with LZ4 in an archive or an asset, which are read from the packages that hold them as
-// they are or compressed with zlib, and zstd frames, which are decompressed where they are found).
+// they are or compressed with zlib, those of Unity, compressed with LZ4 in Shader objects, which are
+// read from its serialized files and bundles, and zstd frames, which are decompressed where they
+// are found).
 // First, a kind of file (by extension) is left out
 // after a sample in a row without shaders, and a file after as many bytes without one, so that a
 // game's textures, audio and video, and what follows the shaders in a large package, are not read
@@ -2571,6 +2749,17 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			}
 		});
 	};
+	// Reads `size` bytes of `file` from `offset` into `out`.
+	const auto read_file = [&](Common::File& file, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
+		uint32_t done = 0;
+		if (size > (1u << 30u) || !file.Seek(offset)) {
+			return false;
+		}
+		out.resize(size);
+		file.Read(out.data(), static_cast<uint32_t>(size), &done);
+		bytes += done;
+		return done == size;
+	};
 	// Whether the package's index (or the whole loose archive) was read.
 	const auto search_unreal = [&](const std::filesystem::path& path, const std::string& extension) {
 		Common::File file;
@@ -2578,14 +2767,7 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			return false;
 		}
 		const auto read = [&](uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
-			uint32_t done = 0;
-			if (size > (1u << 30u) || !file.Seek(offset)) {
-				return false;
-			}
-			out.resize(size);
-			file.Read(out.data(), static_cast<uint32_t>(size), &done);
-			bytes += done;
-			return done == size;
+			return read_file(file, offset, size, out);
 		};
 		std::vector<uint8_t> archive;
 		if (extension == ".pak") {
@@ -2599,6 +2781,19 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 		}
 		search_archive(archive);
 		return true;
+	};
+	// Unity: the Shader objects of a serialized file or a bundle.
+	const auto search_unity = [&](const std::filesystem::path& path) {
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) {
+			return;
+		}
+		const auto read = [&](uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
+			return read_file(file, offset, size, out);
+		};
+		ForEachUnityShaderFile(file.Size(), read, [&](std::span<const uint8_t> serialized) {
+			FindUnityShaders(serialized, shader, [&](std::span<const uint8_t> code) { search(code); });
+		});
 	};
 	// Files and bytes of each kind in a row without a shader, and files probed in a row that gave
 	// no missing code.
@@ -2634,8 +2829,11 @@ bool PipelineCache::ScanGameFiles(const std::stop_token&                        
 			auto extension = Common::PathToString(path.extension());
 			std::ranges::transform(extension, extension.begin(),
 			                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-			if (extension == ".pak" || extension == ".ushaderbytecode") {
-				search_unreal(path, extension);
+			if ((extension == ".pak" || extension == ".ushaderbytecode") && search_unreal(path, extension)) {
+				continue; // Read through its index instead of sampled.
+			}
+			if (extension == ".bundle" || extension == ".unity3d" || extension == ".assets") {
+				search_unity(path);
 			}
 			auto& kind = kinds[extension];
 			if (kind.files >= SampleFiles || kind.bytes >= SampleBytes) {

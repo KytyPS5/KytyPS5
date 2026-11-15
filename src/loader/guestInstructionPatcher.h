@@ -36,6 +36,8 @@ struct InstructionPatchCounts {
 
 struct GuestInstructionPatchResult {
 	uint64_t               function_count                           = 0;
+	// Functions found through the calls and address loads of the listed ones.
+	uint64_t               called_function_count                    = 0;
 	uint64_t               instruction_count                        = 0;
 	uint64_t               red_zone_function_count                  = 0;
 	uint64_t               memory_instruction_count                 = 0;

@@ -1835,6 +1835,35 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
 	return size;
 }
 
+// Appends the code addresses that relative relocations store (virtual tables, tables of function
+// pointers): functions only reached through such pointers are neither listed in .eh_frame nor
+// called directly. Executable segments hold no data, so these addresses are function entries.
+static void AddRelocatedCodeAddresses(Program* program,
+                                      const std::vector<std::pair<uint64_t, uint64_t>>& segments,
+                                      std::vector<uintptr_t>* function_starts) {
+	auto*       elf        = program->elf.get();
+	Elf64_Rela* rela       = nullptr;
+	uint64_t    rela_bytes = 0;
+	GetDynDataOs(elf, &rela, DT_OS_RELA);
+	GetDynData(elf, program->base_vaddr, &rela, DT_RELA);
+	GetDynValue(elf, &rela_bytes, DT_OS_RELASZ);
+	GetDynValue(elf, &rela_bytes, DT_RELASZ);
+	if (rela == nullptr) {
+		return;
+	}
+	for (uint64_t index = 0; index < rela_bytes / sizeof(Elf64_Rela); index++) {
+		if (rela[index].GetType() != R_X86_64_RELATIVE) {
+			continue;
+		}
+		const uint64_t address = program->base_vaddr + rela[index].r_addend;
+		if (std::ranges::any_of(segments, [address](const auto& segment) {
+			    return address >= segment.first && address < segment.first + segment.second;
+		    })) {
+			function_starts->push_back(address);
+		}
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
@@ -1993,6 +2022,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
 			    module_name));
+		} else {
+			AddRelocatedCodeAddresses(program, executable_segments, &function_starts);
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
@@ -2006,11 +2037,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			totals.clwb += result.clwb;
 			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
-				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 " (%" PRIu64
+				     " found through calls), red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
+				     module_name.c_str(), result.function_count, result.called_function_count,
+				     result.red_zone_function_count,
 				     result.memory_instruction_count, result.patched_memory_instruction_count,
 				     result.short_memory_instruction_count,
 				     result.stack_dependent_memory_instruction_count,

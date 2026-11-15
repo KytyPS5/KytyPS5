@@ -96,6 +96,9 @@ struct EqaaPlan {
 	std::array<std::array<uint8_t, 16>, 4> host_of_guest {};
 	// Nibble q holds host_of_guest[q][0], the host sample that carries guest sample 0.
 	uint16_t anchor_select = 0;
+	// An AnchorShadow over a depth target that stores every raster sample: host sample i is
+	// guest sample i.
+	bool     full_depth    = false;
 	uint32_t inexact       = 0;
 };
 

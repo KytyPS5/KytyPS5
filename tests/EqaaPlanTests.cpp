@@ -249,11 +249,11 @@ void TestOneFragmentFallbacks() {
 	      "the anchor count changed a target without FMASK");
 
 	inputs               = OneFragmentInputs();
-	inputs.depth_samples = 2;
+	inputs.depth_samples = 1;
 	plan                 = PlanEqaa(inputs, NvidiaCaps());
 	Check(plan.mode == EqaaMode::FragmentApprox &&
 	          plan.reason == EqaaFallbackReason::MixedSampleCounts,
-	      "1 colour fragment over 4 depth samples is not the fragment approximation");
+	      "1 colour fragment over 2 depth samples is not the fragment approximation");
 
 	inputs           = OneFragmentInputs();
 	inputs.colors[1] = {1, 0};
@@ -315,6 +315,124 @@ void TestTwoFragments() {
 	      "2 stored samples without FMASK under 4 raster samples do not place the anchors");
 }
 
+// Death Stranding 2's water pre-pass: 4 raster samples on a regular grid, one stored fragment
+// under FMASK, and a depth target that keeps all four samples.
+EqaaInputs FullDepthInputs() {
+	EqaaInputs inputs;
+	inputs.msaa_num_samples     = 2;
+	inputs.msaa_exposed_samples = 2;
+	inputs.msaa_enable          = true;
+	for (uint32_t quad = 0; quad < 4; quad++) {
+		inputs.locations[quad * 4] = Pack(-4, -4, 4, -4, -4, 4, 4, 4);
+	}
+	inputs.max_anchor_samples = 2;
+	inputs.color_count        = 1;
+	inputs.colors[0]          = {2, 0};
+	inputs.has_depth          = true;
+	inputs.depth_samples      = 2;
+	return inputs;
+}
+
+void TestFullDepth() {
+	Check(FullDepthInputs().locations[0] == 0x444cc4ccu, "the pre-pass sample locations");
+	auto plan = PlanEqaa(FullDepthInputs(), NvidiaCaps());
+	Check(plan.mode == EqaaMode::AnchorShadow && plan.full_depth,
+	      "1 fragment over full-rate depth is not a full-depth shadow");
+	Check(plan.guest_samples == 4 && plan.host_samples == 4 && plan.pattern.count == 4,
+	      "full-depth host count");
+	Check(plan.pattern.xy[0] == 0x44 && plan.pattern.xy[1] == 0x4c && plan.pattern.xy[2] == 0xc4 &&
+	          plan.pattern.xy[3] == 0xcc,
+	      "the full-depth host pattern is not the guest's grid");
+	Check(plan.anchor_select == 0x0000, "sample 0 is not the stored fragment's sample");
+	for (uint32_t quad = 0; quad < 4; quad++) {
+		for (uint32_t sample = 0; sample < 4; sample++) {
+			Check(plan.host_of_guest[quad][sample] == sample,
+			      "a full-depth host sample is not its guest sample");
+		}
+	}
+	Check(plan.inexact == FmaskUnmodelled, "full-depth inexact parts");
+	Check(!PlanEqaa(OneFragmentInputs(), NvidiaCaps()).full_depth,
+	      "a one-sample depth target was planned as full-rate depth");
+
+	// The host samples keep the guest's order where sorting the locations would not.
+	auto reversed = FullDepthInputs();
+	for (uint32_t quad = 0; quad < 4; quad++) {
+		reversed.locations[quad * 4] = Pack(4, 4, -4, 4, 4, -4, -4, -4);
+	}
+	plan = PlanEqaa(reversed, NvidiaCaps());
+	Check(plan.mode == EqaaMode::AnchorShadow && plan.full_depth && plan.pattern.xy[0] == 0xcc &&
+	          plan.pattern.xy[1] == 0xc4 && plan.pattern.xy[2] == 0x4c &&
+	          plan.pattern.xy[3] == 0x44 && plan.anchor_select == 0x0000,
+	      "the full-depth host samples do not follow the guest sample order");
+
+	// The standard locations still need the shadow that stores one fragment.
+	auto standard = FullDepthInputs();
+	SetStandard4(standard);
+	plan = PlanEqaa(standard, NvidiaCaps());
+	Check(plan.mode == EqaaMode::AnchorShadow && plan.full_depth && plan.pattern.count == 4 &&
+	          plan.pattern.xy[0] == 0x26 && plan.pattern.xy[3] == 0xea,
+	      "full-rate depth at the standard locations is not a full-depth shadow");
+
+	// Without FMASK the colour target sees one sample, so the anchor count does not matter.
+	auto plain               = FullDepthInputs();
+	plain.colors[0]          = {0, 0};
+	plain.max_anchor_samples = 0;
+	plan                     = PlanEqaa(plain, NvidiaCaps());
+	Check(plan.mode == EqaaMode::AnchorShadow && plan.full_depth && plan.inexact == 0,
+	      "a one-sample colour target over full-rate depth is not a full-depth shadow");
+
+	// Every sample's PA_SC_AA_MASK bit counts, not the anchor's alone.
+	auto masked    = FullDepthInputs();
+	masked.aa_mask = {0xfffffffdu, 0xffffffffu};
+	Check((PlanEqaa(masked, NvidiaCaps()).inexact & AaMaskIgnored) != 0,
+	      "a depth sample's bit cleared in PA_SC_AA_MASK was not reported");
+}
+
+void TestFullDepthFallbacks() {
+	auto inputs               = FullDepthInputs();
+	inputs.max_anchor_samples = 0;
+	auto plan                 = PlanEqaa(inputs, NvidiaCaps());
+	Check(plan.mode == EqaaMode::Fallback && plan.reason == EqaaFallbackReason::AnchorCount,
+	      "fewer anchors than depth samples did not fall back");
+
+	inputs                          = FullDepthInputs();
+	inputs.overrasterization_amount = 1;
+	plan                            = PlanEqaa(inputs, NvidiaCaps());
+	Check(plan.mode == EqaaMode::Fallback && plan.reason == EqaaFallbackReason::OrReduce,
+	      "overrasterization over full-rate depth did not fall back");
+
+	// The depth target's samples cannot follow locations that differ between quad pixels.
+	inputs               = FullDepthInputs();
+	inputs.locations[12] = Pack(-4, -4, 4, -4, -4, 4, 2, 2);
+	plan                 = PlanEqaa(inputs, NvidiaCaps());
+	Check(plan.mode == EqaaMode::Fallback && plan.reason == EqaaFallbackReason::NonUniformNative,
+	      "per-quad locations over full-rate depth did not fall back");
+
+	auto caps             = NvidiaCaps();
+	caps.sample_locations = false;
+	plan                  = PlanEqaa(FullDepthInputs(), caps);
+	Check(plan.mode == EqaaMode::Fallback && plan.reason == EqaaFallbackReason::HostUnsupported,
+	      "a host without sample locations did not fall back");
+	caps               = NvidiaCaps();
+	caps.sample_counts = 1u | 2u;
+	plan               = PlanEqaa(FullDepthInputs(), caps);
+	Check(plan.mode == EqaaMode::Fallback && plan.reason == EqaaFallbackReason::HostUnsupported,
+	      "a host without custom 4x locations did not fall back");
+	caps           = NvidiaCaps();
+	caps.coord_min = 0.3f;
+	plan           = PlanEqaa(FullDepthInputs(), caps);
+	Check(plan.mode == EqaaMode::Fallback && plan.reason == EqaaFallbackReason::HostUnsupported,
+	      "a location outside the host range did not fall back");
+
+	// Two stored fragments over four depth samples have no plan.
+	inputs           = FullDepthInputs();
+	inputs.colors[0] = {2, 1};
+	plan             = PlanEqaa(inputs, NvidiaCaps());
+	Check(plan.mode == EqaaMode::FragmentApprox &&
+	          plan.reason == EqaaFallbackReason::MixedSampleCounts && !plan.full_depth,
+	      "2 colour fragments over 4 depth samples are not the fragment approximation");
+}
+
 void TestAaMask() {
 	auto inputs    = CheckerboardInputs(false);
 	inputs.aa_mask = {0xffff0002u, 0xffffffffu};
@@ -338,6 +456,8 @@ int main() {
 	TestOneFragment();
 	TestOneFragmentFallbacks();
 	TestTwoFragments();
+	TestFullDepth();
+	TestFullDepthFallbacks();
 	std::printf("EqaaPlanTests: all tests passed\n");
 	return 0;
 }

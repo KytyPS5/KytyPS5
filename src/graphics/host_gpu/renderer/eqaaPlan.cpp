@@ -58,34 +58,27 @@ bool HostSupportsCount(const EqaaHostCaps& caps, uint32_t samples) {
 	return caps.sample_locations && caps.sub_pixel_bits >= 4 && (caps.sample_counts & samples) != 0;
 }
 
-EqaaPlan PlanNative(EqaaPlan plan, const QuadPositions& positions, uint32_t samples,
-                    const EqaaInputs& inputs, const EqaaHostCaps& caps, EqaaMode failure) {
-	const auto fail = [&](EqaaFallbackReason reason) {
-		return failure == EqaaMode::Fallback ? Fallback(plan, reason)
-		                                     : FragmentApprox(plan, reason);
-	};
-	const bool uniform = std::ranges::all_of(positions, [&](const auto& quad) {
+// Whether every quad pixel places its first `samples` samples alike.
+bool IsUniform(const QuadPositions& positions, uint32_t samples) {
+	return std::ranges::all_of(positions, [&](const auto& quad) {
 		return std::equal(quad.begin(), quad.begin() + samples, positions[0].begin());
 	});
-	if (!uniform) {
-		return fail(EqaaFallbackReason::NonUniformNative);
-	}
-	if (IsStandardPattern(positions[0], samples)) {
-		return plan;
-	}
-	// Custom locations on a depth attachment need a sample-locations-compatible image.
-	if (inputs.has_depth) {
-		return fail(EqaaFallbackReason::NativeDepth);
-	}
-	if (!HostSupportsCount(caps, samples) ||
-	    !std::all_of(positions[0].begin(), positions[0].begin() + samples,
-	                 [&](uint8_t xy) { return LocationInRange(xy, caps); })) {
-		return fail(EqaaFallbackReason::HostUnsupported);
-	}
-	plan.mode          = EqaaMode::Native;
+}
+
+// Whether the host takes a quad pixel's first `samples` locations as custom locations.
+bool HostPlaces(const std::array<uint8_t, 16>& pattern, uint32_t samples,
+                const EqaaHostCaps& caps) {
+	return HostSupportsCount(caps, samples) &&
+	       std::all_of(pattern.begin(), pattern.begin() + samples,
+	                   [&](uint8_t xy) { return LocationInRange(xy, caps); });
+}
+
+// Host sample i becomes guest sample i at its own location; the host applies no PA_SC_AA_MASK.
+void PlaceGuestSamples(EqaaPlan& plan, const std::array<uint8_t, 16>& pattern, uint32_t samples,
+                       const EqaaInputs& inputs) {
 	plan.host_samples  = static_cast<uint8_t>(samples);
 	plan.pattern.count = static_cast<uint8_t>(samples);
-	std::copy_n(positions[0].begin(), samples, plan.pattern.xy.begin());
+	std::copy_n(pattern.begin(), samples, plan.pattern.xy.begin());
 	for (auto& quad: plan.host_of_guest) {
 		for (uint32_t sample = 0; sample < samples; sample++) {
 			quad[sample] = static_cast<uint8_t>(sample);
@@ -97,6 +90,38 @@ EqaaPlan PlanNative(EqaaPlan plan, const QuadPositions& positions, uint32_t samp
 			plan.inexact |= AaMaskIgnored;
 		}
 	}
+}
+
+// What the host's pixel stage does differently from the guest's over a shadow's samples.
+uint32_t ShadowPixelStageInexact(const EqaaInputs& inputs) {
+	return (inputs.ps_reads_coverage ? CoverageInputUnmapped : 0u) |
+	       (inputs.alpha_to_mask ? AlphaToMaskHost : 0u) |
+	       (inputs.ps_sample_rate ? SampleRateShading : 0u) |
+	       (inputs.mask_export ? MaskExportUnmapped : 0u) |
+	       (inputs.ps_centroid ? CentroidHostDefined : 0u);
+}
+
+EqaaPlan PlanNative(EqaaPlan plan, const QuadPositions& positions, uint32_t samples,
+                    const EqaaInputs& inputs, const EqaaHostCaps& caps, EqaaMode failure) {
+	const auto fail = [&](EqaaFallbackReason reason) {
+		return failure == EqaaMode::Fallback ? Fallback(plan, reason)
+		                                     : FragmentApprox(plan, reason);
+	};
+	if (!IsUniform(positions, samples)) {
+		return fail(EqaaFallbackReason::NonUniformNative);
+	}
+	if (IsStandardPattern(positions[0], samples)) {
+		return plan;
+	}
+	// Custom locations on a depth attachment need a sample-locations-compatible image.
+	if (inputs.has_depth) {
+		return fail(EqaaFallbackReason::NativeDepth);
+	}
+	if (!HostPlaces(positions[0], samples, caps)) {
+		return fail(EqaaFallbackReason::HostUnsupported);
+	}
+	plan.mode = EqaaMode::Native;
+	PlaceGuestSamples(plan, positions[0], samples, inputs);
 	plan.inexact |= inputs.ps_reads_coverage ? CoverageInputUnmapped : 0u;
 	return plan;
 }
@@ -164,11 +189,25 @@ EqaaPlan PlanAnchorShadow(EqaaPlan plan, const QuadPositions& positions, uint32_
 			plan.inexact |= AaMaskIgnored;
 		}
 	}
-	plan.inexact |= inputs.ps_reads_coverage ? CoverageInputUnmapped : 0u;
-	plan.inexact |= inputs.alpha_to_mask ? AlphaToMaskHost : 0u;
-	plan.inexact |= inputs.ps_sample_rate ? SampleRateShading : 0u;
-	plan.inexact |= inputs.mask_export ? MaskExportUnmapped : 0u;
-	plan.inexact |= inputs.ps_centroid ? CentroidHostDefined : 0u;
+	plan.inexact |= ShadowPixelStageInexact(inputs);
+	return plan;
+}
+
+// One stored fragment over a depth target that keeps every raster sample. Sample 0's fragment is
+// the stored one (an expanded one-fragment FMASK names it at sample 0 alone), and the host
+// shadows hold the guest's samples in their own order.
+EqaaPlan PlanFullDepthShadow(EqaaPlan plan, const QuadPositions& positions, uint32_t samples,
+                             const EqaaInputs& inputs, const EqaaHostCaps& caps) {
+	if (!IsUniform(positions, samples)) {
+		return Fallback(plan, EqaaFallbackReason::NonUniformNative);
+	}
+	if (!HostPlaces(positions[0], samples, caps)) {
+		return Fallback(plan, EqaaFallbackReason::HostUnsupported);
+	}
+	plan.mode       = EqaaMode::AnchorShadow;
+	plan.full_depth = true;
+	PlaceGuestSamples(plan, positions[0], samples, inputs);
+	plan.inexact |= ShadowPixelStageInexact(inputs);
 	return plan;
 }
 
@@ -208,10 +247,13 @@ EqaaPlan PlanEqaa(const EqaaInputs& inputs, const EqaaHostCaps& caps) {
 	}
 
 	const uint8_t stored = colors.empty() ? inputs.depth_samples : colors.front().fragments;
+	// Depth stores what the colour targets do, or every raster sample under one fragment.
+	const bool full_depth =
+	    !colors.empty() && stored == 0 && inputs.has_depth && inputs.depth_samples == n;
 	if (stored < n && all_colors([&](const EqaaTargetSamples& c) {
 		    return c.fragments == stored && (c.samples == stored || c.samples == n);
 	    }) &&
-	    (!inputs.has_depth || inputs.depth_samples == stored)) {
+	    (!inputs.has_depth || inputs.depth_samples == stored || full_depth)) {
 		const auto fail = [&](EqaaFallbackReason reason) {
 			return stored == 0 ? Fallback(plan, reason) : FragmentApprox(plan, reason);
 		};
@@ -220,7 +262,8 @@ EqaaPlan PlanEqaa(const EqaaInputs& inputs, const EqaaHostCaps& caps) {
 		    colors, [](const EqaaTargetSamples& c) { return c.samples > c.fragments; });
 		plan.inexact |= fmask ? FmaskUnmodelled : 0u;
 		// The CB keeps every anchor's fragment and drops unanchored ones it has no room for.
-		if (fmask && inputs.max_anchor_samples != stored) {
+		// Over full-rate depth every sample is an anchor, and sample 0's fragment is kept.
+		if (fmask && inputs.max_anchor_samples != (full_depth ? n : stored)) {
 			return fail(EqaaFallbackReason::AnchorCount);
 		}
 		plan.color_rule =
@@ -231,7 +274,8 @@ EqaaPlan PlanEqaa(const EqaaInputs& inputs, const EqaaHostCaps& caps) {
 			return fail(EqaaFallbackReason::OrReduce);
 		}
 		if (stored == 0) {
-			return PlanAnchorShadow(plan, positions, guest_samples, inputs, caps);
+			return full_depth ? PlanFullDepthShadow(plan, positions, guest_samples, inputs, caps)
+			                  : PlanAnchorShadow(plan, positions, guest_samples, inputs, caps);
 		}
 		// Pixels covered only at unstored samples launch the guest PS but not the host's.
 		plan.inexact |= PsSubset;

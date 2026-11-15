@@ -484,6 +484,10 @@ private:
 	// Before a buffer is destroyed: its copies on the readback queue are done. The copies wait for
 	// earlier submissions only, so the timeline does not cover them.
 	void WaitReadbackQueueCopies(vk::Buffer buffer);
+	// Before the emulator writes guest memory in place of the GPU (fills, copies): the host copies queued for the work
+	// before it, which read guest memory, complete first. Callbacks drain them anyway; dispatches do not
+	// (CommandProcessor::Execute()).
+	void DrainHostCopies();
 	void NoteWrite(uint64_t vaddr, uint64_t size) {
 		// (A GPU write over a copy-feedback snapshot: it no longer holds the bytes.)
 		if (m_copy_feedback_entries != 0) InvalidateCopyFeedback(vaddr, size);

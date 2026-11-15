@@ -869,8 +869,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	    operation.kind != GpuOperationKind::DrawIndirect) {
 		executor.InvalidateRenderTargetMemo();
 		// Guest-visible effects (labels, interrupts, flips, host commands) let the guest overwrite
-		// what earlier draws read: their copies complete first.
-		if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
+		// what earlier draws read: their copies complete first. A dispatch is no such effect, as a
+		// draw is not: the submission that carries it waits for the copies on the recording thread,
+		// and the guest memory it may write on the CPU in place of the GPU (fills, copies) waits
+		// for them there (BufferCache::DrainHostCopies()). Demon's Souls' full device-address
+		// synchronizations hand ~1 MB each to the copy thread, and the dispatch after one waited
+		// ~230 us for it, ~6 times a frame (1.4 ms of the execution thread at Boletaria).
+		if (auto* copies = GetScheduler().HostCopies();
+		    copies != nullptr && operation.kind == GpuOperationKind::Callback) {
 			copies->Drain();
 		}
 	}

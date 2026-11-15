@@ -1759,6 +1759,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	});
 }
 
+void BufferCache::DrainHostCopies() {
+	if (auto* copies = m_scheduler.HostCopies(); copies != nullptr && GuestGpu::IsGpuThread()) {
+		copies->Drain();
+	}
+}
+
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
 	m_gpu_write_generation++;
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
@@ -1780,6 +1786,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		// faults would page by page, so the fill below does not fault on every tracked page.
 		InvalidateMemory(vaddr, size);
 		m_texture_cache.InvalidateMemory(vaddr, size);
+		DrainHostCopies();
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
@@ -1806,6 +1813,7 @@ bool BufferCache::ReplicateBuffer(uint64_t destination, uint64_t count, uint64_t
 	// As FillBuffer(): invalidate the cached buffers and images up front.
 	InvalidateMemory(destination, size);
 	m_texture_cache.InvalidateMemory(destination, size);
+	DrainHostCopies();
 	// The pattern once, then copies of the bytes already written, each twice as long as the one
 	// before: a whole number of patterns precedes every copy, so it continues the pattern.
 	auto*      target = reinterpret_cast<uint8_t*>(destination);
@@ -1842,6 +1850,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		DrainHostCopies();
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		LibKernel::Memory::NoteEmulatorWrite(dst_vaddr, size);

@@ -1360,17 +1360,28 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		KYTY_PROFILER_BLOCK("DrawAuto::PopPendingOperations");
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
-	Common::LockGuard lock(m_context.GetMutex());
+	Common::LockGuard lock = [&]() {
+		KYTY_PROFILER_BLOCK("DrawAuto::LockWait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer)) {
+	bool special_operation = false;
+	{
+		KYTY_PROFILER_BLOCK("DrawAuto::SpecialOperations");
+		special_operation = ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+		                    ResolveColorTargets(buffer);
+	}
+	if (special_operation) {
 		ResetBindings();
 		return true;
 	}
@@ -1404,7 +1415,12 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		ResetBindings();
 		return true;
 	}
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	bool prepared_state = false;
+	{
+		KYTY_PROFILER_BLOCK("DrawAuto::PrepareDrawRenderState");
+		prepared_state = PrepareDrawRenderState(buffer, draw, state);
+	}
+	if (!prepared_state) {
 		ResetBindings();
 		return true;
 	}
@@ -1424,13 +1440,20 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
-	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
-	                                  args.indirect);
+	const auto emit = [&]() {
+		KYTY_PROFILER_BLOCK("DrawAuto::ResolveDrawEmit");
+		return ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
+		                       static_cast<int32_t>(args.first_vertex), args.first_instance,
+		                       args.indirect);
+	}();
 	if (emit) {
+		KYTY_PROFILER_BLOCK("DrawAuto::ExecutePreparedDraw");
 		ExecutePreparedDraw(buffer, draw, state, *emit, {});
 	}
-	ResetBindings();
+	{
+		KYTY_PROFILER_BLOCK("DrawAuto::ResetBindings");
+		ResetBindings();
+	}
 	return emit.has_value();
 }
 

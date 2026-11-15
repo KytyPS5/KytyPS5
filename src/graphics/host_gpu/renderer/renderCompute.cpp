@@ -494,12 +494,25 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
                                       bool async_compute) {
 	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
+	KYTY_PROFILER_BLOCK("RenderExecutor::DispatchIndirect");
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::PopPendingOperations");
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
+	Common::LockGuard lock = [&]() {
+		KYTY_PROFILER_BLOCK("DispatchIndirect::LockWait");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
-	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
-	    (args.x == 0 || args.y == 0 || args.z == 0)) {
+	bool empty_dispatch = false;
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::CheckEmptyArgs");
+		empty_dispatch = !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+		                 LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
+		                 (args.x == 0 || args.y == 0 || args.z == 0);
+	}
+	if (empty_dispatch) {
+		KYTY_PROFILER_BLOCK("DispatchIndirect::SkippedEmpty");
 		return;
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
@@ -509,41 +522,70 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
-	m_context.GetImageHeap().BeginDraw();
-	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
-	buffer.EndRendering();
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::ImageHeapBeginDraw");
+		m_context.GetImageHeap().BeginDraw();
+	}
+	bool has_program = false;
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::GetComputeProgram");
+		has_program = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info) != nullptr;
+	}
+	if (!has_program) return;
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::EndRendering");
+		buffer.EndRendering();
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
-	CacheDmaBases(m_context, input_info.stage);
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::CacheDmaBases");
+		CacheDmaBases(m_context, input_info.stage);
+	}
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("DispatchIndirect::PrepareBda");
 		m_context.PrepareBda();
 	}
-	PrepareRayQuery(m_context, input_info.stage, bindings);
-	BindSharedMemory(m_context, input_info, bindings, args_addr);
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::RayQueryAndSharedMemory");
+		PrepareRayQuery(m_context, input_info.stage, bindings);
+		BindSharedMemory(m_context, input_info, bindings, args_addr);
+	}
 	if (program.info.uses_image_heap) {
+		KYTY_PROFILER_BLOCK("DispatchIndirect::ImageHeapRebind");
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	const auto obtained = [&]() {
+		KYTY_PROFILER_BLOCK("DispatchIndirect::ObtainArgsBuffer");
+		return m_context.GetBufferCache().ObtainBuffer(args_addr, sizeof(vk::DispatchIndirectCommand),
+		                                               false);
+	}();
+	const auto [args_buffer, args_offset] = obtained;
 	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings)) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::RecordDispatchAndBarriers");
+		if (HasStorageWrites(input_info, bindings)) {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	ResetBindings();
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect::ResetBindings");
+		ResetBindings();
+	}
 }
 
 } // namespace Libs::Graphics

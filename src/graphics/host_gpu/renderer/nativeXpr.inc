@@ -1609,8 +1609,8 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (stream.Handle() != record.upload) return false;
 	// Constants into the stream buffer, at the set's dynamic offsets (binding order).
 	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
-	const auto  alignment = std::max<uint64_t>({256, limits.minUniformBufferOffsetAlignment,
-	                                            limits.minStorageBufferOffsetAlignment});
+	const auto  alignment = std::max(std::max<uint64_t>(256, limits.minUniformBufferOffsetAlignment),
+	                                 uint64_t {limits.minStorageBufferOffsetAlignment});
 	std::array<uint32_t, 8>        offsets {};
 	ShaderRecompiler::IR::PushData push_data;
 	if (record.dynamic_bindings.size() > offsets.size()) return false;

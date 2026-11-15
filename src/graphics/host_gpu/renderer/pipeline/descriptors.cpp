@@ -2527,7 +2527,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 				const auto  limit =
 				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 				    (graphics.StorageMinAlignment() - 1);
-				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+				size = std::min(std::min(size, uint64_t {256} * 1024 * 1024), limit);
 			}
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
@@ -2594,9 +2594,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			auto view = prepared.buffers[index];
 			// A null descriptor (empty binding) keeps offset 0 and the whole size, as Vulkan requires.
 			if (view.buffer != nullptr) {
-				view.range = std::min<vk::DeviceSize>(
-				    {view.range, ShaderRecompiler::IR::UniformBufferBytes,
-				     m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
+				// Two-operand minimums: an initializer list takes the vectorized library search.
+				view.range = std::min(
+				    std::min<vk::DeviceSize>(view.range, ShaderRecompiler::IR::UniformBufferBytes),
+				    vk::DeviceSize {m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxUniformBufferRange});
 			}
 			prepared.uniform_buffers[resource.uniform_index] = view;
 		}

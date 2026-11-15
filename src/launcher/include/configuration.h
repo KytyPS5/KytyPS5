@@ -87,6 +87,10 @@ public:
 	enum class PssrUpscaler { Linear, DLSS, FSR };
 	Q_ENUM(PssrUpscaler)
 
+	// Experiment: the draw templates, the second resolve thread and the per-draw block of small buffers.
+	enum class DrawMode { Original, Experiment };
+	Q_ENUM(DrawMode)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -130,6 +134,7 @@ public:
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
+	DrawMode               draw_mode                   = DrawMode::Original;
 	bool                   shader_cache_enabled        = true;
 	bool                   async_pipelines_enabled     = true;
 	bool                   pipeline_manifest_record    = false;
@@ -184,6 +189,7 @@ public:
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		relaxed_shader_float        = other.relaxed_shader_float;
 		native_rt                   = other.native_rt;
+		draw_mode                   = other.draw_mode;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		async_pipelines_enabled     = other.async_pipelines_enabled;
 		pipeline_manifest_record    = other.pipeline_manifest_record;

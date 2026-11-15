@@ -453,6 +453,17 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
 	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+	// Draw mode: the emulator reads these switches from its environment (off unless set).
+	auto environment = QProcessEnvironment::systemEnvironment();
+	for (const auto* name: {"KYTY_DRAW_TEMPLATES", "KYTY_RESOLVE_HELPER", "KYTY_DRAW_BUFFERS"}) {
+		environment.remove(QString::fromLatin1(name));
+	}
+	if (info.draw_mode == Configuration::DrawMode::Experiment) {
+		environment.insert(QStringLiteral("KYTY_DRAW_TEMPLATES"), QStringLiteral("2"));
+		environment.insert(QStringLiteral("KYTY_RESOLVE_HELPER"), QStringLiteral("1"));
+		environment.insert(QStringLiteral("KYTY_DRAW_BUFFERS"), QStringLiteral("1"));
+	}
+	process->setProcessEnvironment(environment);
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

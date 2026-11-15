@@ -221,6 +221,16 @@
               <property name="text"><string>Native ray tracing (experimental)</string></property>
              </widget>
             </item>
+            <item row="15" column="0">
+             <widget class="QLabel" name="label_draw_mode">
+              <property name="text"><string>Draw mode:</string></property>
+             </widget>
+            </item>
+            <item row="15" column="1">
+             <widget class="QComboBox" name="comboBox_draw_mode">
+              <property name="toolTip"><string>Experiment: draw templates, a second resolve thread and a per-draw block of small buffers. Faster in GTA V, still being tested.</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

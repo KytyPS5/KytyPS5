@@ -173,10 +173,11 @@ struct AheadWrites {
 			count       = static_cast<uint16_t>(count + delta);
 		}
 	}
+	[[nodiscard]] bool Has(uint64_t begin, uint64_t end) const {
+		return std::ranges::any_of(ranges, [&](const auto& range) { return range.first == begin && range.second == end; });
+	}
 	void Add(uint64_t begin, uint64_t end) {
-		for (const auto& [b, e]: ranges) {
-			if (b == begin && e == end) return;
-		}
+		if (Has(begin, end)) return;
 		Count(ranges[next].first, ranges[next].second, -1);
 		ranges[next] = {begin, end};
 		Count(begin, end, 1);
@@ -190,7 +191,17 @@ struct AheadWrites {
 		return false;
 	}
 };
-thread_local AheadWrites t_ahead_writes;
+// The resolve thread's ranges. A walk on a helper thread reads them as of the draw it was handed
+// (the draws before it): the resolve thread adds under a sequence count, and the helper copies them
+// when the count it was handed moved (SyncAheadWrites()). Draws handed to a helper write no buffers.
+AheadWrites                               g_ahead_writes;
+std::atomic<uint64_t>                     g_ahead_writes_sequence {0};
+thread_local std::unique_ptr<AheadWrites> t_ahead_writes_copy;
+thread_local uint64_t                     t_ahead_writes_copied = UINT64_MAX;
+
+AheadWrites& ThreadAheadWrites() {
+	return t_ahead_writes_copy != nullptr ? *t_ahead_writes_copy : g_ahead_writes;
+}
 
 // Guest memory writes with known bytes (WRITE_DATA) of operations the resolution thread passed
 // and the execution thread has not run yet, oldest first: walks ahead of later operations read
@@ -286,7 +297,7 @@ void LearnGpuProducedBound(uint64_t address) {
 }
 
 bool AheadGpuProduced(uint64_t address) {
-	if (!t_ahead_writes.Contains(address) && !g_gpu_produced_bounds.Contains(address)) return false;
+	if (!ThreadAheadWrites().Contains(address) && !g_gpu_produced_bounds.Contains(address)) return false;
 	t_ahead_unread_load = true;
 	return true;
 }
@@ -300,7 +311,19 @@ void NoteAheadWrites(const ShaderRecompiler::IR::ResourcePlan&     plan,
 		const uint64_t base    = descriptor.dwords[0] | (uint64_t {descriptor.dwords[1] & 0xffffu} << 32u);
 		const uint32_t stride  = (descriptor.dwords[1] >> 16u) & 0x3fffu;
 		const uint64_t size    = uint64_t {descriptor.dwords[2]} * (stride != 0u ? stride : 1u);
-		if (base != 0 && size != 0) t_ahead_writes.Add(base, base + size);
+		if (base == 0 || size == 0) continue;
+		if (t_ahead_writes_copy != nullptr) {
+			t_ahead_writes_copy->Add(base, base + size);
+			continue;
+		}
+		// The resolve thread is the only writer: the count moves only when the ranges change, so a
+		// helper copies them again only then.
+		if (g_ahead_writes.Has(base, base + size)) continue;
+		const auto sequence = g_ahead_writes_sequence.load(std::memory_order_relaxed);
+		g_ahead_writes_sequence.store(sequence + 1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		g_ahead_writes.Add(base, base + size);
+		g_ahead_writes_sequence.store(sequence + 2, std::memory_order_release);
 	}
 }
 
@@ -314,20 +337,28 @@ void RecordAheadLoads(void* userdata, std::span<const uint64_t> loads) {
 
 class ProgramLockGuard {
 public:
-	explicit ProgramLockGuard(std::atomic_flag& flag): m_flag(flag) {
-		while (m_flag.test_and_set(std::memory_order_acquire)) {
-			while (m_flag.test(std::memory_order_relaxed)) {
+	// Takes the lock only when `take`.
+	explicit ProgramLockGuard(std::atomic_flag& flag, bool take = true): m_flag(take ? &flag : nullptr) {
+		if (m_flag == nullptr) return;
+		while (m_flag->test_and_set(std::memory_order_acquire)) {
+			while (m_flag->test(std::memory_order_relaxed)) {
 				Common::SpinPause();
 			}
 		}
 	}
-	~ProgramLockGuard() { m_flag.clear(std::memory_order_release); }
+	~ProgramLockGuard() {
+		if (m_flag != nullptr) m_flag->clear(std::memory_order_release);
+	}
 	ProgramLockGuard(const ProgramLockGuard&)            = delete;
 	ProgramLockGuard& operator=(const ProgramLockGuard&) = delete;
 
 private:
-	std::atomic_flag& m_flag;
+	std::atomic_flag* m_flag;
 };
+
+// Whether this thread walks resource plans ahead with scratch of its own (BeginAheadThread()):
+// GetAhead() then takes the program lock for the cache lookups only, and the walk runs without it.
+thread_local bool t_ahead_unlocked = false;
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
@@ -1888,7 +1919,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
-	const ProgramLockGuard lock(m_program_lock);
+	const ProgramLockGuard lock(m_program_lock, ahead == nullptr || !t_ahead_unlocked);
 	if (ahead != nullptr) {
 		const ShaderModule* pixel_module = nullptr;
 		if (pixel_active) {
@@ -1935,37 +1966,48 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInfo& input_info,
                                             uint32_t& push_data_cursor, ProgramResolution& ahead) {
+	// The key of each thread that resolves ahead (its vector keeps its storage).
+	thread_local ProgramKey key;
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		m_ahead_key.stage = input_info.logical_stage;
+		key.stage = input_info.logical_stage;
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-		m_ahead_key.stage = ShaderType::Pixel;
+		key.stage = ShaderType::Pixel;
 	} else {
 		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-		m_ahead_key.stage = ShaderType::Compute;
+		key.stage = ShaderType::Compute;
 	}
-	m_ahead_key.hash            = params.hash;
-	m_ahead_key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, m_ahead_key.static_state);
-	AppendNativeRayTracingKey(m_ahead_key.stage, m_ahead_key.static_state);
-	const auto entry = m_program_cache.find(m_ahead_key);
-	if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
-		QueueCompile(params, input_info, push_data_cursor, nullptr);
-	}
-	// SWAPPC programs link the functions they call from guest memory, and image heap views are
-	// acquired in draw order: the execution thread resolves them.
-	if (entry == m_program_cache.end() || ahead.stages == ProgramResolution::MaxStages ||
-	    entry->second.skip_dispatch || entry->second.call_source ||
-	    std::ranges::any_of(entry->second.modules, [](const ShaderModule& module) {
-		    return module.info.info.uses_image_heap;
-	    })) {
-		ahead.reads.Fail();
-		return nullptr;
+	key.hash            = params.hash;
+	key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, key.static_state);
+	AppendNativeRayTracingKey(key.stage, key.static_state);
+	// Programs are added under the program lock and never removed, and a program found ahead
+	// (one without a call source) keeps its resource plan: a thread with scratch of its own
+	// (t_ahead_unlocked) walks it without the lock. Other threads hold it already.
+	const bool unlocked = t_ahead_unlocked;
+	Program*   program  = nullptr;
+	{
+		const ProgramLockGuard lock(m_program_lock, unlocked);
+		const auto             entry = m_program_cache.find(key);
+		if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
+			QueueCompile(key, params, input_info, push_data_cursor, nullptr);
+		}
+		// SWAPPC programs link the functions they call from guest memory, and image heap views are
+		// acquired in draw order: the execution thread resolves them.
+		if (entry == m_program_cache.end() || ahead.stages == ProgramResolution::MaxStages ||
+		    entry->second.skip_dispatch || entry->second.call_source ||
+		    std::ranges::any_of(entry->second.modules, [](const ShaderModule& module) {
+			    return module.info.info.uses_image_heap;
+		    })) {
+			ahead.reads.Fail();
+			return nullptr;
+		}
+		program = &entry->second;
 	}
 	const auto stage_index    = ahead.stages++;
 	auto&      resources      = ahead.resources[stage_index];
 	auto&      specialization = ahead.specializations[stage_index];
-	ahead.plans[stage_index] = &entry->second.resource_plan;
-	ahead.reads.SetStage(stage_index, &entry->second.resource_plan);
+	ahead.plans[stage_index] = &program->resource_plan;
+	ahead.reads.SetStage(stage_index, &program->resource_plan);
 	// The walker's loads of GPU-owned pages read the backing store instead of downloading
 	// GPU-written bytes, and the loads that still fault fail the walk; every load is logged with
 	// the value it read, for the execution thread to check. The pending writes change only between
@@ -1988,12 +2030,12 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		runtime.runtime_stride        = RuntimeStride(params.hash);
 	}
 	t_ahead_unread_load = false;
-	if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, resources,
+	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 	                                                specialization)) {
 		ahead.reads.Fail();
 		return nullptr;
 	}
-	NoteAheadWrites(entry->second.resource_plan, resources);
+	NoteAheadWrites(program->resource_plan, resources);
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		return layout.push_data_start_dword ==
@@ -2001,9 +2043,10 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		                                                    layout.ShaderDataDwords()) &&
 		       candidate.specialization == specialization;
 	};
-	auto& modules = entry->second.modules;
-	auto& last    = entry->second.last_module[1];
-	auto  module  = last < modules.size() && matches(modules[last])
+	const ProgramLockGuard lock(m_program_lock, unlocked);
+	auto&                  modules = program->modules;
+	auto&                  last    = program->last_module[1];
+	auto                   module  = last < modules.size() && matches(modules[last])
 	                    ? modules.begin() + static_cast<std::ptrdiff_t>(last)
 	                    : std::ranges::find_if(modules, matches);
 	if (module == modules.end()) {
@@ -2015,7 +2058,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		// ADD_TID or reserved dst_sel that no vertex program compiles). Only the execution
 		// thread's own lookup compiles those.
 		if (!ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load) {
-			QueueCompile(params, input_info, push_data_cursor, &specialization);
+			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
 		}
 		ahead.reads.Fail();
 		return nullptr;
@@ -2059,14 +2102,15 @@ void PipelineCache::UnlockPrograms() {
 }
 
 template <typename InputInfo>
-void PipelineCache::QueueCompile(const ShaderParams& params, const InputInfo& input_info,
+void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& params,
+                                 const InputInfo&                                    input_info,
                                  uint32_t                                            push_data_cursor,
                                  const ShaderRecompiler::IR::ResourceSpecialization* specialization) {
-	if (m_in_flight.contains(m_ahead_key)) {
+	if (m_in_flight.contains(key)) {
 		return;
 	}
 	auto job              = std::make_unique<CompileJob>();
-	job->key              = m_ahead_key;
+	job->key              = key;
 	job->params           = params;
 	job->push_data_cursor = push_data_cursor;
 	if (specialization != nullptr) {
@@ -2079,7 +2123,7 @@ void PipelineCache::QueueCompile(const ShaderParams& params, const InputInfo& in
 	} else {
 		job->compute = std::make_unique<ShaderComputeInputInfo>(input_info);
 	}
-	m_in_flight[m_ahead_key]++;
+	m_in_flight[key]++;
 	{
 		std::lock_guard lock(m_job_mutex);
 		m_jobs.push_back(std::move(job));
@@ -2704,6 +2748,41 @@ void PipelineCache::NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	state.Count(write, 1);
 }
 
+bool PipelineCache::AheadGuestWritesPending() {
+	return !t_ahead_guest_writes.writes.empty();
+}
+
+void PipelineCache::BeginAheadThread(uint32_t slot) {
+	ShaderRecompiler::IR::UsePlanScratchSlot(slot);
+	t_ahead_unlocked = true;
+}
+
+uint64_t PipelineCache::AheadWritesSequence() {
+	return g_ahead_writes_sequence.load(std::memory_order_relaxed);
+}
+
+void PipelineCache::SyncAheadWrites(uint64_t sequence) {
+	if (t_ahead_writes_copy == nullptr) {
+		t_ahead_writes_copy = std::make_unique<AheadWrites>();
+	}
+	if (t_ahead_writes_copied == sequence) {
+		return;
+	}
+	for (;;) {
+		const auto before = g_ahead_writes_sequence.load(std::memory_order_acquire);
+		if ((before & 1u) != 0) {
+			Common::SpinPause();
+			continue;
+		}
+		std::memcpy(static_cast<void*>(t_ahead_writes_copy.get()), &g_ahead_writes, sizeof(AheadWrites));
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (g_ahead_writes_sequence.load(std::memory_order_relaxed) == before) {
+			t_ahead_writes_copied = before;
+			return;
+		}
+	}
+}
+
 void PipelineCache::RetireAheadGuestWrites(uint64_t executed) {
 	auto& state = t_ahead_guest_writes;
 	while (!state.writes.empty() && state.writes.front().sequence <= executed) {
@@ -2721,7 +2800,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
-	const ProgramLockGuard lock(m_program_lock);
+	const ProgramLockGuard lock(m_program_lock, !t_ahead_unlocked);
 	return GetAhead(params, input_info, push_data_cursor, ahead);
 }
 

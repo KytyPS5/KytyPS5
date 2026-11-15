@@ -1006,11 +1006,32 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
-	// GPU-thread scratch for walker results and material keys.
+	// GPU-thread scratch for walker results and material keys, of the threads that walk under the
+	// program lock (see PlanScratch()).
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// The same scratch for each thread that walks ahead of execution without the lock
+	// (UsePlanScratchSlot()), made on its first walk.
+	struct ThreadScratch {
+		std::vector<uint64_t>     srt_scratch;
+		std::vector<uint32_t>     material_keys;
+		std::vector<SelectorKeys> selector_keys;
+	};
+	static constexpr uint32_t                             ThreadScratchSlots = 2;
+	mutable std::array<std::unique_ptr<ThreadScratch>, ThreadScratchSlots> thread_scratch;
 };
+
+// The walk and materialization scratch of `plan` for the calling thread.
+struct PlanScratchRef {
+	std::vector<uint64_t>&                   srt_scratch;
+	std::vector<uint32_t>&                   material_keys;
+	std::vector<ResourcePlan::SelectorKeys>& selector_keys;
+};
+PlanScratchRef PlanScratch(const ResourcePlan& plan);
+// The calling thread walks plans with scratch slot `slot` (< ResourcePlan::ThreadScratchSlots) of
+// their own instead of the plans' scratch: several threads walk the same plans at once.
+void UsePlanScratchSlot(uint32_t slot);
 
 struct Program: ResourcePlan {
 	Program() = default;

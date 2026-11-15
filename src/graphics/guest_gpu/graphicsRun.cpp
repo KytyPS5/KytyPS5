@@ -431,10 +431,121 @@ void GuestGpu::ExecutionThread() {
 
 static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectOffsets& offsets);
 
+namespace {
+
+// KYTY_RESOLVE_HELPER=1: a second thread resolves some of the draws ahead of execution. The resolve
+// thread reserves the draw's resolution in order and hands the draw over while the helper has
+// little to do; the execution thread waits for the resolution to be ready
+// (RenderExecutor::WaitResolvedDraw()). The register snapshots stay valid until the operation
+// executed. Writes of guest memory with known bytes that walks ahead must read
+// (PipelineCache::NoteAheadGuestWrite()) are only known to the resolve thread: draws resolve there
+// while any is pending. Walks ahead do not read control flow from buffers that operations before
+// them write: the helper takes only draws of programs the resolve thread saw write no buffers, so
+// the written ranges stay the resolve thread's (PipelineCache::SyncAheadWrites()).
+class ResolveHelper {
+public:
+	struct Job {
+		RenderExecutor::ResolvedDraw* draw           = nullptr;
+		const HW::Context*            context        = nullptr;
+		const HW::UserConfig*         user_config    = nullptr;
+		const HW::Shader*             shaders        = nullptr;
+		ShaderIndirectOffsets         offsets        = {};
+		bool                          indirect_draw  = false;
+		uint64_t                      context_id     = 0;
+		uint64_t                      user_config_id = 0;
+		uint64_t                      ahead_writes   = 0;
+	};
+
+	explicit ResolveHelper(RenderExecutor& executor): m_executor(executor) {
+		m_thread = std::jthread([this] { Run(); });
+	}
+	~ResolveHelper() {
+		m_jobs.Stop();
+		m_thread.join();
+	}
+	KYTY_CLASS_NO_COPY(ResolveHelper);
+
+	// Whether the helper takes the draw: it is not busy with two already, and the draw's programs
+	// were seen to write no buffers.
+	[[nodiscard]] bool Takes(const HW::Shader& shaders) const {
+		return m_pending.load(std::memory_order_acquire) < MaxPending &&
+		       m_programs[Slot(shaders)] == ProgramsKey(shaders) && !PipelineCache::AheadGuestWritesPending();
+	}
+	// Learns whether the programs of a draw the resolve thread resolved write buffers.
+	void Learn(const HW::Shader& shaders, const RenderExecutor::ResolvedDraw* resolved) {
+		if (resolved != nullptr) {
+			m_programs[Slot(shaders)] = RenderExecutor::ResolvedDrawWritesBuffers(*resolved) ? 0 : ProgramsKey(shaders);
+		}
+	}
+	// Reserves the draw's resolution and hands it over; null when the draw resolves its programs
+	// itself.
+	RenderExecutor::ResolvedDraw* Resolve(const GpuRegisterState& state, const ShaderIndirectOffsets& offsets,
+	                                      bool indirect_draw) {
+		auto* draw = m_executor.ReserveResolvedDraw(*state.shaders);
+		if (draw != nullptr) {
+			m_pending.fetch_add(1, std::memory_order_relaxed);
+			m_jobs.Push({draw, state.context, state.user_config, state.shaders, offsets, indirect_draw,
+			             state.context_id, state.user_config_id, PipelineCache::AheadWritesSequence()});
+		}
+		return draw;
+	}
+
+private:
+	static constexpr uint32_t MaxPending = 2;
+	static constexpr size_t   ProgramSlots = 4096;
+
+	// The programs of a draw, by their addresses (never 0).
+	static uint64_t ProgramsKey(const HW::Shader& shaders) {
+		const auto&                   vs = shaders.GetVs();
+		const std::array<uint64_t, 5> programs {vs.es_regs.data_addr, vs.ls_regs.data_addr, vs.hs_regs.data_addr,
+		                                        vs.gs_regs.data_addr, shaders.GetPs().ps_regs.data_addr};
+		return XXH3_64bits(programs.data(), sizeof(programs)) | 1u;
+	}
+	static size_t Slot(const HW::Shader& shaders) {
+		return static_cast<size_t>(ProgramsKey(shaders) >> 20u) & (ProgramSlots - 1);
+	}
+
+	void Run() {
+		KYTY_PROFILER_THREAD("Thread_GpuResolveHelper");
+		Config::ConfigureGpuStageThread(Config::GpuStageThread::ResolveHelper);
+		PipelineCache::BeginAheadThread(1);
+		for (;;) {
+			auto job = m_jobs.TryPop();
+			if (!job) {
+				job = m_jobs.Pop();
+				if (!job) {
+					if (m_jobs.IsStopped()) {
+						break;
+					}
+					continue;
+				}
+			}
+			PipelineCache::SyncAheadWrites(job->ahead_writes);
+			m_executor.ResolveDrawInto(*job->draw, *job->context, *job->user_config, *job->shaders, job->offsets,
+			                           job->indirect_draw, job->context_id, job->user_config_id);
+			m_pending.fetch_sub(1, std::memory_order_release);
+		}
+	}
+
+	RenderExecutor&             m_executor;
+	Common::SpscQueue<Job>      m_jobs {64};
+	std::atomic<uint32_t>       m_pending {0};
+	// Resolve thread: ProgramsKey() of programs seen to write no buffers, by Slot().
+	std::vector<uint64_t>       m_programs = std::vector<uint64_t>(ProgramSlots);
+	std::jthread                m_thread;
+};
+
+} // namespace
+
 void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
+	std::optional<ResolveHelper> helper;
+	if (Config::ResolveHelperEnabled()) {
+		PipelineCache::BeginAheadThread(0);
+		helper.emplace(executor);
+	}
 	for (;;) {
 		auto operation = m_operations.TryPop();
 		if (!operation) {
@@ -491,19 +602,33 @@ void GuestGpu::ResolveThread() {
 		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		           operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.
-			operation->resolved =
-			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
-			                              *operation->state.shaders, {}, false, operation->state.context_id,
-			                              operation->state.user_config_id);
+			if (helper && helper->Takes(*operation->state.shaders)) {
+				operation->resolved = helper->Resolve(operation->state, {}, false);
+			} else {
+				operation->resolved =
+				    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
+				                              *operation->state.shaders, {}, false, operation->state.context_id,
+				                              operation->state.user_config_id);
+				if (helper) {
+					helper->Learn(*operation->state.shaders, operation->resolved);
+				}
+			}
 		} else if (operation->kind == GpuOperationKind::DrawIndirect) {
 			// Resolved for the offsets the GPU-read records give the shaders; draws that read
 			// their records on the CPU patch the SGPRs instead and resolve themselves.
 			ShaderIndirectOffsets offsets;
 			if (IndirectDrawOffsets(operation->draw_indirect.registers, offsets)) {
-				operation->resolved = executor.ResolveDrawAhead(
-				    *operation->state.context, *operation->state.user_config,
-				    *operation->state.shaders, offsets, true, operation->state.context_id,
-				    operation->state.user_config_id);
+				if (helper && helper->Takes(*operation->state.shaders)) {
+					operation->resolved = helper->Resolve(operation->state, offsets, true);
+				} else {
+					operation->resolved = executor.ResolveDrawAhead(
+					    *operation->state.context, *operation->state.user_config,
+					    *operation->state.shaders, offsets, true, operation->state.context_id,
+					    operation->state.user_config_id);
+					if (helper) {
+						helper->Learn(*operation->state.shaders, operation->resolved);
+					}
+				}
 			}
 		} else if (operation->kind == GpuOperationKind::DispatchDirect && operation->dispatch.mode == 0x41u &&
 		           Scout::Mode() == 3 && Scout::Running() &&
@@ -541,6 +666,8 @@ void GuestGpu::ResolveThread() {
 		}
 		m_resolved.Push(std::move(*operation));
 	}
+	// The helper finishes the resolutions it was handed first.
+	helper.reset();
 	m_resolved.Stop();
 }
 

@@ -166,7 +166,7 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 }
 
 const uint8_t* Scratch(const ResourcePlan& plan) {
-	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
+	return reinterpret_cast<const uint8_t*>(PlanScratch(plan).srt_scratch.data());
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
@@ -1802,9 +1802,36 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
 
+// The scratch slot of the calling thread (UsePlanScratchSlot()); none: the plans' own scratch.
+thread_local uint32_t t_plan_scratch_slot = UINT32_MAX;
+
+void UsePlanScratchSlot(uint32_t slot) {
+	EXIT_IF(slot >= ResourcePlan::ThreadScratchSlots);
+	t_plan_scratch_slot = slot;
+}
+
+PlanScratchRef PlanScratch(const ResourcePlan& plan) {
+	if (t_plan_scratch_slot == UINT32_MAX) {
+		return {plan.srt_scratch, plan.material_keys, plan.selector_keys};
+	}
+	// Only this thread uses its slot. The plan's scratch sizes are fixed when its walker is compiled.
+	auto& own = plan.thread_scratch[t_plan_scratch_slot];
+	if (own == nullptr) {
+		own = std::make_unique<ResourcePlan::ThreadScratch>();
+	}
+	if (own->srt_scratch.size() != plan.srt_scratch.size()) {
+		own->srt_scratch.assign(plan.srt_scratch.size(), 0u);
+	}
+	if (own->selector_keys.size() != plan.selector_keys.size()) {
+		own->selector_keys.resize(plan.selector_keys.size());
+	}
+	return {own->srt_scratch, own->material_keys, own->selector_keys};
+}
+
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
+	auto& scratch = PlanScratch(plan).srt_scratch;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
@@ -1814,13 +1841,13 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_pending_write  = runtime.pending_write;
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	                                                     scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	t_walker_ahead   = false;
 	t_gpu_produced   = nullptr;
 	t_pending_write  = nullptr;
 	if (end == nullptr || t_walker_faulted) return false;
-	const auto* first = plan.srt_scratch.data() + plan.srt_captures / 8u;
+	const auto* first = scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
 		// Resizing first spares emplace_back's reload of the vector's end per read.
 		const auto base = reads->size();

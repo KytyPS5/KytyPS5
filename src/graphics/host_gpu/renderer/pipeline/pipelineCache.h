@@ -448,6 +448,19 @@ public:
 	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	                                std::span<const uint32_t> data, bool one_address);
 	static void RetireAheadGuestWrites(uint64_t executed);
+	// Resolution thread: whether walks ahead read writes NoteAheadGuestWrite() noted. Other
+	// threads that resolve ahead have none.
+	[[nodiscard]] static bool AheadGuestWritesPending();
+	// Resolution thread: counts the buffer ranges resolutions ahead found written, which later
+	// walks ahead do not read control flow from (the writer may not have run yet).
+	[[nodiscard]] static uint64_t AheadWritesSequence();
+	// A helper thread that resolves ahead: its walks read the resolution thread's written ranges as
+	// of `sequence` (AheadWritesSequence() when it was handed the draw), or later.
+	static void SyncAheadWrites(uint64_t sequence);
+	// A thread that resolves ahead (`slot` 0: the resolution thread, 1: its helper) walks the
+	// resource plans with scratch of its own, without the program lock: several threads resolve
+	// ahead at once. Without it, the program lock is held for the whole resolution.
+	static void BeginAheadThread(uint32_t slot);
 	const ShaderModule* GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
 	                                           ShaderComputeInputInfo&      input_info,
 	                                           ProgramResolution&           ahead);
@@ -583,7 +596,6 @@ private:
 	// Draws resolve their programs on the resolve thread and, when a resolution is not usable,
 	// on the execution thread, which also resolves dispatches. Compile workers add programs.
 	std::atomic_flag m_program_lock;
-	ProgramKey       m_ahead_key;
 
 	// Graphics programs compiled on worker threads: the resolve thread queues the programs and
 	// modules its draws miss, so the shaders of a new area compile in parallel instead of one
@@ -635,10 +647,10 @@ private:
 	void DestroyModule(const ShaderModule& module) const;
 	void LockPrograms();
 	void UnlockPrograms();
-	// Under the program lock (resolve thread): queues the program of m_ahead_key, or one of its
+	// Under the program lock (resolving ahead): queues the program of `key`, or one of its
 	// modules, to the compile workers.
 	template <typename InputInfo>
-	void QueueCompile(const ShaderParams& params, const InputInfo& input_info,
+	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	                  uint32_t                                            push_data_cursor,
 	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization);
 	// Execution thread, under the program lock: waits without the lock until no worker compiles

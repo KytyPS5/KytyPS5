@@ -240,15 +240,19 @@ uint32_t GpuPipelineStages();
 uint32_t ParseGpuPipelineStages(const char* value);
 
 // Threads of a pipelined GPU. KYTY_GPU_THREAD_CPUS lists the logical processors the command
-// processor, execution, recording, resolve and host copy threads are pinned to ("off" leaves
-// them unpinned); KYTY_GPU_THREAD_PRIORITY=0 keeps their normal priority.
+// processor, execution, recording, resolve, host copy and resolve helper threads are pinned to
+// ("off" leaves them unpinned); KYTY_GPU_THREAD_PRIORITY=0 keeps their normal priority.
 enum class GpuStageThread : uint32_t {
 	CommandProcessor = 0,
 	Execution        = 1,
 	Recording        = 2,
 	Resolve          = 3,
-	HostCopy         = 4
+	HostCopy         = 4,
+	ResolveHelper    = 5
 };
+// KYTY_RESOLVE_HELPER=1: a second thread resolves draws ahead of their execution beside the
+// resolve thread.
+bool ResolveHelperEnabled();
 // Applies the priority and affinity of `stage` to the calling thread.
 void ConfigureGpuStageThread(GpuStageThread stage);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

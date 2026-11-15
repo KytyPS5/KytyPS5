@@ -235,6 +235,15 @@ public:
 	                                             const ShaderIndirectOffsets& indirect_offsets = {},
 	                                             bool indirect_draw = false, uint64_t context_id = 0,
 	                                             uint64_t user_config_id = 0);
+	// Resolve thread: as ResolveDrawAhead(), for a resolution another thread makes
+	// (ResolveDrawInto()): the next resolution of the ring, in use and not ready yet; null when the
+	// draw resolves its programs itself. The execution thread waits for it to be ready.
+	[[nodiscard]] ResolvedDraw* ReserveResolvedDraw(const HW::Shader& shaders);
+	// Any thread that resolves ahead: resolves the draw into `draw` (from ReserveResolvedDraw())
+	// and makes it ready, or marks it failed (the draw resolves its programs itself).
+	void ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
+	                     const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
+	                     bool indirect_draw, uint64_t context_id, uint64_t user_config_id);
 	// Resolve thread: the compute program of a DISPATCH_DIRECT with the given registers and
 	// initiator; null when the dispatch resolves it itself. Shares the ring of draw resolutions.
 	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
@@ -252,7 +261,13 @@ public:
 	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
 	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
 	// the same bytes.
-	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
+	void UseResolvedDraw(ResolvedDraw* resolved) noexcept {
+		m_resolved_draw = resolved != nullptr ? WaitResolvedDraw(resolved) : nullptr;
+	}
+	// Execution thread: `resolved` once ready; null when its resolution failed.
+	static ResolvedDraw* WaitResolvedDraw(ResolvedDraw* resolved) noexcept;
+	// Whether a stage of the resolved draw writes buffers.
+	[[nodiscard]] static bool ResolvedDrawWritesBuffers(const ResolvedDraw& resolved);
 	// Execution thread: the operation that carried `resolved` executed.
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
@@ -608,12 +623,12 @@ private:
 	std::array<DrawBufferView, 16> m_draw_buffer_views {};
 	uint32_t                       m_draw_buffer_view_count = 0;
 	bool                           m_draw_buffer_views_on   = false;
-	// Resolve thread: the context and user configuration keys of the last register snapshots a
-	// state key was made for (DrawStateKey()), by snapshot id.
-	uint64_t m_state_key_context_id     = 0;
-	uint64_t m_state_key_context        = 0;
-	uint64_t m_state_key_user_config_id = 0;
-	uint64_t m_state_key_user_config    = 0;
+	// Resolves the programs of a draw into `draw`; false when the draw resolves them itself.
+	bool ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
+	                         const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
+	                         bool indirect_draw, uint64_t context_id, uint64_t user_config_id);
+	// The next resolution of the ring, once the execution thread released it.
+	ResolvedDraw& NextResolvedDraw();
 	// Whether a template may stand for the image and sampler bindings of these stages.
 	[[nodiscard]] static bool DrawTemplateEligible(std::span<const ShaderStageRuntime* const> stages);
 	// The template for `key` when its stages run the same programs with the same T#s and S#s.

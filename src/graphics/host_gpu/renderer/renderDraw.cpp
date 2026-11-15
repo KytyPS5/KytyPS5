@@ -484,6 +484,10 @@ struct RenderExecutor::ResolvedDraw {
 	// See DrawResourceKey() (0 without draw templates).
 	uint64_t               resource_key = 0;
 	std::atomic_bool       busy {false};
+	// A resolution another thread makes (ReserveResolvedDraw()): Pending until it is Ready or
+	// Failed.
+	enum : uint8_t { Ready, Pending, Failed };
+	std::atomic<uint8_t> state {Ready};
 };
 
 // More resolutions than operations can wait between the resolve and execution threads, so the
@@ -496,7 +500,30 @@ struct RenderExecutor::ResolvedDrawRing {
 };
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
+	// Not while another thread still resolves into it.
+	(void)WaitResolvedDraw(resolved);
 	resolved->busy.store(false, std::memory_order_release);
+}
+
+bool RenderExecutor::ResolvedDrawWritesBuffers(const ResolvedDraw& resolved) {
+	for (uint32_t i = 0; i < resolved.programs.stages; i++) {
+		const auto* plan = resolved.programs.plans[i];
+		if (plan == nullptr || std::ranges::any_of(plan->info.buffers, [](const auto& buffer) { return buffer.written; })) {
+			return true;
+		}
+	}
+	return false;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::WaitResolvedDraw(ResolvedDraw* resolved) noexcept {
+	auto state = resolved->state.load(std::memory_order_acquire);
+	for (Common::SpinWait wait; state == ResolvedDraw::Pending;
+	     state = resolved->state.load(std::memory_order_acquire)) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	return state == ResolvedDraw::Ready ? resolved : nullptr;
 }
 
 // The render targets the last draw acquired. Nearly every draw renders to the targets of the
@@ -1347,6 +1374,18 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 	if (!DrawHasValidVertexShader(shaders)) {
 		return nullptr;
 	}
+	auto& draw = NextResolvedDraw();
+	draw.state.store(ResolvedDraw::Ready, std::memory_order_relaxed);
+	if (!ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw, context_id,
+	                         user_config_id)) {
+		return nullptr;
+	}
+	// Published to the execution thread with the operation that carries it.
+	draw.busy.store(true, std::memory_order_relaxed);
+	return &draw;
+}
+
+RenderExecutor::ResolvedDraw& RenderExecutor::NextResolvedDraw() {
 	if (m_resolved_ring == nullptr) {
 		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
 	}
@@ -1358,7 +1397,33 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 			std::this_thread::yield();
 		}
 	}
-	ring.next           = (ring.next + 1) % ResolvedDrawRing::Size;
+	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	return draw;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ReserveResolvedDraw(const HW::Shader& shaders) {
+	if (!DrawHasValidVertexShader(shaders)) {
+		return nullptr;
+	}
+	auto& draw = NextResolvedDraw();
+	draw.state.store(ResolvedDraw::Pending, std::memory_order_relaxed);
+	draw.busy.store(true, std::memory_order_relaxed);
+	return &draw;
+}
+
+void RenderExecutor::ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context,
+                                     const HW::UserConfig& user_config, const HW::Shader& shaders,
+                                     const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw,
+                                     uint64_t context_id, uint64_t user_config_id) {
+	const bool resolved = ResolveDrawPrograms(draw, context, user_config, shaders, indirect_offsets, indirect_draw,
+	                                          context_id, user_config_id);
+	draw.state.store(resolved ? ResolvedDraw::Ready : ResolvedDraw::Failed, std::memory_order_release);
+}
+
+bool RenderExecutor::ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& context,
+                                         const HW::UserConfig& user_config, const HW::Shader& shaders,
+                                         const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw,
+                                         uint64_t context_id, uint64_t user_config_id) {
 	draw.compute_module = nullptr;
 	auto& state         = draw.storage.state;
 	ResetDrawRenderState(state, draw.storage.tessellation_stages_written);
@@ -1370,7 +1435,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 	if (!m_context.GetPipelineCache().GetGraphicsProgramsAhead(context, user_config, shaders, state,
 	                                                          draw.programs) ||
 	    draw.programs.reads.Failed() || state.vertex_info[0].stage.module == nullptr) {
-		return nullptr;
+		return false;
 	}
 	draw.resource_key = 0;
 	if (DrawTemplatesEnabled()) {
@@ -1387,22 +1452,23 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
 			draw.resource_key = DrawResourceKey({stages.data(), stage_count});
 		}
 		if (draw.resource_key != 0 && DrawStateTemplatesEnabled()) {
-			// Snapshots with the same id have the same registers (0: live registers).
-			if (context_id == 0 || context_id != m_state_key_context_id) {
-				m_state_key_context    = DrawContextKey(context);
-				m_state_key_context_id = context_id;
+			// The context and user configuration keys of the last register snapshots this thread made a
+			// state key for, by snapshot id. Snapshots with the same id have the same registers (0:
+			// live registers).
+			thread_local uint64_t context_key_id = 0, context_key = 0, user_config_key_id = 0, user_config_key = 0;
+			if (context_id == 0 || context_id != context_key_id) {
+				context_key    = DrawContextKey(context);
+				context_key_id = context_id;
 			}
-			if (user_config_id == 0 || user_config_id != m_state_key_user_config_id) {
-				m_state_key_user_config    = DrawUserConfigKey(user_config);
-				m_state_key_user_config_id = user_config_id;
+			if (user_config_id == 0 || user_config_id != user_config_key_id) {
+				user_config_key    = DrawUserConfigKey(user_config);
+				user_config_key_id = user_config_id;
 			}
-			draw.resource_key = DrawStateKey(draw.resource_key, m_state_key_context, m_state_key_user_config,
-			                                 shaders, state.vertex_info[0]);
+			draw.resource_key =
+			    DrawStateKey(draw.resource_key, context_key, user_config_key, shaders, state.vertex_info[0]);
 		}
 	}
-	// Published to the execution thread with the operation that carries it.
-	draw.busy.store(true, std::memory_order_relaxed);
-	return &draw;
+	return true;
 }
 
 RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
@@ -1415,18 +1481,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Con
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return nullptr;
 	}
-	if (m_resolved_ring == nullptr) {
-		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
-	}
-	auto& ring = *m_resolved_ring;
-	auto& slot = ring.draws[ring.next];
-	// The execution thread releases resolutions in order.
-	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
-		if (!wait.Spin()) {
-			std::this_thread::yield();
-		}
-	}
-	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	auto& slot = NextResolvedDraw();
+	slot.state.store(ResolvedDraw::Ready, std::memory_order_relaxed);
 	slot.programs.Reset();
 	ValueInitialize(slot.compute);
 	slot.compute.async_compute = async_compute;
@@ -1457,18 +1513,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return nullptr;
 	}
-	if (m_resolved_ring == nullptr) {
-		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
-	}
-	auto& ring = *m_resolved_ring;
-	auto& slot = ring.draws[ring.next];
-	// The execution thread releases resolutions in order.
-	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
-		if (!wait.Spin()) {
-			std::this_thread::yield();
-		}
-	}
-	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	auto& slot = NextResolvedDraw();
+	slot.state.store(ResolvedDraw::Ready, std::memory_order_relaxed);
 	slot.programs.Reset();
 	ValueInitialize(slot.compute);
 	slot.compute.async_compute = async_compute;

@@ -632,10 +632,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto& sources = indirect.sources;
 	const auto* selector = indirect.selector ? &*indirect.selector : nullptr;
 	const bool byte_keys = IsBoundedDescriptorTable(program, indirect);
+	const auto scratch = PlanScratch(program);
 	auto* selector_keys = selector != nullptr
-	    ? &program.selector_keys[program.selector_groups[source_index]] : nullptr;
-	auto& keys = selector_keys != nullptr ? selector_keys->values : program.material_keys;
-	auto& byte_offsets = program.material_keys;
+	    ? &scratch.selector_keys[program.selector_groups[source_index]] : nullptr;
+	auto& keys = selector_keys != nullptr ? selector_keys->values : scratch.material_keys;
+	auto& byte_offsets = scratch.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
 	// Ordinals of the distinct candidates: tables of tens of thousands of descriptors (the material
@@ -1019,7 +1020,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
 			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
-			auto& heap_words = program.material_keys;
+			auto& heap_words = PlanScratch(program).material_keys;
 			if (image_heap) {
 				heap_words.resize(table_size / 4u);
 				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
@@ -2149,7 +2150,7 @@ void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& s
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	t_record_blocks.clear();
-	for (auto& keys: program.selector_keys) keys.resolved = false;
+	for (auto& keys: PlanScratch(program).selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
@@ -2856,7 +2857,8 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       srt_plan_complete, resource_tracking_complete, info, buffer_vector_access,
 	       buffer_feeds_descriptors, uniform_fill,
 	       // Derived on load.
-	       descriptor_refresh, descriptor_word_flat, srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       descriptor_refresh, descriptor_word_flat, srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys,
+	       thread_scratch] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,

@@ -315,17 +315,25 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
 }
 
+bool ResolveHelperEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RESOLVE_HELPER");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
 void ConfigureGpuStageThread(GpuStageThread stage) {
 	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
-	// from core 0: the stages share its L3.
-	static const std::array<int, 5> cpus = [] {
-		std::array<int, 5> result {4, 6, 8, 10, 2};
+	// from core 0: the stages share its L3. The resolve helper takes core 0, the last one there.
+	static const std::array<int, 6> cpus = [] {
+		std::array<int, 6> result {4, 6, 8, 10, 2, 0};
 		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
 		if (std::string_view(value) == "off") {
-			return std::array<int, 5> {-1, -1, -1, -1, -1};
+			return std::array<int, 6> {-1, -1, -1, -1, -1, -1};
 		}
 		// Stages without a listed CPU keep their default.
 		for (auto& cpu: result) {
@@ -352,7 +360,9 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	// ~95% of a core each) otherwise run on the SMT siblings of the pinned stages and slow them
 	// down: give the stages whole physical cores.
 	static std::once_flag reserved;
-	std::call_once(reserved, [] { Common::Thread::ReserveCores(cpus); });
+	std::call_once(reserved, [] {
+		Common::Thread::ReserveCores(std::span {cpus}.first(ResolveHelperEnabled() ? 6 : 5));
+	});
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
 }
 

@@ -174,6 +174,8 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	// The push dwords the shader data may take end here.
+	uint32_t push_data_end = IR::PushData::DwordCount;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -315,6 +317,11 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
 // A per-sample PS reads barycentrics only through interpolation functions.
 bool PixelShaderIsPerSample(const EmitterState& state);
+
+// PA_SC_AA_MASK leaves some of this pixel shader's quad pixels uncovered.
+inline bool PixelShaderIsMasked(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel && state.input_info.pixel->ps_aa_mask;
+}
 
 Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 

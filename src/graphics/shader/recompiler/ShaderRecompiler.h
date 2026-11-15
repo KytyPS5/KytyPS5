@@ -27,6 +27,8 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// The push dwords the program's shader data may take end here.
+	uint32_t push_data_end = IR::PushData::DwordCount;
 };
 
 struct TranslateResult {

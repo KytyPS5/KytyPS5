@@ -861,8 +861,11 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitLiveMask(EmitterState& state) {
+	// The built-in does not show a pixel the AA mask demoted.
 	const auto helper =
-	    EmitNative<spv::OpLoad, IR::Type::U1>(state, state.helper_invocation_variable);
+	    PixelShaderIsMasked(state)
+	        ? EmitNative<spv::OpIsHelperInvocationEXT, IR::Type::U1>(state)
+	        : EmitNative<spv::OpLoad, IR::Type::U1>(state, state.helper_invocation_variable);
 	return EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(
 	    state, ConstantU32(state, spv::ScopeSubgroup), EmitLogicalNotBool(state, helper));
 }

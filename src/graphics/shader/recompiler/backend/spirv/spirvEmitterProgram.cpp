@@ -38,6 +38,32 @@ void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	EmitKillIfBoolFalse(state, active);
 }
 
+// PA_SC_AA_MASK: a pixel whose bit is clear in the draw's quad mask is not covered. It runs on
+// as a helper, which keeps its neighbours' derivatives and drops what it writes.
+void EmitAaMask(EmitterState& state) {
+	const auto position = InputVariableForKind(state, IR::StageInputKind::FragCoord);
+	const auto parity   = [&](uint32_t component) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+		                          pointer, position, ConstantU32(state, component));
+		state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
+		return EmitAndU32(state, Unary(state, spv::OpConvertFToU, TypeU32(state), value),
+		                  ConstantU32(state, 1));
+	};
+	const auto x     = parity(0);
+	const auto y     = parity(1);
+	const auto pixel = EmitOrU32(
+	    state, x, EmitBinaryU32(state, spv::OpShiftLeftLogical, y, ConstantU32(state, 1)));
+	const auto mask = EmitPushDataLoad(state, ConstantU32(state, IR::PushData::AaMaskDword));
+	const auto kept = EmitAndU32(state, EmitBinaryU32(state, spv::OpShiftRightLogical, mask, pixel),
+	                             ConstantU32(state, 1));
+	EmitIfCondition(state,
+	                EmitNative<spv::OpIEqual, IR::Type::U1>(state, kept, ConstantU32(state, 0)),
+	                [&]() { state.builder.AddFunction(spv::OpDemoteToHelperInvocationEXT); });
+}
+
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
 	const auto value_type = TypeId(ctx.state, type);
 	return value_type == 0 ? 0 : TypePointer(ctx.state, spv::StorageClassFunction, value_type);
@@ -750,6 +776,9 @@ void EmitProgram(EmitterState& state) {
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryBindings(state);
+	if (PixelShaderIsMasked(state)) {
+		EmitAaMask(state);
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

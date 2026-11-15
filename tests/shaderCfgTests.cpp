@@ -10661,6 +10661,79 @@ void TestAutomaticObjectPrimitiveId() {
 #endif
 }
 
+void TestAaMaskPixelShader() {
+  using namespace ShaderRecompiler::IR;
+  constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
+  constexpr uint32_t CapabilityDemoteToHelperInvocation = 5379;
+  constexpr uint32_t OpKill = 252;
+  constexpr uint32_t OpDemoteToHelperInvocation = 5380;
+  constexpr uint32_t OpIsHelperInvocation = 5381;
+
+  // Exports the number of live lanes.
+  const uint32_t shader[] = {
+      EncodeSop1(0x10, 0, 126),  // s_bcnt1_i32_b64 s0, exec
+      EncodeVop1(0x01, 0, 0),    // v_mov_b32 v0, s0
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0), 0xbf810000u};
+  ShaderPixelInputInfo pixel;
+  pixel.ps_early_z = true;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto mask_dword_reads = [](const std::string &source) {
+    size_t count = 0;
+    for (size_t line = 0; line < source.size();) {
+      const auto end = std::min(source.find('\n', line), source.size());
+      const auto text = std::string_view(source).substr(line, end - line);
+      count += text.find("OpAccessChain %_ptr_PushConstant_uint") != std::string_view::npos &&
+               text.ends_with(" %uint_31");
+      line = end + 1;
+    }
+    return count;
+  };
+
+  const auto ordinary_key = MakeStageStaticKey(pixel);
+  const auto ordinary = RecompileForTest(shader, options);
+  const auto ordinary_source = DisassembleSpirvBinary(ordinary.spirv);
+  Check(SpirvInstructionOpcodeCount(ordinary.spirv, OpDemoteToHelperInvocation) == 0 &&
+            SpirvInstructionOpcodeCount(ordinary.spirv, OpIsHelperInvocation) == 0 &&
+            !SpirvContainsCapability(ordinary.spirv, CapabilityDemoteToHelperInvocation) &&
+            ordinary_source.find("BuiltIn HelperInvocation") != std::string::npos &&
+            ordinary_source.find("BuiltIn FragCoord") == std::string::npos &&
+            ordinary_source.find("PushConstant") == std::string::npos &&
+            SpirvContainsExecutionMode(ordinary.spirv, ExecutionModeEarlyFragmentTests),
+        "a pixel shader without an AA mask tests one");
+
+  pixel.ps_aa_mask = true;
+  Check(MakeStageStaticKey(pixel) != ordinary_key,
+        "the AA mask was omitted from the shader identity");
+  options.push_data_end = PushData::AaMaskDword;
+  const auto masked = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(masked.spirv);
+  Check(SpirvInstructionOpcodeCount(masked.spirv, OpDemoteToHelperInvocation) == 1 &&
+            SpirvInstructionOpcodeCount(masked.spirv, OpKill) == 0 &&
+            SpirvContainsCapability(masked.spirv, CapabilityDemoteToHelperInvocation) &&
+            source.find("OpExtension \"SPV_EXT_demote_to_helper_invocation\"") !=
+                std::string::npos,
+        "a masked pixel is not demoted to a helper invocation");
+  Check(source.find("BuiltIn FragCoord") != std::string::npos && mask_dword_reads(source) == 1 &&
+            !masked.program.bindings.UsesPushData(),
+        "the mask is not read from the draw's dword by the pixel's position");
+  // The live mask is taken after the demotion, and sees it.
+  const auto demote = source.find("OpDemoteToHelperInvocation");
+  const auto helper = source.find("OpIsHelperInvocationEXT");
+  Check(SpirvInstructionOpcodeCount(masked.spirv, OpIsHelperInvocation) == 1 &&
+            demote != std::string::npos && helper != std::string::npos && demote < helper &&
+            source.find("BuiltIn HelperInvocation") == std::string::npos,
+        "the live lanes of a masked shader include the pixels its mask demoted");
+  Check(!SpirvContainsExecutionMode(masked.spirv, ExecutionModeEarlyFragmentTests),
+        "the depth test of a masked shader writes depth before the mask is applied");
+  CheckSpirvBinaryValidates(masked.spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  options.push_data_end = PushData::DwordCount;
+  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+              "a masked pixel shader was emitted without its mask dword kept free");
+#endif
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       NativeRenderTargetHost(), Prospero::ChannelLayout::k16_16_16_16,
@@ -12809,6 +12882,21 @@ void TestGraphicsPushConstantPlacement() {
   spill.program.bindings.AdvancePushData(cursor);
   Check(cursor == 29, "spilled shader data consumed push space");
   CheckSpirvBinaryValidates(spill.spirv);
+
+  // The stages of a draw under an AA mask leave the mask's dword alone.
+  using ShaderRecompiler::IR::PushData;
+  Check(PushData::AaMaskDword == 31 && PushData::CanFit(27, 4, PushData::AaMaskDword) &&
+            !PushData::CanFit(28, 4, PushData::AaMaskDword) &&
+            PushData::StartFor(28, 4, PushData::AaMaskDword) == PushData::NoStart &&
+            PushData::StartFor(28, 4) == 28,
+        "the AA mask dword is not the last push dword, or shader data may take it");
+  options.push_data_end = PushData::AaMaskDword;
+  const auto below = RecompileForTest(shader, options, 27);
+  Check(below.program.bindings.push_data_start_dword == 27,
+        "shader data that ends before the AA mask dword left the push block");
+  const auto reserved = RecompileForTest(shader, options, 28);
+  Check(reserved.program.bindings == spill.program.bindings && reserved.spirv == spill.spirv,
+        "shader data took the AA mask dword");
 }
 
 void TestCapturedBufferLoadUbyteD16Decode() {
@@ -13840,6 +13928,7 @@ int main() {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestAutomaticObjectPrimitiveId();
+  TestAaMaskPixelShader();
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();

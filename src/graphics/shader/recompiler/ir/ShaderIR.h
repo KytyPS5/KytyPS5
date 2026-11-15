@@ -398,6 +398,9 @@ struct PushData {
 
 	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
 	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
+	// The quad pixels a draw's PA_SC_AA_MASK covers, bit (y & 1) * 2 + (x & 1). The shader data
+	// of such a draw's stages ends before it.
+	static constexpr uint32_t AaMaskDword = DwordCount - 1;
 
 	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
 	                                                           uint32_t user_clip_planes = 0) {
@@ -407,11 +410,13 @@ struct PushData {
 		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
 	}
 
-	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
-		return size != 0 && start <= DwordCount && size <= DwordCount - start;
+	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size,
+	                                           uint32_t end = DwordCount) {
+		return size != 0 && start <= end && size <= end - start;
 	}
-	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
-		return CanFit(cursor, size) ? cursor : NoStart;
+	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size,
+	                                                 uint32_t end = DwordCount) {
+		return CanFit(cursor, size, end) ? cursor : NoStart;
 	}
 };
 

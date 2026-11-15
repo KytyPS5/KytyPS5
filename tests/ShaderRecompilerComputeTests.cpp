@@ -1673,6 +1673,8 @@ struct GraphicsCase {
   u32 width = 1;
   std::vector<u32> object_ids;
   std::vector<u32> gds_initial;
+  // PA_SC_AA_MASK: bit (y & 1) * 2 + (x & 1) keeps that pixel of a quad.
+  u32 aa_quad_mask = 0xf;
 };
 
 struct CompiledShader {
@@ -2191,6 +2193,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.object_primitive_id = !test.object_ids.empty();
+  pixel_info.ps_aa_mask = test.aa_quad_mask != 0xf;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -2206,6 +2209,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
+  if (pixel_info.ps_aa_mask) {
+    options.push_data_end = ShaderRecompiler::IR::PushData::AaMaskDword;
+  }
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
@@ -25870,6 +25876,7 @@ public:
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const bool object_id = !test.object_ids.empty();
+    const bool masked = test.aa_quad_mask != 0xf;
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
@@ -25922,7 +25929,7 @@ public:
                   fragment_bind.ShaderDataDwords() * sizeof(u32),
               "fragment push constant data size does not match reflection");
     }
-    if (fragment_bind.UsesPushData() || object_id) {
+    if (fragment_bind.UsesPushData() || object_id || masked) {
       push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
       push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
     }
@@ -26129,6 +26136,9 @@ public:
         if (fragment_bind.UsesPushData()) {
           std::copy(test.push_constants.begin(), test.push_constants.end(),
                     push_data.dwords.begin() + fragment_bind.push_data_start_dword);
+        }
+        if (masked) {
+          push_data.dwords[ShaderRecompiler::IR::PushData::AaMaskDword] = test.aa_quad_mask;
         }
         cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
                           sizeof(push_data), push_data.dwords.data());
@@ -27752,6 +27762,9 @@ private:
             available_features13.synchronization2 == true,
             "synchronization2 is not supported");
     Require("VulkanHarness", "dispatch",
+            available_features13.shaderDemoteToHelperInvocation == true,
+            "demotion to helper invocations is not supported");
+    Require("VulkanHarness", "dispatch",
             available_features.sampleRateShading == true,
             "sample-rate shading is not supported");
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
@@ -27832,6 +27845,7 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    device_features13.shaderDemoteToHelperInvocation = true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
@@ -53676,6 +53690,38 @@ GraphicsCase GraphicsBranchPathFinalVmExportDiscardsInactiveExec() {
            O::S_CBRANCH_SCC1, O::S_MOV_B32, O::S_ENDPGM}};
 }
 
+// PA_SC_AA_MASK over a triangle that covers every pixel: the kept ones alone export, beside
+// the shader's own push data.
+GraphicsCase GraphicsAaMaskKeepsQuadPixels(u32 quad_mask) {
+  auto test = GraphicsDirectSgprPushConstantExport();
+  test.name = quad_mask == 0x1   ? "GraphicsAaMaskKeepsEvenColumns"
+              : quad_mask == 0x2 ? "GraphicsAaMaskKeepsOddColumns"
+                                 : "GraphicsAaMaskKeepsOddRows";
+  test.width = 4;
+  test.aa_quad_mask = quad_mask;
+  const auto color = test.expected_pixel;
+  test.expected_pixel.clear();
+  // The target is its row 0.
+  for (u32 x = 0; x < test.width; x++) {
+    for (const u32 component : color) {
+      test.expected_pixel.push_back((quad_mask >> (x & 1u)) & 1u ? component : 0);
+    }
+  }
+  return test;
+}
+
+// The pixel the mask drops is a helper lane, like the one the triangle of
+// GraphicsDsAppendSkipsHelperLanes leaves uncovered.
+GraphicsCase GraphicsAaMaskSkipsHelperLanes(bool consume) {
+  auto test = GraphicsDsAppendSkipsHelperLanes(consume);
+  test.name = consume ? "GraphicsAaMaskSkipsConsume" : "GraphicsAaMaskSkipsAppend";
+  test.vertices = {0xbf800000u, 0xbf800000u, 0, 0, 0, 0,
+                   0x40400000u, 0xbf800000u, 0, 0, 0, 0,
+                   0xbf800000u, 0x40400000u, 0, 0, 0, 0};
+  test.aa_quad_mask = 0x2;
+  return test;
+}
+
 GraphicsCase GraphicsObjectPrimitiveId(bool discard) {
   auto test = discard ? GraphicsNullVmExportDiscardsInactiveExec()
                       : GraphicsDirectSgprPushConstantExport();
@@ -54455,6 +54501,11 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
       GraphicsObjectPrimitiveId(false),
       GraphicsObjectPrimitiveId(true),
+      GraphicsAaMaskKeepsQuadPixels(0x1),
+      GraphicsAaMaskKeepsQuadPixels(0x2),
+      GraphicsAaMaskKeepsQuadPixels(0xc),
+      GraphicsAaMaskSkipsHelperLanes(false),
+      GraphicsAaMaskSkipsHelperLanes(true),
   });
   return cases;
 }
@@ -62789,6 +62840,15 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--aa-mask-only") == 0) {
+    VulkanHarness vulkan;
+    for (const u32 quad_mask : {0x1u, 0x2u, 0xcu}) {
+      RunGraphicsCase(&vulkan, GraphicsAaMaskKeepsQuadPixels(quad_mask));
+    }
+    RunGraphicsCase(&vulkan, GraphicsAaMaskSkipsHelperLanes(false));
+    RunGraphicsCase(&vulkan, GraphicsAaMaskSkipsHelperLanes(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eqaa-only") == 0) {

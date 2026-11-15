@@ -42,6 +42,7 @@
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1237,13 +1238,11 @@ static bool TableViewCurrent(const TextureCache& texture_cache, const Image& ima
 	       (!image.is_depth_copy || texture_cache.DepthCopyCurrent(image));
 }
 
-static bool TableImageReady(const Image& image, const TextureBinding& texture) {
-	if (image.binding.is_bound || image.binding.is_target || image.binding.force_general ||
-	    texture.desc.type == TextureCache::BindingType::Storage) {
-		return false;
-	}
-	// As the transit of a sampled element (see CommitBindings()) and Image::GetBarriers().
-	const auto layout = image.info.data.Empty() ? vk::ImageLayout::eGeneral
+// The sampled texture's subresources are in the layout and access its transit would leave them
+// in (see CommitBindings() and Image::GetBarriers()): the transit would change nothing.
+static bool ImageReadReady(const Image& image, const TextureBinding& texture) {
+	// (A depth copy, which has no guest memory, is sampled in the read layout of depth.)
+	const auto layout = image.info.data.Empty() && !image.is_depth_copy ? vk::ImageLayout::eGeneral
 	                    : image.info.IsDepth()  ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                            : vk::ImageLayout::eShaderReadOnlyOptimal;
 	if (texture.layout != layout) {
@@ -1283,6 +1282,11 @@ static bool TableImageReady(const Image& image, const TextureBinding& texture) {
 		}
 	}
 	return true;
+}
+
+static bool TableImageReady(const Image& image, const TextureBinding& texture) {
+	return !image.binding.is_bound && !image.binding.is_target && !image.binding.force_general &&
+	       texture.desc.type != TextureCache::BindingType::Storage && ImageReadReady(image, texture);
 }
 
 void RenderExecutor::MarkTableElement(TableBindingState& state, uint32_t element) {
@@ -1962,6 +1966,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
+	prepared.template_stage  = nullptr;
+	prepared.template_images = 0;
 	prepared.images.resize(program.info.images.size());
 	prepared.shader_data.clear();
 	const bool same_program = prepared.last_program == &program &&
@@ -2109,6 +2115,370 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+bool RenderExecutor::DrawTemplateEligible(std::span<const ShaderStageRuntime* const> stages) {
+	if (stages.size() > std::tuple_size_v<decltype(DrawTemplate::stages)>) {
+		return false;
+	}
+	for (const auto* stage: stages) {
+		const auto& program = stage->module->info;
+		if (program.info.uses_image_heap || program.info.images.size() > 64u) {
+			return false;
+		}
+		// Bindless tables, the image heap, storage images and views by mip are bound their own
+		// way, draw by draw.
+		for (const auto& image: program.info.images) {
+			if (image.heap || image.table_capacity != 0u || image.written ||
+			    image.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+DrawTemplate* RenderExecutor::FindDrawTemplate(uint64_t key,
+                                               std::span<const ShaderStageRuntime* const> stages) {
+	if (m_draw_templates == nullptr) {
+		return nullptr;
+	}
+	auto* found = m_draw_templates->Find(key);
+	return found != nullptr && DrawTemplateStagesMatch(*found, stages) ? found : nullptr;
+}
+
+bool RenderExecutor::DrawTemplateStagesMatch(const DrawTemplate&                        found,
+                                             std::span<const ShaderStageRuntime* const> stages) {
+	if (found.stage_count != stages.size()) {
+		return false;
+	}
+	for (uint32_t s = 0; s < found.stage_count; s++) {
+		const auto& stage    = found.stages[s];
+		const auto& snapshot = *stages[s]->resources;
+		if (stage.program != &stages[s]->module->info || stage.image_values != snapshot.images ||
+		    stage.sampler_values != snapshot.samplers) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool RenderExecutor::DrawTemplateRefused(uint64_t key) const {
+	const auto* found = m_draw_templates != nullptr ? m_draw_templates->Find(key) : nullptr;
+	return found != nullptr && found->stage_count == 0 &&
+	       found->refused_tick == m_context.GetTextureCache().m_gc_tick;
+}
+
+void RenderExecutor::PrepareBindingsFromTemplate(const ShaderStageRuntime& runtime,
+                                                 const DrawTemplateStage&  stage,
+                                                 PreparedBindings&         prepared) {
+	const auto& program  = runtime.module->info;
+	const auto& snapshot = *runtime.resources;
+	prepared.runtime            = &runtime;
+	prepared.gds                = {nullptr, 0, VK_WHOLE_SIZE};
+	prepared.flattened_srt      = {};
+	prepared.shader_data_buffer = {};
+	prepared.shared_memory      = {};
+	// The images are checked against their versions once the buffers are found (see
+	// CheckTemplateImages()); until then they are what the template committed.
+	prepared.template_stage  = &stage;
+	prepared.template_images = 0;
+	prepared.images.resize(stage.images.size());
+	for (size_t i = 0; i < stage.images.size(); i++) {
+		const auto& source  = stage.images[i];
+		auto&       binding = prepared.images[i];
+		binding.image_id    = source.image_id;
+		binding.image_view  = source.image_view;
+		binding.layout      = source.layout;
+		if (!binding.mip_views.empty()) {
+			binding.mip_views.clear();
+		}
+		binding.lookup = nullptr;
+		binding.reused = true;
+		if (source.image_id) {
+			prepared.template_images |= uint64_t {1} << i;
+			binding.desc.type = source.desc.type;
+		} else {
+			binding.desc = source.desc;
+		}
+	}
+	prepared.table_images.clear();
+	prepared.table_views.clear();
+	prepared.table_sources.clear();
+	prepared.table_roots.clear();
+	prepared.table_versions.clear();
+	prepared.table_slots.clear();
+	prepared.table_state   = nullptr;
+	prepared.tables_reused = false;
+	prepared.table_visits.clear();
+	prepared.table_moved_slots.clear();
+	prepared.samplers.assign(stage.samplers.begin(), stage.samplers.end());
+	// The next draw of the stage without a template looks its T#s up again.
+	prepared.last_program = nullptr;
+	prepared.shader_data.clear();
+	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
+	for (const auto reg: program.info.user_data_registers) {
+		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	}
+	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
+		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+	}
+}
+
+uint64_t RenderExecutor::TemplateRangeEpoch(uint64_t address, uint64_t size) {
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto set_epoch     = texture_cache.ImageSetEpoch();
+	if (set_epoch != m_template_pages_epoch) {
+		if (m_template_page_epochs.empty()) {
+			m_template_page_epochs.assign(TemplatePageBuckets, 0);
+		}
+		// Pages that share a bucket share the latest epoch of either.
+		auto       change = m_template_pages_epoch;
+		const bool known  = texture_cache.ForEachImageSetChangeSince(
+            m_template_pages_epoch, [&](uint64_t change_address, uint64_t change_size) {
+                change++;
+                if (change_size == 0) {
+                    return;
+                }
+                const auto last = (change_address + change_size - 1) >> TextureCache::ImagePageBits;
+                for (auto page = change_address >> TextureCache::ImagePageBits; page <= last; page++) {
+                    m_template_page_epochs[page & (TemplatePageBuckets - 1)] = change;
+                }
+            });
+		if (known) {
+			m_template_pages_epoch = change;
+		} else {
+			// The history no longer reaches back: every range may have changed.
+			m_template_pages_epoch = set_epoch;
+			m_template_pages_floor = set_epoch;
+		}
+	}
+	uint64_t   epoch = m_template_pages_floor;
+	const auto last  = (address + std::max<uint64_t>(size, 1) - 1) >> TextureCache::ImagePageBits;
+	for (auto page = address >> TextureCache::ImagePageBits; page <= last; page++) {
+		epoch = std::max(epoch, m_template_page_epochs[page & (TemplatePageBuckets - 1)]);
+	}
+	return epoch;
+}
+
+bool RenderExecutor::CheckTemplateImages(PreparedBindings& prepared) {
+	auto&      stage         = *const_cast<DrawTemplateStage*>(prepared.template_stage);
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto set_epoch     = texture_cache.ImageSetEpoch();
+	const auto tick          = texture_cache.m_gc_tick;
+	const bool touch         = stage.touched_tick != tick;
+	const bool set_moved     = stage.image_set_epoch != set_epoch;
+	bool       changed       = false;
+	for (auto mask = prepared.template_images; mask != 0; mask &= mask - 1) {
+		const auto  i      = static_cast<uint32_t>(std::countr_zero(mask));
+		const auto& source = stage.images[i];
+		// The version moves with anything a binding of the image depends on: its identity,
+		// registration, contents, tracking and layout (see Image::StateChanged()).
+		bool current = texture_cache.ImageVersion(source.image_id) == stage.image_versions[i];
+		if (current && set_moved) {
+			const auto& range = source.desc.info.data;
+			current           = TemplateRangeEpoch(range.address, range.size) <= stage.image_set_epoch;
+		}
+		if (!current) {
+			// Looked up and acquired again (see RebindImages()), and transited.
+			const auto& program  = prepared.runtime->module->info;
+			const auto& snapshot = *prepared.runtime->resources;
+			const Common::HackNotice::ScopedShader shader_scope(program.shader_hash);
+			prepared.template_images &= ~(uint64_t {1} << i);
+			prepared.images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(prepared.images[i].image_id, false);
+			changed = true;
+			continue;
+		}
+		if (touch) {
+			// As the lookup would, once per tick: the image stays in use.
+			auto& image              = texture_cache.GetImage(source.image_id);
+			image.tick_accessed_last = tick;
+			texture_cache.TouchImage(image);
+		}
+	}
+	if (changed) {
+		return false;
+	}
+	stage.image_set_epoch = set_epoch;
+	stage.touched_tick    = tick;
+	return true;
+}
+
+void RenderExecutor::StoreDrawTemplate(uint64_t key, std::span<PreparedBindings* const> stages) {
+	if (stages.size() > std::tuple_size_v<decltype(DrawTemplate::stages)>) {
+		return;
+	}
+	if (m_draw_templates == nullptr) {
+		m_draw_templates = std::make_unique<DrawTemplateTable>();
+	}
+	auto& texture_cache = m_context.GetTextureCache();
+	auto& stored        = m_draw_templates->Insert(key);
+	stored.stage_count  = 0;
+	stored.refused_tick = 0;
+	stored.commit_valid = false;
+	for (const auto* prepared: stages) {
+		const auto& snapshot  = *prepared->runtime->resources;
+		auto&       stage     = stored.stages[stored.stage_count++];
+		stage.program         = &prepared->runtime->module->info;
+		stage.image_values    = snapshot.images;
+		stage.sampler_values  = snapshot.samplers;
+		stage.samplers        = prepared->samplers;
+		stage.image_set_epoch = texture_cache.ImageSetEpoch();
+		stage.touched_tick    = texture_cache.m_gc_tick;
+		stage.images.resize(prepared->images.size());
+		stage.image_versions.resize(prepared->images.size());
+		for (size_t i = 0; i < prepared->images.size(); i++) {
+			const auto& binding = prepared->images[i];
+			auto&       copy    = stage.images[i];
+			copy.image_id       = binding.image_id;
+			copy.image_view     = binding.image_view;
+			copy.desc           = binding.desc;
+			copy.layout         = binding.layout;
+			copy.mip_views.clear();
+			copy.lookup             = nullptr;
+			copy.reused             = false;
+			stage.image_versions[i] = 0;
+			if (!binding.image_id) {
+				continue;
+			}
+			// Only images the commit left in their read layouts, that the draw does not also
+			// render to or write, and whose state the version follows: depth images and their
+			// color twins and copies are refreshed from each other when acquired.
+			const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+			if (image == nullptr || !image->registered || image->version == nullptr ||
+			    image->binding.needs_rebind || image->binding.is_target ||
+			    image->binding.force_general || image->binding.shader_write ||
+			    image->info.IsDepth() || image->is_depth_copy || image->depth_id ||
+			    binding.image_view == nullptr ||
+			    binding.desc.type != TextureCache::BindingType::Texture ||
+			    !ImageReadReady(*image, binding)) {
+				// Not stored again until the next tick.
+				stored.stage_count  = 0;
+				stored.refused_tick = texture_cache.m_gc_tick;
+				return;
+			}
+			stage.image_versions[i] = texture_cache.ImageVersion(binding.image_id);
+		}
+	}
+}
+
+bool RenderExecutor::TemplateCommitsSupported() {
+	static const bool supported = VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPushDescriptorSetWithTemplateKHR != nullptr &&
+	                              VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateDescriptorUpdateTemplate != nullptr;
+	return supported;
+}
+
+void RenderExecutor::StoreTemplateCommit(DrawTemplate& stored, const PipelineCache::Pipeline& pipeline) {
+	std::vector<vk::DescriptorUpdateTemplateEntry> entries;
+	entries.reserve(m_descriptor_writes.size());
+	stored.commit_valid = false;
+	stored.commit_data.clear();
+	stored.commit_slots.clear();
+	for (size_t i = 0; i < m_descriptor_writes.size(); i++) {
+		const auto& write = m_descriptor_writes[i];
+		const auto  stage = m_commit_capture_kinds[i].first;
+		const auto  kind  = m_commit_capture_kinds[i].second;
+		const bool  image = write.pImageInfo != nullptr;
+		if (write.pTexelBufferView != nullptr || image == (write.pBufferInfo != nullptr) ||
+		    write.descriptorCount == 0 || write.descriptorCount > UINT16_MAX) {
+			return;
+		}
+		const size_t stride = image ? sizeof(vk::DescriptorImageInfo) : sizeof(vk::DescriptorBufferInfo);
+		const size_t offset = (stored.commit_data.size() + 7u) & ~size_t {7};
+		const size_t bytes  = stride * write.descriptorCount;
+		stored.commit_data.resize(offset + bytes);
+		std::memcpy(stored.commit_data.data() + offset,
+		            image ? static_cast<const void*>(write.pImageInfo) : static_cast<const void*>(write.pBufferInfo),
+		            bytes);
+		entries.push_back({write.dstBinding, write.dstArrayElement, write.descriptorCount, write.descriptorType,
+		                   offset, stride});
+		if (!image) {
+			// Buffer views are the draw's own.
+			stored.commit_slots.push_back({stage, kind, static_cast<uint16_t>(write.descriptorCount),
+			                               static_cast<uint32_t>(offset)});
+		}
+	}
+	// One update template per layout and entries.
+	uint64_t hash = XXH3_64bits(entries.data(), entries.size() * sizeof(vk::DescriptorUpdateTemplateEntry));
+	hash          = XXH3_64bits_withSeed(&pipeline.pipeline_layout, sizeof(pipeline.pipeline_layout), hash);
+	auto& update_template = m_commit_templates[hash];
+	if (!update_template) {
+		vk::DescriptorUpdateTemplateCreateInfo create {};
+		create.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
+		create.pDescriptorUpdateEntries   = entries.data();
+		create.templateType               = vk::DescriptorUpdateTemplateType::ePushDescriptors;
+		create.descriptorSetLayout        = pipeline.descriptor_set_layout;
+		create.pipelineBindPoint          = vk::PipelineBindPoint::eGraphics;
+		create.pipelineLayout             = pipeline.pipeline_layout;
+		create.set                        = 0;
+		if (m_context.GetGraphics().device.createDescriptorUpdateTemplate(&create, nullptr, &update_template) !=
+		    vk::Result::eSuccess) {
+			update_template = nullptr;
+			return;
+		}
+	}
+	stored.commit_template = update_template;
+	stored.commit_layout   = pipeline.pipeline_layout;
+	stored.commit_valid    = true;
+}
+
+void RenderExecutor::CommitTemplateBindings(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+                                            std::span<PreparedBindings* const> stages, const DrawTemplate& found) {
+	auto                           vk_buffer = buffer.Handle();
+	ShaderRecompiler::IR::PushData push_data;
+	bool                           has_push_data = false;
+	for (const auto* prepared: stages) {
+		const auto& program = prepared->runtime->module->info;
+		if (program.bindings.UsesPushData()) {
+			std::ranges::copy(prepared->shader_data, push_data.dwords.begin() + program.bindings.push_data_start_dword);
+			has_push_data = true;
+		}
+	}
+	if (has_push_data) {
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages, 0, sizeof(push_data),
+		                        push_data.dwords.data());
+	}
+	m_commit_data.resize(found.commit_data.size());
+	std::memcpy(m_commit_data.data(), found.commit_data.data(), found.commit_data.size());
+	for (const auto& slot: found.commit_slots) {
+		const auto& descriptors = *stages[slot.stage];
+		auto*       views       = m_commit_data.data() + slot.offset;
+		const auto  put         = [&](const vk::DescriptorBufferInfo* source, size_t count) {
+			EXIT_IF(count != slot.count);
+			std::memcpy(views, source, sizeof(vk::DescriptorBufferInfo) * count);
+		};
+		switch (static_cast<BindingKind>(slot.kind)) {
+			case BindingKind::Buffers: put(descriptors.buffers.data(), descriptors.buffers.size()); break;
+			case BindingKind::UniformBuffers:
+				put(descriptors.uniform_buffers.data(), descriptors.uniform_buffers.size());
+				break;
+			case BindingKind::BdaPagetable:
+			case BindingKind::FaultBuffer: {
+				auto&       cache      = m_context.GetBufferCache();
+				const auto* bda_buffer = static_cast<BindingKind>(slot.kind) == BindingKind::BdaPagetable
+				                             ? cache.GetBdaPageTableBuffer()
+				                             : cache.GetFaultBuffer();
+				const vk::DescriptorBufferInfo view {bda_buffer->Handle(), 0, bda_buffer->Size()};
+				put(&view, 1);
+				break;
+			}
+			case BindingKind::MipStats: {
+				const auto&                    counters = m_context.GetLodStats().CounterBuffer();
+				const vk::DescriptorBufferInfo view {counters.Handle(), 0, counters.Size()};
+				put(&view, 1);
+				break;
+			}
+			case BindingKind::FlattenedSrt: put(&descriptors.flattened_srt, 1); break;
+			case BindingKind::ShaderData: put(&descriptors.shader_data_buffer, 1); break;
+			case BindingKind::SharedMemory: put(&descriptors.shared_memory, 1); break;
+			case BindingKind::Gds: put(&descriptors.gds, 1); break;
+			default: EXIT("invalid template commit binding kind %u\n", static_cast<uint32_t>(slot.kind));
+		}
+	}
+	vk_buffer.pushDescriptorSetWithTemplateKHR(found.commit_template, pipeline.pipeline_layout, 0,
+	                                           m_commit_data.data(), m_commit_data.size());
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
@@ -2190,8 +2560,32 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		const auto& source = prepared.buffer_sources[index];
+		// The same read-only range of an earlier stage of the draw, with the same alignment and
+		// view kind, finds the same buffer and offset.
+		const uint32_t flags = (resource.uniform_index != UINT32_MAX ? 1u : 0u) |
+		                       (resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()) ? 2u : 0u);
+		const bool     share = m_draw_buffer_views_on && !resource.written && source.address != 0 && source.size != 0;
+		const DrawBufferView* shared = nullptr;
+		if (share) {
+			for (uint32_t i = 0; i < m_draw_buffer_view_count; i++) {
+				const auto& view = m_draw_buffer_views[i];
+				if (view.address == source.address && view.size == source.size && view.flags == flags) {
+					shared = &view;
+					break;
+				}
+			}
+		}
+		if (shared != nullptr) {
+			prepared.buffers[index] = shared->view;
+			buffer_offset           = shared->offset;
+		} else {
+			prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset);
+			if (share && m_draw_buffer_view_count < m_draw_buffer_views.size()) {
+				m_draw_buffer_views[m_draw_buffer_view_count++] = {source.address, source.size, flags, buffer_offset,
+				                                                   prepared.buffers[index]};
+			}
+		}
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =
@@ -2382,8 +2776,26 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
+	// The images taken from draw templates that changed are looked up again first, as
+	// PrepareBindings() would have; such a lookup can replace an image another binding took from
+	// its template, so the check repeats until nothing changes.
+	std::array<bool, 4> rebind {};
+	EXIT_IF(stages.size() > rebind.size());
+	for (bool settled = false; !settled;) {
+		settled = true;
+		for (size_t i = 0; i < stages.size(); i++) {
+			if (stages[i]->template_stage != nullptr && !CheckTemplateImages(*stages[i])) {
+				rebind[i] = true;
+				settled   = false;
+			}
+		}
+	}
+	for (size_t i = 0; i < stages.size(); i++) {
+		if (stages[i]->template_stage == nullptr || rebind[i]) {
+			// Such a stage no longer binds what its template holds (the draw stores it again).
+			stages[i]->template_stage = nullptr;
+			RebindImages(*stages[i]);
+		}
 	}
 	auto& cache = m_context.GetTextureCache();
 	for (auto& target: colors) {
@@ -2405,9 +2817,12 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	m_draw_buffer_view_count = 0;
+	m_draw_buffer_views_on   = DrawStateTemplatesEnabled();
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}
+	m_draw_buffer_views_on = false;
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
@@ -2438,6 +2853,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.clear();
 	m_descriptor_copies.clear();
 	m_slot_set_writes.clear();
+	m_commit_capture_ok = m_commit_capture != nullptr && pipeline.uses_push_descriptors;
+	m_commit_capture_kinds.clear();
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 	vk::DescriptorBufferInfo                mip_stats_view;
@@ -2456,6 +2873,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	for (auto* prepared: prepared_bindings) {
 		const auto& program     = prepared->runtime->module->info;
 		auto&       descriptors = *prepared;
+		const auto  stage_index = static_cast<uint8_t>(
+		    std::ranges::find(prepared_bindings, prepared) - prepared_bindings.begin());
+		if (descriptors.gds.buffer != nullptr || descriptors.table_state != nullptr) {
+			m_commit_capture_ok = false;
+		}
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
@@ -2506,8 +2928,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		};
-		for (auto& binding: descriptors.images) {
-			transit(binding);
+		for (size_t i = 0; i < descriptors.images.size(); i++) {
+			// Images taken from a draw template are in their read layouts already.
+			if (i >= 64u || ((descriptors.template_images >> i) & 1u) == 0) {
+				transit(descriptors.images[i]);
+			}
 		}
 		for (auto* binding: descriptors.table_images) {
 			transit(*binding);
@@ -2660,6 +3085,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				write.pImageInfo = m_descriptor_images.data() + image_start;
 			}
 			m_descriptor_writes.push_back(write);
+			if (m_commit_capture_ok) {
+				m_commit_capture_kinds.emplace_back(stage_index, static_cast<uint8_t>(index));
+			}
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& resource = program.info.images[i];
@@ -2759,6 +3187,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                        sizeof(push_data), push_data.dwords.data());
 	}
 
+	if (m_commit_capture_ok && m_commit_capture_kinds.size() == m_descriptor_writes.size() &&
+	    m_descriptor_copies.empty() && m_slot_set_writes.empty()) {
+		StoreTemplateCommit(*m_commit_capture, pipeline);
+	}
 	if (!m_descriptor_writes.empty()) {
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,

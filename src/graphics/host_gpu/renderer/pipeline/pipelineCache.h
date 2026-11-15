@@ -78,6 +78,8 @@ public:
 	// the refreshable bits of descriptor words: RefreshDescriptorWords() writes their new values.
 	// A bound tested for zero only has to stay zero or nonzero.
 	[[nodiscard]] bool StillValid() const;
+	// Whether StillValid() found descriptor bits to refresh.
+	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
 	// Execution thread, after StillValid(): writes the refreshable bits that changed (the guest
 	// rewrites V# bases and T# statistics fields after it submits the draws) into the stage's
 	// buffer or image descriptors, and the whole word into the flattened SRT dword it also fills.
@@ -177,10 +179,13 @@ struct ProgramResolution {
 	std::array<const ShaderRecompiler::IR::ResourcePlan*, MaxStages>    plans {};
 	GuestReadLog                                                        reads;
 	uint32_t                                                            stages = 0;
+	// Revalidate() refreshed descriptor bits that changed since the resolution read them.
+	bool                                                                refreshed_words = false;
 
 	void Reset() {
 		reads.Clear();
-		stages = 0;
+		stages          = 0;
+		refreshed_words = false;
 	}
 	// Execution thread: whether the resolution holds, with its flattened SRT dwords read again.
 	// `gpu_flat_loads`: see GuestReadLog::RefreshFlatLoads().
@@ -188,6 +193,7 @@ struct ProgramResolution {
 		if (!reads.StillValid()) {
 			return false;
 		}
+		refreshed_words = reads.HasDescriptorRefresh();
 		reads.RefreshDescriptorWords(std::span(resources).first(stages), std::span(plans).first(stages));
 		reads.RefreshFlatLoads(std::span(resources).first(stages), gpu_flat_loads);
 		return true;

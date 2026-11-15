@@ -485,7 +485,8 @@ void GuestGpu::ResolveThread() {
 			// The register snapshots stay valid until the operation executed.
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
-			                              *operation->state.shaders);
+			                              *operation->state.shaders, {}, false, operation->state.context_id,
+			                              operation->state.user_config_id);
 		} else if (operation->kind == GpuOperationKind::DrawIndirect) {
 			// Resolved for the offsets the GPU-read records give the shaders; draws that read
 			// their records on the CPU patch the SGPRs instead and resolve themselves.
@@ -493,7 +494,8 @@ void GuestGpu::ResolveThread() {
 			if (IndirectDrawOffsets(operation->draw_indirect.registers, offsets)) {
 				operation->resolved = executor.ResolveDrawAhead(
 				    *operation->state.context, *operation->state.user_config,
-				    *operation->state.shaders, offsets, true);
+				    *operation->state.shaders, offsets, true, operation->state.context_id,
+				    operation->state.user_config_id);
 			}
 		} else if (operation->kind == GpuOperationKind::DispatchDirect && operation->dispatch.mode == 0x41u &&
 		           Scout::Mode() == 3 && Scout::Running() &&

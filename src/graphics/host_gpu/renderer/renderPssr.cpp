@@ -92,6 +92,9 @@ RenderExecutor::~RenderExecutor() {
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
 	device.destroyDescriptorSetLayout(m_pssr_descriptor_layout, nullptr);
+	for (const auto& [hash, update_template]: m_commit_templates) {
+		device.destroyDescriptorUpdateTemplate(update_template, nullptr);
+	}
 }
 
 RenderExecutor::UpscalerFeature* RenderExecutor::UpscalerFeatureFor(const Pssr::Request& request,

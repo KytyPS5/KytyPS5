@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/drawTemplates.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -232,7 +233,8 @@ public:
 	                                             const HW::UserConfig& user_config,
 	                                             const HW::Shader&     shaders,
 	                                             const ShaderIndirectOffsets& indirect_offsets = {},
-	                                             bool indirect_draw = false);
+	                                             bool indirect_draw = false, uint64_t context_id = 0,
+	                                             uint64_t user_config_id = 0);
 	// Resolve thread: the compute program of a DISPATCH_DIRECT with the given registers and
 	// initiator; null when the dispatch resolves it itself. Shares the ring of draw resolutions.
 	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
@@ -589,6 +591,75 @@ private:
 	// Advances when m_texture_descs is cleared (bindings keep pointers into it).
 	uint64_t m_texture_descs_generation = 1;
 
+	// Draw templates (see DrawTemplate): the resource key of the executing draw's resolution
+	// (0 without one), the templates, and the template steps of ExecutePreparedDraw().
+	uint64_t                           m_draw_resource_key = 0;
+	std::unique_ptr<DrawTemplateTable> m_draw_templates;
+	// The read-only storage buffer views the stages of the draw being bound obtained, while it binds
+	// them (see RebindBuffers()): the stages of a draw often bind the same ranges, and nothing runs
+	// between their lookups that changes what one finds.
+	struct DrawBufferView {
+		uint64_t                 address = 0;
+		uint64_t                 size    = 0;
+		uint32_t                 flags   = 0;
+		uint32_t                 offset  = 0;
+		vk::DescriptorBufferInfo view;
+	};
+	std::array<DrawBufferView, 16> m_draw_buffer_views {};
+	uint32_t                       m_draw_buffer_view_count = 0;
+	bool                           m_draw_buffer_views_on   = false;
+	// Resolve thread: the context and user configuration keys of the last register snapshots a
+	// state key was made for (DrawStateKey()), by snapshot id.
+	uint64_t m_state_key_context_id     = 0;
+	uint64_t m_state_key_context        = 0;
+	uint64_t m_state_key_user_config_id = 0;
+	uint64_t m_state_key_user_config    = 0;
+	// Whether a template may stand for the image and sampler bindings of these stages.
+	[[nodiscard]] static bool DrawTemplateEligible(std::span<const ShaderStageRuntime* const> stages);
+	// The template for `key` when its stages run the same programs with the same T#s and S#s.
+	[[nodiscard]] DrawTemplate* FindDrawTemplate(uint64_t key,
+	                                             std::span<const ShaderStageRuntime* const> stages);
+	// Whether a draw failed to store the template for `key` in this tick.
+	[[nodiscard]] bool DrawTemplateRefused(uint64_t key) const;
+	// PrepareBindings() of a stage whose image and sampler bindings come from a template.
+	void PrepareBindingsFromTemplate(const ShaderStageRuntime& runtime,
+	                                 const DrawTemplateStage& stage, PreparedBindings& prepared);
+	// Whether the images a stage took from its template still hold; those that do not are looked
+	// up again (and are then acquired by RebindImages()).
+	[[nodiscard]] bool CheckTemplateImages(PreparedBindings& prepared);
+	// Records the committed image and sampler bindings of the stages as the template for `key`.
+	void StoreDrawTemplate(uint64_t key, std::span<PreparedBindings* const> stages);
+	// Whether the template's stages run the programs of `stages` with the same T#s and S#s.
+	[[nodiscard]] static bool DrawTemplateStagesMatch(const DrawTemplate&                        found,
+	                                                  std::span<const ShaderStageRuntime* const> stages);
+	// State templates (DrawStateTemplatesEnabled()): whether a draw of `found`, whose stages bind
+	// the template's images, acquires its targets as the template recorded (see
+	// DrawTemplate::targets_valid), leaving them as that acquisition would; and recording them.
+	[[nodiscard]] bool TakeTemplateTargets(const DrawTemplate& found);
+	void               StoreTemplateTargets(DrawTemplate& stored, const RenderState& rendering,
+	                                        vk::ImageAspectFlags feedback_aspects);
+	// Template commits (see DrawTemplate::commit_valid): CommitBindings() captures the descriptor
+	// writes of m_commit_capture's draw (the binding kind and stage of each), and draws of a
+	// template with a commit push its data with their own buffer views.
+	DrawTemplate*                                              m_commit_capture    = nullptr;
+	bool                                                       m_commit_capture_ok = false;
+	std::vector<std::pair<uint8_t, uint8_t>>                   m_commit_capture_kinds;
+	std::unordered_map<uint64_t, vk::DescriptorUpdateTemplate> m_commit_templates;
+	std::vector<uint8_t>                                       m_commit_data;
+	[[nodiscard]] static bool TemplateCommitsSupported();
+	void StoreTemplateCommit(DrawTemplate& stored, const PipelineCache::Pipeline& pipeline);
+	void CommitTemplateBindings(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                            std::span<PreparedBindings* const> stages, const DrawTemplate& found);
+	// The image set epoch of the last registration or unregistration of an image over the range,
+	// or a later one (as TextureCache::ImageEpochInRegion(), without its lock): the templates
+	// keep their own copy of the epochs, by page, brought up to date from the texture cache's
+	// history of changes once per draw that finds the set changed.
+	[[nodiscard]] uint64_t TemplateRangeEpoch(uint64_t address, uint64_t size);
+	static constexpr uint32_t TemplatePageBuckets = 1u << 16u;
+	std::vector<uint64_t>     m_template_page_epochs;
+	uint64_t                  m_template_pages_epoch = 0;
+	uint64_t                  m_template_pages_floor = 0;
+
 	// The host sampler for a sampler binding; see NativeSampler().
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                        uint32_t                                        index,
@@ -762,6 +833,8 @@ private:
 	                                                                                     nullptr};
 	// Whether the executing draw reused the render targets of the draw before.
 	bool     m_render_targets_reused = false;
+	// The last AcquireRenderTargets() took the targets of the render target memo.
+	bool     m_targets_from_memo     = false;
 	uint64_t m_draw_window           = 0;
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};

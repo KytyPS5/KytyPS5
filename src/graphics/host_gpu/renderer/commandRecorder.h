@@ -251,6 +251,10 @@ public:
 	}
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
 	                   uint32_t size, const void* values) const;
+	// The descriptors of a push descriptor update template, from its `size` bytes of data.
+	void pushDescriptorSetWithTemplateKHR(vk::DescriptorUpdateTemplate update_template,
+	                                      vk::PipelineLayout layout, uint32_t set, const void* data,
+	                                      size_t size) const;
 
 	void beginRendering(const vk::RenderingInfo& rendering) const;
 	void beginRendering(const vk::RenderingInfo* rendering) const { beginRendering(*rendering); }

@@ -187,6 +187,21 @@ void CommandRecorder::pushDescriptorSetKHR(vk::PipelineBindPoint bind_point,
 	});
 }
 
+void CommandRecorder::pushDescriptorSetWithTemplateKHR(vk::DescriptorUpdateTemplate update_template,
+                                                       vk::PipelineLayout layout, uint32_t set,
+                                                       const void* data, size_t size) const {
+	if (m_stream == nullptr) {
+		m_direct.pushDescriptorSetWithTemplateKHR(update_template, layout, set, data);
+		return;
+	}
+	m_stream->Reserve(CommandStream::RoundUp(size) + 128);
+	// (As a `const void*`: vulkan.hpp also takes the data by reference to a value of any type.)
+	const void* data_copy = m_stream->Copy(static_cast<const std::byte*>(data), size);
+	m_stream->Record([=](vk::CommandBuffer c) {
+		c.pushDescriptorSetWithTemplateKHR(update_template, layout, set, data_copy);
+	});
+}
+
 void CommandRecorder::pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages,
                                     uint32_t offset, uint32_t size, const void* values) const {
 	if (m_stream == nullptr) {

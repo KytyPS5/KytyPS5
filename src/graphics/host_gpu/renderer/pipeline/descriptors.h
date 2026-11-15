@@ -19,6 +19,7 @@ namespace Libs::Graphics {
 struct ShaderStageRuntime;
 
 struct TextureDescDerivation;
+struct DrawTemplateStage;
 
 // The state of a cached image that its lookups and acquisitions depend on. While an image keeps
 // it (and the image set around its range is unchanged), looking it up again and acquiring its
@@ -116,6 +117,11 @@ struct PreparedBindings {
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
 	// The description each T# of `last_images` has (null when its lookups are not reused).
 	std::vector<TextureDescDerivation*>                image_descs;
+	// The draw template the images were taken from (see DrawTemplate), and the images taken
+	// from it that still hold: bit i for images[i]. Those are already in their read layouts
+	// and are not looked up, acquired or transited again.
+	const DrawTemplateStage* template_stage  = nullptr;
+	uint64_t                 template_images = 0;
 };
 
 [[nodiscard]] vk::DescriptorType

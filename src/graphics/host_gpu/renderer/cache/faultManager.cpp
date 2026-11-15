@@ -171,7 +171,7 @@ void FaultManager::ProcessHackMarks() {
 			const bool alone = (mark[0] ^ mark[2]) == ~0u && (mark[1] ^ mark[3]) == ~0u;
 			const auto hash  = alone ? (uint64_t {mark[1]} << 32u) | mark[0] : 0;
 			if (const auto rays = mark[BufferCache::HACK_MARK_GUEST_RAYS]; rays != 0) {
-				NativeRayTracing::NoteGuestRays(hash, rays);
+				RayTracing::NoteGuestRays(hash, rays);
 			}
 			for (size_t kind = 0; kind < HackMarkNotices.size(); kind++) {
 				const auto count = mark[BufferCache::HACK_MARK_COUNTS + kind];

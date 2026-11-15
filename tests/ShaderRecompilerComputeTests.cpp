@@ -264,21 +264,18 @@ struct RecordedCommandCounter {
 };
 
 struct RayTracingTestAccess {
-  static vk::DeviceAddress Triangles(const RayTracing &mirror, uint32_t blas) {
-    return mirror.m_blases[blas].triangles->BufferDeviceAddress();
+  static size_t LiveSlots(const RayTracing &mirror) {
+    return static_cast<size_t>(std::ranges::count_if(mirror.m_slot_list, [](const auto &slot) {
+      return slot != nullptr && !slot->evicted;
+    }));
   }
-  // TLASes, pairs, BLASes and readbacks in flight.
-  static std::array<size_t, 4> Counts(const RayTracing &mirror) {
-    const auto busy = std::ranges::count_if(
-        mirror.m_areas, [](const auto &area) { return area.tick != 0; });
-    return {mirror.m_tlases.size(), mirror.m_pairs.size(),
-            mirror.m_blases.size(), static_cast<size_t>(busy)};
-  }
-  // Runs suspend points up to the next eviction pass.
-  static void Evict(RayTracing &mirror) {
-    for (uint32_t frame = 0; frame < RayTracing::EvictFrames; ++frame) {
-      mirror.RunGarbageCollector();
+  // Calls that use no host BLAS (`header` is not a TLAS) in GPU frame `frame`, enough for an
+  // eviction scan.
+  static void Evict(RayTracing &mirror, uint64_t header, uint64_t frame) {
+    for (uint32_t call = 0; call < 32; ++call) {
+      (void)mirror.Prepare(header, frame);
     }
+    mirror.m_scheduler.Finish();
   }
 };
 

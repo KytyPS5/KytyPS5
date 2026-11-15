@@ -143,7 +143,7 @@ BoxNode LoadBoxNode(uint64_t base, uint node) {
 	return box;
 }
 
-// The state of one preparation (NativeRayTracing::Prepare), cleared before the walks.
+// The state of one preparation (RayTracing::Prepare), cleared before the walks.
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer RtState {
 	uint64_t header_va;
 	uint64_t instance_base;
@@ -165,9 +165,13 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer RtState {
 	uint     changed_count;
 	uint     pool_cursor;
 	uint     pool_overflow;
-	uint     pad0;
-	uint     pad1;
+	// With a Psr header layout (LayoutPsrHeader()): the context the verification invalidates when
+	// it finds a BLAS of the TLAS changed (0: none).
+	uint64_t exact_context;
 };
+
+// The byte offset of the valid word in a context entry (ContextEntry in rt_tlas_walk.comp).
+const uint kContextValid = 36u;
 
 // A host BLAS: the guest BLAS it mirrors and its acceleration structure of triangles, in two
 // geometries: 0 = opaque, 1 = alpha tested. Per primitive (geometry 1 after the capacity of
@@ -334,6 +338,30 @@ GuestInstance LoadGuestInstance(uint64_t record, uvec4 instance_layout) {
 	                     ? words[LayoutDword(instance_layout.z >> 9, instance_layout.w >> 26)] >> ((instance_layout.z >> 14) & 31u)
 	                     : 0u;
 	return instance;
+}
+
+// The layout of the traversals the ray query pass rewrites (word 3 bit 30, RayTracing::Prepare(uint64_t)):
+// the BVHs are sce::Psr's "PSR_BVHL" headers of format 1, 3, 6 or 10, read as the header says (see
+// PsrFormat()). The TLAS walk takes the instance records in order (instance i is record i) instead
+// of walking the box nodes, reads the object-to-world matrix of each record as it is, and
+// publishes the context only once every visible instance has a built host BLAS that the
+// verification found unchanged: the program's own loop walks the guest BVH until then.
+bool LayoutPsrHeader(uvec4 instance_layout) {
+	return ((instance_layout.w >> 30) & 1u) != 0;
+}
+
+// The format of a "PSR_BVHL" header (bottom-level property 0x40 set for a BLAS), or 0. Formats
+// 3 and 6 move the TLAS instance count to +0x74; format 10 moves the instance offset, node count and
+// record bounds 8 bytes higher. Format 10 is read only in its base layout: not Trinity (property
+// 0x40000), BVH8 (0x80000), three-level (0x100000) or depopulated (0x20000000), nor a GPU-sized
+// TLAS (0x80000000), whose count covers slots the build leaves unwritten.
+uint PsrFormat(uint64_t header, bool blas) {
+	const uint version    = LoadGuestU32(header + 0xfc);
+	const uint properties = LoadGuestU32(header + 0x18);
+	const bool known      = version == 1u || version == 3u || version == 6u ||
+	                        (version == 10u && (properties & 0xa01c0000u) == 0u);
+	const bool magic      = LoadGuestU32(header) == 0x5f525350u && LoadGuestU32(header + 4) == 0x4c485642u;
+	return magic && known && ((properties & 0x40u) != 0u) == blas ? version : 0u;
 }
 
 // A cheap mix of 32-bit words for signatures.

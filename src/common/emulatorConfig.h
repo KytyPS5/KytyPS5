@@ -223,10 +223,10 @@ bool NativeRtEnabled();
 bool AsyncPipelinesEnabled();
 // Experimental, --native-rt (alias --native-raytracing), like NativeRtEnabled(): the ray tracing
 // passes the shader recompiler recognizes trace with the host's ray tracing hardware (see
-// NativeRayTracing). Off, the device enables no ray tracing feature and no shader is patched.
+// RayTracing). Off, the device enables no ray tracing feature and no shader is patched.
 bool NativeRayTracingEnabled();
 // With native ray tracing: the patched shaders count on the GPU the rays they send back to the
-// guest traversal, for the "[RT]" summaries (see NativeRayTracing). Costs a ballot per wave.
+// guest traversal, for the "[RT]" summaries (see RayTracing). Costs a ballot per wave.
 bool RayTracingStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();

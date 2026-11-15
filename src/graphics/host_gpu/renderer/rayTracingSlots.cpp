@@ -1,4 +1,4 @@
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -53,10 +53,6 @@ constexpr uint32_t MaxRetries       = 8;
 constexpr uint64_t LateRetryPrepares = 64;
 // Preparations a changed slot stays rebuilt before each use (about 30 frames).
 constexpr uint32_t DynamicPrepares  = 120;
-// A slot no TLAS referenced for this many frames is evicted (its BLAS left the scene or its
-// memory was unmapped); one that comes back is counted and built again as a new BLAS, so objects
-// the camera turns away from for a while keep their shadows when it turns back.
-constexpr uint64_t EvictFrames      = 1800;
 // Eviction scans run every this many preparations and evict at most MaxEvictions slots each
 // (every one costs GPU updates in the stream).
 constexpr uint64_t EvictScanPrepares = 8;
@@ -122,7 +118,7 @@ struct RtState {
 	uint32_t changed_count;
 	uint32_t pool_cursor;
 	uint32_t pool_overflow;
-	uint32_t pad[2];
+	uint64_t exact_context;
 };
 static_assert(sizeof(RtState) == StateSize);
 constexpr uint32_t StateDispatch = offsetof(RtState, dispatch);
@@ -167,7 +163,7 @@ struct TlasPush {
 	uint32_t table_mask;
 	uint32_t prepare_id;
 	uint32_t verify;
-	// The layout of the instance records (Decoder::RayTracingLayout::Pack()).
+	// The layout of the instance records (IR::RayTracingLayout::Pack()).
 	std::array<uint32_t, 4> layout;
 };
 static_assert(sizeof(TlasPush) == 128 && offsetof(TlasPush, layout) % 16 == 0);
@@ -218,6 +214,8 @@ struct BlasPush {
 };
 
 constexpr uint32_t BlasNodeCountAt80 = 1;
+// The BLASes of a Psr header layout (RayTracing::PsrHeaderLayout, see rt_blas_walk.comp).
+constexpr uint32_t BlasPsrHeader     = 2;
 
 // After the entry table of a slot (16 bytes per triangle), 32-byte aligned: the alpha records of
 // its alpha tested triangles, 32 bytes each, that the RT passes fill (see AlphaTest() of the ray
@@ -381,12 +379,12 @@ constexpr int64_t RtSummaryNs = 10000000000;
 struct RtStats {
 	// Dispatches whose guest TLAS the host walked (Prepare()).
 	RtCounter native;
-	// NativeRayTracing::GuestDispatch, with the last shader of each.
-	std::array<RtCounter, static_cast<size_t>(NativeRayTracing::GuestDispatch::Count)>             guest;
-	std::array<std::atomic<uint64_t>, static_cast<size_t>(NativeRayTracing::GuestDispatch::Count)> last_guest {};
+	// RayTracing::GuestDispatch, with the last shader of each.
+	std::array<RtCounter, static_cast<size_t>(RayTracing::GuestDispatch::Count)>             guest;
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(RayTracing::GuestDispatch::Count)> last_guest {};
 	uint32_t                                                                                        guest_calls = 0;
 	// Walks that published no context (rt_tlas_walk.comp): with a null TLAS header (read through
-	// the user data pointer, so the program without the patch could not be chosen) or with a header
+	// the user data pointer, so the program with the guest's walks could not be chosen) or with a header
 	// that is not that of a TLAS. Their dispatches take the guest traversal. The last program.
 	RtCounter             walks_null_header;
 	RtCounter             walks_bad_header;
@@ -423,14 +421,14 @@ void SummarizeRayTracing() {
 	if (now < next || !stats.next_summary_ns.compare_exchange_strong(next, now + RtSummaryNs)) {
 		return;
 	}
-	using Kind           = NativeRayTracing::GuestDispatch;
+	using Kind           = RayTracing::GuestDispatch;
 	const auto native    = stats.native.TakeDelta();
 	const auto guest     = [&](Kind kind) { return stats.guest[static_cast<size_t>(kind)].TakeDelta(); };
 	const auto last      = [&](Kind kind) {
 		return RtShader(stats.last_guest[static_cast<size_t>(kind)].load(std::memory_order_relaxed));
 	};
 	const auto null_tlas  = guest(Kind::NullTlas);
-	const auto unpatched  = guest(Kind::Unpatched);
+	const auto unrecognized = guest(Kind::Unrecognized);
 	const auto null_header = stats.walks_null_header.TakeDelta();
 	const auto bad_header  = stats.walks_bad_header.TakeDelta();
 	const auto uncached    = stats.walks_uncached.TakeDelta();
@@ -439,23 +437,23 @@ void SummarizeRayTracing() {
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
 	stats.guest_rays_reported  = rays_total;
-	const auto programs        = ShaderRecompiler::GetRayTracingPrograms();
-	const auto new_unpatched   = programs.unpatched - stats.programs_reported.unpatched;
-	const auto new_guest_sites = programs.guest_sites - stats.programs_reported.guest_sites;
-	stats.programs_reported    = programs;
+	const auto programs         = ShaderRecompiler::GetRayTracingPrograms();
+	const auto new_unrecognized = programs.unrecognized - stats.programs_reported.unrecognized;
+	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
+	stats.programs_reported     = programs;
 	// The first call starts the period; dispatches without a TLAS alone trace nothing.
-	if (next == 0 || unpatched + unpublished + uncached + overflow + rays + new_unpatched + new_guest_sites == 0) {
+	if (next == 0 || unrecognized + unpublished + uncached + overflow + rays + new_unrecognized + new_always_guest == 0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
 	log(fmt::format("[RT] summary of the last 10 s: {} dispatches traced through host TLASes, {} walked the guest BVH",
-	                native, null_tlas + unpatched));
-	if (unpatched != 0) {
-		log(fmt::format("[RT]   {} of programs whose BVH walk the patch does not recognize (last cs {})", unpatched,
-		                last(Kind::Unpatched)));
+	                native, null_tlas + unrecognized));
+	if (unrecognized != 0) {
+		log(fmt::format("[RT]   {} of programs whose BVH walk no form recognizes (last cs {})", unrecognized,
+		                last(Kind::Unrecognized)));
 	}
 	if (null_tlas != 0) {
-		log(fmt::format("[RT]   {} without a TLAS (the program without the patch)", null_tlas));
+		log(fmt::format("[RT]   {} without a TLAS (the program with the guest's own walks)", null_tlas));
 	}
 	if (unpublished != 0) {
 		log(fmt::format("[RT]   {} TLAS walks published no context ({} with a null header, {} with a header that is "
@@ -477,16 +475,16 @@ void SummarizeRayTracing() {
 		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
 		                RtShader(stats.last_guest_rays.load(std::memory_order_relaxed))));
 	}
-	if (new_unpatched + new_guest_sites != 0) {
-		log(fmt::format("[RT]   programs compiled so far: {} patched, {} whose BVH walk the patch does not recognize "
+	if (new_unrecognized + new_always_guest != 0) {
+		log(fmt::format("[RT]   programs compiled so far: {} traced natively, {} whose BVH walk no form recognizes "
 		                "(last cs {}), {} with sites that always walk the guest BVH (last cs {})",
-		                programs.patched, programs.unpatched, RtShader(programs.last_unpatched), programs.guest_sites,
-		                RtShader(programs.last_guest_sites)));
+		                programs.native, programs.unrecognized, RtShader(programs.last_unrecognized),
+		                programs.always_guest, RtShader(programs.last_always_guest)));
 	}
 }
 } // namespace
 
-void NativeRayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept {
+void RayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept {
 	auto& stats = g_rt_stats;
 	stats.guest[static_cast<size_t>(kind)].Add();
 	stats.last_guest[static_cast<size_t>(kind)].store(shader_hash, std::memory_order_relaxed);
@@ -496,24 +494,24 @@ void NativeRayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_has
 	}
 }
 
-void NativeRayTracing::NoteGuestRays(uint64_t shader_hash, uint64_t rays) {
+void RayTracing::NoteGuestRays(uint64_t shader_hash, uint64_t rays) {
 	g_rt_stats.guest_rays.fetch_add(rays, std::memory_order_relaxed);
 	g_rt_stats.last_guest_rays.store(shader_hash, std::memory_order_relaxed);
 	SummarizeRayTracing();
 }
 
-void NativeRayTracing::SetDeviceSupport(bool supported) noexcept {
+void RayTracing::SetDeviceSupport(bool supported) noexcept {
 	g_device_support.store(supported, std::memory_order_relaxed);
 }
 
-bool NativeRayTracing::PatchShaders() noexcept {
+bool RayTracing::NativeTraversals() noexcept {
 	return g_device_support.load(std::memory_order_relaxed);
 }
 
-bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+bool RayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
                                       TlasSource& source) noexcept {
-	// Only the programs the recompiler patched trace through the host structures.
-	if (!info.ray_query || !PatchShaders()) {
+	// Only the programs whose walks the recompiler made native trace through the host structures.
+	if (!info.ray_query || !NativeTraversals()) {
 		return false;
 	}
 	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,
@@ -521,7 +519,7 @@ bool NativeRayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& in
 	return true;
 }
 
-uint64_t NativeRayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
+uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
                                        const std::function<bool(uint64_t, uint64_t)>& readable) {
 	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
 		return pointer;
@@ -534,12 +532,12 @@ uint64_t NativeRayTracing::UserPointer(const TlasSource& source, uint64_t pointe
 	return uint64_t {vsharp[0]} | (uint64_t {vsharp[1] & 0xffffu} << 32u);
 }
 
-bool NativeRayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
+bool RayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
                                            TlasSource& source) noexcept {
 	if (FindTlasSource(info, source)) {
 		return true;
 	}
-	// A layout is never all zero (Decoder::RayTracingLayout::Pack()).
+	// A layout is never all zero (IR::RayTracingLayout::Pack()).
 	if (!info.bvh || info.ray_query_layout == std::array<uint32_t, 4> {}) {
 		return false;
 	}
@@ -549,10 +547,10 @@ bool NativeRayTracing::FindGuestTlasSource(const ShaderRecompiler::IR::ShaderInf
 	return true;
 }
 
-NativeRayTracing::GuestTlas NativeRayTracing::ReadGuestTlas(
+RayTracing::GuestTlas RayTracing::ReadGuestTlas(
     uint64_t header, const TlasSource& source, const std::function<bool(uint64_t, uint64_t)>& readable,
     std::vector<std::pair<uint64_t, uint64_t>>& blases) {
-	// As rt_tlas_walk.comp reads the TLAS (Decoder::RayTracingLayout::Pack() for the layout).
+	// As rt_tlas_walk.comp reads the TLAS (IR::RayTracingLayout::Pack() for the layout).
 	if (header == 0 || (header & 255u) != 0) {
 		return {};
 	}
@@ -678,7 +676,7 @@ NativeRayTracing::GuestTlas NativeRayTracing::ReadGuestTlas(
 	return tlas;
 }
 
-NativeRayTracing::Allocation NativeRayTracing::Arena::Allocate(uint64_t size, uint64_t alignment) {
+RayTracing::Allocation RayTracing::Arena::Allocate(uint64_t size, uint64_t alignment) {
 	// Sizes and chunk starts are multiples of 256, so are all offsets.
 	EXIT_IF(alignment == 0 || alignment > 256 || (256 % alignment) != 0);
 	size = (size + 255u) & ~uint64_t {255};
@@ -731,7 +729,7 @@ NativeRayTracing::Allocation NativeRayTracing::Arena::Allocate(uint64_t size, ui
 	return carve(*m_chunks.back(), 0, m_chunks.back()->buffer->Size());
 }
 
-void NativeRayTracing::Arena::Free(const Allocation& allocation) {
+void RayTracing::Arena::Free(const Allocation& allocation) {
 	if (allocation.buffer == nullptr) {
 		return;
 	}
@@ -774,7 +772,7 @@ void NativeRayTracing::Arena::Free(const Allocation& allocation) {
 	}
 }
 
-bool NativeRayTracing::Arena::BeginDrain() {
+bool RayTracing::Arena::BeginDrain() {
 	uint64_t total_free = 0;
 	for (const auto& chunk: m_chunks) {
 		if (!chunk->dedicated) {
@@ -799,11 +797,9 @@ bool NativeRayTracing::Arena::BeginDrain() {
 	return best != nullptr;
 }
 
-NativeRayTracing::NativeRayTracing(GraphicContext& graphics, CommandScheduler& scheduler,
-                                   BufferCache& buffer_cache)
-    : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
-      m_arena(graphics, scheduler) {
-	m_enabled = graphics.native_ray_tracing_enabled;
+void RayTracing::InitializeSlots() {
+	// The device has the ray tracing extensions (--native-rt).
+	m_enabled = m_graphics.ray_query_enabled || m_graphics.native_ray_tracing_enabled;
 	if (!m_enabled) {
 		return;
 	}
@@ -824,11 +820,11 @@ NativeRayTracing::NativeRayTracing(GraphicContext& graphics, CommandScheduler& s
 		}
 		m_budget = std::clamp(heap / 4, BudgetMin, BudgetMax);
 	}
-	LOGF("NativeRayTracing: enabled, BLAS memory budget %llu MiB\n",
+	LOGF("RayTracing: native ray tracing enabled, BLAS memory budget %llu MiB\n",
 	     static_cast<unsigned long long>(m_budget >> 20u));
 }
 
-NativeRayTracing::~NativeRayTracing() {
+void RayTracing::DestroySlots() {
 	if (!m_enabled) {
 		return;
 	}
@@ -854,10 +850,10 @@ NativeRayTracing::~NativeRayTracing() {
 	device.destroyPipelineLayout(m_hle_tlas_layout);
 	device.destroyPipeline(m_hle_refit_pipeline);
 	device.destroyPipelineLayout(m_hle_refit_layout);
-	device.destroyDescriptorSetLayout(m_descriptor_layout);
+	device.destroyDescriptorSetLayout(m_walk_descriptor_layout);
 }
 
-void NativeRayTracing::CreatePipelines() {
+void RayTracing::CreatePipelines() {
 	auto device = m_graphics.device;
 	// The BDA page table, and the fault and use bitmaps the walks record their pages in (the HLE
 	// passes only read the page table).
@@ -869,14 +865,14 @@ void NativeRayTracing::CreatePipelines() {
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
 	layout_info.bindingCount = WalkBindings;
 	layout_info.pBindings    = bindings.data();
-	RequireVulkanSuccess(device.createDescriptorSetLayout(&layout_info, nullptr, &m_descriptor_layout),
+	RequireVulkanSuccess(device.createDescriptorSetLayout(&layout_info, nullptr, &m_walk_descriptor_layout),
 	                     "create native ray tracing descriptor layout");
 	const auto make = [&](std::span<const uint32_t> code, uint32_t push_size,
 	                      vk::PipelineLayout& layout, vk::Pipeline& pipeline, const char* name) {
 		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, push_size};
 		vk::PipelineLayoutCreateInfo info {};
 		info.setLayoutCount         = 1;
-		info.pSetLayouts            = &m_descriptor_layout;
+		info.pSetLayouts            = &m_walk_descriptor_layout;
 		info.pushConstantRangeCount = 1;
 		info.pPushConstantRanges    = &push;
 		RequireVulkanSuccess(device.createPipelineLayout(&info, nullptr, &layout),
@@ -901,21 +897,21 @@ void NativeRayTracing::CreatePipelines() {
 	     "HLE BLAS refit");
 }
 
-void NativeRayTracing::CreateBuffers() {
+void RayTracing::CreateBuffers() {
 	const auto make = [&](uint64_t size, vk::BufferUsageFlags flags, const char* name) {
 		auto buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 		                                       flags, size);
 		SetVulkanObjectNameF(m_graphics.device, buffer->Handle(), "%s", name);
 		return buffer;
 	};
-	m_state          = make(StateSize, DataFlags, "RT state");
+	m_walk_state          = make(StateSize, DataFlags, "RT state");
 	m_queue          = make(uint64_t {QueueCapacity} * 4, DataFlags, "RT queue");
 	m_instance_nodes = make(uint64_t {InstanceCapacity} * 4, DataFlags, "RT instance nodes");
 	m_instances      = make(uint64_t {InstanceCapacity} * InstanceStride, AsFlags, "RT instances");
 	m_table          = make(uint64_t {TableEntries + HostTableEntries} * TableStride, DataFlags, "RT BLAS table");
 	m_slots          = make(uint64_t {SlotCapacity} * SlotStride, DataFlags, "RT slots");
 	m_missing        = make(uint64_t {MissingCapacity} * MissingStride, DataFlags, "RT missing");
-	m_context        = make(uint64_t {MaxContexts} * ContextStride, DataFlags, "RT context");
+	m_context_table        = make(uint64_t {MaxContexts} * ContextStride, DataFlags, "RT context");
 	m_pool           = make(uint64_t {PoolCapacity} * 4, DataFlags, "RT walk pool");
 	m_verify_list    = make(uint64_t {SlotCapacity} * 4, DataFlags, "RT verify list");
 	m_changed        = make(uint64_t {ChangedCapacity} * 4, DataFlags, "RT changed");
@@ -931,10 +927,10 @@ void NativeRayTracing::CreateBuffers() {
 		readback.buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                           AllFlags, ReadbackSize);
 	}
-	m_context_address = m_context->BufferDeviceAddress();
+	m_context_address = m_context_table->BufferDeviceAddress();
 }
 
-void NativeRayTracing::CreateTlas(uint32_t capacity) {
+void RayTracing::CreateTlas(uint32_t capacity) {
 	auto device = m_graphics.device;
 	vk::AccelerationStructureGeometryKHR geometry {};
 	geometry.geometryType                       = vk::GeometryTypeKHR::eInstances;
@@ -965,7 +961,7 @@ void NativeRayTracing::CreateTlas(uint32_t capacity) {
 	EXIT_IF(m_tlas_scratch_size > BuildScratchSize);
 }
 
-bool NativeRayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& sizes, bool exact) {
+bool RayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& sizes, bool exact) {
 	auto device = m_graphics.device;
 	// Room to grow (unless the counts are capacities already); the 64-bit sums cannot overflow.
 	const uint64_t capacity0 = exact ? opaque : uint64_t {opaque} + opaque / 8 + 16;
@@ -1012,11 +1008,11 @@ bool NativeRayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSiz
 	return m_budget == 0 || m_arena.Used() + sizes.Total() <= m_budget;
 }
 
-uint64_t NativeRayTracing::SlotBytes(const Slot& slot) noexcept {
+uint64_t RayTracing::SlotBytes(const Slot& slot) noexcept {
 	return slot.storage.size + slot.vertices0.size + slot.vertices1.size + slot.entries.size;
 }
 
-void NativeRayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
+void RayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
 	auto device        = m_graphics.device;
 	slot.capacity0     = sizes.capacity0;
 	slot.capacity1     = sizes.capacity1;
@@ -1039,7 +1035,7 @@ void NativeRayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
 	slot.as_address = device.getAccelerationStructureAddressKHR(address_info);
 }
 
-bool NativeRayTracing::CreateSlot(const PendingSlot& pending) {
+bool RayTracing::CreateSlot(const PendingSlot& pending) {
 	// Its build was seen after the walk reported it: the walk finds the host's slot first, the
 	// entry the walk claimed is released.
 	if (const auto it = m_slots_by_blas.find(pending.blas_va); it != m_slots_by_blas.end()) {
@@ -1070,7 +1066,7 @@ bool NativeRayTracing::CreateSlot(const PendingSlot& pending) {
 	slot->root           = pending.root;
 	slot->table_index    = pending.table_index;
 	slot->leaf_count     = pending.leaf_count;
-	slot->last_use_frame = m_frame;
+	slot->last_use_frame = m_walk_frame;
 	AllocateSlot(*slot, sizes);
 	slot->needs_build = true;
 	m_slots_by_blas[slot->blas_va].push_back(index);
@@ -1081,7 +1077,7 @@ bool NativeRayTracing::CreateSlot(const PendingSlot& pending) {
 	return true;
 }
 
-void NativeRayTracing::RetireResources(Slot& slot, uint32_t slot_index) {
+void RayTracing::RetireResources(Slot& slot, uint32_t slot_index) {
 	Retired retired {};
 	retired.tick        = m_scheduler.CurrentTick();
 	retired.prepare_id  = m_prepare_id;
@@ -1097,7 +1093,7 @@ void NativeRayTracing::RetireResources(Slot& slot, uint32_t slot_index) {
 	m_retired.push_back(retired);
 }
 
-void NativeRayTracing::DestroyRetired() {
+void RayTracing::DestroyRetired() {
 	auto device = m_graphics.device;
 	while (!m_retired.empty()) {
 		auto& retired = m_retired.front();
@@ -1123,7 +1119,7 @@ void NativeRayTracing::DestroyRetired() {
 	}
 }
 
-void NativeRayTracing::EvictSlot(uint32_t index) {
+void RayTracing::EvictSlot(uint32_t index) {
 	auto& slot       = *m_slot_list[index];
 	slot.evicted     = true;
 	slot.needs_build = false;
@@ -1141,9 +1137,9 @@ void NativeRayTracing::EvictSlot(uint32_t index) {
 	RetireResources(slot, index);
 }
 
-void NativeRayTracing::EvictUnused(std::vector<uint32_t>& evicted) {
-	if (m_frame > EvictFrames) {
-		const auto limit = m_frame - EvictFrames;
+void RayTracing::EvictUnused(std::vector<uint32_t>& evicted) {
+	if (m_walk_frame > EvictFrames) {
+		const auto limit = m_walk_frame - EvictFrames;
 		for (uint32_t index = 0; index < m_slot_list.size() && evicted.size() < MaxEvictions; index++) {
 			auto* slot = m_slot_list[index].get();
 			if (slot == nullptr || slot->evicted || slot->last_use_frame >= limit) {
@@ -1156,13 +1152,13 @@ void NativeRayTracing::EvictUnused(std::vector<uint32_t>& evicted) {
 	EvictOverBudget(evicted);
 }
 
-void NativeRayTracing::EvictOverBudget(std::vector<uint32_t>& evicted) {
+void RayTracing::EvictOverBudget(std::vector<uint32_t>& evicted) {
 	// What the retired slots hold is on its way out.
 	const auto live = m_arena.Used() - m_retired_bytes;
-	if (m_budget == 0 || live <= m_budget / 8 * 7 || m_frame <= LruMinAge) {
+	if (m_budget == 0 || live <= m_budget / 8 * 7 || m_walk_frame <= LruMinAge) {
 		return;
 	}
-	const auto                                 limit = m_frame - LruMinAge;
+	const auto                                 limit = m_walk_frame - LruMinAge;
 	std::vector<std::pair<uint64_t, uint32_t>> candidates;
 	for (uint32_t index = 0; index < m_slot_list.size(); index++) {
 		const auto* slot = m_slot_list[index].get();
@@ -1182,7 +1178,7 @@ void NativeRayTracing::EvictOverBudget(std::vector<uint32_t>& evicted) {
 	}
 }
 
-void NativeRayTracing::Defragment(std::vector<uint32_t>& moved) {
+void RayTracing::Defragment(std::vector<uint32_t>& moved) {
 	const auto used = m_arena.Used();
 	if (m_arena.Draining() == nullptr) {
 		if (m_prepare_id < m_defrag_after ||
@@ -1226,7 +1222,7 @@ void NativeRayTracing::Defragment(std::vector<uint32_t>& moved) {
 	}
 }
 
-void NativeRayTracing::ReportAgain(uint64_t blas_va, uint32_t root, uint32_t table_index) {
+void RayTracing::ReportAgain(uint64_t blas_va, uint32_t root, uint32_t table_index) {
 	if (m_retries.size() >= MaxRetryKeys) {
 		// Forget the failures: the entries of the exhausted ones are released so they can be
 		// reported again, the others are queued anyway.
@@ -1247,7 +1243,7 @@ void NativeRayTracing::ReportAgain(uint64_t blas_va, uint32_t root, uint32_t tab
 	}
 }
 
-void NativeRayTracing::PendingWalks(std::vector<uint64_t>& blases) {
+void RayTracing::PendingWalks(std::vector<uint64_t>& blases) {
 	Common::LockGuard lock(m_mutex);
 	for (const auto& pending: m_new_slots) {
 		blases.push_back(pending.blas_va);
@@ -1268,13 +1264,13 @@ void NativeRayTracing::PendingWalks(std::vector<uint64_t>& blases) {
 	}
 }
 
-void NativeRayTracing::AnnounceWalks(std::span<const uint64_t> blases) {
+void RayTracing::AnnounceWalks(std::span<const uint64_t> blases) {
 	m_announced_walks.assign(blases.begin(), blases.end());
 	std::ranges::sort(m_announced_walks);
 	m_walks_announced = true;
 }
 
-void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
+void RayTracing::RecordBuilds(const CommandRecorder& command) {
 	auto&                 readback = m_readbacks[m_readback_index];
 	std::vector<Job>      jobs;
 	std::vector<uint32_t> slots;
@@ -1285,9 +1281,12 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	constexpr uint64_t    Alignment = 256;
 	// A slot gathers (see below) when the guest only refit its BLAS since the last host build: the
 	// first build after a refit pass, or, for a slot the guest changes again within the frame
-	// (dynamic), every build of the same refit pass.
+	// (dynamic), every build of the same refit pass. The BLASes of a Psr header layout are walked
+	// again: their traversals trace a host BLAS only while it is the guest's (and the HLE refits
+	// are not theirs: refit_seq and m_refit_seq stay 0).
 	const auto gathers = [&](const Slot* slot) {
-		return slot != nullptr && slot->built && slot->refit_seq == m_refit_seq && slot->gathers < MaxGathers &&
+		return slot != nullptr && slot->built && (m_blas_flags & BlasPsrHeader) == 0 &&
+		       slot->refit_seq == m_refit_seq && slot->gathers < MaxGathers &&
 		       (slot->built_refit_seq + 1 == m_refit_seq ||
 		        (slot->built_refit_seq == m_refit_seq && slot->dynamic_until != 0));
 	};
@@ -1437,7 +1436,7 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
 	const BlasPush push {m_jobs->BufferDeviceAddress(),    m_pool->BufferDeviceAddress(),
-	                     m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
+	                     m_slots->BufferDeviceAddress(),   m_walk_state->BufferDeviceAddress(),
 	                     m_changed->BufferDeviceAddress(), ModeBuild,
 	                     PoolCapacity,                     walk_count,
 	                     ChangedCapacity,                  m_prepare_id,
@@ -1538,13 +1537,13 @@ void NativeRayTracing::RecordBuilds(const CommandRecorder& command) {
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride + offsetof(SlotInfo, state),
 		             &built, sizeof(built));
 		m_slot_list[index]->built       = true;
-		m_slot_list[index]->built_frame = m_frame;
+		m_slot_list[index]->built_frame = m_walk_frame;
 	}
 	readback.build_count = static_cast<uint32_t>(slots.size());
 	readback.build_slots = std::move(slots);
 }
 
-void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
+void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
                                const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
                                uint64_t frame, uint64_t shader_hash) {
 	if (!m_enabled) {
@@ -1559,7 +1558,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	}
 	readback.build_count = 0;
 	readback.build_slots.clear();
-	const auto source_key = source.user_sgpr << 16u | source.header_offset;
+	const bool psr        = (source.layout[3] & PsrHeaderLayout) != 0;
+	const auto source_key = psr ? UINT32_MAX : source.user_sgpr << 16u | source.header_offset;
 	readback.source_key   = source_key;
 	readback.frame        = frame;
 	readback.shader_hash  = shader_hash;
@@ -1573,7 +1573,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	std::vector<std::tuple<uint32_t, uint64_t, uint32_t>> host_writes;
 	{
 		Common::LockGuard lock(m_mutex);
-		m_frame = frame;
+		m_walk_frame = frame;
 		DestroyRetired();
 		for (const auto index: m_give_up) {
 			if (index < m_slot_list.size() && m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
@@ -1696,10 +1696,10 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	if (!m_cleared) {
 		// The buffers start clear (empty table, invalid contexts).
 		m_cleared = true;
-		for (const auto* buffer: {m_table.get(), m_slots.get(), m_context.get()}) {
+		for (const auto* buffer: {m_table.get(), m_slots.get(), m_context_table.get()}) {
 			command.fillBuffer(buffer->Handle(), 0, buffer->Size(), 0);
 		}
-		// Patched shaders find the context through the BDA page table.
+		// Native walks find the context through the BDA page table.
 		UpdateBuffer(command, m_buffer_cache.GetBdaPageTableBuffer()->Handle(),
 		             BufferCache::NATIVE_RT_CONTEXT_PAGE * sizeof(uint64_t), &m_context_address,
 		             sizeof(m_context_address));
@@ -1732,7 +1732,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	for (const auto& [index, info]: reallocated) {
 		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
 	}
-	command.fillBuffer(m_state->Handle(), 0, StateSize, 0);
+	command.fillBuffer(m_walk_state->Handle(), 0, StateSize, 0);
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
@@ -1745,16 +1745,25 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot &&
 		       (uint64_t {slot} + 1) * sizeof(uint32_t) <= flattened_srt.range;
 	};
-	const bool header_in_state = flattened_srt.buffer && in_srt(source.header_slots[0]) &&
-	                             in_srt(source.header_slots[1]);
-	if (header_in_state) {
+	// A header the caller has (the ray query pass's traversals) goes into the state as it is.
+	const bool header_given    = source.header != 0 || psr;
+	const bool header_in_state = header_given || (flattened_srt.buffer && in_srt(source.header_slots[0]) &&
+	                                              in_srt(source.header_slots[1]));
+	if (header_given) {
+		UpdateBuffer(command, m_walk_state->Handle(), offsetof(RtState, header_va), &source.header,
+		             sizeof(source.header));
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+		              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+		                  vk::AccessFlagBits2::eTransferWrite);
+	} else if (header_in_state) {
 		const std::array<vk::BufferCopy, 2> words {{
 		    {flattened_srt.offset + uint64_t {source.header_slots[0]} * sizeof(uint32_t),
 		     offsetof(RtState, header_va), sizeof(uint32_t)},
 		    {flattened_srt.offset + uint64_t {source.header_slots[1]} * sizeof(uint32_t),
 		     offsetof(RtState, header_va) + sizeof(uint32_t), sizeof(uint32_t)},
 		}};
-		command.copyBuffer(flattened_srt.buffer, m_state->Handle(), static_cast<uint32_t>(words.size()),
+		command.copyBuffer(flattened_srt.buffer, m_walk_state->Handle(), static_cast<uint32_t>(words.size()),
 		                   words.data());
 		MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 		              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
@@ -1781,8 +1790,8 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
 	                             writes.data());
 
-	// The BVHs of the traversal's layout (Decoder::RayTracingLayout::Pack() word 3).
-	m_blas_flags = ((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u;
+	// The BVHs of the traversal's layout (IR::RayTracingLayout::Pack() word 3).
+	m_blas_flags = (((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u) | (psr ? BlasPsrHeader : 0u);
 	RecordBuilds(command);
 	m_walks_announced = false;
 
@@ -1795,7 +1804,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 
 	const TlasPush tlas_push {
 	    .user_ptr_va       = user_pointer,
-	    .state             = m_state->BufferDeviceAddress(),
+	    .state             = m_walk_state->BufferDeviceAddress(),
 	    .queue             = m_queue->BufferDeviceAddress(),
 	    .instance_nodes    = m_instance_nodes->BufferDeviceAddress(),
 	    .instances         = m_instances->BufferDeviceAddress(),
@@ -1832,19 +1841,19 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
 	                             writes.data());
 	BlasPush blas_push {m_missing->BufferDeviceAddress(), m_pool->BufferDeviceAddress(),
-	                    m_slots->BufferDeviceAddress(),   m_state->BufferDeviceAddress(),
+	                    m_slots->BufferDeviceAddress(),   m_walk_state->BufferDeviceAddress(),
 	                    m_changed->BufferDeviceAddress(), ModeCount,
 	                    PoolCapacity,                     0,
 	                    ChangedCapacity,                  m_prepare_id,
 	                    m_blas_flags};
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(blas_push),
 	                      &blas_push);
-	command.dispatchIndirect(m_state->Handle(), StateDispatch);
+	command.dispatchIndirect(m_walk_state->Handle(), StateDispatch);
 	blas_push.jobs = m_verify_list->BufferDeviceAddress();
 	blas_push.mode = ModeVerify;
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(blas_push),
 	                      &blas_push);
-	command.dispatchIndirect(m_state->Handle(), StateVerify);
+	command.dispatchIndirect(m_walk_state->Handle(), StateVerify);
 
 	// The TLAS over the walk's instances (inactive ones have a null BLAS).
 	{
@@ -1886,7 +1895,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	    {0, ReadbackChanged, uint64_t {ChangedCapacity} * 4},
 	    {0, ReadbackUsed, uint64_t {SlotCapacity} * 4},
 	}};
-	command.copyBuffer(m_state->Handle(), readback.buffer->Handle(), 1, &regions[0]);
+	command.copyBuffer(m_walk_state->Handle(), readback.buffer->Handle(), 1, &regions[0]);
 	command.copyBuffer(m_missing->Handle(), readback.buffer->Handle(), 1, &regions[1]);
 	command.copyBuffer(m_jobs->Handle(), readback.buffer->Handle(), 1, &regions[2]);
 	command.copyBuffer(m_changed->Handle(), readback.buffer->Handle(), 1, &regions[3]);
@@ -1899,7 +1908,7 @@ void NativeRayTracing::Prepare(const CommandRecorder& command, uint64_t user_poi
 	m_readback_index = (m_readback_index + 1) % m_readbacks.size();
 }
 
-void NativeRayTracing::ProcessReadback(Readback& readback) {
+void RayTracing::ProcessReadback(Readback& readback) {
 	readback.buffer->Invalidate(0, ReadbackSize);
 	const auto* bytes = readback.buffer->Mapped().data();
 	RtState     state {};
@@ -2029,7 +2038,7 @@ void NativeRayTracing::ProcessReadback(Readback& readback) {
 	readback.tick = 0;
 }
 
-uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
+uint32_t RayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
                                          std::array<uint32_t, 32>& header) noexcept {
 	// Larger lists keep the game's own build (CommandProcessor::HleTlasDispatch()).
 	count          = std::min(count, HleTlasMaxInstances);
@@ -2061,7 +2070,7 @@ uint32_t NativeRayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
 	return header[4];
 }
 
-void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va,
+void RayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va,
                                      uint32_t count, uint32_t stride, uint64_t header_va,
                                      HleTlasFormat format) {
 	if (!m_enabled || header_va == 0 || (count != 0 && input_va == 0)) {
@@ -2096,7 +2105,7 @@ void NativeRayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t in
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 }
 
-void NativeRayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
+void RayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
 	if (!m_enabled) {
 		return;
 	}
@@ -2163,7 +2172,7 @@ void NativeRayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> build
 	}
 }
 
-uint32_t NativeRayTracing::FindHostSlotIndex(uint64_t blas_va) const {
+uint32_t RayTracing::FindHostSlotIndex(uint64_t blas_va) const {
 	if (const auto it = m_slots_by_blas.find(blas_va); it != m_slots_by_blas.end()) {
 		for (const auto candidate: it->second) {
 			if (m_slot_list[candidate]->root == GuestBlasRoot) {
@@ -2174,7 +2183,7 @@ uint32_t NativeRayTracing::FindHostSlotIndex(uint64_t blas_va) const {
 	return UINT32_MAX;
 }
 
-uint32_t NativeRayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes) {
+uint32_t RayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes) {
 	// A host table entry: the first free (or released) one of the key's probe chain.
 	const uint64_t key  = blas_va ^ (uint64_t {GuestBlasRoot} << 48u);
 	const uint32_t hash = TableHash(key);
@@ -2204,7 +2213,7 @@ uint32_t NativeRayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& siz
 	slot->root             = GuestBlasRoot;
 	slot->table_index      = UINT32_MAX;
 	slot->host_table_index = host;
-	slot->last_use_frame   = m_frame;
+	slot->last_use_frame   = m_walk_frame;
 	AllocateSlot(*slot, sizes);
 	slot->needs_build = true;
 	m_slots_by_blas[blas_va].push_back(index);
@@ -2215,7 +2224,7 @@ uint32_t NativeRayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& siz
 	return index;
 }
 
-void NativeRayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_size) {
+void RayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_size) {
 	if (!m_enabled || blas_va == 0) {
 		return;
 	}
@@ -2246,7 +2255,7 @@ void NativeRayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memo
 	}
 }
 
-void NativeRayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+void RayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
                                       std::span<const HleRefitGeometry> geometries, uint32_t header_layout,
                                       bool arguments) {
 	if (!m_enabled || blases.empty()) {

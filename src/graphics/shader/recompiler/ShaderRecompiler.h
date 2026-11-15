@@ -97,17 +97,17 @@ struct ShaderSource {
 };
 
 // The programs with a guest BVH walk compiled with native ray tracing, by distinct shader hash (see
-// the "[RT]" summary of NativeRayTracing): those whose walk the patch replaced, those whose walk it
-// does not recognize, and those with a patched site that always takes the guest walk (its alpha
-// tested triangles have no per lane alpha test, see EmitRayQueryInit); the last hash of the
-// latter two.
-enum class RayTracingProgramKind : uint32_t { Patched, Unpatched, GuestSites };
+// the "[RT]" summary of RayTracing): those whose walks trace natively (IR::TraceNativeTraversals),
+// those whose walk no form recognizes, and those with a native site that always takes the guest
+// walk (its alpha tested triangles have no per lane alpha test, see EmitRayQueryInit); the last
+// hash of the latter two.
+enum class RayTracingProgramKind : uint32_t { Native, Unrecognized, AlwaysGuest };
 struct RayTracingPrograms {
-	uint64_t patched          = 0;
-	uint64_t unpatched        = 0;
-	uint64_t guest_sites      = 0;
-	uint64_t last_unpatched   = 0;
-	uint64_t last_guest_sites = 0;
+	uint64_t native            = 0;
+	uint64_t unrecognized      = 0;
+	uint64_t always_guest      = 0;
+	uint64_t last_unrecognized = 0;
+	uint64_t last_always_guest = 0;
 };
 void                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
 [[nodiscard]] RayTracingPrograms GetRayTracingPrograms();

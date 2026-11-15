@@ -311,8 +311,8 @@ struct ShaderModule {
 	// buffer atomics alone make the driver run the depth and stencil tests after a shader that can
 	// discard.
 	std::shared_ptr<const ShaderModule>          plain;
-	// A compute program built without the native ray tracing patch while it is on: the program of
-	// a dispatch without a TLAS (see PipelineCache::GetComputeProgram()).
+	// A compute program built without native ray tracing while it is on (the guest's walks): the
+	// program of a dispatch without a TLAS (see PipelineCache::GetComputeProgram()).
 	bool                                         guest_traversal = false;
 	// The resource plan of the program the module belongs to (null for table modules, see
 	// PipelineCache::GetComputeProgramTable()); it lives as long as the cache.
@@ -574,8 +574,8 @@ private:
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
-	// GetProgram() looks up and compiles compute programs without the native ray tracing patch
-	// (for a dispatch without a TLAS, see GetComputeProgram()).
+	// GetProgram() looks up and compiles compute programs without native ray tracing (for a
+	// dispatch without a TLAS, see GetComputeProgram()).
 	bool                                   m_guest_traversal = false;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;

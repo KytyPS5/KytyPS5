@@ -14,14 +14,13 @@
 #include <span>
 #include <vector>
 
-// Native ray tracing (see RayTracingPatch.h and NativeRayTracing). Each patched traversal (site)
+// Native ray tracing (see IR::TraceNativeTraversals and RayTracing). Each native traversal (site)
 // keeps, per lane: a host ray query over the TLAS the host built from the guest's BVH, a list of
 // up to RayQueryListSize candidate (instance node, leaf) keys the query found and not yet
 // processed, the index of the lane's smallest key and a state word. The wave processes the
 // smallest key any lane has, with every lane that has it, so each leaf runs once per wave like
-// in the guest's own packet traversal; keys of one instance come together, so its setup runs
-// once. The host publishes its acceleration structures in a context table whose device address
-// is the entry after the last page of the BDA page table (see NativeRayTracing).
+// in the guest's own packet traversal; keys of one instance come together. The host publishes its acceleration structures in a context table whose device address
+// is the entry after the last page of the BDA page table (see RayTracing).
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -314,20 +313,22 @@ struct GuestEntry {
 };
 
 // After the entry table of a slot (16 bytes per triangle of both geometries), 32-byte aligned:
-// an alpha record of 32 bytes per alpha tested triangle (NativeRayTracing::ComputeSlotSizes()).
+// an alpha record of 32 bytes per alpha tested triangle (RayTracing::ComputeSlotSizes()).
 constexpr uint32_t AlphaRecordStride = 32;
 
-GuestEntry TriangleEntry(EmitterState& s, const LaneVariables& lane, uint32_t intersection) {
+// `ray_query`: the query variable; `slots()`: loads the address of the slot infos.
+template <class Slots>
+GuestEntry TriangleEntry(EmitterState& s, uint32_t ray_query, uint32_t intersection, Slots&& slots) {
 	const auto u = TypeU32(s), wide = TypeU64(s);
 	const auto query = [&](spv::Op op) {
 		const auto result = s.builder.AllocateId();
-		s.builder.AddFunction(op, u, result, lane.query, U32(s, intersection));
+		s.builder.AddFunction(op, u, result, ray_query, U32(s, intersection));
 		return result;
 	};
 	const auto slot      = query(spv::OpRayQueryGetIntersectionInstanceCustomIndexKHR);
 	const auto geometry  = query(spv::OpRayQueryGetIntersectionGeometryIndexKHR);
 	const auto primitive = query(spv::OpRayQueryGetIntersectionPrimitiveIndexKHR);
-	const auto info      = ScaledAddress(s, Load(s, wide, lane.slots), slot, SlotStride);
+	const auto info      = ScaledAddress(s, slots(), slot, SlotStride);
 	const auto table     = LoadAddressU64(s, AddressPlus(s, info, SlotEntryTable));
 	const auto capacity0 = LoadAddressU32(s, AddressPlus(s, info, SlotCapacity0));
 	const auto capacity1 = LoadAddressU32(s, AddressPlus(s, info, SlotCapacity1));
@@ -349,6 +350,10 @@ GuestEntry TriangleEntry(EmitterState& s, const LaneVariables& lane, uint32_t in
 	return {field(0), field(4), field(8), field(12), valid, record};
 }
 
+GuestEntry TriangleEntry(EmitterState& s, const LaneVariables& lane, uint32_t intersection) {
+	return TriangleEntry(s, lane.query, intersection, [&] { return Load(s, TypeU64(s), lane.slots); });
+}
+
 // The guest TLAS leaf pointer of the instance of a hit or candidate.
 uint32_t InstanceNode(EmitterState& s, const LaneVariables& lane, uint32_t intersection) {
 	const auto instance = s.builder.AllocateId();
@@ -360,11 +365,11 @@ uint32_t InstanceNode(EmitterState& s, const LaneVariables& lane, uint32_t inter
 // The barycentrics of a hit or candidate as the guest triangle test reports them: the weights of
 // the node vertices its remap bits select (two bits each); the host triangle has the node's
 // vertices in order.
-std::array<uint32_t, 2> GuestBarycentrics(EmitterState& s, const LaneVariables& lane, uint32_t intersection,
+std::array<uint32_t, 2> GuestBarycentrics(EmitterState& s, uint32_t query, uint32_t intersection,
                                           uint32_t remap) {
 	const auto u = TypeU32(s), f = TypeF32(s);
 	const auto bary = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpRayQueryGetIntersectionBarycentricsKHR, TypeF32Vector(s, 2), bary, lane.query,
+	s.builder.AddFunction(spv::OpRayQueryGetIntersectionBarycentricsKHR, TypeF32Vector(s, 2), bary, query,
 	                      U32(s, intersection));
 	std::array<uint32_t, 3> weights {};
 	for (uint32_t i = 0; i < 2; i++) {
@@ -652,7 +657,7 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 		uv[k][0] = as_f32(cache(AlphaCache::Coordinates, k * 2));
 		uv[k][1] = as_f32(cache(AlphaCache::Coordinates, k * 2 + 1));
 	}
-	const auto [i, j] = GuestBarycentrics(s, lane, CandidateIntersection, candidate.remap);
+	const auto [i, j] = GuestBarycentrics(s, lane.query, CandidateIntersection, candidate.remap);
 	const auto w0     = Binary(s, spv::OpFSub, f, Binary(s, spv::OpFSub, f, ConstantF32Value(s, 1.0f), i), j);
 	const auto coord  = [&](uint32_t c) {
 		return fadd(fadd(fmul(uv[0][c], w0), fmul(uv[1][c], i)), fmul(uv[2][c], j));
@@ -803,7 +808,7 @@ uint32_t AlphaTestEntry(ValueEmitContext& ctx, const LaneVariables& lane, const 
 			s.builder.AddFunction(spv::OpCompositeExtract, f, uv[k][c], halves, c);
 		}
 	}
-	const auto [i, j] = GuestBarycentrics(s, lane, CandidateIntersection, candidate.remap);
+	const auto [i, j] = GuestBarycentrics(s, lane.query, CandidateIntersection, candidate.remap);
 	const auto w0     = Binary(s, spv::OpFSub, f, Binary(s, spv::OpFSub, f, ConstantF32Value(s, 1.0f), i), j);
 	const auto coord  = [&](uint32_t c) { return fadd(fadd(fmul(uv[0][c], w0), fmul(uv[1][c], i)), fmul(uv[2][c], j)); };
 	const auto x = coord(0), y = coord(1);
@@ -888,7 +893,7 @@ void Refill(ValueEmitContext& ctx, uint32_t site) {
 				      entry_alpha ? Add(s, Binary(s, spv::OpShiftRightLogical, u, hit_entry.entry, U32(s, 3)), U32(s, 1))
 				                  : hit_entry.node);
 				const auto [bary_u, bary_v] =
-				    GuestBarycentrics(s, lane, CommittedIntersection, hit_entry.remap);
+				    GuestBarycentrics(s, lane.query, CommittedIntersection, hit_entry.remap);
 				Store(s, lane.result_u, Unary(s, spv::OpBitcast, u, bary_u));
 				Store(s, lane.result_v, Unary(s, spv::OpBitcast, u, bary_v));
 				auto instance_record = InstanceRecordAddress(s, lane.base, node);
@@ -1387,8 +1392,10 @@ void EmitRayQueryMark(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
 
-// Upstream's ray queries over its BVH mirror (RayQueryTraversal, RayTracing): one query per 32-lane
-// half of an emulated wave64, apart from the native ray tracing sites above.
+// The ray queries of the traversals the ray query pass rewrites (RayQueryTraversal) over the
+// host structures of RayTracing::Prepare(uint64_t, uint64_t): one query per 32-lane half of an
+// emulated wave64, apart from the native ray tracing sites above. Their context entry is the one
+// of the sites (ContextValid and the other offsets above).
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -1430,7 +1437,7 @@ uint32_t EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto address = ContextAddress(s);
 	const auto present = Binary(s, spv::OpINotEqual, TypeBool(s), address, ConstantU64(s, 0));
 	return EmitValueOrDefaultIfCondition(s, present, TypeBool(s), ConstantBool(s, false), [&] {
-		return Binary(s, spv::OpINotEqual, TypeBool(s), LoadContext(s, address, 0, TypeU32(s), 4),
+		return Binary(s, spv::OpINotEqual, TypeBool(s), LoadContext(s, address, ContextValid, TypeU32(s), 4),
 		              ConstantU32(s, 0));
 	});
 }
@@ -1462,7 +1469,7 @@ void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 		};
 		const auto structure = Unary(s, spv::OpConvertUToAccelerationStructureKHR,
 		                             s.builder.Type(spv::OpTypeAccelerationStructureKHR),
-		                             LoadContext(s, ContextAddress(s), 16, TypeU64(s), 8));
+		                             LoadContext(s, ContextAddress(s), ContextTlas, TypeU64(s), 8));
 		s.builder.AddFunction(spv::OpRayQueryInitializeKHR, RayQuery(s), structure,
 		                      ConstantU32(s, 0),
 		                      Select(s, TypeU32(s), traced, ctx.Arg(inst, 7), ConstantU32(s, 0)),
@@ -1477,28 +1484,23 @@ uint32_t EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    [&] { return Unary(s, spv::OpRayQueryProceedKHR, TypeBool(s), RayQuery(s)); });
 }
 
-// The mirror's SBT offset of an instance is its first prim record.
+// The candidate (t, u, v, prim record): the record and the barycentric remap of its triangle are
+// in the entry table of its host BLAS (the slot of the instance's custom index).
 uint32_t EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    s, ctx.Arg(inst, 0), TypeU32Vector(s, 4), ConstantU32CompositeZero(s, 4), [&] {
-		    const auto query = RayQuery(s), candidate = ConstantU32(s, Candidate);
-		    const auto get = [&](spv::Op op, uint32_t type) {
-			    return Binary(s, op, type, query, candidate);
-		    };
-		    const auto bits =
-		        Unary(s, spv::OpBitcast, TypeU32Vector(s, 2),
-				      get(spv::OpRayQueryGetIntersectionBarycentricsKHR, TypeF32Vector(s, 2)));
-		    const auto record =
-		        Binary(s, spv::OpIAdd, TypeU32(s),
-				       get(spv::OpRayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR,
-				           TypeU32(s)),
-				       get(spv::OpRayQueryGetIntersectionPrimitiveIndexKHR, TypeU32(s)));
-		    const auto u = s.builder.AllocateId(), v = s.builder.AllocateId();
-		    s.builder.AddFunction(spv::OpCompositeExtract, TypeU32(s), u, bits, 0u);
-		    s.builder.AddFunction(spv::OpCompositeExtract, TypeU32(s), v, bits, 1u);
+		    const auto query = RayQuery(s);
+		    const auto entry = TriangleEntry(s, query, Candidate, [&] {
+			    return LoadContext(s, ContextAddress(s), ContextSlots, TypeU64(s), 8);
+		    });
+		    const auto [weight_u, weight_v] = GuestBarycentrics(s, query, Candidate, entry.remap);
+		    const auto u      = Unary(s, spv::OpBitcast, TypeU32(s), weight_u);
+		    const auto v      = Unary(s, spv::OpBitcast, TypeU32(s), weight_v);
+		    const auto record = Binary(s, spv::OpShiftRightLogical, TypeU32(s), entry.entry, ConstantU32(s, 3));
 		    const auto t      = Unary(s, spv::OpBitcast, TypeU32(s),
-			                          get(spv::OpRayQueryGetIntersectionTKHR, TypeF32(s)));
+			                          Binary(s, spv::OpRayQueryGetIntersectionTKHR, TypeF32(s), query,
+			                                 ConstantU32(s, Candidate)));
 		    const auto result = s.builder.AllocateId();
 		    s.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(s, 4), result, t, u, v,
 			                      record);
@@ -1506,16 +1508,16 @@ uint32_t EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    });
 }
 
-// Instance i of the mirror has custom index i: the guest record at i * 128 in the instance array.
+// Instance i of the host TLAS is guest record i: at i * 128 in the instance array.
 uint32_t EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 0), TypeU64(s), ConstantU64(s, 0), [&] {
-		const auto index  = Binary(s, spv::OpRayQueryGetIntersectionInstanceCustomIndexKHR,
-		                           TypeU32(s), RayQuery(s), ConstantU32(s, Candidate));
+		const auto index  = Binary(s, spv::OpRayQueryGetIntersectionInstanceIdKHR, TypeU32(s),
+		                           RayQuery(s), ConstantU32(s, Candidate));
 		const auto offset = Binary(s, spv::OpShiftLeftLogical, TypeU64(s),
 		                           Unary(s, spv::OpUConvert, TypeU64(s), index), ConstantU32(s, 7));
 		return Binary(s, spv::OpIAdd, TypeU64(s),
-		              LoadContext(s, ContextAddress(s), 24, TypeU64(s), 8), offset);
+		              LoadContext(s, ContextAddress(s), ContextInstanceBase, TypeU64(s), 8), offset);
 	});
 }
 

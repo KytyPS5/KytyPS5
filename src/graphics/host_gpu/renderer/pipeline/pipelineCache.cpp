@@ -15,7 +15,7 @@
 #include "graphics/host_gpu/renderer/execHelpers.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -96,7 +96,7 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
-// Whether the dispatch of a patched program reads a null TLAS header address from its flattened
+// Whether the dispatch of a native program reads a null TLAS header address from its flattened
 // SRT (ShaderInfo::ray_query_header_slots): it has nothing to trace with the host structures.
 bool ReadsNullTlas(const ShaderModule& module, const ShaderRecompiler::IR::ResourceSnapshot& resources) {
 	const auto& info  = module.info.info;
@@ -498,7 +498,7 @@ void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSourc
 } // namespace
 
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
-	if (native && stage == ShaderType::Compute && NativeRayTracing::PatchShaders()) {
+	if (native && stage == ShaderType::Compute && RayTracing::NativeTraversals()) {
 		key.push_back(0x52545041u);
 		// They count the rays they send back to the guest traversal (--rt-stats).
 		if (Config::RayTracingStatsEnabled()) {
@@ -1147,7 +1147,7 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
 	} else if (key.stage == ShaderType::Compute) {
-		module.guest_traversal = NativeRayTracing::PatchShaders() && !options.native_ray_tracing;
+		module.guest_traversal = RayTracing::NativeTraversals() && !options.native_ray_tracing;
 	}
 	if (!result.spirv_plain.empty()) {
 		ValidateShaderSpirv(stage, key.hash, result.spirv_plain, profile.maintenance8);
@@ -1306,7 +1306,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-	options.native_ray_tracing = NativeRayTracing::PatchShaders() && !m_guest_traversal;
+	options.native_ray_tracing = RayTracing::NativeTraversals() && !m_guest_traversal;
 	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
@@ -2064,7 +2064,7 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		return nullptr;
 	}
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-		// The program without the patch serves a dispatch without a TLAS: the execution thread
+		// The program with the guest's walks serves a dispatch without a TLAS: the execution thread
 		// resolves it (see GetComputeProgram()).
 		if (ReadsNullTlas(*module, resources)) {
 			ahead.reads.Fail();
@@ -2179,7 +2179,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.back_code       = job.params.back_code;
 		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-		options.native_ray_tracing = NativeRayTracing::PatchShaders();
+		options.native_ray_tracing = RayTracing::NativeTraversals();
 		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// compiles them.
@@ -2719,9 +2719,10 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	const ProgramLockGuard lock(m_program_lock);
 	const auto             cursor = push_data_cursor;
 	const auto*            module = GetProgram(params, input_info, push_data_cursor);
-	// A dispatch without a TLAS runs the program without the native ray tracing patch. The
-	// patched one would take its guest traversal, but much slower: Astro Bot dispatches most of
-	// its ray tracing passes so, and the patched cs 45f8ddf6 took 3.6 ms instead of 0.7.
+	// A dispatch without a TLAS runs the program with the guest's walks (without native ray
+	// tracing). The native one would take its guest traversal, but much slower: Astro Bot
+	// dispatches most of its ray tracing passes so, and the native cs 45f8ddf6 took 3.6 ms instead
+	// of 0.7.
 	if (module != nullptr && ReadsNullTlas(*module, *input_info.stage.resources)) {
 		push_data_cursor  = cursor;
 		m_guest_traversal = true;

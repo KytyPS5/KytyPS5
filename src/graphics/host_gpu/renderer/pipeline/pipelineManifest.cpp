@@ -8,7 +8,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -3813,12 +3813,12 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 		    BuildStageStaticKey(info, key.static_state);
 	    },
 	    input);
-	// With native ray tracing on, dispatches look compute programs up as the compiler patches
-	// them, under their own keys (AppendNativeRayTracingKey()); unpatched, the manifest's would
-	// serve none, and each dispatch would translate its program and create its pipeline on the
+	// With native ray tracing on, dispatches look compute programs up as the compiler rewrites
+	// them, under their own keys (AppendNativeRayTracingKey()); without native walks, the manifest's
+	// would serve none, and each dispatch would translate its program and create its pipeline on the
 	// execution thread. The guest traversal serves the dispatches without a TLAS
-	// (GetComputeProgram()): `guest_traversal` builds that variant of a patched program.
-	const bool native = NativeRayTracing::PatchShaders() && !guest_traversal;
+	// (GetComputeProgram()): `guest_traversal` builds that variant of a native program.
+	const bool native = RayTracing::NativeTraversals() && !guest_traversal;
 	AppendNativeRayTracingKey(options.stage, key.static_state, native);
 	options.shader_hash        = key.hash;
 	options.user_data          = user_data;
@@ -4115,9 +4115,9 @@ void PipelineCache::RecordModule(const ProgramKey&                       key,
 		default: record.input = *options.input_info.vertex; break;
 	}
 	NormalizeManifestInput(record);
-	// A program the native ray tracing patches is recorded as asked for: the patch keeps the guest
-	// walk and adds no resources (device addresses only), so the record's specialization is the
-	// unpatched program's too. The manifest builds it as the host does, patched or not
+	// A program native ray tracing rewrites is recorded as asked for: the native walks keep the
+	// guest's and add no resources (device addresses only), so the record's specialization is the
+	// guest program's too. The manifest builds it as the host does, native or not
 	// (BuildManifestModule()). Its identity is the manifest's, without this host's static key
 	// marks (AppendNativeRayTracingKey()), as the records loaded and built have it.
 	auto host = record;

@@ -81,30 +81,33 @@ static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRun
 	return true;
 }
 
-// The host acceleration structures of a program that traces through a guest TLAS (see
-// NativeRayTracing::Prepare()), recorded before its dispatch, outside a render pass. Indirect
+// The host acceleration structures of a program whose native walks trace through a guest TLAS (see
+// RayTracing::Prepare()), recorded before its dispatch, outside a render pass. Indirect
 // dispatches trace too (Astro Bot's RT passes are dispatched with thread dimensions read from
-// memory).
+// memory). Apart from PrepareRayQuery(), which serves the walks of the ray query pass: that one
+// writes its context address into the shader data, which RebindBuffers() uploads, so it comes
+// before; this one reads the TLAS header address from the flattened SRT that RebindBuffers()
+// uploads (with the dwords GPU work wrote), so it comes after.
 static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorder& command,
                                     const HW::ComputeShaderInfo& cs_regs, const PreparedBindings& bindings) {
-	auto& native_rt = context.GetNativeRayTracing();
+	auto& native_rt = *context.GetRayTracing();
 	if (!native_rt.Enabled()) {
 		return;
 	}
 	const auto& module = *bindings.runtime->module;
 	const auto& info   = module.info.info;
-	if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(info, source)) {
+	if (RayTracing::TlasSource source; RayTracing::FindTlasSource(info, source)) {
 		const auto& user    = cs_regs.cs_user_sgpr.value;
 		// Through a V# (Marvel's Wolverine), read from guest memory: the game writes its tables.
-		const auto  pointer = NativeRayTracing::UserPointer(
+		const auto  pointer = RayTracing::UserPointer(
 		    source, uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u),
 		    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
 		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
 		                  module.info.shader_hash);
 	} else if (info.bvh) {
 		// It walks a guest BVH on its own (see the "[RT]" summaries).
-		using Kind = NativeRayTracing::GuestDispatch;
-		NativeRayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unpatched,
+		using Kind = RayTracing::GuestDispatch;
+		RayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unrecognized,
 		                                    module.info.shader_hash);
 	}
 }
@@ -363,7 +366,8 @@ static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& st
 	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
 	const auto& flat       = stage.resources->flattened_srt;
 	const auto [low, high] = program.info.ray_query_tlas;
-	const auto address = context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+	const auto address =
+	    context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u, context.GetGpu().GetFrameNum());
 	bindings.shader_data[dword]     = static_cast<uint32_t>(address);
 	bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
 }

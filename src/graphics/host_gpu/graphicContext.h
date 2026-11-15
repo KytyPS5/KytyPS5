@@ -48,7 +48,7 @@ struct GraphicContext {
 	// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (pipelineCreationCacheControl).
 	bool                               pipeline_cache_lookup_enabled          = false;
 	bool                                      mesh_shader_enabled                   = false;
-	// VK_KHR_acceleration_structure + VK_KHR_ray_query (see NativeRayTracing).
+	// VK_KHR_acceleration_structure + VK_KHR_ray_query (see RayTracing).
 	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

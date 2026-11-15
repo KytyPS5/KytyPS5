@@ -13,7 +13,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/indirectWriteTables.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
@@ -63,10 +62,9 @@ public:
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
-	NativeRayTracing&   GetNativeRayTracing() { return m_native_ray_tracing; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
-	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
+	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
@@ -154,7 +152,7 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
-	// CacheDmaBases() for the guest TLAS of a program (see NativeRayTracing::FindGuestTlasSource()),
+	// CacheDmaBases() for the guest TLAS of a program (see RayTracing::FindGuestTlasSource()),
 	// with m_mapped_ranges_mutex held.
 	void CacheTlasMemory(const ShaderStageRuntime& runtime);
 	// SynchronizeDmaFootprint() once the reach of the stages is to be enumerated.
@@ -174,7 +172,7 @@ private:
 	                                       ShaderBufferResource& vsharp);
 	// The address of the header of the guest TLAS a program traces, and where the program reads
 	// it from when that is guest memory (else 0); false when the host cannot read it.
-	[[nodiscard]] bool GuestTlasHeader(const ShaderStageRuntime& runtime, const NativeRayTracing::TlasSource& source,
+	[[nodiscard]] bool GuestTlasHeader(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source,
 	                                   uint64_t& header, uint64_t& header_at);
 	// The size of the memory of the guest BLAS at `blas` (0 when it is not mapped); false when it
 	// is not known: the GPU wrote its header, in memory the library did not capture.
@@ -205,7 +203,6 @@ private:
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};
 	LodStatsCounter           m_lod_stats {*this};
-	NativeRayTracing          m_native_ray_tracing {m_graphics, m_command_scheduler, m_buffer_cache};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;

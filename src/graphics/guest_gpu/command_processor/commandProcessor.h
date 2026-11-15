@@ -8,7 +8,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/psrShaders.h"
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -306,7 +306,7 @@ private:
 		uint64_t                        header = 0;
 		uint32_t                        stride = 0;
 		uint32_t                        count  = 0;
-		NativeRayTracing::HleTlasFormat format = NativeRayTracing::HleTlasFormat::Base460;
+		RayTracing::HleTlasFormat format = RayTracing::HleTlasFormat::Base460;
 		// The native build can read the list.
 		[[nodiscard]] bool Native() const;
 	};
@@ -346,7 +346,7 @@ private:
 	uint64_t                               m_psr_decompressed      = 0;
 	uint32_t                               m_psr_decompressed_size = 0;
 	// The BLAS whose last build pass is being dispatched (blas_va 0: none).
-	NativeRayTracing::GuestBlasBuild m_psr_blas_built;
+	RayTracing::GuestBlasBuild m_psr_blas_built;
 	// The sce::Psr shader of each compute shader address seen.
 	std::unordered_map<uint64_t, Psr::Shader> m_cs_psr_shaders;
 

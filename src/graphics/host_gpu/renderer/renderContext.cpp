@@ -35,9 +35,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
       m_image_heap(*this, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	if (graphics.ray_query_enabled) {
-		m_ray_tracing = std::make_unique<RayTracing>(*this);
-	}
+	m_ray_tracing = std::make_unique<RayTracing>(*this);
 }
 
 RenderContext::~RenderContext() {
@@ -477,8 +475,8 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 	// walks of each found no TLAS, or a part of it. The BLASes they reference that the CPU wrote
 	// are cached as well.
 	const auto&                  program = runtime.module->info;
-	NativeRayTracing::TlasSource source;
-	if (!NativeRayTracing::FindGuestTlasSource(program.info, source)) {
+	RayTracing::TlasSource source;
+	if (!RayTracing::FindGuestTlasSource(program.info, source)) {
 		return;
 	}
 	const auto& resources = *runtime.resources;
@@ -488,7 +486,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
 		         m_buffer_cache.IsRegionGpuModified(address, size));
 	};
-	// The header address as the walk reads it (see NativeRayTracing::Prepare()).
+	// The header address as the walk reads it (see RayTracing::Prepare()).
 	uint64_t    header = 0;
 	const auto& srt    = resources.flattened_srt;
 	const auto  in_srt = [&](uint32_t slot) {
@@ -502,7 +500,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
 			return;
 		}
-		const auto pointer = NativeRayTracing::UserPointer(
+		const auto pointer = RayTracing::UserPointer(
 		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
 		if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
 		    !readable(pointer + source.header_offset, sizeof(header))) {
@@ -511,7 +509,7 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 		std::memcpy(&header, reinterpret_cast<const void*>(pointer + source.header_offset), sizeof(header));
 	}
 	std::vector<std::pair<uint64_t, uint64_t>> ranges;
-	const auto tlas = m_native_ray_tracing.ReadGuestTlas(header, source, readable, ranges);
+	const auto tlas = m_ray_tracing->ReadGuestTlas(header, source, readable, ranges);
 	if (tlas.end != 0) {
 		ranges.emplace_back(header, tlas.end);
 	}
@@ -524,8 +522,8 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 			}
 		});
 	}
-	if (program.info.ray_query && m_native_ray_tracing.Enabled()) {
-		m_native_ray_tracing.NoteTlasInstances(tlas.instances);
+	if (program.info.ray_query && m_ray_tracing->Enabled()) {
+		m_ray_tracing->NoteTlasInstances(tlas.instances);
 	}
 }
 
@@ -881,7 +879,7 @@ void RenderContext::NoteGuestBvhMemory(uint64_t address, uint64_t size) {
 	m_guest_bvh_memory[address] = size;
 }
 
-bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const NativeRayTracing::TlasSource& source,
+bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source,
                                     uint64_t& header, uint64_t& header_at) {
 	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
@@ -896,13 +894,13 @@ bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const Nat
 	const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
 	uint64_t    pointer   = 0;
 	if (source.user_sgpr >= program.user_data_base && index + 1u < user_data.size()) {
-		pointer = NativeRayTracing::UserPointer(
+		pointer = RayTracing::UserPointer(
 		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
 	}
 	if (pointer != 0 && pointer <= UINT64_MAX - source.header_offset) {
 		header_at = pointer + source.header_offset;
 	}
-	// The header address as the walk reads it (see NativeRayTracing::Prepare()).
+	// The header address as the walk reads it (see RayTracing::Prepare()).
 	const auto& srt    = resources.flattened_srt;
 	const auto  in_srt = [&](uint32_t slot) {
 		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot && slot < srt.size();
@@ -1066,11 +1064,11 @@ bool RenderContext::RayQueryTableVsharp(const ShaderStageRuntime& runtime, uint3
 bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	const auto&                  program = runtime.module->info;
 	const auto&                  reach   = program.info.ray_query_reach;
-	NativeRayTracing::TlasSource source;
+	RayTracing::TlasSource source;
 	uint64_t                     header    = 0;
 	uint64_t                     header_at = 0;
-	if (reach.empty() || reach.size() != 1u + uint64_t {reach[0]} * 2u || !m_native_ray_tracing.Enabled() ||
-	    !NativeRayTracing::FindGuestTlasSource(program.info, source) ||
+	if (reach.empty() || reach.size() != 1u + uint64_t {reach[0]} * 2u || !m_ray_tracing->Enabled() ||
+	    !RayTracing::FindGuestTlasSource(program.info, source) ||
 	    !GuestTlasHeader(runtime, source, header, header_at)) {
 		return false;
 	}
@@ -1093,7 +1091,7 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 	}
 	add(header, tlas->size);
 	m_walk_blases.clear();
-	m_native_ray_tracing.PendingWalks(m_walk_blases);
+	m_ray_tracing->PendingWalks(m_walk_blases);
 	for (const auto* list: {&tlas->blases, &m_walk_blases}) {
 		for (const auto blas: *list) {
 			uint64_t size = 0;
@@ -1119,7 +1117,7 @@ bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
 			return false;
 		}
 	}
-	m_native_ray_tracing.AnnounceWalks(m_walk_blases);
+	m_ray_tracing->AnnounceWalks(m_walk_blases);
 	return true;
 }
 
@@ -1186,9 +1184,7 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
-	if (m_ray_tracing) {
-		m_ray_tracing->RunGarbageCollector();
-	}
+	m_ray_tracing->RunGarbageCollector();
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

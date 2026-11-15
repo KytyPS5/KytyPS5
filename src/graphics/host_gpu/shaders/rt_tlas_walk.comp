@@ -74,6 +74,10 @@ shared uint s_tail;
 shared uint s_next_tail;
 shared uint s_valid;
 shared uint64_t s_header;
+// A Psr header layout: the format of the TLAS header, and whether every visible instance has an
+// unchanged host BLAS so far.
+shared uint s_psr_format;
+shared uint s_exact;
 
 const uint kSlotPending = 0xffffffffu;
 // The key of a table entry the host released (an evicted slot, a BLAS to report again): lookups
@@ -110,7 +114,7 @@ uint ReportMissing(TableEntry entry, uint index, uint64_t previous, uint64_t bla
 	return kSlotPending;
 }
 
-// BLASes whose builds the host saw (see NativeRayTracing::NoteGuestBlasBuilds()) are in a second
+// BLASes whose builds the host saw (see RayTracing::NoteGuestBlasBuilds()) are in a second
 // table, after the walk's own (pc.table_mask + 1 entries), that only the host writes: same
 // entries and hash, empty keys end a probe chain and released ones (tombstones) are skipped. It
 // is probed first, so such a BLAS never waits for a report.
@@ -188,17 +192,34 @@ uint FindSlot(uint64_t blas_va, uint root) {
 void main() {
 	const uint lid   = gl_LocalInvocationID.x;
 	RtState    state = RtState(pc.state);
+	const bool psr   = LayoutPsrHeader(pc.instance_layout);
 	if (lid == 0) {
 		const uint64_t header = pc.header_offset == kHeaderInState
 		                            ? state.header_va
 		                            : LoadGuestU64(pc.user_ptr_va + pc.header_offset);
 		s_header              = header;
-		s_valid               = header != 0 && (header & 255) == 0 ? 1u : 0u;
+		// A Psr header is read 4-byte aligned; the walks of the native forms keep their TLAS
+		// 256-byte aligned.
+		s_valid               = header != 0 && (header & (psr ? 3u : 255u)) == 0 ? 1u : 0u;
+		s_exact               = 1u;
+		s_psr_format          = 0u;
 		state.header_va       = header;
 		// A header in memory the host has not cached yet (recorded: cached for the next walk)
 		// gives an empty TLAS.
 		const bool cached = s_valid != 0 && HostAddress(header) != 0;
-		if (cached) {
+		if (cached && psr) {
+			// The instance records in order: no box node is walked.
+			const uint     format  = PsrFormat(header, false);
+			const uint64_t records = header + LoadGuestU64(header + (format == 10u ? 0x30u : 0x28u));
+			if (format == 0u || (records & 3) != 0) {
+				s_valid = 0u;
+			} else {
+				s_psr_format         = format;
+				state.instance_base  = records;
+				state.instance_count = LoadGuestU32(header + (format == 3u || format == 6u ? 0x74u : 0x70u));
+				state.exact_context  = pc.context;
+			}
+		} else if (cached) {
 			state.instance_base = header + LoadGuestU64(header + LayoutInstanceOffset(pc.instance_layout));
 			state.node_limit    = LayoutNodeCountAt80(pc.instance_layout) ? LoadGuestU32(header + 80) - 1u
 			                                                              : LoadGuestU32(header + 88);
@@ -207,12 +228,19 @@ void main() {
 		}
 		U32Ref(pc.queue).v = pc.root;
 		s_head             = 0;
-		s_tail             = cached ? 1 : 0;
+		s_tail             = cached && !psr ? 1 : 0;
+		if (psr && !cached) {
+			s_valid = 0u;
+		}
 	}
 	barrier();
 	if (s_valid == 0) {
 		if (lid == 0 && pc.context != 0) {
 			ContextEntry(pc.context).valid = 0;
+			if (psr) {
+				// The header is not one the host mirrors (or not readable yet).
+				ContextEntry(pc.context).instance_count = ~0u;
+			}
 		}
 		return;
 	}
@@ -277,14 +305,51 @@ void main() {
 	memoryBarrierBuffer();
 	barrier();
 
+	if (psr && lid == 0 && state.instance_count > pc.instance_capacity) {
+		// The host TLAS grows for the next walk (see the readback).
+		atomicOr(state.overflow, 2u);
+		s_exact = 0u;
+	}
 	const uint count = min(state.instance_count, pc.instance_capacity);
 	for (uint i = lid; i < count; i += gl_WorkGroupSize.x) {
-		const uint     node   = U32Ref(pc.instance_nodes + uint64_t(i) * 4).v;
+		// A Psr header layout takes record i as instance i.
+		const uint node = psr ? i << 3 : U32Ref(pc.instance_nodes + uint64_t(i) * 4).v;
+		if (psr) {
+			U32Ref(pc.instance_nodes + uint64_t(i) * 4).v = node;
+		}
 		const uint64_t      record = InstanceRecord(header, instance_base, node, pc.instance_layout);
 		if (HostAddress(record) == 0) {
 			atomicOr(state.overflow, kUnmapped);
+			if (psr) {
+				s_exact = 0u;
+			}
 		}
-		const GuestInstance guest  = LoadGuestInstance(record, pc.instance_layout);
+		GuestInstance guest;
+		// A Psr record is drawn when it has a BLAS, a root that is not empty (node types 6 and 7)
+		// and a mask; it has a host BLAS unless it is an AABB instance (+112 bit 31) or its BLAS
+		// is not 64-byte aligned.
+		bool visible = true, mirrored = true;
+		if (psr) {
+			// Format 10 holds BLAS >> 3 at +48 under flags at bit 54, the mask in bits 24..31 and
+			// object-to-world rows at +64; the others the BLAS at +0, the mask in bits 8..15 and
+			// columns.
+			const bool     v10   = s_psr_format == 10u;
+			const uint64_t raw   = LoadGuestU64(record + (v10 ? 48u : 0u));
+			const uint     flags = LoadGuestU32(record + 60);
+			guest.blas  = v10 ? (raw & ((uint64_t(1) << 54) - 1ul)) << 3 : raw;
+			guest.root  = LoadGuestU32(record + 56);
+			guest.mask  = v10 ? flags >> 24 : (flags >> 8) & 0xffu;
+			guest.flags = 0u;
+			for (uint r = 0; r < 3; r++) {
+				for (uint c = 0; c < 4; c++) {
+					guest.rows[r][c] = uintBitsToFloat(LoadGuestU32(record + 64u + (v10 ? r * 16u + c * 4u : c * 12u + r * 4u)));
+				}
+			}
+			visible  = guest.blas != 0 && (guest.root & 6u) != 6u && guest.mask != 0u;
+			mirrored = (guest.blas & 63) == 0 && (LoadGuestU32(record + 112) >> 31) == 0u;
+		} else {
+			guest = LoadGuestInstance(record, pc.instance_layout);
+		}
 		const uint64_t      blas   = guest.blas;
 		const uint          root   = LayoutInline(pc.instance_layout, node)
 		                                 ? LayoutInlineRoot(pc.instance_layout)
@@ -297,10 +362,18 @@ void main() {
 		const uint flip        = LayoutFlipFacing(pc.instance_layout) ? 1u : 0u;
 		uint       host_flags  = (guest_flags & 4u) != 0 ? 1u : ((((guest_flags >> 3) ^ flip) & 1u) != 0 ? 2u : 0u);
 		host_flags |= (guest_flags & 2u) != 0 ? 8u : ((guest_flags & 1u) != 0 ? 4u : 0u);
+		// The rewritten loops of a Psr header layout take every triangle as a candidate and test
+		// facing and opacity themselves.
+		if (psr) {
+			host_flags = 1u | 8u;
+		}
 		InstanceRef    out_instance = InstanceRef(pc.instances + uint64_t(i) * 64);
 		uint64_t       reference    = 0;
 		uint           slot         = kSlotPending;
-		if (blas != 0 && mask != 0) {
+		if (psr && visible && !mirrored) {
+			s_exact = 0u;
+		}
+		if (blas != 0 && mask != 0 && visible && mirrored) {
 			slot = FindHostSlot(blas, root);
 			if (slot == kNoEntry) {
 				slot = FindSlot(blas, root);
@@ -317,6 +390,36 @@ void main() {
 					}
 				}
 			}
+			if (psr && reference == 0) {
+				s_exact = 0u;
+			}
+		}
+		if (psr) {
+			// The record's object-to-world matrix as it is (row-major 3x4, VkTransformMatrixKHR).
+			bool usable = reference != 0;
+			for (uint r = 0; r < 3; r++) {
+				usable = usable && all(lessThan(abs(guest.rows[r]), vec4(1e18))) && !any(isnan(guest.rows[r]));
+			}
+			if (!usable) {
+				if (visible && mirrored) {
+					s_exact = 0u;
+				}
+				atomicAdd(state.inactive, 1u);
+				out_instance.rows[0]    = vec4(0);
+				out_instance.rows[1]    = vec4(0);
+				out_instance.rows[2]    = vec4(0);
+				out_instance.index_mask = 0;
+				out_instance.sbt_flags  = 0;
+				out_instance.reference  = 0;
+				continue;
+			}
+			out_instance.rows[0]    = guest.rows[0];
+			out_instance.rows[1]    = guest.rows[1];
+			out_instance.rows[2]    = guest.rows[2];
+			out_instance.index_mask = (slot & 0xffffffu) | (mask << 24);
+			out_instance.sbt_flags  = host_flags << 24;
+			out_instance.reference  = reference;
+			continue;
 		}
 		// The guest matrix maps world to object space; the host instance needs its inverse.
 		const vec4 r0 = guest.rows[0];
@@ -379,9 +482,9 @@ void main() {
 			context.tlas_address   = pc.tlas_address;
 			context.instance_nodes = pc.instance_nodes;
 			context.slots          = pc.slots;
-			context.instance_count = count;
+			context.instance_count = psr ? state.instance_count : count;
 			context.instance_base  = instance_base;
-			context.valid          = pc.tlas_address != 0 ? 1u : 0u;
+			context.valid          = pc.tlas_address != 0 && (!psr || s_exact != 0) ? 1u : 0u;
 		}
 	}
 }

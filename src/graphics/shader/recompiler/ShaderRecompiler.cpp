@@ -626,14 +626,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	for (const auto& body: decoded.call_bodies)
 		ir.inlined_call_entries.push_back(body.begin);
-	// The TLAS of the native ray tracing patch (see NativeRayTracing::FindTlasSource()).
-	if (decoded.ray_tracing_source.valid) {
-		ir.info.ray_query_user_sgpr     = decoded.ray_tracing_source.user_sgpr;
-		ir.info.ray_query_header_offset = decoded.ray_tracing_source.header_offset;
-		ir.info.ray_query_header_vsharp = decoded.ray_tracing_source.header_vsharp;
-		ir.info.ray_query_root          = decoded.ray_tracing_source.root;
-		ir.info.ray_query_layout        = decoded.ray_tracing_source.layout;
-	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,
@@ -788,6 +780,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	// The walks of the native ray tracing sites (RayQueryInit) keep the guest's loop for when the
+	// host has no structures for their TLAS: the ray query pass leaves those walks as they are.
 	if (options.profile->ray_query) {
 		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",

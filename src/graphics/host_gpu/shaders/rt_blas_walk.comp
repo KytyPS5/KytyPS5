@@ -9,7 +9,7 @@
 //             with their entry table, and pads both geometries with inactive (NaN) triangles.
 // MODE_VERIFY: recomputes the signature of the boxes of built slots and lists those that changed.
 //
-// A build with a layout (a BLAS whose build the host saw, see NativeRayTracing::NoteGuestBlasBuilds())
+// A build with a layout (a BLAS whose build the host saw, see RayTracing::NoteGuestBlasBuilds())
 // places each triangle by its primitive: the geometry of its triangle node (the header's table of
 // the geometry of each triangle node: +40 offset, +108 geometry count, +124 first triangle node;
 // in BLASes of generation Base252, GTA V 01.005: +32, +112 and +128)
@@ -78,15 +78,44 @@ layout(push_constant, std430) uniform Push {
 	// The preparation (see SlotInfo::rebase).
 	uint     prepare_id;
 	// FLAG_NODE_COUNT_AT_80: the BLAS headers hold their node count at +80 instead of the T# size
-	// (the count less one) at +88.
+	// (the count less one) at +88. FLAG_PSR_HEADER: the BLASes of a Psr header layout (see
+	// LayoutPsrHeader() in rt_common.inc).
 	uint     flags;
 } pc;
 
 const uint FLAG_NODE_COUNT_AT_80 = 1u;
+const uint FLAG_PSR_HEADER       = 2u;
 
-// The node limit of the T# of a BLAS (the count of its nodes less one).
+// The node limit of the T# of a BLAS (the count of its nodes less one). A Psr header holds the
+// count at +0x50, 8 bytes higher in format 10.
 uint BlasNodeLimit(uint64_t blas_va) {
+	if ((pc.flags & FLAG_PSR_HEADER) != 0) {
+		return LoadGuestU32(blas_va + (PsrFormat(blas_va, true) == 10u ? 0x58u : 0x50u)) - 1u;
+	}
 	return (pc.flags & FLAG_NODE_COUNT_AT_80) != 0 ? LoadGuestU32(blas_va + 80) - 1u : LoadGuestU32(blas_va + 88);
+}
+
+// With FLAG_PSR_HEADER, the signature of a slot also covers its leaves: the words of their list
+// entries and the vertices of their triangles. The guest may refit a Psr BLAS without changing
+// its boxes, and the rewritten loops trace the host BLAS only while it is the guest's.
+uint LeafSignature(uint64_t blas_va, uint64_t base, uint leaf) {
+	uint       hash  = Mix(0x7654321u, leaf);
+	const uint first = leaf >> 3;
+	for (uint k = 0; k < kMaxLeafEntries; k++) {
+		const uvec2 pair = LoadGuestU32x2(blas_va + (uint64_t(first + k) << 3));
+		hash             = Mix(Mix(hash, pair.x), pair.y);
+		if (NodeType(pair.x) < 4u) {
+			vec3 p[3];
+			LoadTriangle(NodeAddress(base, pair.x), NodeType(pair.x), p);
+			for (uint v = 0; v < 3; v++) {
+				hash = Mix(Mix(Mix(hash, floatBitsToUint(p[v].x)), floatBitsToUint(p[v].y)), floatBitsToUint(p[v].z));
+			}
+		}
+		if ((pair.y & 0x80000000u) != 0) {
+			break;
+		}
+	}
+	return hash;
 }
 
 const uint MODE_COUNT  = 0u;
@@ -209,7 +238,8 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 				// its part of the triangle, and the guest's traversal tests the whole triangle in any
 				// leaf the ray enters (dropping those left the sun lighting the inside of a garage, and
 				// a third of the triangles of the foliage the game rebuilds every frame).
-				if (all(lessThanEqual(s_root_lo, s_root_hi))) {
+				// The BLASes of a Psr header layout are mirrored as the guest holds them.
+				if ((pc.flags & FLAG_PSR_HEADER) == 0 && all(lessThanEqual(s_root_lo, s_root_hi))) {
 					const vec3 margin = (s_root_hi - s_root_lo) * 1e-3 + vec3(1e-3);
 					for (uint v = 0; v < 3; v++) {
 						usable = usable && all(greaterThanEqual(p[v], s_root_lo - margin)) &&
@@ -449,6 +479,9 @@ void main() {
 						atomicOr(s_overflow, 1u);
 					}
 				} else if (type < 4u) {
+					if ((pc.flags & FLAG_PSR_HEADER) != 0) {
+						hash = Mix(hash, LeafSignature(blas_va, base, child));
+					}
 					if (pc.mode == MODE_VERIFY) {
 						atomicAdd(s_leaves, 1u);
 					} else {
@@ -538,6 +571,11 @@ void main() {
 			const uint index = atomicAdd(state.changed_count, 1u);
 			if (index < pc.changed_capacity) {
 				U32Ref(pc.changed + uint64_t(index) * 4).v = slot;
+			}
+			// A rewritten loop of a Psr header layout walks the guest BVH until the host BLAS
+			// holds the change.
+			if (state.exact_context != 0) {
+				U32Ref(state.exact_context + kContextValid).v = 0u;
 			}
 			// Built again by the host; until then only reported once (a walk that overflowed saw
 			// only part of the BLAS: it is reported until the build counts it).

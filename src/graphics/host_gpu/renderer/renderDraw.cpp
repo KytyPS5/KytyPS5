@@ -1,7 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/host_gpu/renderer/cxCompat.h"
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 

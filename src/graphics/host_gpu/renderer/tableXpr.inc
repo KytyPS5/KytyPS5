@@ -3309,7 +3309,7 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const S
 	    plan->uniform_fill.fill.kind != ShaderRecompiler::IR::UniformFillKind::None ||
 	    std::ranges::any_of(program.info.buffers, [](const auto& buffer) { return buffer.indirect_write_table; }))
 		return refuse("a program table mode does not serve");
-	if (NativeRayTracing::TlasSource source; NativeRayTracing::FindTlasSource(program.info, source))
+	if (RayTracing::TlasSource source; RayTracing::FindTlasSource(program.info, source))
 		return refuse("native ray tracing");
 	auto compute = std::make_unique<ShaderComputeInputInfo>();
 	compute->async_compute = async_compute;

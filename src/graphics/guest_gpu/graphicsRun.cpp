@@ -16,7 +16,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/renderer/nativeRayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -2095,7 +2095,7 @@ static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) 
 // the BLAS header), psr_qbvh_fan_refit_async (the vertices of a geometry's triangle nodes, from
 // its vertex buffer and object matrix), psr_qbvh_fan_refit_recover_aabbs (the arguments of the
 // last one) and psr_qbvh_refit_bottom_level (the boxes, bottom up). With native ray tracing they
-// are replaced by NativeRayTracing::RecordHleRefit(): the dispatches are dropped; each BLAS
+// are replaced by RayTracing::RecordHleRefit(): the dispatches are dropped; each BLAS
 // (s[0:1] of the first shader) and each geometry (the geometry table V# at s[0:3], BLAS at s[4:5]
 // and geometry index s8 of the second one in generation Base460, s6 in Base252) are kept and,
 // with the last box pass, one host command refits every BLAS (with the vertices other work wrote
@@ -2111,7 +2111,7 @@ static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) 
 // arguments of every BLAS of the window before anything else the window runs, and the refit of
 // the boxes, which also writes the BLAS's bounds in its header, makes them infinite again.
 bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
-	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+	if (data_addr == 0 || !m_renderer.GetRayTracing()->Enabled()) {
 		return false;
 	}
 	using Psr::Shader;
@@ -2192,7 +2192,7 @@ void CommandProcessor::EmitHleRefitArgs() {
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
-		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, {}, 2, true);
+		context.GetRayTracing()->RecordHleRefit(command.Handle(), blases, {}, 2, true);
 	});
 }
 
@@ -2207,7 +2207,7 @@ void CommandProcessor::EmitHleRefit() {
 	EmitHostCommand([this, blases = m_hle_refit_blases, refs = m_hle_refit_geometries, header_layout] {
 		auto&                                          context = m_renderer;
 		auto&                                          cache   = context.GetBufferCache();
-		std::vector<NativeRayTracing::HleRefitGeometry> geometries;
+		std::vector<RayTracing::HleRefitGeometry> geometries;
 		geometries.reserve(refs.size());
 		uint64_t last_vertices = 0;
 		for (const auto& ref: refs) {
@@ -2219,7 +2219,7 @@ void CommandProcessor::EmitHleRefit() {
 			std::array<uint32_t, 30> entry {};
 			ReadGuestAroundGpuWrites(ref.table + uint64_t {ref.geometry} * 120u, entry.data(),
 			                         sizeof(entry));
-			NativeRayTracing::HleRefitGeometry geometry {.blas = ref.blas, .geometry = ref.geometry};
+			RayTracing::HleRefitGeometry geometry {.blas = ref.blas, .geometry = ref.geometry};
 			std::memcpy(geometry.vsharp.data(), &entry[2], sizeof(geometry.vsharp));
 			std::memcpy(geometry.matrix.data(), &entry[14], sizeof(geometry.matrix));
 			ShaderBufferResource vsharp;
@@ -2248,7 +2248,7 @@ void CommandProcessor::EmitHleRefit() {
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
-		context.GetNativeRayTracing().RecordHleRefit(command.Handle(), blases, geometries, header_layout);
+		context.GetRayTracing()->RecordHleRefit(command.Handle(), blases, geometries, header_layout);
 	});
 }
 
@@ -2257,13 +2257,13 @@ void CommandProcessor::EmitHleRefit() {
 // once per TLAS (psr_morton_rotate_tree_top more often; a TLAS of one or two instances, like the
 // one of Nightreign's title screen, takes psr_morton_init_one_instance_root_node instead of the
 // sort and the hierarchy passes), several of which wait for the GPU. With
-// native ray tracing, the stage is replaced by NativeRayTracing::RecordHleTlas(): its dispatches
+// native ray tracing, the stage is replaced by RayTracing::RecordHleTlas(): its dispatches
 // are dropped; the instance list of each build (the V# at s[6:9] and the count at s8 of
 // psr_morton_compute_bounding_box_for_instances, written by the game's CPU) is kept with the TLAS
 // address (s[0:1] of psr_collapse_to_qbvh_simple_top, the stage's last shader), user data of
 // generation Base460, and there one host command builds every TLAS. True when the dispatch is
 // dropped. A list the native build cannot read (records shorter than 96 bytes or not a multiple of
-// 16 bytes, no list, more than NativeRayTracing::HleTlasMaxInstances instances) is seen at the
+// 16 bytes, no list, more than RayTracing::HleTlasMaxInstances instances) is seen at the
 // stage's first dispatch: the game builds that TLAS itself, from that dispatch to its last pass.
 // GTA V 01.005 (generation Base252) builds its three TLASes of a frame with 12 shaders of an older
 // build of the library (no indirect arguments, valid instance indices or vec2u scans; the sort,
@@ -2274,11 +2274,11 @@ void CommandProcessor::EmitHleRefit() {
 bool CommandProcessor::HleTlasBuild::Native() const {
 	// An empty list still makes an empty TLAS.
 	return count == 0 || (input != 0 && stride >= 96 && stride % 16 == 0 &&
-	                      count <= NativeRayTracing::HleTlasMaxInstances);
+	                      count <= RayTracing::HleTlasMaxInstances);
 }
 
 bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
-	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+	if (data_addr == 0 || !m_renderer.GetRayTracing()->Enabled()) {
 		return false;
 	}
 	using Psr::Shader;
@@ -2315,8 +2315,8 @@ bool CommandProcessor::HleTlasDispatch(uint64_t data_addr) {
 		return HleTlasBuild {.input  = uint64_t {user[v]} | (uint64_t {user[v + 1] & 0xffffu} << 32u),
 		                     .stride = (user[v + 1] >> 16u) & 0x3fffu,
 		                     .count  = user[v + 2],
-		                     .format = base252 ? NativeRayTracing::HleTlasFormat::Base252
-		                                       : NativeRayTracing::HleTlasFormat::Base460};
+		                     .format = base252 ? RayTracing::HleTlasFormat::Base252
+		                                       : RayTracing::HleTlasFormat::Base460};
 	};
 	if (m_guest_tlas_builds != 0) {
 		// The game's own builds run to their last passes.
@@ -2417,7 +2417,7 @@ void CommandProcessor::EmitHleTlas() {
 				}
 			}
 			std::array<uint32_t, 32> header {};
-			const auto size = NativeRayTracing::HleTlasHeader(build.count, build.format, header);
+			const auto size = RayTracing::HleTlasHeader(build.count, build.format, header);
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
 			// The dispatches that trace the TLAS reach its memory and the BLASes of the list.
@@ -2430,7 +2430,7 @@ void CommandProcessor::EmitHleTlas() {
 		command.EndRendering();
 		for (const auto& build: builds) {
 			if (build.header != 0 && build.Native()) {
-				context.GetNativeRayTracing().RecordHleTlas(command.Handle(), build.input,
+				context.GetRayTracing()->RecordHleTlas(command.Handle(), build.input,
 				                                            build.count, build.stride,
 				                                            build.header, build.format);
 			}
@@ -2443,7 +2443,7 @@ void CommandProcessor::EmitHleTlas() {
 // writes (120-byte srt_geometry_config entries: +0 kind, 1 = triangles; +4 flags, bit 0 opaque;
 // +8 vertex buffer V#; +24 index buffer V#, whose record count, +32, is the triangle count; +56
 // object matrix). With native ray tracing the builds still run (shaders read the guest BVH), and
-// the command processor tells NativeRayTracing about each one as it ends, so the host BLAS follows
+// the command processor tells RayTracing about each one as it ends, so the host BLAS follows
 // it in the same frame instead of waiting for a walk to find it: psr_morton_compute_bounding_box_
 // for_vertices runs once per geometry (the table V# at s[0:3], its record count the geometry count,
 // the build's scratch memory at s[4:5] and the geometry index s9), and so does
@@ -2458,14 +2458,14 @@ void CommandProcessor::EmitHleTlas() {
 // index of the codes is in bits 18-31 of s6, builds without refit data end with
 // collapse_to_qbvh_simple (the last pass of its TLAS builds too), whose s14 is the primitive count
 // minus one, and its BLAS header holds the fields the layout build reads at other offsets
-// (NativeRayTracing::GuestBlasBuild::header_layout).
+// (RayTracing::GuestBlasBuild::header_layout).
 //
 // It also streams in compressed BLASes and decompresses them on the GPU: psr_morton_capture_memory
 // (the BLAS memory at s[0:1], its size at s2), psr_decompress_header_base, then the other passes and
 // psr_decompress_compute_fan_node_* (the BLAS at s6 with its high bits at s1). Their triangle
-// counts are only on the GPU: NativeRayTracing sizes their slots from the memory.
+// counts are only on the GPU: RayTracing sizes their slots from the memory.
 void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
-	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+	if (data_addr == 0 || !m_renderer.GetRayTracing()->Enabled()) {
 		return;
 	}
 	using Psr::Shader;
@@ -2556,7 +2556,7 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 	if (blas == 0 || table == 0 || std::ranges::find(seen, 0) != seen.end()) {
 		return;
 	}
-	NativeRayTracing::GuestBlasBuild build {.blas_va = blas, .header_layout = base252 ? 1u : 0u};
+	RayTracing::GuestBlasBuild build {.blas_va = blas, .header_layout = base252 ? 1u : 0u};
 	std::vector<uint32_t>            entries(seen.size() * GeometryStride / 4);
 	ReadGuestAroundGpuWrites(table, entries.data(), entries.size() * 4);
 	uint64_t triangles = 0;
@@ -2575,7 +2575,7 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 }
 
 void CommandProcessor::GuestTlasDispatch(uint64_t data_addr) {
-	if (data_addr == 0 || !m_renderer.GetNativeRayTracing().Enabled()) {
+	if (data_addr == 0 || !m_renderer.GetRayTracing()->Enabled()) {
 		return;
 	}
 	using Psr::Shader;
@@ -2594,7 +2594,7 @@ void CommandProcessor::GuestTlasDispatch(uint64_t data_addr) {
 void CommandProcessor::EmitPsrBlasBuilt() {
 	if (m_psr_decompressed != 0) {
 		EmitHostCommand([this, blas = m_psr_decompressed, size = m_psr_decompressed_size] {
-			m_renderer.GetNativeRayTracing().NoteGuestBlasDecompressed(blas, size);
+			m_renderer.GetRayTracing()->NoteGuestBlasDecompressed(blas, size);
 		});
 		m_psr_decompressed = 0;
 	}
@@ -2602,7 +2602,7 @@ void CommandProcessor::EmitPsrBlasBuilt() {
 		return;
 	}
 	EmitHostCommand([this, build = std::move(m_psr_blas_built)] {
-		m_renderer.GetNativeRayTracing().NoteGuestBlasBuilds(std::span(&build, 1));
+		m_renderer.GetRayTracing()->NoteGuestBlasBuilds(std::span(&build, 1));
 	});
 	m_psr_blas_built = {};
 }

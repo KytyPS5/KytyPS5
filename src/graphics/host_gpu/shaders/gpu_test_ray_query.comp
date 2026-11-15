@@ -4,17 +4,30 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // Traces a ray along +z from each origin through a mirrored TLAS, accepting every candidate.
-// Writes the context's {valid, instances}, then {hit, t, u, v, custom index, SBT offset +
-// primitive} per ray.
+// Writes the context's {valid, instances}, then {hit, t, u, v, instance, prim record} per ray,
+// with u and v the guest's (the weights of the vertices the triangle's remap selects) and the
+// record from the entry table of the host BLAS (see rt_tlas_walk.comp and rt_blas_walk.comp).
 
 layout(local_size_x = 8) in;
 
-layout(buffer_reference, std430) readonly buffer Context {
-	uint     valid;
-	uint     instances;
-	uint     missing_count;
+// A context entry (ContextEntry in rt_tlas_walk.comp).
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Context {
+	uint64_t header;
 	uint64_t structure;
+	uint64_t instance_nodes;
+	uint64_t slots;
+	uint     instances;
+	uint     valid;
+	uint64_t instance_base;
 };
+// A slot info (SlotInfo in rt_common.inc): the entry table at +8, the capacities at +16.
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Slot {
+	uint64_t structure;
+	uint64_t entries;
+	uint     capacity0;
+	uint     capacity1;
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Entries { uvec4 entries[]; };
 layout(buffer_reference, std430) readonly buffer Origins { vec4 origins[]; };
 layout(buffer_reference, std430) writeonly buffer Output { uint words[]; };
 layout(push_constant) uniform Parameters {
@@ -23,6 +36,10 @@ layout(push_constant) uniform Parameters {
 	Output  result;
 	uint    count;
 };
+
+float Weight(vec3 weights, uint index) {
+	return index == 1u ? weights.y : (index == 2u ? weights.z : weights.x);
+}
 
 void main() {
 	const uint ray = gl_GlobalInvocationID.x;
@@ -44,13 +61,19 @@ void main() {
 		}
 		if (rayQueryGetIntersectionTypeEXT(query, true) ==
 		    gl_RayQueryCommittedIntersectionTriangleEXT) {
-			const vec2 weights = rayQueryGetIntersectionBarycentricsEXT(query, true);
-			const uint record =
-			    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, true) +
-			    uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+			Slot slot = Slot(context.slots +
+			                 uint64_t(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)) * 64ul);
+			const uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+			const uint index     = rayQueryGetIntersectionGeometryIndexEXT(query, true) == 0
+			                           ? primitive
+			                           : slot.capacity0 + primitive;
+			const uvec4 entry   = Entries(slot.entries).entries[index];
+			const vec2  bary    = rayQueryGetIntersectionBarycentricsEXT(query, true);
+			const vec3  weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
 			hit = uint[6](1u, floatBitsToUint(rayQueryGetIntersectionTEXT(query, true)),
-			              floatBitsToUint(weights.x), floatBitsToUint(weights.y),
-			              uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)), record);
+			              floatBitsToUint(Weight(weights, entry.w & 3u)),
+			              floatBitsToUint(Weight(weights, (entry.w >> 2) & 3u)),
+			              uint(rayQueryGetIntersectionInstanceIdEXT(query, true)), entry.x >> 3);
 		}
 	}
 	for (uint i = 0u; i < 6u; ++i) {

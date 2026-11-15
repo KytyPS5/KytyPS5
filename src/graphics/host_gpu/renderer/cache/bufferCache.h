@@ -46,7 +46,7 @@ public:
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	// The entry after the last page holds the device address of the native ray tracing context
-	// (see NativeRayTracing::ContextAddress()), 0 without one.
+	// (see RayTracing::ContextAddress()), 0 without one.
 	static constexpr uint64_t NATIVE_RT_CONTEXT_PAGE = CACHING_NUMPAGES;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    (CACHING_NUMPAGES + 1) * sizeof(vk::DeviceAddress);
@@ -63,8 +63,8 @@ public:
 	static constexpr uint32_t HACK_MARK_ENTRIES   = 256;
 	static constexpr uint32_t HACK_MARK_DWORDS    = 8;
 	static constexpr uint32_t HACK_MARK_COUNTS    = 4; // dword of the count of HackMark 0
-	// With --rt-stats, the rays that the native ray tracing patch of the shader sent back to the
-	// guest traversal (added, see EmitRayQueryInit): not a workaround, reported by NativeRayTracing.
+	// With --rt-stats, the rays that the native ray tracing walks of the shader sent back to the
+	// guest traversal (added, see EmitRayQueryInit): not a workaround, reported by RayTracing.
 	static constexpr uint32_t HACK_MARK_GUEST_RAYS = HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count);
 	static constexpr uint64_t HACK_MARKS_SIZE     = uint64_t {HACK_MARK_ENTRIES} * HACK_MARK_DWORDS * 4;
 	static constexpr uint64_t FAULT_BUFFER_SIZE   = HACK_MARKS_OFFSET + HACK_MARKS_SIZE;

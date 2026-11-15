@@ -98,7 +98,9 @@
 
   // The fan BLAS and a TLAS naming A, B scaled and moved, the whole BLAS with an empty mask, and
   // an empty root, in a header format. Rays along +z must hit the mirror as the guest's own walk
-  // would, after a relink and after a refit too.
+  // would, after a relink and after a refit too. The mirror is RayTracing's host BLASes (slots)
+  // and TLAS: the context is valid only while every visible instance has a host BLAS as the guest
+  // holds it.
   void CheckBvhMirror(u32 format) {
     using G = GuestBvh;
     const auto label = "BvhMirror format " + std::to_string(format);
@@ -131,6 +133,8 @@
     top.Instance(0x200, blas, G::Link(4, 5), 0x0001, identity);
     top.Instance(0x280, blas, G::Empty, 0xff01, identity);
 
+    // The host structures exist on a device with ray queries.
+    m_runtime_context.ray_query_enabled = true;
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     auto &cache = context.GetBufferCache();
@@ -141,6 +145,8 @@
     context.MapMemory(blas, 2 * page);
     {
       RayTracing mirror(context);
+      // The GPU frame of the calls (what the eviction of unused host BLASes counts).
+      uint64_t frame = 1;
       constexpr auto usage = vk::BufferUsageFlagBits::eShaderDeviceAddress;
       Libs::Graphics::Buffer origins(m_runtime_context, scheduler, MemoryUsage::Upload, 0, usage,
                                      16 * 8);
@@ -174,7 +180,7 @@
         origins.Flush(0, origins.Size());
         if (read == 0) {
           context.PrepareBda(false);
-          read = mirror.Prepare(tlas);
+          read = mirror.Prepare(tlas, frame);
         }
         const struct {
           vk::DeviceAddress context, origins, output;
@@ -222,15 +228,14 @@
           Require(name, step, ok, "a ray hit the wrong triangle, instance or barycentrics");
         }
       };
-      // The call after a guest change finds it, writing no triangles: the word at `kept`, if any,
-      // keeps the fan's z = 5. A few calls later the mirror holds the change.
-      const auto settle = [&](const char *step, std::span<const Hit> hits,
-                              vk::DeviceAddress kept = 0) {
+      // A call after a guest change finds it (the context is not valid: the program walks the
+      // guest BVH), or, when the guest changed the BLAS lately (`found` false), may trace it
+      // already: such a host BLAS is built again before every use. A few calls later the mirror
+      // holds the change.
+      const auto settle = [&](const char *step, std::span<const Hit> hits, bool found) {
         auto result = trace(hits);
-        Require(name, step, result[0] == 0, "the mirror stayed valid over a changed guest BVH");
-        if (kept != 0) {
-          Require(name, step, trace({}, kept)[0] == std::bit_cast<u32>(5.0f),
-                  "a call that built nothing wrote triangles");
+        if (found) {
+          Require(name, step, result[0] == 0, "the mirror stayed valid over a changed guest BVH");
         }
         for (u32 call = 0; call < 8 && result[0] == 0; ++call) {
           result = trace(hits);
@@ -246,63 +251,58 @@
           {{16.4f, 1.0f}, 99, 1, 6.0f, 0.7f, 0.2f},
           {{4.5f, 2.5f}}, // Only the instance with an empty mask covers it.
       }};
-      settle("build", built);
+      settle("build", built, true);
 
-      // A call with every readback area of its tick in flight neither submits nor waits, unless
-      // its TLAS has none of them, like the BLAS header prepared as a second TLAS.
+      // Calls within one tick neither submit nor wait while readbacks are free, also for a BLAS
+      // header prepared as a TLAS (not mirrored).
       const auto tick = scheduler.CurrentTick();
       for (u32 call = 0; call <= 8; ++call) {
-        (void)mirror.Prepare(tlas);
+        (void)mirror.Prepare(tlas, frame);
       }
+      (void)mirror.Prepare(blas, frame);
       Require(name, "busy areas", scheduler.CurrentTick() == tick,
-              "a call waited for a readback area");
-      (void)mirror.Prepare(blas);
-      Require(name, "busy areas", scheduler.CurrentTick() != tick,
-              "a TLAS without a readback in flight went without one");
+              "a call waited for a readback");
       expect("busy areas", trace(built), built);
+
+      // A refit raises vertex 0 of unit 10 to z = 7: the triangle of record 96 is hit at z = 6.
+      cache.InvalidateMemory(blas, page);
+      bottom.Node(10)[2] = std::bit_cast<u32>(7.0f);
+      auto refit = built;
+      refit[0].t = 6.0f;
+      settle("refit", refit, true);
 
       // A rebuild that keeps the records: A takes records 98, 99 and B 96, 97.
       cache.InvalidateMemory(blas, page);
       bottom.Children(6, {G::Link(98, 0), G::Link(99, 0), G::Empty, G::Empty});
       bottom.Children(8, {G::Link(96, 0), G::Empty, G::Empty, G::Empty});
-      std::array<Hit, 6> relinked{{
+      const std::array<Hit, 6> relinked{{
           {{4.5f, 2.5f}, 98, 0, 5.0f, 0.625f, 0.25f},
           {{3.2f, 1.0f}, 99, 0, 5.0f, 0.7f, 0.2f},
-          {{10.4f, 0.3f}, 96, 1, 6.0f, 0.3f, 0.5f},
+          {{10.4f, 0.3f}, 96, 1, 7.0f, 0.3f, 0.5f},
           {{11.8f, 0.6f}, 97, 1, 6.0f, 0.4f, 0.5f},
           {{0.2f, 0.3f}},
           {{19.0f, 2.5f}},
       }};
-      settle("relink", relinked);
+      settle("relink", relinked, false);
 
-      // A refit raises vertex 0 of unit 10, word 8 of the triangles, to z = 7; the mirror then
-      // updates on every call.
-      cache.InvalidateMemory(blas, page);
-      bottom.Node(10)[2] = std::bit_cast<u32>(7.0f);
-      relinked[2].t = 7.0f;
-      settle("refit", relinked, RayTracingTestAccess::Triangles(mirror, 0) + 32);
-
-      // An eviction pass keeps what calls used since the last one. Then A loses record 99 and B
-      // its root: the next pass drops B and the readback in flight with A's new walk, which A
-      // takes again. With no call before two more passes, everything goes.
-      const auto counts = [&](std::array<size_t, 4> wanted) {
-        return RayTracingTestAccess::Counts(mirror) == wanted;
-      };
-      RayTracingTestAccess::Evict(mirror);
-      Require(name, "eviction", counts({2, 2, 1, 0}), "an eviction pass dropped a used mirror");
+      // A host BLAS no call used for EvictFrames frames goes at the next eviction scan. A loses
+      // record 99 and B its root halfway: A is used again and stays when B goes; with no call for
+      // another EvictFrames frames A goes too.
+      const auto live = [&](size_t wanted) { return RayTracingTestAccess::LiveSlots(mirror) == wanted; };
+      Require(name, "eviction", live(2), "a used host BLAS went");
+      frame += RayTracing::EvictFrames / 2;
       cache.InvalidateMemory(blas, 2 * page);
       bottom.Children(6, {G::Link(98, 0), G::Empty, G::Empty, G::Empty});
       top.Instance(0x180, blas, G::Empty, 0xff02, identity);
       const std::array<Hit, 2> only_a{relinked[0], {{3.2f, 1.0f}}};
-      trace(only_a);
-      (void)mirror.Prepare(tlas);
-      RayTracingTestAccess::Evict(mirror);
-      Require(name, "eviction", counts({1, 1, 1, 0}),
-              "an eviction pass kept an unused pair or a readback");
-      settle("eviction", only_a);
-      RayTracingTestAccess::Evict(mirror);
-      RayTracingTestAccess::Evict(mirror);
-      Require(name, "eviction", counts({0, 0, 0, 0}), "an eviction pass kept an unused mirror");
+      settle("eviction", only_a, false);
+      frame += RayTracing::EvictFrames / 2 + 1;
+      RayTracingTestAccess::Evict(mirror, blas, frame);
+      Require(name, "eviction", live(1), "an eviction scan kept an unused host BLAS or dropped a used one");
+      expect("eviction", trace(only_a), only_a);
+      frame += RayTracing::EvictFrames + 1;
+      RayTracingTestAccess::Evict(mirror, blas, frame);
+      Require(name, "eviction", live(0), "an eviction scan kept an unused host BLAS");
 
       // A format 10 TLAS in the Trinity layout is not mirrored, even once its page is synchronized.
       if (format == 10) {
@@ -321,6 +321,7 @@
     }
     context.UnmapMemory(blas, 2 * page);
     scheduler.Finish();
+    m_runtime_context.ray_query_enabled = false;
     bool released = LibKernel::Memory::KernelMunmap(blas, 2 * page) == 0;
     if (released) {
       released = LibKernel::Memory::KernelReleaseDirectMemory(direct, 2 * page) == 0;

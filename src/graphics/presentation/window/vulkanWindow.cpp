@@ -655,10 +655,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
 	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
-	// Host ray tracing of guest BVHs (see NativeRayTracing).
+	// Host ray tracing of guest BVHs (see RayTracing).
 	graphics.native_ray_tracing_enabled = ray_query_enabled;
 	LOGF("Vulkan native ray tracing: %s\n", graphics.native_ray_tracing_enabled ? "true" : "false");
-	NativeRayTracing::SetDeviceSupport(graphics.native_ray_tracing_enabled);
+	RayTracing::SetDeviceSupport(graphics.native_ray_tracing_enabled);
 	const float                              queue_priority = 1.0f;
 	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
 	queue_create_infos[0] = {

@@ -38,7 +38,8 @@ struct ImageUsage {
 	bool video_out     = false;
 };
 
-// A host-only multisampled render proxy of one view of a single-sample image.
+// A host-only multisampled render proxy of one view of an image: of a single-sample image, or
+// of a depth image that stores every sample of a full-depth plan.
 struct EqaaShadow {
 	std::unique_ptr<Image>            image;
 	HostSamplePattern                 pattern;

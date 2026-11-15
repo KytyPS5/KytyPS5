@@ -147,6 +147,11 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	return image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                            : vk::ImageAspectFlags {vk::ImageAspectFlagBits::eColor};
 }
+
+// The samples a plan's target stores: full-rate depth keeps the pass's, every other one sample.
+[[nodiscard]] uint32_t EqaaOwnerSamples(const Image& owner, const EqaaPlan& plan) {
+	return plan.full_depth && owner.info.IsDepth() ? plan.host_samples : 1u;
+}
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1235,7 +1240,8 @@ void TextureCache::RefreshImage(ImageId id, vk::ImageAspectFlags settle) {
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	// An upload replaces its own plane; any other requested aspect is written back first.
-	const auto uploaded = !cpu_dirty ? vk::ImageAspectFlags {}
+	// A multisampled image takes no upload, so its shadow settles in full.
+	const auto uploaded = !cpu_dirty || image.info.samples > 1 ? vk::ImageAspectFlags {}
 	                      : image.depth_id
 	                          ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
 	                          : EqaaAllAspects & ~vk::ImageAspectFlagBits::eStencil;
@@ -1619,13 +1625,15 @@ void TextureCache::FreeBcAliases(Image& image) {
 	}
 }
 
-bool TextureCache::EqaaShadowSupported(ImageId id, uint32_t samples) {
+bool TextureCache::EqaaShadowSupported(ImageId id, const EqaaPlan& plan) {
 	std::scoped_lock lock {m_lock};
-	const auto&      owner  = m_slot_images[id];
-	const auto&      limits = m_graphics.GetPhysicalDeviceProperties().limits;
-	const auto       count  = vulkan_sample_count(samples);
+	const auto&      owner   = m_slot_images[id];
+	const auto&      limits  = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint32_t   samples = plan.host_samples;
+	const auto       count   = vulkan_sample_count(samples);
 	if (count == vk::SampleCountFlagBits {} || owner.backing.image == nullptr ||
-	    owner.backing.samples != 1 || owner.backing.image_type != vk::ImageType::e2D) {
+	    owner.backing.samples != EqaaOwnerSamples(owner, plan) ||
+	    owner.backing.image_type != vk::ImageType::e2D) {
 		return false;
 	}
 	const bool depth = owner.info.IsDepth();
@@ -1685,7 +1693,8 @@ vk::ImageView TextureCache::AcquireEqaaShadow(ImageId id, const ImageDesc& desc,
 	const auto&      view    = desc.view_info;
 	const auto       aspects = OwnerAspects(image);
 	EXIT_IF(plan.mode != EqaaMode::AnchorShadow || plan.pattern.count != plan.host_samples ||
-	        view.level_count != 1 || image.backing.samples != 1 || !image.registered);
+	        view.level_count != 1 || image.backing.samples != EqaaOwnerSamples(image, plan) ||
+	        !image.registered);
 	if (image.eqaa != nullptr &&
 	    (image.eqaa->pattern != plan.pattern || image.eqaa->mip != view.base_level ||
 	     image.eqaa->base_layer != view.base_layer || image.eqaa->layers != view.layer_count ||
@@ -1786,7 +1795,10 @@ void TextureCache::ExpandEqaa(Image& image, vk::ImageAspectFlags aspects) {
 	image.eqaa_settling = true;
 	m_blit_helper.EqaaExpand(image, shadow, aspects);
 	image.eqaa_settling = false;
-	shadow.samples_equal |= aspects;
+	// An owner that stores every sample hands over samples that may differ.
+	if (image.backing.samples == 1) {
+		shadow.samples_equal |= aspects;
+	}
 }
 
 void TextureCache::DropShadow(Image& image) {

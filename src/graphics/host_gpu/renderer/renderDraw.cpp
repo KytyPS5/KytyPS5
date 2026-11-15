@@ -863,6 +863,30 @@ static void DisableEqaaShadow(DrawTargets& targets, EqaaFallbackReason reason) {
 	targets.depth.attachment_samples = 0;
 }
 
+// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
+// keep those matching the raster count instead of resolving multisampled shadows.
+static void DropMixedSampleTargets(DrawTargets& targets, uint32_t raster) {
+	const auto colors       = std::span {targets.colors, targets.color_count};
+	const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
+	                                                 : targets.colors[0].desc.info.samples;
+	if (std::ranges::none_of(colors, [&](const RenderColorInfo& color) {
+		    return color.desc.info.samples != pass_samples;
+	    })) {
+		return;
+	}
+	const auto dropped = std::ranges::remove_if(
+	    colors, [&](const RenderColorInfo& color) { return color.desc.info.samples != raster; });
+	targets.color_count -= static_cast<uint32_t>(dropped.size());
+	if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
+		targets.depth = {};
+	}
+	static std::atomic_bool logged = false;
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(
+		    "Warning: dropping attachments whose sample count differs from the raster.\n");
+	}
+}
+
 // Buffer, image or GDS writes of a draw's pixel stage.
 static bool PixelStageWritesMemory(const ShaderStageRuntime& stage) {
 	const auto& info = stage.module->info.info;
@@ -920,9 +944,9 @@ void RenderExecutor::PlanDrawEqaa(CommandBuffer& buffer, const DrawRenderState& 
 		auto&      cache   = m_context.GetTextureCache();
 		const auto samples = targets.eqaa.host_samples;
 		bool       ok      = !targets.depth.image_id ||
-		                     cache.EqaaShadowSupported(targets.depth.image_id, samples);
+		                     cache.EqaaShadowSupported(targets.depth.image_id, targets.eqaa);
 		for (uint32_t i = 0; i < targets.color_count; i++) {
-			ok = ok && cache.EqaaShadowSupported(targets.colors[i].image_id, samples);
+			ok = ok && cache.EqaaShadowSupported(targets.colors[i].image_id, targets.eqaa);
 			targets.colors[i].attachment_samples = samples;
 		}
 		targets.depth.attachment_samples = targets.depth.image_id ? samples : 0u;
@@ -967,29 +991,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	ResolveRenderDepthTarget(buffer, targets.depth);
 	PlanDrawEqaa(buffer, state);
-	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
-	// keep those matching the raster count instead of resolving multisampled shadows.
-	const auto colors       = std::span {targets.colors, targets.color_count};
-	const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
-	                                                 : targets.colors[0].desc.info.samples;
-	if (targets.eqaa.mode != EqaaMode::AnchorShadow &&
-	    std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
-		    return color.desc.info.samples != pass_samples;
-	    })) {
-		const auto raster =
-		    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
-		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
-			return color.desc.info.samples != raster;
-		});
-		targets.color_count -= static_cast<uint32_t>(dropped.size());
-		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
-			targets.depth = {};
-		}
-		static std::atomic_bool logged = false;
-		if (!logged.exchange(true, std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog(
-			    "Warning: dropping attachments whose sample count differs from the raster.\n");
-		}
+	if (targets.eqaa.mode != EqaaMode::AnchorShadow) {
+		DropMixedSampleTargets(
+		    targets, render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples));
 	}
 
 	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
@@ -1263,6 +1267,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		    });
 	    })) {
 		DisableEqaaShadow(m_targets, EqaaFallbackReason::TargetSampled);
+		// Without their shadows, one-sample colour targets share no count with full-rate depth.
+		DropMixedSampleTargets(
+		    m_targets, render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples));
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;

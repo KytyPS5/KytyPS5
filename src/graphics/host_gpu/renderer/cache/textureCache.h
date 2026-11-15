@@ -65,8 +65,8 @@ public:
 	                                             bool eqaa = false);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
 	                                            bool eqaa = false);
-	// Whether a target of this view can carry an EQAA shadow of `samples` samples.
-	[[nodiscard]] bool EqaaShadowSupported(ImageId id, uint32_t samples);
+	// Whether the plan's shadow can stand in for this target.
+	[[nodiscard]] bool EqaaShadowSupported(ImageId id, const EqaaPlan& plan);
 	// The shadow view an AnchorShadow pass draws through.
 	[[nodiscard]] vk::ImageView AcquireEqaaShadow(ImageId id, const ImageDesc& desc,
 	                                              const EqaaPlan& plan, vk::ImageAspectFlags writes,

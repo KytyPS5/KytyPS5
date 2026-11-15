@@ -13,6 +13,7 @@ namespace Libs::Graphics {
 
 class CommandScheduler;
 class Image;
+struct BlitHelperTestAccess;
 struct EqaaShadow;
 struct GraphicContext;
 
@@ -27,9 +28,11 @@ public:
 
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
 
-	// Copies each pixel's anchor sample of `aspects` from the shadow into its owner's view.
+	// Copies each pixel's anchor sample of `aspects` from the shadow into its owner's view, or
+	// every sample into an owner that stores them all.
 	void EqaaSelect(Image& owner, EqaaShadow& shadow, vk::ImageAspectFlags aspects);
-	// Writes the owner's view of `aspects` into every sample of the shadow.
+	// Writes the owner's view of `aspects` into every sample of the shadow, sample for sample
+	// from an owner that stores them all.
 	void EqaaExpand(Image& owner, EqaaShadow& shadow, vk::ImageAspectFlags aspects);
 	[[nodiscard]] static vk::Format EqaaColorFormat(vk::Format format);
 	// Packed unsigned floats have no UINT view, but every texel they encode is exact in fp32.
@@ -38,6 +41,8 @@ public:
 	}
 
 private:
+	friend struct BlitHelperTestAccess;
+
 	enum class EqaaKind : uint8_t {
 		ColorSelect,
 		ColorExpand,
@@ -62,6 +67,10 @@ private:
 	void RecordEqaaLayer(Image& source, uint32_t source_level, uint32_t source_layer, Image& target,
 	                     uint32_t target_level, uint32_t target_layer, vk::ImageAspectFlags aspects,
 	                     bool select, uint16_t anchor_select);
+	// Copies every sample of `layers` layers between two images of one sample count.
+	void CopyEqaaSamples(Image& source, uint32_t source_level, uint32_t source_layer, Image& target,
+	                     uint32_t target_level, uint32_t target_layer, uint32_t layers,
+	                     vk::ImageAspectFlags aspects);
 
 	struct PipelineKey {
 		uint32_t   samples = 1;

@@ -335,6 +335,15 @@ struct ImageTestAccess {
   }
 };
 
+struct BlitHelperTestAccess {
+  // Writes sample `sample` of each source pixel's `aspect` into a single-sample image.
+  static void SelectSample(BlitHelper &blit, Image &source, Image &target,
+                           vk::ImageAspectFlags aspect, uint32_t sample) {
+    blit.RecordEqaaLayer(source, 0, 0, target, 0, 0, aspect, true,
+                         static_cast<uint16_t>(sample * 0x1111u));
+  }
+};
+
 struct TileManagerTestAccess {
   static uint32_t ConversionRows(uint64_t offset, uint64_t row_stride,
                                  uint64_t active, uint32_t remaining,
@@ -561,6 +570,7 @@ struct TextureCacheTestAccess {
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
+  static BlitHelper &Blit(TextureCache &cache) { return cache.m_blit_helper; }
 };
 
 struct RenderExecutorTestAccess {
@@ -14956,6 +14966,15 @@ public:
       image = resolved.get();
       layer = mip = 0;
     }
+    return ReadImageTexel(name, scheduler, *image, offset, extent, layer, mip);
+  }
+
+  // The texels of a single-sample image.
+  std::vector<u32> ReadImageTexel(const char *name, CommandScheduler &scheduler,
+                                  Libs::Graphics::Image &source, vk::Offset3D offset = {},
+                                  vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0,
+                                  uint32_t mip = 0) {
+    auto *image = &source;
     const auto bytes = image->info.bytes_per_block * extent.width *
                        extent.height * extent.depth;
     auto probe = CreateHostBuffer(name, bytes,
@@ -24016,6 +24035,242 @@ public:
       }
       registers.SetColorAttrib(0, {});
       registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+    }
+
+    // Death Stranding 2's water pre-pass: 4 raster samples on a regular grid, one stored colour
+    // fragment under FMASK, and a depth target that keeps all four samples.
+    if (m_runtime_context.sample_location_counts & vk::SampleCountFlagBits::e4) {
+      HW::AaConfig grid_aa = aa;
+      grid_aa.msaa_num_samples = 2;
+      grid_aa.msaa_exposed_samples = 2;
+      registers.SetAaConfig(grid_aa);
+      // Sample s sits at (0.25 + 0.5 * (s & 1), 0.25 + 0.5 * (s >> 1)) of its pixel.
+      HW::AaSampleControl grid{};
+      for (uint32_t quad = 0; quad < 4; quad++) {
+        grid.locations[quad * 4] = 0x444cc4ccu;
+      }
+      registers.SetAaSampleControl(grid);
+      registers.SetEqaaControl({.max_anchor_samples = 2});
+      registers.SetColorAttrib(0, {.num_samples = 2, .num_fragments = 0});
+      HW::DepthRenderTarget full{};
+      full.z_info.format = Prospero::DepthFormat::kZ32F;
+      full.z_info.num_samples = 2;
+      full.stencil_info.format = Prospero::StencilFormat::kInvalid;
+      full.size = {static_cast<uint16_t>(width - 1), static_cast<uint16_t>(height - 1), true};
+      full.z_read_base_addr = full.z_write_base_addr = base + 0x180000;
+      registers.SetDepthRenderTarget(full);
+      constexpr uint64_t color_base = base + 0x1c0000;
+      const auto greater = static_cast<uint8_t>(vk::CompareOp::eGreater);
+      const auto everywhere = [&](float z) {
+        return vertex_shader({-3.0f, 5.0f, -3.0f}, {-1.0f, -1.0f, 7.0f}, {z, z, z});
+      };
+      // The rows above a horizontal edge.
+      const auto above = [&](float pixels, float z) {
+        const float y = pixels / (height / 2.0f) - 1.0f;
+        return vertex_shader({-1.0f, 7.0f, -1.0f}, {y, y, -3.0f}, {z, z, z});
+      };
+      const auto three = pixel_shader(3.0f);
+      const auto four = pixel_shader(4.0f);
+      const auto five = pixel_shader(5.0f);
+      const u32 f3 = literal(3.0f);
+      const u32 f4 = literal(4.0f);
+      const u32 f5 = literal(5.0f);
+
+      // The first draw clears depth: the fresh shadow takes the clear, not its owner's contents.
+      registers.SetDepthControl({.z_enable = true, .z_write_enable = true, .zfunc = greater});
+      registers.SetRenderControl({.depth_clear_enable = true});
+      registers.SetDepthClearValue(0.0f);
+      draw(color_base, nothing, one);
+      registers.SetRenderControl({});
+      const auto color = color_id(color_base);
+      RenderDepthInfo depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      {
+        const auto &color_image = cache.GetImage(color.image_id);
+        const auto &depth_image = cache.GetImage(depth.image_id);
+        Require(name, "full-depth shadows",
+                color_image.backing.samples == 1 && color_image.eqaa != nullptr &&
+                    color_image.eqaa->image->backing.samples == 4 &&
+                    color_image.eqaa->anchor_select == 0x0000 &&
+                    depth_image.backing.samples == 4 && depth_image.eqaa != nullptr &&
+                    depth_image.eqaa->image->backing.samples == 4 &&
+                    depth_image.eqaa->pattern.count == 4 &&
+                    depth_image.eqaa->pattern.xy[0] == 0x44 &&
+                    depth_image.eqaa->pattern.xy[1] == 0x4c &&
+                    depth_image.eqaa->pattern.xy[2] == 0xc4 &&
+                    depth_image.eqaa->pattern.xy[3] == 0xcc &&
+                    color_image.eqaa->pattern == depth_image.eqaa->pattern,
+                "the pass did not render into 4x shadows of its one-sample colour target and "
+                "its four-sample depth target");
+      }
+      // One sample of every pixel of the depth target, fetched as its guest reader fetches it.
+      const auto read_depth = [&](uint32_t sample) {
+        cache.UpdateImage(depth.image_id);
+        auto &source = cache.GetImage(depth.image_id);
+        auto info = source.info;
+        info.data = {};
+        info.metadata = {};
+        info.samples = 1;
+        Libs::Graphics::Image single(m_runtime_context, scheduler, info);
+        BlitHelperTestAccess::SelectSample(TextureCacheTestAccess::Blit(cache), source, single,
+                                           vk::ImageAspectFlagBits::eDepth, sample);
+        return ReadImageTexel(name, scheduler, single, {}, {width, height, 1});
+      };
+      using Planes = std::array<std::vector<u32>, 4>;
+      const auto read_samples = [&] {
+        return Planes{read_depth(0), read_depth(1), read_depth(2), read_depth(3)};
+      };
+      const auto value = [&](const Planes &planes, uint32_t x, uint32_t y, uint32_t sample) {
+        return std::bit_cast<float>(planes[sample][y * width + x]);
+      };
+      const auto expect_color = [&](const char *label, const std::vector<u32> &pixels,
+                                    const auto &expected) {
+        for (uint32_t y = 0; y < height; y++) {
+          for (uint32_t x = 8; x < 13; x++) {
+            if (at(pixels, x, y) != expected(x, y)) {
+              std::fprintf(stderr, "%s: (%u, %u) = %08x, expected %08x\n", label, x, y,
+                           at(pixels, x, y), expected(x, y));
+              Require(name, label, false, "the stored fragment is not the one at sample 0");
+            }
+          }
+        }
+      };
+      const auto expect_depth = [&](const char *label, const Planes &planes,
+                                    const auto &expected) {
+        for (uint32_t y = 0; y < height; y++) {
+          for (uint32_t x = 8; x < 13; x++) {
+            for (uint32_t sample = 0; sample < 4; sample++) {
+              const float stored = value(planes, x, y, sample);
+              const float wanted = expected(x, y, sample);
+              if (!(std::abs(stored - wanted) < 1e-6f)) {
+                std::fprintf(stderr, "%s: (%u, %u) sample %u = %f, expected %f\n", label, x, y,
+                             sample, stored, wanted);
+                Require(name, label, false,
+                        "a depth sample was not rendered at its guest location or not stored "
+                        "under its guest index");
+              }
+            }
+          }
+        }
+      };
+
+      // Column 10's samples 0 and 2 sit at 10.25 px, samples 1 and 3 at 10.75 px; the standard
+      // locations would leave sample 0 at 10.375 px, right of the edge.
+      draw(color_base, everywhere(0.3f), one);
+      draw(color_base, left_of(10.3f, 0.6f), two);
+      draw(color_base, everywhere(0.5f), three);
+      {
+        const auto &depth_image = cache.GetImage(depth.image_id);
+        Require(name, "full-depth dirty after the pass",
+                (depth_image.eqaa->dirty & vk::ImageAspectFlagBits::eDepth) &&
+                    (cache.GetImage(color.image_id).eqaa->dirty & vk::ImageAspectFlagBits::eColor),
+                "the pass did not leave its newest colour and depth in the shadows");
+      }
+      expect_color("nearer fragment at sample 0", read_red(color.image_id),
+                   [&](uint32_t x, uint32_t) { return x <= 10 ? f2 : f3; });
+      float d_left = 0.0f;
+      float d_fill = 0.0f;
+      {
+        const auto planes = read_samples();
+        d_left = value(planes, 2, 6, 0);
+        d_fill = value(planes, 20, 6, 0);
+        Require(name, "full-depth test order", d_left > d_fill && d_fill > 0.0f,
+                "the nearer triangle did not win the depth test");
+        expect_depth("per-sample depth test", planes,
+                     [&](uint32_t x, uint32_t, uint32_t sample) {
+                       return x < 10 || (x == 10 && (sample & 1u) == 0) ? d_left : d_fill;
+                     });
+      }
+
+      // Row 3's samples 0 and 1 sit at 3.25 px, samples 2 and 3 at 3.75 px.
+      draw(color_base, above(3.3f, 0.8f), four);
+      expect_color("row coverage at sample 0", read_red(color.image_id),
+                   [&](uint32_t x, uint32_t y) { return y <= 3 ? f4 : x <= 10 ? f2 : f3; });
+      {
+        const auto planes = read_samples();
+        const float d_top = value(planes, 2, 0, 0);
+        Require(name, "full-depth row order", d_top > d_left,
+                "the nearest triangle did not win the depth test");
+        expect_depth("samples in guest order", planes,
+                     [&](uint32_t x, uint32_t y, uint32_t sample) {
+                       if (y < 3 || (y == 3 && sample < 2)) {
+                         return d_top;
+                       }
+                       return x < 10 || (x == 10 && (sample & 1u) == 0) ? d_left : d_fill;
+                     });
+      }
+
+      // A full clear reaches the owner and its shadow; coverage without sample 0 then stores
+      // depth and no colour.
+      vk::ClearValue reset{};
+      reset.depthStencil = vk::ClearDepthStencilValue{0.25f, 0};
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+                                         {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, reset);
+      {
+        const auto &depth_image = cache.GetImage(depth.image_id);
+        Require(name, "mirrored depth clear",
+                (depth_image.eqaa->samples_equal & vk::ImageAspectFlagBits::eDepth) &&
+                    depth_image.eqaa->synced == depth_image.content_stamp,
+                "a full clear did not leave the depth shadow equal to its owner");
+      }
+      draw(color_base, right_of(10.6f, 0.9f), five);
+      {
+        // The guest reads the depth target as a multisampled R32F texture. A multisampled image
+        // takes no upload, so a guest write under it does not hold its shadow back.
+        auto &depth_image = cache.GetImage(depth.image_id);
+        Require(name, "full-depth dirty after the clear",
+                static_cast<bool>(depth_image.eqaa->dirty & vk::ImageAspectFlagBits::eDepth),
+                "the pass did not leave its newest depth in the shadow");
+        depth_image.MarkCpuDirty();
+        auto sampled = depth.desc;
+        sampled.type = BindingType::Texture;
+        sampled.view_info.format = vk::Format::eR32Sfloat;
+        sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        Require(name, "sampled full-rate depth settles",
+                cache.FindTexture(depth.image_id, sampled) &&
+                    !(depth_image.eqaa->dirty & vk::ImageAspectFlagBits::eDepth),
+                "sampling the four-sample depth target left its shadow unsettled");
+      }
+      expect_color("coverage without sample 0", read_red(color.image_id),
+                   [&](uint32_t x, uint32_t y) { return x >= 11 ? f5 : y <= 3 ? f4 : f2; });
+      {
+        const auto planes = read_samples();
+        const float d_right = value(planes, 20, 6, 0);
+        Require(name, "full-depth clear order", d_right > 0.25f,
+                "the triangle did not pass the depth test against the clear");
+        expect_depth("mirrored clear under partial coverage", planes,
+                     [&](uint32_t x, uint32_t, uint32_t sample) {
+                       return x > 10 || (x == 10 && (sample & 1u) != 0) ? d_right : 0.25f;
+                     });
+      }
+
+      // Depth is interpolated at each sample's guest location: along x, samples 1 and 3 are
+      // half a pixel right of samples 0 and 2.
+      registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                                 .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+      draw(color_base, ramp, one);
+      {
+        const auto planes = read_samples();
+        const auto d = [&](uint32_t sample, uint32_t x) {
+          return static_cast<double>(value(planes, x, 1, sample));
+        };
+        for (uint32_t x = 1; x + 2 < width; x++) {
+          const double slope = d(0, x + 1) - d(0, x);
+          Require(name, "per-sample depth locations",
+                  slope > 0.0 && std::abs(d(1, x) - d(0, x) - 0.5 * slope) < 1e-6 &&
+                      std::abs(d(2, x) - d(0, x)) < 1e-6 && std::abs(d(3, x) - d(1, x)) < 1e-6,
+                  "stored depth is not interpolated at the guest's sample locations");
+        }
+      }
+      registers.SetDepthRenderTarget({});
+      registers.SetDepthControl({});
+      registers.SetEqaaControl({});
+      registers.SetColorAttrib(0, {});
+      registers.SetAaConfig(aa);
+    } else {
+      std::printf("[host]    %-32s SKIP (no 4x custom sample locations)\n", "EqaaFullDepth");
     }
 
     // The pipeline key carries the host sample locations.

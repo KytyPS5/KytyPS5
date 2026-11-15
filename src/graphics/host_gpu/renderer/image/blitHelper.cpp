@@ -493,8 +493,33 @@ void BlitHelper::RecordEqaaLayer(Image& source, uint32_t source_level, uint32_t 
 	m_scheduler.GetDynamicState().Invalidate();
 }
 
+void BlitHelper::CopyEqaaSamples(Image& source, uint32_t source_level, uint32_t source_layer,
+                                 Image& target, uint32_t target_level, uint32_t target_layer,
+                                 uint32_t layers, vk::ImageAspectFlags aspects) {
+	EXIT_IF(source.backing.samples != target.backing.samples ||
+	        source.backing.format != target.backing.format);
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               ImageSubresourceRange {source_level, 1, source_layer, layers}, command);
+	target.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	               ImageSubresourceRange {target_level, 1, target_layer, layers}, command);
+	vk::ImageCopy region {};
+	region.srcSubresource = {aspects, source_level, source_layer, layers};
+	region.dstSubresource = {aspects, target_level, target_layer, layers};
+	region.extent = vk::Extent3D {std::max(target.backing.extent.width >> target_level, 1u),
+	                              std::max(target.backing.extent.height >> target_level, 1u), 1};
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                  target.backing.image, vk::ImageLayout::eTransferDstOptimal, region);
+}
+
 void BlitHelper::EqaaSelect(Image& owner, EqaaShadow& shadow, vk::ImageAspectFlags aspects) {
-	EXIT_IF(shadow.image == nullptr || owner.backing.samples != 1);
+	EXIT_IF(shadow.image == nullptr);
+	if (owner.backing.samples != 1) {
+		CopyEqaaSamples(*shadow.image, 0, 0, owner, shadow.mip, shadow.base_layer, shadow.layers,
+		                aspects);
+		return;
+	}
 	for (uint32_t layer = 0; layer < shadow.layers; layer++) {
 		RecordEqaaLayer(*shadow.image, 0, layer, owner, shadow.mip, shadow.base_layer + layer,
 		                aspects, true, shadow.anchor_select);
@@ -502,7 +527,12 @@ void BlitHelper::EqaaSelect(Image& owner, EqaaShadow& shadow, vk::ImageAspectFla
 }
 
 void BlitHelper::EqaaExpand(Image& owner, EqaaShadow& shadow, vk::ImageAspectFlags aspects) {
-	EXIT_IF(shadow.image == nullptr || owner.backing.samples != 1);
+	EXIT_IF(shadow.image == nullptr);
+	if (owner.backing.samples != 1) {
+		CopyEqaaSamples(owner, shadow.mip, shadow.base_layer, *shadow.image, 0, 0, shadow.layers,
+		                aspects);
+		return;
+	}
 	for (uint32_t layer = 0; layer < shadow.layers; layer++) {
 		RecordEqaaLayer(owner, shadow.mip, shadow.base_layer + layer, *shadow.image, 0, layer,
 		                aspects, false, 0);

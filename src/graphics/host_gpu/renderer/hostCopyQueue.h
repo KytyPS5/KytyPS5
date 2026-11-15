@@ -78,6 +78,14 @@ public:
 		m_ring_users[m_ring_chunk] = m_queued + m_pending.count + 1;
 		Queue(destination, staged, size);
 	}
+	// Producer: queues call(context, a, b) on the copy thread, in order with the copies (KYTY_ASYNC_REPROTECT: a page
+	// protection ahead of the copies of the pages).
+	void Call(void (*call)(void*, uint64_t, uint64_t), void* context, uint64_t a, uint64_t b) {
+		m_pending.jobs[m_pending.count++] = {reinterpret_cast<void*>(a), context, static_cast<size_t>(b), call};
+		if (m_pending.count == BatchSize) {
+			(void)Flush();
+		}
+	}
 	// Producer: hands the gathered copies to the copy thread; returns the number of copies
 	// queued so far.
 	uint64_t Flush() {
@@ -126,6 +134,8 @@ private:
 		void*       destination = nullptr;
 		const void* source      = nullptr;
 		size_t      size        = 0;
+		// A call instead of a copy (Call()): call(source as the context, destination, size).
+		void (*call)(void*, uint64_t, uint64_t) = nullptr;
 	};
 	struct Batch {
 		std::array<Job, BatchSize> jobs {};
@@ -146,7 +156,11 @@ private:
 			}
 			for (size_t i = 0; i < batch->count; i++) {
 				const auto& job = batch->jobs[i];
-				std::memcpy(job.destination, job.source, job.size);
+				if (job.call != nullptr) [[unlikely]] {
+					job.call(const_cast<void*>(job.source), reinterpret_cast<uint64_t>(job.destination), job.size);
+				} else {
+					std::memcpy(job.destination, job.source, job.size);
+				}
 			}
 			done += batch->count;
 			// The destinations are write-combined: their stores (and the non-temporal ones a large

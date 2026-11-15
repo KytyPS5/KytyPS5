@@ -59,6 +59,9 @@ constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
 // The page tracking's lock: waiters sleep instead of spinning on a preempted holder.
 using SpinGuard = std::lock_guard<TrackingSpinLock>;
 
+// KYTY_ASYNC_REPROTECT (PageManager::SetDeferredWriteProtectSink).
+thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
+
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
@@ -196,7 +199,11 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				if (track && !is_read && g_deferred_write_protect != nullptr) {
+					g_deferred_write_protect->push_back({base_addr + range_begin * PAGE_SIZE, range_bytes});
+				} else {
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -275,6 +282,39 @@ struct PageManager::Impl {
 		for (auto g = vaddr / READ_GRANULE_SIZE; g <= last_byte / READ_GRANULE_SIZE; ++g)
 			if (((read_granules[g / 64].load(std::memory_order_acquire) >> (g % 64)) & 1u) != 0) return true;
 		return false;
+	}
+
+	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
+		ValidateRange(vaddr, size);
+		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			if (auto* region = FindRegion(chunk_begin); region != nullptr) {
+				SpinGuard  lock(region->lock);
+				const auto first     = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last      = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				size_t     run_begin = first;
+				auto       run_perms = Common::VirtualMemory::Mode::ReadWrite;
+				bool       in_run    = false;
+				for (size_t page_index = first; page_index <= last; page_index++) {
+					const bool watched = page_index < last && (region->pages[page_index].write_watchers != 0 ||
+					                                           region->pages[page_index].access_watchers != 0);
+					const auto perms   = watched ? region->pages[page_index].Perms() : run_perms;
+					if (in_run && (!watched || perms != run_perms)) {
+						Protect(region_base + run_begin * PAGE_SIZE, (page_index - run_begin) * PAGE_SIZE, run_perms);
+						in_run = false;
+					}
+					if (watched && !in_run) {
+						run_begin = page_index;
+						run_perms = perms;
+						in_run    = true;
+					}
+				}
+			}
+			chunk_begin = chunk_end;
+		}
 	}
 
 	template <bool track, bool is_read>
@@ -373,6 +413,14 @@ bool PageManager::AllowExecute(uint64_t vaddr) {
 	return Libs::LibKernel::Memory::ProtectGuestHostMemory(
 	    Common::AlignDown(vaddr, PAGE_SIZE), PAGE_SIZE,
 	    static_cast<Mode>(static_cast<uint32_t>(perms) | static_cast<uint32_t>(Mode::Execute)));
+}
+
+void PageManager::SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept {
+	g_deferred_write_protect = sink;
+}
+
+void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
+	m_impl->ReapplyProtection(vaddr, size);
 }
 
 template <bool track, bool is_read>

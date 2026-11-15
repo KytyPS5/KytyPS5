@@ -11,7 +11,9 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <cstdlib>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -132,6 +134,12 @@ public:
 		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
 	}
+	// A write protection of pages of the tracker region of `vaddr` is still queued (KYTY_ASYNC_REPROTECT).
+	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const {
+		if (!GuestRange {vaddr, 1}.Valid()) return false;
+		const auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr && manager->DeferredProtectionPending();
+	}
 	// The emulator wrote guest memory itself (any thread): the epochs of the regions it touches move.
 	void NoteHostWrite(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || !GuestRange {vaddr, size}.Valid()) return;
@@ -244,6 +252,7 @@ public:
 	                        UploadFunc&& upload_func, uint32_t device_sync = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		const bool defer = !is_written && DeferProtections();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			// A read-only use of a region without CPU-dirty pages has nothing to upload (a CPU
 			// write racing with this check is one that lands after the synchronization); nor has
@@ -255,6 +264,7 @@ public:
 			if (!is_written && device_sync != 0) {
 				const std::pair<uint64_t, uint64_t> range {offset, bytes};
 				std::scoped_lock                    lock(manager->lock);
+				DeferScope deferred(defer, manager);
 				if (manager->ConsumeCpuDirtyRangesKeepingBusy(
 				        std::span(&range, 1), device_sync,
 				        [&](size_t, uint64_t address, uint64_t run) noexcept { range_func(address, run); })) {
@@ -263,12 +273,16 @@ public:
 				return;
 			}
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+			{
+				DeferScope deferred(defer, manager);
+				manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+			}
 			if (!is_written) {
 				manager->lock.unlock();
 			}
 		});
 		upload_func();
+		ApplyDeferredProtections();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -287,6 +301,7 @@ public:
 	                         uint32_t device_sync = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, size_t, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		const bool defer = DeferProtections();
 		struct Piece {
 			uint64_t region;
 			uint64_t offset;
@@ -318,6 +333,7 @@ public:
 					offsets.emplace_back(pieces[piece].offset, pieces[piece].size);
 				}
 				std::scoped_lock lock(manager->lock);
+				DeferScope       deferred(defer, manager);
 				const auto piece_func = [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
 					range_func(pieces[first + piece].range, address, bytes);
 				};
@@ -332,10 +348,64 @@ public:
 			first = last;
 		}
 		upload_func();
+		ApplyDeferredProtections();
+	}
+
+	// KYTY_ASYNC_REPROTECT (chenxiao07's; 0 turns it off). The write protection of the pages an upload marks clean is
+	// the copy's to apply, ahead of the copy (BufferCache::UploadCopies hands both to the host copy thread, which reads
+	// the backing store): a guest write before it lands in the copy, a write after it faults as before. Until it is
+	// applied the region proves nothing (RegionManager::CpuModificationEpoch is 0); applied, it moves that epoch. Only
+	// while the caller's upload function takes them (UploadScope): any left are applied when it returns.
+	struct DeferredProtect {
+		RegionManager* manager = nullptr;
+		uint64_t       address = 0, size = 0;
+	};
+	struct UploadScope {
+		bool previous;
+		UploadScope() noexcept: previous(std::exchange(s_upload_takes_protections, true)) {}
+		~UploadScope() { s_upload_takes_protections = previous; }
+		UploadScope(const UploadScope&)            = delete;
+		UploadScope& operator=(const UploadScope&) = delete;
+	};
+	// The upload function takes the protections to apply ahead of its copies (and applies or queues each of them).
+	[[nodiscard]] static std::vector<DeferredProtect>& DeferredProtects() noexcept { return s_deferred; }
+	[[nodiscard]] static bool AsyncReprotect() noexcept {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_ASYNC_REPROTECT");
+			return value == nullptr || value[0] != '0';
+		}();
+		return on;
 	}
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+
+	inline static thread_local bool                         s_upload_takes_protections = false;
+	inline static thread_local std::vector<DeferredProtect> s_deferred;
+	[[nodiscard]] static bool DeferProtections() noexcept { return s_upload_takes_protections && AsyncReprotect(); }
+	// While it lives, the write protections a consumption of CPU-dirty pages of `manager` makes are recorded for the
+	// upload function (under the region's lock).
+	struct DeferScope {
+		RegionManager*                          manager = nullptr;
+		std::vector<PageManager::DeferredRange> ranges;
+		DeferScope(bool defer, RegionManager* region) noexcept: manager(defer ? region : nullptr) {
+			if (manager != nullptr) PageManager::SetDeferredWriteProtectSink(&ranges);
+		}
+		~DeferScope() {
+			if (manager == nullptr) return;
+			PageManager::SetDeferredWriteProtectSink(nullptr);
+			for (const auto& range: ranges) {
+				manager->BeginDeferredProtection();
+				s_deferred.push_back({manager, range.address, range.size});
+			}
+		}
+		DeferScope(const DeferScope&)            = delete;
+		DeferScope& operator=(const DeferScope&) = delete;
+	};
+	static void ApplyDeferredProtections() {
+		for (const auto& deferred: s_deferred) deferred.manager->ApplyDeferredProtection(deferred.address, deferred.size);
+		s_deferred.clear();
+	}
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {

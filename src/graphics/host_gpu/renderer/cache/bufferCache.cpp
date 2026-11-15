@@ -1308,6 +1308,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	const MemoryTracker::UploadScope upload_scope; // (UploadCopies takes the pages' protections)
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -1366,6 +1367,7 @@ void BufferCache::SynchronizeBuffers(std::span<Buffer* const>                   
 	for (size_t index = 0; index < buffers.size(); index++) {
 		m_span_copies[index].clear();
 	}
+	const MemoryTracker::UploadScope upload_scope; // (UploadCopies takes the pages' protections)
 	m_memory_tracker.ForEachUploadRanges(
 	    ranges,
 	    [&](size_t index, uint64_t address, uint64_t bytes) noexcept {
@@ -1409,15 +1411,42 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		const bool in_ring =
 		    hand_over && mapped >= ring.data() && mapped < ring.data() + ring.size();
+		// KYTY_ASYNC_REPROTECT: the pages being copied were marked clean with their write protection deferred. It
+		// precedes every copy: queued ahead of them when all go to the host copy thread, applied here otherwise.
+		if (auto& deferred = MemoryTracker::DeferredProtects(); !deferred.empty()) {
+			bool queued = in_ring;
+			for (const auto& copy: copies) {
+				queued = queued && LibKernel::Memory::FindBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size) != nullptr;
+			}
+			for (const auto& item: deferred) {
+				if (queued) {
+					host_copies->Call(
+					    [](void* manager, uint64_t address, uint64_t size) {
+						    static_cast<RegionManager*>(manager)->ApplyDeferredProtection(address, size);
+					    },
+					    item.manager, item.address, item.size);
+				} else {
+					item.manager->ApplyDeferredProtection(item.address, item.size);
+				}
+			}
+			deferred.clear();
+			if (queued) m_protect_jobs = host_copies->Flush();
+		}
 		for (auto& copy: copies) {
 			const auto  address = buffer.CpuAddress() + copy.dstOffset;
 			const void* backing =
 			    in_ring ? LibKernel::Memory::FindBackingPointer(address, copy.size) : nullptr;
 			if (backing != nullptr) {
 				host_copies->Copy(mapped + copy.srcOffset, backing, copy.size);
-			} else if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
-			                                                copy.size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+			} else {
+				// (A copy made here: the protections an earlier upload of this synchronization queued go first.)
+				if (m_protect_jobs != 0 && host_copies != nullptr) {
+					host_copies->WaitFor(m_protect_jobs);
+					m_protect_jobs = 0;
+				}
+				if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
+					EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				}
 			}
 			copy.srcOffset += base_offset;
 		}

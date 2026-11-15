@@ -105,8 +105,8 @@ public:
 		return region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE ? m_region_registrations[region].load(std::memory_order_acquire)
 		                                                           : 0;
 	}
-	// (This tree applies no write protection later than the upload that asks for it.)
-	[[nodiscard]] bool DeferredProtectionPending(uint64_t) const { return false; }
+	// A write protection of pages of the tracker region of `vaddr` is still queued (KYTY_ASYNC_REPROTECT).
+	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const { return m_memory_tracker.DeferredProtectionPending(vaddr); }
 	// A guest write faulted on a page the cache protects.
 	void                   InvalidateFaultedPage(uint64_t vaddr);
 	// RenderContext::UnmapMemory, after InvalidateMemory: the buffers the unmapped range holds whole go (nothing the guest
@@ -433,6 +433,8 @@ private:
 	// Execution thread: a guest access to bytes a complete snapshot holds is served from it, the whole snapshot with
 	// it; false when a readback in flight covers the pages or the snapshots do not cover them.
 	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
+	// KYTY_ASYNC_REPROTECT: the host copy thread's job count once the last queued page protections are applied.
+	uint64_t m_protect_jobs = 0;
 	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
 	// queue waits for those submissions only, not for the work queued after them.
 	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,

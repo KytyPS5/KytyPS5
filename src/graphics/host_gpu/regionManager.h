@@ -165,8 +165,22 @@ public:
 	// (NoteHostWrite); with the guest's writes to dirty pages, every change of the region's bytes the CPU can see.
 	// (chenxiao07's RegionManager::CpuModificationEpoch.)
 	[[nodiscard]] uint64_t CpuModificationEpoch() const {
+		// Pages marked clean whose write protection is still queued (KYTY_ASYNC_REPROTECT) can change unseen: nothing
+		// is provable until it was applied (and moved the epoch).
+		if (m_deferred_protects.load(std::memory_order_acquire) != 0) return 0;
 		return m_cpu_dirty_epoch.load(std::memory_order_acquire) + m_gpu_clean_epoch.load(std::memory_order_acquire) +
 		       m_host_write_epoch.load(std::memory_order_acquire);
+	}
+	// KYTY_ASYNC_REPROTECT: a write protection of pages of this region is queued (MemoryTracker::ForEachUploadRange).
+	void BeginDeferredProtection() noexcept { m_deferred_protects.fetch_add(1, std::memory_order_acq_rel); }
+	[[nodiscard]] bool DeferredProtectionPending() const noexcept {
+		return m_deferred_protects.load(std::memory_order_acquire) != 0;
+	}
+	// The host copy thread (or the execution thread, when the copies are its own) applies it.
+	void ApplyDeferredProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ReapplyProtection(vaddr, size);
+		m_host_write_epoch.fetch_add(1, std::memory_order_acq_rel);
+		m_deferred_protects.fetch_sub(1, std::memory_order_acq_rel);
 	}
 	// The emulator wrote CPU-dirty pages of the region (their state stays).
 	void NoteHostWrite() noexcept { m_host_write_epoch.fetch_add(1, std::memory_order_release); }
@@ -477,6 +491,7 @@ private:
 	std::unique_ptr<BusyPages> m_busy;
 	std::atomic<uint32_t>      m_kept_sync {0};
 	std::atomic<uint64_t> m_host_write_epoch {0};
+	std::atomic<uint32_t> m_deferred_protects {0}; // (KYTY_ASYNC_REPROTECT)
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 	inline static std::atomic<uint64_t> s_gpu_clean_epoch {0};

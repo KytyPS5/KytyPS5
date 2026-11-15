@@ -2017,7 +2017,8 @@ bool ReadCodeRecord(const CodeRecord& record, const uint8_t* compressed, std::ve
 
 // A shader binary ends with a 0x30-byte footer (shader.cpp, ShaderProgramSize()): its magic, a
 // version and the sizes of the code, of the literal buffer after it and of the section between
-// those and the footer. Calls `found` with the program (what ShaderMapUserData() hashes) of every
+// those and the footer, which begins 16 bytes aligned (a program whose literal buffer leaves it
+// unaligned is padded). Calls `found` with the program (what ShaderMapUserData() hashes) of every
 // footer in `data` whose program lies in it; returns how many.
 template <typename Found>
 uint32_t FindShaderPrograms(std::span<const uint8_t> data, Found&& found) {
@@ -2032,7 +2033,7 @@ uint32_t FindShaderPrograms(std::span<const uint8_t> data, Found&& found) {
 		std::array<uint32_t, 8> footer {};
 		std::memcpy(footer.data(), data.data() + at, sizeof(footer));
 		const auto program = Common::AlignUp(uint64_t {footer[5]}, 16) + footer[6];
-		const auto before  = program + Common::AlignUp(uint64_t {footer[7]}, 16);
+		const auto before  = Common::AlignUp(program, 16) + Common::AlignUp(uint64_t {footer[7]}, 16);
 		if (footer[4] != 1 || footer[5] == 0 || program % 4 != 0 || before > at) {
 			continue;
 		}

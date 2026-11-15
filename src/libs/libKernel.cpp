@@ -1818,6 +1818,107 @@ LIB_DEFINE(InitLibKernelWriteThrottling) {
 
 } // namespace LibKernelWriteThrottling
 
+namespace LibKernelModuleInfo {
+
+LIB_VERSION("libkernel_module_info", 1, "libkernel", 1, 1);
+
+// PS5 module info layout (352 bytes), cross-checked against AnyPS5's SceTypes.hpp.
+struct ModuleInfo2 {
+	uint64_t st_size;
+	char     name[256];
+	struct {
+		uint64_t address;
+		uint32_t size;
+		int32_t  prot;
+	} segments[4];
+	uint32_t segment_count;
+	uint8_t  fingerprint[20];
+};
+
+// Module enumeration for crash-report tooling. EA titles call it at startup
+// (UFC 6, PPSA23566; Madden NFL 26, PPSA26127). Signature follows
+// sceKernelGetModuleList2/sceKernelGetModuleInfo2 as implemented by shadPS4 and AnyPS5.
+static int KYTY_SYSV_ABI KernelGetModuleList2(int32_t* handles, uint64_t num_array,
+                                              uint64_t* out_count) {
+	PRINT_NAME();
+
+	if (handles == nullptr || out_count == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	auto*             rt    = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto        ids   = rt->GetProgramIds();
+	const auto        count = static_cast<uint64_t>(ids.size());
+	uint64_t          index = 0;
+	for (; index < count && index < num_array; index++) {
+		handles[index] = ids[index];
+	}
+
+	if (count > num_array) {
+		return LibKernel::KERNEL_ERROR_ENOMEM;
+	}
+
+	*out_count = index;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI KernelGetModuleInfo2(int32_t handle, ModuleInfo2* info) {
+	PRINT_NAME();
+
+	if (info == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (info->st_size != sizeof(ModuleInfo2)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	auto* rt      = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto* program = rt->FindProgramById(handle);
+	if (program == nullptr || program->elf == nullptr) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	const auto* ehdr = program->elf->GetEhdr();
+	const auto* phdr = program->elf->GetPhdr();
+	if (ehdr == nullptr || phdr == nullptr) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	std::memset(info, 0, sizeof(ModuleInfo2));
+	info->st_size = sizeof(ModuleInfo2);
+
+	if (program->dynamic_info != nullptr && program->dynamic_info->so_name != nullptr &&
+	    program->dynamic_info->so_name[0] != '\0') {
+		std::snprintf(info->name, sizeof(info->name), "%s", program->dynamic_info->so_name);
+	} else {
+		auto fallback_name = Common::PathToString(program->file_name.filename());
+		std::snprintf(info->name, sizeof(info->name), "%s", fallback_name.c_str());
+	}
+
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type != Loader::PT_LOAD || phdr[i].p_memsz == 0) {
+			continue;
+		}
+		if (info->segment_count >= std::size(info->segments)) {
+			break;
+		}
+		auto& segment   = info->segments[info->segment_count++];
+		segment.address = program->base_vaddr + phdr[i].p_vaddr;
+		segment.size    = static_cast<uint32_t>(phdr[i].p_memsz);
+		segment.prot    = ((phdr[i].p_flags & 4) != 0 ? 1 : 0) | ((phdr[i].p_flags & 2) != 0 ? 2 : 0) |
+		               ((phdr[i].p_flags & 1) != 0 ? 4 : 0);
+	}
+
+	return OK;
+}
+
+LIB_DEFINE(InitLibKernel_1_ModuleInfo) {
+	LIB_FUNC("QgsKEUfkqMA", KernelGetModuleInfo2);
+	LIB_FUNC("ZzzC3ZGVAkc", KernelGetModuleList2);
+}
+
+} // namespace LibKernelModuleInfo
+
 namespace Posix {
 
 LIB_VERSION("Posix", 1, "libkernel", 1, 1);
@@ -3368,6 +3469,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LibKernelApr::InitLibKernel_1_Apr(s);
 	Posix::InitLibKernel_1_Posix(s);
 	LibKernelWriteThrottling::InitLibKernelWriteThrottling(s);
+	LibKernelModuleInfo::InitLibKernel_1_ModuleInfo(s);
 
 	LIB_OBJECT("f7uOxY9mM1U", &LibKernel::g_stack_chk_guard);
 	LIB_OBJECT("djxxOmW6-aw", &LibKernel::g_progname);

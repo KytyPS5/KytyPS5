@@ -35,6 +35,11 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 	}
 }
 
+uint32_t MeshPrimitiveType(EmitterState& state) {
+	const auto size = state.input_info.vertex->mesh.output_primitive_size;
+	return size == 1u ? TypeU32(state) : TypeU32Vector(state, size);
+}
+
 } // namespace
 
 void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
@@ -81,15 +86,17 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 	state.mesh_allocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2);
 	state.mesh_primitive_data =
 	    MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.lane_count);
-	state.mesh_primitives =
-	    MeshArray(state, spv::StorageClassOutput, TypeU32Vector(state, 3), mesh.max_primitives);
+	state.mesh_primitives = MeshArray(state, spv::StorageClassOutput, MeshPrimitiveType(state),
+	                                  mesh.max_primitives);
 	state.mesh_cull =
 	    MeshArray(state, spv::StorageClassOutput, TypeBool(state), mesh.max_primitives);
 	state.interface_variables.push_back(state.mesh_primitives);
 	state.interface_variables.push_back(state.mesh_cull);
-	state.builder.AddAnnotation(
-	    spv::OpDecorate, state.mesh_primitives, spv::DecorationBuiltIn,
-	    spv::BuiltInPrimitiveTriangleIndicesEXT); // PrimitiveTriangleIndicesEXT
+	constexpr spv::BuiltIn indices[] = {spv::BuiltInPrimitivePointIndicesEXT,
+	                                    spv::BuiltInPrimitiveLineIndicesEXT,
+	                                    spv::BuiltInPrimitiveTriangleIndicesEXT};
+	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_primitives, spv::DecorationBuiltIn,
+	                            indices[mesh.output_primitive_size - 1u]);
 	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_cull, spv::DecorationBuiltIn,
 	                            spv::BuiltInCullPrimitiveEXT); // CullPrimitiveEXT
 	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_cull, spv::DecorationPerPrimitiveEXT);
@@ -182,20 +189,25 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		EmitIfCondition(state, is_primitive, [&] {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, half));
+			const auto size = state.input_info.vertex->mesh.output_primitive_size;
+			const auto type = MeshPrimitiveType(state);
 			uint32_t   vertex[3] {};
-			for (uint32_t component = 0; component < 3; component++) {
+			for (uint32_t component = 0; component < size; component++) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
 				    ConstantU32(state, component * 10u), ConstantU32(state, 9));
 			}
-			const auto triangle = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
-			                          vertex[0], vertex[1], vertex[2]);
-			const auto triangle_pointer =
-			    MeshElement(state, state.mesh_primitives, spv::StorageClassOutput,
-			                TypeU32Vector(state, 3), index);
-			state.builder.AddFunction(spv::OpStore, triangle_pointer, triangle);
+			auto primitive = vertex[0];
+			if (size > 1u) {
+				primitive = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, type, primitive,
+				                          std::span<const uint32_t>(vertex, size));
+			}
+			state.builder.AddFunction(
+			    spv::OpStore,
+			    MeshElement(state, state.mesh_primitives, spv::StorageClassOutput, type, index),
+			    primitive);
 			const auto null_bit =
 			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
 			const auto culled = state.builder.AllocateId();

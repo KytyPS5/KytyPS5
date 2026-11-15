@@ -2860,8 +2860,11 @@ bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {
 	constexpr uint64_t ScatterJobBytes = 4 * 1024;
 	constexpr uint32_t MaxJobs         = 65535;
 	const auto         staging         = m_staging_buffer.BufferDeviceAddress();
-	std::vector<Job>   jobs;
-	size_t             first = 0;
+	// Counted first and written straight into the staging buffer: a list of tens of thousands of
+	// jobs grown on the heap took ~5 % of the execution thread in ASTRO BOT (PPSA21564), in the
+	// heap's search for large free blocks.
+	uint64_t           job_count = 0;
+	size_t             first     = 0;
 	for (const auto& batch: m_upload_batch_buffers) {
 		if (batch.address == 0 || staging == 0) {
 			return false;
@@ -2872,24 +2875,34 @@ bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {
 			if (((copy.srcOffset | copy.dstOffset | copy.size) & 3u) != 0) {
 				return false;
 			}
-			for (uint64_t done = 0; done < copy.size; done += ScatterJobBytes) {
-				jobs.push_back({staging + copy.srcOffset + done, batch.address + copy.dstOffset + done,
-				                static_cast<uint32_t>(std::min(ScatterJobBytes, copy.size - done)), 0, 0});
-			}
+			job_count += (copy.size + ScatterJobBytes - 1) / ScatterJobBytes;
 		}
 		first += batch.count;
 	}
-	if (jobs.empty() || jobs.size() > MaxJobs) {
+	if (job_count == 0 || job_count > MaxJobs) {
 		return false;
 	}
 	// The job list goes after the staged data, in the same lap of the staging buffer (no wait: that
 	// would submit the command buffer without the batch).
-	const auto bytes            = jobs.size() * sizeof(Job);
+	const auto bytes            = job_count * sizeof(Job);
 	const auto [mapped, offset] = m_staging_buffer.Map(bytes, 16, false);
 	if (mapped == nullptr) {
 		return false;
 	}
-	std::memcpy(mapped, jobs.data(), bytes);
+	uint8_t* job = mapped;
+	first        = 0;
+	for (const auto& batch: m_upload_batch_buffers) {
+		for (uint32_t i = 0; i < batch.count; i++) {
+			const auto& copy = m_upload_batch_copies[first + i];
+			for (uint64_t done = 0; done < copy.size; done += ScatterJobBytes) {
+				const Job value {staging + copy.srcOffset + done, batch.address + copy.dstOffset + done,
+				                 static_cast<uint32_t>(std::min(ScatterJobBytes, copy.size - done)), 0, 0};
+				std::memcpy(job, &value, sizeof(value));
+				job += sizeof(value);
+			}
+		}
+		first += batch.count;
+	}
 	m_staging_buffer.Commit();
 	if (!m_scatter_pipeline) {
 		const auto                   device = m_graphics.device;
@@ -2922,7 +2935,7 @@ bool BufferCache::ScatterUploadBatch(const CommandRecorder& native) {
 		uint64_t jobs;
 		uint32_t job_count;
 		uint32_t pad;
-	} push {staging + offset, static_cast<uint32_t>(jobs.size()), 0};
+	} push {staging + offset, static_cast<uint32_t>(job_count), 0};
 	native.bindPipeline(vk::PipelineBindPoint::eCompute, m_scatter_pipeline);
 	native.pushConstants(m_scatter_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	native.dispatch(push.job_count, 1, 1);

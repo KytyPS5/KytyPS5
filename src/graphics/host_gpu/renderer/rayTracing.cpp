@@ -24,6 +24,9 @@ enum Mode : uint32_t { Walk, Triangles, Boxes, Instances };
 
 constexpr uint32_t PairGeometry = 1; // The geometry hash of its last build or update is known.
 constexpr uint32_t PairUpdated  = 2;
+constexpr uint32_t PairRebuilt  = 4;
+// The BLAS root link: node 4, the first after the header, as an FP16 or FP32 box (kind 4 or 5).
+constexpr uint32_t RootLink     = 4u << 3 | 4u;
 constexpr uint32_t StateAbsent  = 1; // The job met a page no buffer backs.
 constexpr uint32_t GroupSize    = 64;
 constexpr uint64_t TriangleSize = 36;
@@ -72,6 +75,7 @@ struct GpuPair {
 	uint32_t          blas;
 	uint32_t          root;
 	uint32_t          first;
+	uint32_t          count;
 	uint32_t          topology;
 	uint32_t          links;
 	uint32_t          box_count;
@@ -333,6 +337,7 @@ void RayTracing::Apply(Area& area) {
 		if (blas.known && blas.topology == state.topology && blas.geometry != state.geometry) {
 			blas.dynamic = true;
 		}
+		blas.reshaped = blas.reshaped || (blas.known && blas.topology != state.topology);
 		blas.topology = state.topology;
 		blas.geometry = state.geometry;
 		blas.known    = true;
@@ -432,8 +437,10 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		} while (area.covered[index] < records);
 	}
 
-	// Pairs without a walk under the BLAS topology last seen get one. Walked ranges get a mirror,
-	// updated every call once the BLAS geometry changed, and their visited boxes hashed again.
+	// A pair at the BLAS root takes the header's records; its mirror is rebuilt every call once
+	// they changed. Other pairs without a walk under the BLAS topology last seen get one. Walked
+	// ranges get a mirror, updated every call once the BLAS geometry changed, and their visited
+	// boxes hashed again.
 	// Builds take scratch offsets relative to the scratch buffer until it is sized.
 	std::vector<vk::AccelerationStructureGeometryKHR>              geometries;
 	std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     builds;
@@ -447,10 +454,17 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	area.walks.clear();
 	area.verified.clear();
 	for (uint32_t index = 0; index < m_pairs.size(); ++index) {
-		auto&       pair    = m_pairs[index];
-		const auto& blas    = m_blases[pair.blas];
-		const bool  current = pair.walked && blas.known && pair.topology == blas.topology;
-		if (!current && !pair.walking && blas.end > blas.begin) {
+		auto&       pair  = m_pairs[index];
+		const auto& blas  = m_blases[pair.blas];
+		const bool  whole = (pair.root & ~1u) == RootLink;
+		if (whole && blas.known) {
+			if (pair.count != blas.end - blas.begin || pair.first != blas.begin) pair.built = false;
+			pair.count    = blas.end - blas.begin;
+			pair.first    = blas.begin;
+			pair.topology = blas.topology;
+		}
+		const bool current = (whole || pair.walked) && blas.known && pair.topology == blas.topology;
+		if (!whole && !current && !pair.walking && blas.end > blas.begin) {
 			Reserve(pair.boxes, {}, 4ull * std::max(blas.nodes, 1u));
 			pair.box_capacity = static_cast<uint32_t>(pair.boxes->Size() / 4);
 			area.walks.push_back(index);
@@ -459,7 +473,7 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		const bool ready   = current && pair.count != 0 && pair.first >= blas.begin &&
 		                     pair.first - blas.begin + uint64_t {pair.count} <= blas.capacity &&
 		                     pair.first < (1u << 24);
-		const bool rebuild = ready && !pair.built;
+		const bool rebuild = ready && (!pair.built || (whole && blas.reshaped));
 		const bool update =
 		    ready && !rebuild &&
 		    (blas.dynamic || (!pair.geometry_known && m_applied >= pair.update_serial));
@@ -504,13 +518,15 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		    .blas         = pair.blas,
 		    .root         = pair.root,
 		    .first        = pair.first,
+		    .count        = pair.count,
 		    .topology     = pair.topology,
 		    .links        = pair.links,
 		    .box_count    = pair.box_count,
 		    .box_capacity = pair.box_capacity,
 		    .geometry     = pair.geometry,
-		    .flags =
-		        (pair.geometry_known ? PairGeometry : 0) | ((rebuild || update) ? PairUpdated : 0),
+		    .flags        = (pair.geometry_known ? PairGeometry : 0) |
+			                ((rebuild || update) ? PairUpdated : 0) |
+			                ((whole && rebuild) ? PairRebuilt : 0),
 		};
 	}
 

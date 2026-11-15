@@ -209,7 +209,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	done.acquire();
 }
 
-void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
+void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies) {
 	EXIT_IF(!command);
 	if (!m_pipelined || IsGpuThread() || g_cp_thread) {
 		SendCommandSync(std::move(command));
@@ -222,6 +222,7 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command) {
 			operation();
 			done.release();
 		});
+		m_urgent_drains += drain_copies ? 1 : 0;
 		m_urgent_pending.fetch_add(1, std::memory_order_release);
 	}
 	// A busy execution thread runs the command before its next operation; wake an idle one directly.
@@ -237,15 +238,22 @@ void GuestGpu::RunUrgentCommands() {
 	}
 	m_renderer.GetRenderExecutor().InvalidateRenderTargetMemo();
 	m_renderer.GetRenderExecutor().FlushDeferredDispatchBarrier();
-	// Unmaps free memory that copies of executed draws may still read.
-	if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
-		copies->Drain();
-	}
 	std::vector<Common::UniqueFunction<void>> commands;
+	bool                                      drain = false;
 	{
 		std::lock_guard lock(m_urgent_mutex);
 		commands.swap(m_urgent_commands);
+		drain = std::exchange(m_urgent_drains, 0) != 0;
 		m_urgent_pending.store(0, std::memory_order_relaxed);
+	}
+	// Unmaps free memory that copies of executed draws may still read. The guest's reads of
+	// memory the GPU wrote (readback faults) do not wait for them: those copies read CPU-dirty
+	// pages, not the GPU-written ones the read releases, and the GPU work the read waits for was
+	// submitted after them (every submission waits for the copies queued before it).
+	if (drain) {
+		if (auto* copies = m_renderer.GetCommandScheduler().HostCopies(); copies != nullptr) {
+			copies->Drain();
+		}
 	}
 	for (auto& command: commands) {
 		command();

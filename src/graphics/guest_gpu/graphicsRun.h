@@ -36,8 +36,9 @@ public:
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 	// Runs a host command on the execution thread before the operations queued so far, and
 	// waits for it. Only for work that no queued operation depends on (memory the guest unmaps
-	// after the operations that used it executed).
-	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command);
+	// after the operations that used it executed). `drain_copies`: the host copies of executed
+	// draws complete before it runs (see RunUrgentCommands()).
+	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies = true);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -182,6 +183,7 @@ private:
 	std::mutex                                m_urgent_mutex;
 	std::vector<Common::UniqueFunction<void>> m_urgent_commands;
 	std::atomic_uint32_t                      m_urgent_pending {0};
+	uint32_t                                  m_urgent_drains = 0; // (queued commands that drain the copies)
 	// Game and host threads bump it when they queue work, under m_queue_mutex; the command
 	// processor thread spins on it before it sleeps.
 	std::atomic_uint64_t m_work_epoch {0};

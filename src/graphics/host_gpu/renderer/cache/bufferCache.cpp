@@ -496,7 +496,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
-	});
+	}, false);
 }
 
 void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault) {
@@ -553,7 +553,7 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 		if (queue_read.slot == nullptr && tick >= m_scheduler.CurrentTick()) {
 			m_scheduler.Flush();
 		}
-	});
+	}, false);
 	if (tick == 0) {
 		return;
 	}
@@ -592,12 +592,12 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 					}
 				}
 			}
-		});
+		}, false);
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		gpu.SendUrgentCommandSync(
-		    [&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
+		    [&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); }, false);
 	}
 }
 

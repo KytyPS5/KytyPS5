@@ -1016,7 +1016,7 @@ void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
 	// Like the buffer readback of a faulting access: the GPU work the access needs was recorded
 	// before it, not after the backlog of operations queued since.
 	m_scheduler.Context().GetGpu().SendUrgentCommandSync(
-	    [this, armed = std::move(armed)] { FlushLazyImages(armed); });
+	    [this, armed = std::move(armed)] { FlushLazyImages(armed); }, false);
 }
 
 void TextureCache::FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images) {

@@ -382,12 +382,16 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	const auto&      program   = runtime.module->info;
 	const auto&      user_data = runtime.resources->user_data;
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	for (const auto reg: program.info.dma_base_registers) {
-		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
-		if (reg < program.user_data_base || index + 1u >= user_data.size()) {
+	for (const auto [low_reg, high_reg]: program.info.dma_base_registers) {
+		const auto low  = static_cast<uint64_t>(low_reg) - program.user_data_base;
+		const auto high = static_cast<uint64_t>(high_reg) - program.user_data_base;
+		if (low_reg < program.user_data_base || high_reg < program.user_data_base ||
+		    low >= user_data.size() || high >= user_data.size()) {
 			continue;
 		}
-		const auto base = user_data[index] | (static_cast<uint64_t>(user_data[index + 1u]) << 32u);
+		// Guest addresses have 48 bits: a V#'s dword 1 holds the stride above the high 16 of them.
+		const auto base =
+		    user_data[low] | (static_cast<uint64_t>(user_data[high] & 0xffffu) << 32u);
 		// The registers of an access that never runs may hold stale data. Mapped memory never
 		// reaches the top of the address space, so a window that would overflow is skipped.
 		if (base > UINT64_MAX - BufferCache::CACHING_PAGESIZE) {

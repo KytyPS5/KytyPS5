@@ -643,9 +643,10 @@ struct ShaderInfo {
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
-	// User-data registers holding the low dword of a 64-bit base address that DMA (FLAT/global)
-	// accesses offset from; the next register holds the high dword.
-	std::vector<uint32_t>            dma_base_registers;
+	// User-data registers {low, high} of a base address that DMA (FLAT/global) accesses offset
+	// from: the low dword, and the next register for a 64-bit pointer or any other one for a V#
+	// whose dword 1 the shader builds from the high 16 bits of the base.
+	std::vector<std::array<uint32_t, 2>> dma_base_registers;
 	// The guest memory DMA reads, when every DMA access is a read whose address is a user-data
 	// base pair plus an offset with known possible bits (see DmaFootprint).
 	struct DmaWindow {

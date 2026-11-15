@@ -8954,7 +8954,7 @@ void TestDmaBaseRegisters() {
   std::sort(registers.begin(), registers.end());
   // Registers 10 and 11 feed the offset, and through the carry the high
   // dword, but a base high dword never feeds the low dword.
-  Check(registers == std::vector<uint32_t>{4u, 12u},
+  Check(registers == std::vector<std::array<uint32_t, 2>>{{4u, 5u}, {12u, 13u}},
         "DMA base registers were not recorded");
 
   // A base pair built as one composite: each dword extracts its own component.
@@ -8975,7 +8975,8 @@ void TestDmaBaseRegisters() {
                    {pair_address, pair_low, pair_high, Value(true)},
                    composite.AddMemory(memory, 0xc0));
     composite.PlanAndTrack();
-    Check(composite.program.info.dma_base_registers == std::vector<uint32_t>{12u},
+    Check(composite.program.info.dma_base_registers ==
+              std::vector<std::array<uint32_t, 2>>{{12u, 13u}},
           "a composite base pair lost the provenance of its dwords");
   }
 
@@ -8998,8 +8999,29 @@ void TestDmaBaseRegisters() {
                {chain_address, low_value, chain_high, Value(true)},
                chain.AddMemory(memory, 0xd0));
     chain.PlanAndTrack();
-    Check(chain.program.info.dma_base_registers == std::vector<uint32_t>{20u},
+    Check(chain.program.info.dma_base_registers ==
+              std::vector<std::array<uint32_t, 2>>{{20u, 21u}},
           "a base at the visit limit was missed");
+  }
+
+  // The halves of a base in two user-data registers that are not a pair: SAROS's
+  // cs bbd2706c785082e8 builds a V# from {s3, s0 | stride}.
+  {
+    Fixture split;
+    const auto split_lane = split.Emit(ValueOpcode::UndefU32);
+    const auto split_low = split.Emit(ValueOpcode::IAdd32, {split.UserData(3), split_lane});
+    const auto split_high = split.Emit(ValueOpcode::IAdd32, {split.UserData(0), Value(0u)});
+    const auto split_address = split.Address(split_low, split_high, 0xe0);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Flat;
+    memory.address_is_full = true;
+    split.Emit(ValueOpcode::LoadAddressU32,
+               {split_address, split_low, split_high, Value(true)},
+               split.AddMemory(memory, 0xe0));
+    split.PlanAndTrack();
+    Check(split.program.info.dma_base_registers ==
+              std::vector<std::array<uint32_t, 2>>{{3u, 0u}},
+          "a base whose halves are not a register pair was missed");
   }
 }
 

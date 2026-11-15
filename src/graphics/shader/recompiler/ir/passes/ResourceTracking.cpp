@@ -5400,9 +5400,9 @@ private:
 
 	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
 	// offset: the low dword derives from register N and the high dword from register N + 1 (and,
-	// through the carry, from everything the low dword does). Record N so the host can cache the
-	// memory at the base before the shader runs; an access to memory without a cached buffer only
-	// records a fault and reads zero.
+	// through the carry, from everything the low dword does). Record {N, N + 1} so the host can
+	// cache the memory at the base before the shader runs; an access to memory without a cached
+	// buffer only records a fault and reads zero.
 	// Whether a user-data register pair is the base of the V#; it is recorded as a DMA base.
 	bool CollectDmaBase(const Inst& handle) {
 		const auto low      = AddressUserDataSources(handle.Arg(0));
@@ -5410,14 +5410,26 @@ private:
 		const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
 			return std::ranges::find(registers, reg) != registers.end();
 		};
+		const auto add = [&](uint32_t low_reg, uint32_t high_reg) {
+			const std::array<uint32_t, 2> pair {low_reg, high_reg};
+			auto&                         bases = m_info.dma_base_registers;
+			if (std::ranges::find(bases, pair) == bases.end()) {
+				bases.push_back(pair);
+			}
+		};
 		bool found = false;
 		for (const auto reg: low) {
 			if (contains(high, reg + 1u) && !contains(low, reg + 1u)) {
 				found = true;
-				if (!contains(m_info.dma_base_registers, reg)) {
-					m_info.dma_base_registers.push_back(reg);
-				}
+				add(reg, reg + 1u);
 			}
+		}
+		// The two halves of the base in user data that are not a pair: SAROS's cs bbd2706c785082e8
+		// (at boot) stores its records through {s3, s0 | stride 32, count, format} and
+		// {s6 + 0x100, s1 | stride, count, format}, with s0 and s1 the high 16 bits of the bases.
+		if (!found && low.size() == 1u && high.size() == 1u && low[0] != high[0]) {
+			found = true;
+			add(low[0], high[0]);
 		}
 		return found;
 	}

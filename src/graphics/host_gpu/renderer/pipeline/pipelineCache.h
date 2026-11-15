@@ -211,6 +211,11 @@ public:
 
 private:
 	friend struct PipelineCacheTestAccess;
+	friend void CreatePipelineInternal(GraphicContext& graphics, PipelineCache& pipeline_cache,
+	                                  Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                                  const std::array<const ShaderModule*, 4>& stages);
+	friend void CreatePipelineInternal(GraphicContext& graphics, PipelineCache& pipeline_cache,
+	                                  Pipeline& pipeline, const ShaderModule& module);
 
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
@@ -257,6 +262,10 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
+	mutable std::mutex            m_driver_cache_mutex;
+	// Pipeline creation during shader-cache warm-up can overlap. Keep abandoned handles alive
+	// until every worker has stopped using them.
+	std::vector<vk::PipelineCache> m_retired_driver_caches;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
@@ -271,6 +280,8 @@ private:
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
 	void InitializeDriverCache();
+	[[nodiscard]] vk::PipelineCache AcquireDriverCache() const;
+	void AbandonDriverCache(vk::PipelineCache cache, vk::Result failure);
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();
 	void WriteDriverCache() const;
@@ -296,12 +307,37 @@ std::filesystem::path ShaderStorePath();
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
 // Stages are indexed like GraphicsPipelineKey::stage_ids.
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
-                            const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache);
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache& pipeline_cache,
+                            PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key,
+                            const std::array<const ShaderModule*, 4>& stages);
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache& pipeline_cache,
+                            PipelineCache::Pipeline& pipeline, const ShaderModule& module);
+
+struct PipelineCacheCreationResult {
+	vk::Result result;
+	// The first result is kept when a cached attempt is followed by an uncached retry.
+	vk::Result first_result;
+	bool       retried_without_cache = false;
+
+	[[nodiscard]] bool Succeeded() const { return result == vk::Result::eSuccess; }
+};
+
+// A corrupted or oversized driver cache can make a valid pipeline fail to compile. Retry
+// conservatively without it; compilation and resource failures still reach the caller.
+template <typename DriverCache, typename CreateFunction, typename DisableFunction>
+PipelineCacheCreationResult CreatePipelineWithDriverCacheFallback(
+    DriverCache driver_cache, CreateFunction&& create, DisableFunction&& disable) {
+	const auto first_result = create(driver_cache);
+	const bool retryable = first_result == vk::Result::eErrorOutOfHostMemory ||
+	                       first_result == vk::Result::eErrorUnknown;
+	if (!driver_cache || first_result == vk::Result::eSuccess || !retryable) {
+		return {.result = first_result, .first_result = first_result};
+	}
+	disable(driver_cache, first_result);
+	return {.result = create(DriverCache {}),
+	        .first_result = first_result,
+	        .retried_without_cache = true};
+}
 
 } // namespace Libs::Graphics
 

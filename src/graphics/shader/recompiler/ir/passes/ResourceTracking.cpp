@@ -3822,11 +3822,14 @@ private:
 
 	bool TryMakeFiniteDescriptor(Inst& handle, IndirectDescriptorPlan& plan) {
 		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
-		if ((!sampler && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
-		    handle.NumArgs() != (sampler ? 4u : 8u))
+		const bool buffer = handle.GetOpcode() == ValueOpcode::GetBufferResource;
+		if ((!sampler && !buffer && handle.GetOpcode() != ValueOpcode::GetImageResource) ||
+		    handle.NumArgs() != (sampler || buffer ? 4u : 8u))
 			return false;
 		if (std::ranges::any_of(handle.Uses(), [&](const Use& use) {
 			const auto op = use.user->GetOpcode();
+			if (buffer)
+				return BufferAccessOf(op) != BufferAccess::Atomic || use.user->GetType() != Type::U32;
 			if (op != ValueOpcode::ImageSampleRaw) return sampler || op != ValueOpcode::ImageGatherRaw;
 			return sampler && (m_program.memory_info[use.user->Flags<MemoryFlags>().index]
 			                       .image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0u;
@@ -3984,8 +3987,9 @@ private:
 		m_loop_proofs.clear();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
+				const bool atomic = BufferAccessOf(inst.GetOpcode()) == BufferAccess::Atomic;
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
-				     !IndirectBufferAccess(inst)) ||
+				     !IndirectBufferAccess(inst) && !atomic) ||
 				    inst.NumArgs() == 0u) {
 					continue;
 				}
@@ -4011,7 +4015,8 @@ private:
 						    })) return;
 						plan.read_dwords = 4u;
 					}
-					if (TryMakeNestedDescriptor(*handle, descriptor, plan) ||
+					if (atomic ? TryMakeFiniteDescriptor(*handle, plan) :
+					    TryMakeNestedDescriptor(*handle, descriptor, plan) ||
 					    (sampler && TryMakeFiniteDescriptor(*handle, plan)) ||
 					    TryMakeTableDescriptor(*handle, descriptor, plan) ||
 					    (!sampler && (TryMakeFiniteDescriptor(*handle, plan) ||
@@ -4028,7 +4033,7 @@ private:
 				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u) {
 					plan_handle(inst.Arg(1), 4u, memory.sampler * 4u, true);
 				}
-				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,
+				plan_handle(inst.Arg(0), atomic || IndirectBufferAccess(inst) ? 4u : 8u,
 				            memory.resource * 4u, false);
 			}
 		}

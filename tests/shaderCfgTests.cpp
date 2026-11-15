@@ -7184,6 +7184,102 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
   }
 }
 
+void TestLoopPhiBufferAtomicIAdd32UsesBda() {
+  // Same loop-carried V# shape as a structured buffer load, but with an atomic.
+  // Admitting the atomic without a BDA emit path makes SPIR-V generation EXIT.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128), // preheader: s0 = 0
+      EncodeMubuf0(0x32, 0, true, true),
+      EncodeMubuf1(0, 0, 1),       // loop: BUFFER_ATOMIC_ADD v0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopc(0x0a, 0, 130),    // s_cmp_lt_u32 s0, 2
+      EncodeSopp(0x05, 0xfffbu),   // s_cbranch_scc1 loop
+      EncodeSopp(0x01),
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("BUFFER_ATOMIC_ADD") != std::string::npos),
+        "loop-Phi buffer atomic did not decode BUFFER_ATOMIC_ADD");
+  Check((result.ir_dump.find("BufferAtomicIAdd32") != std::string::npos),
+        "loop-Phi buffer atomic did not lower to BufferAtomicIAdd32");
+
+  uint32_t indirect_atomics = 0;
+  for (const auto *block : result.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() !=
+          ShaderRecompiler::IR::ValueOpcode::BufferAtomicIAdd32) {
+        continue;
+      }
+      const auto &memory = result.program.memory_info
+          [inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index];
+      indirect_atomics +=
+          memory.kind == ShaderRecompiler::IR::ResourceKind::IndirectBuffer &&
+          !memory.planning_only;
+    }
+  }
+  Check(result.program.info.uses_dma && indirect_atomics == 1u,
+        "loop-Phi BufferAtomicIAdd32 was not planned as an indirect buffer");
+
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("get_bda_pointer") != std::string::npos &&
+            source.find("OpConvertUToPtr") != std::string::npos &&
+            source.find("OpAtomicIAdd") != std::string::npos &&
+            source.find("OpMemoryBarrier") != std::string::npos,
+        "loop-Phi BufferAtomicIAdd32 SPIR-V is not a BDA atomic");
+  Check(source.find("load_indirect_buffer") == std::string::npos,
+        "BufferAtomicIAdd32 was emitted as an indirect buffer load helper");
+}
+
+void TestBufferAtomicOnPhiOfTwoDescriptors() {
+  constexpr uint32_t no_offset_register = 125u << 25u;
+  constexpr uint32_t first_descriptor_offset = 16u;
+  constexpr uint32_t second_descriptor_offset = 32u;
+  constexpr uint32_t s_load_dwordx4_s20_from_s0 = EncodeSmem0(0x02, 20, 0);
+  constexpr uint32_t s4_descriptor = 4u / 4u;
+  constexpr uint32_t s20_descriptor = 20u / 4u;
+  constexpr uint32_t buffer_load_dword = 0x0c;
+  constexpr uint32_t buffer_atomic_add = 0x32;
+  constexpr uint32_t v_cmp_lt_u32_vcc_1_v1 = EncodeVopc(0xc1, 129, 1);
+  constexpr uint32_t s_cbranch_vccz_over_second_load = EncodeSopp(0x06, 2);
+  constexpr uint32_t op_atomic_iadd = 234u;
+  const uint32_t shader[] = {
+      s_load_dwordx4_s20_from_s0, no_offset_register | first_descriptor_offset,
+      EncodeMubuf0(buffer_load_dword, 0, false), EncodeMubuf1(1, s4_descriptor, 0),
+      v_cmp_lt_u32_vcc_1_v1,
+      s_cbranch_vccz_over_second_load,
+      s_load_dwordx4_s20_from_s0, no_offset_register | second_descriptor_offset,
+      EncodeMubuf0(buffer_atomic_add, 0, false), EncodeMubuf1(0, s20_descriptor, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> table{};
+  table[first_descriptor_offset / 4u] = 0x2000u;
+  table[first_descriptor_offset / 4u + 2u] = 4u;
+  table[second_descriptor_offset / 4u] = 0x3000u;
+  table[second_descriptor_offset / 4u + 2u] = 4u;
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  const std::array<uint32_t, 8> user_data{static_cast<uint32_t>(table_address),
+                                          static_cast<uint32_t>(table_address >> 32u), 0u, 0u,
+                                          0x4000u, 0u, 4u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  for (const uint32_t second_stride : {0u, 4u}) {
+    table[second_descriptor_offset / 4u + 1u] = second_stride << 16u;
+    const auto result = RecompileForTest(shader, options);
+    const auto &buffers = result.program.info.buffers;
+    Check(!result.program.info.uses_dma && buffers.size() == 3u,
+          "atomic on a Phi of two descriptors did not bind both buffers");
+    Check(std::ranges::count_if(buffers, [](const auto &buffer) { return buffer.atomic; }) == 2,
+          "a buffer chosen by the Phi is not tracked as atomically written");
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto atomics = SpirvInstructionOpcodeCount(result.spirv, op_atomic_iadd);
+    Check(second_stride == 0u ? atomics >= 1u : atomics == 2u,
+          "atomic on a Phi of two descriptors does not act on the chosen buffer");
+  }
+}
+
 void TestCapturedBufferAtomicsX2() {
   using ShaderRecompiler::IR::ValueOpcode;
   struct Case {
@@ -13509,6 +13605,79 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
+void TestPipelineCacheCreationFallback() {
+  constexpr uintptr_t driver_cache = 1;
+  int create_calls = 0;
+  int disable_calls = 0;
+  auto result = CreatePipelineWithDriverCacheFallback(
+      driver_cache,
+      [&](auto cache) {
+        create_calls++;
+        if (create_calls == 1) {
+          Check(cache == driver_cache,
+                "pipeline cache fallback did not try the driver cache first");
+          return vk::Result::eErrorOutOfHostMemory;
+        }
+        Check(cache == 0,
+              "pipeline cache fallback retried with the failed driver cache");
+        return vk::Result::eSuccess;
+      },
+      [&](auto cache, vk::Result failure) {
+        disable_calls++;
+        Check(cache == driver_cache,
+              "pipeline cache fallback disabled the wrong cache");
+        Check(failure == vk::Result::eErrorOutOfHostMemory,
+              "pipeline cache fallback lost the initial Vulkan result");
+      });
+  Check(result.Succeeded() && result.retried_without_cache &&
+            result.first_result == vk::Result::eErrorOutOfHostMemory &&
+            create_calls == 2 && disable_calls == 1,
+        "pipeline cache fallback did not recover an out-of-host-memory failure");
+
+  create_calls = 0;
+  disable_calls = 0;
+  result = CreatePipelineWithDriverCacheFallback(
+      driver_cache,
+      [&](auto) {
+        create_calls++;
+        return vk::Result::eSuccess;
+      },
+      [&](auto, vk::Result) { disable_calls++; });
+  Check(result.Succeeded() && !result.retried_without_cache &&
+            create_calls == 1 && disable_calls == 0,
+        "pipeline cache fallback retried a successful cached creation");
+
+  create_calls = 0;
+  disable_calls = 0;
+  result = CreatePipelineWithDriverCacheFallback(
+      driver_cache,
+      [&](auto) {
+        create_calls++;
+        return vk::Result::eErrorInitializationFailed;
+      },
+      [&](auto, vk::Result) { disable_calls++; });
+  Check(!result.Succeeded() && !result.retried_without_cache &&
+            result.result == vk::Result::eErrorInitializationFailed &&
+            result.first_result == vk::Result::eErrorInitializationFailed &&
+            create_calls == 1 && disable_calls == 0,
+        "pipeline cache fallback hid a non-cache pipeline failure");
+
+  create_calls = 0;
+  disable_calls = 0;
+  result = CreatePipelineWithDriverCacheFallback(
+      0u,
+      [&](auto cache) {
+        create_calls++;
+        Check(cache == 0,
+              "pipeline cache fallback invented a missing driver cache");
+        return vk::Result::eErrorOutOfHostMemory;
+      },
+      [&](auto, vk::Result) { disable_calls++; });
+  Check(!result.Succeeded() && !result.retried_without_cache &&
+            create_calls == 1 && disable_calls == 0,
+        "pipeline cache fallback retried an already uncached creation");
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
@@ -13643,6 +13812,8 @@ int main() {
   TestComputeDispatchWaveSize();
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
+  TestLoopPhiBufferAtomicIAdd32UsesBda();
+  TestBufferAtomicOnPhiOfTwoDescriptors();
   TestCapturedBufferAtomicsX2();
   TestDisabledDebugBranches();
   TestOrderedPsDoneEndsProgram();
@@ -13715,6 +13886,7 @@ int main() {
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
+  TestPipelineCacheCreationFallback();
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();

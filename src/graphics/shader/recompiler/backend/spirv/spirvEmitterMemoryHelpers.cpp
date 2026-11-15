@@ -130,6 +130,14 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+bool EmptyIndirectBufferCandidate(const EmitterState& state, uint32_t resource) {
+	const auto& buffer = state.program.info.buffers[resource];
+	const auto& sources = state.program.descriptor_sources;
+	return buffer.packed_stride == 0u && buffer.source < sources.size() &&
+	       sources[buffer.source].indirect_descriptor &&
+	       sources[buffer.source].indirect_descriptor->sources.empty();
+}
+
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
 	const auto& buffers = state.program.info.buffers;
 	const auto& root = buffers[resource];
@@ -137,10 +145,10 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 	    root.indirect_resources.size() < 2u) {
 		return UINT32_MAX;
 	}
-	const auto first = root.packed_stride == 0u ? 1u : 0u;
+	const auto first = EmptyIndirectBufferCandidate(state, resource) ? 1u : 0u;
 	const auto representative = root.indirect_resources[first];
 	const auto& shared = buffers[representative];
-	if (shared.packed_stride == 0u) return UINT32_MAX;
+	if (EmptyIndirectBufferCandidate(state, representative)) return UINT32_MAX;
 	uint32_t next_child_slot = UINT32_MAX;
 	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
 		const auto& candidate = buffers[root.indirect_resources[ordinal]];

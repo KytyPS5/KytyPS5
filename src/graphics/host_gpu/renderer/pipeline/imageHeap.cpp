@@ -386,7 +386,14 @@ uint32_t ImageHeap::Allocate() {
 	}
 	if (m_free.empty()) {
 		if (m_elements.size() == IR::ImageHeapCapacity) {
-			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
+			size_t refs = 0;
+			size_t views = 0;
+			for (const auto& memory: m_memories) views += memory->views.size();
+			for (const auto& element: m_elements) refs += element.refs;
+			EXIT("image heaps exceed %u resident images (tables=%zu views=%zu refs=%zu "
+			     "free=%zu retired=%zu)\n",
+			     IR::ImageHeapCapacity, m_memories.size(), views, refs, m_free.size(),
+			     m_retired.size());
 		}
 		m_elements.emplace_back();
 		return static_cast<uint32_t>(m_elements.size() - 1u);
@@ -608,10 +615,11 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void ImageHeap::RunGarbageCollector() {
-	// A smaller table rebuilt each frame moves to a new base. Larger ones keep their dead words.
+	// A table rebuilt in a later frame moves to a new base. Keeping every large table would consume
+	// the global bindless array even though only the tables acquired this frame are needed.
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
-		if (memory->size >= MinTableBytes || memory->draw > m_suspend_draw) return false;
+		if (memory->draw > m_suspend_draw) return false;
 		Drop(*memory);
 		return true;
 	});

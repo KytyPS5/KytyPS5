@@ -545,8 +545,11 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 					// A direct call always enters a function, even one that lies inside the
 					// caller's range because .eh_frame did not list it. Tail jumps are left
 					// out: they can target the middle of a function, and splitting it there
-					// would truncate the red-zone liveness of its first half.
-					if (branch_target >= segment_start && branch_target < segment_end) {
+					// would truncate the red-zone liveness of its first half. A call to the next
+					// instruction reads its own address with a following pop and stays in the
+					// same function, so it is not a function entry.
+					if (branch_target != next_address && branch_target >= segment_start &&
+					    branch_target < segment_end) {
 						function.callees.insert(branch_target);
 					}
 				}

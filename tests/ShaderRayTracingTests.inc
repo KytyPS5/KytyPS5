@@ -780,6 +780,13 @@ void TestRayTracingNativeWalks() {
                     .header_offset = ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryHeader,
                     .layout = {0x76543210u, 0x3dc6ba98u, 0x0008018fu, 0u},
                     .reach = 1});
+  CheckNativeWalks({.name = "SAROS's cs 192d8cd7fb8773d8",
+                    .code = kSarosFlatClosest32,
+                    .wave_size = 32,
+                    .user_sgpr = 0,
+                    .header_offset = ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryHeader,
+                    .layout = {0x76543210u, 0x1dc6ba98u, 0x000dbb8fu, 0u},
+                    .reach = 1});
 }
 
 void TestRayTracingInstructions() {

@@ -504,9 +504,25 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 	const std::array<const Inst*, 5> targets {word0, word1, root->Arg(1).Resolve().TryInstruction(),
 	                                          root->Arg(2).Resolve().TryInstruction(), flags};
 	t.state[0] = node;
-	// (Before resource tracking only the primitive word counts: the native forms take the hit's
-	// values from the host and run none of the walk's code on the candidates.)
-	for (uint32_t role = 1; role < (tracked ? targets.size() : 2u); ++role) {
+	// (Before resource tracking only the phi of the primitive word must be there, the others only
+	// where one phi alone carries them: the native forms take the hit's values from the host and run
+	// none of the walk's code on the candidates.)
+	for (uint32_t role = 1; !tracked && role < targets.size(); ++role) {
+		Inst*    only  = nullptr;
+		uint32_t count = 0;
+		for (auto& [carrier, values]: carried) {
+			if (values.contains(targets[role])) {
+				only = carrier;
+				++count;
+			}
+		}
+		if (count == 1 && std::ranges::find(t.state.begin(), t.state.begin() + role, only) == t.state.begin() + role) {
+			t.state[role] = only;
+		} else if (role == 1) {
+			return false;
+		}
+	}
+	for (uint32_t role = 1; tracked && role < targets.size(); ++role) {
 		for (auto& [carrier, values]: carried) {
 			if (!values.contains(targets[role])) continue;
 			if (t.state[role] != nullptr) return false;
@@ -4898,16 +4914,157 @@ bool MatchPacketWaveWalk(Program& program, PacketWalk& w) {
 	return true;
 }
 
-// A flat any hit walk (SAROS's visibility rays, waves of 32 lanes, cs 0035a11651ca7301): the ray
-// query pass's recognizer of flat walks (Match), before resource tracking. One loop and one
-// intersection take the TLAS and the BLASes, each lane on its own stack; at an instance node of the
-// TLAS the lane loads its record (the world to object matrix, the BLAS, its root and the instance
-// mask), and the first triangle it hits within the fixed t max ends its walk, which keeps the hit's
-// distance and the primitive word of its leaf list entry. With the host's structures the loop runs on
-// no lane whose query traces, and the values read after it are the host's hit.
+// The facing test of a flat walk's leaf code (MatchFlatWalk) where it has one: its accept condition is
+// finite && (!cull || facing) (&& nearer: T <= the extent), with the atoms over the leaf's lanes (the
+// condition of its lane masked writes): the test that the distance is finite (the class of
+// -|numerator|), the facing test (the numerator's sign against bit k of the instance flags: equal, or
+// not equal for the other facing), the cull test ((R & Select(flags bit k - 1, 0, 1)) != 0, R =
+// Select(c, 1, 0) from before the walk: lanes c cull unless the instance takes both facings) and the
+// nearer test. Without a facing test: true, both facings.
+template <typename Record>
+bool FlatFacing(const Program& program, const Traversal& t, PacketWalk& w, Value hit, Record&& record) {
+	const auto first = BlockIndex(program, t.header), last = BlockIndex(program, t.latch);
+	const auto component = [&](Value value) {
+		const auto* extract = Producer(Canonical(value), ValueOpcode::CompositeExtractU32x4);
+		return extract != nullptr && extract->Arg(0).Resolve().TryInstruction() == t.bvh ? Immediate(extract->Arg(1))
+		                                                                                : std::nullopt;
+	};
+	// The instance flags the walk carries: a phi of the loop that an instance node sets to a record
+	// dword >> s (SAROS: the bits above the BLAS in dword 13, s = 22), its dword and s.
+	const auto flags_of = [&](Value value) -> std::optional<std::pair<uint32_t, uint32_t>> {
+		const auto* phi = HeaderPhi(t, Canonical(value));
+		if (phi == nullptr) return std::nullopt;
+		std::unordered_set<const Inst*> values;
+		Collect(Back(t, *phi), t.header, values);
+		std::optional<std::pair<uint32_t, uint32_t>> found;
+		for (const auto* inst: values) {
+			if (inst->GetOpcode() == ValueOpcode::Phi || inst->GetOpcode() == ValueOpcode::SelectU32) continue;
+			const auto* shift = inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 ? inst : nullptr;
+			const auto  by    = shift != nullptr ? Immediate(shift->Arg(1)) : std::optional<uint32_t> {0u};
+			auto        field = shift != nullptr ? shift->Arg(0).Resolve() : Value(const_cast<Inst*>(inst));
+			// (Loaded on the lanes at the instance node: Select(lanes, load, kept).)
+			if (const auto* kept = Producer(field, ValueOpcode::SelectU32); kept != nullptr) {
+				const auto* load = Producer(kept->Arg(1), ValueOpcode::LoadAddressU32);
+				if (load == nullptr || load->Arg(3).Resolve() != kept->Arg(0).Resolve()) return std::nullopt;
+				field = kept->Arg(1).Resolve();
+			}
+			const auto dword = record(field);
+			if (!by || *by > 28u || !dword || found) return std::nullopt;
+			found = std::pair {*dword, *by};
+		}
+		return found;
+	};
+	// A bit of the flags the walk carries: BitFieldUExtract(flags, k, 1).
+	const auto flag_bit = [&](Value value) -> const Inst* {
+		const auto* bit = Producer(Canonical(value), ValueOpcode::BitFieldUExtract);
+		return bit != nullptr && flags_of(bit->Arg(0)) && Immediate(bit->Arg(1)) && Immediate(bit->Arg(2)) == 1u ? bit
+		                                                                                                         : nullptr;
+	};
+	const Inst* facing = nullptr;
+	const Inst* lanes  = nullptr;
+	const Inst* flags  = nullptr;
+	uint32_t    k      = 0;
+	for (auto at = first; at <= last; ++at) {
+		for (const auto& inst: *program.blocks[at]) {
+			const auto op = inst.GetOpcode();
+			for (uint32_t side = 0; (op == ValueOpcode::IEqual32 || op == ValueOpcode::INotEqual32) && side < 2; ++side) {
+				const auto* sign = Producer(Canonical(inst.Arg(side)), ValueOpcode::ShiftRightLogical32);
+				const auto* bit  = flag_bit(inst.Arg(1 - side));
+				const auto* kept = Producer(inst.Arg(side), ValueOpcode::SelectU32);
+				if (sign == nullptr || Immediate(sign->Arg(1)) != 31u || component(sign->Arg(0)) != 0u || bit == nullptr ||
+				    *Immediate(bit->Arg(1)) < 3u || kept == nullptr)
+					continue;
+				if (facing != nullptr) return false;
+				facing = &inst;
+				lanes  = kept->Arg(0).Resolve().TryInstruction();
+				flags  = Canonical(bit->Arg(0)).TryInstruction();
+				k      = *Immediate(bit->Arg(1));
+			}
+		}
+	}
+	if (facing == nullptr) return true;
+	LaneTable table;
+	table.exec       = lanes;
+	const auto value = table.Condition(hit);
+	if (!value || lanes == nullptr) return false;
+	constexpr size_t None = 8;
+	size_t           finite = None, face = None, cull = None, nearer = None;
+	Value            culling;
+	for (size_t a = 0; a < table.atoms.size(); ++a) {
+		const auto* atom = table.atoms[a];
+		const auto  op   = atom->GetOpcode();
+		if (atom == facing) {
+			face = a;
+		} else if (op == ValueOpcode::FPCmpClass32 && Immediate(atom->Arg(1)) == 0x38u && finite == None) {
+			const auto* negated = Producer(Canonical(atom->Arg(0)), ValueOpcode::FPNeg32);
+			const auto* size    = negated != nullptr ? Producer(Canonical(negated->Arg(0)), ValueOpcode::FPAbs32) : nullptr;
+			if (size == nullptr || component(size->Arg(0)) != 0u) return false;
+			finite = a;
+		} else if (op == ValueOpcode::FPOrdLessThanEqual32 && t.extent != nullptr && nearer == None) {
+			const auto* far = Canonical(atom->Arg(0)).TryInstruction();
+			if (far == nullptr || WrittenHitDistance(Value(const_cast<Inst*>(far)), t.bvh) != RayQueryResultKind::T ||
+			    Canonical(atom->Arg(1)).TryInstruction() != t.extent)
+				return false;
+			nearer = a;
+		} else if (op == ValueOpcode::INotEqual32 && cull == None) {
+			// (R & Select(both, 0, 1)) != 0, both = (flags & 1 << (k - 1)) != 0 on the leaf's lanes.
+			const auto* both = Immediate(atom->Arg(1)) == 0u ? Producer(atom->Arg(0), ValueOpcode::BitwiseAnd32) : nullptr;
+			for (uint32_t side = 0; both != nullptr && side < 2 && culling.IsEmpty(); ++side) {
+				const auto* r      = Producer(both->Arg(side), ValueOpcode::SelectU32);
+				const auto  kept   = ResolveActiveU32(both->Arg(1 - side), Value(const_cast<Inst*>(lanes)));
+				const auto* select = Producer(kept, ValueOpcode::SelectU32);
+				if (r == nullptr || select == nullptr || Immediate(r->Arg(1)) != 1u || Immediate(r->Arg(2)) != 0u ||
+				    !DefinedBefore(program, r->Arg(0), t.header) || Immediate(select->Arg(1)) != 0u ||
+				    Immediate(select->Arg(2)) != 1u)
+					continue;
+				LaneTable  inner;
+				inner.exec       = lanes;
+				const auto taken = inner.Condition(select->Arg(0));
+				const auto* test = inner.atoms.size() == 1 ? inner.atoms[0] : nullptr;
+				const auto* bits = test != nullptr && test->GetOpcode() == ValueOpcode::INotEqual32 && Immediate(test->Arg(1)) == 0u
+				                       ? Producer(test->Arg(0), ValueOpcode::BitwiseAnd32)
+				                       : nullptr;
+				for (uint32_t b = 0; bits != nullptr && b < 2; ++b) {
+					if (taken == LaneTable::Tables[0] && Immediate(bits->Arg(b)) == 1u << (k - 1u) &&
+					    Canonical(bits->Arg(1 - b)).TryInstruction() == flags)
+						culling = r->Arg(0).Resolve();
+				}
+			}
+			if (culling.IsEmpty()) return false;
+			cull = a;
+		} else {
+			return false;
+		}
+	}
+	if (finite == None || face == None || cull == None) return false;
+	const auto set = [](size_t a, uint32_t c) { return a != None && ((c >> a) & 1u) != 0; };
+	for (uint32_t c = 0; c < 32; ++c) {
+		const bool accept = set(finite, c) && (!set(cull, c) || set(face, c)) && (nearer == None || set(nearer, c));
+		if ((((*value >> c) & 1u) != 0) != accept) return false;
+	}
+	const auto field = flags_of(Value(const_cast<Inst*>(flags)));
+	if (!field || field->second + k - 3u > 31u) return false;
+	auto& layout       = w.shape.layout;
+	layout.flags_dword = field->first;
+	layout.flags_shift = field->second + k - 3u;
+	layout.flip_facing = facing->GetOpcode() == ValueOpcode::INotEqual32;
+	w.cull             = culling;
+	w.both_facings     = false;
+	return true;
+}
+
+// A flat walk (SAROS's visibility rays, waves of 32 lanes, cs 0035a11651ca7301): the ray query pass's
+// recognizer of flat walks (Match), before resource tracking. One loop and one intersection take the
+// TLAS and the BLASes, each lane on its own stack; at an instance node of the TLAS the lane loads its
+// record (the world to object matrix, the BLAS, its root and the instance mask). An any hit walk ends
+// at the first triangle it hits within the fixed t max and keeps the hit's distance and the primitive
+// word of its leaf list entry; a closest hit walk (cs 192d8cd7fb8773d8) keeps those of the nearest,
+// with its triangle node and instance record, of the facing the instance flags select (FlatFacing).
+// With the host's structures the loop runs on no lane whose query traces, and the values read after
+// it are the host's hit.
 bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	Traversal t;
-	if (!Match(program, bvh, t, false) || t.extent != nullptr) return false;
+	if (!Match(program, bvh, t, false)) return false;
 	auto& s = w.shape;
 	if (!LoopShape(t.header, w.preheader, w.latch, w.merge) || w.preheader != t.preheader || w.latch != t.latch)
 		return false;
@@ -5019,9 +5176,13 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 			hit = inst.Arg(0).Resolve();
 		}
 	}
-	if (hit.IsEmpty()) return false;
+	if (hit.IsEmpty() || !FlatFacing(program, t, w, hit, record)) return false;
+	s.source.layout = layout.Pack();
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
+		if (value == t.state[0]) return RayQueryResultKind::Node;
 		if (value == t.state[1]) return RayQueryResultKind::Word;
+		if (value != nullptr && value == t.state[2]) return RayQueryResultKind::InstanceLo;
+		if (value != nullptr && value == t.state[3]) return RayQueryResultKind::InstanceHi;
 		return WrittenHitDistance(Value(const_cast<Inst*>(value)), &bvh);
 	};
 	w.results.clear();
@@ -5029,7 +5190,7 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	if (!results || w.results.empty()) return false;
 	w.lanes     = lanes;
 	w.t_max     = t.ray[6];
-	w.any_hit   = true;
+	w.any_hit   = t.extent == nullptr;
 	w.alpha_off = Value(1u);
 	w.lane_phis = t.lanes;
 	return true;

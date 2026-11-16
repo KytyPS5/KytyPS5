@@ -212,6 +212,12 @@ struct Traversal: Loop {
 	const Inst*          walk     = nullptr;
 	const Inst*          resource = nullptr;
 	std::array<Value, 2> words {};
+	// Before resource tracking, a flat walk's instance root and BLAS loads, whether the record holds the
+	// BLAS >> 3 in 54 bits (sce::Psr format 10) and the shift of the record's instance mask bits.
+	const Inst* root       = nullptr;
+	const Inst* blas       = nullptr;
+	bool        packed     = false;
+	uint32_t    mask_shift = 8;
 };
 
 Value Entry(const Loop& t, const Inst& phi) {
@@ -320,7 +326,11 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 }
 
 // A walk over 64-bit node pointers: one loop takes the TLAS and, from instance records, the BLASes.
-bool Match(const Program& program, Inst& bvh, Traversal& t) {
+// Before resource tracking (`tracked` false: the native ray tracing forms, see TlasWord) the loop may
+// also carry the header >> 3 itself, read records of sce::Psr format 10 (the BLAS >> 3 in 54 bits at
+// +48, the instance mask in bits 24..31 of the flags) and have no extent, its t max fixed (an any hit
+// walk: SAROS, cs 0035a11651ca7301).
+bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true) {
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
 	if (descriptor == nullptr || address == nullptr || bvh.Flags<uint32_t>() != 2u ||
@@ -332,8 +342,16 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	}
 
 	// The ray: extent, origin and direction phis start as the world ray and its t_max.
+	const auto before = [&](Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst == nullptr || BlockIndex(program, inst->Parent()) < BlockIndex(program, t.header);
+	};
 	for (uint32_t arg = 2; arg < 9; ++arg) {
 		const auto* ray = HeaderPhi(t, address->Arg(arg));
+		if (ray == nullptr && !tracked && arg == 2 && t.extent == nullptr && before(address->Arg(arg))) {
+			t.ray[6] = address->Arg(arg);
+			continue;
+		}
 		if (ray == nullptr) return false;
 		t.ray[(arg + 4) % 7] = Entry(t, *ray);
 	}
@@ -355,12 +373,46 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	    low != nullptr ? Producer(low->Arg(0), ValueOpcode::ShiftRightLogical64) : nullptr;
 	const auto* base =
 	    shift != nullptr ? Producer(shift->Arg(0), ValueOpcode::CompositeConstructU64) : nullptr;
-	if (node == nullptr || base == nullptr || Immediate(low->Arg(1)) != 0u ||
+	// (Or phis of the header >> 3, the low one in the sum and the high one in the high word's: their
+	// words from before the loop are the TLAS header's, shifted.)
+	std::array<Inst*, 2> shifted {};
+	if (base == nullptr && !tracked && node != nullptr) {
+		const auto* high = Producer(ResolveActiveU32(address->Arg(1), exec), ValueOpcode::IAdd32);
+		shifted[0]       = HeaderPhi(t, ResolveActiveU32(base_part, exec));
+		for (uint32_t arg = 0; high != nullptr && arg < 2 && shifted[1] == nullptr; ++arg) {
+			shifted[1] = HeaderPhi(t, high->Arg(arg));
+		}
+		shift = nullptr;
+		for (uint32_t word = 0; word < 2 && shifted[0] != nullptr && shifted[1] != nullptr; ++word) {
+			const auto* part =
+			    Producer(ResolveActiveU32(Entry(t, *shifted[word]), lanes), ValueOpcode::CompositeExtractU64);
+			const auto* by = part != nullptr ? Producer(part->Arg(0), ValueOpcode::ShiftRightLogical64) : nullptr;
+			if (by == nullptr || Immediate(part->Arg(1)) != word || (word == 1 && by != shift)) {
+				shift = nullptr;
+				break;
+			}
+			shift = by;
+		}
+		base = shift != nullptr ? Producer(shift->Arg(0), ValueOpcode::CompositeConstructU64) : nullptr;
+	}
+	const bool in_phis = shifted[0] != nullptr && base != nullptr;
+	if (node == nullptr || base == nullptr || (!in_phis && Immediate(low->Arg(1)) != 0u) ||
 	    Immediate(shift->Arg(1)) != 3u) {
 		return false;
 	}
 	for (uint32_t word = 0; word < 2; ++word) {
+		if (in_phis) {
+			t.words[word] = base->Arg(word);
+			if (!before(t.words[word])) return false;
+			continue;
+		}
 		const auto* header = HeaderPhi(t, base->Arg(word));
+		if (!tracked) {
+			if (header == nullptr) return false;
+			t.words[word] = ResolveActiveU32(Entry(t, *header), lanes);
+			if (!before(t.words[word])) return false;
+			continue;
+		}
 		const auto  slot =
 		    header != nullptr ? Slot(ResolveActiveU32(Entry(t, *header), lanes)) : std::nullopt;
 		if (!slot) return false;
@@ -382,9 +434,26 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	}
 	if (root == nullptr || word0 == nullptr) return false;
 
+	// The BLAS of a header >> 3 in phis is the record dword its low phi takes (format 10: +48).
+	uint32_t blas_offset = InstanceBlas;
+	if (in_phis) {
+		std::unordered_set<const Inst*> taken;
+		Collect(Back(t, *shifted[0]), t.header, taken);
+		blas_offset = UINT32_MAX;
+		for (const auto* inst: taken) {
+			if (inst->GetOpcode() != ValueOpcode::LoadAddressU32 || inst->Arg(1) != root->Arg(1) ||
+			    inst->Arg(2) != root->Arg(2)) {
+				continue;
+			}
+			if (blas_offset != UINT32_MAX) return false;
+			blas_offset = program.memory_info[inst->Flags<MemoryFlags>().index].offset;
+		}
+		if (blas_offset != 48u) return false;
+	}
+
 	// Prim record word 1 and the instance flags and BLAS are each loaded once in the loop.
 	const std::array<std::pair<const Inst*, uint32_t>, 3> wanted {
-	    {{word0, 4}, {root, InstanceFlags}, {root, InstanceBlas}}};
+	    {{word0, 4}, {root, InstanceFlags}, {root, blas_offset}}};
 	std::array<const Inst*, 3> found {};
 	for (const auto* block: t.loop) {
 		for (const auto& inst: *block) {
@@ -402,6 +471,26 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	const auto [word1, flags, blas] = found;
 	if (word1 == nullptr || flags == nullptr || blas == nullptr) return false;
 	t.loads = {word0, word1, flags};
+	t.root  = root;
+	t.blas  = blas;
+	// (Format 10: the high phi takes the next record dword's 22 bits.)
+	if (in_phis) {
+		std::unordered_set<const Inst*> taken;
+		Collect(Back(t, *shifted[1]), t.header, taken);
+		t.packed = std::ranges::any_of(taken, [&](const Inst* inst) {
+			if (inst->GetOpcode() != ValueOpcode::BitwiseAnd32) return false;
+			for (uint32_t arg = 0; arg < 2; ++arg) {
+				const auto* word = ResolveActiveU32(inst->Arg(arg), root->Arg(3)).TryInstruction();
+				if (Immediate(inst->Arg(1 - arg)) == 0x3fffffu && word != nullptr &&
+				    GlobalLoad(program, *word, blas_offset + 4u) && word->Arg(1) == root->Arg(1) &&
+				    word->Arg(2) == root->Arg(2)) {
+					return true;
+				}
+			}
+			return false;
+		});
+		if (!t.packed) return false;
+	}
 
 	// The phi the iteration's code reads for each of them.
 	std::vector<std::pair<Inst*, std::unordered_set<const Inst*>>> carried;
@@ -415,7 +504,9 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	const std::array<const Inst*, 5> targets {word0, word1, root->Arg(1).Resolve().TryInstruction(),
 	                                          root->Arg(2).Resolve().TryInstruction(), flags};
 	t.state[0] = node;
-	for (uint32_t role = 1; role < targets.size(); ++role) {
+	// (Before resource tracking only the primitive word counts: the native forms take the hit's
+	// values from the host and run none of the walk's code on the candidates.)
+	for (uint32_t role = 1; role < (tracked ? targets.size() : 2u); ++role) {
 		for (auto& [carrier, values]: carried) {
 			if (!values.contains(targets[role])) continue;
 			if (t.state[role] != nullptr) return false;
@@ -429,7 +520,8 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	}
 
 	// The instance BLAS load, or a select that moves it into the next header, runs under the root
-	// load's lanes and the mask test flags << k < 0: mask bit 23 - k.
+	// load's lanes and the mask test flags << k < 0: mask bit 23 - k (format 10: 7 - k, of the bits
+	// from 24).
 	const auto leaf = root->Arg(3);
 	const auto test = [&](Value condition) -> std::optional<uint32_t> {
 		const auto* both = Producer(condition, ValueOpcode::LogicalAnd);
@@ -440,13 +532,14 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 		                                              ValueOpcode::ShiftLeftLogical32)
 		                                   : nullptr;
 		const auto  bit  = mask != nullptr ? Immediate(mask->Arg(1)) : std::nullopt;
-		const bool  kept = bit && Immediate(sign->Arg(0)) == 0u && *bit >= 16u && *bit <= 23u &&
+		const bool  range = bit && (t.packed ? *bit <= 7u : *bit >= 16u && *bit <= 23u);
+		const bool  kept  = range && Immediate(sign->Arg(0)) == 0u &&
 		                   ResolveActiveU32(mask->Arg(0), leaf).TryInstruction() == flags;
 		return kept ? bit : std::nullopt;
 	};
 	auto                            bit = test(blas->Arg(3));
 	std::unordered_set<const Inst*> next;
-	if (!bit) Collect(Back(t, *HeaderPhi(t, base->Arg(0))), t.header, next);
+	if (!bit) Collect(Back(t, in_phis ? *shifted[0] : *HeaderPhi(t, base->Arg(0))), t.header, next);
 	for (std::vector<const Inst*> taking {blas}; !bit && !taking.empty();) {
 		const auto* value = taking.back();
 		taking.pop_back();
@@ -460,6 +553,10 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	}
 	if (!bit) return false;
 	t.cull_mask = 1u << (23u - *bit);
+	if (t.packed) {
+		t.cull_mask  = 1u << (7u - *bit);
+		t.mask_shift = 24;
+	}
 	return true;
 }
 
@@ -2488,6 +2585,8 @@ struct PacketWalk {
 	bool                                 leaf = false;
 	std::vector<std::pair<Block*, bool>> list_exits;
 	Value                                leaf_t;
+	// Flat: the phis of the lanes of the walk, which start without the lanes whose query traces.
+	std::vector<Inst*> lane_phis;
 };
 
 // The machine code of the template's BLAS walk (FNV-1a of its instruction words).
@@ -4799,6 +4898,143 @@ bool MatchPacketWaveWalk(Program& program, PacketWalk& w) {
 	return true;
 }
 
+// A flat any hit walk (SAROS's visibility rays, waves of 32 lanes, cs 0035a11651ca7301): the ray
+// query pass's recognizer of flat walks (Match), before resource tracking. One loop and one
+// intersection take the TLAS and the BLASes, each lane on its own stack; at an instance node of the
+// TLAS the lane loads its record (the world to object matrix, the BLAS, its root and the instance
+// mask), and the first triangle it hits within the fixed t max ends its walk, which keeps the hit's
+// distance and the primitive word of its leaf list entry. With the host's structures the loop runs on
+// no lane whose query traces, and the values read after it are the host's hit.
+bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
+	Traversal t;
+	if (!Match(program, bvh, t, false) || t.extent != nullptr) return false;
+	auto& s = w.shape;
+	if (!LoopShape(t.header, w.preheader, w.latch, w.merge) || w.preheader != t.preheader || w.latch != t.latch)
+		return false;
+	w.header = t.header;
+	const auto lanes = Entry(t, *t.exec);
+	const auto root  = Immediate(ResolveActiveU32(Entry(t, *t.state[0]), lanes));
+	if (!root) return false;
+	for (uint32_t k = 0; k < 7; ++k) {
+		s.ray[k] = t.ray[k];
+	}
+	s.tlas = {t.words[0].Resolve(), t.words[1].Resolve()};
+	// The record of TLAS leaf `node`: (node >> 3) << 7 (or << 8) from the instance array, the TLAS +
+	// the 64-bit offset at TLAS + instance_offset.
+	auto&       layout = s.layout;
+	const auto* sum    = Producer(Canonical(t.root->Arg(1)), ValueOpcode::IAdd32);
+	bool        found  = false;
+	for (uint32_t side = 0; sum != nullptr && side < 2 && !found; ++side) {
+		const auto* scale = Producer(Canonical(sum->Arg(side)), ValueOpcode::ShiftLeftLogical32);
+		const auto* index = scale != nullptr ? Producer(Canonical(scale->Arg(0)), ValueOpcode::ShiftRightLogical32) : nullptr;
+		const auto  bits  = scale != nullptr ? Immediate(scale->Arg(1)) : std::nullopt;
+		const auto* array = Producer(Canonical(sum->Arg(1 - side)), ValueOpcode::IAdd32);
+		if (index == nullptr || Immediate(index->Arg(1)) != 3u || !bits || *bits < 7u || *bits > 8u || array == nullptr)
+			continue;
+		for (uint32_t b = 0; b < 2 && !found; ++b) {
+			const auto offset = LoadOf(program, array->Arg(b));
+			if (offset && array->Arg(1 - b).Resolve() == s.tlas[0] && offset->low == s.tlas[0] &&
+			    offset->high == s.tlas[1]) {
+				layout.instance_offset = offset->offset;
+				layout.record_stride   = 1u << *bits;
+				found                  = true;
+			}
+		}
+	}
+	if (!found) return false;
+	const auto record = [&](Value value) -> std::optional<uint32_t> {
+		const auto* load = Producer(value, ValueOpcode::LoadAddressU32);
+		if (load == nullptr || load->Arg(1) != t.root->Arg(1) || load->Arg(2) != t.root->Arg(2)) return std::nullopt;
+		const auto& memory = MemoryOf(program, *load);
+		if (memory.kind != ResourceKind::Global || !memory.address_is_full || (memory.offset & 3u) != 0) return std::nullopt;
+		return memory.offset / 4u;
+	};
+	// The world to object matrix: the object space ray the instance node gives the origin and
+	// direction phis (the one complete form among the values they take: the program writes partial
+	// sums to the same registers).
+	const auto* address = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
+	std::array<Value, 6> world {};
+	for (uint32_t k = 0; k < 6; ++k) {
+		world[k] = Term(s.ray[k]);
+	}
+	const auto object = [&](uint32_t arg, bool origin, LinearForm& out) {
+		auto* phi = HeaderPhi(t, address->Arg(arg));
+		if (phi == nullptr) return false;
+		std::unordered_set<const Inst*> values;
+		Collect(Back(t, *phi), t.header, values);
+		bool any = false;
+		for (const auto* value: values) {
+			if (value->GetOpcode() == ValueOpcode::Phi || value->GetOpcode() == ValueOpcode::SelectU32) continue;
+			LinearForm form;
+			form.fill(NoDword);
+			if (!Expand(Value(const_cast<Inst*>(value)), world, record, form)) continue;
+			bool complete = (form[3] != NoDword) == origin;
+			for (uint32_t c = 0; c < 3; ++c) {
+				complete = complete && (form[c] != NoDword) == origin && (form[4 + c] != NoDword) != origin;
+			}
+			if (!complete) continue;
+			if (any && form != out) return false;
+			out = form;
+			any = true;
+		}
+		return any;
+	};
+	for (uint32_t row = 0; row < 3; ++row) {
+		LinearForm origin, direction;
+		if (!object(3 + row, true, origin) || !object(6 + row, false, direction)) return false;
+		for (uint32_t c = 0; c < 3; ++c) {
+			if (direction[4 + c] != origin[c]) return false;
+			layout.transform[row * 4 + c] = static_cast<uint8_t>(origin[c]);
+		}
+		layout.transform[row * 4 + 3] = static_cast<uint8_t>(origin[3]);
+	}
+	const auto root_dword = record(Value(const_cast<Inst*>(t.root)));
+	const auto blas_dword = record(Value(const_cast<Inst*>(t.blas)));
+	const auto mask_dword = record(Value(const_cast<Inst*>(t.loads[2])));
+	if (!root_dword || !blas_dword || !mask_dword) return false;
+	layout.root_dword  = *root_dword;
+	layout.blas_dword  = *blas_dword;
+	layout.blas_packed = t.packed;
+	layout.mask_dword  = *mask_dword;
+	layout.mask_shift  = t.mask_shift;
+	layout.mask_width  = 0;
+	layout.flags_dword = NoField;
+	layout.inline_type = NoField;
+	// (No T# gives the node count: format 10 headers hold it at +88, the others at +80.)
+	layout.node_count_80 = !t.packed;
+	layout.valid         = true;
+	s.cull_mask          = t.cull_mask;
+	s.masked             = true;
+	if (!DeriveHeaderSource(program, s)) return false;
+	s.source.root   = *root;
+	s.source.layout = layout.Pack();
+	if (!WalkReach(program, w.header, w.latch, w.merge->start_pc, s.source)) return false;
+	// The values read after the walk: those its hit writes (where it writes the primitive word), the
+	// word and the distance.
+	Value hit;
+	for (auto at = BlockIndex(program, w.header); at <= BlockIndex(program, w.latch); ++at) {
+		for (auto& inst: *program.blocks[at]) {
+			if (inst.GetOpcode() != ValueOpcode::SelectU32 || inst.Arg(1).Resolve().TryInstruction() != t.state[1]) continue;
+			if (!hit.IsEmpty() && hit != inst.Arg(0).Resolve()) return false;
+			hit = inst.Arg(0).Resolve();
+		}
+	}
+	if (hit.IsEmpty()) return false;
+	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
+		if (value == t.state[1]) return RayQueryResultKind::Word;
+		return WrittenHitDistance(Value(const_cast<Inst*>(value)), &bvh);
+	};
+	w.results.clear();
+	const auto results = HitResults(program, w, kind_of, hit);
+	if (!results || w.results.empty()) return false;
+	w.lanes     = lanes;
+	w.t_max     = t.ray[6];
+	w.any_hit   = true;
+	w.alpha_off = Value(1u);
+	w.lane_phis = t.lanes;
+	return true;
+}
+
 void RewriteHitWalk(Program& program, PacketWalk& w, uint32_t site, bool entry_alpha) {
 	using Op         = ValueOpcode;
 	const auto flags = [site](auto variant) {
@@ -4856,6 +5092,13 @@ void RewriteHitWalk(Program& program, PacketWalk& w, uint32_t site, bool entry_a
 	                                   entry(Op::CompositeExtractU32x4, {ballot, Value(1u)})}),
 	           Value(0u)});
 	entry(Op::RayQueryNext, {}, flags(0u));
+	// (A flat walk: its lanes start without those that trace.)
+	if (!w.lane_phis.empty()) {
+		const auto guest = entry(Op::LogicalAnd, {w.lanes, entry(Op::LogicalNot, {native})});
+		for (auto* phi: w.lane_phis) {
+			phi->SetArg(Incoming(*phi, w.preheader), guest);
+		}
+	}
 	// The walk takes the way to its exit.
 	for (size_t at = 0; at < w.path.size(); ++at) {
 		auto* block = w.path[at];
@@ -5043,7 +5286,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 	const auto mark = [](Inst* bvh) {
 		bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectNative);
 	};
-	enum class Kind { Entry, ClosestLane, ClosestOpaque, ClosestLeaf, PacketLane, LaneMask };
+	enum class Kind { Entry, ClosestLane, ClosestOpaque, ClosestLeaf, PacketLane, Flat, LaneMask };
 	struct Walk {
 		Kind         kind = Kind::LaneMask;
 		PacketWalk   packet;
@@ -5079,6 +5322,12 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 				walk.kind = Kind::PacketLane;
 				found     = true;
 			}
+		}
+		if (!found && MatchFlatWalk(program, *bvh, walk.packet = {})) {
+			walk.kind   = Kind::Flat;
+			walk.header = walk.packet.header;
+			walk.latch  = walk.packet.latch;
+			found       = true;
 		}
 		if (!found && options.wave_size == 32 && MatchLaneMaskWalk(program, *bvh, walk.lane)) {
 			walk.kind   = Kind::LaneMask;
@@ -5144,7 +5393,8 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		switch (walk.kind) {
 			case Kind::Entry: RewriteHitWalk(program, walk.packet, site, true); break;
 			case Kind::ClosestOpaque:
-			case Kind::PacketLane: RewriteHitWalk(program, walk.packet, site, false); break;
+			case Kind::PacketLane:
+			case Kind::Flat: RewriteHitWalk(program, walk.packet, site, false); break;
 			case Kind::ClosestLane: RewriteClosestLaneWalk(program, walk.packet, site); break;
 			case Kind::ClosestLeaf: RewriteClosestLeafWalk(program, walk.packet, site); break;
 			case Kind::LaneMask: RewriteLaneMaskWalk(program, walk.lane, site); break;

@@ -572,7 +572,8 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool plane_owner) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -753,7 +754,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
 	}
-	auto*      image               = &texture_cache.GetImage(id);
+	auto* image = &texture_cache.GetImage(id);
+	if (image->depth_id && storage && !plane_owner) {
+		// A depth image takes no storage view: a shader stores to its stencil plane through
+		// the plane's color twin.
+		id    = texture_cache.StencilTwin(id, desc.info);
+		image = &texture_cache.GetImage(id);
+	}
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;

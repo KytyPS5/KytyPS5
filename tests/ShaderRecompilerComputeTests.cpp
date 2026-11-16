@@ -516,6 +516,11 @@ struct TextureCacheTestAccess {
     cache.DeleteImage(id);
   }
 
+  static bool DownloadImageMemory(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.DownloadImageMemory(id);
+  }
+
   static const Image *Owner(const TextureCache &cache, ImageId id) {
     return cache.m_slot_images.try_get(id);
   }
@@ -10424,10 +10429,12 @@ public:
       Require(
           name, "raw D16 uint texture backing",
           raw_d16_uint_image && raw_d16_uint_image != raw_d16_image &&
-              !TextureCacheTestAccess::Contains(texture_cache, raw_d16_image) &&
+              texture_cache.GetImage(raw_d16_uint_image).twin == raw_d16_image &&
+              texture_cache.GetImage(raw_d16_image).twin == raw_d16_uint_image &&
               texture_cache.GetImage(raw_d16_uint_image).backing.format ==
                   vk::Format::eR16Uint,
-          "D16 uint sampling did not recreate a true integer color backing");
+          "D16 uint sampling did not get a true integer color backing beside "
+          "the depth image");
       Require(name, "raw D16 uint texture view",
               texture_cache.FindTexture(raw_d16_uint_image, raw_d16_uint) !=
                   nullptr,
@@ -10462,13 +10469,14 @@ public:
       Require(
           name, "raw D16 8_8 texture backing",
           raw_d16_rg8_image && raw_d16_rg8_image != raw_d16_rg8_depth_image &&
-              !TextureCacheTestAccess::Contains(texture_cache,
-                                                raw_d16_rg8_depth_image) &&
+              texture_cache.GetImage(raw_d16_rg8_image).twin ==
+                  raw_d16_rg8_depth_image &&
               texture_cache.GetImage(raw_d16_rg8_image).backing.format ==
                   vk::Format::eR8G8Unorm &&
               texture_cache.FindTexture(raw_d16_rg8_image, raw_d16_rg8) !=
                   nullptr,
-          "D16 sampled as 8_8 UNORM did not recreate a color backing");
+          "D16 sampled as 8_8 UNORM did not get a color backing beside the "
+          "depth image");
       auto raw_d16_rg8_readback =
           CreateHostBuffer(name, sizeof(raw_d16_values),
                            vk::BufferUsageFlagBits::eTransferDst, {0u});
@@ -10542,8 +10550,7 @@ public:
           texture_cache.GetImage(layered_raw_d16_depth_image);
       Require(name, "layered raw D16 owner layout",
               layered_raw_d16_depth_image != layered_d16_color_image &&
-                  !TextureCacheTestAccess::Contains(texture_cache,
-                                                    layered_d16_color_image) &&
+                  layered_depth_owner.twin == layered_d16_color_image &&
                   layered_depth_owner.info.resources.layers == 6 &&
                   layered_depth_owner.info.data.size ==
                       sizeof(layered_raw_d16_values) &&
@@ -10595,13 +10602,9 @@ public:
       layered_raw_d16_expected.fill(UINT16_MAX);
       Require(
           name, "layered raw D16 round trip",
-          reacquired_layered_raw_d16_uint_image &&
-              reacquired_layered_raw_d16_uint_image !=
+          reacquired_layered_raw_d16_uint_image == layered_d16_color_image &&
+              reacquired_layered_raw_d16_native.twin ==
                   layered_raw_d16_depth_image &&
-              !TextureCacheTestAccess::Contains(texture_cache,
-                                                layered_raw_d16_depth_image) &&
-              reacquired_layered_raw_d16_native.backing.format ==
-                  vk::Format::eR16Uint &&
               reacquired_layered_raw_d16_uint_view != nullptr &&
               layered_raw_d16_after == layered_raw_d16_expected,
           "the partial depth view lost a layer or failed to restore raw UINT "
@@ -17477,6 +17480,678 @@ public:
   }
 
   // Cyberpunk 2077 copies its HTile D16 depth target through a kDepth k16UInt image load.
+  // Death Stranding 2 (PPSA02015) stores into its shadow and scene depth from compute through
+  // R32F views, draws to them again and samples them in between. The depth image and the color
+  // image of the bytes stay cached as twins: a use of one copies the other's newer contents
+  // and creates no image.
+  void CheckDepthColorTwins() {
+    constexpr const char *name = "DepthColorTwins";
+    constexpr uintptr_t base = 0x0000000206c00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t target = base + 0x10000;
+    constexpr uint64_t stencil = base + 0x20000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t table_size = 0x10000;
+    constexpr vk::Extent3D extent{16, 8, 1};
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "twin allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "twin mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // The T# of the depth bytes in a color format.
+    const auto descriptor = [](Format format, uint32_t swizzle) {
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(target >> 8u);
+      words[1] = static_cast<uint32_t>(target >> 40u) |
+                 (static_cast<uint32_t>(format) << 20u) | (((extent.width - 1u) & 3u) << 30u);
+      words[2] = ((extent.width - 1u) >> 2u) | ((extent.height - 1u) << 14u);
+      words[3] = swizzle | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    const auto depth_words = descriptor(Format::k32Float, DstSel(4, 0, 0, 1));
+    std::memcpy(reinterpret_cast<void *>(table), depth_words.data(), sizeof(depth_words));
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      auto &device = context.GetGraphics().device;
+
+      ImageDesc depth{};
+      depth.type = BindingType::DepthTarget;
+      depth.info.data = {target, 0};
+      depth.info.pixel_format = vk::Format::eD32Sfloat;
+      depth.info.guest_format = Format::k32Float;
+      depth.info.type = Prospero::ImageType::kColor2D;
+      depth.info.extent = extent;
+      depth.info.resources = {1, 1};
+      depth.info.bytes_per_block = 4;
+      depth.info.samples = 1;
+      depth.info.tile_mode = Prospero::TileMode::kLinear;
+      depth.info.UpdateSize();
+      depth.view_info.format = vk::Format::eD32Sfloat;
+      depth.view_info.type = vk::ImageViewType::e2D;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto size = depth.info.data.size;
+
+      IR::ImageResource stored{};
+      stored.resource_class = IR::ImageResourceClass::Storage;
+      stored.numeric_class = Prospero::TextureNumericClass::Float;
+      stored.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      stored.written = true;
+      IR::ImageResource sampled{};
+      sampled.resource_class = IR::ImageResourceClass::Sampled;
+      sampled.numeric_class = Prospero::TextureNumericClass::Float;
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.read = true;
+      const auto resolve = [&](const IR::ImageResource &resource,
+                               const std::array<uint32_t, 8> &words) {
+        IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(words.begin(), 8, value.dwords.begin());
+        return RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      };
+      const auto bits = [](float value) { return std::bit_cast<u32>(value); };
+      // The image's own first and last texel, without a refresh.
+      const auto holds = [&](ImageId id, float value) {
+        return ReadCachedTexel(name, context, id)[0] == bits(value) &&
+               ReadCachedTexel(name, context, id, {15, 7, 0})[0] == bits(value);
+      };
+      const auto guest = [&] {
+        u32 word = 0;
+        std::memcpy(&word, reinterpret_cast<const void *>(target), sizeof(word));
+        return word;
+      };
+      // A draw: the depth target is acquired, then written.
+      const auto draw_depth = [&](ImageId expected, float value) {
+        auto desc = depth;
+        const auto id = textures.FindImage(desc);
+        Require(name, "depth target",
+                id == expected && textures.FindDepthTarget(id, desc) != nullptr,
+                "the depth target changed image");
+        vk::ClearValue clear{};
+        clear.depthStencil.depth = value;
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, clear);
+      };
+      // A dispatch: the storage view is acquired, then written.
+      const auto store = [&](float value) {
+        const auto binding = resolve(stored, depth_words);
+        Require(name, "storage view",
+                binding.image_id &&
+                    textures.FindTexture(binding.image_id, binding.desc) != nullptr,
+                "depth bytes have no storage view");
+        auto &image = textures.GetImage(binding.image_id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                      {}, scheduler.Current().Handle());
+        vk::ClearColorValue color{};
+        color.float32[0] = value;
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
+        return binding.image_id;
+      };
+
+      auto first_desc = depth;
+      const auto depth_id = textures.FindImage(first_desc);
+      draw_depth(depth_id, 0.25f);
+      const auto images = Libs::Graphics::Image::serials.load();
+      auto binding = resolve(stored, depth_words);
+      const auto color_id = binding.image_id;
+      Require(name, "twins",
+              color_id && color_id != depth_id &&
+                  textures.GetImage(color_id).twin == depth_id &&
+                  textures.GetImage(depth_id).twin == color_id &&
+                  textures.GetImage(color_id).backing.format == vk::Format::eR32Sfloat &&
+                  textures.FindTexture(color_id, binding.desc) != nullptr &&
+                  holds(color_id, 0.25f),
+              "a storage view of depth bytes did not get a color image with the depth "
+              "image's contents beside it");
+      Require(name, "storage write", store(0.5f) == color_id && holds(depth_id, 0.25f),
+              "a storage write did not go to the color twin, or reached the depth image "
+              "before a use of it");
+      for (uint32_t round = 0; round < 3u; ++round) {
+        const float value = 0.03125f * static_cast<float>(round + 1u);
+        draw_depth(depth_id, value);
+        binding = resolve(stored, depth_words);
+        Require(name, "depth to color",
+                binding.image_id == color_id &&
+                    textures.FindTexture(color_id, binding.desc) != nullptr &&
+                    holds(color_id, value),
+                "a storage view missed what a draw wrote to the depth twin");
+        Require(name, "next storage write", store(value + 0.5f) == color_id,
+                "a storage write changed image");
+        auto desc = depth;
+        Require(name, "color to depth",
+                textures.FindImage(desc) == depth_id &&
+                    textures.FindDepthTarget(depth_id, desc) != nullptr &&
+                    holds(depth_id, value + 0.5f),
+                "a draw missed what a storage write left in the color twin");
+      }
+      Require(name, "no image per change", Libs::Graphics::Image::serials.load() == images + 1u,
+              "changing between the two uses created images");
+
+      // A sampled view reads the twin that holds the newest contents where it can.
+      draw_depth(depth_id, 0.125f);
+      binding = resolve(sampled, depth_words);
+      Require(name, "sampled depth twin",
+              binding.image_id == depth_id &&
+                  textures.FindTexture(depth_id, binding.desc) != nullptr &&
+                  !holds(color_id, 0.125f),
+              "a sampled view did not read the depth twin that held the newest contents, "
+              "or took a copy for it");
+      Require(name, "written color twin", store(0.375f) == color_id,
+              "a storage write changed image");
+      Require(name, "sampled color twin", resolve(sampled, depth_words).image_id == color_id,
+              "a sampled view did not read the color twin that held the newest contents");
+      // A view the depth image cannot provide takes a copy.
+      draw_depth(depth_id, 0.625f);
+      const auto raw_words = descriptor(Format::k8_8_8_8UNorm, DstSel(4, 5, 6, 7));
+      binding = resolve(sampled, raw_words);
+      Require(name, "color-only view",
+              binding.image_id == color_id &&
+                  textures.FindTexture(color_id, binding.desc) != nullptr &&
+                  holds(color_id, 0.625f),
+              "a view only the color twin provides missed the depth twin's contents");
+
+      // Range lookups and write-back take the twin that holds the newest contents.
+      Require(name, "newest color",
+              store(0.875f) == color_id &&
+                  textures.FindImageFromRange(target, size) == color_id &&
+                  !TextureCacheTestAccess::DownloadImageMemory(textures, depth_id),
+              "the depth twin stood for contents only the color twin held");
+      draw_depth(depth_id, 0.0625f);
+      Require(name, "newest depth",
+              textures.FindImageFromRange(target, size) == depth_id &&
+                  !TextureCacheTestAccess::DownloadImageMemory(textures, color_id) &&
+                  TextureCacheTestAccess::DownloadImageMemory(textures, depth_id),
+              "the color twin stood for contents only the depth twin held");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "write-back", guest() == bits(0.0625f),
+              "guest memory did not take the newest twin's contents");
+
+      // A CPU write reaches both twins.
+      const std::vector<u32> written(size / sizeof(u32), bits(0.3125f));
+      Libs::LibKernel::Memory::WriteBacking(target, written.data(), size);
+      Require(name, "CPU write",
+              context.InvalidateMemory(target, size) &&
+                  textures.GetImage(depth_id).IsCpuDirty() &&
+                  textures.GetImage(color_id).IsCpuDirty(),
+              "a CPU write did not dirty both twins");
+      binding = resolve(stored, depth_words);
+      auto dirty_desc = depth;
+      Require(name, "CPU contents",
+              binding.image_id == color_id &&
+                  textures.FindTexture(color_id, binding.desc) != nullptr &&
+                  holds(color_id, 0.3125f) && textures.FindImage(dirty_desc) == depth_id &&
+                  textures.FindDepthTarget(depth_id, dirty_desc) != nullptr &&
+                  holds(depth_id, 0.3125f) && !textures.GetImage(depth_id).IsCpuDirty() &&
+                  !textures.GetImage(color_id).IsCpuDirty(),
+              "a twin kept contents older than a CPU write");
+      // Twins in step are one image to a range lookup, as an image alone is.
+      const auto in_step = textures.FindImageFromRange(target, size / 2u);
+      Require(name, "range of twins in step", in_step == depth_id || in_step == color_id,
+              "a range lookup found two images where twins hold the same contents");
+
+      // A fill of the bytes clears the pair as one image.
+      Require(name, "fill",
+              textures.ClearImageFromBuffer(scheduler.Current(), target, size, bits(0.4375f)),
+              "a fill of a pair's bytes was not a clear");
+      binding = resolve(stored, depth_words);
+      auto filled_desc = depth;
+      Require(name, "filled twins",
+              textures.FindTexture(color_id, binding.desc) != nullptr &&
+                  holds(color_id, 0.4375f) && textures.FindImage(filled_desc) == depth_id &&
+                  textures.FindDepthTarget(depth_id, filled_desc) != nullptr &&
+                  holds(depth_id, 0.4375f),
+              "a twin missed the fill");
+
+      // A pass that draws through the depth twin's EQAA shadow leaves the newest depth there.
+      EqaaPlan plan{};
+      plan.mode = EqaaMode::AnchorShadow;
+      plan.guest_samples = 4;
+      plan.host_samples = 4;
+      plan.pattern.count = 4;
+      plan.pattern.xy = {0x62, 0xe6, 0x2a, 0xae};
+      if (textures.EqaaShadowSupported(depth_id, plan)) {
+        auto pass_desc = depth;
+        Require(name, "shadowed pass",
+                textures.FindImage(pass_desc) == depth_id &&
+                    textures.FindDepthTarget(depth_id, pass_desc, true) != nullptr &&
+                    textures.AcquireEqaaShadow(depth_id, pass_desc, plan,
+                                               vk::ImageAspectFlagBits::eDepth,
+                                               vk::ImageAspectFlagBits::eDepth) != nullptr,
+                "the depth twin has no EQAA shadow");
+        auto &shadow = textures.EqaaShadowImage(depth_id);
+        shadow.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                       {}, scheduler.Current().Handle());
+        const vk::ClearDepthStencilValue drawn{0.40625f, 0};
+        const vk::ImageSubresourceRange drawn_range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearDepthStencilImage(
+            shadow.backing.image, vk::ImageLayout::eTransferDstOptimal, &drawn, 1, &drawn_range);
+        binding = resolve(stored, depth_words);
+        Require(name, "shadowed depth twin",
+                binding.image_id == color_id &&
+                    textures.FindTexture(color_id, binding.desc) != nullptr &&
+                    holds(color_id, 0.40625f),
+                "a storage view missed what a pass drew through the depth twin's EQAA shadow");
+      }
+
+      // A clear may cover a part of the image, so the twin that lacks the newest contents takes
+      // them first; its next use takes nothing back.
+      Require(name, "write before a clear", store(0.5625f) == color_id,
+              "a storage write changed image");
+      vk::ClearValue direct{};
+      direct.depthStencil.depth = 0.28125f;
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, direct);
+      auto cleared_desc = depth;
+      Require(name, "clear of the older twin",
+              textures.FindImage(cleared_desc) == depth_id &&
+                  textures.FindDepthTarget(depth_id, cleared_desc) != nullptr &&
+                  holds(depth_id, 0.28125f),
+              "a use of a cleared twin took the other twin's older contents back");
+
+      // An unused twin whose contents the other one holds is collected alone, as a clean
+      // image is.
+      draw_depth(depth_id, 0.1875f);
+      const std::array old_color{color_id};
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, old_color, 64, UINT64_MAX);
+      textures.RunGarbageCollector();
+      Require(name, "idle color twin",
+              !TextureCacheTestAccess::Contains(textures, color_id) &&
+                  TextureCacheTestAccess::Contains(textures, depth_id) &&
+                  !textures.GetImage(depth_id).twin && holds(depth_id, 0.1875f),
+              "an idle twin without contents of its own was kept, or took the other along");
+      const auto second_color = store(0.6875f);
+      const std::array old_depth{depth_id};
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, old_depth, 128, UINT64_MAX);
+      textures.RunGarbageCollector();
+      Require(name, "idle depth twin",
+              !TextureCacheTestAccess::Contains(textures, depth_id) &&
+                  TextureCacheTestAccess::Contains(textures, second_color) &&
+                  holds(second_color, 0.6875f),
+              "an idle depth twin whose contents the color twin held was kept");
+      auto second_desc = depth;
+      const auto second_depth = textures.FindImage(second_desc);
+      Require(name, "new depth twin",
+              second_depth && textures.GetImage(second_depth).twin == second_color &&
+                  textures.FindDepthTarget(second_depth, second_desc) != nullptr &&
+                  holds(second_depth, 0.6875f),
+              "a draw after the collection lost the color twin's contents");
+      // The one that alone holds the newest contents stays without pressure. Under pressure
+      // it is written back, and takes along the twin that lacks them.
+      draw_depth(second_depth, 0.8125f);
+      const std::array newest{second_depth};
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, newest, 192, UINT64_MAX);
+      textures.RunGarbageCollector();
+      Require(name, "newest twin",
+              TextureCacheTestAccess::Contains(textures, second_depth) &&
+                  TextureCacheTestAccess::Contains(textures, second_color),
+              "the only holder of a pair's newest contents was collected without pressure");
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, newest, 256, 0);
+      textures.RunGarbageCollector();
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "pressured pair",
+              !TextureCacheTestAccess::Contains(textures, second_depth) &&
+                  !TextureCacheTestAccess::Contains(textures, second_color) &&
+                  guest() == bits(0.8125f),
+              "pressure kept a twin without the pair's contents, or lost the contents");
+
+      // A resident table that lists the color view selects the twin with the newest contents
+      // at each change.
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+      IR::ImageResource root{};
+      root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      IR::ImageHeapView view{};
+      // The image a table probe selects after a draw.
+      const auto selected = [&](uint32_t probe = 0) {
+        Require(name, "table", heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root},
+                                            view),
+                "the table was declined");
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+        return ImageHeapTestAccess::ImageOf(
+            heap, ImageHeapTestAccess::Views(heap)[0]->slots[probe * 8u]);
+      };
+      auto third_desc = depth;
+      const auto third_depth = textures.FindImage(third_desc);
+      draw_depth(third_depth, 0.21875f);
+      Require(name, "resident depth twin", selected() == third_depth,
+              "a resident color view of depth bytes did not select the depth image");
+      const auto third_color = store(0.71875f);
+      Require(name, "resident color twin",
+              third_color != third_depth && selected() == third_color &&
+                  holds(third_color, 0.71875f),
+              "a resident view kept the depth twin after a storage write to the color twin");
+      draw_depth(third_depth, 0.34375f);
+      Require(name, "resident depth twin again",
+              selected() == third_depth && !holds(third_color, 0.34375f),
+              "a resident view kept the color twin after a draw to the depth twin, or took a "
+              "copy for it");
+
+      // A storage write to a color twin that already holds the newest contents copies nothing,
+      // and moves the resident view all the same.
+      binding = resolve(sampled, raw_words);
+      Require(name, "resident twins in step",
+              binding.image_id == third_color &&
+                  textures.FindTexture(third_color, binding.desc) != nullptr &&
+                  holds(third_color, 0.34375f) && selected() == third_depth,
+              "a view only the color twin provides did not bring it in step, or moved the "
+              "resident view");
+      Require(name, "resident color twin again",
+              store(0.46875f) == third_color && selected() == third_color,
+              "a resident view kept the depth twin after a storage write that needed no copy");
+
+      // A depth target of another format replaces the depth twin, and the color twin with it.
+      Require(name, "last storage write", store(0.9375f) == third_color,
+              "a storage write changed image");
+      auto stencil_desc = depth;
+      stencil_desc.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      ImageInfo plane{};
+      plane.data = {stencil, 0};
+      plane.pixel_format = vk::Format::eR8Uint;
+      plane.guest_format = Format::k8UInt;
+      plane.type = Prospero::ImageType::kColor2D;
+      plane.extent = extent;
+      plane.resources = {1, 1};
+      plane.bytes_per_block = 1;
+      plane.samples = 1;
+      plane.tile_mode = Prospero::TileMode::kLinear;
+      plane.UpdateSize();
+      stencil_desc.info.stencil = plane.data;
+      stencil_desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+      stencil_desc.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      const auto stencil_id = textures.FindImage(stencil_desc);
+      Require(name, "replaced pair",
+              stencil_id && stencil_id != third_depth &&
+                  !TextureCacheTestAccess::Contains(textures, third_depth) &&
+                  !TextureCacheTestAccess::Contains(textures, third_color) &&
+                  textures.FindDepthTarget(stencil_id, stencil_desc) != nullptr &&
+                  holds(stencil_id, 0.9375f),
+              "a depth target of another format kept a twin of the one it replaced, or lost "
+              "the newest contents");
+      // A depth and stencil image takes a color twin of its depth plane as well.
+      const auto fourth_color = store(0.15625f);
+      auto stencil_use = stencil_desc;
+      Require(name, "depth and stencil twin",
+              fourth_color && textures.GetImage(fourth_color).twin == stencil_id &&
+                  textures.FindImage(stencil_use) == stencil_id &&
+                  textures.FindDepthTarget(stencil_id, stencil_use) != nullptr &&
+                  holds(stencil_id, 0.15625f),
+              "a depth and stencil image missed a storage write to its color twin");
+      // A shader stores to the stencil plane through a color twin of the plane: the depth image
+      // takes no storage view.
+      IR::ImageResource stencil_stored = stored;
+      stencil_stored.numeric_class = Prospero::TextureNumericClass::Uint;
+      auto plane_words = descriptor(Format::k8UInt, DstSel(4, 0, 0, 1));
+      plane_words[0] = static_cast<uint32_t>(stencil >> 8u);
+      // The first four stencil texels of the depth image.
+      const auto stencil_of = [&](ImageId id) {
+        auto readback = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0u});
+        vk::BufferImageCopy copy{};
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 1};
+        copy.imageExtent = {4, 1, 1};
+        textures.GetImage(id).Download(std::span<const vk::BufferImageCopy>(&copy, 1),
+                                       readback.buffer, 0, readback.size);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+            nullptr, 1, &barrier, 0, nullptr);
+        scheduler.Finish();
+        const auto word = ReadBuffer(name, readback, 1)[0];
+        DestroyBuffer(&readback);
+        return word;
+      };
+      const auto plane_holds = [&](ImageId id, uint32_t value) {
+        return ReadCachedTexel(name, context, id, {}, {4, 1, 1})[0] == value * 0x01010101u;
+      };
+      // A draw that writes stencil.
+      const auto draw_stencil = [&](uint32_t value) {
+        vk::ClearValue clear{};
+        clear.depthStencil.stencil = value;
+        TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), stencil_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, clear);
+      };
+      // A dispatch that stores to the plane.
+      const auto store_stencil = [&](uint32_t value) {
+        const auto stored_plane = resolve(stencil_stored, plane_words);
+        Require(name, "stencil storage view",
+                stored_plane.image_id &&
+                    textures.FindTexture(stored_plane.image_id, stored_plane.desc) != nullptr,
+                "a stencil plane has no storage view");
+        auto &image = textures.GetImage(stored_plane.image_id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                      {}, scheduler.Current().Handle());
+        vk::ClearColorValue color{};
+        color.uint32[0] = value;
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
+        return stored_plane.image_id;
+      };
+      draw_stencil(0x5a);
+      const auto plane_images = Libs::Graphics::Image::serials.load();
+      binding = resolve(stencil_stored, plane_words);
+      const auto plane_color = binding.image_id;
+      Require(name, "stencil plane twin",
+              plane_color && plane_color != stencil_id &&
+                  textures.GetImage(plane_color).backing.format == vk::Format::eR8Uint &&
+                  textures.GetImage(plane_color).twin &&
+                  textures.GetImage(textures.GetImage(plane_color).twin).depth_id == stencil_id &&
+                  textures.FindTexture(plane_color, binding.desc) != nullptr &&
+                  plane_holds(plane_color, 0x5a),
+              "a storage view of a stencil plane did not get a color image with the plane's "
+              "contents");
+      Require(name, "stencil store",
+              store_stencil(0xa5) == plane_color && stencil_of(stencil_id) == 0x5a5a5a5au,
+              "a store to a stencil plane changed image, or reached the depth image before a "
+              "use of it");
+      binding = resolve(stencil_stored, plane_words);
+      Require(name, "stencil twin in step",
+              textures.FindTexture(plane_color, binding.desc) != nullptr &&
+                  plane_holds(plane_color, 0xa5),
+              "a second use of the plane's color twin took the plane's older contents");
+      auto plane_use = stencil_desc;
+      Require(name, "stored stencil",
+              textures.FindImage(plane_use) == stencil_id &&
+                  textures.FindDepthTarget(stencil_id, plane_use) != nullptr &&
+                  stencil_of(stencil_id) == 0xa5a5a5a5u,
+              "a draw missed what a shader stored to the stencil plane");
+      draw_stencil(0x3c);
+      binding = resolve(stencil_stored, plane_words);
+      Require(name, "drawn stencil",
+              binding.image_id == plane_color &&
+                  textures.FindTexture(plane_color, binding.desc) != nullptr &&
+                  plane_holds(plane_color, 0x3c) &&
+                  Libs::Graphics::Image::serials.load() == plane_images + 1u,
+              "a storage view missed the stencil a draw wrote, or the change created images");
+      // A clear of the plane takes its twin's newer contents first; its next use takes nothing
+      // back.
+      Require(name, "store before a stencil clear", store_stencil(0x77) == plane_color,
+              "a store to a stencil plane changed image");
+      draw_stencil(0x11);
+      plane_use = stencil_desc;
+      Require(name, "clear of the older stencil plane",
+              textures.FindImage(plane_use) == stencil_id &&
+                  textures.FindDepthTarget(stencil_id, plane_use) != nullptr &&
+                  stencil_of(stencil_id) == 0x11111111u,
+              "a use of a cleared stencil plane took its twin's older contents back");
+
+      // A plane that HTile compresses takes no guest bytes, and takes a store all the same.
+      auto compressed_use = stencil_desc;
+      compressed_use.info.metadata.kind = ImageMetadataKind::Htile;
+      compressed_use.info.metadata.range = {base + 0x30000, 0x8000};
+      compressed_use.info.metadata.stencil_compressed = true;
+      Require(name, "store to a compressed plane", store_stencil(0x4b) == plane_color,
+              "a store to a stencil plane changed image");
+      Require(name, "compressed stencil plane",
+              textures.FindImage(compressed_use) == stencil_id &&
+                  textures.FindDepthTarget(stencil_id, compressed_use) != nullptr &&
+                  stencil_of(stencil_id) == 0x4b4b4b4bu,
+              "a draw missed what a shader stored to a compressed stencil plane");
+      draw_stencil(0x2d);
+      // Its record stays dirty after a CPU write, and a draw to the depth plane leaves it so.
+      const std::vector<uint8_t> plane_bytes(plane.data.size, uint8_t{0x99});
+      Libs::LibKernel::Memory::WriteBacking(stencil, plane_bytes.data(), plane_bytes.size());
+      Require(name, "CPU write to a compressed plane",
+              context.InvalidateMemory(stencil, plane_bytes.size()),
+              "the stencil plane was not mapped");
+      vk::ClearValue plane_depth{};
+      plane_depth.depthStencil.depth = 0.5f;
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), stencil_id,
+          {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, plane_depth);
+      binding = resolve(stencil_stored, plane_words);
+      Require(name, "drawn compressed stencil",
+              binding.image_id == plane_color &&
+                  textures.FindTexture(plane_color, binding.desc) != nullptr &&
+                  plane_holds(plane_color, 0x2d),
+              "a storage view missed the stencil a draw wrote to a compressed plane");
+      plane_use = stencil_desc;
+      Require(name, "plain plane again",
+              textures.FindImage(plane_use) == stencil_id &&
+                  textures.FindDepthTarget(stencil_id, plane_use) != nullptr,
+              "the depth target changed image");
+
+      // Only the depth twin holds the stencil plane: it stays while its color twin holds the
+      // depth, and under pressure it keeps a color twin that alone holds the newest depth.
+      binding = resolve(stored, depth_words);
+      Require(name, "color twin in step",
+              binding.image_id == fourth_color &&
+                  textures.FindTexture(fourth_color, binding.desc) != nullptr,
+              "a storage view of the depth plane changed image");
+      const std::array old_stencil{stencil_id};
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, old_stencil, 320, UINT64_MAX);
+      textures.RunGarbageCollector();
+      Require(name, "idle depth and stencil twin",
+              TextureCacheTestAccess::Contains(textures, stencil_id) &&
+                  TextureCacheTestAccess::Contains(textures, fourth_color),
+              "a depth and stencil twin was collected for the depth its color twin held");
+      Require(name, "write to the stencil pair", store(0.84375f) == fourth_color,
+              "a storage write changed image");
+      const std::array newest_color{fourth_color};
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, newest_color, 384, 0);
+      textures.RunGarbageCollector();
+      Require(name, "pressured stencil pair",
+              TextureCacheTestAccess::Contains(textures, stencil_id) &&
+                  TextureCacheTestAccess::Contains(textures, fourth_color),
+              "pressure collected a color twin and, with it, the stencil plane of its depth "
+              "twin");
+
+      // The color twin of a stencil plane alone holds a store until the depth image takes it:
+      // pressure keeps it, and freeing it leaves the plane with its depth image.
+      Require(name, "store to keep", store_stencil(0x66) == plane_color,
+              "a store to a stencil plane changed image");
+      const std::array newest_plane{plane_color};
+      TextureCacheTestAccess::ConfigureGarbageCollection(textures, newest_plane, 448, 0);
+      textures.RunGarbageCollector();
+      Require(name, "pressured stencil twin",
+              TextureCacheTestAccess::Contains(textures, plane_color),
+              "pressure collected the only holder of a stored stencil plane");
+      const auto planes = textures.GetImage(stencil_id).stencil_ids.size();
+      TextureCacheTestAccess::DeleteImage(textures, plane_color);
+      Require(name, "freed stencil twin",
+              !TextureCacheTestAccess::Contains(textures, plane_color) &&
+                  textures.GetImage(stencil_id).stencil_ids.size() == planes,
+              "freeing a stencil plane's color twin took the plane from its depth image");
+
+      // A resident view of the stencil plane samples the depth image, which takes a store to
+      // the plane's color twin at the next draw, whatever layout the store found it in.
+      Libs::LibKernel::Memory::WriteBacking(table + 32u, plane_words.data(), sizeof(plane_words));
+      Require(name, "table write", context.InvalidateMemory(table + 32u, sizeof(plane_words)),
+              "the table was not mapped");
+      Require(name, "resident stencil plane", selected(1) == stencil_id,
+              "a resident view of a stencil plane did not select its depth image");
+      draw_stencil(0x21);
+      Require(name, "table again",
+              heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view),
+              "the table was declined");
+      heap.Rebind(executor);
+      const auto stored_plane = store_stencil(0x77);
+      Require(name, "resident stored stencil",
+              stored_plane != stencil_id && selected(1) == stencil_id &&
+                  stencil_of(stencil_id) == 0x77777777u,
+              "a resident view of a stencil plane missed a store to the plane's color twin");
+
+      // A record that another depth image takes for its own plane gives up its twin.
+      auto other_desc = stencil_desc;
+      other_desc.info.data.address = target + 0x8000;
+      const auto other_depth = textures.FindImage(other_desc);
+      TextureCacheTestAccess::AssociateStencil(textures, other_depth, plane.data);
+      bool paired = true;
+      for (const auto id : TextureCacheTestAccess::FindImages(textures, stencil, plane.data.size)) {
+        const auto &image = textures.GetImage(id);
+        paired &= !image.twin || (textures.GetImage(image.twin).twin == id &&
+                                  !(image.depth_id && textures.GetImage(image.twin).depth_id));
+      }
+      Require(name, "plane of another depth image",
+              other_depth && other_depth != stencil_id && paired,
+              "a stencil record that changed depth image kept the twin of its old plane");
+
+      // A view that needs a color image of its own replaces the color twin, and the depth twin
+      // with it: no holder of the old contents stays beside the new image.
+      const auto reversed =
+          resolve(sampled, descriptor(Format::k10_11_11Float, DstSel(4, 5, 6, 7))).image_id;
+      Require(name, "replaced color twin",
+              reversed && reversed != fourth_color &&
+                  !TextureCacheTestAccess::Contains(textures, stencil_id) &&
+                  !TextureCacheTestAccess::Contains(textures, fourth_color),
+              "a color image that replaced a twin left the other twin cached");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "twin unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "twin release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckDepthBitsCopy() {
     constexpr const char *name = "DepthBitsCopy";
     constexpr uintptr_t base = 0x0000000205000000ull;
@@ -63537,6 +64212,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBgra16Readback();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-twins-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthColorTwins();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
     return 0;
@@ -63945,6 +64625,7 @@ int main(int argc, char **argv) {
   vulkan.CheckAddressRangeBacking();
   vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckDepthColorTwins();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorage();

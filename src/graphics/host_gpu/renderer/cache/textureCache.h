@@ -79,6 +79,9 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// The color image a shader stores through over a stencil plane, whose depth image takes no
+	// storage view; the plane itself where the two do not copy into each other.
+	[[nodiscard]] ImageId StencilTwin(ImageId plane, const ImageInfo& requested);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -241,6 +244,22 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// A depth image and the color image of the same guest bytes are twins, and so are a stencil
+	// plane and the color image of its bytes. Whether the image's twin holds contents the image
+	// lacks.
+	[[nodiscard]] bool TwinNewer(const Image& image) const;
+	// Copies the twin's newer contents into the image.
+	void SyncTwin(ImageId id);
+	// Copies a stencil plane between its depth image and the color image of its bytes.
+	void CopyStencil(ImageId plane, ImageId color, bool to_color);
+	// Resident heaps that sample the written image's twin resolve again: to the image, or to a
+	// copy of its contents.
+	void TwinWritten(const Image& image) const;
+	// Frees the image's twin, a second holder of the contents the image holds.
+	void FreeTwin(Image& image);
+	// The depth twin in place of a color image that lacks its contents, for a sampled view of
+	// `requested` that a depth view provides.
+	[[nodiscard]] ImageId       SampledTwin(ImageId id, const ImageInfo& requested) const;
 	void RefreshImage(ImageId id, vk::ImageAspectFlags settle = EqaaAllAspects);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);

@@ -857,6 +857,8 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	add_test(NAME texture_cache_image_twins
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-twins-only)
 	add_test(NAME texture_cache_memory_residency
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --memory-residency-only)
 	add_test(NAME texture_cache_image_heap_changes

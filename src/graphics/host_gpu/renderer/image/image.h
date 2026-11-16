@@ -186,6 +186,11 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
+	// The color image of a depth image's guest bytes or of a stencil plane's, or the reverse:
+	// both stay cached while the guest uses the bytes both ways.
+	ImageId twin {};
+	// The twin's content stamp when this image last held the same contents.
+	uint64_t         twin_stamp         = 0;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.

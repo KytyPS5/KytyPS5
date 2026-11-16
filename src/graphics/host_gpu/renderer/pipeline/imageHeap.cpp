@@ -515,6 +515,11 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	};
 	std::erase_if(m_changes, [&](const Image::HeapChange& change) {
 		const auto id = CurrentImage(change);
+		// An image whose twin holds newer contents needs new elements too: they resolve to the
+		// twin where it provides their view, and to a copy of its contents where it does not.
+		if (id && textures.TwinNewer(textures.m_slot_images[id])) {
+			return false;
+		}
 		if (id && shadowed_target(textures.m_slot_images[id])) {
 			m_unsettled.emplace_back(change.serial, id);
 		} else if (id) {

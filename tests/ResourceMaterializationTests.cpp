@@ -157,8 +157,8 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   program.descriptor_sources[image1].dwords[0] = Value(1u);
   program.descriptor_sources[image1].dwords[1] = Value(static_cast<uint32_t>(
       Libs::Graphics::Prospero::BufferFormat::k11_11_10UInt) << 20u);
-  program.descriptor_sources[image1].dwords[3] = Value(static_cast<uint32_t>(
-      Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  program.descriptor_sources[image1].dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+      uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   for (uint32_t index = 0; index < 2; ++index) {
     auto &value = block.AppendNewInst(
         ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});

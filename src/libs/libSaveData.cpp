@@ -266,6 +266,7 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
+static constexpr uint32_t SAVE_DATA_EVENT_TYPE_CONVERT_END       = 5u;
 
 static constexpr size_t   SAVE_DATA_MEMORY_MAX_SIZE      = 32 * 1024 * 1024;
 static constexpr uint32_t SAVE_DATA_MEMORY_SET_PARAM     = 1u;
@@ -1246,15 +1247,34 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 	uint64_t blocks = 0;
-	if (read_save_blocks(source, &blocks) == OK) {
+	int      status = read_save_blocks(source, &blocks);
+	if (status == OK) {
 		if (convert->dst_blocks == blocks) {
 			return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 		}
 		if (convert->dst_blocks < blocks) {
 			return SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC;
 		}
+		status = write_save_file(source / "sce_sys" / "blocks.bin", &convert->dst_blocks,
+		                         sizeof(convert->dst_blocks));
 	}
-	EXIT("save data conversion of %s is not implemented\n", convert->src_dir_name->data);
+	const auto* dir_name = convert->src_dir_name;
+	if (status == OK && convert->dst_dir_name != nullptr) {
+		std::error_code error;
+		std::filesystem::rename(
+		    source, save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id),
+		    error);
+		if (error) {
+			status = SAVE_DATA_ERROR_INTERNAL;
+		} else {
+			dir_name = convert->dst_dir_name;
+		}
+	}
+	SceSaveDataTitleId title {};
+	std::snprintf(title.data, sizeof(title.data), "%s", get_title_id().c_str());
+	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, &title, dir_name,
+	                      status);
+	return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {

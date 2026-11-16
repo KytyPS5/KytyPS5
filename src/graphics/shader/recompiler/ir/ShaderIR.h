@@ -110,8 +110,30 @@ struct MemoryInfo {
 		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
 		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
 	}
+	// Raw 32-bit integer atomics through a V# selected at runtime: they run on guest memory by
+	// device address, as the stores write it.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		if (formatted || typed || data_bits != 32u) return false;
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return true;
+			default: return false;
+		}
+	}
+	[[nodiscard]] bool SupportsIndirectBufferWrite(ValueOpcode opcode) const {
+		return SupportsIndirectBufferStore(opcode) || SupportsIndirectBufferAtomic(opcode);
+	}
 	[[nodiscard]] bool SupportsIndirectBufferAccess(ValueOpcode opcode) const {
-		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferStore(opcode);
+		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferWrite(opcode);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;

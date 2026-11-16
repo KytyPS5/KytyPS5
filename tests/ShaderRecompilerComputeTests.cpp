@@ -38352,6 +38352,86 @@ TestCase BufferStoresGpuSelectedDescriptors() {
   return test;
 }
 
+// SAROS (PPSA07631) in PS5 Pro mode closed at boot on cs 12070dfbb803ca3b: it ORs bits into a mask
+// through a V# whose base a uniform branch on user data takes from one of two user-data bases (low
+// and high halves in separate registers), offset by the low dword of an S_LSHL_B64 of a loaded
+// dword and an unrelated register, and whose record count it loads. The atomic runs on the guest
+// memory by device address and returns the old value.
+TestCase BufferAtomicThroughUserDataBases(bool second) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 FirstByte = 2048;
+  constexpr u32 SecondByte = 3072;
+  constexpr u32 Index = 3;
+  TestCase test;
+  test.name = second ? "BufferAtomicThroughUserDataBases1" : "BufferAtomicThroughUserDataBases0";
+  test.initial.resize(1024);
+  for (u32 i = 0; i < test.initial.size(); ++i) {
+    test.initial[i] = 0x5a000000u + i;
+  }
+  test.initial[64] = 8; // The record count, loaded on the GPU.
+  test.initial[65] = 2; // The offset in dwords, loaded on the GPU.
+  test.expected = test.initial;
+  const u32 target = ((second ? SecondByte : FirstByte) + 8u + Index * 4u) / 4u;
+  test.expected[target] |= 0x00f0u;
+  test.expected[0] = test.initial[target];
+  test.has_user_data = true;
+  test.user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  test.user_data[3] = 3u << 28u;
+  test.user_data[50] = 1u << 20u;
+  test.user_data[51] = 3u << 28u;
+  test.user_data[4] = static_cast<u32>(GuestBase + FirstByte);
+  test.user_data[5] = second ? 1u : 0u;
+  test.user_data[6] = static_cast<u32>(GuestBase >> 32u);
+  test.user_data[7] = static_cast<u32>(GuestBase + SecondByte);
+  test.user_data[16] = static_cast<u32>(GuestBase >> 32u);
+  test.user_data[9] = 0xdeadbeefu; // The high dword of the shifted pair.
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1))); // s_mov_b64 exec, 1
+  AppendVMovU32(&code, 30, 64 * 4);
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 26, Vgpr(0))); // v_readfirstlane_b32 s26, v0
+  AppendVMovU32(&code, 30, 65 * 4);
+  AppendBufferLoadDword(&code, 0, 30);
+  code.push_back(EncodeVop1(0x02, 10, Vgpr(0))); // v_readfirstlane_b32 s10, v0
+  code.push_back(EncodeSMovB32(11, 9));
+  code.push_back(EncodeSop2(0x1f, 12, 10, InlineU32(2))); // s_lshl_b64 s[12:13], s[10:11], 2
+  code.push_back(EncodeSopc(0x06, InlineU32(0), 5)); // s_cmp_eq_u32 0, s5
+  const auto to_second = code.size();
+  code.push_back(EncodeSopp(0x04)); // s_cbranch_scc0
+  code.push_back(EncodeSop2(0x00, 24, 4, 12)); // s_add_u32 s24, s4, s12
+  code.push_back(EncodeSop2(0x04, 25, 6, InlineU32(0))); // s_addc_u32 s25, s6, 0
+  code.push_back(EncodeSop2(0x10, 25, 25, 255)); // s_or_b32 s25, s25, stride 4
+  code.push_back(0x40000u);
+  const auto to_join = code.size();
+  code.push_back(EncodeSopp(0x02)); // s_branch
+  code[to_second] = EncodeSopp(0x04, static_cast<int16_t>(code.size() - to_second - 1u));
+  code.push_back(EncodeSop2(0x00, 24, 7, 12));
+  code.push_back(EncodeSop2(0x04, 25, 16, InlineU32(0)));
+  code.push_back(EncodeSop2(0x10, 25, 25, 255));
+  code.push_back(0x40000u);
+  code[to_join] = EncodeSopp(0x02, static_cast<int16_t>(code.size() - to_join - 1u));
+  AppendSMovLiteral(&code, 27, 0x16204u);
+  AppendVMovU32(&code, 1, Index);
+  AppendVMovU32(&code, 2, 0x00f0u);
+  code.push_back(EncodeMubuf0(0x3a, 0, true, false, true)); // buffer_atomic_or v2, v1, s[24:27] idxen glc
+  code.push_back(EncodeMubuf1(2, 6, 1));
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_writes = {{GuestBase, true}};
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_MOV_B32, O::S_LSHL_B64, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::S_ADD_U32,
+                  O::S_ADDC_U32, O::S_OR_B32, O::S_BRANCH, O::BUFFER_ATOMIC_OR, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "OpAtomicOr"};
+  return test;
+}
+
+TestCase BufferAtomicThroughFirstUserDataBase() { return BufferAtomicThroughUserDataBases(false); }
+
+TestCase BufferAtomicThroughSecondUserDataBase() { return BufferAtomicThroughUserDataBases(true); }
+
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -50944,6 +51024,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferStoresGpuSelectedDescriptors);
+  AddCase(BufferAtomicThroughFirstUserDataBase);
+  AddCase(BufferAtomicThroughSecondUserDataBase);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
@@ -58461,6 +58543,8 @@ int main(int argc, char **argv) {
     CheckRuntimeBufferRecords(vulkan);
     CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferStoresGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferAtomicThroughFirstUserDataBase());
+    RunCase(&vulkan, BufferAtomicThroughSecondUserDataBase());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());

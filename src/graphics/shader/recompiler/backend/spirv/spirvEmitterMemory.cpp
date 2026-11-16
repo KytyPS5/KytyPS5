@@ -1336,6 +1336,39 @@ void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t c
 	else EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), store);
 }
 
+// A 32-bit integer atomic through a V# selected at runtime (IR::MemoryInfo::SupportsIndirectBufferAtomic):
+// it runs on the guest memory by device address where StoreIndirectBuffer() writes it. Memory without a
+// cached buffer records a fault and returns zero, as an indirect load reads it.
+uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto exec   = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto atomic = [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto valid  = AndCondition(
+		    state, Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
+		    IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false));
+		// RDNA2 DWORD accesses ignore the two low address bits.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		const auto run = [&](uint32_t bda) {
+			const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+			return EmitValueOrZeroIfCondition(state, present, [&]() {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
+				const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
+				RecordBdaWrite(state, BdaPageIndex(state, aligned));
+				return old;
+			});
+		};
+		if (state.converged_calls)
+			return run(GetBdaPointerMasked(state, aligned, AndCondition(state, valid, exec)));
+		return EmitValueOrZeroIfCondition(state, valid, [&]() { return run(GetBdaPointer(state, aligned)); });
+	};
+	if (state.converged_calls) return atomic();
+	return EmitValueOrZeroIfCondition(state, exec, atomic);
+}
+
 // One component of a formatted load through a V# selected at runtime: `selector` is the
 // component's DST_SEL (0 and 1 are constants, 4..7 the format's X..W).
 uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
@@ -2215,6 +2248,7 @@ std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::ar
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) return AtomicIndirectBuffer(ctx, inst);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;

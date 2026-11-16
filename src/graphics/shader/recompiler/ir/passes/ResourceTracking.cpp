@@ -176,7 +176,10 @@ const Inst* ExtractedComponent(const Inst& inst) {
 // operands. Lane masks and conditions (U1 operands) select between values rather than compute
 // them, and memory results are data, so the walk does not follow them. A constant-index extract
 // of a composite constructor follows only the selected operand, so the dwords of a pair built
-// with CompositeConstruct keep their own sources.
+// with CompositeConstruct keep their own sources, and the low dword of a 64-bit sum, difference,
+// AND or left shift follows only the low dwords of its 64-bit operands: SAROS's
+// cs 12070dfbb803ca3b offsets its base {s3, s0} by the low dword of S_LSHL_B64 {loaded dword,
+// VCC_HI}, and compiled for wave32 VCC_HI is the initial s15, which is not part of the base.
 std::vector<uint32_t> AddressUserDataSources(Value root) {
 	constexpr size_t         MaxVisited = 256;
 	std::vector<uint32_t>    registers;
@@ -186,6 +189,27 @@ std::vector<uint32_t> AddressUserDataSources(Value root) {
 		    std::ranges::find(visited, inst) == visited.end()) {
 			visited.push_back(inst);
 		}
+	};
+	const auto visit_low = [&](auto&& self, Value wide, uint32_t depth) -> void {
+		const auto* inst = wide.Resolve().TryInstruction();
+		if (inst == nullptr) return;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::CompositeConstructU64) {
+			visit(inst->Arg(0).Resolve().TryInstruction());
+			return;
+		}
+		if (depth < 8u && (op == ValueOpcode::IAdd64 || op == ValueOpcode::ISub64 ||
+		                   op == ValueOpcode::BitwiseAnd64 || op == ValueOpcode::ShiftLeftLogical64)) {
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				if (inst->Arg(i).Resolve().GetType() == Type::U64) {
+					self(self, inst->Arg(i), depth + 1u);
+				} else {
+					visit(inst->Arg(i).Resolve().TryInstruction());
+				}
+			}
+			return;
+		}
+		visit(inst);
 	};
 	visit(root.Resolve().TryInstruction());
 	for (size_t next = 0; next < visited.size(); next++) {
@@ -206,11 +230,47 @@ std::vector<uint32_t> AddressUserDataSources(Value root) {
 			visit(component);
 			continue;
 		}
+		if (op == ValueOpcode::CompositeExtractU64 && inst->Arg(1).Resolve().IsImmediate() &&
+		    inst->Arg(1).Resolve().U32() == 0u) {
+			visit_low(visit_low, inst->Arg(0), 0u);
+			continue;
+		}
 		for (size_t i = 0; i < inst->NumArgs(); i++) {
 			visit(inst->Arg(i).Resolve().TryInstruction());
 		}
 	}
 	return registers;
+}
+
+// Whether a dword of a V# derives from memory the shader reads, within a bounded walk of its
+// operands (as AddressUserDataSources(), through Phis): the GPU computes such a V#. One whose
+// dwords all come from user data is the host's to bind, as a buffer a loop carries for instance.
+bool DerivesFromMemory(const Inst& handle) {
+	constexpr size_t         MaxVisited = 256;
+	std::vector<const Inst*> visited;
+	const auto               visit = [&](Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst != nullptr && inst->GetType() != Type::U1 && visited.size() < MaxVisited &&
+		    std::ranges::find(visited, inst) == visited.end()) {
+			visited.push_back(inst);
+		}
+	};
+	for (size_t i = 0; i < handle.NumArgs(); i++) {
+		visit(handle.Arg(i));
+	}
+	for (size_t next = 0; next < visited.size(); next++) {
+		const auto* inst = visited[next];
+		const auto  op   = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			return true;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			visit(inst->Arg(i));
+		}
+	}
+	return false;
 }
 
 Value CanonicalizeSampleAdjustDword3(Value value) {
@@ -5405,11 +5465,6 @@ private:
 	// buffer only records a fault and reads zero.
 	// Whether a user-data register pair is the base of the V#; it is recorded as a DMA base.
 	bool CollectDmaBase(const Inst& handle) {
-		const auto low      = AddressUserDataSources(handle.Arg(0));
-		const auto high     = AddressUserDataSources(handle.Arg(1));
-		const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
-			return std::ranges::find(registers, reg) != registers.end();
-		};
 		const auto add = [&](uint32_t low_reg, uint32_t high_reg) {
 			const std::array<uint32_t, 2> pair {low_reg, high_reg};
 			auto&                         bases = m_info.dma_base_registers;
@@ -5417,19 +5472,52 @@ private:
 				bases.push_back(pair);
 			}
 		};
-		bool found = false;
-		for (const auto reg: low) {
-			if (contains(high, reg + 1u) && !contains(low, reg + 1u)) {
-				found = true;
-				add(reg, reg + 1u);
+		const auto collect = [&](Value low_value, Value high_value) {
+			const auto low      = AddressUserDataSources(low_value);
+			const auto high     = AddressUserDataSources(high_value);
+			const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
+				return std::ranges::find(registers, reg) != registers.end();
+			};
+			bool found = false;
+			for (const auto reg: low) {
+				if (contains(high, reg + 1u) && !contains(low, reg + 1u)) {
+					found = true;
+					add(reg, reg + 1u);
+				}
 			}
+			// The two halves of the base in user data that are not a pair: SAROS's cs
+			// bbd2706c785082e8 (at boot) stores its records through {s3, s0 | stride 32, count,
+			// format} and {s6 + 0x100, s1 | stride, count, format}, with s0 and s1 the high 16 bits
+			// of the bases.
+			if (!found && low.size() == 1u && high.size() == 1u && low[0] != high[0]) {
+				found = true;
+				add(low[0], high[0]);
+			}
+			return found;
+		};
+		if (collect(handle.Arg(0), handle.Arg(1))) {
+			return true;
 		}
-		// The two halves of the base in user data that are not a pair: SAROS's cs bbd2706c785082e8
-		// (at boot) stores its records through {s3, s0 | stride 32, count, format} and
-		// {s6 + 0x100, s1 | stride, count, format}, with s0 and s1 the high 16 bits of the bases.
-		if (!found && low.size() == 1u && high.size() == 1u && low[0] != high[0]) {
-			found = true;
-			add(low[0], high[0]);
+		// A V# a uniform branch takes from one of several bases: the dwords are Phis of one block,
+		// and each incoming edge brings one base. SAROS's cs 12070dfbb803ca3b (PS5 Pro mode) ORs
+		// bits through {s6 + offset, s1 | stride 4, count, format} or {s3 + offset, s0 | stride 4,
+		// count, format}, by user data s2.
+		const auto* low_phi  = handle.Arg(0).Resolve().TryInstruction();
+		const auto* high_phi = handle.Arg(1).Resolve().TryInstruction();
+		if (low_phi == nullptr || high_phi == nullptr || low_phi->GetOpcode() != ValueOpcode::Phi ||
+		    high_phi->GetOpcode() != ValueOpcode::Phi || low_phi->Parent() != high_phi->Parent() ||
+		    low_phi->NumArgs() != high_phi->NumArgs() || low_phi->NumArgs() < 2u) {
+			return false;
+		}
+		bool found = false;
+		for (size_t arm = 0; arm < low_phi->NumArgs(); ++arm) {
+			size_t other = 0;
+			while (other < high_phi->NumArgs() && high_phi->PhiBlock(other) != low_phi->PhiBlock(arm)) {
+				++other;
+			}
+			if (other < high_phi->NumArgs() && collect(low_phi->Arg(arm), high_phi->Arg(other))) {
+				found = true;
+			}
 		}
 		return found;
 	}
@@ -5518,7 +5606,7 @@ private:
 			    (memory.kind != ResourceKind::Buffer && memory.kind != ResourceKind::IndirectBuffer)) {
 				return false;
 			}
-			if (memory.SupportsIndirectBufferStore(op)) {
+			if (memory.SupportsIndirectBufferWrite(op)) {
 				written = true;
 			} else if (!memory.SupportsIndirectBufferLoad(op)) {
 				return false;
@@ -5752,28 +5840,30 @@ private:
 				// The host prepares V# table targets at compute dispatch only.
 				const bool indirect_store =
 				    m_program.stage == ShaderType::Compute && memory.kind == ResourceKind::Buffer &&
-				    memory.SupportsIndirectBufferStore(op) &&
+				    memory.SupportsIndirectBufferWrite(op) &&
 				    MatchIndirectWriteTable(*handle, table_source, table_offset);
 				if (indirect_store) {
 					AddIndirectWriteTable(table_source, table_offset, flags.pc);
 				} else if (m_program.stage == ShaderType::Compute && handle != nullptr &&
-				           memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferStore(op) &&
-				           CollectDmaBase(*handle)) {
-					// A raw store through a V# whose fields the GPU computes from a base in user data:
-					// Gran Turismo 7's cs f0ff5e4576313e72 (PS5 Pro mode, loading a race) writes lists
-					// at its user-data base + 0x100 with a record count it sums from two counters it
-					// loads. Such a store writes guest memory by device address, like a FLAT store: the
-					// host caches the memory at the base before the shader runs, and the pages it really
-					// wrote come back through the write bitmap. Compute shaders only, as V# table
-					// stores: the host prepares them at dispatch.
+				           memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferWrite(op) &&
+				           DerivesFromMemory(*handle) && CollectDmaBase(*handle)) {
+					// A raw store or atomic through a V# whose fields the GPU computes from a base in
+					// user data: Gran Turismo 7's cs f0ff5e4576313e72 (PS5 Pro mode, loading a race)
+					// writes lists at its user-data base + 0x100 with a record count it sums from two
+					// counters it loads; SAROS's cs 12070dfbb803ca3b (PS5 Pro mode, at boot) ORs bits
+					// into a mask at one of two user-data bases. Such an access writes guest memory by
+					// device address, like a FLAT store: the host caches the memory at the base before
+					// the shader runs, and the pages it really wrote come back through the write
+					// bitmap. Compute shaders only, as V# table stores: the host prepares them at
+					// dispatch.
 					m_program.has_address_writes = true;
 				} else if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                               : ResourceKind::Buffer) ||
 				           !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or 32-bit formatted load "
-					     "or a raw DWORD store");
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or 32-bit formatted load, "
+					     "or a raw DWORD store or 32-bit integer atomic from a user-data base");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_dma_tracked                           = true;

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/precompileNotice.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -1073,7 +1074,8 @@ void Presenter::Impl::Present() {
 		auto&      command = present_scheduler.BeginCommand();
 		const bool draw_system_overlay = [&] {
 			ScopedTimer overlay_time(Counter::OverlayNs);
-			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			return (overlay_visual.active || PerformanceOverlayEnabled() ||
+			        ManifestProgressVisible()) &&
 			       swapchain.PrepareSystemOverlay();
 		}();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],

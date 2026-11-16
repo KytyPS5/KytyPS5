@@ -896,6 +896,8 @@ private:
 		uint32_t running         = 0;
 		// Code of listed shaders still arrives from the code store or the game's files.
 		bool     scanning        = false;
+		// Modules built, found compiled already, or failed.
+		uint64_t modules_done    = 0;
 		uint64_t pipelines_done  = 0;
 		uint32_t threads         = 0;
 		// PrecompileMean of a module build and of a graphics pipeline creation.

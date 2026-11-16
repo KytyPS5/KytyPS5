@@ -57,7 +57,26 @@ void HidePrecompileNotice();
 // the game waits).
 bool ProcessPrecompileNoticeInput(const SDL_Event& event);
 
-// Must run between ImGui::NewFrame() and ImGui::Render(), on the present thread.
+// The bar above the notice (or in its place) while the threads of the pipeline manifest, and the
+// helper processes, compile in the background what the game will need, and the game runs: it may
+// run slower until they are done. Its work counts shaders translated and pipelines created alike,
+// from when the work began.
+struct ManifestProgress {
+	uint32_t done      = 0;
+	uint32_t total     = 0;
+	// Of the work left.
+	uint32_t pipelines = 0;
+	uint32_t shaders   = 0;
+};
+
+void ShowManifestProgress(const ManifestProgress& progress);
+void HideManifestProgress();
+// The bar takes no input and does not keep the overlay refreshing: it is drawn on the frames the
+// game presents (and once more when it shows or hides).
+[[nodiscard]] bool ManifestProgressVisible() noexcept;
+
+// Must run between ImGui::NewFrame() and ImGui::Render(), on the present thread: the notice and
+// the bar.
 void DrawPrecompileNotice(vk::Extent2D extent);
 
 } // namespace Libs::Graphics

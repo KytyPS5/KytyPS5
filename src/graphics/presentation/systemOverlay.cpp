@@ -1807,7 +1807,7 @@ struct SystemOverlay::Impl {
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled() &&
-		    !PrecompileNoticeVisible()) {
+		    !PrecompileNoticeVisible() && !ManifestProgressVisible()) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;

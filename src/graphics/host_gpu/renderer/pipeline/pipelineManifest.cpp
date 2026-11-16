@@ -4048,6 +4048,7 @@ PipelineCache::ManifestBacklog PipelineCache::GetManifestBacklog() const {
 	for (const auto index: state.module_jobs) {
 		backlog.compute_modules += state.warm.modules[index].stage == ShaderType::Compute ? 1u : 0u;
 	}
+	backlog.modules_done     = state.built + state.found + state.failed;
 	backlog.pipelines_done   = state.pipelines + state.pipelines_known + state.pipelines_failed;
 	backlog.threads          = static_cast<uint32_t>(state.threads.size());
 	backlog.module_seconds   = state.module_time.Get();

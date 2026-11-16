@@ -46,6 +46,12 @@ constexpr auto     LogPeriod   = std::chrono::seconds(10);
 // notice says it waits from SlowSeconds on.
 constexpr auto     StallShown  = std::chrono::seconds(3);
 constexpr auto     StallGap    = std::chrono::seconds(1);
+// The manifest's bar (ManifestProgress): up once the manifest's threads and the helpers have had
+// work for ManifestBarDelay, and until they have had none for ManifestBarLinger (Demon's Souls maps
+// its shaders in batches while it boots and loads: one bar for the batches that follow each other
+// closely).
+constexpr auto     ManifestBarDelay  = std::chrono::seconds(1);
+constexpr auto     ManifestBarLinger = std::chrono::seconds(2);
 
 template <typename... Args>
 void PrecompileLog(fmt::format_string<Args...> format, Args&&... args) {
@@ -59,8 +65,12 @@ struct Estimate {
 	// those finished so far.
 	uint32_t pending  = 0;
 	uint64_t finished = 0;
-	// Shaders whose code is mapped and which are not translated yet.
+	// Shaders whose code is mapped and which are not translated yet, and those translated so far
+	// (or found translated, or failed).
 	uint32_t shaders  = 0;
+	uint64_t shaders_finished = 0;
+	// Records the manifest's threads build or create now.
+	uint32_t running  = 0;
 	// What the driver has left to compile, and all that is left.
 	double   driver_seconds = 0.0;
 	double   seconds_left   = 0.0;
@@ -152,6 +162,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		e.pending        = jobs + backlog.pipelines;
 		e.finished       = stats.done + stats.failed + stats.withdrawn + backlog.pipelines_done;
 		e.shaders        = backlog.modules;
+		e.shaders_finished = backlog.modules_done;
+		e.running        = backlog.running;
 		e.driver_seconds = helpers + graphics;
 		e.seconds_left   = std::max(helpers, graphics + modules);
 		e.drained = jobs == 0 && backlog.modules == 0 && backlog.pipelines == 0 && backlog.running == 0 &&
@@ -193,6 +205,12 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 	bool                                   shown       = false;
 	uint64_t                               notice_base = 0;
 	Clock::time_point                      notice_shown_at;
+	// The manifest's bar: its work counts shaders translated and pipelines created alike, from when
+	// the work began.
+	bool                                   bar_shown = false;
+	std::optional<Clock::time_point>       bar_work_since;
+	Clock::time_point                      bar_last_work;
+	uint64_t                               bar_base = 0;
 	const auto seconds = [](Clock::duration duration) { return std::chrono::duration<double>(duration).count(); };
 
 	std::mutex                  sleep_mutex;
@@ -321,6 +339,40 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			}
 		}
 
+		// The manifest's bar, while the game runs: stopped, it has the notice's progress.
+		if (m_manifest_warm) {
+			const uint64_t finished = e.finished + e.shaders_finished;
+			const uint32_t left     = e.pending + e.running + e.shaders;
+			if (left != 0) {
+				bar_last_work = now;
+				if (!bar_shown && !bar_work_since) {
+					bar_work_since = now;
+					bar_base       = finished;
+				}
+			} else if (!bar_shown) {
+				bar_work_since.reset();
+			}
+			if (!bar_shown && bar_work_since && now - *bar_work_since >= ManifestBarDelay) {
+				bar_shown = true;
+				PrecompileLog("Pipeline manifest bar: shown ({} pipelines left, {} shaders to translate)",
+				              e.pending + e.running, e.shaders);
+			} else if (bar_shown && now - bar_last_work >= ManifestBarLinger) {
+				bar_shown = false;
+				PrecompileLog("Pipeline manifest bar: hidden after {:.1f} s ({} shaders and pipelines done)",
+				              seconds(now - *bar_work_since), finished - std::min(bar_base, finished));
+				bar_work_since.reset();
+			}
+			if (bar_shown && phase != Phase::Ask && phase != Phase::Wait) {
+				const auto done = static_cast<uint32_t>(finished - std::min(bar_base, finished));
+				ShowManifestProgress({.done      = done,
+				                      .total     = done + left,
+				                      .pipelines = e.pending + e.running,
+				                      .shaders   = e.shaders});
+			} else {
+				HideManifestProgress();
+			}
+		}
+
 		// One notice: what the game does now decides its text, whatever brought the notice.
 		std::optional<PrecompileNoticeState> state;
 		if (phase == Phase::Ask) {
@@ -370,6 +422,7 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 	pause.reset();
 	set_helpers(helpers_running);
 	HidePrecompileNotice();
+	HideManifestProgress();
 }
 
 } // namespace Libs::Graphics

@@ -283,8 +283,12 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+	KYTY_PROFILER_BLOCK("Program::FindModule");
+	{
+		KYTY_PROFILER_BLOCK("Program::MaterializeResources");
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+		                                                    specialization));
+	}
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -392,8 +396,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
-	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	auto entry = m_program_cache.find(m_lookup_key);
+	{
+		KYTY_PROFILER_BLOCK("GetProgram::BuildStageStaticKey");
+		BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	}
+	auto entry = [&]() {
+		KYTY_PROFILER_BLOCK("GetProgram::ProgramCacheFind");
+		return m_program_cache.find(m_lookup_key);
+	}();
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
@@ -405,7 +415,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
-			source_changed = cached.RefreshCallSource(runtime);
+			{
+				KYTY_PROFILER_BLOCK("GetProgram::RefreshCallSource");
+				source_changed = cached.RefreshCallSource(runtime);
+			}
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor);
@@ -413,6 +426,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (module != nullptr) return bind(*module);
 	}
 
+	// Everything below runs only when no compiled module matches: translate and compile.
+	KYTY_PROFILER_BLOCK("GetProgram::CacheMissCompile");
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
@@ -882,7 +897,10 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto        params      = PrepareProgram(regs, input_info);
+	const auto        params      = [&]() {
+		KYTY_PROFILER_BLOCK("GetComputeProgram::PrepareProgram");
+		return PrepareProgram(regs, input_info);
+	}();
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
@@ -1075,10 +1093,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		KYTY_PROFILER_BLOCK("CreatePipeline(Gfx)::DriverCompile");
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
-	StorePipeline(key);
-	CheckpointDriverCache();
+	{
+		KYTY_PROFILER_BLOCK("CreatePipeline(Gfx)::StoreAndCheckpoint");
+		StorePipeline(key);
+		CheckpointDriverCache();
+	}
 
 	return pipeline;
 }
@@ -1102,9 +1124,13 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		KYTY_PROFILER_BLOCK("CreatePipeline(Compute)::DriverCompile");
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
-	CheckpointDriverCache();
+	{
+		KYTY_PROFILER_BLOCK("CreatePipeline(Compute)::Checkpoint");
+		CheckpointDriverCache();
+	}
 
 	return pipeline;
 }

@@ -304,6 +304,10 @@ public:
 	// that last visited them, or where a pass left pages CPU dirty since: that pass left no other
 	// pending write under a buffer in their part of the set.
 	void SynchronizeBuffersInSet(const RangeSet& set, SetRegions& regions);
+	// Adds [address, address + size) to `set`, a set SynchronizeBuffersInSet() synchronizes with
+	// `regions`: its next pass visits the tracking regions of the range whatever their epoch (their
+	// CPU-dirty pages there were outside the set so far).
+	void AddToSet(RangeSet& set, SetRegions& regions, uint64_t address, uint64_t size);
 	void FlushUploadBatch();
 	// FlushUploadBatch() as one dispatch; false when the batch does not fit it.
 	bool ScatterUploadBatch(const CommandRecorder& native);

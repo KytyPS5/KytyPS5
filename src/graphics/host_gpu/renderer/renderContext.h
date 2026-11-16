@@ -235,6 +235,8 @@ private:
 	void SynchronizeDirtyBdaRegions(GuestRange range);
 	// SynchronizeDmaFootprint(): the spans of an operation.
 	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
+	// AddBufferTable(): the runs (offset, bytes) of a buffer table that differ from its copy.
+	std::vector<std::pair<uint64_t, uint64_t>> m_table_runs;
 	// The guest TLASes the native builds wrote (NoteHleTlas()), and the memory sce::Psr captured
 	// for its BVHs (NoteGuestBvhMemory(): size by address). Execution thread.
 	struct HleTlas {
@@ -255,6 +257,9 @@ private:
 		// `ranges` were last synchronized.
 		std::array<uint64_t, 3> compared_in {};
 		std::array<uint64_t, 3> synced_in {};
+		// The V#s replaced since `ranges` was decoded from the whole table: their old ranges stay
+		// in it (see AddBufferTable()).
+		uint32_t                replaced = 0;
 		// Pages the CPU wrote that the comparison of another table took from the record of the
 		// written pages (tables may share pages).
 		std::vector<std::pair<uint64_t, uint64_t>> written;

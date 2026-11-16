@@ -3144,6 +3144,41 @@ void BufferCache::ForceSynchronization(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+void BufferCache::AddToSet(RangeSet& set, SetRegions& state, uint64_t address, uint64_t size) {
+	const bool covered = state.version == set.Version();
+	if (!set.Add(address, size)) {
+		return;
+	}
+	const auto end = address + size;
+	for (auto index = address / TRACKER_REGION_SIZE; index <= (end - 1) / TRACKER_REGION_SIZE; index++) {
+		if (index < state.regions.size()) {
+			state.regions[index] = {};
+		}
+	}
+	if (!covered) {
+		return;
+	}
+	// The pages the set covers, as SynchronizeBuffersInSet() finds them, without a walk of the set
+	// (a region the set did not cover yet, but after the last, makes the next pass walk it).
+	for (auto at = address; at < end;) {
+		const auto index    = at / TRACKER_REGION_SIZE;
+		const auto base     = index * TRACKER_REGION_SIZE;
+		const auto stop     = std::min(end, base + TRACKER_REGION_SIZE);
+		const auto found    = std::ranges::lower_bound(state.covered, index);
+		const auto position = static_cast<size_t>(found - state.covered.begin());
+		if (found == state.covered.end()) {
+			state.covered.push_back(index);
+			state.covered_pages.emplace_back();
+		} else if (*found != index) {
+			return;
+		}
+		state.covered_pages[position].SetRange((at - base) / TRACKER_PAGE_SIZE,
+		                                       (stop - base + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
+		at = stop;
+	}
+	state.version = set.Version();
+}
+
 void BufferCache::SynchronizeBuffersInSet(const RangeSet& set, SetRegions& state) {
 	const UploadBatch batch {*this};
 	// The uploads of this pass leave the pages the guest keeps writing CPU dirty, as those of a

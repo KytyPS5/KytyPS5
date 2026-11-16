@@ -1060,14 +1060,16 @@ bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
 	// one).
 	const auto layout = ReachLayout();
 	bool       same   = entries.copy.size() == size;
+	m_table_runs.clear();
 	if (entries.compared_in != layout || !same) {
 		entries.compared_in = layout;
 		const auto compare  = [&](uint64_t run, uint64_t bytes) {
 			const auto begin = std::max(run, address);
 			const auto end   = std::min(run + bytes, address + size);
-			if (same && begin < end) {
-				same = std::memcmp(entries.copy.data() + (begin - address), memory + (begin - address),
-				                   end - begin) == 0;
+			if (entries.copy.size() == size && begin < end &&
+			    std::memcmp(entries.copy.data() + (begin - address), memory + (begin - address), end - begin) != 0) {
+				same = false;
+				m_table_runs.emplace_back(begin - address, end - begin);
 			}
 		};
 		m_buffer_cache.ConsumeCpuWrites(CpuWriteConsumer::BufferTables, address, size, [&](uint64_t run, uint64_t bytes) {
@@ -1088,16 +1090,12 @@ bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
 		entries.written.clear();
 	}
 	if (!same) {
-		entries.copy.assign(memory, memory + size);
-		entries.ranges.Clear();
-		entries.regions   = {};
-		entries.synced_in = {};
-		for (uint64_t offset = 0; offset < size; offset += EntryBytes) {
+		// The vertices are read from the base of their V#, at the offsets the indices of the
+		// geometry give: within the buffer the V# describes. What is not guest memory (the entries
+		// of geometry streamed out) has nothing to upload.
+		const auto range_of = [](const uint8_t* entry) {
 			ShaderBufferResource buffer;
-			std::memcpy(buffer.fields, entries.copy.data() + offset, EntryBytes);
-			// The vertices are read from the base of their V#, at the offsets the indices of the
-			// geometry give: within the buffer the V# describes. What is not guest memory (the
-			// entries of geometry streamed out) has nothing to upload.
+			std::memcpy(buffer.fields, entry, EntryBytes);
 			auto       bytes = buffer.GetSize();
 			const auto base  = buffer.Base48();
 			if (base < LOWER_ADDRESS_SIZE) {
@@ -1109,10 +1107,38 @@ bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
 			} else {
 				bytes = 0;
 			}
-			if (base != 0 && bytes != 0) {
-				entries.ranges.Add(base, bytes);
+			return std::pair {base, base != 0 ? bytes : 0};
+		};
+		// GTA V's table changes a few V#s at a time as it streams geometry in or out, up to 12 times
+		// a second while driving: decoding the 131 072 V#s again took 2.5-2.9 ms each time. The V#s
+		// that changed add their ranges; the ranges of the V#s they replace stay (synchronizing more
+		// buffers is harmless) until there are many of them, and the table is decoded again.
+		const auto count = static_cast<uint32_t>(size / EntryBytes);
+		if (entries.copy.size() == size && entries.replaced <= count / 8) {
+			for (const auto& [offset, bytes]: m_table_runs) {
+				for (auto at = offset / EntryBytes * EntryBytes; at < offset + bytes; at += EntryBytes) {
+					if (std::memcmp(entries.copy.data() + at, memory + at, EntryBytes) == 0) {
+						continue;
+					}
+					std::memcpy(entries.copy.data() + at, memory + at, EntryBytes);
+					entries.replaced++;
+					if (const auto [base, length] = range_of(entries.copy.data() + at); length != 0) {
+						m_buffer_cache.AddToSet(entries.ranges, entries.regions, base, length);
+					}
+				}
+			}
+		} else {
+			entries.copy.assign(memory, memory + size);
+			entries.ranges.Clear();
+			entries.regions  = {};
+			entries.replaced = 0;
+			for (uint64_t offset = 0; offset < size; offset += EntryBytes) {
+				if (const auto [base, length] = range_of(entries.copy.data() + offset); length != 0) {
+					entries.ranges.Add(base, length);
+				}
 			}
 		}
+		entries.synced_in = {};
 	}
 	m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
 	if (std::ranges::find(m_dma_sets, &entries) == m_dma_sets.end()) {

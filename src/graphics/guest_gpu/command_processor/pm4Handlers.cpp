@@ -508,6 +508,8 @@ KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0004200);
 
+	cp.SyncFetchWithExecution();
+
 	return 1;
 }
 
@@ -599,9 +601,11 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 
 	if (TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr), reference, mask,
 	                        function)) {
+		cp.PrepareCommandFetch({then_buffer, then_num_dw});
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
+		cp.PrepareCommandFetch({else_buffer, else_num_dw});
 		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
 	}
 
@@ -993,6 +997,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     ", control = 0x%08" PRIx32 "\n",
 		     indirect_num_dw, buffer[2]);
 	}
+
+	cp.PrepareCommandFetch({indirect_buffer, indirect_num_dw});
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 

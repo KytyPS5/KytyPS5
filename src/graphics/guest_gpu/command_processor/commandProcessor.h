@@ -187,6 +187,11 @@ public:
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
+	// PFP_SYNC_ME: the command buffers fetched after it are read once the work before it executed.
+	void SyncFetchWithExecution();
+	// Before fetching an indirect command buffer: after a PFP_SYNC_ME, waits for the work emitted
+	// before it and reads back what the GPU wrote of the buffer (command buffers built on the GPU).
+	void PrepareCommandFetch(std::span<const uint32_t> commands);
 
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 	// A handler that took more draw packets than the one it was called for (a run of indirect draws) tells the scout's
@@ -267,6 +272,8 @@ private:
 	uint64_t       m_index_base_addr                  = 0;
 	uint64_t       m_draw_indirect_args_base_addr     = 0;
 	uint64_t       m_dispatch_indirect_args_base_addr = 0;
+	// The last operation emitted before a PFP_SYNC_ME whose fetches have not waited for it yet.
+	uint64_t       m_fetch_sync_sequence              = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws when they execute.
 	GpuNumInstances m_num_instances;
 

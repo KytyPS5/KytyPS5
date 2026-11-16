@@ -1518,6 +1518,33 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
+void CommandProcessor::SyncFetchWithExecution() {
+	if (m_pipeline != nullptr) {
+		m_fetch_sync_sequence = m_pipeline->NextSequence() - 1;
+	}
+}
+
+void CommandProcessor::PrepareCommandFetch(std::span<const uint32_t> commands) {
+	// SAROS (PPSA07631) shades its Nanite geometry with dispatches that a compute pass writes into
+	// a command buffer on the GPU (Unreal's shader bundles): cs 7c991e9d4e6cbb3c compacts the
+	// packets of the non-empty bins over a buffer the CPU fills with one-dword NOPs, then the guest
+	// waits for it (CS_PARTIAL_FLUSH, PFP_SYNC_ME) and calls the buffer. Parsed ahead of execution,
+	// the call found only the NOPs: no dispatch shaded the floor, which stayed black. As the
+	// prefetch parser does after PFP_SYNC_ME, the fetch waits for the work before it, and the GPU's
+	// bytes of the buffer are read back.
+	if (m_fetch_sync_sequence == 0 || m_pipeline == nullptr) {
+		return;
+	}
+	m_pipeline->WaitForExecution(std::exchange(m_fetch_sync_sequence, 0));
+	const auto address = reinterpret_cast<uint64_t>(commands.data());
+	const auto size    = commands.size_bytes();
+	auto&      buffers = m_renderer.GetBufferCache();
+	if (size != 0 && GuestRange {address, size}.Valid() && buffers.MayBeGpuModified(address, size) &&
+	    buffers.IsRegionGpuModified(address, size)) {
+		buffers.ReadMemory(address, size);
+	}
+}
+
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;

@@ -415,6 +415,10 @@ void Swapchain::Create() {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
 	}
+	// A minimized window's surface has no area; presentation creates the swapchain once it has one.
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		return;
+	}
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -565,7 +569,7 @@ void Swapchain::Recreate(bool surface_lost) {
 
 bool Swapchain::NeedsResize() const {
 	Common::LockGuard lock(m_window.mutex);
-	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
+	return m_handle == nullptr || m_window_extent.width != m_window.graphic_ctx.screen_width ||
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
@@ -1052,6 +1056,9 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		if (swapchain.ImageCount() == 0) {
+			return;
+		}
 		auto status = [&] {
 			ScopedTimer acquire_time(Counter::PresentAcquireNs);
 			return swapchain.AcquireNextImage(present_scheduler);

@@ -400,10 +400,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		KYTY_PROFILER_BLOCK("GetProgram::BuildStageStaticKey");
 		BuildStageStaticKey(input_info, m_lookup_key.static_state);
 	}
-	auto entry = [&]() {
+	auto entry = m_program_cache.end();
+	{
 		KYTY_PROFILER_BLOCK("GetProgram::ProgramCacheFind");
-		return m_program_cache.find(m_lookup_key);
-	}();
+		entry = m_program_cache.find(m_lookup_key);
+	}
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);

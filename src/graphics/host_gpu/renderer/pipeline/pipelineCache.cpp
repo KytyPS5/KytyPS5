@@ -85,8 +85,8 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
 	// Driver cache entries already distinguish shader code and pipeline state across builds.
-	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -113,8 +113,8 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	return !values.empty() && Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                                        values.size_bytes());
 }
 
 void DumpShader(std::span<const uint32_t> words, const std::string& name) {
@@ -219,8 +219,9 @@ vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_compo
 }
 
 // The host format of each vertex input attribute, narrowed to the components the stage reads.
-std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
-                                           const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+std::vector<vk::Format>
+VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
+                   const ShaderRecompiler::IR::CompiledShaderInfo& program) {
 	std::vector<vk::Format> formats(input_info.resources_num);
 	for (int index = 0; index < input_info.resources_num; index++) {
 		const auto registers_num = input_info.resources_dst[index].registers_num;
@@ -263,14 +264,15 @@ bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
+std::size_t
+PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	return XXH3_64bits(&key, sizeof(key));
 }
 
 std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
-	return call_source
-	    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
-	    : std::span<const uint32_t>{};
+	return call_source ? std::span<const uint32_t>(call_source->linked->code)
+	                         .subspan(call_source->code.size())
+	                   : std::span<const uint32_t> {};
 }
 
 bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -288,7 +290,7 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-		        push_data_cursor, layout.ShaderDataDwords()) ||
+		                                        push_data_cursor, layout.ShaderDataDwords()) ||
 		    candidate.specialization != specialization) {
 			continue;
 		}
@@ -307,14 +309,14 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
-	const auto profile = SpirvProfile(m_graphics);
-	options.profile    = &profile;
+	const auto                         profile = SpirvProfile(m_graphics);
+	options.profile                            = &profile;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 	                                               program.specialization, push_data_cursor);
-	auto info = std::move(result.program).TakeCompiledInfo();
+	auto info   = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
-	const auto function_code = program.FunctionCode();
+	const auto                   function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
 	                            info.bindings.push_data_start_dword, program.specialization);
@@ -369,11 +371,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	};
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-		options.stage            = input_info.logical_stage;
+		options.stage             = input_info.logical_stage;
 		options.input_info.vertex = &input_info;
-		options.user_data_base   = 8;
-		if (options.stage == ShaderType::Mesh ||
-		    options.stage == ShaderType::TessellationControl) {
+		options.user_data_base    = 8;
+		if (options.stage == ShaderType::Mesh || options.stage == ShaderType::TessellationControl) {
 			options.user_data_base = 0;
 		}
 		if (options.stage == ShaderType::Mesh) {
@@ -384,17 +385,17 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		options.input_info.pixel = &input_info;
 	} else {
 		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
-		options.stage              = ShaderType::Compute;
-		options.input_info.compute = &input_info;
-		runtime.workgroup_counts   = input_info.workgroup_counts;
+		options.stage                 = ShaderType::Compute;
+		options.input_info.compute    = &input_info;
+		runtime.workgroup_counts      = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
-	auto entry = m_program_cache.find(m_lookup_key);
-	const auto bind = [&](const ShaderModule& module) {
+	auto       entry = m_program_cache.find(m_lookup_key);
+	const auto bind  = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
 		module.info.bindings.AdvancePushData(push_data_cursor);
 		return &module;
@@ -420,13 +421,15 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
-		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
-		                                    ShaderRecompiler::StageName(options.stage), params.hash));
+		DumpShader(params.code,
+		           fmt::format("original/{}_{:016x}.bin",
+		                       ShaderRecompiler::StageName(options.stage), params.hash));
 		source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		if (source.unsupported_call_pc != UINT32_MAX) {
-			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
-			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
-			                 params.hash, source.unsupported_call_pc);
+			PipelineCacheLog(
+			    "!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+			    "reason=unsupported GPU-selected callable target; rendering is incomplete",
+			    params.hash, source.unsupported_call_pc);
 			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
 			return nullptr;
 		}
@@ -435,7 +438,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	ShaderRecompiler::TranslateResult translated;
 	if (current != nullptr) {
 		if (!current->calls.empty()) {
-			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+			if (entry == m_program_cache.end())
+				ShaderRecompiler::RefreshShaderSource(*current, runtime);
 			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 			translated.program.source_reads = current->reads;
 		} else {
@@ -448,10 +452,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto retained = !source.calls.empty()
 		                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 		                    : nullptr;
-		entry = m_program_cache.emplace(m_lookup_key, Program {
-		    .call_source   = std::move(retained),
-		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
-		}).first;
+		entry = m_program_cache
+		            .emplace(m_lookup_key,
+		                     Program {
+		                         .call_source = std::move(retained),
+		                         .resource_plan =
+		                             ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
+		                     })
+		            .first;
 		auto& program = entry->second;
 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 		    program.resource_plan, runtime, program.resources, program.specialization));
@@ -465,7 +473,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
-PipelineCache::PipelineCache(GraphicContext&                         graphics,
+PipelineCache::PipelineCache(GraphicContext&                        graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path&           shader_store)
     : m_graphics(graphics), m_image_heap(image_heap),
@@ -534,9 +542,8 @@ void PipelineCache::InitializeDriverCache() {
 			    payload_read != initial_data.size() || cached_signature != signature ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
-				    path);
+				PipelineCacheLog("Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
+				                 path);
 			}
 		} else {
 			file.Close();
@@ -632,7 +639,8 @@ void PipelineCache::WriteDriverCache() const {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	const bool written =
+	    prefix_written == prefix.size() && payload_written == payload.size() && flushed;
 	std::error_code error;
 	if (written) {
 		std::filesystem::rename(temp_path, m_driver_cache_path, error);
@@ -648,13 +656,13 @@ void PipelineCache::WriteDriverCache() const {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
-	const auto& context           = command.GetRegisters();
-	const auto& user_config       = command.GetUserConfig();
-	const auto& sh                = context.GetShaderRegisters();
-	const auto& vertex_regs       = command.GetShaders().GetVs();
-	const auto& pixel_regs        = command.GetShaders().GetPs();
-	auto&       vertex_info       = state.vertex_info;
-	auto&       pixel_info        = state.ps_input_info;
+	const auto& context             = command.GetRegisters();
+	const auto& user_config         = command.GetUserConfig();
+	const auto& sh                  = context.GetShaderRegisters();
+	const auto& vertex_regs         = command.GetShaders().GetVs();
+	const auto& pixel_regs          = command.GetShaders().GetPs();
+	auto&       vertex_info         = state.vertex_info;
+	auto&       pixel_info          = state.ps_input_info;
 	const bool  object_primitive_id = context.HasObjectPrimitiveIdOutput();
 	const auto  write_mask          = context.GetRenderTargetMask() & sh.m_cbShaderMask;
 	uint32_t    color_output_mask   = object_primitive_id ? 1u << 7u : 0;
@@ -674,7 +682,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	    (color_output_mask != 0 || db.shader_kill_enable || db.shader_z_export_enable ||
 	     db.shader_mask_export_enable || db.shader_dual_export_enable ||
 	     db.shader_execute_on_noop || sh.AlphaToMask());
-	state.ps_active = pixel_active;
+	state.ps_active        = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -689,9 +697,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 		// Reflection decodes both programs; the key also covers the VGT fields in tess.
-		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
-		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
-		                                   sh.m_vgtTfParam};
+		const uint64_t layout_key[]   = {vertex_params[0].hash, vertex_params[1].hash,
+		                                 uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
+		                                     sh.m_vgtTfParam};
 		const auto [layout, inserted] = m_tess_layouts.try_emplace(
 		    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
 		if (inserted) {
@@ -716,9 +724,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
 		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
 		const auto& target = context.GetRenderTarget(7);
-		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
-		                                                       target.info.channel_type)
-		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+		EXIT_NOT_IMPLEMENTED(
+		    Prospero::ResolveRenderTargetFormat(target.info.format, target.info.channel_type)
+		        .buffer_format != Prospero::BufferFormat::k32UInt);
 	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
@@ -745,9 +753,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		// A task shader launches each record's groups and passes its draw parameters in a
 		// payload beside the LDS, the allocation pair and the Layer array; without room for
 		// it, the CPU reads the records.
-		if (state.indirect_draw &&
+#if defined(_WIN32)
+		// AMD's Windows driver (Adrenalin 26.10.1, RX 6600) hangs the GPU on the first task+mesh
+		// draw, before any task or mesh wave starts (Radeon GPU Detective: DispatchMesh in
+		// progress, no shader in flight); A Game About Digging A Hole (PPSA30552) loses the device
+		// on its first indirect mesh draw. Its records go through the CPU instead.
+		const bool task_shader_usable = m_graphics.physical_device_properties.vendorID != 0x1002u;
+#else
+		const bool task_shader_usable = true;
+#endif
+		if (state.indirect_draw && task_shader_usable &&
 		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
-		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) *
+		            sizeof(uint32_t) <=
 		        limits.maxMeshPayloadAndSharedMemorySize) {
 			vertex_info[0].indirect_offsets = state.indirect_offsets;
 			vertex_info[0].indirect_draw    = true;
@@ -766,24 +784,25 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				        .export_mapping;
 			}
 		}
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
-			const auto& rt = context.GetRenderTarget(slot);
-			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
+			const auto& rt          = context.GetRenderTarget(slot);
+			const auto  target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
 			if (rt.base.addr == 0 || target_mask == 0u) continue;
 			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
 				pixel_info.target_uint_mask |= 1u << export_index;
 			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
 				pixel_info.target_sint_mask |= 1u << export_index;
 			}
-			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
+			const auto format =
+			    Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
 			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
-			const auto mapping = pixel_info.target_export_mapping[export_index];
+			const auto mapping     = pixel_info.target_export_mapping[export_index];
 			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
-			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			const bool blend       = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
 			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
 			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
 			    pixel_info.target_output_mode[export_index] != 9u) {
@@ -793,7 +812,8 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
 			}
 			pixel_info.target_packed_unorm_mask |= 1u << export_index;
-			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
+			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode)
+			                                << export_index;
 		}
 		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
 			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
@@ -882,10 +902,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto        params      = PrepareProgram(regs, input_info);
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	const auto params             = PrepareProgram(regs, input_info);
+	input_info.lds_storage =
+	    input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	uint32_t          push_data_cursor = 0;
+	uint32_t push_data_cursor = 0;
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
@@ -899,8 +920,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto& vs_input_info = vertex_info.front();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
-	const bool ps_active    = state.ps_active;
-	const bool tessellation = vertex_info.size() == 3;
+	const bool                         ps_active    = state.ps_active;
+	const bool                         tessellation = vertex_info.size() == 3;
 	std::array<const ShaderModule*, 4> stages {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		stages[i] = vertex_info[i].stage.module;
@@ -911,7 +932,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const bool mesh        = stages[0]->info.stage == ShaderType::Mesh;
 	const auto color_count = targets.color_count;
 
-	auto&             ctx = command.GetRegisters();
+	auto& ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -941,9 +962,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		auto alpha_source = ShaderAlphaBlendSource::None;
+		const auto& rt           = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc           = ctx.GetBlendControl(colors[i].target_slot);
+		auto        alpha_source = ShaderAlphaBlendSource::None;
 		if (slot == 0 && ps_active) {
 			alpha_source = ps_input_info.alpha_blend_source;
 		}
@@ -951,7 +972,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
-			static std::atomic_bool warned = false;
+			static std::atomic_bool warned   = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "Warning: blending disabled for unsupported color mapping "
@@ -964,13 +985,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			auto blend = bc;
 			switch (alpha_source) {
 				case ShaderAlphaBlendSource::SourceAlpha:
-					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
-					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+					blend.color_srcblend       = RemapSourceAlphaFactor(blend.color_srcblend);
+					blend.color_destblend      = RemapSourceAlphaFactor(blend.color_destblend);
 					blend.separate_alpha_blend = false;
 					break;
 				case ShaderAlphaBlendSource::SourceAlphaOne:
 				case ShaderAlphaBlendSource::SourceAlphaZero:
-					// The second source carries the mapped source factor; its alpha stays logical Sa.
+					// The second source carries the mapped source factor; its alpha stays logical
+					// Sa.
 					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
 					blend.color_destblend =
 					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
@@ -1024,7 +1046,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	const bool rect_list             = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
@@ -1043,7 +1065,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
 		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
 		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
-			const auto& buffer = vs_input_info.buffers[binding];
+			const auto& buffer                 = vs_input_info.buffers[binding];
 			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
 			                                      .instance = buffer.fetch_index != 0};
 		}
@@ -1051,8 +1073,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
 			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
 			key.vertex_input.attributes[attribute] = {
-			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
-			                                    vs_input_info.buffers[binding].addr),
+			    .offset  = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
+			                                     vs_input_info.buffers[binding].addr),
 			    .binding = static_cast<uint8_t>(binding),
 			};
 		}
@@ -1083,7 +1105,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	return pipeline;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
+PipelineCache::Pipeline&
+PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	const auto& module = *input_info.stage.module;

@@ -2625,7 +2625,8 @@ void TextureCache::RunGarbageCollector() {
 	const uint64_t   tick = m_gc_tick++;
 	DropIdleShadows(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		// Memory freed stays in the allocator's blocks, where the next allocations take it.
+		m_total_used_memory = m_graphics.GetDeviceMemoryInUse();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

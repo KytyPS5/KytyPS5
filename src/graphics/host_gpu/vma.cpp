@@ -107,6 +107,28 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+uint64_t GraphicContext::GetDeviceMemoryInUse() const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const bool discrete =
+	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
+	uint64_t usage = 0;
+	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
+		const bool device_local =
+		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
+		                      vk::MemoryHeapFlagBits::eDeviceLocal);
+		if (!discrete || device_local) {
+			const auto& statistics = budgets[heap].statistics;
+			const auto  free       = statistics.blockBytes - statistics.allocationBytes;
+			usage += budgets[heap].usage > free ? budgets[heap].usage - free : 0;
+		}
+	}
+	return usage;
+}
+
 bool GraphicContext::DeviceBudgetAllows(uint64_t size) const {
 	if (allocator == nullptr) {
 		return false;

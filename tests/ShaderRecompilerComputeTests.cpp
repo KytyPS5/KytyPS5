@@ -467,6 +467,13 @@ struct TextureCacheTestAccess {
     }
   }
 
+  static void SetGarbageCollectionThresholds(TextureCache &cache, uint64_t trigger,
+                                             uint64_t pressure, uint64_t critical) {
+    cache.m_trigger_gc_memory = trigger;
+    cache.m_pressure_gc_memory = pressure;
+    cache.m_critical_gc_memory = critical;
+  }
+
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
@@ -5789,6 +5796,112 @@ public:
                 "a buffer took new device memory with the budget used up");
       }
       graphics.device_budget_override = 0;
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // The collectors' pressure is the device memory in use: the driver's figure without the free
+  // space inside the blocks the allocator holds. What they release stays in those blocks for the
+  // next allocations, so the memory held would keep them collecting for nothing.
+  void CheckDeviceMemoryInUse() {
+    constexpr const char *name = "DeviceMemoryInUse";
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    constexpr uint64_t base = 0x00000003b0000000ull;
+    constexpr uint64_t pages = base + MiB / 2;
+    constexpr uint64_t never = std::numeric_limits<uint64_t>::max();
+    EnsureRuntimeContext();
+    auto &graphics = m_runtime_context;
+    {
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      const bool windowed = BufferCacheTestAccess::Windowed(cache);
+      const auto page = windowed ? BufferCacheTestAccess::WindowPage(cache) : 0;
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+      TextureCacheTestAccess::SetGarbageCollectionThresholds(textures, never, never, never);
+      const auto direct = MapGuestPattern(name, base, MiB);
+      context.MapMemory(base, MiB);
+      const auto free_space = [&] {
+        return graphics.GetDeviceMemoryUsage() - graphics.GetDeviceMemoryInUse();
+      };
+
+      // Memory only the first frame uses: an image, and a page where buffers have windows.
+      auto desc = MakeLinearDesc(base, 256 * 256 * 4, vk::Format::eR8G8B8A8Unorm,
+                                 Prospero::BufferFormat::k8_8_8_8UNorm,
+                                 Prospero::ImageType::kColor2D, {256, 256, 1}, 1, 4, 1);
+      const auto image = textures.FindImage(desc);
+      if (windowed) {
+        (void)cache.FindBuffer(pages, page);
+      }
+      const auto idle = [&] {
+        return TextureCacheTestAccess::Contains(textures, image) &&
+               (!windowed || cache.IsRegionRegistered(pages, page));
+      };
+      const auto gone = [&] {
+        return !TextureCacheTestAccess::Contains(textures, image) &&
+               (!windowed || !cache.IsRegionRegistered(pages, page));
+      };
+      context.RunGarbageCollector();
+
+      // Pages freed inside blocks that keep others of their run leave their bytes there.
+      constexpr uint64_t unit = 64 * 1024;
+      constexpr size_t count = 96 * MiB / unit;
+      uint32_t device_types = 0;
+      const auto &memory = graphics.physical_device_memory_properties;
+      for (uint32_t type = 0; type < memory.memoryTypeCount; ++type) {
+        if (memory.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+          device_types |= 1u << type;
+        }
+      }
+      const VkMemoryRequirements requirements{unit, unit, device_types};
+      const VmaAllocationCreateInfo unit_info{};
+      std::vector<VmaAllocation> run(count);
+      Require(name, "fixture",
+              vmaAllocateMemoryPages(graphics.allocator, &requirements, &unit_info, count,
+                                     run.data(), nullptr) == VK_SUCCESS,
+              "the pages were not allocated");
+      const auto full = free_space();
+      Require(name, "room held", full == HeldDeviceRoom(),
+              "the memory in use is not the usage without the room in the memory held");
+      std::vector<VmaAllocation> kept;
+      std::vector<VmaAllocation> freed;
+      for (size_t index = 0; index < count; ++index) {
+        (index % 256 == 0 || index + 1 == count ? kept : freed).push_back(run[index]);
+      }
+      vmaFreeMemoryPages(graphics.allocator, freed.size(), freed.data());
+      const auto hole = free_space();
+      Require(name, "freed space",
+              hole == HeldDeviceRoom() && hole >= full + freed.size() * unit,
+              "memory freed inside a block the allocator holds still counts as in use");
+
+      // The device reports its memory use, so the collectors take their pressure from it. A
+      // trigger between the memory in use and the memory held is none.
+      const bool reports = graphics.memory_budget_ext_enabled;
+      graphics.memory_budget_ext_enabled = true;
+      const auto in_use = graphics.GetDeviceMemoryInUse();
+      TextureCacheTestAccess::SetGarbageCollectionThresholds(textures, in_use + hole / 2, never,
+                                                             never);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, in_use + hole / 2, never);
+      context.RunGarbageCollector();
+      Require(name, "free space", idle(),
+              "the free space inside the allocator's blocks counted as memory pressure");
+      TextureCacheTestAccess::SetGarbageCollectionThresholds(textures, in_use / 2, never, never);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, in_use / 2, never);
+      context.RunGarbageCollector();
+      Require(name, "memory in use", in_use != 0 && gone(),
+              "the device memory in use did not count as memory pressure");
+      graphics.memory_budget_ext_enabled = reports;
+      vmaFreeMemoryPages(graphics.allocator, kept.size(), kept.data());
+
+      context.UnmapMemory(base, MiB);
+      scheduler.Finish();
+      UnmapGuestPattern(name, base, MiB, direct);
     }
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -64334,6 +64447,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--device-budget-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDeviceBudgetPlacement();
+    vulkan.CheckDeviceMemoryInUse();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sparse-buffer-only") == 0) {
@@ -64662,6 +64776,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferReadbackWaiter(false);
     vulkan.CheckBufferReadbackWaiter(true);
     vulkan.CheckDeviceBudgetPlacement();
+    vulkan.CheckDeviceMemoryInUse();
     vulkan.CheckSparseBufferPages();
     vulkan.CheckSparsePageTable();
     vulkan.CheckBufferWindowPages();

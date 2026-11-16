@@ -137,6 +137,8 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	// The device memory the driver holds for this process, what it allocates itself included.
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// The part of it in use: without the free space inside the blocks this process holds.
+	[[nodiscard]] uint64_t GetDeviceMemoryInUse() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	// Whether `size` more bytes of device-local memory stay within the device-local budget.
 	[[nodiscard]] bool DeviceBudgetAllows(uint64_t size) const;

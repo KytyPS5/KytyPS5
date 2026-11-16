@@ -1238,7 +1238,8 @@ void BufferCache::RunGarbageCollector() {
 		RetireIdleWindows();
 	}
 	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		// Memory released stays in the allocator's blocks, where the next allocations take it.
+		m_total_used_memory = m_graphics.GetDeviceMemoryInUse();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

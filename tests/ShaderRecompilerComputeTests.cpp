@@ -24281,6 +24281,109 @@ public:
     Require(name, "pipeline key", !(plain == custom),
             "custom sample locations shared a pipeline with the standard ones");
 
+    // Death Stranding 2 samples its EQAA targets through resident image heaps. While a pass draws
+    // into one, discovery leaves its shadow alone: settling it between the draws would write the
+    // shadow back each time. The first discovery after the pass settles it.
+    {
+      namespace IR = ShaderRecompiler::IR;
+      constexpr uint64_t target = base + 0x90000;
+      constexpr uint64_t table = base + 0xa0000;
+      constexpr uint64_t table_size = 4u * 32u;
+      registers.SetDepthRenderTarget({});
+      registers.SetDepthControl({});
+      registers.SetEqaaControl({});
+      registers.SetColorAttrib(0, {});
+      registers.SetAaConfig(aa);
+      auto &heap = context.GetImageHeap();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "heap set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "heap pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+      // The table's one texture is the target: the same linear 32x8 RGBA32F image.
+      const std::array<u32, 8> words{
+          static_cast<u32>(target >> 8u),
+          static_cast<u32>(target >> 40u) |
+              (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) |
+              (((width - 1u) & 3u) << 30u),
+          ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0};
+      std::memcpy(reinterpret_cast<void *>(table), words.data(), sizeof(words));
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      // What a draw that reads the table does before it records, and when it records.
+      const auto discover = [&] {
+        Require(name, "heap acquire",
+                heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &sampled}, view),
+                "the table was declined");
+        heap.Rebind(executor);
+      };
+      const auto bind = [&] {
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        heap.BeginDraw();
+      };
+
+      set_frame(false);
+      draw(target, left_of(10.4f), one);
+      const auto color = color_id(target);
+      auto &image = cache.GetImage(color.image_id);
+      discover();
+      bind();
+      Require(name, "heap element",
+              ImageHeapTestAccess::ImageOf(
+                      heap, ImageHeapTestAccess::Views(heap)[0]->slots[0]) == color.image_id &&
+                  image.heap_refs.load() != 0u,
+              "the table's texture did not resolve to the render target's image");
+
+      // The next pass draws into the target; its following draw binds the target, then reads
+      // the table.
+      draw(target, right_of(10.4f), two);
+      RenderColorInfo bound{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), bound, 0);
+      Require(name, "heap target in a pass",
+              bound.image_id == color.image_id && image.binding.is_target &&
+                  static_cast<bool>(image.eqaa->dirty & vk::ImageAspectFlagBits::eColor),
+              "the pass's target is not bound with its newest colour in the shadow");
+      discover();
+      Require(name, "heap leaves a pass's target",
+              static_cast<bool>(image.eqaa->dirty & vk::ImageAspectFlagBits::eColor),
+              "discovery settled the shadow of a target its pass still draws into");
+      bind();
+
+      // The pass is over: the first discovery settles what it drew.
+      RenderExecutorTestAccess::ResetBindings(executor);
+      Require(name, "heap pass ended", !image.binding.is_target,
+              "the target stayed bound after its bindings were reset");
+      discover();
+      Require(name, "heap settles after the pass", !image.eqaa->dirty,
+              "the first discovery after the pass left the target's shadow unsettled");
+      bind();
+      // Read without another refresh: the owner holds both passes' colour.
+      const auto texels = ReadCachedTexel(name, context, color.image_id, {}, {width, height, 1});
+      std::vector<u32> red(width * height);
+      for (uint32_t i = 0; i < red.size(); i++) {
+        red[i] = texels[i * 4];
+      }
+      check_columns("heap settled colour", red, f1, f2, f1, f2);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+
     context.UnmapMemory(base, allocation_size);
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);

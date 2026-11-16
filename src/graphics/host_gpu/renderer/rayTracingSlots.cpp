@@ -1274,7 +1274,7 @@ void RayTracing::AnnounceWalks(std::span<const uint64_t> blases) {
 	m_walks_announced = true;
 }
 
-void RayTracing::RecordBuilds(const CommandRecorder& command) {
+bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 	auto&                 readback = m_readbacks[m_readback_index];
 	std::vector<Job>      jobs;
 	std::vector<uint32_t> slots;
@@ -1367,7 +1367,7 @@ void RayTracing::RecordBuilds(const CommandRecorder& command) {
 		m_build_queue.insert(m_build_queue.end(), deferred.rbegin(), deferred.rend());
 	}
 	if (jobs.empty()) {
-		return;
+		return false;
 	}
 	// A BLAS the guest only refit since the last host build keeps its triangles and their order:
 	// its vertices are gathered again through its entry table instead of walking the guest BVH.
@@ -1545,6 +1545,7 @@ void RayTracing::RecordBuilds(const CommandRecorder& command) {
 	}
 	readback.build_count = static_cast<uint32_t>(slots.size());
 	readback.build_slots = std::move(slots);
+	return walk_count != readback.build_count;
 }
 
 void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
@@ -1800,7 +1801,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 
 	// The BVHs of the traversal's layout (IR::RayTracingLayout::Pack() word 3).
 	m_blas_flags = (((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u) | (psr ? BlasPsrHeader : 0u);
-	RecordBuilds(command);
+	const bool gathered = RecordBuilds(command);
 	m_walks_announced = false;
 
 	command.fillBuffer(m_instances->Handle(), 0, uint64_t {tlas_count} * InstanceStride, 0);
@@ -1810,6 +1811,25 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_tlas_layout, 0, WalkBindings,
 	                             writes.data());
 
+	// The walk lists the built BLASes the TLAS uses, and the check (ModeVerify) walks all their
+	// boxes again to find the ones the guest changed, which are then built before every
+	// preparation for a while (m_dynamic). A TLAS whose header is the user data pair is known
+	// here: its BLASes are checked at its first preparation of a frame. SAROS traces the same TLAS
+	// in four to five passes a frame, and each check took 0.64 ms of the GPU; a BLAS the guest
+	// changes later in the frame is found in the next one. Slots gathered now take their boxes
+	// in this check.
+	bool verify = true;
+	if (in_user && !psr && given != 0) {
+		auto checked =
+		    std::ranges::find(m_checked_headers, given, &std::pair<uint64_t, uint64_t>::first);
+		if (checked == m_checked_headers.end()) {
+			checked        = m_checked_headers.begin() + m_checked_next;
+			m_checked_next = (m_checked_next + 1) % m_checked_headers.size();
+			*checked       = {given, UINT64_MAX};
+		}
+		verify          = gathered || checked->second != frame;
+		checked->second = frame;
+	}
 	const TlasPush tlas_push {
 	    .user_ptr_va       = user_pointer,
 	    .state             = m_walk_state->BufferDeviceAddress(),
@@ -1827,7 +1847,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	    .instance_capacity = tlas_count,
 	    .table_mask        = TableEntries - 1,
 	    .prepare_id        = m_prepare_id,
-	    .verify            = 1u,
+	    .verify            = verify ? 1u : 0u,
 	    // The facing of each instance follows the game's triangle test (the layout's flip bit: GTA
 	    // V 01.011's accepts, with flags bit 3 clear, the triangles whose test sign is set, the
 	    // host's back faces; not flipping them culled the wrong face of every instance without both

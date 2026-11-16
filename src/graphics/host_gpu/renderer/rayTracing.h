@@ -438,7 +438,8 @@ private:
 	// least used chunk to new memory (like a grown slot: they are built again), appending their
 	// indices to `moved`.
 	void Defragment(std::vector<uint32_t>& moved);
-	void RecordBuilds(const CommandRecorder& command);
+	// Whether it gathered slots (their boxes are taken by the check of this preparation).
+	bool RecordBuilds(const CommandRecorder& command);
 	void ProcessReadback(Readback& readback);
 
 	bool              m_enabled = false;
@@ -530,6 +531,10 @@ private:
 	uint32_t                                      m_guest_tlas_next = 0;
 	uint32_t                                      m_next_instances  = 0;
 	uint32_t                  m_prepare_id          = 0;
+	// The TLASes whose header is the user data pair that a preparation checked the BLASes of
+	// (header, frame), replaced in turn (see Prepare()).
+	std::array<std::pair<uint64_t, uint64_t>, 8> m_checked_headers {};
+	uint32_t                                     m_checked_next = 0;
 	// BlasPush::flags of the last preparation's layout.
 	uint32_t                  m_blas_flags          = 0;
 	uint64_t                  m_walk_frame               = 0;

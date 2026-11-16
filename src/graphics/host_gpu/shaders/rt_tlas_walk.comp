@@ -52,6 +52,7 @@ layout(push_constant, std430) uniform Push {
 	uint     instance_capacity;
 	uint     table_mask;
 	uint     prepare_id;
+	// Whether the BLAS walk checks the listed slots (the list itself is always made: their use).
 	uint     verify;
 	// The layout of the instance records (IR::RayTracingLayout::Pack()).
 	uvec4    instance_layout;
@@ -384,7 +385,7 @@ void main() {
 				SlotInfo info = SlotInfo(pc.slots + uint64_t(slot) * kSlotStride);
 				if (info.state == kSlotBuilt) {
 					reference = info.as_address;
-					if (pc.verify != 0 && atomicExchange(info.stamp, pc.prepare_id) != pc.prepare_id) {
+					if (atomicExchange(info.stamp, pc.prepare_id) != pc.prepare_id) {
 						const uint v = atomicAdd(state.verify_count, 1u);
 						U32Ref(pc.verify_list + uint64_t(v) * 4).v = slot;
 					}
@@ -473,7 +474,7 @@ void main() {
 		state.dispatch_x   = missing;
 		state.dispatch_y   = 1;
 		state.dispatch_z   = 1;
-		state.verify_x     = state.verify_count;
+		state.verify_x     = pc.verify != 0 ? state.verify_count : 0u;
 		state.verify_y     = 1;
 		state.verify_z     = 1;
 		if (pc.context != 0) {

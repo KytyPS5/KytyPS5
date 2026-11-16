@@ -135,8 +135,7 @@ struct GraphicContext {
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
-	// The device memory this process allocated. The driver's usage figure is not used: NVIDIA
-	// counts host-visible allocations in the device-local heap.
+	// The device memory the driver holds for this process, what it allocates itself included.
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	// Whether `size` more bytes of device-local memory stay within the device-local budget.

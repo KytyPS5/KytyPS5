@@ -101,7 +101,7 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
 		                      vk::MemoryHeapFlagBits::eDeviceLocal);
 		if (!discrete || device_local) {
-			usage += budgets[heap].statistics.blockBytes;
+			usage += budgets[heap].usage;
 		}
 	}
 	return usage;
@@ -118,7 +118,7 @@ bool GraphicContext::DeviceBudgetAllows(uint64_t size) const {
 	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
 		if (physical_device_memory_properties.memoryHeaps[heap].flags &
 		    vk::MemoryHeapFlagBits::eDeviceLocal) {
-			usage += budgets[heap].statistics.blockBytes;
+			usage += budgets[heap].usage;
 			budget += budgets[heap].budget;
 		}
 	}

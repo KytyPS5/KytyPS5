@@ -5736,9 +5736,8 @@ public:
     std::printf("[gpu]     %-32s ok (%s)\n", name, windowed ? "windows" : "joined buffers");
   }
 
-  // The device budget counts this process's own device-local memory: NVIDIA's reported usage
-  // also counts host-visible allocations (PPSA02015 then put its buffers in system memory until
-  // it ran out). A buffer leaves the device only when new device memory would pass the budget.
+  // The device budget is the driver's, and so is the usage it is compared with. A buffer leaves
+  // the device only when new device memory would pass the budget.
   void CheckDeviceBudgetPlacement() {
     constexpr const char *name = "DeviceBudgetPlacement";
     constexpr uint64_t MiB = 1024ull * 1024ull;

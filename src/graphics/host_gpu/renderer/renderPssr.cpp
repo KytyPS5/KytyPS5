@@ -47,7 +47,7 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
                              Dlss::Inputs& inputs) {
 	const auto release = [&](std::unique_ptr<Upscaler::Feature>& feature) {
 		if (feature != nullptr) {
-			m_context.GetCommandScheduler().DeferOperation(
+			m_context.GetCommandScheduler().DeferRelease(
 			    [feature = std::move(feature)]() mutable { feature.reset(); });
 		}
 	};
@@ -88,7 +88,7 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 }
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	Common::LockGuard lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
 	std::copy_n(request.input, 8, input_descriptor.fields);

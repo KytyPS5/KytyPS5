@@ -188,9 +188,9 @@ uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
 
 DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 	DecodedCodeInstruction decoded {.address = address};
-	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address),
-	                                           end - address, &decoded.instruction,
-	                                           decoded.operands.data());
+	const auto             status =
+	    ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address), end - address,
+	                           &decoded.instruction, decoded.operands.data());
 	if (!ZYAN_SUCCESS(status)) {
 		decoded.instruction.length = 0;
 		return decoded;
@@ -600,8 +600,8 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	return function;
 }
 
-// Adds the direct-call targets reachable from the known function starts, to a fixpoint.
-// Targets come from decoded control flow only, never from raw byte scans.
+// Adds the direct-call targets reachable from the known function starts, and the functions that
+// follow their decoded code after alignment padding, to a fixpoint.
 void AddDecodedCallees(uintptr_t segment_start, uintptr_t segment_end,
                        std::vector<uintptr_t>* starts) {
 	std::set<uintptr_t>    known(starts->begin(), starts->end());
@@ -616,6 +616,36 @@ void AddDecodedCallees(uintptr_t segment_start, uintptr_t segment_end,
 			if (known.insert(callee).second) {
 				pending.push_back(callee);
 			}
+		}
+		// Functions reached only through pointers (lambdas, virtual functions) are neither called
+		// directly nor always listed in .eh_frame. Clang pads between functions with int3 up to
+		// the 16-byte function alignment, so the aligned address after the padding that ends a
+		// function starts another one.
+		if (function.instructions.empty()) {
+			continue;
+		}
+		const auto& [last_address, last] = *function.instructions.rbegin();
+		uintptr_t  next                  = last_address + last.instruction.length;
+		const bool complete =
+		    !function.has_indirect_branch && IsControlFlowTerminator(last.instruction);
+		if (!complete) {
+			// Blocks reached only through an unresolved jump table still belong to this
+			// function: step over them linearly up to the int3 padding that ends it.
+			while (next < end && *reinterpret_cast<const u8*>(next) != 0xcc) {
+				const auto decoded = DecodeCodeInstruction(next, end);
+				if (decoded.instruction.length == 0) {
+					break;
+				}
+				next += decoded.instruction.length;
+			}
+		}
+		const uintptr_t padding_start = next;
+		while (next < end && *reinterpret_cast<const u8*>(next) == 0xcc) {
+			++next;
+		}
+		if (next < end && (next & 15u) == 0 && (complete || next != padding_start) &&
+		    known.insert(next).second) {
+			pending.push_back(next);
 		}
 	}
 	starts->assign(known.begin(), known.end());
@@ -1430,7 +1460,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		constexpr s64 ShortJumpMin = std::numeric_limits<s8>::min();
 		constexpr s64 ShortJumpMax = std::numeric_limits<s8>::max();
-		const auto    relay_slot = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
+		const auto    relay_slot   = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
 			const s64 displacement =
 			    static_cast<s64>(address) - static_cast<s64>(site + ShortJumpSize);
 			return displacement >= ShortJumpMin && displacement <= ShortJumpMax;
@@ -1493,15 +1523,14 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 					}
 				}
 				if (span.instructions.empty() ||
-				    !(span.continuation <= site ||
-				      span.patch_start >= site_span.continuation) ||
+				    !(span.continuation <= site || span.patch_start >= site_span.continuation) ||
 				    overlaps_patched_span(span.patch_start, span.continuation)) {
 					continue;
 				}
 
 				const uintptr_t relay_address = span.patch_start + NearJumpSize;
-				const s64 displacement = static_cast<s64>(relay_address) -
-				                         static_cast<s64>(short_jump_address + ShortJumpSize);
+				const s64       displacement = static_cast<s64>(relay_address) -
+				                               static_cast<s64>(short_jump_address + ShortJumpSize);
 				if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
 					continue;
 				}
@@ -1523,8 +1552,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		std::map<uintptr_t, uintptr_t> relay_parent {{site, site}};
 		std::vector<uintptr_t>         relay_queue {site};
 		for (size_t queue_index = 0;
-		     !host_span && !final_relay_slot && queue_index < relay_queue.size();
-		     ++queue_index) {
+		     !host_span && !final_relay_slot && queue_index < relay_queue.size(); ++queue_index) {
 			const uintptr_t current = relay_queue[queue_index];
 			if (current != site) {
 				if (std::ranges::find(relay_slots, current) != relay_slots.end()) {
@@ -1534,8 +1562,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				}
 				const auto near_slot =
 				    std::ranges::find_if(relay_slots, [current](uintptr_t address) {
-					    const s64 displacement = static_cast<s64>(address) -
-					                             static_cast<s64>(current + ShortJumpSize);
+					    const s64 displacement =
+					        static_cast<s64>(address) - static_cast<s64>(current + ShortJumpSize);
 					    return address != current && displacement >= ShortJumpMin &&
 					           displacement <= ShortJumpMax;
 				    });
@@ -1574,10 +1602,9 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			continue;
 		}
 
-		const auto* site_trampoline =
-		    module->trampoline_gen.getCode() + *site_trampoline_offset;
-		auto&     patch_gen = module->patch_gen;
-		uintptr_t relay_address {};
+		const auto* site_trampoline = module->trampoline_gen.getCode() + *site_trampoline_offset;
+		auto&       patch_gen       = module->patch_gen;
+		uintptr_t   relay_address {};
 		if (final_relay_slot) {
 			relay_address = *final_relay_slot;
 			patch_gen.reset();
@@ -1604,8 +1631,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		uintptr_t jump_target = relay_address;
 		while (final_short_jump != site) {
 			patch_gen.reset();
-			patch_gen.setSize(final_short_jump -
-			                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.setSize(final_short_jump - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
 			patch_gen.jmp(reinterpret_cast<void*>(jump_target),
 			              Xbyak::CodeGenerator::LabelType::T_SHORT);
 			EXIT_IF(Xbyak::GetError() != 0);
@@ -1666,7 +1692,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	if (tsc_only && tsc_multiplier == 0) {
 		return result;
 	}
-	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+	auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
 		return result;
 	}
@@ -1690,7 +1716,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 
 	std::unique_lock lock {module->mutex};
 	const size_t     trampoline_begin = module->trampoline_gen.getSize();
-	bool analyze_red_zone = protect_memory;
+	bool             analyze_red_zone = protect_memory;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif

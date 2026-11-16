@@ -435,12 +435,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	physical.UpdateSize();
 	info.UpdateSize();
 	const auto same_mip = [&](uint32_t target, uint32_t source) {
-		const auto& left  = physical.mip_layout[target];
-		const auto& right = info.mip_layout[source];
-		return left.offset == right.offset && left.size == right.size &&
-		       left.pitch == right.pitch && left.height == right.height &&
-		       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-		       left.surface_z == right.surface_z &&
+		return physical.mip_layout[target] == info.mip_layout[source] &&
 		       physical.MipExtent(target) == info.MipExtent(source);
 	};
 	if (physical.first_tail_level == info.first_tail_level &&

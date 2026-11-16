@@ -284,7 +284,8 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
 	return true;
 }
 
-bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSurfaceLayout& out) {
+bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSurfaceLayout& out,
+                               TileMipLayout* mips) {
 	bool volume = false;
 	switch (description.dimension) {
 		case TileSurfaceDimension::Dim2D: break;
@@ -304,68 +305,67 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 	const auto& block   = texture.block;
 	const auto  width0  = (description.width + texture.texel_width - 1u) / texture.texel_width;
 	const auto  height0 = (description.height + texture.texel_height - 1u) / texture.texel_height;
-
-	TileSurfaceLayout result {};
-	result.description      = description;
-	result.texture          = texture;
 	const uint32_t block_slices =
 	    volume ? ShiftCeil(description.depth, std::countr_zero(block.block_depth))
 	           : description.layers;
 
-	MipTailLayout tail {};
-	result.first_tail_level = GetMipTailLayout(block, tail)
-	                              ? FirstTailLevel(tail, width0, height0, description.levels)
-	                              : description.levels;
+	MipTailLayout  tail {};
+	const uint32_t first_tail_level =
+	    GetMipTailLayout(block, tail) ? FirstTailLevel(tail, width0, height0, description.levels)
+	                                  : description.levels;
 
 	// The tail block starts a slice; the larger mips follow it from the smallest up.
-	uint64_t offset = result.first_tail_level < description.levels ? block.block_size : 0;
+	uint64_t offset = first_tail_level < description.levels ? block.block_size : 0;
 	for (uint32_t level = description.levels; level-- > 0;) {
-		auto& mip = result.mips[level];
-		mip.width = std::max(
-		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
-		mip.height = std::max(
-		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
-		if (level >= result.first_tail_level) {
-			mip.padded_width  = block.block_width;
-			mip.padded_height = block.block_height;
-			mip.size          = block.block_size;
-			mip.tail_x        = tail.locations[level - result.first_tail_level].x;
-			mip.tail_y        = tail.locations[level - result.first_tail_level].y;
+		if (level >= first_tail_level) {
+			const auto [x, y] = tail.locations[level - first_tail_level];
+			mips[level]       = {0, block.block_size, block.block_width, block.block_height, x, y};
 			continue;
 		}
-		mip.padded_width  = Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		mip.padded_height = Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
-		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
-		           block.bytes_per_element;
-		mip.offset = offset;
-		offset += mip.size;
+		const auto pitch =
+		    Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		const auto height =
+		    Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		const auto size = uint64_t {block.block_depth} * pitch * height * block.bytes_per_element;
+		mips[level]     = {offset, size, pitch, height};
+		offset += size;
 	}
 	if (offset > UINT64_MAX / block_slices) {
 		return false;
 	}
-	result.block_slice_size = offset;
-	result.total_size       = offset * block_slices;
-	out                     = result;
+	out.texture          = texture;
+	out.first_tail_level = first_tail_level;
+	out.block_slice_size = offset;
+	out.total_size       = offset * block_slices;
 	return true;
 }
 
-static void SetLegacyTiledMipLayout(const TileSurfaceLayout& layout, TileSizeAlign* total_size,
-                                    TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
+static void SetLegacyTiledMipLayout(const TileSurfaceDescription& description,
+                                    const TileSurfaceLayout& layout, const TileMipLayout* mips,
+                                    TileSizeAlign* total_size, TileSizeOffset* level_sizes,
+                                    TilePaddedSize* padded_size) {
 	EXIT_NOT_IMPLEMENTED(layout.block_slice_size > UINT32_MAX);
-	const auto& block = layout.texture.block;
+	const auto& texture = layout.texture;
+	const auto& block   = texture.block;
 	if (total_size != nullptr) {
 		*total_size = {static_cast<uint32_t>(layout.block_slice_size), block.block_size};
 	}
 
 	uint64_t linear_tail_offset = 0;
-	for (uint32_t level = 0; level < layout.description.levels; ++level) {
-		const auto& mip  = layout.mips[level];
+	for (uint32_t level = 0; level < description.levels; ++level) {
+		const auto& mip  = mips[level];
 		const bool  tail = level >= layout.first_tail_level;
 		EXIT_NOT_IMPLEMENTED(mip.offset > UINT32_MAX || mip.size > UINT32_MAX);
 		if (level_sizes != nullptr) {
 			if (tail) {
-				const uint64_t linear_size =
-				    static_cast<uint64_t>(mip.width) * mip.height * block.bytes_per_element;
+				const uint64_t width =
+				    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width;
+				const uint64_t height =
+				    ((description.height >> level) + texture.texel_height - 1u) /
+				    texture.texel_height;
+				const uint64_t linear_size = std::max<uint64_t>(width, 1) *
+				                             std::max<uint64_t>(height, 1) *
+				                             block.bytes_per_element;
 				EXIT_NOT_IMPLEMENTED(linear_size > UINT32_MAX || linear_tail_offset > UINT32_MAX);
 				level_sizes[level] = {static_cast<uint32_t>(linear_size),
 				                      static_cast<uint32_t>(linear_tail_offset)};
@@ -376,8 +376,8 @@ static void SetLegacyTiledMipLayout(const TileSurfaceLayout& layout, TileSizeAli
 			}
 		}
 		if (padded_size != nullptr) {
-			padded_size[level] = {mip.padded_width * layout.texture.texel_width,
-			                      mip.padded_height * layout.texture.texel_height};
+			padded_size[level] = {mip.pitch * texture.texel_width,
+			                      mip.height * texture.texel_height};
 		}
 	}
 }
@@ -1023,10 +1023,11 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 	}
 
 	TileSurfaceLayout            layout {};
+	TileMipLayout                mips[16];
 	const TileSurfaceDescription description {
 	    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
-	if (TileGetTiledTextureLayout(description, layout)) {
-		SetLegacyTiledMipLayout(layout, total_size, level_sizes, padded_size);
+	if (TileGetTiledTextureLayout(description, layout, mips)) {
+		SetLegacyTiledMipLayout(description, layout, mips, total_size, level_sizes, padded_size);
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {
@@ -1041,9 +1042,10 @@ void TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint
 	EXIT_NOT_IMPLEMENTED(depth == 0);
 	if (volume_texture && tile != Prospero::TileMode::kLinear) {
 		TileSurfaceLayout            layout {};
+		TileMipLayout                mips[16];
 		const TileSurfaceDescription description {
 		    format, tile, TileSurfaceDimension::Dim3D, width, height, depth, levels, 1};
-		if (!TileGetTiledTextureLayout(description, layout)) {
+		if (!TileGetTiledTextureLayout(description, layout, mips)) {
 			EXIT("unsupported 3D texture layout: format=%u tile=%u extent=%ux%ux%u levels=%u\n",
 			     static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width, height, depth,
 			     levels);

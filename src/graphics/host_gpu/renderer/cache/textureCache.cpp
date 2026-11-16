@@ -636,13 +636,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
-		info.data       = cached.info.data;
-		info.resources  = cached.info.resources;
-		info.mip_layout          = cached.info.mip_layout;
-		info.tiling              = cached.info.tiling;
-		info.tiled_slice_stride  = cached.info.tiled_slice_stride;
-		info.linear_slice_stride = cached.info.linear_slice_stride;
-		info.first_tail_level    = cached.info.first_tail_level;
+		info.data               = cached.info.data;
+		info.resources          = cached.info.resources;
+		info.mip_layout         = cached.info.mip_layout;
+		info.tiling             = cached.info.tiling;
+		info.tiled_slice_stride = cached.info.tiled_slice_stride;
+		info.first_tail_level   = cached.info.first_tail_level;
 	}
 	info.htile_initial_clear  = false;
 	const auto replacement_id = InsertImage(info);
@@ -760,14 +759,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
-		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
-		                 cached.info.mip_layout.begin(),
-		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
-			                 return left.offset == right.offset && left.size == right.size &&
-			                        left.pitch == right.pitch && left.height == right.height &&
-			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-			                        left.surface_z == right.surface_z;
-		                 }))) {
+		     !std::equal(requested.mip_layout.begin(),
+		                 requested.mip_layout.begin() + requested.resources.levels,
+		                 cached.info.mip_layout.begin()))) {
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
@@ -916,7 +910,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		EXIT("TextureCache: invalid depth upload\n");
 	}
 	const auto layers          = info.resources.layers;
-	const auto full_slice_size = info.linear_slice_stride;
+	const auto full_slice_size = info.LinearLayout().slice_stride;
 	auto       linear          = m_tiler.Detile(source.Handle(), source_offset, info);
 	auto       copies          = info.BufferCopies(linear.offset);
 	if (image.depth_id) {
@@ -1664,7 +1658,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
-	const auto     full_slice_size  = info.linear_slice_stride;
+	const auto     full_slice_size  = info.LinearLayout().slice_stride;
 	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
 	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
@@ -1919,14 +1913,12 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 	part.data.size    = size;
 	part.extent       = {extent.width, extent.height, 1};
 	part.resources    = {count, 1};
+	part.pitch        = std::max(info.pitch >> first, 1u);
 	part.first_tail_level -= std::min(first, info.first_tail_level);
-	uint64_t linear = 0;
 	for (uint32_t level = 0; level < count; level++) {
 		auto& mip = part.mip_layout[level] = info.mip_layout[first + level];
 		mip.offset -= begin;
 		mip.size /= layers;
-		mip.linear_offset = Common::AlignUp<uint64_t>(linear, std::max(info.bytes_per_block, 4u));
-		linear            = mip.linear_offset + mip.linear_size;
 	}
 	const auto [buffer, source_offset] = m_buffer_cache.ObtainBuffer(source, size, false);
 	const auto texels = m_tiler.Detile(buffer->Handle(), source_offset, part);

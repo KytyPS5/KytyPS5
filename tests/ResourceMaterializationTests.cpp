@@ -1383,6 +1383,9 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   auto &first = program.descriptor_sources[0];
   first.dwords[0] = Value(0x100u);
   first.dwords[1] = Value(static_cast<uint32_t>(BufferFormat::k8UNorm) << 20u);
+  // A sampled T# whose channels all select zero reads as null: the candidates select R, G, B, A.
+  program.descriptor_sources[1].dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+      static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   first.dwords[3] = program.descriptor_sources[1].dwords[3];
   program.descriptor_sources[1].dwords[1] = Value(static_cast<uint32_t>(
       mixed ? BufferFormat::k8UInt : BufferFormat::k8UNorm) << 20u);

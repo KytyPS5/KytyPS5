@@ -1966,7 +1966,7 @@ vk::ImageView TextureCache::AcquireEqaaShadow(ImageId id, const ImageDesc& desc,
 	}
 	shadow.dirty |= writes & aspects;
 	shadow.samples_equal &= ~writes;
-	shadow.last_tick       = m_scheduler.CurrentTick();
+	shadow.last_tick       = m_gc_tick;
 	auto shadow_view       = view;
 	shadow_view.base_level = 0;
 	shadow_view.base_layer = 0;
@@ -2623,7 +2623,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
-	DropIdleShadows(m_scheduler.CurrentTick());
+	DropIdleShadows(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

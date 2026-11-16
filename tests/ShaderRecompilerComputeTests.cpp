@@ -25054,6 +25054,16 @@ public:
         red[i] = texels[i * 4];
       }
       check_columns("heap settled colour", red, f1, f2, f1, f2);
+      // A shadow ages in frames, as its owner does, not in command buffers.
+      for (uint32_t submit = 0; submit <= 16u; ++submit)
+        scheduler.Flush();
+      cache.RunGarbageCollector();
+      Require(name, "shadow frame lifetime", image.eqaa != nullptr,
+              "one frame's command buffers aged an idle shadow out");
+      TextureCacheTestAccess::SkipFrames(cache, 17u);
+      cache.RunGarbageCollector();
+      Require(name, "shadow frame aging", image.eqaa == nullptr,
+              "a shadow unused for 17 frames stayed");
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
       device.destroyDescriptorSetLayout(empty, nullptr);

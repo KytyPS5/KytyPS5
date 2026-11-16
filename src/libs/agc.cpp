@@ -1845,9 +1845,10 @@ uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values)
 	return 4u * num_values + 8u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
-                                                  const volatile ShaderRegister* regs,
-                                                  uint32_t                       num_regs) {
+// Emits one packet per run of consecutive offsets. A run's values are read after the previous
+// run is allocated; a run that cannot be allocated is skipped.
+static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderRegister* regs,
+                                      uint32_t num_regs, uint32_t op) {
 	if (num_regs == 0) {
 		return nullptr;
 	}
@@ -1855,75 +1856,8 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
 
-	std::vector<ShaderRegister> local_regs(num_regs);
-	for (uint32_t i = 0; i < num_regs; i++) {
-		local_regs[i].offset = regs[i].offset;
-		local_regs[i].value  = regs[i].value;
-	}
-
-	uint32_t* first_cmd        = nullptr;
-	uint32_t  run_start_index  = 0;
-	uint32_t  run_start_offset = local_regs[0].offset;
-	uint32_t  prev_offset      = run_start_offset;
-
-	for (uint32_t i = 1; i <= num_regs; i++) {
-		const bool flush = (i == num_regs || local_regs[i].offset != prev_offset + 1u);
-
-		if (flush) {
-			const auto run_count = i - run_start_index;
-			auto*      cmd       = buf->AllocateDW(run_count + 2u);
-
-			if (cmd == nullptr) {
-				LOGF_COLOR(Log::Color::Red,
-				           "\t failed to allocate set-sh-registers-direct command\n");
-				return first_cmd;
-			}
-
-			if (first_cmd == nullptr) {
-				first_cmd = cmd;
-			}
-
-			cmd[0] = KYTY_PM4(run_count + 2u, Pm4::IT_SET_SH_REG, 0u);
-			cmd[1] = run_start_offset & 0xffffu;
-
-			for (uint32_t j = 0; j < run_count; j++) {
-				cmd[j + 2u] = local_regs[run_start_index + j].value;
-			}
-
-			if (i < num_regs) {
-				run_start_index  = i;
-				run_start_offset = local_regs[i].offset;
-			}
-		}
-
-		if (i < num_regs) {
-			prev_offset = local_regs[i].offset;
-		}
-	}
-
-	return first_cmd;
-}
-
-uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
-                                                  const volatile ShaderRegister* regs,
-                                                  uint32_t                       num_regs) {
-	PRINT_NAME();
-
-	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(regs), num_regs);
-
-	if (num_regs == 0) {
-		return nullptr;
-	}
-
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	EXIT_NOT_IMPLEMENTED(regs == nullptr);
-
-	// Original implementation stages register values in a temporary DWORD array. It reads each new run only
-	// after the preceding run has been allocated, so preserve that ordering around grow callbacks.
-	std::vector<uint32_t> values(num_regs);
-	values[0] = regs[0].value;
+	auto* values = static_cast<uint32_t*>(__builtin_alloca(num_regs * sizeof(uint32_t)));
+	values[0]    = regs[0].value;
 
 	uint32_t* first_cmd        = nullptr;
 	uint32_t  run_start_index  = 0;
@@ -1950,26 +1884,40 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                
 				first_cmd = cmd;
 			}
 
-			cmd[0] = KYTY_PM4(run_count + 2u, Pm4::IT_SET_UCONFIG_REG, 0u);
+			cmd[0] = KYTY_PM4(run_count + 2u, op, 0u);
 			cmd[1] = run_start_offset & 0xffffu;
-			memcpy(cmd + 2, values.data() + run_start_index,
+			memcpy(cmd + 2, values + run_start_index,
 			       static_cast<size_t>(run_count) * sizeof(uint32_t));
-		} else {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t failed to allocate set-uc-registers-direct command\n");
 		}
 
 		if (i == num_regs) {
 			return first_cmd;
 		}
 
-		// Original implementation skips an intermediate run whose grow callback fails, then keeps scanning.
 		run_start_index  = i;
 		run_start_offset = regs[i].offset;
 		prev_offset      = run_start_offset;
 		values[i]        = regs[i].value;
 		i++;
 	}
+}
+
+uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs) {
+	return set_registers_direct(buf, regs, num_regs, Pm4::IT_SET_SH_REG);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs) {
+	PRINT_NAME();
+
+	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+	         "\t num_regs = %" PRIu32 "\n",
+	         reinterpret_cast<uint64_t>(regs), num_regs);
+
+	return set_registers_direct(buf, regs, num_regs, Pm4::IT_SET_UCONFIG_REG);
 }
 
 int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {

@@ -551,6 +551,7 @@ public:
 		m_info.address_bases.clear();
 		m_info.user_address_bases.clear();
 		m_info.dma_base_registers.clear();
+		m_info.vsharp_base_registers.clear();
 		m_info.dma_windows.clear();
 		m_info.dma_tables.clear();
 		m_info.dma_record_tables.clear();
@@ -5464,11 +5465,12 @@ private:
 	// through the carry, from everything the low dword does). Record {N, N + 1} so the host can
 	// cache the memory at the base before the shader runs; an access to memory without a cached
 	// buffer only records a fault and reads zero.
-	// Whether a user-data register pair is the base of the V#; it is recorded as a DMA base.
-	bool CollectDmaBase(const Inst& handle) {
+	// Whether a user-data register pair is the base of the V#; it is recorded as a DMA base, in
+	// vsharp_base_registers for a V# the GPU computes (`vsharp`).
+	bool CollectDmaBase(const Inst& handle, bool vsharp = false) {
 		const auto add = [&](uint32_t low_reg, uint32_t high_reg) {
 			const std::array<uint32_t, 2> pair {low_reg, high_reg};
-			auto&                         bases = m_info.dma_base_registers;
+			auto& bases = vsharp ? m_info.vsharp_base_registers : m_info.dma_base_registers;
 			if (std::ranges::find(bases, pair) == bases.end()) {
 				bases.push_back(pair);
 			}
@@ -5847,7 +5849,7 @@ private:
 					AddIndirectWriteTable(table_source, table_offset, flags.pc);
 				} else if (m_program.stage == ShaderType::Compute && handle != nullptr &&
 				           memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferWrite(op) &&
-				           DerivesFromMemory(*handle) && CollectDmaBase(*handle)) {
+				           DerivesFromMemory(*handle) && CollectDmaBase(*handle, true)) {
 					// A raw store or atomic through a V# whose fields the GPU computes from a base in
 					// user data: Gran Turismo 7's cs f0ff5e4576313e72 (PS5 Pro mode, loading a race)
 					// writes lists at its user-data base + 0x100 with a record count it sums from two

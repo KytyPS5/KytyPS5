@@ -674,6 +674,11 @@ struct ShaderInfo {
 	// from: the low dword, and the next register for a 64-bit pointer or any other one for a V#
 	// whose dword 1 the shader builds from the high 16 bits of the base.
 	std::vector<std::array<uint32_t, 2>> dma_base_registers;
+	// The same for the bases of V#s the GPU computes (raw stores and atomics, see
+	// ResourceTracking): such a V# holds records past an offset the shader reads from memory,
+	// which can reach much farther from its base than a FLAT access does
+	// (RenderContext::CacheDmaBases()).
+	std::vector<std::array<uint32_t, 2>> vsharp_base_registers;
 	// The guest memory DMA reads, when every DMA access is a read whose address is a user-data
 	// base pair plus an offset with known possible bits (see DmaFootprint).
 	struct DmaWindow {

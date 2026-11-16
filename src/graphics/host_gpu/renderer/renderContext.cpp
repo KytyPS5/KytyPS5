@@ -25,6 +25,14 @@
 
 namespace Libs::Graphics {
 
+namespace {
+
+// How far CacheDmaBases() caches after the base of a V# the GPU computes: the mapped memory that
+// follows it without a gap, up to this.
+constexpr uint64_t VsharpBaseReach = uint64_t {32} << 20u;
+
+} // namespace
+
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
     : m_graphics(graphics), m_render_executor(*this),
       m_command_scheduler(*this, graphics,
@@ -403,28 +411,44 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	const auto&      program   = runtime.module->info;
 	const auto&      user_data = runtime.resources->user_data;
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	for (const auto [low_reg, high_reg]: program.info.dma_base_registers) {
+
+	const auto cache_after = [&](const std::array<uint32_t, 2>& pair, uint64_t window,
+	                             bool contiguous) {
+		const auto [low_reg, high_reg] = pair;
 		const auto low  = static_cast<uint64_t>(low_reg) - program.user_data_base;
 		const auto high = static_cast<uint64_t>(high_reg) - program.user_data_base;
 		if (low_reg < program.user_data_base || high_reg < program.user_data_base ||
 		    low >= user_data.size() || high >= user_data.size()) {
-			continue;
+			return;
 		}
 		// Guest addresses have 48 bits: a V#'s dword 1 holds the stride above the high 16 of them.
 		const auto base =
 		    user_data[low] | (static_cast<uint64_t>(user_data[high] & 0xffffu) << 32u);
 		// The registers of an access that never runs may hold stale data. Mapped memory never
 		// reaches the top of the address space, so a window that would overflow is skipped.
-		if (base > UINT64_MAX - BufferCache::CACHING_PAGESIZE) {
-			continue;
+		if (base > UINT64_MAX - window) {
+			return;
 		}
-		// DMA reaches only memory with a cached buffer; any other access records a fault and
-		// reads zero, and the buffer arrives after the shader has run. That loses data the guest
-		// writes for a single dispatch, such as the glyph bitmaps GTA V copies into its font atlas.
-		m_mapped_ranges.ForEachInRange(base, BufferCache::CACHING_PAGESIZE,
-		                               [this](uint64_t start, uint64_t end) {
-			                               (void)m_buffer_cache.FindBuffer(start, end - start);
-		                               });
+		m_mapped_ranges.ForEachInRange(base, window, [&](uint64_t start, uint64_t end) {
+			// Memory past a gap belongs to another allocation.
+			if (!contiguous || start == base) {
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			}
+		});
+	};
+	// DMA reaches only memory with a cached buffer; any other access records a fault and reads
+	// zero, and the buffer arrives after the shader has run. That loses data the guest writes for a
+	// single dispatch, such as the glyph bitmaps GTA V copies into its font atlas.
+	for (const auto& pair: program.info.dma_base_registers) {
+		cache_after(pair, BufferCache::CACHING_PAGESIZE, false);
+	}
+	// A V# the GPU computes from a base holds records past offsets the shader reads from memory,
+	// anywhere in the allocation that starts there. SAROS's kTrinity BVH passes in PS5 Pro mode
+	// reach up to ~10 MiB into their scratch memory, which the guest maps apart for a large BVH:
+	// past 16 KiB the stores of one pass were lost and the next read zeros, so the refit pass (cs
+	// 0x4a2181e0b7db95a7) looped forever over records with bad indices.
+	for (const auto& pair: program.info.vsharp_base_registers) {
+		cache_after(pair, VsharpBaseReach, true);
 	}
 	CacheTlasMemory(runtime);
 }

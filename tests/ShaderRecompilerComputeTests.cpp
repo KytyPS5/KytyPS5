@@ -1736,6 +1736,9 @@ struct TestCase {
   // Guest addresses whose caching page V#-table stores must (true) or must not
   // (false) have marked in the fault buffer's write bitmap.
   std::vector<std::pair<uint64_t, bool>> expected_bda_writes;
+  // The user-data base pairs of V#s the GPU computes, sorted; the host caches more after them than
+  // after a DMA base (RenderContext::CacheDmaBases()).
+  std::vector<std::array<u32, 2>> expected_vsharp_bases;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -2116,6 +2119,18 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     Require(test.name, "typed IR", actual == expected,
             text + " count=" + std::to_string(actual) +
                 ", expected=" + std::to_string(expected));
+  }
+  if (!test.expected_vsharp_bases.empty()) {
+    auto bases = result.program.info.vsharp_base_registers;
+    std::ranges::sort(bases);
+    std::string found;
+    for (const auto &[low, high] : bases) {
+      found += " {s" + std::to_string(low) + ", s" + std::to_string(high) + "}";
+    }
+    Require(test.name, "V# base registers",
+            bases == test.expected_vsharp_bases &&
+                result.program.info.dma_base_registers.empty(),
+            "the user-data bases of a V# the GPU computes were not recorded as V# bases:" + found);
   }
   if (test.expected_mip_descriptors != 0) {
     const auto image = std::ranges::find_if(
@@ -38420,6 +38435,7 @@ TestCase BufferAtomicThroughUserDataBases(bool second) {
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 0}};
   test.expected_bda_writes = {{GuestBase, true}};
+  test.expected_vsharp_bases = {{4u, 6u}, {7u, 16u}};
   test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
                   O::S_MOV_B32, O::S_LSHL_B64, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC0, O::S_ADD_U32,
                   O::S_ADDC_U32, O::S_OR_B32, O::S_BRANCH, O::BUFFER_ATOMIC_OR, O::BUFFER_STORE_DWORD,

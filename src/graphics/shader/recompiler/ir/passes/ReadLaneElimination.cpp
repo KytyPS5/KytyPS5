@@ -1,7 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
-#include <optional>
 #include <queue>
 
 #include <unordered_map>
@@ -186,13 +185,18 @@ private:
 	ValueOpcode  operation;
 };
 
-// The subgroup reduction that replaces a proven whole-wave scan of operation.
-std::optional<ValueOpcode> WaveReduction(ValueOpcode operation) {
+// Associative, commutative operations with a subgroup reduction; lanes combine in any order.
+bool IsWaveReduction(ValueOpcode operation) {
 	switch (operation) {
-		case ValueOpcode::UMin32: return ValueOpcode::SubgroupUMinU32;
-		case ValueOpcode::UMax32: return ValueOpcode::SubgroupUMaxU32;
-		case ValueOpcode::BitwiseOr32: return ValueOpcode::SubgroupOrU32;
-		default: return std::nullopt;
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32: return true;
+		default: return false;
 	}
 }
 
@@ -207,12 +211,14 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			const auto opcode = inst.GetOpcode();
-			if (const auto reduce = WaveReduction(opcode)) {
+			if (IsWaveReduction(opcode)) {
 				const auto seed = WaveReductionMatcher(block, opcode).Match(inst, wave_size);
 				if (!seed.IsEmpty()) {
 					const auto position = std::find_if(block->begin(), block->end(),
 					                                  [&](const Inst& candidate) { return &candidate == &inst; });
-					auto&      reduction = *block->PrependNewInst(position, *reduce, {seed});
+					auto&      reduction =
+					    *block->PrependNewInst(position, ValueOpcode::SubgroupReduceU32, {seed});
+					reduction.SetFlags(opcode);
 					inst.ReplaceUsesWith(Value(&reduction));
 					stats.rewritten_reductions++;
 				}

@@ -2055,6 +2055,115 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	return true;
 }
 
+// What the branches on the way to a block decide: conditions and the value each one has there.
+using BranchFacts = std::vector<std::pair<Value, bool>>;
+
+// A condition without its negations, and whether it was negated an odd number of times.
+std::pair<Value, bool> Literal(Value value) {
+	bool negated = false;
+	for (uint32_t depth = 0; depth < 8; ++depth) {
+		const auto* inst = Producer(value, ValueOpcode::LogicalNot);
+		if (inst == nullptr) break;
+		value   = inst->Arg(0);
+		negated = !negated;
+	}
+	return {value.Resolve(), negated};
+}
+
+// The value of a condition that `facts` decide.
+std::optional<bool> Decided(Value value, const BranchFacts& facts, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value.IsEmpty() || depth > 8) return std::nullopt;
+	if (value.IsImmediate()) return value.GetType() == Type::U1 ? std::optional(value.U1()) : std::nullopt;
+	for (const auto& [condition, holds]: facts) {
+		if (condition == value) return holds;
+	}
+	const auto* inst = value.TryInstruction();
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LogicalNot: {
+			const auto arg = Decided(inst->Arg(0), facts, depth + 1);
+			return arg ? std::optional(!*arg) : std::nullopt;
+		}
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalAnd: {
+			const bool any = inst->GetOpcode() == ValueOpcode::LogicalOr;
+			const auto a = Decided(inst->Arg(0), facts, depth + 1), b = Decided(inst->Arg(1), facts, depth + 1);
+			if (a == any || b == any) return any;
+			if (a && b) return !any;
+			return std::nullopt;
+		}
+		case ValueOpcode::ConditionRef: return Decided(inst->Arg(0), facts, depth + 1);
+		default: return std::nullopt;
+	}
+}
+
+// Whether the edge `from` -> `to` can be taken under `facts`; it adds the condition the edge needs.
+bool TakesEdge(const Block* from, const Block* to, BranchFacts& facts) {
+	const auto& terminator = from->terminator;
+	if (terminator.kind != CFG::TerminatorKind::ConditionalBranch || terminator.true_block == terminator.false_block)
+		return true;
+	const bool needed  = to == terminator.true_block;
+	const auto decided = Decided(from->condition, facts);
+	if (decided) return *decided == needed;
+	const auto [condition, negated] = Literal(from->condition);
+	facts.emplace_back(condition, needed != negated);
+	return true;
+}
+
+// Whether `block` can run under `facts`, through the conditional branches into the blocks of one
+// predecessor before it; it adds the conditions they need.
+bool BlockRuns(const Block* block, BranchFacts& facts) {
+	for (uint32_t depth = 0; depth < 64; ++depth) {
+		const auto preds = block->ImmPredecessors();
+		if (preds.size() != 1) return true;
+		if (!TakesEdge(preds[0], block, facts)) return false;
+		block = preds[0];
+	}
+	return true;
+}
+
+// The values a phi tree (no loop) can hold under `facts`: the incoming values of the edges that can
+// be taken (into `found`); false if it reaches a loop.
+bool ReachingValues(Value value, const BranchFacts& facts, std::vector<Value>& found, uint32_t depth = 0) {
+	value           = value.Resolve();
+	const auto* phi = Producer(value, ValueOpcode::Phi);
+	if (phi == nullptr) {
+		if (std::ranges::find(found, value) == found.end()) found.push_back(value);
+		return true;
+	}
+	const auto* block = phi->Parent();
+	if (depth > 32 || block->terminator.loop_header) return false;
+	for (size_t arg = 0; arg < phi->NumArgs(); ++arg) {
+		const auto* from = phi->PhiBlock(arg);
+		// (The facts about the phis of the block are about their incoming values from `from`.)
+		BranchFacts edge;
+		bool        holds = true;
+		for (const auto& [condition, value_there]: facts) {
+			const auto* fact = Producer(condition, ValueOpcode::Phi);
+			if (fact == nullptr || fact->Parent() != block) {
+				edge.emplace_back(condition, value_there);
+				continue;
+			}
+			const auto [incoming, negated] = Literal(fact->Arg(Incoming(*fact, from)));
+			const auto decided             = Decided(incoming, {});
+			holds                          = holds && (!decided || *decided == (value_there != negated));
+			edge.emplace_back(incoming, value_there != negated);
+		}
+		if (!holds || !TakesEdge(from, block, edge) || !BlockRuns(from, edge)) continue;
+		if (!ReachingValues(phi->Arg(arg), edge, found, depth + 1)) return false;
+	}
+	return true;
+}
+
+// The one value `value` can hold where `inst` runs (through the phis of a guest switch whose other
+// cases leave the program: the structurizer joins their values), or empty.
+Value ReachingValue(Value value, const Inst& inst) {
+	BranchFacts        facts;
+	std::vector<Value> found;
+	if (!BlockRuns(inst.Parent(), facts) || !ReachingValues(value, facts, found) || found.size() != 1) return {};
+	return found[0];
+}
+
 // Where the TLAS header address comes from: a user data pointer + offset, or the base of a V# at
 // a user data pointer + offset, + offset.
 bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
@@ -2071,9 +2180,18 @@ bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
 		source.header_offset = MemoryOf(program, *read).offset;
 		return true;
 	}
-	const auto load = LoadOf(program, value);
-	const auto user = load ? UserRegister(load->low) : std::nullopt;
-	if (!user || UserRegister(load->high) != *user + 1u) return false;
+	auto load = LoadOf(program, value);
+	auto user = load ? UserRegister(load->low) : std::nullopt;
+	// (A pair that the cases of a switch before it set to other user data pairs, ASTRO BOT's ps
+	// 9833d01b08e21d08 and ASTRO's PLAYROOM's 29289be6a0202b6d: those cases leave the program before
+	// the load.)
+	if (load && !user) {
+		const auto& at = *value.Resolve().TryInstruction();
+		load->low      = ReachingValue(load->low, at);
+		load->high     = ReachingValue(load->high, at);
+		user           = !load->low.IsEmpty() ? UserRegister(load->low) : std::nullopt;
+	}
+	if (!user || load->high.IsEmpty() || UserRegister(load->high) != *user + 1u) return false;
 	source.user_sgpr     = *user;
 	source.header_offset = load->offset;
 	return true;
@@ -2379,6 +2497,29 @@ Value PathEntry(const PacketWalk& w, Value value) {
 	return value;
 }
 
+// The first iteration's lanes of lanes the walk takes again in each round (the lane mask of an exec
+// mask the loop restores: Select(first round, the lanes before the loop, the saved mask's lanes),
+// and those of a branch around the loop): PathEntry, also through the selects whose condition it
+// decides and the ands of the same lanes.
+Value EntryLanes(const PacketWalk& w, Value lanes, uint32_t depth = 0) {
+	lanes = PathEntry(w, lanes);
+	if (depth > 8) return lanes;
+	const auto all = [](Value value) {
+		return !value.IsEmpty() && value.IsImmediate() && value.GetType() == Type::U1 && value.U1();
+	};
+	if (const auto* select = Producer(lanes, ValueOpcode::SelectU1); select != nullptr) {
+		const auto first = EntryLanes(w, select->Arg(0), depth + 1);
+		if (!first.IsEmpty() && first.IsImmediate() && first.GetType() == Type::U1)
+			return EntryLanes(w, select->Arg(first.U1() ? 1 : 2), depth + 1);
+	}
+	if (const auto* both = Producer(lanes, ValueOpcode::LogicalAnd); both != nullptr) {
+		const auto a = EntryLanes(w, both->Arg(0), depth + 1), b = EntryLanes(w, both->Arg(1), depth + 1);
+		if (!a.IsEmpty() && (a == b || all(b))) return a;
+		if (all(a)) return b;
+	}
+	return lanes;
+}
+
 // The guest code of a walk's loop [header, latch] (the code that stays in the BVH), up to `end`.
 bool WalkReach(const Program& program, const Block* header, const Block* latch, uint32_t end,
                NativeTraversals& source) {
@@ -2573,6 +2714,18 @@ bool MatchPacketWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	}
 	w.lanes = origin->Arg(0).Resolve();
 	w.t_max = PathEntry(w, s.ray[6]);
+	// (Lanes the walk takes again in each round, ASTRO BOT's ps 9833d01b08e21d08 and ASTRO's
+	// PLAYROOM's 29289be6a0202b6d: the lanes of the first one, and the values from before of the
+	// box test's components the lanes copy there from SGPRs before each test (a ray origin the
+	// same in every lane).)
+	if (!DefinedBefore(program, w.lanes, w.header)) {
+		for (auto& component: std::span(s.ray).first(6)) {
+			const auto* copy = Producer(component, ValueOpcode::SelectU32);
+			if (!DefinedBefore(program, component, w.header) && copy != nullptr && copy->Arg(0).Resolve() == w.lanes)
+				component = copy->Arg(1).Resolve();
+		}
+		w.lanes = EntryLanes(w, w.lanes);
+	}
 	if (!DefinedBefore(program, w.lanes, w.header) || !DefinedBefore(program, w.t_max, w.header) ||
 	    std::ranges::any_of(std::span(s.ray).first(6),
 	                        [&](Value v) { return !DefinedBefore(program, v, w.header); }))

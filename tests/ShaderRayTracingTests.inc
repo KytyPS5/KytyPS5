@@ -646,6 +646,8 @@ struct NativeWalks {
   uint32_t root = 0x25;
   std::array<uint32_t, 4> layout{};
   size_t reach = 0;
+  // (Not for a pixel shader: its exports are not valid SPIR-V in the compute stage the walks are traced in.)
+  bool validates = true;
 };
 
 void CheckNativeWalks(const NativeWalks &expected) {
@@ -697,7 +699,9 @@ void CheckNativeWalks(const NativeWalks &expected) {
   Check(traced, (std::string("the BVH walks of ") + expected.name +
                  " do not trace with ray queries, or have the wrong TLAS source, instance record layout or reach")
                     .c_str());
-  CheckSpirvBinaryValidates(compiled.spirv);
+  if (expected.validates) {
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
 }
 
 // The native walks of real programs of each form, with the sites, TLAS sources and instance record layouts the
@@ -750,6 +754,18 @@ void TestRayTracingNativeWalks() {
                     .header_vsharp = 0x50,
                     .layout = {0x76543210u, 0x3dc6ba98u, 0x000801cfu, 0u},
                     .reach = 1});
+  CheckNativeWalks({.name = "ASTRO BOT's ps 9833d01b08e21d08",
+                    .code = kAstroUniformOrigin64,
+                    .user_sgpr = 0,
+                    .header_offset = 0x28,
+                    .layout = {0x76543210u, 0x1dc6ba98u, 0x000dbb8fu, 0x000f2510u},
+                    .validates = false});
+  CheckNativeWalks({.name = "ASTRO's PLAYROOM's ps 29289be6a0202b6d",
+                    .code = kPlayroomUniformOrigin64,
+                    .user_sgpr = 0,
+                    .header_offset = 0x28,
+                    .layout = {0xd951c840u, 0x4c25ea62u, 0x30482080u, 0x308f2511u},
+                    .validates = false});
 }
 
 void TestRayTracingInstructions() {

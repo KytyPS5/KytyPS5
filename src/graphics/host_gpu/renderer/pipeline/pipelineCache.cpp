@@ -884,6 +884,17 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	vertex_info[0].mesh.layer_chunk_dword = UINT32_MAX;
+#if defined(_WIN32)
+	// AMD's Windows driver (Adrenalin 26.10.1, RX 6600) renders a mesh shader's per-primitive Layer
+	// L into layer L mod 8 (a vertex shader's Layer works). A Game About Digging A Hole (PPSA30552)
+	// builds its 32-layer colour-grading LUT with one such draw, so 24 layers stay black and the
+	// image turns grey. Layered mesh draws run once per 8 layers; the dword holds the chunk.
+	if (mesh_active && m_graphics.physical_device_properties.vendorID == 0x1002u) {
+		vertex_info[0].mesh.layer_chunk_dword = push_data_cursor++;
+	}
+#endif
+	pixel_info.layer_chunk_dword = vertex_info[0].mesh.layer_chunk_dword;
 	if (pixel_active) {
 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
 		for (const auto& output: pixel_module.info.info.outputs) {

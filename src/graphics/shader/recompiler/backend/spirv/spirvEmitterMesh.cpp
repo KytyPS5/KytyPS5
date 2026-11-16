@@ -233,9 +233,29 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind != IR::StageOutputKind::Layer) {
 					continue;
 				}
-				const auto layer = MeshLoad(state, output.mesh_data_variable,
-				                            spv::StorageClassWorkgroup, TypeU32(state),
-				                            vertex[state.input_info.vertex->mesh.provoking_vertex]);
+				auto layer = MeshLoad(state, output.mesh_data_variable, spv::StorageClassWorkgroup,
+				                      TypeU32(state),
+				                      vertex[state.input_info.vertex->mesh.provoking_vertex]);
+				if (const auto chunk_dword = state.input_info.vertex->mesh.layer_chunk_dword;
+				    chunk_dword != UINT32_MAX) {
+					// The draw runs once per 8 layers with a view starting at chunk * 8: keep this
+					// chunk's primitives and write their layer within it.
+					const auto chunk = EmitPushDataLoad(state, ConstantU32(state, chunk_dword));
+					const auto group = EmitBinaryU32(state, spv::OpShiftRightLogical, layer,
+					                                 ConstantU32(state, 3));
+					const auto other = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), other, group,
+					                          chunk);
+					const auto skip = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), skip, culled,
+					                          other);
+					state.builder.AddFunction(spv::OpStore,
+					                          MeshElement(state, state.mesh_cull,
+					                                      spv::StorageClassOutput, TypeBool(state),
+					                                      index),
+					                          skip);
+					layer = EmitBinaryU32(state, spv::OpBitwiseAnd, layer, ConstantU32(state, 7));
+				}
 				const auto pointer = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeU32(state)),

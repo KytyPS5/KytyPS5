@@ -1210,16 +1210,18 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	const auto layer_chunk_dword   = state.vertex_info[0].mesh.layer_chunk_dword;
 	uint32_t   layered_mesh_chunks = 0;
-	if (mesh_active && !mesh_task && layer_chunk_dword != UINT32_MAX) {
+	if (layer_chunk_dword != UINT32_MAX) {
+		// Every draw with the dword starts at chunk 0: a draw without a Layer output renders to
+		// the first layer, and its pixel shader may still read the layer.
+		constexpr uint32_t first_chunk = 0;
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
+		                        layer_chunk_dword * sizeof(uint32_t), sizeof(uint32_t),
+		                        &first_chunk);
 		const auto& outputs = state.vertex_info[0].stage.module->info.info.outputs;
-		if (std::ranges::any_of(outputs, [](const auto& output) {
+		if (mesh_active && !mesh_task && std::ranges::any_of(outputs, [](const auto& output) {
 			    return output.kind == ShaderRecompiler::IR::StageOutputKind::Layer;
 		    })) {
-			layered_mesh_chunks            = std::max((rendering.num_layers + 7u) / 8u, 1u);
-			constexpr uint32_t first_chunk = 0;
-			vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
-			                        layer_chunk_dword * sizeof(uint32_t), sizeof(uint32_t),
-			                        &first_chunk);
+			layered_mesh_chunks = std::max((rendering.num_layers + 7u) / 8u, 1u);
 		}
 	}
 	buffer.BeginRendering(rendering);
@@ -1267,7 +1269,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			                        layer_chunk_dword * sizeof(uint32_t), sizeof(uint32_t), &chunk);
 			buffer.BeginRendering(chunk_rendering);
 			vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+			// Each chunk counts its own samples; the dump adds the queries up.
+			const int32_t chunk_query = occlusion_queries.Begin(vk_buffer);
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+			occlusion_queries.End(vk_buffer, chunk_query);
 		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);

@@ -572,8 +572,9 @@ void TestAsynchronousDevicePushKeepsQueueBounded() {
 
 	uint32_t queued    = 0;
 	uint32_t available = 0;
-	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK,
-	      "queue-level query failed");
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) ==
+	          static_cast<int>(0x80268008u),
+	      "a full queue's level query did not report NOT_READY");
 	Check(queued == 1 && available == 0, "async queue level does not match accepted pushes");
 
 	AudioOut2::AudioOut2PortDestroy(port);
@@ -633,6 +634,34 @@ void TestQueueDrainsAtExactGrainRate() {
 	Check(queued_after(32000) == 0, "three grains did not drain in their playing time");
 	g_process_time_frozen = false;
 	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// The query rejects two null outputs and an unknown context, leaving the outputs alone, and
+// writes both levels before it reports NOT_READY for a queue with no free entry.
+void TestQueueLevelResults() {
+	constexpr int invalid_param = static_cast<int>(0x80268001u);
+	constexpr int not_ready     = static_cast<int>(0x80268008u);
+	const auto    context       = CreateContext(2);
+	g_process_time_frozen       = true;
+	uint32_t queued = 7, available = 7;
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, nullptr, nullptr) == invalid_param,
+	      "two null outputs were accepted");
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, nullptr, &available) == OK &&
+	          available == 2,
+	      "an empty queue's free entries were wrong");
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK &&
+	          AudioOut2::AudioOut2ContextPush(context, 0) == OK,
+	      "async pushes failed");
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == not_ready &&
+	          queued == 2 && available == 0,
+	      "a full queue did not report NOT_READY with its levels");
+	g_process_time_frozen = false;
+	AudioOut2::AudioOut2ContextDestroy(context);
+	queued = available = 7;
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) ==
+	              invalid_param &&
+	          queued == 7 && available == 7,
+	      "a destroyed context answered the level query");
 }
 
 void TestPcmCopiedBeforeScratchBufferReuse() {
@@ -937,6 +966,7 @@ int main() {
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPushConsumesPcm();
 	TestQueueDrainsAtExactGrainRate();
+	TestQueueLevelResults();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();

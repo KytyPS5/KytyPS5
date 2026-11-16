@@ -1381,8 +1381,13 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_running_walker = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
-			reads->emplace_back(*read, sizeof(uint32_t));
+		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
+		const std::span captured {plan.srt_scratch.data() + plan.srt_captures / 8u, end};
+		const auto      first = reads->size();
+		reads->resize(first + captured.size());
+		std::ranges::transform(captured, reads->data() + first, [](uint64_t address) {
+			return std::pair {address, uint64_t {sizeof(uint32_t)}};
+		});
 	}
 	return true;
 }

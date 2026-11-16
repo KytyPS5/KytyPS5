@@ -7,6 +7,14 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+// Tracy zones only where the profiler is linked; standalone test binaries build without it.
+#if __has_include(<tracy/Tracy.hpp>)
+#include "common/profiler.h"
+#define KYTY_RM_ZONE(name) KYTY_PROFILER_BLOCK(name)
+#else
+#define KYTY_RM_ZONE(name)
+#endif
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1600,7 +1608,12 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+	bool walked = false;
+	{
+		KYTY_RM_ZONE("Materialize::WalkSrt");
+		walked = WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
+	}
+	if (!walked) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
@@ -1653,146 +1666,160 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
 		    kind, resource, source, candidates));
 	};
-	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.assign(program.info.buffers.size(), {});
-	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
-		const auto base_index =
-		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
-		if (base_index >= program.info.buffers.size()) return false;
-		const auto& base = program.info.buffers[base_index];
-		if (i < program.info.buffers.size()) {
-			const auto* source = Source(program, base.source);
-			if (source == nullptr) return false;
-			if (source->indirect_descriptor.has_value()) {
-				snapshot.buffers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, base.source)) {
-					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, snapshot,
-					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
-					        }))
-						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+	{
+		KYTY_RM_ZONE("Materialize::Buffers");
+		snapshot.buffers.resize(program.info.buffers.size());
+		specialization.buffers.assign(program.info.buffers.size(), {});
+		for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
+			const auto base_index =
+			    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
+			if (base_index >= program.info.buffers.size()) return false;
+			const auto& base = program.info.buffers[base_index];
+			if (i < program.info.buffers.size()) {
+				const auto* source = Source(program, base.source);
+				if (source == nullptr) return false;
+				if (source->indirect_descriptor.has_value()) {
+					snapshot.buffers[i] = {.dword_count = 4u};
+					if (WalkedActive(program, base.source)) {
+						if (!MaterializeIndirectDescriptor(
+						        program, base.source, i, 4u, 4u, observed, snapshot,
+						        snapshot.buffers, specialization.buffers,
+						        [&](DescriptorValue& value) {
+							        return NormalizeIndirectBuffer(
+							            value, source->indirect_descriptor->indexed, base);
+						        }))
+							return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+					}
+				} else if (!evaluate(base.source, snapshot.buffers[i])) {
+					return false;
 				}
-			} else if (!evaluate(base.source, snapshot.buffers[i])) {
-				return false;
 			}
-		}
-		auto&                descriptor_value = snapshot.buffers[i];
-		ShaderBufferResource descriptor;
-		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
-			return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
-		}
-		if (descriptor.Type() != 0) {
-			descriptor_value.dwords.fill(0);
-			descriptor = {};
-		}
-		auto       packed_stride = descriptor.PackedStride();
-		const auto stride        = packed_stride & 0x3fffu;
-		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-		if (stride == 0u) {
-			packed_stride &= ~((1u << 14u) | (3u << 16u));
-		} else if (!swizzle) {
-			packed_stride &= ~(3u << 16u);
-		}
-		auto& buffer         = specialization.buffers[i];
-		buffer.packed_stride = packed_stride;
-		buffer.descriptor_format =
-		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
-		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
-		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
-		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
-	}
-	snapshot.images.resize(program.info.images.size());
-	specialization.images.resize(program.info.images.size());
-	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-		const auto& image = program.info.images[i];
-		specialization.images[i] = {
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
-		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
-		};
-		const auto* source = Source(program, image.source);
-		if (source == nullptr) {
-			return false;
-		}
-		if (source->indirect_descriptor.has_value()) {
-			snapshot.images[i] = {.dword_count = 8u};
-			if (!WalkedActive(program, image.source) || !WalkedImageActive(program, i)) {
-				continue;
+			auto&                descriptor_value = snapshot.buffers[i];
+			ShaderBufferResource descriptor;
+			if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
+				return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
 			}
-			const auto& indirect = *source->indirect_descriptor;
-			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
-			if (!MaterializeIndirectDescriptor(
-			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
-				        // A broad heap also contains resources for other typed image operations.
-				        // A sample of a T# whose channels all select 0 reads 0 at any address.
-				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
-				            (image.sample_access_only && !image.depth_compare &&
-				             DescriptorImageSwizzle(value) == 0u) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
-					        value.dwords.fill(0u);
-				        return true;
-			        })) {
-				return resource_failed("image", i, image.source, snapshot.images.size());
+			if (descriptor.Type() != 0) {
+				descriptor_value.dwords.fill(0);
+				descriptor = {};
 			}
-		} else {
-			if (!evaluate(image.source, snapshot.images[i])) {
-				return false;
+			auto       packed_stride = descriptor.PackedStride();
+			const auto stride        = packed_stride & 0x3fffu;
+			const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+			if (stride == 0u) {
+				packed_stride &= ~((1u << 14u) | (3u << 16u));
+			} else if (!swizzle) {
+				packed_stride &= ~(3u << 16u);
 			}
-			// An image listed only by unreached blocks reads zero, not its source's descriptor.
-			if (!WalkedImageActive(program, i) ||
-			    !ValidImageDescriptor(snapshot.images[i], image.r128)) {
-				snapshot.images[i].dwords.fill(0);
-			}
+			auto& buffer         = specialization.buffers[i];
+			buffer.packed_stride = packed_stride;
+			buffer.descriptor_format =
+			    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
+			buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
+			buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+			buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 		}
 	}
-	snapshot.samplers.resize(program.info.samplers.size());
-	specialization.samplers.assign(program.info.samplers.size(), {});
-	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
-		const auto base_index =
-		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
-		if (base_index >= program.info.samplers.size()) return false;
-		if (i < program.info.samplers.size()) {
-			auto source = program.info.samplers[i].source;
-			const auto* descriptor = Source(program, source);
-			if (descriptor == nullptr) return false;
-			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
-			if (indirect != nullptr && indirect->sources.empty()) {
-				snapshot.samplers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
-				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
-				        specialization.samplers,
-				        [](DescriptorValue&) { return true; }))
-					return resource_failed("sampler", i, source, snapshot.samplers.size());
+	{
+		KYTY_RM_ZONE("Materialize::Images");
+		snapshot.images.resize(program.info.images.size());
+		specialization.images.resize(program.info.images.size());
+		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+			const auto& image = program.info.images[i];
+			specialization.images[i] = {
+			    .numeric_class = image.numeric_class,
+			    .dimension = image.dimension,
+			    .mip_count = image.mip_count,
+			    .conversion_format = image.conversion_format,
+			    .shader_swizzle = image.shader_swizzle,
+			    .indirect_root = image.indirect_root,
+			    .indirect_mapping_offset = image.indirect_mapping_offset,
+			    .indirect_search_iterations = image.indirect_search_iterations,
+			    .cube = image.cube,
+			};
+			const auto* source = Source(program, image.source);
+			if (source == nullptr) {
+				return false;
+			}
+			if (source->indirect_descriptor.has_value()) {
+				snapshot.images[i] = {.dword_count = 8u};
+				if (!WalkedActive(program, image.source) || !WalkedImageActive(program, i)) {
+					continue;
+				}
+				const auto& indirect = *source->indirect_descriptor;
+				const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+				if (!MaterializeIndirectDescriptor(
+				        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
+				        specialization.images, [&](DescriptorValue& value) {
+					        // A broad heap also contains resources for other typed image operations.
+					        // A sample of a T# whose channels all select 0 reads 0 at any address.
+					        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+					            (image.sample_access_only && !image.depth_compare &&
+					             DescriptorImageSwizzle(value) == 0u) ||
+					            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+						        value.dwords.fill(0u);
+					        return true;
+				        })) {
+					return resource_failed("image", i, image.source, snapshot.images.size());
+				}
 			} else {
-				if (indirect != nullptr) source = indirect->sources[0];
-				if (!evaluate(source, snapshot.samplers[i])) return false;
+				if (!evaluate(image.source, snapshot.images[i])) {
+					return false;
+				}
+				// An image listed only by unreached blocks reads zero, not its source's descriptor.
+				if (!WalkedImageActive(program, i) ||
+				    !ValidImageDescriptor(snapshot.images[i], image.r128)) {
+					snapshot.images[i].dwords.fill(0);
+				}
 			}
 		}
-		if (program.info.samplers[base_index].gather_lod) {
-			const auto control = snapshot.samplers[i].dwords[2];
-			const auto filter = (control >> 26u) & 3u;
-			const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
-			// MipNone always selects the base level. Point/linear selection requires zero
-			// primary/secondary bias; linear mip snapping is not implemented.
-			if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
-			    (filter == 2u && perf_mip != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
+	}
+	{
+		KYTY_RM_ZONE("Materialize::Samplers");
+		snapshot.samplers.resize(program.info.samplers.size());
+		specialization.samplers.assign(program.info.samplers.size(), {});
+		for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
+			const auto base_index =
+			    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
+			if (base_index >= program.info.samplers.size()) return false;
+			if (i < program.info.samplers.size()) {
+				auto source = program.info.samplers[i].source;
+				const auto* descriptor = Source(program, source);
+				if (descriptor == nullptr) return false;
+				const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
+				if (indirect != nullptr && indirect->sources.empty()) {
+					snapshot.samplers[i] = {.dword_count = 4u};
+					if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
+					        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
+					        specialization.samplers,
+					        [](DescriptorValue&) { return true; }))
+						return resource_failed("sampler", i, source, snapshot.samplers.size());
+				} else {
+					if (indirect != nullptr) source = indirect->sources[0];
+					if (!evaluate(source, snapshot.samplers[i])) return false;
+				}
+			}
+			if (program.info.samplers[base_index].gather_lod) {
+				const auto control = snapshot.samplers[i].dwords[2];
+				const auto filter = (control >> 26u) & 3u;
+				const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
+				// MipNone always selects the base level. Point/linear selection requires zero
+				// primary/secondary bias; linear mip snapping is not implemented.
+				if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
+				    (filter == 2u && perf_mip != 0u)) {
+					return SpecializationFail(
+					    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
+				}
 			}
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	bool built = false;
+	{
+		KYTY_RM_ZONE("Materialize::BuildResourceSpecialization");
+		built = BuildResourceSpecialization(program, snapshot, specialization);
+	}
+	return built;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {

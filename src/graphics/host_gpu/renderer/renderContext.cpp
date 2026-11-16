@@ -78,9 +78,18 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	if (access == PageFaultAccess::Write) {
 		KYTY_PROFILER_BLOCK("HandleFault::WriteInvalidate");
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		{
+			KYTY_PROFILER_BLOCK("WriteInvalidate::BufferCache");
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			KYTY_PROFILER_BLOCK("WriteInvalidate::TextureCache");
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			KYTY_PROFILER_BLOCK("WriteInvalidate::ImageHeap");
+			m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		}
 	} else {
 		KYTY_PROFILER_BLOCK("HandleFault::ReadMemory");
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

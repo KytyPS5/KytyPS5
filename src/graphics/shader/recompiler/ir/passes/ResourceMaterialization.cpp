@@ -1149,7 +1149,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			table_offset = byte_keys ? key
 			    : uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
 			          (indirect.table_immediate & ~3u);
-			if (!(byte_keys && key == UINT32_MAX) &&
+			// The shader's U32 arithmetic can wrap a key past 4 GiB from the table, into memory
+			// nothing maps (Demon's Souls: key 0xffffffff of a 32-key domain, read at +0x1000020c0).
+			// The GPU would fault on it, so the shader never selects it: it reads as null, as the
+			// out-of-range byte keys do.
+			if (!(byte_keys && key == UINT32_MAX) && table_offset <= UINT32_MAX &&
 			    !ReadScalarTable(table_base, table_size, table_offset, runtime,
 			                     std::span(candidate.dwords).first(read_dwords))) {
 				return read_failed("table descriptor read", key, 0u, table_base, table_offset, descriptor_bytes);
@@ -1399,6 +1403,14 @@ private:
 	uint32_t                                    count = 0;
 };
 
+// Candidates the host read from guest memory where the shader could read a T#, rather than T#s the
+// shader names itself (explicit sources).
+static bool MemoryImageCandidates(const ResourcePlan& program, const ImageResource& base) {
+	const auto* source = Source(program, base.source);
+	return source != nullptr && source->indirect_descriptor.has_value() &&
+	       source->indirect_descriptor->sources.empty();
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
@@ -1575,6 +1587,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const auto& image_class = specialization.images[exemplar];
 		const auto& base = program.info.images[root_index];
+		// A sampled candidate read from memory whose coordinates the instruction's dimension
+		// cannot address is one the shader never selects, as the slots of another dimension of a
+		// bounded table are (see MaterializeResources()), as long as the first typed candidate has
+		// that dimension; otherwise the first typed one is the odd one.
+		const bool null_strays = MemoryImageCandidates(program, base) && base.sample_access_only &&
+		                         image_class.dimension == base.dimension;
+		// Address components a dimension reads. A stray that would read one the instruction does
+		// not supply (a 2D T# under a 1D sample) still fails the draw.
+		const auto coordinates = [](Decoder::ImageDimension dimension) {
+			switch (dimension) {
+				case Decoder::ImageDimension::Dim1D: return 1u;
+				case Decoder::ImageDimension::Dim1DArray:
+				case Decoder::ImageDimension::Dim2D:
+				case Decoder::ImageDimension::Dim2DMsaa: return 2u;
+				case Decoder::ImageDimension::Dim3D:
+				case Decoder::ImageDimension::Dim2DArray:
+				case Decoder::ImageDimension::Dim2DMsaaArray: return 3u;
+				default: return 0u;
+			}
+		};
 		const bool storage_swizzle = base.unfiltered_access_only &&
 		    base.resource_class == ImageResourceClass::Storage;
 		const auto is_2d = [](Decoder::ImageDimension dimension) {
@@ -1610,13 +1642,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (image.indirect_root != root_index) {
 				continue;
 			}
-			if (NullImageDescriptor(snapshot.images[candidate])) {
+			const auto null_candidate = [&] {
 				image.numeric_class     = image_class.numeric_class;
 				image.dimension         = image_class.dimension;
 				image.mip_count         = image_class.mip_count;
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
+			};
+			if (NullImageDescriptor(snapshot.images[candidate])) {
+				null_candidate();
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
@@ -1626,10 +1661,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    is_1d_or_2d(image_class.dimension);
 			const bool prefix_coordinates =
 			    leading_coordinates && leading(image.dimension, snapshot.images[candidate]);
-			if ((!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
-			     !unfiltered_coordinates && !prefix_coordinates) ||
-			    image.conversion_format != image_class.conversion_format ||
-			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
+			const bool other_coordinates =
+			    !same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
+			    !unfiltered_coordinates && !prefix_coordinates;
+			// Demon's Souls' pixel shader 3f7b19201073e188 picks one of the eight T#s of its
+			// material block by a byte of a vertex attribute, the host reads the 32 it can reach,
+			// and past the eighth come the block's sampler, its constants and leftovers of other
+			// T#s (one read as a 1D T# next to the 2D arrays the shader samples). Such a candidate
+			// reads as null instead of failing the draw.
+			if (other_coordinates && null_strays && !image.cube && coordinates(image.dimension) != 0u &&
+			    coordinates(image.dimension) < coordinates(base.dimension)) {
+				snapshot.images[candidate].dwords.fill(0u);
+				null_candidate();
+			} else if (other_coordinates ||
+			           image.conversion_format != image_class.conversion_format ||
+			           (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));

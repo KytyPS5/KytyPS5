@@ -3273,6 +3273,20 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	return true;
 }
 
+bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	if (owner == nullptr || owner->info.metadata.range.address != address) {
+		return true;
+	}
+	const auto& info = owner->info;
+	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u);
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);

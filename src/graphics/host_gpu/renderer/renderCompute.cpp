@@ -151,19 +151,32 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
+	if (program.info.has_bitwise_xor) {
+		return false;
+	}
+	// The clear replaces every store of the dispatch: each buffer it writes must be metadata it
+	// covers. Guest memory can hold an image's metadata and other data in turn (SAROS in PS5 Pro
+	// mode keeps the counters of a work queue where a depth target has its HTile), and a smaller
+	// or other write is that data.
+	bool clears = false;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (!cache.CoversMeta(descriptor.Base48(), descriptor.GetSize())) {
+			return false;
+		}
+		clears = true;
+	}
+	for (uint32_t i = 0; clears && i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].written) {
+			const auto descriptor =
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			(void)cache.ClearMeta(descriptor.Base48());
 		}
 	}
-	return false;
+	return clears;
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,

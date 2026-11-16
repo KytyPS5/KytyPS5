@@ -125,6 +125,9 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// Whether metadata starts at `address` and `size` bytes from there cover a whole slice of it
+	// (when the image that owns it is known): a smaller write is other data in that memory.
+	[[nodiscard]] bool CoversMeta(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);

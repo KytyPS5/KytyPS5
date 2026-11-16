@@ -7487,6 +7487,23 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+
+    // A dispatch that also writes other memory keeps its stores: the guest
+    // keeps other data where an image has its metadata (SAROS in PS5 Pro mode).
+    constexpr uint64_t mixed_meta = 0x0000000204202200ull;
+    constexpr uint64_t mixed_other = 0x0000000204202300ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, mixed_meta);
+    ShaderModule mixed_program;
+    ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
+    (void)MakeInput(mixed_meta, false, true, mixed_program, mixed_snapshot);
+    const auto mixed_input =
+        MakeInput(mixed_other, false, true, mixed_program, mixed_snapshot);
+    const bool mixed_consumed =
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, mixed_input, command);
+    Require(name, "metadata and other writes preserved",
+            !mixed_consumed && !texture_cache.IsMetaCleared(mixed_meta, 0),
+            "a dispatch that writes other memory was replaced by a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }

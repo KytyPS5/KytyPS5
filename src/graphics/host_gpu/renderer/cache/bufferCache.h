@@ -110,6 +110,9 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// At a suspend point: releases resident pages the frame that ended did not use, clean ones
+	// first, until `bytes` are released. Returns the bytes released.
+	uint64_t ReclaimIdle(uint64_t bytes);
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -223,6 +226,8 @@ private:
 	[[nodiscard]] bool ReclaimPages(uint64_t bytes);
 	void               WriteBackPages(std::span<const uint64_t> pages);
 	void               CollectPages(uint64_t before, bool aggressive);
+	// Releases idle pages, the written ones after their write-back.
+	void               ReleaseIdle(std::vector<uint64_t> idle, std::vector<uint64_t> written);
 	void               RetireIdleWindows();
 
 	GraphicContext&                                   m_graphics;

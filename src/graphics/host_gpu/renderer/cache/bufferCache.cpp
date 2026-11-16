@@ -215,6 +215,7 @@ void BufferCache::AllocatePages(std::span<SparsePage> pages) {
 		m_graphics.LogMemoryBudget();
 		EXIT("out of device memory for %" PRIu64 " bytes of guest buffer pages\n", bytes);
 	}
+	m_graphics.NotePastBudget(bytes);
 }
 
 void BufferCache::CommitPages(uint64_t begin, uint64_t end) {
@@ -416,6 +417,10 @@ void BufferCache::CollectPages(uint64_t before, bool aggressive) {
 			written.push_back(address);
 		}
 	});
+	ReleaseIdle(std::move(idle), std::move(written));
+}
+
+void BufferCache::ReleaseIdle(std::vector<uint64_t> idle, std::vector<uint64_t> written) {
 	if (!written.empty()) {
 		std::ranges::sort(written);
 		WriteBackPages(written);
@@ -432,6 +437,32 @@ void BufferCache::CollectPages(uint64_t before, bool aggressive) {
 	} else {
 		UnbindReleased(releases);
 	}
+}
+
+uint64_t BufferCache::ReclaimIdle(uint64_t bytes) {
+	if (!Windowed() || m_gc_tick < 2) {
+		return 0;
+	}
+	std::vector<uint64_t> idle;
+	std::vector<uint64_t> written;
+	const auto enough = [&] { return (idle.size() + written.size()) * m_page_size >= bytes; };
+	// Clean pages need no write-back. A DMA shader reaches a page without a bind, so the pages
+	// one was reported to use leave only by age.
+	for (const bool modified: {false, true}) {
+		if (enough()) {
+			break;
+		}
+		m_page_lru.ForEachItemBelow(m_gc_tick - 2, [&](uint64_t address) {
+			if (!m_dma_accessed.Intersects(address, m_page_size) &&
+			    m_memory_tracker.IsRegionGpuModified(address, m_page_size) == modified) {
+				(modified ? written : idle).push_back(address);
+			}
+			return enough();
+		});
+	}
+	const auto released = (idle.size() + written.size()) * m_page_size;
+	ReleaseIdle(std::move(idle), std::move(written));
+	return released;
 }
 
 void BufferCache::RetireIdleWindows() {

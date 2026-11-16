@@ -327,6 +327,15 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	// What allocations took past the budget comes back from idle memory, whatever its age:
+	// pages before images, which cost more to make again.
+	if (auto past = m_graphics.device_past_budget.exchange(0, std::memory_order_relaxed);
+	    past != 0) {
+		past -= std::min(past, m_buffer_cache.ReclaimIdle(past));
+		if (past != 0) {
+			(void)m_texture_cache.ReclaimIdle(past);
+		}
+	}
 	if (m_ray_tracing) {
 		m_ray_tracing->RunGarbageCollector();
 	}

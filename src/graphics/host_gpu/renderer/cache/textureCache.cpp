@@ -2620,6 +2620,48 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::EvictIdle(ImageId id, bool download) {
+	auto owner = m_slot_images.try_get(id);
+	if (owner == nullptr || !owner->registered || owner->depth_id) {
+		return false;
+	}
+	if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
+		// Resident heaps sample it without touching it.
+		TouchImage(*owner);
+		return false;
+	}
+	// An image whose twin holds all its contents is freed as a clean one is. Freeing any
+	// other frees a twin that lacks its contents too, so that twin's stencil keeps both.
+	const auto* twin    = owner->twin ? &m_slot_images[owner->twin] : nullptr;
+	const bool  stencil = owner->info.HasStencil();
+	const bool  held    = twin != nullptr && !stencil && !TwinNewer(*twin);
+	if (!held && owner->SafeToDownload() &&
+	    (!download || stencil || (twin != nullptr && (twin->info.HasStencil() || twin->depth_id)) ||
+	     !DownloadImageMemory(id))) {
+		return false;
+	}
+	FreeImage(id);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+	return true;
+}
+
+uint64_t TextureCache::ReclaimIdle(uint64_t bytes) {
+	std::scoped_lock lock {m_lock};
+	if (m_gc_tick < 2) {
+		return 0;
+	}
+	const auto           before = m_total_used_memory;
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(m_gc_tick - 2, [&](ImageId id) { candidates.push_back(id); });
+	for (const auto id: candidates) {
+		if (before - m_total_used_memory >= bytes) {
+			break;
+		}
+		(void)EvictIdle(id, true);
+	}
+	return before - m_total_used_memory;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
@@ -2652,29 +2694,10 @@ void TextureCache::RunGarbageCollector() {
 			if (deletions == 0) {
 				break;
 			}
-			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
-				continue;
-			}
-			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
-				// Resident heaps sample it without touching it.
-				TouchImage(*owner);
-				continue;
-			}
-			// An image whose twin holds all its contents is freed as a clean one is. Freeing any
-			// other frees a twin that lacks its contents too, so that twin's stencil keeps both.
-			const auto* twin    = owner->twin ? &m_slot_images[owner->twin] : nullptr;
-			const bool  stencil = owner->info.HasStencil();
-			const bool  held    = twin != nullptr && !stencil && !TwinNewer(*twin);
-			if (!held && owner->SafeToDownload() &&
-			    (!pressured || stencil ||
-			     (twin != nullptr && (twin->info.HasStencil() || twin->depth_id)) ||
-			     !DownloadImageMemory(id))) {
+			if (!EvictIdle(id, pressured)) {
 				continue;
 			}
 			--deletions;
-			FreeImage(id);
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

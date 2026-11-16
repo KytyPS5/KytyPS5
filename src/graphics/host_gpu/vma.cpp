@@ -70,6 +70,15 @@ void GraphicContext::DestroyAllocator() {
 	allocator = nullptr;
 }
 
+void GraphicContext::NotePastBudget(uint64_t size) {
+	device_past_budget.fetch_add(size, std::memory_order_relaxed);
+	static std::once_flag logged;
+	std::call_once(logged, [this] {
+		LOGF("device memory: an allocation passed the budget\n");
+		LogMemoryBudget();
+	});
+}
+
 void GraphicContext::LogMemoryBudget() const {
 	if (allocator == nullptr || physical_device == nullptr) {
 		return;
@@ -216,14 +225,14 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 	const vk::DeviceImageMemoryRequirements query {.pCreateInfo = &image_info};
-	// Device memory while it is in budget, host memory past it.
-	if (!AllocateDeviceLocal(device.getImageMemoryRequirements(query).memoryRequirements.size,
-	                         alloc_info, allocate)) {
-		alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	const auto size = device.getImageMemoryRequirements(query).memoryRequirements.size;
+	// An image has no memory but the device's: one the budget has no room for still goes there.
+	if (!AllocateDeviceLocal(size, alloc_info, allocate)) {
 		if (allocate(alloc_info) != VK_SUCCESS) {
 			LogMemoryBudget();
 			return false;
 		}
+		NotePastBudget(size);
 	}
 	image.image = native_image;
 
@@ -349,11 +358,15 @@ bool GraphicContext::CreatePartialImage(const vk::ImageCreateInfo& base, uint32_
 		}
 	}
 	const VkMemoryRequirements memory {size, block, requirements.memoryTypeBits & device_types};
-	const bool                 allocated =
-	    memory.memoryTypeBits != 0 &&
-	    AllocateDeviceLocal(size, {}, [&](const VmaAllocationCreateInfo& info) {
-		    return vmaAllocateMemory(allocator, &memory, &info, &image.allocation, nullptr);
-	    });
+	const auto                 allocate = [&](const VmaAllocationCreateInfo& info) {
+		return vmaAllocateMemory(allocator, &memory, &info, &image.allocation, nullptr);
+	};
+	bool allocated = memory.memoryTypeBits != 0 && AllocateDeviceLocal(size, {}, allocate);
+	// Past the budget it still takes its memory: a full image would take more.
+	if (!allocated && memory.memoryTypeBits != 0 && allocate({}) == VK_SUCCESS) {
+		NotePastBudget(size);
+		allocated = true;
+	}
 	if (!allocated) {
 		image.allocation = nullptr;
 		device.destroyImage(native, nullptr);

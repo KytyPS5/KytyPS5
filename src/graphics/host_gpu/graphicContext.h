@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <span>
@@ -142,6 +143,8 @@ struct GraphicContext {
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	// Whether `size` more bytes of device-local memory stay within the device-local budget.
 	[[nodiscard]] bool DeviceBudgetAllows(uint64_t size) const;
+	// An allocation of `size` bytes took device memory the budget has no room for.
+	void NotePastBudget(uint64_t size);
 	// Device-local memory through `allocate`: from the blocks already held, then from new memory
 	// while the budget allows. False when neither served it.
 	template <typename Allocate>
@@ -161,6 +164,8 @@ struct GraphicContext {
 	}
 	// Replaces the device-local budget; zero keeps the reported one. For tests.
 	uint64_t device_budget_override = 0;
+	// Bytes allocations took past the budget, until the collectors take them.
+	std::atomic<uint64_t> device_past_budget {0};
 
 	struct HeapUsage {
 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.

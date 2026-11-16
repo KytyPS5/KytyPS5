@@ -5744,7 +5744,8 @@ public:
   }
 
   // The device budget is the driver's, and so is the usage it is compared with. A buffer leaves
-  // the device only when new device memory would pass the budget.
+  // the device only when new device memory would pass the budget. An image has no other memory:
+  // past the budget it still goes to the device, and its bytes are owed to the collectors.
   void CheckDeviceBudgetPlacement() {
     constexpr const char *name = "DeviceBudgetPlacement";
     constexpr uint64_t MiB = 1024ull * 1024ull;
@@ -5764,37 +5765,92 @@ public:
     {
       RenderContext context(graphics);
       auto &scheduler = context.GetCommandScheduler();
-      // A block with room to spare, so small buffers need no new device memory.
+      // A block with room to spare, so small allocations need no new device memory.
       const Buffer seed(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, MiB);
       Require(name, "seed", seed.IsDeviceLocal(), "a small buffer was not placed on the device");
       const auto usage = graphics.GetDeviceMemoryUsage();
-      {
-        const Buffer upload(graphics, scheduler, MemoryUsage::Upload, 0, AllFlags, 300 * MiB);
-        Require(name, "host allocations",
-                upload.IsDeviceLocal() || graphics.GetDeviceMemoryUsage() == usage,
-                "host memory was counted as device memory");
-      }
+      const auto held = HeldDeviceBytes();
+      const auto unflagged = UnflaggedBytes();
       graphics.device_budget_override = usage + 64 * MiB;
       {
         const Buffer over(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
-        Require(name, "past the budget",
-                !over.IsDeviceLocal() && graphics.GetDeviceMemoryUsage() == usage,
+        Require(name, "past the budget", !over.IsDeviceLocal() && HeldDeviceBytes() == held,
                 "a buffer took device memory past the budget");
       }
       graphics.device_budget_override = usage + 1024 * MiB;
       {
         const Buffer within(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
         Require(name, "within the budget",
-                within.IsDeviceLocal() && graphics.GetDeviceMemoryUsage() >= usage + 512 * MiB,
+                within.IsDeviceLocal() && HeldDeviceBytes() >= held + 512 * MiB,
                 "a buffer the budget allows left the device");
         graphics.device_budget_override = graphics.GetDeviceMemoryUsage();
-        const Buffer held(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 64 * 1024);
-        Require(name, "held memory", held.IsDeviceLocal(),
+        const Buffer fits(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 64 * 1024);
+        Require(name, "held memory", fits.IsDeviceLocal(),
                 "a buffer that fits the device memory already held left the device");
         const Buffer full(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
         Require(name, "full device", !full.IsDeviceLocal(),
                 "a buffer took new device memory with the budget used up");
       }
+
+      // An image larger than the room in the memory held, with no budget for new memory.
+      graphics.device_budget_override = 1;
+      graphics.device_past_budget = 0;
+      vk::ImageCreateInfo create{};
+      create.imageType = vk::ImageType::e2D;
+      create.format = vk::Format::eR8G8B8A8Unorm;
+      create.extent = {2048, 2048, 1};
+      create.mipLevels = 1;
+      create.arrayLayers = static_cast<uint32_t>(HeldDeviceRoom() / (16 * MiB)) + 2u;
+      create.samples = vk::SampleCountFlagBits::e1;
+      create.tiling = vk::ImageTiling::eOptimal;
+      create.usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+      create.initialLayout = vk::ImageLayout::eUndefined;
+      Require(name, "image fixture",
+              create.arrayLayers <= graphics.physical_device_properties.limits.maxImageArrayLayers,
+              "the memory held has more room than one image takes");
+      const auto device_local = [&](const VulkanImage &image) {
+        VkMemoryPropertyFlags properties{};
+        vmaGetAllocationMemoryProperties(graphics.allocator, image.allocation, &properties);
+        return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+      };
+      VulkanImage large;
+      Require(name, "image", graphics.CreateImage(create, large),
+              "an image the budget has no room for was not created");
+      VmaAllocationInfo allocation{};
+      vmaGetAllocationInfo(graphics.allocator, large.allocation, &allocation);
+      Require(name, "image past the budget",
+              device_local(large) && UnflaggedBytes() == unflagged &&
+                  graphics.device_past_budget == allocation.size,
+              "an image the budget has no room for left the device, or its bytes are not owed");
+      create.extent = {16, 8, 1};
+      create.arrayLayers = 1;
+      VulkanImage fitting;
+      Require(name, "small image", graphics.CreateImage(create, fitting),
+              "a small image was not created");
+      Require(name, "image in held memory",
+              device_local(fitting) && graphics.device_past_budget == allocation.size,
+              "an image that fits the device memory already held counted as past the budget");
+      graphics.DeleteImage(fitting);
+      graphics.DeleteImage(large);
+      // A partial image the budget has no room for stays partial: a full one takes more. Its
+      // bound levels are larger than a block of the allocator, so no memory held fits them.
+      if (graphics.sparse_residency_image2d_enabled) {
+        graphics.device_past_budget = 0;
+        create.extent = {16384, 16384, 1};
+        create.mipLevels = 15;
+        VulkanImage partial;
+        Require(name, "partial image", graphics.CreateImage(create, partial, 1),
+                "a partial image the budget has no room for was not created");
+        VmaAllocationInfo bound{};
+        vmaGetAllocationInfo(graphics.allocator, partial.allocation, &bound);
+        Require(name, "partial image past the budget",
+                partial.sparse && device_local(partial) &&
+                    graphics.device_past_budget == bound.size,
+                "a partial image the budget has no room for became a full one, or its bytes are "
+                "not owed");
+        graphics.DeleteImage(partial);
+      }
+      graphics.device_past_budget = 0;
       graphics.device_budget_override = 0;
     }
     std::printf("[host]    %-32s ok\n", name);
@@ -5906,6 +5962,128 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // What allocations took past the device budget comes back at the next suspend point, from
+  // memory the frame that ended did not use and whatever its age: pages before images, clean
+  // pages before GPU-written ones, the oldest first, and no more than passed the budget. Pages a
+  // DMA shader used leave only by age.
+  void CheckDeviceBudgetCatchUp() {
+    constexpr const char *name = "DeviceBudgetCatchUp";
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    constexpr uint64_t base = 0x00000003c0000000ull;
+    constexpr uint64_t size = 4 * MiB;
+    constexpr uint64_t written = base;
+    constexpr uint64_t clean = base + MiB;
+    constexpr uint64_t marked = base + 2 * MiB;
+    constexpr uint64_t used = marked + MiB / 2;
+    constexpr uint64_t images = base + 3 * MiB;
+    constexpr uint64_t image_size = 256 * 256 * 4;
+    constexpr uint64_t never = std::numeric_limits<uint64_t>::max();
+    EnsureRuntimeContext();
+    auto &graphics = m_runtime_context;
+    bool windowed = false;
+    {
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      windowed = BufferCacheTestAccess::Windowed(cache);
+      if (windowed) {
+        HW::Context registers{};
+        HW::UserConfig user_config{};
+        HW::Shader shaders{};
+        scheduler.Begin(registers, user_config, shaders);
+        context.InitializeGpu(nullptr);
+        const auto page = BufferCacheTestAccess::WindowPage(cache);
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, never, never);
+        TextureCacheTestAccess::SetGarbageCollectionThresholds(textures, never, never, never);
+        const auto direct = MapGuestPattern(name, base, size);
+        context.MapMemory(base, size);
+        const auto image = [&](uint32_t index) {
+          auto desc = MakeLinearDesc(images + index * image_size, image_size,
+                                     vk::Format::eR8G8B8A8Unorm,
+                                     Prospero::BufferFormat::k8_8_8_8UNorm,
+                                     Prospero::ImageType::kColor2D, {256, 256, 1}, 1, 4, 1);
+          return textures.FindImage(desc);
+        };
+        // A frame uses one page and one image, and ends with `past` bytes past the budget.
+        ImageId used_image{};
+        const auto frame = [&](uint64_t past) {
+          (void)cache.FindBuffer(used, page);
+          used_image = image(2);
+          graphics.device_past_budget = past;
+          context.RunGarbageCollector();
+        };
+        const auto registered = [&](uint64_t address) {
+          return cache.IsRegionRegistered(address, page);
+        };
+        const auto contains = [&](ImageId id) {
+          return TextureCacheTestAccess::Contains(textures, id);
+        };
+
+        // The first frame: a GPU-written page, four clean ones, one a DMA shader used, and the
+        // oldest image. The second frame adds a newer image.
+        const auto [target, target_offset] = cache.ObtainBuffer(written, 0x1000, true);
+        target->Fill(target_offset, 0x1000, 0x99999999u);
+        (void)cache.FindBuffer(clean, 4 * page);
+        (void)cache.FindBuffer(marked, page);
+        cache.MarkGpuUse(marked, page);
+        const auto oldest = image(0);
+        frame(0);
+        const auto newer = image(1);
+        frame(0);
+        Require(name, "nothing owed",
+                registered(written) && registered(clean) && registered(clean + 3 * page) &&
+                    registered(marked) && registered(used) && contains(oldest) &&
+                    contains(newer) && contains(used_image),
+                "a suspend point with nothing past the budget released idle memory");
+
+        frame(2 * page);
+        Require(name, "clean pages",
+                !cache.IsRegionRegistered(clean, 2 * page) && registered(clean + 2 * page) &&
+                    registered(clean + 3 * page) && registered(written) &&
+                    cache.IsRegionGpuModified(written, 0x1000) && registered(marked) &&
+                    registered(used) && contains(oldest) && contains(newer) &&
+                    contains(used_image) && graphics.device_past_budget == 0,
+                "the oldest clean pages did not make up for the bytes past the budget, or more "
+                "than those bytes left");
+
+        frame(3 * page);
+        // Guest pages the GPU's bytes have not reached are not readable.
+        u32 guest = 0;
+        if (!cache.IsRegionGpuModified(written, 0x1000)) {
+          std::memcpy(&guest, reinterpret_cast<const void *>(written), sizeof(guest));
+        }
+        Require(name, "written pages",
+                !cache.IsRegionRegistered(clean, 4 * page) && !registered(written) &&
+                    !cache.IsRegionGpuModified(written, 0x1000) && guest == 0x99999999u &&
+                    registered(marked) && registered(used) && contains(oldest) &&
+                    contains(newer) && contains(used_image),
+                "a GPU-written page did not follow the clean ones written back, or an image "
+                "left before the idle pages");
+
+        frame(page);
+        Require(name, "images",
+                registered(marked) && registered(used) && !contains(oldest) && contains(newer) &&
+                    contains(used_image),
+                "the oldest idle image did not follow the pages, or a page a DMA shader used or "
+                "memory of the frame left");
+
+        // More is owed than idle memory holds: what the frame used stays.
+        frame(2 * image_size);
+        Require(name, "memory of the frame",
+                registered(marked) && registered(used) && !contains(newer) &&
+                    contains(used_image),
+                "memory the frame used made up for bytes past the budget, or idle memory stayed");
+
+        context.UnmapMemory(base, size);
+        scheduler.Finish();
+        UnmapGuestPattern(name, base, size, direct);
+      }
+    }
+    std::printf(windowed ? "[gpu]     %-32s ok\n" : "[gpu]     %-32s skipped (no buffer windows)\n",
+                name);
+  }
+
   // Copies one dword per offset out of a cache buffer and waits for the result.
   std::vector<u32> ReadBufferWords(const char *name, CommandScheduler &scheduler,
                                    const Libs::Graphics::Buffer &buffer,
@@ -5952,6 +6130,33 @@ public:
     for (uint32_t heap = 0; heap < m_memory_properties.memoryHeapCount; ++heap) {
       if (m_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
         bytes += budgets[heap].statistics.blockBytes - budgets[heap].statistics.allocationBytes;
+      }
+    }
+    return bytes;
+  }
+  // The device memory the allocator holds, in use or not.
+  uint64_t HeldDeviceBytes() {
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(m_runtime_context.allocator, budgets);
+    uint64_t bytes = 0;
+    for (uint32_t heap = 0; heap < m_memory_properties.memoryHeapCount; ++heap) {
+      if (m_memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+        bytes += budgets[heap].statistics.blockBytes;
+      }
+    }
+    return bytes;
+  }
+  // Bytes allocated in memory types that are neither device-local nor host-visible: where
+  // such memory lies is the driver's choice.
+  uint64_t UnflaggedBytes() {
+    VmaTotalStatistics statistics{};
+    vmaCalculateStatistics(m_runtime_context.allocator, &statistics);
+    constexpr auto placed = vk::MemoryPropertyFlagBits::eDeviceLocal |
+                            vk::MemoryPropertyFlagBits::eHostVisible;
+    uint64_t bytes = 0;
+    for (uint32_t type = 0; type < m_memory_properties.memoryTypeCount; ++type) {
+      if (!(m_memory_properties.memoryTypes[type].propertyFlags & placed)) {
+        bytes += statistics.memoryType[type].statistics.allocationBytes;
       }
     }
     return bytes;
@@ -6316,8 +6521,9 @@ public:
 
         // A frame later there is no budget for more. The range grows into the place of idle
         // pages, not of its own, and the work recorded so far still reads the pages that go.
-        auto usage = graphics.GetDeviceMemoryUsage();
-        graphics.device_budget_override = usage;
+        auto device = HeldDeviceBytes();
+        graphics.device_budget_override = 1;
+        graphics.device_past_budget = 0;
         const auto wanted = Common::AlignUp(HeldDeviceRoom() + 2 * MiB, page);
         const auto taken = wanted - MiB;
         Require(name, "fixture", taken < idle_size,
@@ -6330,7 +6536,7 @@ public:
         Require(name, "reclaimed",
                 cache.IsRegionRegistered(fresh, page) &&
                     cache.IsRegionRegistered(fresh + wanted - page, page) &&
-                    graphics.GetDeviceMemoryUsage() <= usage &&
+                    HeldDeviceBytes() <= device && graphics.device_past_budget == 0 &&
                     !cache.IsRegionRegistered(idle, taken) &&
                     cache.IsRegionRegistered(idle + taken, page),
                 "new pages did not take the place of idle ones within the device budget");
@@ -6340,12 +6546,11 @@ public:
         DestroyBuffer(&earlier);
 
         // Next frame the idle pages left are DMA-accessed and the new ones are bound again:
-        // neither makes room, so more pages pass the budget.
+        // neither makes room, so more pages pass the budget and their bytes are owed.
         cache.MarkGpuUse(idle + taken, idle_size - taken);
         cache.RunGarbageCollector();
         (void)cache.FindBuffer(fresh, wanted);
-        usage = graphics.GetDeviceMemoryUsage();
-        graphics.device_budget_override = usage;
+        device = HeldDeviceBytes();
         const auto more = Common::AlignUp(HeldDeviceRoom() + MiB, page);
         Require(name, "second fixture", more <= idle_size - taken,
                 "the DMA-accessed pages could not make room for the new ones");
@@ -6356,8 +6561,9 @@ public:
                     cache.IsRegionRegistered(past + more - page, page) &&
                     cache.IsRegionRegistered(fresh, page) &&
                     cache.IsRegionRegistered(idle + taken, page) &&
-                    graphics.GetDeviceMemoryUsage() > usage,
+                    HeldDeviceBytes() > device && graphics.device_past_budget == more,
                 "pages bound this frame or DMA-accessed pages made room for new ones");
+        graphics.device_past_budget = 0;
         context.UnmapMemory(idle, MiB);
         scheduler.Finish();
         UnmapGuestPattern(name, idle, MiB, direct);
@@ -64448,6 +64654,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckDeviceBudgetPlacement();
     vulkan.CheckDeviceMemoryInUse();
+    vulkan.CheckDeviceBudgetCatchUp();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sparse-buffer-only") == 0) {
@@ -64777,6 +64984,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferReadbackWaiter(true);
     vulkan.CheckDeviceBudgetPlacement();
     vulkan.CheckDeviceMemoryInUse();
+    vulkan.CheckDeviceBudgetCatchUp();
     vulkan.CheckSparseBufferPages();
     vulkan.CheckSparsePageTable();
     vulkan.CheckBufferWindowPages();

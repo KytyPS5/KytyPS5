@@ -105,6 +105,9 @@ public:
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
+	// At a suspend point: frees images the frame that ended did not use, oldest first, until
+	// `bytes` are freed. Returns the bytes freed.
+	uint64_t ReclaimIdle(uint64_t bytes);
 
 private:
 	struct MetaDataInfo {
@@ -292,6 +295,9 @@ private:
 	void        ExpandEqaa(Image& image, vk::ImageAspectFlags aspects);
 	void        DropShadow(Image& image);
 	void        DropIdleShadows(uint64_t tick);
+	// Frees an idle image the collector may take, downloading its GPU-written contents when
+	// `download`; false when it stays.
+	[[nodiscard]] bool EvictIdle(ImageId id, bool download);
 	[[nodiscard]] const vk::SampleLocationsInfoEXT*
 	                      InternSampleLocations(const HostSamplePattern& pattern);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);

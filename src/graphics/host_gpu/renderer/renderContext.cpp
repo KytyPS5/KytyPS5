@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/profiler.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -62,18 +63,26 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	KYTY_PROFILER_BLOCK("RenderContext::HandleFault");
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
 	// The access retries once the image write-backs over its page land.
-	if (WaitWriteBacks(fault_vaddr, fault_size)) {
+	bool waited = false;
+	{
+		KYTY_PROFILER_BLOCK("HandleFault::WaitWriteBacks");
+		waited = WaitWriteBacks(fault_vaddr, fault_size);
+	}
+	if (waited) {
 		return true;
 	}
 	if (access == PageFaultAccess::Write) {
+		KYTY_PROFILER_BLOCK("HandleFault::WriteInvalidate");
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		KYTY_PROFILER_BLOCK("HandleFault::ReadMemory");
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

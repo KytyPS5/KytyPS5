@@ -673,6 +673,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+			KYTY_PROFILER_BLOCK("SrtWalker::SkipFaultingLoad");
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}

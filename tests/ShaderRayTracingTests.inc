@@ -630,11 +630,134 @@ void TestRayTracingClosestWave() {
   CheckSpirvBinaryValidates(compiled.spirv);
 }
 
+#include "ShaderRayTracingPrograms.inc"
+
+// What the IR's native walks (IR::TraceNativeTraversals) take of a real program compiled as the game compiles it
+// with --native-rt: the number of sites, the TLAS source, the instance record layout and the ranges of the guest
+// code that stays in the BVH (ray_query_reach), and the SPIR-V validates.
+struct NativeWalks {
+  const char *name = "";
+  std::span<const uint32_t> code;
+  uint32_t wave_size = 64;
+  uint32_t sites = 1;
+  uint32_t user_sgpr = 0;
+  uint32_t header_offset = 0;
+  uint32_t header_vsharp = ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot;
+  uint32_t root = 0x25;
+  std::array<uint32_t, 4> layout{};
+  size_t reach = 0;
+};
+
+void CheckNativeWalks(const NativeWalks &expected) {
+  namespace D = ShaderRecompiler::Decoder;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = expected.wave_size;
+  options.native_ray_tracing = true;
+  static const ShaderRecompiler::Spirv::Profile profile = [] {
+    auto with_ray_query = ShaderRecompiler::Spirv::DefaultProfile;
+    with_ray_query.ray_query = true;
+    return with_ray_query;
+  }();
+  options.profile = &profile;
+  static ShaderComputeInputInfo compute{};
+  compute.scratch_size_dwords = 16384;
+  compute.lds_size_dwords = 16384;
+  compute.wave_size = expected.wave_size;
+  compute.thread_ids_num = 3;
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  options.input_info.compute = &compute;
+  auto translated = ShaderRecompiler::TranslateProgram(expected.code, options);
+  const auto reach = translated.program.info.ray_query_reach.size();
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  specialization.buffers.assign(plan.info.buffers.size(), {});
+  specialization.images.assign(plan.info.images.size(), {});
+  for (auto &image : specialization.images) {
+    image.numeric_class = Prospero::TextureNumericClass::Float;
+    image.dimension = D::ImageDimension::Dim2D;
+  }
+  specialization.samplers.assign(plan.info.samplers.size(), {});
+  const auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+  const auto &info = compiled.program.info;
+  const bool traced = info.ray_query && info.ray_query_sites == expected.sites &&
+                      info.ray_query_user_sgpr == expected.user_sgpr &&
+                      info.ray_query_header_offset == expected.header_offset &&
+                      info.ray_query_header_vsharp == expected.header_vsharp && info.ray_query_root == expected.root &&
+                      info.ray_query_layout == expected.layout && reach == expected.reach &&
+                      SpirvInstructionOpcodeCount(compiled.spirv, 4473u) != 0;
+  if (!traced) {
+    std::fprintf(stderr,
+                 "%s: %u sites, TLAS header at user data s%u + 0x%x (V# 0x%x), root 0x%x, layout %08x %08x %08x %08x, "
+                 "%zu reach entries\n",
+                 expected.name, info.ray_query_sites, info.ray_query_user_sgpr, info.ray_query_header_offset,
+                 info.ray_query_header_vsharp, info.ray_query_root, info.ray_query_layout[0], info.ray_query_layout[1],
+                 info.ray_query_layout[2], info.ray_query_layout[3], reach);
+  }
+  Check(traced, (std::string("the BVH walks of ") + expected.name +
+                 " do not trace with ray queries, or have the wrong TLAS source, instance record layout or reach")
+                    .c_str());
+  CheckSpirvBinaryValidates(compiled.spirv);
+}
+
+// The native walks of real programs of each form, with the sites, TLAS sources and instance record layouts the
+// decoded patch derived for them: a change of the ray query pass that leaves one of them to the guest's traversal
+// fails here.
+void TestRayTracingNativeWalks() {
+  CheckNativeWalks({.name = "GTA V's cs 2f34bc2dfe6b04a3",
+                    .code = kGtaFidelityPacketLeaf64,
+                    .sites = 3,
+                    .user_sgpr = 4,
+                    .header_offset = 0x10,
+                    .layout = {0x76543210u, 0x1dc6ba98u, 0x000dbb8fu, 0u},
+                    .reach = 1});
+  CheckNativeWalks({.name = "GTA V's cs 0b41af19bddf132c",
+                    .code = kGtaFidelityPacketAlpha64,
+                    .sites = 3,
+                    .user_sgpr = 4,
+                    .header_offset = 0x10,
+                    .layout = {0x76543210u, 0x3dc6ba98u, 0x000dbb8fu, 0u},
+                    .reach = 3});
+  CheckNativeWalks({.name = "GTA V's cs 48d704640ab9fb40",
+                    .code = kGtaPerformanceRtPacketLane64,
+                    .sites = 3,
+                    .user_sgpr = 4,
+                    .header_offset = 0x10,
+                    .layout = {0x76543210u, 0x3dc6ba98u, 0x000dbb8fu, 0u},
+                    .reach = 3});
+  CheckNativeWalks({.name = "GTA V's cs 84ed00053b3771da",
+                    .code = kGtaShortRaysClosestOpaque64,
+                    .user_sgpr = 4,
+                    .header_offset = 0x70,
+                    .layout = {0xc963b852u, 0x3c05da74u, 0u, 0u},
+                    .reach = 1});
+  CheckNativeWalks({.name = "GTA V's cs 6aeb221de7ff018e",
+                    .code = kGtaReflectionsClosestAlpha64,
+                    .user_sgpr = 4,
+                    .header_offset = 0x40,
+                    .layout = {0x76543210u, 0x3dc6ba98u, 0x0008018fu, 0u},
+                    .reach = 3});
+  CheckNativeWalks({.name = "Resident Evil Village's cs be0b848d2e06ec9b",
+                    .code = kRe8ClosestLaneEntry64,
+                    .user_sgpr = 2,
+                    .header_offset = 0x60,
+                    .layout = {0xc963b852u, 0x3c05da74u, 0x00083eafu, 0x20000000u}});
+  CheckNativeWalks({.name = "Marvel's Wolverine's cs b790bfb6f776e13a",
+                    .code = kWolverineAnyLane32,
+                    .wave_size = 32,
+                    .user_sgpr = 12,
+                    .header_offset = 0x430,
+                    .header_vsharp = 0x50,
+                    .layout = {0x76543210u, 0x3dc6ba98u, 0x000801cfu, 0u},
+                    .reach = 1});
+}
+
 void TestRayTracingInstructions() {
   TestTrinityBvhInstruction();
   TestTrinityStackInstruction();
   TestRayTracingClosestLeafCalls();
   TestRayTracingClosestWave();
+  TestRayTracingNativeWalks();
   namespace D = ShaderRecompiler::Decoder;
   const std::array code{
       0xf1989f01u, 0x00081014u,

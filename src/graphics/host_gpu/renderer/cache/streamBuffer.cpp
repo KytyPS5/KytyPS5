@@ -106,11 +106,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		                       static_cast<const VkBufferCreateInfo*>(buffer_info), &info,
 		                       &native_buffer, &m_allocation, &allocation_result);
 	};
-	// Device-local buffers move to host memory once the device is out of budget.
+	// Device-local buffers move to host memory once the device is out of budget: host-visible
+	// memory, the only kind no driver keeps on the device.
 	if (usage != MemoryUsage::DeviceLocal ||
 	    !graphics.AllocateDeviceLocal(size, allocation_info, allocate)) {
 		if (usage == MemoryUsage::DeviceLocal) {
-			allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			allocation_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 		}
 		if (allocate(allocation_info) != VK_SUCCESS) {
 			graphics.LogMemoryBudget();

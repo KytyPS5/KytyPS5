@@ -5744,8 +5744,10 @@ public:
   }
 
   // The device budget is the driver's, and so is the usage it is compared with. A buffer leaves
-  // the device only when new device memory would pass the budget. An image has no other memory:
-  // past the budget it still goes to the device, and its bytes are owed to the collectors.
+  // the device only when new device memory would pass the budget, for host-visible memory: where
+  // memory without that flag lies is the driver's choice (NVIDIA keeps it on the device). An
+  // image has no other memory: past the budget it still goes to the device, and its bytes are
+  // owed to the collectors.
   void CheckDeviceBudgetPlacement() {
     constexpr const char *name = "DeviceBudgetPlacement";
     constexpr uint64_t MiB = 1024ull * 1024ull;
@@ -5774,8 +5776,10 @@ public:
       graphics.device_budget_override = usage + 64 * MiB;
       {
         const Buffer over(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 512 * MiB);
-        Require(name, "past the budget", !over.IsDeviceLocal() && HeldDeviceBytes() == held,
-                "a buffer took device memory past the budget");
+        Require(name, "past the budget",
+                !over.IsDeviceLocal() && HeldDeviceBytes() == held &&
+                    UnflaggedBytes() == unflagged,
+                "a buffer past the budget took device memory, or memory the driver places");
       }
       graphics.device_budget_override = usage + 1024 * MiB;
       {

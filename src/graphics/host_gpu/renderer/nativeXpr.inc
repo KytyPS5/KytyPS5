@@ -319,6 +319,7 @@ struct RenderExecutor::NativeXprCache {
 		const PipelineCache::Pipeline* pipeline   = nullptr;
 		uint64_t                       index_base = 0, index_bytes = 0;
 		vk::IndexType                  index_type = vk::IndexType::eUint16;
+		bool                           query_bias = false; // the dynamic state was emitted while a query counted
 	} emit;
 	struct RetiredSet {
 		vk::DescriptorPool pool;
@@ -1567,9 +1568,13 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 // A draw state's dynamic state, only what differs from what the emissions recorded in the command buffer (the
 // scheduler's DynamicState marks the differences: Assign, Commit).
 void RenderExecutor::NativeXprEmitDynamic(NativeXprCache&, CommandRecorder vk_buffer,
-                                          const NativeXprDrawState& draw_state, bool) {
+                                          const NativeXprDrawState& draw_state, bool, bool query_bias) {
 	auto& dynamic = m_context.GetCommandScheduler().GetDynamicState();
 	dynamic.Assign(draw_state.dynamic);
+	if (query_bias) {
+		// As the normal path's (OcclusionCounters::ProxyBiasUnits).
+		dynamic.BiasTowardViewer(OcclusionCounters::ProxyBiasUnits, OcclusionCounters::ProxyBiasSlope);
+	}
 	dynamic.Commit(m_context.GetGraphics(), vk_buffer);
 }
 

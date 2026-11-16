@@ -384,7 +384,7 @@ private:
 	                          const TableImageSet* reading = nullptr);
 	bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
 	void NativeXprEmitDynamic(NativeXprCache& cache, CommandRecorder vk_buffer, const NativeXprDrawState& draw_state,
-	                          bool same_command);
+	                          bool same_command, bool query_bias);
 	bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
 	                   const PipelineCache::Pipeline& pipeline, uint64_t args_addr, uint64_t index_base,
 	                   uint64_t index_bytes, vk::IndexType index_type);

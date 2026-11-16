@@ -2124,6 +2124,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_draw_targets->depth,
 	                           rendering);
+	// A guest occlusion query's bounding box counts as on the console (OcclusionCounters::ProxyBiasUnits).
+	const bool query_bias = m_context.GetOcclusionQueries().Counting() &&
+	                        dynamic_state.BiasTowardViewer(OcclusionCounters::ProxyBiasUnits,
+	                                                       OcclusionCounters::ProxyBiasSlope);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 	dynamic_state.MoveGeneration(); // (its pipeline, descriptors and index buffer replace a table draw's)
@@ -2192,6 +2196,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	// After the draw is recorded: storing may clean buffer owners (copies) and so may end
 	// rendering or restart the scheduler.
+	if (query_bias) {
+		// The state a table draw captures is the guest's: its draws take the bias while a query counts.
+		dynamic_state.SetDepthBiasEnabled(false);
+	}
 	if (std::exchange(m_table_store, false)) {
 		TableStore(buffer, state, state.topology, primitive_restart_enable, rendering, dynamic_state,
 		           !mesh_active && draw.indexed && (emit.indirect.address != 0 || index_source.host_data == nullptr) &&

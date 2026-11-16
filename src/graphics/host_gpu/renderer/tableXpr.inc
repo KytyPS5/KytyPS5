@@ -2672,7 +2672,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		return Spec::Refuse("table: variant colors"), TableResult::Native;
 	}
 	buffer.BeginRendering(draw_state.rendering);
-	if (!same_command || emit.state != &draw_state) NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command);
+	const bool query_bias = m_context.GetOcclusionQueries().Counting();
+	if (!same_command || emit.state != &draw_state || emit.query_bias != query_bias)
+		NativeXprEmitDynamic(cache, vk_buffer, draw_state, same_command, query_bias);
 	const auto& pipeline = *variant.pipeline;
 	if (!same_command || emit.pipeline != &pipeline)
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
@@ -2737,6 +2739,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	emit.generation  = dynamic.Generation();
 	emit.state       = &draw_state;
 	emit.pipeline    = &pipeline;
+	emit.query_bias  = query_bias;
 	draw_state.Use(m_context.FrameNumber());
 	if (indexed) {
 		emit.index_base  = index_base;

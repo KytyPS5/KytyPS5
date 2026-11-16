@@ -33,6 +33,14 @@ constexpr uint64_t ValueMask = ReadyBit - 1u;
 // Added to a segment whose samples could not all be counted, so its queries read visible.
 constexpr uint64_t UncountedSamples = uint64_t {1} << 24u;
 
+// The console's depth block counts ZPASS samples conservatively unless DB_COUNT_CONTROL disables it,
+// and a bounding box drawn for a query that lies on the surfaces in the depth buffer still counts
+// there. Vulkan's queries test every sample exactly: a draw that a guest query counts and that tests
+// depth without writing it is moved toward the viewer by this many units of the depth format and of
+// its depth slope (see DynamicState::BiasTowardViewer()).
+constexpr float ProxyBiasUnits = 64.0f;
+constexpr float ProxyBiasSlope = 1.0f;
+
 // The value a dump writes for one DB: the whole count lives in DB 0, the others stay at zero.
 [[nodiscard]] constexpr uint64_t DbValue(uint32_t db, uint64_t total) {
 	return ReadyBit | (db == 0 ? (total & ValueMask) : 0u);

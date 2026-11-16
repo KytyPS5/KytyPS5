@@ -123,6 +123,26 @@ struct DynamicState {
 		SetAttachmentFeedbackLoopAspects(values.feedback_loop_aspects);
 	}
 
+	/// A depth bias toward the viewer for a draw that tests depth without writing it and has no bias of
+	/// its own (an occlusion query's bounding box, see OcclusionCounters::ProxyBiasUnits); false when the
+	/// draw is not one.
+	bool BiasTowardViewer(float units, float slope) {
+		if (!depth_test_enabled || depth_write_enabled || depth_bias_enabled) {
+			return false;
+		}
+		float sign = 0.0f;
+		switch (depth_compare_op) {
+			case vk::CompareOp::eLess:
+			case vk::CompareOp::eLessOrEqual: sign = -1.0f; break;
+			case vk::CompareOp::eGreater:
+			case vk::CompareOp::eGreaterOrEqual: sign = 1.0f; break;
+			default: return false;
+		}
+		SetDepthBiasEnabled(true);
+		SetDepthBias(sign * units, 0.0f, sign * slope);
+		return true;
+	}
+
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() {
 		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));

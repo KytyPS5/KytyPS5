@@ -106,7 +106,8 @@ public:
 	static void SetDeviceSupport(bool supported) noexcept;
 
 	// The guest TLAS of a known tracing shader: its header's address is the 64-bit value at
-	// user data pointer (user SGPR pair `user_sgpr`) + `header_offset`; `root` its root node,
+	// user data pointer (user SGPR pair `user_sgpr`) + `header_offset` (or that pointer itself, see
+	// HeaderInUserData()); `root` its root node,
 	// `layout` how the shader reads its instance records (IR::RayTracingLayout::Pack());
 	// `header_slots` the flattened SRT dwords the shader reads the header's address from, when it
 	// loads it from its user data (ShaderInfo::ray_query_header_slots); `header_vsharp` (not
@@ -130,6 +131,12 @@ public:
 	// base of the V# at it + `header_vsharp` (read with `read`, false when unreadable: 0).
 	[[nodiscard]] static uint64_t UserPointer(const TlasSource& source, uint64_t pointer,
 	                                          const std::function<bool(uint64_t, uint64_t)>& readable);
+	// Whether the header's address is the user data pointer itself, of which the shader takes the
+	// low 48 bits (IR::ShaderInfo::UserDataRayQueryHeader): no memory holds it.
+	[[nodiscard]] static bool HeaderInUserData(const TlasSource& source) noexcept;
+	[[nodiscard]] static constexpr uint64_t UserDataHeader(uint64_t pointer) noexcept {
+		return pointer & 0xffffffffffffull;
+	}
 	// The source of a program that traces through a guest TLAS (its info), or false.
 	[[nodiscard]] static bool FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
 	                                         TlasSource& source) noexcept;

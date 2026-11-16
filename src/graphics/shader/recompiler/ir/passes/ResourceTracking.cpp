@@ -5196,7 +5196,8 @@ private:
 		const auto& source = m_decoded.ray_tracing_source;
 		const auto* handle = read.Arg(0).Resolve().TryInstruction();
 		uint32_t    reg    = 0;
-		return source.header_vsharp == 0xffffffffu && memory.kind == ResourceKind::ScalarAddress &&
+		return source.header_vsharp == 0xffffffffu && source.header_offset != ShaderInfo::UserDataRayQueryHeader &&
+		       memory.kind == ResourceKind::ScalarAddress &&
 		       !memory.address_is_full && handle != nullptr && UserDataBasePair(*handle, reg) &&
 		       reg == source.user_sgpr &&
 		       (memory.offset == source.header_offset || memory.offset == source.header_offset + 4u);

@@ -502,11 +502,14 @@ void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
 		}
 		const auto pointer = RayTracing::UserPointer(
 		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
-		if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
-		    !readable(pointer + source.header_offset, sizeof(header))) {
+		if (RayTracing::HeaderInUserData(source)) {
+			header = RayTracing::UserDataHeader(pointer);
+		} else if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
+		           !readable(pointer + source.header_offset, sizeof(header))) {
 			return;
+		} else {
+			std::memcpy(&header, reinterpret_cast<const void*>(pointer + source.header_offset), sizeof(header));
 		}
-		std::memcpy(&header, reinterpret_cast<const void*>(pointer + source.header_offset), sizeof(header));
 	}
 	std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	const auto tlas = m_ray_tracing->ReadGuestTlas(header, source, readable, ranges);
@@ -896,6 +899,10 @@ bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const Ray
 	if (source.user_sgpr >= program.user_data_base && index + 1u < user_data.size()) {
 		pointer = RayTracing::UserPointer(
 		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
+	}
+	if (RayTracing::HeaderInUserData(source)) {
+		header = RayTracing::UserDataHeader(pointer);
+		return header != 0;
 	}
 	if (pointer != 0 && pointer <= UINT64_MAX - source.header_offset) {
 		header_at = pointer + source.header_offset;

@@ -2180,6 +2180,19 @@ bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
 		source.header_offset = MemoryOf(program, *read).offset;
 		return true;
 	}
+	// (A header address that is a user data pair itself, its high word cut to 16 bits, SAROS, cs
+	// 0697eb9d76b3160b: no load.)
+	if (const auto low = UserRegister(value); low) {
+		const auto* cut  = Producer(w.tlas[1], ValueOpcode::BitwiseAnd32);
+		auto        high = UserRegister(w.tlas[1]);
+		for (uint32_t arg = 0; cut != nullptr && arg < 2; ++arg) {
+			if (Immediate(cut->Arg(1 - arg)) == 0xffffu) high = UserRegister(cut->Arg(arg));
+		}
+		if (high != *low + 1u) return false;
+		source.user_sgpr     = *low;
+		source.header_offset = ShaderInfo::UserDataRayQueryHeader;
+		return true;
+	}
 	auto load = LoadOf(program, value);
 	auto user = load ? UserRegister(load->low) : std::nullopt;
 	// (A pair that the cases of a switch before it set to other user data pairs, ASTRO BOT's ps

@@ -648,6 +648,9 @@ struct Bindings {
 
 struct ShaderInfo {
 	static constexpr uint32_t NoRayQuerySlot  = 0xffffffffu;
+	// ray_query_header_offset of a TLAS header address that is the user data pair itself (the low 48
+	// bits): the program loads nothing for it.
+	static constexpr uint32_t UserDataRayQueryHeader = 0xffffffffu;
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	// Programs with inlined call targets (ray tracing hit groups) gather the images and samplers
 	// of every target: Wolverine's cs 1a04c58a9fbc2052 has more than 64 sampler roots.
@@ -749,7 +752,8 @@ struct ShaderInfo {
 	bool                            ray_query                     = false;
 	uint32_t                        ray_query_sites               = 0;
 	// Its guest TLAS: the header address is the 64-bit value at user data pointer
-	// `ray_query_user_sgpr` + `ray_query_header_offset`, the root node `ray_query_root`.
+	// `ray_query_user_sgpr` + `ray_query_header_offset` (UserDataRayQueryHeader: that pointer), the
+	// root node `ray_query_root`.
 	uint32_t                        ray_query_user_sgpr           = 0;
 	uint32_t                        ray_query_header_offset       = 0;
 	// Not NoRayQuerySlot: the header address is at the base of the V# at the user data pointer +

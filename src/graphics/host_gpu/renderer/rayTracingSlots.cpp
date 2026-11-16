@@ -519,6 +519,10 @@ bool RayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
 	return true;
 }
 
+bool RayTracing::HeaderInUserData(const TlasSource& source) noexcept {
+	return source.header_offset == ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryHeader;
+}
+
 uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
                                        const std::function<bool(uint64_t, uint64_t)>& readable) {
 	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
@@ -1559,7 +1563,10 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	readback.build_count = 0;
 	readback.build_slots.clear();
 	const bool psr        = (source.layout[3] & PsrHeaderLayout) != 0;
-	const auto source_key = psr ? UINT32_MAX : source.user_sgpr << 16u | source.header_offset;
+	const bool in_user    = HeaderInUserData(source);
+	const auto source_key = psr       ? UINT32_MAX
+	                        : in_user ? 0xffff0000u | source.user_sgpr
+	                                  : source.user_sgpr << 16u | source.header_offset;
 	readback.source_key   = source_key;
 	readback.frame        = frame;
 	readback.shader_hash  = shader_hash;
@@ -1745,13 +1752,14 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot &&
 		       (uint64_t {slot} + 1) * sizeof(uint32_t) <= flattened_srt.range;
 	};
-	// A header the caller has (the ray query pass's traversals) goes into the state as it is.
-	const bool header_given    = source.header != 0 || psr;
-	const bool header_in_state = header_given || (flattened_srt.buffer && in_srt(source.header_slots[0]) &&
-	                                              in_srt(source.header_slots[1]));
+	// A header the caller has (the ray query pass's traversals), or the user data pointer itself,
+	// goes into the state as it is.
+	const bool     header_given    = source.header != 0 || psr || in_user;
+	const bool     header_in_state = header_given || (flattened_srt.buffer && in_srt(source.header_slots[0]) &&
+	                                                  in_srt(source.header_slots[1]));
+	const uint64_t given           = in_user ? UserDataHeader(user_pointer) : source.header;
 	if (header_given) {
-		UpdateBuffer(command, m_walk_state->Handle(), offsetof(RtState, header_va), &source.header,
-		             sizeof(source.header));
+		UpdateBuffer(command, m_walk_state->Handle(), offsetof(RtState, header_va), &given, sizeof(given));
 		MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 		              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |

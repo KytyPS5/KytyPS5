@@ -1641,6 +1641,9 @@ struct LaneMaskWalk {
 	Inst*                 wave_node      = nullptr; // The phi of the box test's node, when it starts at the root.
 	Inst*                 wave_box       = nullptr;
 	Inst*                 wave_triangles = nullptr;
+	// (SAROS, cs 2fa6b5a3b15e54d4: the triangle test of a second copy of the leaf list loop, which the
+	// walk takes for the instances of the other facing mode; see LeafFacingCopies.)
+	Inst*                 wave_copy      = nullptr;
 	// The instance record address the setup loads the root from.
 	AddressLoad           record;
 	RayTracingLayout      layout;
@@ -2664,7 +2667,8 @@ bool WalkReach(const Program& program, const Block* header, const Block* latch, 
 
 // A BLAS the wave walks (scalar nodes: ASTRO BOT, cs bdd0bb9bd8852dd4): two intersections in the
 // node test's loop with one descriptor, the box test `tests[box]`, whose node starts (through the
-// phis of the BLAS walk's loops) at the root, and the triangle test of the leaf list.
+// phis of the BLAS walk's loops) at the root, and the triangle test of the leaf list (or, SAROS's cs
+// 2fa6b5a3b15e54d4, three: two triangle tests, each in its own copy of the leaf list loop).
 // The value a wave-wide BLAS walk's box test node starts at (the root) in the outermost loop
 // [header, latch] of the walk, entered from `pre`; empty if none.
 Value WaveRoot(const Program& program, const Inst* address, const Block* header, const Block* pre,
@@ -2711,17 +2715,27 @@ Value WaveRoot(const Program& program, const Inst* address, const Block* header,
 
 bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_t box, LaneMaskWalk& s) {
 	const auto* a = Producer(tests[0]->Arg(0), ValueOpcode::CompositeConstructU32x4);
-	const auto* b = Producer(tests[1]->Arg(0), ValueOpcode::CompositeConstructU32x4);
-	if (a == nullptr || b == nullptr) return false;
-	for (size_t k = 0; k < 4; ++k) {
-		if (a->Arg(k).Resolve() != b->Arg(k).Resolve()) return false;
+	for (const auto* test: tests) {
+		const auto* b = Producer(test->Arg(0), ValueOpcode::CompositeConstructU32x4);
+		if (a == nullptr || b == nullptr) return false;
+		for (size_t k = 0; k < 4; ++k) {
+			if (a->Arg(k).Resolve() != b->Arg(k).Resolve()) return false;
+		}
 	}
 	const auto* address = Producer(tests[box]->Arg(1), ValueOpcode::MakeImageAddress);
 	Block*      header  = EnclosingLoop(program, tests[box]->Parent());
 	Block *     pre = nullptr, *latch = nullptr, *merge = nullptr;
-	// (The triangle test is in the box test's loop: its own loop over the leaf list is inside it.)
+	std::vector<Inst*> triangles;
+	for (size_t k = 0; k < tests.size(); ++k) {
+		if (k != box) triangles.push_back(tests[k]);
+	}
+	// (The triangle test is in the box test's loop: its own loop over the leaf list is inside it. Two
+	// are in two loops.)
 	if (address == nullptr || header == s.header || !LoopShape(header, pre, latch, merge) ||
-	    !InLoop(program, header, s.header, s.latch) || !InLoop(program, tests[1 - box]->Parent(), header, latch))
+	    !InLoop(program, header, s.header, s.latch) || triangles.empty() || triangles.size() > 2 ||
+	    std::ranges::any_of(triangles, [&](const Inst* tri) { return !InLoop(program, tri->Parent(), header, latch); }) ||
+	    (triangles.size() == 2 &&
+	     EnclosingLoop(program, triangles[0]->Parent()) == EnclosingLoop(program, triangles[1]->Parent())))
 		return false;
 	// The outermost loop of the BLAS walk in the node test's loop.
 	for (;;) {
@@ -2742,7 +2756,8 @@ bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_
 	s.wave_latch     = latch;
 	s.wave_root      = root;
 	s.wave_box       = tests[box];
-	s.wave_triangles = tests[1 - box];
+	s.wave_triangles = triangles[0];
+	s.wave_copy      = triangles.size() == 2 ? triangles[1] : nullptr;
 	return true;
 }
 
@@ -2911,6 +2926,13 @@ bool MatchPacketWalk(Program& program, Inst& bvh, PacketWalk& w) {
 		    !(MatchWaveBlas(program, others, 1, s) && DeriveLaneLayout(program, s))) {
 			return false;
 		}
+	} else if (others.size() == 3) {
+		// A BLAS the wave walks with two copies of its leaf list loop (ClosestWave).
+		bool found = false;
+		for (uint32_t box = 0; box < 3 && !found; ++box) {
+			found = MatchWaveBlas(program, others, box, s) && DeriveLaneLayout(program, s);
+		}
+		if (!found) return false;
 	} else {
 		return false;
 	}
@@ -2927,10 +2949,11 @@ bool MatchPacketWalk(Program& program, Inst& bvh, PacketWalk& w) {
 // hit's write count: the code after the walk reads the others (other values the walk keeps in the
 // same registers, or what they hold from before the walk) only where the walk found no hit. The
 // kinds found; none when a value of a kind is read in a phi of the walk's merge (which would not see
-// the host's hit).
+// the host's hit). `others`: more accept conditions (the copies of a leaf code, LeafFacingCopies).
 template <typename KindOf>
 std::optional<std::array<bool, 8>> HitResults(const Program& program, PacketWalk& w, KindOf&& kind_of,
-                                              Value hit = {}, bool negated = false, bool select_kinds = false) {
+                                              Value hit = {}, bool negated = false, bool select_kinds = false,
+                                              std::span<const Value> others = {}) {
 	const auto first = BlockIndex(program, w.header), last = BlockIndex(program, w.latch);
 	const auto in_walk = [&](const Block* block) {
 		const auto at = BlockIndex(program, block);
@@ -2943,7 +2966,7 @@ std::optional<std::array<bool, 8>> HitResults(const Program& program, PacketWalk
 	const auto hit_mask = select_kinds ? LaneMaskOf(hit.Resolve().TryInstruction()) : Value {};
 	const auto same     = [&](Value condition) {
 		condition = condition.Resolve();
-		return condition == hit.Resolve() ||
+		return condition == hit.Resolve() || std::ranges::find(others, condition) != others.end() ||
 		       (!hit_mask.IsEmpty() && LaneMaskOf(condition.TryInstruction()) == hit_mask);
 	};
 	for (auto at = first; at <= last; ++at) {
@@ -4001,6 +4024,29 @@ std::optional<std::pair<uint32_t, uint32_t>> RecordBit(const Program& program, c
 	return std::nullopt;
 }
 
+// A test of one bit of a record dword: its dword, its bit and whether it tests that the bit is set.
+std::optional<std::tuple<uint32_t, uint32_t, bool>> RecordBitTest(const Program& program, const LaneMaskWalk& s,
+                                                                  const Inst* test) {
+	const auto op = test->GetOpcode();
+	if (op != ValueOpcode::IEqual32 && op != ValueOpcode::INotEqual32) return std::nullopt;
+	for (uint32_t side = 0; side < 2; ++side) {
+		const auto constant = Immediate(test->Arg(side));
+		const auto other    = test->Arg(1 - side);
+		if (constant == 0u) {
+			if (const auto f = RecordField(program, s, other); f && std::popcount(f->second) == 1) {
+				return std::tuple {f->first, static_cast<uint32_t>(std::countr_zero(f->second)),
+				                   op == ValueOpcode::INotEqual32};
+			}
+			if (const auto bit = RecordBit(program, s, other))
+				return std::tuple {bit->first, bit->second, op == ValueOpcode::INotEqual32};
+		} else if (constant == 1u) {
+			if (const auto bit = RecordBit(program, s, other))
+				return std::tuple {bit->first, bit->second, op == ValueOpcode::IEqual32};
+		}
+	}
+	return std::nullopt;
+}
+
 // The facing the leaf code of a wave-wide BLAS walk accepts (ClosestWave), from its accept condition
 // (`negated`: its reject condition), per lane
 //   accept = hit & !far & (facing | flags bit 2 | !enable)
@@ -4031,29 +4077,8 @@ bool LeafFacing(const Program& program, PacketWalk& w, Value condition, bool neg
 		return extract != nullptr && extract->Arg(0).Resolve().TryInstruction() == tri &&
 		       Immediate(extract->Arg(1)) == component;
 	};
-	const auto field      = [&](Value value) { return RecordField(program, s, value); };
 	const auto record_bit = [&](Value value) { return RecordBit(program, s, value); };
-	// A test of one bit of a record dword (and whether it tests that the bit is set).
-	const auto bit_test = [&](const Inst* test) -> std::optional<std::tuple<uint32_t, uint32_t, bool>> {
-		const auto op = test->GetOpcode();
-		if (op != ValueOpcode::IEqual32 && op != ValueOpcode::INotEqual32) return std::nullopt;
-		for (uint32_t side = 0; side < 2; ++side) {
-			const auto constant = Immediate(test->Arg(side));
-			const auto other    = test->Arg(1 - side);
-			if (constant == 0u) {
-				if (const auto f = field(other); f && std::popcount(f->second) == 1) {
-					return std::tuple {f->first, static_cast<uint32_t>(std::countr_zero(f->second)),
-					                   op == ValueOpcode::INotEqual32};
-				}
-				if (const auto bit = record_bit(other))
-					return std::tuple {bit->first, bit->second, op == ValueOpcode::INotEqual32};
-			} else if (constant == 1u) {
-				if (const auto bit = record_bit(other))
-					return std::tuple {bit->first, bit->second, op == ValueOpcode::IEqual32};
-			}
-		}
-		return std::nullopt;
-	};
+	const auto bit_test   = [&](const Inst* test) { return RecordBitTest(program, s, test); };
 	// What each atom is.
 	constexpr size_t None = 8;
 	size_t           hit = None, facing = None, far = None, both = None, enable = None, guest = None;
@@ -4190,6 +4215,189 @@ std::optional<RayQueryResultKind> WaveResultKind(const Program& program, const L
 	return std::nullopt;
 }
 
+// What a value of the leaf code of a ClosestWave walk with two copies of its leaf list loop is
+// (LeafFacingCopies): WaveResultKind of either triangle test, or the distance a copy keeps written
+// as min(t, T) (`currents`: the t of each copy), which is T where the copy writes it.
+std::optional<RayQueryResultKind> CopyResultKind(const Program& program, const LaneMaskWalk& s,
+                                                 std::span<const Value> currents, const Inst* value) {
+	for (const auto* tri: {s.wave_triangles, s.wave_copy}) {
+		if (const auto kind = WaveResultKind(program, s, tri, value)) return kind;
+	}
+	const auto* min = Producer(Canonical(Value(const_cast<Inst*>(value))), ValueOpcode::FPMin32);
+	for (uint32_t side = 0; min != nullptr && side < 2; ++side) {
+		const auto* t = Canonical(min->Arg(side)).TryInstruction();
+		if (t != nullptr && std::ranges::find(currents, Canonical(min->Arg(1 - side))) != currents.end() &&
+		    CopyResultKind(program, s, {}, t) == RayQueryResultKind::T)
+			return RayQueryResultKind::T;
+	}
+	return std::nullopt;
+}
+
+// The facing of a ClosestWave walk whose leaf code is in two copies of the leaf list loop, each with
+// its own triangle test (SAROS, cs 2fa6b5a3b15e54d4): a branch on the instance's flags bit 2 (both
+// facings) before them takes one copy, which keeps the nearest hit, or the other, which keeps the
+// nearest hit of the facing flags bit 3 selects (as LeafFacing: equal to the sign of the test's first
+// result, or not equal for the flipped facing). A copy writes the distance it keeps, t, as
+// Select(c, min(t, T), t) with c = hit & facing, or Select(c, T, t) with c = hit & !far & facing, and
+// what it keeps of the hit under hit & !far & facing (hit: the first result is finite, or not +inf;
+// facing true in the copy of both facings); its other Selects are lane masked writes. Sets the
+// layout's flags and flip and the queries' facing; `conditions` the copies' write conditions and
+// `currents` their t.
+bool LeafFacingCopies(const Program& program, PacketWalk& w, std::vector<Value>& conditions,
+                      std::array<Value, 2>& currents) {
+	auto&      s    = w.shape;
+	const auto tris = std::array {s.wave_triangles, s.wave_copy};
+	// The branch to the copies' loops, and the copy of both facings.
+	std::array<Block*, 2> headers {}, pres {}, latches {};
+	for (uint32_t k = 0; k < 2; ++k) {
+		Block* merge = nullptr;
+		headers[k]   = EnclosingLoop(program, tris[k]->Parent());
+		if (!LoopShape(headers[k], pres[k], latches[k], merge) || pres[k]->ImmPredecessors().size() != 1) return false;
+	}
+	const auto* branch = pres[0]->ImmPredecessors()[0];
+	const auto& term   = branch->terminator;
+	if (pres[1]->ImmPredecessors()[0] != branch || term.kind != CFG::TerminatorKind::ConditionalBranch ||
+	    !((term.true_block == pres[0] && term.false_block == pres[1]) ||
+	      (term.true_block == pres[1] && term.false_block == pres[0])))
+		return false;
+	const auto [ref, inverted] = BranchCondition(*branch);
+	const auto* test           = ref != nullptr ? ref->Arg(0).Resolve().TryInstruction() : nullptr;
+	const auto  both           = test != nullptr ? RecordBitTest(program, s, test) : std::nullopt;
+	if (!both) return false;
+	const auto [both_dword, both_bit, both_set] = *both;
+	const auto* when_set                        = both_set != inverted ? term.true_block : term.false_block;
+	const uint32_t all                          = when_set == pres[0] ? 0u : 1u;
+	// Each copy's t: what its far test compares T with.
+	for (uint32_t k = 0; k < 2; ++k) {
+		for (auto at = BlockIndex(program, headers[k]); at <= BlockIndex(program, latches[k]); ++at) {
+			for (const auto& inst: *program.blocks[at]) {
+				const auto op = inst.GetOpcode();
+				if (op != ValueOpcode::FPOrdGreaterThan32 && op != ValueOpcode::FPOrdLessThanEqual32) continue;
+				const auto* t = Canonical(inst.Arg(0)).TryInstruction();
+				if (t == nullptr || WaveResultKind(program, s, tris[k], t) != RayQueryResultKind::T) continue;
+				if (!currents[k].IsEmpty() && currents[k] != Canonical(inst.Arg(1))) return false;
+				currents[k] = Canonical(inst.Arg(1));
+			}
+		}
+		if (currents[k].IsEmpty()) return false;
+	}
+	const auto kind_of = [&](const Inst* value) { return CopyResultKind(program, s, currents, value); };
+	uint32_t   flags_dword = 0, facing_bit = 0;
+	bool       flip        = false;
+	for (uint32_t k = 0; k < 2; ++k) {
+		const auto* tri = tris[k];
+		LaneTable   lanes;
+		lanes.exec      = tri->Arg(2).Resolve().TryInstruction();
+		lanes.exec_mask = LaneMaskOf(lanes.exec);
+		const auto raw  = [&](Value value, uint32_t component) {
+			const auto* extract = Producer(Canonical(value), ValueOpcode::CompositeExtractU32x4);
+			return extract != nullptr && extract->Arg(0).Resolve().TryInstruction() == tri &&
+			       Immediate(extract->Arg(1)) == component;
+		};
+		// The write of the distance (its condition, with the far test when it writes min(t, T)), and the
+		// writes of the hit.
+		std::optional<uint32_t> distance;
+		std::vector<Value>      writes;
+		const Inst*             far = nullptr;
+		for (auto at = BlockIndex(program, headers[k]); at <= BlockIndex(program, latches[k]); ++at) {
+			for (const auto& inst: *program.blocks[at]) {
+				const auto op = inst.GetOpcode();
+				if ((op == ValueOpcode::FPOrdGreaterThan32 || op == ValueOpcode::FPOrdLessThanEqual32) &&
+				    Canonical(inst.Arg(1)) == currents[k]) {
+					if (far != nullptr) return false;
+					far = &inst;
+				}
+			}
+		}
+		for (auto at = BlockIndex(program, headers[k]); at <= BlockIndex(program, latches[k]); ++at) {
+			for (const auto& inst: *program.blocks[at]) {
+				// (Lane masked writes keep their value on the other lanes.)
+				if (inst.GetOpcode() != ValueOpcode::SelectU32 || inst.Arg(0).Resolve().TryInstruction() == lanes.exec)
+					continue;
+				const auto condition = inst.Arg(0).Resolve();
+				bool       written   = false;
+				for (uint32_t arm = 1; arm <= 2 && !written; ++arm) {
+					const auto* t = Canonical(inst.Arg(arm)).TryInstruction();
+					if (t == nullptr || Canonical(inst.Arg(3 - arm)) != currents[k] || kind_of(t) != RayQueryResultKind::T)
+						continue;
+					auto table = lanes.Condition(condition);
+					if (!table || distance) return false;
+					if (arm == 2) *table = ~*table;
+					// (min(t, T): written where T <= t too.)
+					if (Producer(Canonical(Value(const_cast<Inst*>(t))), ValueOpcode::FPMin32) != nullptr) {
+						const auto closer = far != nullptr ? lanes.Condition(Value(const_cast<Inst*>(far))) : std::nullopt;
+						if (!closer) return false;
+						*table &= far->GetOpcode() == ValueOpcode::FPOrdLessThanEqual32 ? *closer : ~*closer;
+					}
+					distance = table;
+					written  = true;
+				}
+				if (!written) writes.push_back(condition);
+				conditions.push_back(condition);
+			}
+		}
+		if (!distance || writes.empty()) return false;
+		for (const auto& write: writes) {
+			if (lanes.Condition(write) != distance) return false;
+		}
+		// What each atom is: hit & near & facing (facing: none in the copy of both facings).
+		constexpr size_t None = 8;
+		size_t           hit = None, near = None, facing = None;
+		bool             nearer = true;
+		for (size_t a = 0; a < lanes.atoms.size(); ++a) {
+			const auto* atom = lanes.atoms[a];
+			const auto  op   = atom->GetOpcode();
+			if (atom == far) {
+				near   = a;
+				nearer = op == ValueOpcode::FPOrdLessThanEqual32;
+				continue;
+			}
+			if (op == ValueOpcode::FPCmpClass32 && Immediate(atom->Arg(1)) == 0x38u && hit == None) {
+				const auto* negated = Producer(Canonical(atom->Arg(0)), ValueOpcode::FPNeg32);
+				const auto* size    = negated != nullptr ? Producer(Canonical(negated->Arg(0)), ValueOpcode::FPAbs32) : nullptr;
+				if (size == nullptr || !raw(size->Arg(0), 0)) return false;
+				hit = a;
+				continue;
+			}
+			if ((op == ValueOpcode::IEqual32 || op == ValueOpcode::INotEqual32) && facing == None && k != all) {
+				for (uint32_t side = 0; side < 2 && facing == None; ++side) {
+					const auto* sign = Producer(Canonical(atom->Arg(side)), ValueOpcode::ShiftRightLogical32);
+					const auto  bit  = sign != nullptr && Immediate(sign->Arg(1)) == 31u && raw(sign->Arg(0), 0)
+					                       ? RecordBit(program, s, atom->Arg(1 - side))
+					                       : std::nullopt;
+					if (bit && bit->second >= 3u) {
+						facing      = a;
+						flags_dword = bit->first;
+						facing_bit  = bit->second;
+						flip        = op == ValueOpcode::INotEqual32;
+					}
+				}
+				if (facing == a) continue;
+			}
+			const bool compare = op == ValueOpcode::IEqual32 || op == ValueOpcode::INotEqual32 ||
+			                     op == ValueOpcode::FPOrdNotEqual32 || op == ValueOpcode::FPUnordNotEqual32;
+			if (compare && hit == None && (raw(atom->Arg(0), 0) || raw(atom->Arg(1), 0))) {
+				hit = a;
+				continue;
+			}
+			return false;
+		}
+		if (hit == None || near == None || (k != all && facing == None)) return false;
+		const auto set = [](size_t a, uint32_t c) { return a != None && ((c >> a) & 1u) != 0; };
+		for (uint32_t c = 0; c < 32; ++c) {
+			const bool accept = set(hit, c) && set(near, c) == nearer && (k == all || set(facing, c));
+			if ((((*distance >> c) & 1u) != 0) != accept) return false;
+		}
+	}
+	if (both_dword != flags_dword || both_bit + 1u != facing_bit) return false;
+	s.layout.flags_dword = flags_dword;
+	s.layout.flags_shift = facing_bit - 3u;
+	s.layout.flip_facing = flip;
+	w.cull               = Value(true);
+	w.both_facings       = false;
+	return true;
+}
+
 // ClosestWave (ASTRO BOT, cs bdd0bb9bd8852dd4; ASTRO's PLAYROOM's 2020 template): a packet walk
 // whose BLAS walk is the wave's (scalar nodes: a box test and a test of the triangles of a leaf
 // list) with leaf code that keeps the nearest triangle, every one opaque, of the facing the
@@ -4197,7 +4405,8 @@ std::optional<RayQueryResultKind> WaveResultKind(const Program& program, const L
 // list entry's primitive word and triangle node, the instance record address) under its accept
 // condition, or keeps them under its reject condition. As for ClosestOpaque, the host traverses
 // before the walk, now with that facing, and the values the code after the walk reads of the hit
-// are the host's, when nearer than the walk's t max.
+// are the host's, when nearer than the walk's t max. (Or SAROS's cs 2fa6b5a3b15e54d4: the leaf code
+// in two copies of the leaf list loop, one per facing mode, LeafFacingCopies.)
 bool MatchClosestWaveWalk(Program& program, PacketWalk& w) {
 	auto& s = w.shape;
 	if (s.wave_triangles == nullptr || !s.blases.empty()) return false;
@@ -4205,6 +4414,24 @@ bool MatchClosestWaveWalk(Program& program, PacketWalk& w) {
 	const Inst* tri = s.wave_triangles;
 	const auto  kind_of = [&](const Inst* value) { return WaveResultKind(program, s, tri, value); };
 	if (WaveBlasBase(tri) == nullptr) return false;
+	if (s.wave_copy != nullptr) {
+		std::vector<Value>   conditions;
+		std::array<Value, 2> currents;
+		if (!LeafFacingCopies(program, w, conditions, currents)) return false;
+		for (auto at = first; at <= last; ++at) {
+			for (const auto& inst: *program.blocks[at]) {
+				const auto op = inst.GetOpcode();
+				if (op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageGatherRaw || op == ValueOpcode::ImageRead)
+					return false;
+			}
+		}
+		const auto copy_kind = [&](const Inst* value) { return CopyResultKind(program, s, currents, value); };
+		const auto found     = HitResults(program, w, copy_kind, conditions.front(), false, true, conditions);
+		if (!found || !(*found)[static_cast<uint32_t>(RayQueryResultKind::Word)]) return false;
+		s.layout.node_count_80 = TlasNodeCount80(program, s);
+		s.source.layout        = s.layout.Pack();
+		return true;
+	}
 	// The far test (T > t, or T <= t, t the distance the leaf code keeps) and the write of the
 	// distance: Select(accept, T, t), or Select(reject, t, T).
 	Value current;

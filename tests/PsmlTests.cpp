@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace Libs::LibPsml {
@@ -483,6 +484,7 @@ constexpr int MFSR2_NOT_INITIALIZED = static_cast<int>(0x8a8a0001u);
 constexpr int MFSR2_ALREADY_INITIALIZED = static_cast<int>(0x8a8a0002u);
 constexpr int MFSR2_INVALID_PROFILE = static_cast<int>(0x8a8a0003u);
 constexpr int MFSR2_INVALID_CONTEXT = static_cast<int>(0x8a8a0005u);
+constexpr int MFSR2_CORRUPTED = static_cast<int>(0x8a8a0007u);
 constexpr int MFSR2_NULL_ARGUMENT = static_cast<int>(0x8a8a0009u);
 constexpr int MFSR2_NULL_TEXTURE = static_cast<int>(0x8a8a000au);
 constexpr int MFSR2_INVALID_TEXTURE = static_cast<int>(0x8a8a000bu);
@@ -770,6 +772,52 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
   params.flags = 0;
   params.motion_offset[0] = 1.0f;
   EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+}
+
+// A dispatch rejects a set reserved byte, a pre-exposure that is not a positive finite value
+// and a render size past the context's output, and a space without room for the packet is
+// corrupted under one NOP. A context's first written packet starts its history.
+TEST_F(PsmlMfsr2Test, DispatchChecksParametersAndResetsANewContext) {
+  void *context = NewContext(1920, 1080, 8);
+  const auto output = Texture(1920, 1080, 0x10000);
+  const auto color = Texture(1920, 1080, 0x20000);
+  Mfsr2DispatchParameters params{.output = output.data(), .color = color.data(),
+                                 .width = 1920, .height = 1080};
+  std::vector<uint32_t> command(0x800);
+  CommandSpace space{command.data(), 0x800};
+  const auto dispatch = [&](int expected) {
+    command[0] = 0xdeadbeef;
+    EXPECT_EQ(Function<Dispatch>("lrJwpLjKXRc")(context, &space, &params), expected);
+    Pssr::Request request;
+    std::memcpy(&request, command.data() + 1, sizeof(request));
+    return request.flags;
+  };
+  for (const float exposure : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::infinity()}) {
+    params.pre_exposure = exposure;
+    dispatch(MFSR2_INVALID_PARAMETER);
+  }
+  params.pre_exposure = 1.0f;
+  params.reserved = 1;
+  dispatch(MFSR2_INVALID_PARAMETER);
+  params.reserved = 0;
+  params.width = 1921;
+  dispatch(MFSR2_RENDER_SIZE);
+  params.width = 1920;
+  space.dwords = Pssr::RequestDwords;
+  dispatch(MFSR2_CORRUPTED);
+  EXPECT_EQ(command[0], KYTY_PM4(Pssr::RequestDwords, Pm4::IT_NOP, Pm4::R_ZERO));
+  space.dwords = 0;
+  dispatch(MFSR2_CORRUPTED);
+  EXPECT_EQ(command[0], 0xdeadbeefu);
+  space.dwords = 0x800;
+  EXPECT_EQ(dispatch(0), Pssr::kReset);
+  EXPECT_EQ(dispatch(0), 0u);
+  EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
+  context = NewContext(1920, 1080, 8);
+  EXPECT_EQ(dispatch(0), Pssr::kReset);
+  EXPECT_EQ(dispatch(0), 0u);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
 }
 

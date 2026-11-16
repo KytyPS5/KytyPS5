@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 namespace Libs::LibPsml {
 
@@ -453,6 +454,7 @@ constexpr int      NOT_INITIALIZED           = static_cast<int>(0x8a8a0001u);
 constexpr int      ALREADY_INITIALIZED       = static_cast<int>(0x8a8a0002u);
 constexpr int      INVALID_PROFILE           = static_cast<int>(0x8a8a0003u);
 constexpr int      INVALID_CONTEXT           = static_cast<int>(0x8a8a0005u);
+constexpr int      COMMAND_BUFFER_CORRUPTED  = static_cast<int>(0x8a8a0007u);
 constexpr int      ARGUMENT_NULL             = static_cast<int>(0x8a8a0009u);
 constexpr int      TEXTURE_NULL              = static_cast<int>(0x8a8a000au);
 constexpr int      INVALID_TEXTURE           = static_cast<int>(0x8a8a000bu);
@@ -513,6 +515,7 @@ struct Context {
 	bool     used;
 	uint32_t width;
 	uint32_t height;
+	bool     dispatched;
 };
 
 bool    g_initialized = false;
@@ -554,17 +557,25 @@ uint64_t ContextBlockCount(const ContextParameters& params) {
 	return (bytes + MEMORY_BLOCK_SIZE - 1) / MEMORY_BLOCK_SIZE;
 }
 
-int CheckDispatch(const Context* context, const DispatchParameters* params) {
+int CheckDispatch(const Context* context, const CommandSpace* space,
+                  const DispatchParameters* params) {
 	if (context == nullptr) {
 		return INVALID_CONTEXT;
 	}
 	if (params == nullptr) {
 		return ARGUMENT_NULL;
 	}
+	if (params->reserved != 0) {
+		return INVALID_PARAMETER;
+	}
 	if (params->output == nullptr) {
 		return TEXTURE_NULL;
 	}
-	if (params->width == 0 || params->height == 0) {
+	if (params->pre_exposure <= 0.0f || !std::isfinite(params->pre_exposure)) {
+		return INVALID_PARAMETER;
+	}
+	if (params->width == 0 || params->height == 0 || params->width > context->width ||
+	    params->height > context->height) {
 		return UNSUPPORTED_RENDER_SIZE;
 	}
 	Graphics::ShaderTextureResource output, color;
@@ -585,10 +596,11 @@ int CheckDispatch(const Context* context, const DispatchParameters* params) {
 		return TEXTURE_NULL;
 	}
 	std::memcpy(color.fields, params->color, sizeof(color.fields));
-	return !is_valid(color) || params->x + params->width > color.Width5() + 1u ||
-	               params->y + params->height > color.Height5() + 1u
-	           ? INVALID_TEXTURE
-	           : OK;
+	if (!is_valid(color) || params->x + params->width > color.Width5() + 1u ||
+	    params->y + params->height > color.Height5() + 1u) {
+		return INVALID_TEXTURE;
+	}
+	return space->dwords < PACKET_DWORDS ? COMMAND_BUFFER_CORRUPTED : OK;
 }
 
 int KYTY_SYSV_ABI Initialize() {
@@ -693,14 +705,16 @@ int KYTY_SYSV_ABI GetDispatchDwords(const Context* /*context*/, uint32_t* out) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace* space,
+int KYTY_SYSV_ABI GetDispatchPackets(Context* context, const CommandSpace* space,
                                      const DispatchParameters* params) {
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
 	}
-	if (const int error = CheckDispatch(context, params); error != OK) {
-		space->cmd[0] = KYTY_PM4(space->dwords, Pm4::IT_NOP, Pm4::R_ZERO);
+	if (const int error = CheckDispatch(context, space, params); error != OK) {
+		if (space->dwords != 0) {
+			space->cmd[0] = KYTY_PM4(space->dwords, Pm4::IT_NOP, Pm4::R_ZERO);
+		}
 		return error;
 	}
 	constexpr uint32_t DILATED_MOTION = 1u << 2;
@@ -708,6 +722,10 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
 		flags |= Pssr::kSpatialOnly;
+	}
+	// A context's first dispatch starts its history.
+	if (!std::exchange(context->dispatched, true)) {
+		flags |= Pssr::kReset;
 	}
 	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;

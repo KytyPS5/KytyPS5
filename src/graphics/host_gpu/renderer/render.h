@@ -551,7 +551,27 @@ private:
 		// ranges from it and writes only the slots whose descriptors changed into it.
 		vk::DescriptorSet                    slot_set;
 		bool                                 slot_set_current = false;
+		// Whole sets of the state's layout that a binding which copies its tables binds instead of
+		// a new set: their table slots are brought up to date from `slot_log` (or copied from the
+		// slot set), and the other descriptors written. A set waits for the GPU work that used it.
+		struct RingSet {
+			vk::DescriptorSet       set;
+			vk::DescriptorSetLayout layout;
+			// The command buffer that last bound it, and the slot version its table slots hold.
+			uint64_t                tick    = 0;
+			uint64_t                version = 0;
+		};
+		std::vector<RingSet>                 ring;
+		// Advances with every change of `slot_infos`; `slot_log` holds the slots changed by the
+		// versions after `slot_log_floor` (a ring set at an older version copies the tables).
+		uint64_t                             slot_version   = 1;
+		uint64_t                             slot_log_floor = 1;
+		std::vector<std::pair<uint64_t, uint32_t>> slot_log;
 	};
+	// A ring set of the state for `layout` that no pending GPU work uses (nullptr when the ring is
+	// full and every set is in use).
+	[[nodiscard]] TableBindingState::RingSet* AcquireTableRingSet(TableBindingState&      state,
+	                                                              vk::DescriptorSetLayout layout);
 	// Prepares the tables of `prepared` from the program's state when it still applies; false
 	// when the tables must be resolved slot by slot.
 	[[nodiscard]] bool ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,

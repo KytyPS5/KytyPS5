@@ -2944,6 +2944,32 @@ void RenderExecutor::StreamDrawReads(std::span<PreparedBindings* const> stages) 
 	}
 }
 
+RenderExecutor::TableBindingState::RingSet* RenderExecutor::AcquireTableRingSet(TableBindingState&      state,
+                                                                               vk::DescriptorSetLayout layout) {
+	// Two or three frames of GPU work use a state's sets at a time.
+	constexpr size_t MaxRingSets = 6;
+	auto&            semaphore   = m_context.GetCommandScheduler().GetMasterSemaphore();
+	for (int pass = 0; pass < 2; pass++) {
+		for (auto& entry: state.ring) {
+			if (entry.layout == layout && semaphore.IsFree(entry.tick)) {
+				return &entry;
+			}
+		}
+		if (pass == 0) {
+			semaphore.Refresh();
+		}
+	}
+	if (state.ring.size() >= MaxRingSets) {
+		return nullptr;
+	}
+	auto& entry  = state.ring.emplace_back();
+	entry.set    = m_context.GetDescriptorHeap().CommitPersistent(layout);
+	entry.layout = layout;
+	// (Older than the log: its tables are copied.)
+	entry.version = 0;
+	return &entry;
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -3091,6 +3117,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (!copy_tables) {
 				// Until the slot set holds this binding's descriptors (see below).
 				table_state->slot_set_current = false;
+				// The ring sets copy the tables written whole.
+				table_state->slot_log.clear();
+				table_state->slot_log_floor = ++table_state->slot_version;
 			}
 		}
 		const std::span<const TableRange> stage_tables =
@@ -3237,6 +3266,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                     slot_info.imageView != info.imageView ||
 				                     slot_info.imageLayout != info.imageLayout;
 				if (copy_tables && changed) {
+					table_state->slot_log.emplace_back(++table_state->slot_version, slot);
 					const auto table =
 					    std::ranges::find_if(stage_tables, [&](const TableRange& range) {
 						    return slot >= range.first_slot && slot - range.first_slot < range.capacity;
@@ -3323,12 +3353,55 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		} else {
 			auto&      heap   = m_context.GetDescriptorHeap();
 			const auto device = m_context.GetGraphics().device;
-			const auto set    = heap.Commit(pipeline.descriptor_set_layout);
+			// A binding whose tables all come from one state's slot set binds a set of the state's
+			// ring: its table slots only take the slots changed since it was last bound. GTA V's
+			// ray tracing operations copied 16 384-49 152 table descriptors into a new set each
+			// time, and sets that large made the heap retire its pools every few of them.
+			TableBindingState* ring_state = nullptr;
+			bool               ring_ok    = !table_ranges.empty();
+			for (const auto& table: table_ranges) {
+				ring_ok    = ring_ok && table.copied && (ring_state == nullptr || ring_state == table.state);
+				ring_state = table.state;
+			}
+			auto* ring = ring_ok ? AcquireTableRingSet(*ring_state, pipeline.descriptor_set_layout) : nullptr;
+			const auto set = ring != nullptr ? ring->set : heap.Commit(pipeline.descriptor_set_layout);
+			if (ring != nullptr && ring->version >= ring_state->slot_log_floor) {
+				m_descriptor_copies.clear();
+				for (auto change = std::ranges::upper_bound(ring_state->slot_log, ring->version, {},
+				                                            [](const auto& entry) { return entry.first; });
+				     change != ring_state->slot_log.end(); ++change) {
+					const auto slot  = change->second;
+					const auto table = std::ranges::find_if(table_ranges, [&](const TableRange& range) {
+						return slot >= range.first_slot && slot - range.first_slot < range.capacity;
+					});
+					EXIT_IF(table == table_ranges.end());
+					vk::WriteDescriptorSet write {};
+					write.dstBinding      = table->binding;
+					write.dstArrayElement = table->base + (slot - table->first_slot);
+					write.descriptorCount = 1;
+					write.descriptorType  = NativeDescriptorType(table->kind);
+					write.pImageInfo      = &ring_state->slot_infos[slot];
+					m_descriptor_writes.push_back(write);
+				}
+			}
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
 			for (auto& copy: m_descriptor_copies) {
 				copy.dstSet = set;
+			}
+			if (ring != nullptr) {
+				ring->tick    = m_context.GetCommandScheduler().CurrentTick();
+				ring->version = ring_state->slot_version;
+			}
+			// The logs keep the latest changes: a ring set older than them copies its tables.
+			for (const auto& table: table_ranges) {
+				auto& log = table.state->slot_log;
+				if (log.size() > 4096) {
+					const auto keep             = log.end() - 2048;
+					table.state->slot_log_floor = (keep - 1)->first;
+					log.erase(log.begin(), keep);
+				}
 			}
 			// The slots written into the slot sets go first: the copies read them.
 			m_descriptor_writes.insert(m_descriptor_writes.end(), m_slot_set_writes.begin(),

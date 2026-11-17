@@ -150,6 +150,24 @@ LIB_DEFINE(InitDialog_1_ErrorDialog) {
 
 } // namespace LibErrorDialog
 
+namespace LibPlayerInvitationDialog {
+
+LIB_VERSION("PlayerInvitationDialog", 1, "PlayerInvitationDialog", 1, 1);
+
+constexpr int PLAYER_INVITATION_DIALOG_STATUS_NONE = 0;
+
+static int KYTY_SYSV_ABI PlayerInvitationDialogUpdateStatus() {
+	PRINT_NAME();
+
+	return PLAYER_INVITATION_DIALOG_STATUS_NONE;
+}
+
+LIB_DEFINE(InitDialog_1_PlayerInvitationDialog) {
+	LIB_FUNC("kFhuwHrIUqs", PlayerInvitationDialogUpdateStatus);
+}
+
+} // namespace LibPlayerInvitationDialog
+
 LIB_DEFINE(InitDialog_1) {
 	LibCommonDialog::InitDialog_1_CommonDialog(s);
 	LibImeDialog::InitDialog_1_ImeDialog(s);
@@ -159,6 +177,7 @@ LIB_DEFINE(InitDialog_1) {
 	LibSaveDataDialogNative::InitDialog_1_SaveDataDialogNative(s);
 	LibMsgDialog::InitDialog_1_MsgDialog(s);
 	LibErrorDialog::InitDialog_1_ErrorDialog(s);
+	LibPlayerInvitationDialog::InitDialog_1_PlayerInvitationDialog(s);
 }
 
 } // namespace Libs

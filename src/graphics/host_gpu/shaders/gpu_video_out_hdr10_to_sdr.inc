@@ -10,6 +10,7 @@ vec3 LinearToSrgb(vec3 linear) {
 vec3 Hdr10ToSdr(vec3 rgb, bool source_linear) {
 	vec3 nits = clamp(rgb, 0.0, 10000.0);
 	if (!source_linear) {
+		rgb = clamp(rgb, 0.0, 1.0);
 		vec3 powered = pow(rgb, vec3(32.0 / 2523.0));
 		nits = 10000.0 * pow(max(powered - 3424.0 / 4096.0, 0.0) /
 		                         (2413.0 / 128.0 - (2392.0 / 128.0) * powered),

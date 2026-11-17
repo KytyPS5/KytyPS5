@@ -2525,7 +2525,17 @@ public:
             pixelsMatch(render(sdr_source, 1u | 8u),
                         {0x80000000u, 0x80808080u, 0x80808080u, 0x805e8080u}),
             "premultiplied linear pixels were not converted to premultiplied sRGB");
+    // PQ with alpha 1/3 and color up to three times the alpha.
+    auto bright_pq_source = CreateImage2D(
+        name, 4, 1, vk::Format::eA2B10G10R10UnormPack32, vk::ImageUsageFlagBits::eSampled,
+        {1u << 30u, pq(341, 341, 341) | 1u << 30u, pq(716, 716, 716) | 1u << 30u,
+         pq(1023, 1023, 1023) | 1u << 30u}, 1, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "premultiplied PQ above alpha",
+            pixelsMatch(render(bright_pq_source, 1u | 4u),
+                        {0x55000000u, 0x55555555u, 0x55555555u, 0x55555555u}),
+            "premultiplied PQ pixels above alpha did not saturate to SDR white");
 
+    DestroyImage(&bright_pq_source);
     DestroyImage(&sdr_source);
     DestroyImage(&nit_source);
     DestroyImage(&pq_source);

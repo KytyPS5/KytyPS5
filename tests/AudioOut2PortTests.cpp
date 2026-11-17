@@ -916,7 +916,7 @@ bool AudioOutHasDevice(int handle) {
 	       g_device_backed_handles.end();
 }
 
-uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
+uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking, bool /*cushion*/) {
 	std::unique_lock lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
 	if (g_block_outputs && g_blocked_output.empty()) {

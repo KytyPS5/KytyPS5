@@ -233,7 +233,7 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	}
 
 	AddcontMount mount {entry->entitlement_label, "/addcont" + std::to_string(index) + "/"};
-	LibKernel::FileSystem::Mount(entry->mount_dir, mount.point);
+	LibKernel::FileSystem::Mount(entry->mount_dir, mount.point, true);
 	LOGF("\t mounted %s -> %s\n", mount.point.c_str(),
 	     Common::PathToString(entry->mount_dir).c_str());
 

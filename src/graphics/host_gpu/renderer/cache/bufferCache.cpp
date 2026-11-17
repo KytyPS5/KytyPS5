@@ -1930,6 +1930,14 @@ void BufferCache::WriteTicks::Assign(uint64_t begin, uint64_t end, uint64_t tick
 	if (begin >= end) {
 		return;
 	}
+	// The operations of one command buffer write the same ranges again and again (Demon's Souls at Boletaria: ~3,500
+	// written buffers a frame, each looked up in the map): a range assigned this tick still has it, as the ticks
+	// assigned only grow.
+	auto& recent = m_recent[((begin ^ (end << 24u)) * 0x9e3779b97f4a7c15ull) >> 56u];
+	if (recent.begin == begin && recent.end == end && recent.tick == tick) {
+		return;
+	}
+	recent = {begin, end, tick};
 	auto it = m_ranges.lower_bound(begin);
 	// Most writes repeat a range of an earlier operation.
 	if (it != m_ranges.end() && it->first == begin && it->second.end == end) {

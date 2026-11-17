@@ -541,6 +541,13 @@ private:
 			uint64_t tick = 0;
 		};
 		std::map<uint64_t, Range> m_ranges;
+		// The ranges assigned last, by a hash of the range (see Assign).
+		struct Recent {
+			uint64_t begin = 0;
+			uint64_t end   = 0;
+			uint64_t tick  = 0;
+		};
+		std::array<Recent, 256> m_recent {};
 	};
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

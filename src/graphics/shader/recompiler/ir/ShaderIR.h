@@ -181,6 +181,8 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 		return Prospero::BufferFormat::k32UInt;
 	if (format == Prospero::BufferFormat::k16SInt && !image.read && !image.atomic)
 		return Prospero::BufferFormat::k16UInt;
+	if (format == Prospero::BufferFormat::k16_16SInt && !image.read && !image.atomic)
+		return Prospero::BufferFormat::k16_16UInt;
 	return Prospero::BufferFormat::kInvalid;
 }
 

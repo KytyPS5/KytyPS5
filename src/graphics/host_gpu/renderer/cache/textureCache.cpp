@@ -1922,6 +1922,24 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
+	// A T# candidate (see RenderExecutor::ResolveTexture) may be one the shader never selects, left
+	// in a table where the game now keeps other data in its metadata's memory: PS5 reads the keys
+	// only if the shader selects it, and never writes the keys of a texture it samples. Its clears
+	// go to the image alone, and not again while neither the keys nor the image changed.
+	uint64_t candidate_keys = 0;
+	if (desc.candidate) {
+		candidate_keys = viewed.address ^ (uint64_t {count} << 48u);
+		for (uint32_t slice = 0; slice < count; slice++) {
+			uint8_t code = 0;
+			(void)LibKernel::Memory::TryReadBacking(run(slice), &code, sizeof(code));
+			candidate_keys = (candidate_keys ^ code) * 0x100000001b3ull;
+		}
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.candidate_clear_key == ((candidate_keys ^ image.write_count) * 0x9e3779b97f4a7c15ull | 1u)) {
+			return;
+		}
+	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
 		uint8_t code = 0;
@@ -1954,11 +1972,16 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
-		if (desc.type != BindingType::VideoOut) {
+		if (desc.type != BindingType::VideoOut && !desc.candidate) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, bytes.size());
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
+	}
+	if (desc.candidate) {
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		image.candidate_clear_key = (candidate_keys ^ image.write_count) * 0x9e3779b97f4a7c15ull | 1u;
 	}
 }
 

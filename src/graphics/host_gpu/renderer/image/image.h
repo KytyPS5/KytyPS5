@@ -249,6 +249,9 @@ public:
 	ImageId          depth_id {};
 	// Counts the transitions to a write access: every GPU or host write of the image takes one.
 	uint64_t         write_count        = 0;
+	// The keys of the metadata slices a lookup of a T# candidate applied the fast clears of, and
+	// write_count after them, hashed (TextureCache::MaterializeColorClear); 0 for none.
+	uint64_t         candidate_clear_key = 0;
 	// A depth copy (see TextureCache::FindDepthCopy()): the color image it copies, and the
 	// write_count of that image the copy holds. depth_copy_source is reset when the color image
 	// is deleted.

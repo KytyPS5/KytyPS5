@@ -94,7 +94,7 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                        Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");

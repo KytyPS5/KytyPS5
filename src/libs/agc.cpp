@@ -3968,11 +3968,9 @@ uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
 	return AgcDcbPopMarker(buf);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
-                                      int32_t display_buffer_index, uint32_t flip_mode,
-                                      int64_t flip_arg) {
-	PRINT_NAME();
-
+// Graphics and compute queues differ only in R and in the release event.
+static uint32_t* set_flip(CommandBuffer* buf, bool compute, uint32_t video_out_handle,
+                          int32_t display_buffer_index, uint32_t flip_mode, int64_t flip_arg) {
 	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
 	         "\t display_buffer_index = %" PRId32 "\n"
 	         "\t flip_mode            = %" PRIu32 "\n"
@@ -3993,24 +3991,25 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 	}
 
 	const auto label = (shown ? reinterpret_cast<uint64_t>(labels + display_buffer_index) : 0u);
+	const auto user_data_r = (compute ? 0u : 1u);
 	// The tag holds the flip mode and buffer index; bit 16 and bits 0..2 are always set.
-	cmd[0] = KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[0] = KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, user_data_r);
 	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = Pm4::USERDATA_TAG_FLIP | 0x10000u | ((flip_mode & 0xfu) << 8u) |
 	         ((static_cast<uint32_t>(display_buffer_index) & 0x1fu) << 3u) | 0x7u;
 	cmd[3] = static_cast<uint32_t>(bus);
 	// WRITE_DATA puts both flip-argument dwords into SQ_THREAD_TRACE_USERDATA_3, without
 	// incrementing the address.
-	cmd[4] = KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u);
+	cmd[4] = KYTY_PM4(6, Pm4::IT_WRITE_DATA, user_data_r);
 	cmd[5] = 0x06010000u;
 	cmd[6] = 0xc343u;
 	cmd[7] = 0;
 	cmd[8] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg));
 	cmd[9] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg) >> 32u);
-	// An end-of-pipe CB/DB and GL2 writeback writes 1 to a shown buffer's label, then interrupts
-	// with the port as context id.
+	// An end-of-pipe CB/DB (end-of-shader CS_DONE on compute) and GL2 writeback writes 1 to a
+	// shown buffer's label, then interrupts with the port as context id.
 	cmd[10] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u);
-	cmd[11] = 0x06200504u;
+	cmd[11] = (compute ? 0x0620062fu : 0x06200504u);
 	cmd[12] = (shown ? 0x42010000u : 0x02010000u);
 	cmd[13] = static_cast<uint32_t>(label) & ~0x3u;
 	cmd[14] = static_cast<uint32_t>(label >> 32u);
@@ -4020,6 +4019,22 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 	cmd[18] = KYTY_PM4(Pm4::FLIP_PACKET_DW - 18u, Pm4::IT_NOP, 0u);
 
 	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+                                      int32_t display_buffer_index, uint32_t flip_mode,
+                                      int64_t flip_arg) {
+	PRINT_NAME();
+
+	return set_flip(buf, false, video_out_handle, display_buffer_index, flip_mode, flip_arg);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+                                      int32_t display_buffer_index, uint32_t flip_mode,
+                                      int64_t flip_arg) {
+	PRINT_NAME();
+
+	return set_flip(buf, true, video_out_handle, display_buffer_index, flip_mode, flip_arg);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,

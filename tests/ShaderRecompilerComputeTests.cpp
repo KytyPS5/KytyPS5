@@ -55996,6 +55996,41 @@ void CheckPm4Flip() {
               flipped_arg == flip_arg,
           "the flip block did not publish the occlusion counters or flip");
 
+  // A compute queue's flip clears R and releases at the end of the shader.
+  constexpr int64_t compute_arg = flip_arg + 1;
+  std::array<uint32_t, 64> acb{};
+  CommandBufferLayout acb_layout{acb.data(), acb.data() + acb.size(),
+                                 acb.data(), acb.data() + acb.size(),
+                                 nullptr,    nullptr,
+                                 0};
+  auto compute_flip = flip;
+  compute_flip[0] = 0xc0027900u;
+  compute_flip[4] = 0xc0043700u;
+  compute_flip[8] = static_cast<uint32_t>(compute_arg);
+  compute_flip[11] = 0x0620062fu;
+  const bool compute_emitted =
+      Gen5::AgcAcbSetFlip(reinterpret_cast<Gen5::CommandBuffer *>(&acb_layout),
+                          handle, -1, 1, compute_arg) == acb.data() &&
+      std::equal(compute_flip.begin(), compute_flip.end(), acb.begin());
+  bool compute_complete = false;
+  gpu.SendCommandSync([&] {
+    CommandProcessor processor(renderer, 0x20);
+    processor.BufferInit();
+    Pm4Execution execution;
+    compute_complete =
+        processor.Process(execution, acb) == Pm4ProcessResult::Complete;
+    processor.BufferFlush();
+  });
+  timeout = 2'000'000;
+  Require(name, "compute flip",
+          compute_emitted && compute_complete &&
+              EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                           &timeout) == 0 &&
+              count == 1 &&
+              VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
+              flipped_arg == compute_arg,
+          "the compute flip packet is not the native one or did not flip");
+
   // Vblanks while the event is undelivered count in that one event.
   Require(name, "vblank event",
           VideoOut::VideoOutAddVblankEvent(flips, handle, nullptr) == 0,

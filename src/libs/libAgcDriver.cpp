@@ -164,6 +164,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("ziVA3whp3p4", Gen5::AgcRewindPatchSetRewindState);
 	LIB_FUNC("eWaWyFegzgQ", Gen5::AgcRewindPatchSetRewindState);      // sceAgcAsyncRewindPatchSetRewindState
 	LIB_FUNC("YUeqkyT7mEQ", Gen5::AgcDcbSetFlip);
+	LIB_FUNC("ebixW91gpPw", Gen5::AgcAcbSetFlip);
 }
 
 } // namespace LibGen5

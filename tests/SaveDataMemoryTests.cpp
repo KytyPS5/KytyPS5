@@ -34,7 +34,7 @@ double GetTimeMs() {
 } // namespace Loader
 
 namespace Libs::LibKernel::FileSystem {
-void Mount(const std::filesystem::path& directory, const std::string& point) {
+void Mount(const std::filesystem::path& directory, const std::string& point, bool) {
 	g_mounted_directory = directory;
 	g_test_mounts[point] = directory;
 }

@@ -5000,6 +5000,15 @@ private:
 
 	// Bounds of an F32 value on the lanes where guard holds; NaN when unknown.
 	std::pair<float, float> FloatRange(Value value, Value guard, uint32_t depth = 0) const {
+		auto [low, high] = IeeeFloatRange(value, guard, depth);
+		// A device may read a denormal as zero.
+		constexpr auto normal = std::numeric_limits<float>::min();
+		if (low > 0.0f && low < normal) low = 0.0f;
+		if (high < 0.0f && high > -normal) high = 0.0f;
+		return {low, high};
+	}
+
+	std::pair<float, float> IeeeFloatRange(Value value, Value guard, uint32_t depth) const {
 		constexpr std::pair unknown {NAN, NAN};
 		value = ActiveValue(value, guard);
 		if (value.IsImmediate() && value.GetType() == Type::F32)
@@ -5011,13 +5020,74 @@ private:
 			return FloatRange(inst->Arg(arg), guard, depth + 1u);
 		};
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::BitCastF32U32: return BitsRange(inst->Arg(0), guard, depth + 1u);
 			case ValueOpcode::BitCastU32F32: return range(0);
+			case ValueOpcode::ConvertF32S32: {
+				uint32_t integer;
+				if (!ImmediateU32(inst->Arg(0), integer)) return unknown;
+				const auto converted = static_cast<float>(std::bit_cast<int32_t>(integer));
+				return {converted, converted};
+			}
 			// Clamping maps NaN to zero.
 			case ValueOpcode::FPSaturate32: return {0.0f, 1.0f};
 			case ValueOpcode::FPFloor32: {
 				const auto [low, high] = range(0);
 				return {std::floor(low), std::floor(high)};
+			}
+			case ValueOpcode::FPCeil32: {
+				const auto [low, high] = range(0);
+				return {std::ceil(low), std::ceil(high)};
+			}
+			case ValueOpcode::FPNeg32: {
+				const auto [low, high] = range(0);
+				return {-high, -low};
+			}
+			// The median lies between any two of its sources, whatever the third is: with a NaN
+			// source it is the minimum of the other two.
+			case ValueOpcode::FPMedTri32: {
+				float    low = INFINITY, high = -INFINITY;
+				uint32_t finite = 0;
+				for (uint32_t source = 0; source < 3u; ++source) {
+					const auto [first, second] = range(source);
+					if (!std::isfinite(first) || !std::isfinite(second)) continue;
+					low  = std::min(low, first);
+					high = std::max(high, second);
+					++finite;
+				}
+				return finite >= 2u ? std::pair {low, high} : unknown;
+			}
+			// Rounding is monotonic: the bounds of a sum, a difference, a product, a minimum and
+			// a maximum of finite values lie at the bounds of the operands.
+			case ValueOpcode::FPAdd32:
+			case ValueOpcode::FPSub32:
+			case ValueOpcode::FPMul32:
+			case ValueOpcode::FPMin32:
+			case ValueOpcode::FPMax32: {
+				const auto a = range(0), b = range(1);
+				if (!std::isfinite(a.first) || !std::isfinite(a.second) ||
+				    !std::isfinite(b.first) || !std::isfinite(b.second))
+					return unknown;
+				std::pair<float, float> bounds;
+				switch (inst->GetOpcode()) {
+					case ValueOpcode::FPAdd32:
+						bounds = {a.first + b.first, a.second + b.second};
+						break;
+					case ValueOpcode::FPSub32:
+						bounds = {a.first - b.second, a.second - b.first};
+						break;
+					case ValueOpcode::FPMin32:
+						bounds = {std::min(a.first, b.first), std::min(a.second, b.second)};
+						break;
+					case ValueOpcode::FPMax32:
+						bounds = {std::max(a.first, b.first), std::max(a.second, b.second)};
+						break;
+					default:
+						bounds = std::minmax({a.first * b.first, a.first * b.second,
+						                      a.second * b.first, a.second * b.second});
+						break;
+				}
+				if (!std::isfinite(bounds.first) || !std::isfinite(bounds.second)) return unknown;
+				return bounds;
 			}
 			case ValueOpcode::FPMad32: {
 				// The rounded multiply and add are monotonic, so the bounds lie at the corners.
@@ -5032,6 +5102,55 @@ private:
 			}
 			default: return unknown;
 		}
+	}
+
+	// Bounds of the F32 whose bits a U32 value holds: the union over the arms of its selects and
+	// phis. The guard chooses a select's arm until a phi of a loop is crossed: its arms may
+	// belong to another iteration, which the guard says nothing about.
+	std::pair<float, float> BitsRange(Value value, Value guard, uint32_t depth) const {
+		constexpr std::pair                            unknown {NAN, NAN};
+		std::vector<std::pair<Value, bool>>            pending {{value, true}};
+		std::array<std::unordered_set<const Inst*>, 2> merged;
+		float                                          low = INFINITY, high = -INFINITY;
+		const auto                                     widen = [&](std::pair<float, float> range) {
+			low  = std::min(low, range.first);
+			high = std::max(high, range.second);
+			return std::isfinite(range.first) && std::isfinite(range.second);
+		};
+		while (!pending.empty()) {
+			const auto [current, guarded] = pending.back();
+			pending.pop_back();
+			const auto active = guarded ? guard : Value {};
+			uint32_t   bits;
+			if (ImmediateU32(current, bits)) {
+				if (!widen({std::bit_cast<float>(bits), std::bit_cast<float>(bits)}))
+					return unknown;
+				continue;
+			}
+			const auto* inst = current.Resolve().TryInstruction();
+			if (inst == nullptr) return unknown;
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::BitCastU32F32) {
+				if (!widen(FloatRange(inst->Arg(0), active, depth + 1u))) return unknown;
+				continue;
+			}
+			if (op != ValueOpcode::Phi && op != ValueOpcode::SelectU32) return unknown;
+			// Without the guard a value is merged once; with it, once unless already merged
+			// without.
+			if (merged[0].contains(inst) || !merged[guarded ? 1u : 0u].insert(inst).second)
+				continue;
+			if (op == ValueOpcode::Phi) {
+				const bool same_iteration = guarded && !InCycle(inst->Parent());
+				for (size_t arm = 0; arm < inst->NumArgs(); ++arm)
+					pending.emplace_back(inst->Arg(arm), same_iteration);
+			} else if (guarded && Implies(guard, inst->Arg(0))) {
+				pending.emplace_back(inst->Arg(1), true);
+			} else {
+				pending.emplace_back(inst->Arg(1), guarded);
+				pending.emplace_back(inst->Arg(2), guarded);
+			}
+		}
+		return low <= high ? std::pair {low, high} : unknown;
 	}
 
 	// consumer, when given, is the block of the instruction that consumes value itself.
@@ -5093,6 +5212,12 @@ private:
 				// The conversion truncates toward zero.
 				const auto [low, high] = FloatRange(inst->Arg(0), guard);
 				if (low >= 0.0f && high < 0x1p31f) return static_cast<uint32_t>(high);
+				break;
+			}
+			case ValueOpcode::ConvertU32F32: {
+				// It truncates toward zero too, and takes a negative value or NaN to zero.
+				const auto high = FloatRange(inst->Arg(0), guard).second;
+				if (high < 0x1p32f) return high <= 0.0f ? 0u : static_cast<uint32_t>(high);
 				break;
 			}
 			case ValueOpcode::SelectU32: {

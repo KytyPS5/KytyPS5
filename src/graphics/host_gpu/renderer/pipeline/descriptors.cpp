@@ -1785,16 +1785,20 @@ void RenderExecutor::RebindReusedTables(PreparedBindings& prepared) {
 	EXIT_IF(state.checked.size() != element_count);
 	// The versions of the elements (GTA V's states have ~17 000) are compared by the helpers too.
 	m_table_checks.clear();
-	m_table_element_flags.assign(element_count, 0);
+	// (Whole words, for the scan below.)
+	m_table_element_flags.assign((size_t {element_count} + 7) & ~size_t {7}, 0);
 	GetExecHelpers().ParallelFor(element_count, 2048, [&](uint32_t begin, uint32_t end) {
 		for (uint32_t index = begin; index < end; index++) {
 			m_table_element_flags[index] =
 			    state.marks[index] != state.mark_stamp && !still_unchanged(state.checked[index]) ? 1 : 0;
 		}
 	});
-	for (uint32_t index = 0; index < element_count; index++) {
-		if (m_table_element_flags[index] != 0) {
-			m_table_checks.push_back(index);
+	// Eight flags at a time: almost all are zero.
+	for (uint32_t first = 0; first < element_count; first += 8) {
+		uint64_t word = 0;
+		std::memcpy(&word, m_table_element_flags.data() + first, sizeof(word));
+		for (; word != 0; word &= word - 1) {
+			m_table_checks.push_back(first + static_cast<uint32_t>(std::countr_zero(word)) / 8u);
 		}
 	}
 	// The others are checked by reading them and their images (scattered in memory): after a

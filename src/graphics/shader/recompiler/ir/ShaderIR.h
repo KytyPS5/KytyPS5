@@ -721,9 +721,22 @@ struct DescriptorSource {
 
 			bool operator==(const PointerTable& other) const = default;
 		};
+		// A record array that image heap keys are words of, read at a bounded record index.
+		struct Demand {
+			uint32_t source  = UINT32_MAX; // The array's address.
+			uint32_t stride  = 0;
+			uint32_t offset  = 0;
+			uint32_t maximum = 0; // Of the record index.
+			Value    limit;       // A host-evaluable value the index is clamped to as well.
+
+			bool operator==(const Demand& other) const = default;
+		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
 		std::optional<PointerTable> pointer_table;
+		// The arrays of every lookup of an image heap: a draw selects only the descriptors their
+		// words name. None where a lookup has no such array.
+		std::optional<std::vector<Demand>> demands;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;

@@ -1098,12 +1098,32 @@ private:
 					current.indirect_descriptor->table_record_bytes = std::max(
 					    current.indirect_descriptor->table_record_bytes,
 					    descriptor.indirect_descriptor->table_record_bytes);
+					// A heap names its records only where every lookup of it does.
+					auto&       demands = current.indirect_descriptor->demands;
+					const auto& added   = descriptor.indirect_descriptor->demands;
+					if (!added) demands.reset();
+					for (size_t entry = 0; demands && entry < added->size(); ++entry)
+						AddDemand(*demands, (*added)[entry]);
 				}
 				return candidate;
 			}
 		}
 		m_sources.push_back(descriptor);
 		return static_cast<uint32_t>(m_sources.size() - 1);
+	}
+
+	// Lookups of one record array at one offset share an entry where the same value clamps them.
+	void AddDemand(std::vector<DescriptorSource::IndirectDescriptor::Demand>& demands,
+	               const DescriptorSource::IndirectDescriptor::Demand&        added) const {
+		for (auto& demand: demands) {
+			if (demand.source != added.source || demand.stride != added.stride ||
+			    demand.offset != added.offset || demand.limit.IsEmpty() != added.limit.IsEmpty() ||
+			    (!added.limit.IsEmpty() && !EquivalentValue(m_program, demand.limit, added.limit)))
+				continue;
+			demand.maximum = std::max(demand.maximum, added.maximum);
+			return;
+		}
+		demands.push_back(added);
 	}
 
 	static bool ImmediateU32(Value value, uint32_t& result) {
@@ -4466,6 +4486,49 @@ private:
 		return UINT32_MAX;
 	}
 
+	// The record array a heap key is a word of, where the record index is bounded on the lanes
+	// of every access of the lookup.
+	std::optional<DescriptorSource::IndirectDescriptor::Demand> RecordDemand(Value       key,
+	                                                                         const Inst& handle) {
+		const auto* read         = key.Resolve().TryInstruction();
+		uint32_t    memory_index = 0;
+		const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+		Value       index;
+		uint32_t    offset = 0, stride = 0;
+		if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress ||
+		    !MemoryIndexBelongsTo(memory_index, *read) ||
+		    !MatchTableOffset(read->Arg(1), index, offset, stride))
+			return {};
+		auto maximum = SelectorMaximum(index);
+		if (maximum == UINT32_MAX) {
+			maximum = 0u;
+			for (const auto& use: handle.Uses()) {
+				const auto active = AccessPredicate(use, false);
+				if (active.IsEmpty()) return {};
+				maximum = std::max(maximum, SelectorMaximum(index, {}, 0, active, read->Parent()));
+			}
+		}
+		// The shader forms the offset in U32 arithmetic; SMEM adds its immediate to it.
+		DescriptorSource records;
+		if (maximum >= MaxIndirectDescriptorProbes ||
+		    ((offset | stride | memory->offset) & 3u) != 0u ||
+		    uint64_t {offset} + uint64_t {maximum} * stride + memory->offset + 4u >
+		        uint64_t {UINT32_MAX} + 1u ||
+		    !MakeRuntimeTableSource(*read, records))
+			return {};
+		DescriptorSource::IndirectDescriptor::Demand demand {.source  = InternSource(records),
+		                                                     .stride  = stride,
+		                                                     .offset  = offset + memory->offset,
+		                                                     .maximum = maximum};
+		if (const auto* clamp = index.Resolve().TryInstruction();
+		    clamp != nullptr && clamp->GetOpcode() == ValueOpcode::UMin32) {
+			for (uint32_t arg = 0; arg < 2u && demand.limit.IsEmpty(); ++arg)
+				if (ValidateRuntimeValue(m_program, clamp->Arg(arg), RuntimeValueType::Integer))
+					demand.limit = clamp->Arg(arg);
+		}
+		return demand;
+	}
+
 	bool TryMakeTableDescriptor(Inst& handle, const DescriptorSource& descriptor,
 	                            IndirectDescriptorPlan& plan) {
 		const bool sampler = handle.GetOpcode() == ValueOpcode::GetSamplerResource;
@@ -4641,6 +4704,8 @@ private:
 					indirect.table_record_bytes = table_immediate + plan.read_dwords * 4u;
 				} else {
 					indirect.table_scalar = true;
+					if (const auto demand = RecordDemand(key, handle))
+						indirect.demands.emplace(1u, *demand);
 				}
 			}
 			plan.retain_reads = true;

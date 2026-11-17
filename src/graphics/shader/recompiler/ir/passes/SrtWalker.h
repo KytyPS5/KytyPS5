@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -20,6 +21,8 @@ struct ImageHeapRequest {
 	uint64_t             first = 0;
 	uint64_t             count = 0;
 	const ImageResource* root  = nullptr;
+	// Byte offsets of the only descriptors the draw can select; null where it can select any.
+	const std::vector<uint32_t>* demand = nullptr;
 };
 
 struct ImageHeapView {

@@ -290,6 +290,23 @@ bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offse
 	           uint64_t {UINT32_MAX} + 1u;
 }
 
+// A buffer the program writes can hold bytes of [begin, end), so the host cannot read them
+// for the draw.
+bool WritesRange(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint64_t begin,
+                 uint64_t end) {
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& buffer = program.info.buffers[i];
+		if (!buffer.written) continue;
+		ShaderBufferResource written;
+		if (program.descriptor_sources[buffer.source].indirect_descriptor ||
+		    !DecodeBufferDescriptor(snapshot.buffers[i], written) ||
+		    (written.Base48() != 0u && written.GetSize() != 0u &&
+		     begin < written.Base48() + written.GetSize() && written.Base48() < end))
+			return true;
+	}
+	return false;
+}
+
 bool EvaluateIndirectCount(const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
                            const SrtRuntime& runtime, uint32_t& count) {
 	if (indirect.workgroup_axis != UINT32_MAX) {
@@ -566,6 +583,57 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 	return true;
 }
 
+// The table offsets a draw's records name, as the shader forms its heap key from each; false
+// where the host cannot read the records the shader will.
+bool ResolveDemand(const ResourcePlan&                         program,
+                   const DescriptorSource::IndirectDescriptor& indirect, const SrtRuntime& runtime,
+                   const ResourceSnapshot& snapshot, std::vector<uint32_t>& offsets) {
+	// The shader forms the offset in U32 arithmetic; one that wraps selects no descriptor.
+	const auto place = [&](uint32_t key, size_t at) {
+		const auto dynamic = (indirect.table_offset + indirect.table_stride * key) & ~3u;
+		offsets[at]        = dynamic + (indirect.table_immediate & ~3u);
+		return offsets[at] >= dynamic ? 1u : 0u;
+	};
+	// A record also reads as zero while its page is not resident on the device.
+	offsets.assign(1u, 0u);
+	size_t count = place(0u, 0u);
+	for (const auto& demand: *indirect.demands) {
+		DescriptorValue address;
+		auto            last  = demand.maximum;
+		uint32_t        limit = 0;
+		if (!WalkedDescriptor(program, demand.source, address) || address.dword_count != 2u ||
+		    (!demand.limit.IsEmpty() && !WalkedValue(program, demand.limit, limit)))
+			return false;
+		if (!demand.limit.IsEmpty()) last = std::min(last, limit);
+		const auto base = ((uint64_t {address.dwords[1]} << 32u) | address.dwords[0]) &
+		                  AddressMask & ~uint64_t {3};
+		if (WritesRange(program, snapshot, base + demand.offset,
+		                base + demand.offset + uint64_t {last} * demand.stride + 4u))
+			return false;
+		// The records are read behind the offsets found so far, which then take their place.
+		const auto words = demand.stride / 4u;
+		const auto first = count;
+		offsets.resize(first + size_t {last} * words + 1u);
+		const auto records = std::span(offsets).subspan(first);
+		if (!ReadScalarTable(base, UINT64_MAX, demand.offset, runtime, records)) {
+			// Record by record: one the shader cannot read is zero to it.
+			for (uint32_t record = 0; record <= last; ++record) {
+				auto& word = records[size_t {record} * words];
+				if (!ReadScalarTable(base, UINT64_MAX,
+				                     demand.offset + uint64_t {record} * demand.stride, runtime,
+				                     {&word, 1u}))
+					word = 0u;
+			}
+		}
+		for (uint32_t record = 0; record <= last; ++record)
+			count += place(offsets[first + size_t {record} * words], count);
+	}
+	offsets.resize(count);
+	std::ranges::sort(offsets);
+	offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+	return true;
+}
+
 // A root's mapping starts at `offset` in the flattened SRT.
 void SetIndirectMapping(ResourceSnapshot& snapshot, uint32_t slot, size_t offset) {
 	EXIT_IF(slot >= snapshot.indirect_mapping_offsets.size());
@@ -666,20 +734,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_
 			if (use_selector && material.Format() != Prospero::BufferFormat::kInvalid &&
 			    material.NumRecords() != 0u && selector->offset < material.Stride()) {
 				const auto begin = material.Base48() + selector->offset;
-				const auto end = begin + uint64_t {material.NumRecords() - 1u} * material.Stride() + 4u;
-				for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-					const auto& buffer = program.info.buffers[i];
-					if (!buffer.written) continue;
-					ShaderBufferResource written;
-					if (program.descriptor_sources[buffer.source].indirect_descriptor ||
-					    !DecodeBufferDescriptor(snapshot.buffers[i], written) ||
-					    (written.Base48() != 0u && written.GetSize() != 0u &&
-					     begin < written.Base48() + written.GetSize() &&
-					     written.Base48() < end)) {
-						use_selector = false;
-						break;
-					}
-				}
+				use_selector     = !WritesRange(
+				    program, snapshot, begin,
+				    begin + uint64_t {material.NumRecords() - 1u} * material.Stride() + 4u);
 			}
 		}
 		if (byte_keys && !use_selector) {
@@ -727,11 +784,18 @@ bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_
 				const auto& image = program.info.images[resource_index];
 				// A resident heap maps slot words instead of materializing its entries.
 				ImageHeapView view;
-				if (image_heap && runtime.image_heap != nullptr &&
-				    image.resource_class == ImageResourceClass::Sampled &&
-				    image.mip_mode != ImageMipMode::Dynamic &&
-				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
-				                                view)) {
+				const bool    resident = image_heap && runtime.image_heap != nullptr &&
+				                         image.resource_class == ImageResourceClass::Sampled &&
+				                         image.mip_mode != ImageMipMode::Dynamic;
+				auto&         demanded = program.material_keys;
+				const auto*   demand =
+				    resident && indirect.demands &&
+				            ResolveDemand(program, indirect, runtime, snapshot, demanded)
+				        ? &demanded
+				        : nullptr;
+				if (resident &&
+				    runtime.image_heap->Acquire(
+				        {table_base, table_size, step, first, count, &image, demand}, view)) {
 					snapshot.specialization_reads.emplace_back(table_base, table_size);
 					if (view.kinds.empty()) return true;
 					auto root = root_resource;
@@ -1687,6 +1751,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			    Clone(target.indirect_descriptor->selector_mask);
 			for (auto& addend: target.indirect_descriptor->selector_addends)
 				addend = Clone(addend);
+			if (auto& demands = target.indirect_descriptor->demands)
+				for (auto& demand: *demands)
+					demand.limit = Clone(demand.limit);
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);

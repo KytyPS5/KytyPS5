@@ -191,8 +191,10 @@ struct FakeImageHeap final : ImageHeapSource {
   bool accept = true;
   std::vector<DescriptorValue> kinds;
   std::vector<ImageHeapRequest> requests;
+  std::vector<std::optional<std::vector<uint32_t>>> demands; // Of each request.
   bool Acquire(const ImageHeapRequest &request, ImageHeapView &view) override {
     requests.push_back(request);
+    demands.emplace_back(request.demand != nullptr ? std::optional(*request.demand) : std::nullopt);
     if (!accept) return false;
     view = {.slots = 0x123456789abcull, .slot_count = 36u, .kinds = kinds};
     return true;
@@ -208,6 +210,7 @@ struct LinearTestMemory {
   size_t watched_dwords = 0;
   uint32_t reads = 0;
   uint32_t descriptor_reads = 0;
+  bool scribble = false; // A failed read leaves garbage behind.
 };
 
 bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
@@ -216,6 +219,7 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
       values.size_bytes() > memory->words.size() * sizeof(uint32_t) ||
       address - memory->base > memory->words.size() * sizeof(uint32_t) - values.size_bytes() ||
       (memory->fail_address >= address && memory->fail_address - address < values.size_bytes())) {
+    if (memory != nullptr && memory->scribble) std::ranges::fill(values, 0xdeadbeefu);
     return false;
   }
   std::memcpy(values.data(), reinterpret_cast<const uint8_t *>(memory->words.data()) +
@@ -538,6 +542,312 @@ void TestResidentImageHeap() {
             snapshot.candidate_images.size() == 1u &&
             snapshot.candidate_images[0].value.dwords == descriptor,
         "a declined heap was not materialized entry by entry");
+}
+
+// An image heap whose key is a word of the 16-byte record an index selects. The records' address
+// is user data 0 and 1, the table's buffer user data 4 to 7, the count of the clamped lookups user
+// data 8 and the buffer the program writes user data 12 to 15.
+enum class RecordIndex {
+  Field, Clamped, FloatConstants, FloatArithmetic, Denormal, Guarded, GuardedMerge, GuardedLoop,
+  Unbounded, Unaligned, Wrapping, LooseMedian,
+  // Several lookups of the one table.
+  Shared, SharedClamped, SharedUnbounded, UnboundedShared
+};
+
+std::unique_ptr<Fixture> MakeRecordHeapFixture(RecordIndex kind, bool writes = false) {
+  auto fixture = std::make_unique<Fixture>();
+  auto &f = *fixture;
+  auto *entry = f.block;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4u; ++dword) heap_words[dword] = f.UserData(dword + 4u);
+  const auto heap = f.Buffer(heap_words, 0x10d8);
+  const auto records = f.Address(f.UserData(0u), f.UserData(1u), 0x10d8);
+  const auto lane = f.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto field = f.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)});
+  const auto varying = f.Emit(ValueOpcode::BitCastF32U32, {lane}); // Any float.
+  const auto number = [&](int32_t integer) {
+    return f.Emit(ValueOpcode::BitCastU32F32,
+                  {f.Emit(ValueOpcode::ConvertF32S32, {Value(static_cast<uint32_t>(integer))})});
+  };
+  const auto guard = f.Emit(ValueOpcode::INotEqual32, {field, Value(3u)});
+  // The number on the lanes of the guard, any bits on the others.
+  const auto guarded = [&](int32_t integer) {
+    return f.Emit(ValueOpcode::SelectU32, {guard, number(integer), lane});
+  };
+  const auto clamped = [&] {
+    return f.Emit(ValueOpcode::UMin32,
+                  {f.Emit(ValueOpcode::ISub32, {f.UserData(8u), Value(1u)}), field});
+  };
+  const auto masked = [&](uint32_t mask) {
+    return f.Emit(ValueOpcode::BitwiseAnd32, {field, Value(mask)});
+  };
+  // Samples the descriptor that word `addend + 4` of record `index` names.
+  uint32_t lookups = 0;
+  const auto lookup = [&](Value index, uint32_t addend = 8u, Value active = Value(true),
+                          uint32_t shift = 4u) {
+    const uint32_t pc = 0x10d8u + 0x100u * lookups++;
+    const auto record_offset = f.Emit(
+        ValueOpcode::IAdd32,
+        {f.Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(shift)}), Value(addend)});
+    MemoryInfo record;
+    record.kind = ResourceKind::ScalarAddress;
+    record.offset = 4u;
+    const auto key = f.Emit(ValueOpcode::LoadAddressU32,
+                            {records, record_offset, Value(0u), Value(true)},
+                            f.AddMemory(record, pc));
+    const auto heap_offset = f.Emit(ValueOpcode::IMul32, {key, Value(32u)});
+    std::array<Value, 8> image_words;
+    for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
+      MemoryInfo component;
+      component.kind = ResourceKind::ScalarBuffer;
+      component.offset = 32u + dword * sizeof(uint32_t);
+      image_words[dword] = f.Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                  f.AddMemory(component, pc));
+    }
+    const auto image = f.Image(image_words, pc + 0x18u);
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, pc + 0x18u);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto texel = f.Emit(ValueOpcode::ImageSampleRaw,
+                              {image, sampler, f.ImageAddress(), active},
+                              f.AddMemory(sample, pc + 0x18u));
+    f.Emit(ValueOpcode::ReferenceU32,
+           {f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)})});
+  };
+  // The index as float bits.
+  const auto converted = [&](Value layer) {
+    return f.Emit(ValueOpcode::ConvertU32F32, {f.Emit(ValueOpcode::BitCastF32U32, {layer})});
+  };
+  switch (kind) {
+    case RecordIndex::Field: lookup(field); break;
+    case RecordIndex::Clamped: lookup(clamped()); break;
+    case RecordIndex::FloatConstants:
+      lookup(converted(f.Emit(
+          ValueOpcode::SelectU32,
+          {f.Emit(ValueOpcode::IEqual32, {field, Value(1u)}), number(6),
+           f.Emit(ValueOpcode::SelectU32,
+                  {f.Emit(ValueOpcode::IEqual32, {field, Value(2u)}), number(9),
+                   Value(std::bit_cast<uint32_t>(12.5f))})})));
+      break;
+    case RecordIndex::FloatArithmetic: {
+      const auto unit = f.Emit(ValueOpcode::FPSaturate32, {varying});
+      const auto scaled = f.Emit(ValueOpcode::FPMul32, {unit, Value::F32(4.0f)});
+      const auto ceiling = f.Emit(
+          ValueOpcode::FPCeil32, {f.Emit(ValueOpcode::FPMul32, {unit, Value::F32(2.5f)})});
+      const auto negated = f.Emit(
+          ValueOpcode::FPNeg32, {f.Emit(ValueOpcode::FPSub32, {unit, Value::F32(3.0f)})});
+      // [0, 3]: two of the median's sources bound it, whatever the third is.
+      const auto median = f.Emit(ValueOpcode::FPMedTri32, {varying, ceiling, negated});
+      const auto sum = f.Emit(
+          ValueOpcode::FPAdd32,
+          {scaled, f.Emit(ValueOpcode::FPMax32, {median, Value::F32(2.0f)})});
+      lookup(f.Emit(ValueOpcode::ConvertU32F32,
+                    {f.Emit(ValueOpcode::FPMin32, {sum, Value::F32(6.5f)})}));
+      break;
+    }
+    case RecordIndex::Denormal: {
+      // -1e-40 floors to -1, and to zero on a device that reads it as zero.
+      const auto floor = f.Emit(ValueOpcode::FPFloor32, {Value::F32(-1e-40f)});
+      lookup(f.Emit(ValueOpcode::ConvertU32F32,
+                    {f.Emit(ValueOpcode::FPMad32, {floor, Value::F32(8.0f), Value::F32(8.0f)})}));
+      break;
+    }
+    case RecordIndex::Guarded: lookup(converted(guarded(5)), 8u, guard); break;
+    case RecordIndex::GuardedMerge: {
+      auto *left = f.AddBlock();
+      auto *right = f.AddBlock();
+      auto *merge = f.AddBlock();
+      entry->AddBranch(left);
+      entry->AddBranch(right);
+      left->AddBranch(merge);
+      right->AddBranch(merge);
+      auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(left, guarded(5));
+      phi.AddPhiOperand(right, guarded(7));
+      f.block = merge;
+      lookup(converted(Value(&phi)), 8u, guard);
+      break;
+    }
+    case RecordIndex::GuardedLoop: {
+      // The select reaches the access through a loop: it may be another iteration's.
+      auto *header = f.AddBlock();
+      auto *latch = f.AddBlock();
+      auto *exit = f.AddBlock();
+      entry->AddBranch(header);
+      header->AddBranch(latch);
+      header->AddBranch(exit);
+      latch->AddBranch(header);
+      auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(entry, number(5));
+      phi.AddPhiOperand(latch, guarded(5));
+      f.block = exit;
+      lookup(converted(Value(&phi)), 8u, guard);
+      break;
+    }
+    case RecordIndex::Unbounded: lookup(lane); break;
+    // Records 2 bytes apart, and records whose last lies past the U32 of its offset.
+    case RecordIndex::Unaligned: lookup(field, 8u, Value(true), 1u); break;
+    case RecordIndex::Wrapping: lookup(field, 0xfffffc10u); break;
+    // One bounded source does not bound a median.
+    case RecordIndex::LooseMedian:
+      lookup(f.Emit(ValueOpcode::ConvertU32F32,
+                    {f.Emit(ValueOpcode::FPMedTri32,
+                            {varying, f.Emit(ValueOpcode::FPNeg32, {varying}), Value::F32(3.0f)})}));
+      break;
+    case RecordIndex::Shared:
+      lookup(masked(7u));
+      lookup(field);
+      lookup(masked(3u), 12u);
+      break;
+    case RecordIndex::SharedClamped:
+      lookup(clamped());
+      lookup(field);
+      break;
+    case RecordIndex::SharedUnbounded:
+      lookup(field);
+      lookup(lane);
+      break;
+    case RecordIndex::UnboundedShared:
+      lookup(lane);
+      lookup(field);
+      break;
+  }
+  if (writes) {
+    const auto output = f.Buffer({f.UserData(12u), f.UserData(13u), f.UserData(14u), f.UserData(15u)});
+    MemoryInfo output_memory;
+    output_memory.kind = ResourceKind::Buffer;
+    f.Emit(ValueOpcode::StoreBufferU32,
+           {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+           f.AddMemory(output_memory, 0x1b00u));
+  }
+  return fixture;
+}
+
+void TestRecordHeapDemand() {
+  // A lookup's record index bounds its records where every lane of every access is bounded.
+  const auto demands_of = [](RecordIndex kind) {
+    auto fixture = MakeRecordHeapFixture(kind);
+    fixture->PlanAndTrack();
+    const auto &program = fixture->program;
+    Check(program.info.images.size() == 1u, "the lookups of one table were not one image");
+    const auto &indirect =
+        program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+    Check(indirect && indirect->table_scalar && !indirect->selector && !indirect->table_maximum,
+          "a record-keyed image heap was not kept as a GPU-selected table");
+    return indirect->demands;
+  };
+  const auto maximum_of = [&](RecordIndex kind) {
+    const auto demands = demands_of(kind);
+    Check(demands && demands->size() == 1u && demands->front().stride == 16u &&
+              demands->front().offset == 12u,
+          "a bounded record index lost its record array");
+    return demands->front().maximum;
+  };
+  Check(maximum_of(RecordIndex::Field) == 63u &&
+            demands_of(RecordIndex::Field)->front().limit.IsEmpty(),
+        "a 6-bit record index was not bounded by its field");
+  Check(maximum_of(RecordIndex::Clamped) == 63u &&
+            !demands_of(RecordIndex::Clamped)->front().limit.IsEmpty(),
+        "a record index clamped to a count lost the count");
+  Check(maximum_of(RecordIndex::FloatConstants) == 12u,
+        "a float holding constants did not bound the index converted from it");
+  Check(maximum_of(RecordIndex::FloatArithmetic) == 6u,
+        "float arithmetic on bounded values did not bound the index");
+  Check(maximum_of(RecordIndex::Denormal) == 8u,
+        "a denormal a device may read as zero was taken at its value");
+  Check(maximum_of(RecordIndex::Guarded) == 5u,
+        "the lanes of the access did not choose the arm of a select");
+  Check(maximum_of(RecordIndex::GuardedMerge) == 7u,
+        "the lanes of the access did not choose arms across a merge");
+  Check(!demands_of(RecordIndex::GuardedLoop),
+        "the lanes of the access chose the arm of another loop iteration");
+  Check(!demands_of(RecordIndex::Unbounded), "an unbounded record index named its records");
+  Check(!demands_of(RecordIndex::Unaligned) && !demands_of(RecordIndex::Wrapping),
+        "records off the DWORD lattice, or past the U32 of their offset, were named");
+  Check(!demands_of(RecordIndex::LooseMedian), "one bounded source bounded a median");
+  // The lookups of one table are one image: it names the records of them all, or none.
+  const auto shared = demands_of(RecordIndex::Shared);
+  Check(shared && shared->size() == 2u && (*shared)[0].offset == 12u &&
+            (*shared)[0].maximum == 63u && (*shared)[1].offset == 16u &&
+            (*shared)[1].maximum == 3u,
+        "lookups of one table did not add up to the records of each");
+  const auto clamps = demands_of(RecordIndex::SharedClamped);
+  Check(clamps && clamps->size() == 2u && (*clamps)[0].limit.IsEmpty() != (*clamps)[1].limit.IsEmpty(),
+        "a clamped lookup and an unclamped one of the same records were taken as one");
+  Check(!demands_of(RecordIndex::SharedUnbounded) && !demands_of(RecordIndex::UnboundedShared),
+        "a table with an unbounded lookup named the records of another");
+
+  // A draw names the table offsets of its records, and of key zero.
+  constexpr uint64_t record_base = 0x2800u;
+  const auto materialize = [&](RecordIndex kind, uint32_t count, uint64_t fail_address,
+                               std::array<uint32_t, 4> written, bool writes) {
+    auto fixture = MakeRecordHeapFixture(kind, writes);
+    fixture->PlanAndTrack();
+    // The plan a restarted game loads from the shader cache.
+    ResourcePlan plan;
+    Check(LoadResourcePlan(SaveResourcePlan(ExtractResourcePlan(fixture->program)), plan),
+          "a plan with record demands did not load from its cache bytes");
+    std::array<uint32_t, 16> data{static_cast<uint32_t>(record_base), 0u, 0u, 0u,
+                                  0x2000u, 32u << 16u, 64u, 0u, count};
+    std::copy(written.begin(), written.end(), data.begin() + 12u);
+    LinearTestMemory memory;
+    memory.fail_address = fail_address;
+    memory.scribble = true;
+    const auto put = [&](uint32_t offset, uint32_t record, uint32_t key) {
+      memory.words[(record_base + offset + record * 16u - memory.base) / 4u] = key;
+    };
+    put(12u, 0u, 5u);
+    put(12u, 1u, 9u);
+    put(12u, 2u, 11u);
+    put(12u, 3u, 0x07ffffffu); // Its offset wraps past the U32 the shader forms it in.
+    put(12u, 4u, 13u);
+    put(16u, 0u, 20u);
+    put(16u, 1u, 21u);
+    put(16u, 3u, 22u);
+    put(16u, 4u, 23u); // Past the 2-bit index of the lookup that reads this word.
+    FakeImageHeap heap;
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory, .image_heap = &heap};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              heap.requests.size() == 1u && heap.requests[0].base == 0x2000u &&
+              heap.requests[0].size == 2048u && heap.requests[0].step == 32u &&
+              heap.requests[0].first == 32u && heap.requests[0].count == 63u,
+          "a record-keyed image heap was not requested as its lattice");
+    const bool captured = std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
+      return read.first == record_base + 12u && read.second != 0u;
+    });
+    return std::pair{heap.demands.at(0), captured};
+  };
+  using Offsets = std::vector<uint32_t>;
+  const std::array<uint32_t, 4> none{};
+  const auto field = materialize(RecordIndex::Field, 0u, UINT64_MAX, none, false);
+  Check(field.first == Offsets({32u, 192u, 320u, 384u, 448u}) && field.second,
+        "a draw did not name the offsets of its records, or did not capture their read");
+  Check(materialize(RecordIndex::Clamped, 3u, UINT64_MAX, none, false).first ==
+            Offsets({32u, 192u, 320u, 384u}),
+        "a draw named records past the count its index is clamped to");
+  Check(materialize(RecordIndex::Field, 0u, record_base + 12u + 2u * 16u, none, false).first ==
+            Offsets({32u, 192u, 320u, 448u}),
+        "a record the host cannot read did not read as zero");
+  Check(materialize(RecordIndex::Shared, 0u, UINT64_MAX, none, false).first ==
+            Offsets({32u, 192u, 320u, 384u, 448u, 672u, 704u, 736u}),
+        "a draw did not name the records of every lookup of its table");
+  Check(materialize(RecordIndex::Unbounded, 0u, UINT64_MAX, none, false).first == std::nullopt &&
+            materialize(RecordIndex::SharedUnbounded, 0u, UINT64_MAX, none, false).first ==
+                std::nullopt,
+        "a draw with an unbounded lookup named offsets");
+  // A program that writes its records cannot have them read before it runs.
+  Check(materialize(RecordIndex::Field, 0u, UINT64_MAX, {0x2c00u, 4u << 16u, 16u, 0u}, true).first ==
+            Offsets({32u, 192u, 320u, 384u, 448u}),
+        "a write next to the records dropped the demand");
+  Check(materialize(RecordIndex::Field, 0u, UINT64_MAX, {0x2bf0u, 4u << 16u, 16u, 0u}, true).first ==
+            std::nullopt,
+        "a draw read records its own program writes");
 }
 
 void TestImageHeapKinds() {
@@ -11532,6 +11842,7 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
+    Run("record heap demand", TestRecordHeapDemand);
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);

@@ -491,6 +491,12 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 			}
 		}
 		for (const auto source: indirect->sources) add(source);
+		if (indirect->demands) {
+			for (const auto& demand: *indirect->demands) {
+				add(demand.source);
+				AddOutput(demand.limit, root);
+			}
+		}
 		AddOutput(indirect->key_count, root);
 		AddOutput(indirect->selector_first, root);
 		AddOutput(indirect->selector_mask, root);

@@ -1,3 +1,9 @@
+vec3 LinearToSrgb(vec3 linear) {
+	linear = clamp(linear, 0.0, 1.0);
+	return mix(linear * 12.92, 1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
+	           greaterThan(linear, vec3(0.0031308)));
+}
+
 // Converts SMPTE ST 2084 PQ (or linear nits) Rec.2020 to sRGB-encoded Rec.709. The 250-nit SDR
 // white scales to 1.0, then an extended Reinhard curve rolls off luminance above 0.75 so that
 // 10,000 nits reaches 1.0.
@@ -22,7 +28,5 @@ vec3 Hdr10ToSdr(vec3 rgb, bool source_linear) {
 		float x = (luma - knee) / span;
 		linear *= (knee + span * x * (1.0 + x / (white * white)) / (1.0 + x)) / luma;
 	}
-	linear = clamp(linear, 0.0, 1.0);
-	return mix(linear * 12.92, 1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055,
-	           greaterThan(linear, vec3(0.0031308)));
+	return LinearToSrgb(linear);
 }

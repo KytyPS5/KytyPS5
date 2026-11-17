@@ -35,7 +35,7 @@ struct Presenter::Frame {
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
-	bool          hdr          = false;
+	uint32_t      source_flags = 0;
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
@@ -726,9 +726,7 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
 	// The main bus ignores alpha.
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
-	                       (frame.hdr ? 4u : 0u) |
-	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
-	                       (layer.bus == 0 ? 16u : 0u);
+	                       frame.source_flags | (layer.bus == 0 ? 16u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -758,7 +756,8 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	auto       vk_command      = command.Handle();
-	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
+	const bool convert_source =
+	    source != nullptr && VideoOutSourceNeedsDraw(source->source_flags, m_hdr_active);
 	const bool blit_source     = source != nullptr && !convert_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
@@ -935,8 +934,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
-                                          bool headset) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info,
+                                          uint64_t video_out_format, bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -946,8 +945,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	frame->hdr   = hdr;
-	frame->blank = false;
+	frame->source_flags = VideoOutSourceFlags(video_out_format);
+	frame->blank        = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -970,8 +969,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->hdr   = false;
-	frame->blank = true;
+	frame->source_flags = 0;
+	frame->blank        = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1050,7 +1049,7 @@ void Presenter::Impl::Present() {
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
 	const auto* main_frame = layers[0].frame;
 	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
-	                         swapchain.SetHdr(main_frame->hdr);
+	                         swapchain.SetHdr((main_frame->source_flags & 4u) != 0);
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);

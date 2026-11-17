@@ -984,7 +984,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	Graphics::ImageInfo source_info;
 	bool                current = false;
 	bool                premultiplied_alpha = false;
-	bool                hdr                 = false;
+	uint64_t            video_out_format    = 0;
 	bool                headset             = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
@@ -1000,7 +1000,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			}
 			const auto& group   = cfg->groups[surface.group_index];
 			source_info         = group.ImageInfo(surface);
-			hdr                 = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
+			video_out_format    = group.attribute.pixel_format;
 			premultiplied_alpha = (group.attribute.option &
 			                       VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
 		}
@@ -1020,7 +1020,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(m_width, m_height,
 		                                       index == VIDEO_OUT_BUFFER_INDEX_BLACK, &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, video_out_format, headset);
 		if (headset) {
 			g_headset_mirror = true;
 		}

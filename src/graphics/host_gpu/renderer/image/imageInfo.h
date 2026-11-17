@@ -308,6 +308,25 @@ inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT210
 	}
 }
 
+// Overlay shader source flags of a VideoOut buffer: PQ (4) and linear (8).
+[[nodiscard]] constexpr uint32_t VideoOutSourceFlags(uint64_t format) {
+	const uint32_t pq = IsHdrVideoOutPixelFormat(format) ? 4u : 0u;
+	switch (format) {
+		case 0x8100000622000000ull:
+		case 0x8100000600000000ull:
+		case 0xc001000622000000ull:
+		case 0xc001000600000000ull:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return pq | 8u;
+		default: return pq;
+	}
+}
+
+// Linear sources, and PQ sources on an SDR target, are drawn through the overlay shader.
+[[nodiscard]] constexpr bool VideoOutSourceNeedsDraw(uint32_t source_flags, bool hdr_target) {
+	return (source_flags & 8u) != 0 || ((source_flags & 4u) != 0 && !hdr_target);
+}
+
 inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},

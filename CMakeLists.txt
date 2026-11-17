@@ -672,7 +672,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
-target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
+target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.

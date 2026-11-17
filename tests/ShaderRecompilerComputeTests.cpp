@@ -2487,8 +2487,8 @@ public:
       return true;
     };
 
-    // Black, 100-nit and 250-nit gray, then a color; every source alpha is zero. Flags: PQ
-    // source (4), linear source (8), opaque main bus (16).
+    // Black, 100-nit and 250-nit gray, then a color; every source alpha is zero. Flags:
+    // premultiplied (1), HDR target (2), PQ source (4), linear source (8), opaque main bus (16).
     const auto pq = [](u32 r, u32 g, u32 b) { return r | (g << 10u) | (b << 20u); };
     auto pq_source = CreateImage2D(
         name, 4, 1, vk::Format::eA2B10G10R10UnormPack32, vk::ImageUsageFlagBits::eSampled,
@@ -2507,7 +2507,26 @@ public:
             pixelsMatch(render(nit_source, 4u | 8u | 16u),
                         {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
             "linear-nit pixels were not converted to opaque sRGB");
+    Require(name, "linear-nit HDR target",
+            pixelsMatch(render(nit_source, 2u | 4u | 8u | 16u),
+                        {0xff000000u, 0xff828282u, 0xff9a9a9au, 0xff6b7f8cu}),
+            "linear-nit pixels were not converted to opaque HDR10 PQ");
 
+    // Linear SDR with alpha 0x80.
+    auto sdr_source = CreateImage2D(
+        name, 4, 1, vk::Format::eR8G8B8A8Unorm, vk::ImageUsageFlagBits::eSampled,
+        {0x80000000u, 0x80808080u, 0x80ffffffu, 0x804080c0u}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "SDR linear source",
+            pixelsMatch(render(sdr_source, 8u | 16u),
+                        {0xff000000u, 0xffbcbcbcu, 0xffffffffu, 0xff89bce1u}),
+            "SDR linear pixels were not converted to opaque sRGB");
+    Require(name, "premultiplied SDR linear source",
+            pixelsMatch(render(sdr_source, 1u | 8u),
+                        {0x80000000u, 0x80808080u, 0x80808080u, 0x805e8080u}),
+            "premultiplied linear pixels were not converted to premultiplied sRGB");
+
+    DestroyImage(&sdr_source);
     DestroyImage(&nit_source);
     DestroyImage(&pq_source);
     DestroyImage(&target);

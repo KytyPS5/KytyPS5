@@ -568,13 +568,24 @@ void GuestReadLog::Append(uint64_t address, const void* data, uint32_t size, boo
 }
 
 bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict) {
-	if (size == 0 || size > UINT32_MAX ||
-	    !Libs::LibKernel::Memory::TryReadBacking(address, data, size)) {
+	if (size == 0 || size > UINT32_MAX) {
 		m_failed = true;
 		return false;
 	}
-	t_ahead_guest_writes.Apply(address, data, size);
+	// The pages of a large strict read are watched before it: its check compares the pages
+	// written since (see StrictWatch).
+	const auto watched = strict && size >= StrictWatch::MinSize
+	                         ? Libs::LibKernel::Memory::WatchStrictRead(address, size)
+	                         : 0;
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, data, size)) {
+		m_failed = true;
+		return false;
+	}
+	const bool ahead = t_ahead_guest_writes.Apply(address, data, size);
 	Append(address, data, static_cast<uint32_t>(size), strict);
+	if (watched != 0 && !ahead) {
+		m_entries.back().watched = watched;
+	}
 	return true;
 }
 
@@ -1036,7 +1047,8 @@ bool GuestReadLog::StillValid() const {
 		// As specialization memory is read on the execution thread: GPU-owned bytes fail. The
 		// bytes compare in place: large reads are the key arrays of bindless tables (GTA V's are
 		// 2 MB, read by four operations a frame), compared by the helpers too.
-		if (!Libs::LibKernel::Memory::GpuCleanBackingEquals(entry.address, recorded, entry.size, ParallelEqual)) {
+		if (!Libs::LibKernel::Memory::GpuCleanBackingEqualsSince(entry.address, recorded, entry.size, entry.watched,
+		                                                        ParallelEqual)) {
 			return false;
 		}
 	}

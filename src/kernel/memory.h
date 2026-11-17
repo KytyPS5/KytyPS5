@@ -161,6 +161,13 @@ void                   DropHotReadsBacking(uint64_t backing, uint64_t size);
 // `equal` when given, else memcmp).
 [[nodiscard]] bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
                                          bool (*equal)(const void*, const void*, uint64_t) = nullptr);
+// Before a large strict read of the range (Graphics::StrictWatch): watches its pages; returns the version of the
+// bytes read after the call, 0 when the range is not watched.
+[[nodiscard]] uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size);
+// GpuCleanBackingEquals() of the bytes of a read that WatchStrictRead() gave `version` (0: all compare): only the
+// pages written since compare.
+[[nodiscard]] bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version,
+                                              bool (*equal)(const void*, const void*, uint64_t) = nullptr);
 // GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
 bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
 // Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU

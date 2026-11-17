@@ -135,6 +135,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
 		m_texture_cache.FlushLazyReadback(fault_vaddr, fault_size);
@@ -260,6 +261,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
+	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
 }
 
@@ -271,6 +273,7 @@ bool RenderContext::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
+	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
 }
 
@@ -404,6 +407,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
+		m_strict_watch.UnmapMemory(vaddr, size);
 		m_occlusion_queries.OnUnmap(vaddr, size);
 		if (size != 0 && vaddr <= UINT64_MAX - size) {
 			m_guest_bvh_memory.erase(m_guest_bvh_memory.lower_bound(vaddr), m_guest_bvh_memory.lower_bound(vaddr + size));

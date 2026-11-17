@@ -870,6 +870,7 @@ void NoteEmulatorWrite(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources != nullptr) {
 		g_gpu_resources->GetBufferCache().NoteHostWrite(vaddr, size);
 		g_gpu_resources->GetTextureCache().NoteMetadataWrite(vaddr, size);
+		g_gpu_resources->GetStrictWatch().InvalidateMemory(vaddr, size);
 	}
 	Graphics::Scout::NoteHostWriteIfOn(vaddr, size);
 }
@@ -934,6 +935,33 @@ bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
 	bytes.resize(size);
 	return TryReadBacking(vaddr, bytes.data(), size) &&
 	       std::memcmp(bytes.data(), expected, size) == 0;
+}
+
+uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)
+	           ? GetGpuResources().GetStrictWatch().Watch(vaddr, size)
+	           : 0;
+}
+
+bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version,
+                                bool (*equal)(const void*, const void*, uint64_t)) {
+	const auto* backing = static_cast<const uint8_t*>(FindBackingPointer(vaddr, size));
+	if (version == 0 || backing == nullptr || g_gpu_resources == nullptr) {
+		return GpuCleanBackingEquals(vaddr, expected, size, equal);
+	}
+	if (!IsGpuCleanBacking(vaddr, size)) {
+		return false;
+	}
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
+	GetGpuResources().GetStrictWatch().Changed(vaddr, size, version, runs);
+	const auto* recorded = static_cast<const uint8_t*>(expected);
+	for (const auto& [offset, bytes]: runs) {
+		if (equal != nullptr ? !equal(backing + offset, recorded + offset, bytes)
+		                     : std::memcmp(backing + offset, recorded + offset, bytes) != 0) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {

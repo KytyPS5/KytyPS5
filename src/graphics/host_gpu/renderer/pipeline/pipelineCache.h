@@ -122,6 +122,9 @@ private:
 		bool     strict  = false;
 		// One dword whose value is only a bound tested for zero (see ZeroTestSlot).
 		bool     zero_test = false;
+		// A large strict read whose pages were watched: the version of its bytes
+		// (LibKernel::Memory::WatchStrictRead()), 0 when they compare whole.
+		uint64_t watched = 0;
 		// The descriptor words with refreshable bits among its dwords: m_words[words_begin, words_end).
 		uint32_t words_begin = 0;
 		uint32_t words_end   = 0;

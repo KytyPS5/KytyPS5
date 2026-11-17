@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/strictWatch.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "kernel/eventQueue.h"
 
@@ -59,6 +60,7 @@ public:
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
 	ImageHeap&          GetImageHeap() { return m_image_heap; }
+	StrictWatch&        GetStrictWatch() { return m_strict_watch; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
@@ -208,6 +210,7 @@ private:
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
+	StrictWatch               m_strict_watch {m_page_manager};
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};
 	LodStatsCounter           m_lod_stats {*this};

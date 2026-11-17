@@ -12,6 +12,7 @@
 #include "common/platform/sysFileIO.h"
 #include "common/stringUtils.h"
 
+#include <cerrno>
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_file_t {
@@ -29,6 +30,25 @@ constexpr DWORD FILE_SHARE_POSIX = static_cast<DWORD>(FILE_SHARE_READ) |
                                    static_cast<DWORD>(FILE_SHARE_DELETE);
 constexpr DWORD READ_WRITE_DELETE = static_cast<DWORD>(GENERIC_READ) |
                                     static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE);
+
+// ReadFile into a page the GPU resource tracker has made PAGE_READONLY fails with ERROR_NOACCESS
+// and delivers 0 bytes. Report it as EFAULT, as POSIX read does, so the caller retries through a
+// host buffer instead of giving the guest a silent short read. Other failures are EIO; a read at
+// end of file is not an error.
+void SysFileReadEx(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read, int* err) {
+	if (err != nullptr) {
+		*err = 0;
+	}
+	DWORD       w   = 0;
+	const BOOL  ok  = ReadFile(f.handle, data, size, &w, nullptr);
+	const DWORD gle = (ok != 0 ? 0 : GetLastError());
+	if (bytes_read != nullptr) {
+		*bytes_read = w;
+	}
+	if (ok == 0 && err != nullptr && gle != ERROR_HANDLE_EOF) {
+		*err = (gle == ERROR_NOACCESS || gle == ERROR_INVALID_USER_BUFFER) ? EFAULT : EIO;
+	}
+}
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	DWORD r = 0;

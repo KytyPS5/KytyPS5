@@ -30367,6 +30367,10 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         vulkan->CreateStorageBuffer(test.name, test.gds_initial, gds_dwords);
   }
   if (needs_sampled_image) {
+    // A packed load reads through an R32Uint view, as the renderer binds it.
+    const bool packed = std::ranges::any_of(
+        compiled.program.info.images,
+        [](const auto &image) { return image.packed; });
     auto sampled_mips = test.sampled_image_rgba_mips;
     auto sampled_format = test.sampled_image_format;
     auto sampled_dwords_per_pixel = test.sampled_image_dwords_per_pixel;
@@ -30383,7 +30387,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         test.sampled_image_type, test.sampled_image_view_type,
         test.sampled_image_layers, test.sampled_image_view_base_layer,
         test.sampled_image_view_layers, vk::SampleCountFlagBits::e1,
-        vk::Format::eUndefined, test.sampled_image_view_base_mip);
+        packed ? vk::Format::eR32Uint : vk::Format::eUndefined,
+        test.sampled_image_view_base_mip);
   }
   if (needs_storage_image) {
     const bool atomic64 = std::ranges::any_of(
@@ -30761,6 +30766,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_GET_LOD:
   case Opcode::IMAGE_LOAD:
   case Opcode::IMAGE_LOAD_MIP:
+  case Opcode::IMAGE_LOAD_PCK:
   case Opcode::IMAGE_STORE:
   case Opcode::IMAGE_STORE_MIP:
   case Opcode::IMAGE_ATOMIC_SWAP:
@@ -54627,6 +54633,42 @@ TestCase ImageAtomicCompareSwapGlcAndExec() {
   return test;
 }
 
+// RDNA 2 MIMG opcode 0x02: the texel's DWORD as stored, which a compare-and-swap then replaces
+// (PPSA02015 accumulates into an 11-11-10 float volume this way). The load fetches through an
+// R32Uint view of the 11-11-10 image and the swap stores through the storage view, here a second
+// image with the same texel: the swap takes place only if the load returned the stored bits.
+TestCase ImageLoadPckFeedsCompareSwap() {
+  constexpr u32 texel = 0x3c0u | (0x380u << 11u) | (0x200u << 22u); // 1.0, 0.5, 2.0
+  TestCase test;
+  test.name = "ImageLoadPckFeedsCompareSwap";
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.insert(code.end(), {EncodeMimg0(0x02, 1), EncodeMimg1(0, 20)}); // image_load_pck v0
+  AppendStoreVgpr(&code, 0, 0);
+  code.push_back(EncodeVop1(0x01, 3, Vgpr(0)));                   // v_mov_b32 v3, v0: comparison
+  code.insert(code.end(), {EncodeVop2(0x25, 2, 255, 0), 0x100u}); // v_add_nc_u32 v2, 0x100, v0
+  code.insert(code.end(), {EncodeMimg0(0x10, 3, 0, true), EncodeMimg1(2, 20)});
+  AppendStoreVgpr(&code, 2, 1);
+  AppendEnd(&code);
+  test.expected = {texel, texel};
+  test.opcodes = {ShaderOpcode::V_MOV_B32,          ShaderOpcode::IMAGE_LOAD_PCK,
+                  ShaderOpcode::V_ADD_NC_U32,       ShaderOpcode::IMAGE_ATOMIC_CMPSWAP,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k11_11_10Float);
+  test.has_user_data = true;
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = texel;
+  test.sampled_image_format = vk::Format::eB10G11R11UfloatPack32;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[6] = texel;
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  test.expected_storage_image_r32ui[6] = texel + 0x100u;
+  test.required_spirv = {"OpImageFetch %v4uint", "OpAtomicCompareExchange"};
+  return test;
+}
+
 TestCase ImageAtomicSwapReturnsPreviousTexel() {
   using O = ShaderOpcode;
 
@@ -56536,6 +56578,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageStoreAndAtomicShareTypedBinding);
   AddCase(ImageAtomicCompareSwapGlcAndExec);
+  AddCase(ImageLoadPckFeedsCompareSwap);
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants<>);
@@ -59061,6 +59104,15 @@ void CheckBasicStorageTextureDescriptor() {
               descriptor.Height5() + 1u == 33 && descriptor.Depth() + 1u == 33,
           "basic 3D storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicStorageTextureResource(), descriptor, 0x10000);
+  // A 32-bit atomic swaps the DWORD of an 11-11-10 float texel through an R32Uint view.
+  auto atomic_resource = BasicStorageTextureResource();
+  atomic_resource.numeric_class = Prospero::TextureNumericClass::Uint;
+  atomic_resource.atomic = true;
+  auto atomic_descriptor = descriptor;
+  atomic_descriptor.fields[1] =
+      (atomic_descriptor.fields[1] & ~(0x1ffu << 20u)) |
+      (static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10Float) << 20u);
+  ValidateStorageTexture(atomic_resource, atomic_descriptor, 0x10000);
 
   const ShaderTextureResource extended{{0x204aca00u, 0xc4700000u, 0x000fc00fu,
                                         0xa1b00facu, 0x0000003fu, 0x00700000u,
@@ -64585,6 +64637,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-cmpswap-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageAtomicCompareSwapGlcAndExec());
+    RunCase(&vulkan, ImageLoadPckFeedsCompareSwap());
     RunCase(&vulkan, ImageAtomicSwapReturnsPreviousTexel());
     RunCase(&vulkan, ImageAtomicVariants());
     RunCase(&vulkan, ImageAtomicVariants<true>());

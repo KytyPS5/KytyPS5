@@ -2639,6 +2639,55 @@ void TestImageAtomicWidthDecoder() {
   }
 }
 
+void TestImageLoadPckDecoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // Captured PPSA02015 pixel shader d02edc1ab2a97eef: image_load_pck v3, v[0:2], s[28:35] and
+  // its NSA form image_load_pck v6, [v3, v1, v5], s[28:35], both of a 3D image.
+  const uint32_t captured[] = {0xf0080110u, 0x00070300u};
+  const uint32_t captured_nsa[] = {0xf0080112u, 0x00070600u, 0x00000501u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_LOAD_PCK && decoded.word_count == 2u &&
+            decoded.dmask == 1u && decoded.dst.reg == 3u && decoded.src0.reg == 0u &&
+            decoded.image_address_components == 3u,
+        "captured IMAGE_LOAD_PCK did not decode as a one-DWORD load at three coordinates");
+  DecodeInstruction(captured_nsa, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_LOAD_PCK && decoded.word_count == 3u &&
+            decoded.dmask == 1u && decoded.dst.reg == 6u,
+        "captured NSA IMAGE_LOAD_PCK did not decode");
+  // Only the first DWORD of the texel as stored has a defined place.
+  for (uint32_t mask = 0; mask < 16u; ++mask) {
+    const uint32_t words[] = {EncodeMimg0(0x02u, mask, false), captured[1]};
+    DecodeInstruction(words, 0, decoded);
+    Check((decoded.opcode == Opcode::IMAGE_LOAD_PCK) == (mask == 1u) &&
+              (decoded.opcode == Opcode::UNSUPPORTED) == (mask != 1u),
+          "IMAGE_LOAD_PCK accepted a data mask beyond its first DWORD");
+  }
+  const uint32_t d16[] = {captured[0], captured[1] | (1u << 31u)};
+  DecodeInstruction(d16, 0, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED, "IMAGE_LOAD_PCK accepted D16 data");
+
+  // Translation marks the image as loaded without conversion.
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.thread_ids_num = 3;
+  static const std::array<uint32_t, 16> user_data{};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+  for (const bool packed : {true, false}) {
+    // image_load_pck / image_load v3, v[0:2], s[28:35]; s_endpgm.
+    const uint32_t code[] = {packed ? captured[0] : captured[0] & ~(0x7fu << 18u), captured[1],
+                             0xbf810000u};
+    const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    const auto &memory = translated.program.memory_info;
+    Check(memory.size() == 1u && memory[0].kind == ShaderRecompiler::IR::ResourceKind::Image &&
+              memory[0].image_packed == packed,
+          "translation did not mark the load of an IMAGE_LOAD_PCK, or marked a plain load");
+  }
+}
+
 void TestImageGatherDecoder() {
   using namespace ShaderRecompiler::Decoder;
   struct Gather {
@@ -13803,6 +13852,7 @@ int main() {
   // here.
   TestScalarAshrI64Decoder();
   TestImageAtomicWidthDecoder();
+  TestImageLoadPckDecoder();
   TestImageGatherDecoder();
   TestDsReturningAtomic64Decoder();
   TestDsCompareStore32Decoder();

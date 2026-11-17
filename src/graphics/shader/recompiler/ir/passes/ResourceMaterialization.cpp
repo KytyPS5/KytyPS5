@@ -1183,14 +1183,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic &&
-		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
-		                   : format != Prospero::BufferFormat::k32UInt &&
-		                         format != Prospero::BufferFormat::k32SInt &&
-		                         format != Prospero::BufferFormat::k32Float)) {
+		if (base.atomic && (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+		                                  : !IsRawWordFormat(format))) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
+		}
+		if (base.packed) {
+			if (!IsRawWordFormat(format)) {
+				return SpecializationFail(
+				    fmt::format("packed load of image descriptor {} uses unsupported format {}", i,
+				                static_cast<uint32_t>(format)));
+			}
+			if (image.indirect_root != ImageResource::NoIndirectImage) {
+				return SpecializationFail("packed load requires a direct image");
+			}
 		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
@@ -1228,6 +1235,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
 		image.numeric_class = Prospero::SampledTextureNumericClass(
 		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
+		if (base.packed) image.numeric_class = Prospero::TextureNumericClass::Uint;
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
 			if (image.indirect_root != ImageResource::NoIndirectImage) {
 				return SpecializationFail("packed UNorm sampling requires a direct image");

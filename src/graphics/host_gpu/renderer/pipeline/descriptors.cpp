@@ -402,10 +402,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    ShaderRecompiler::IR::RawSignedStorageFormat(resource, format) != Prospero::BufferFormat::kInvalid;
 	const auto numeric_class =
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
-	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic && !resource.atomic64;
+	const bool raw_word_atomic = ShaderRecompiler::IR::IsRawWordFormat(format) && uint_resource &&
+	                             resource.atomic && !resource.atomic64;
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_word_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -438,10 +438,13 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
-// sRGB views decode before filtering; a sampler that skips degamma reads through a UNorm view.
-static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::BufferFormat format,
-                                    vk::Format pixel_format, bool skip_degamma) {
-	if (skip_degamma) return SrgbUnormViewFormat(pixel_format);
+// A packed load reads the texel's DWORD. sRGB views decode before filtering; a sampler that skips
+// degamma reads through a UNorm view.
+static vk::Format SampledViewFormat(const GraphicContext&                      graphics,
+                                    const ShaderRecompiler::IR::ImageResource& resource,
+                                    Prospero::BufferFormat format, vk::Format pixel_format) {
+	if (resource.packed) return vk::Format::eR32Uint;
+	if (resource.skip_degamma) return SrgbUnormViewFormat(pixel_format);
 	switch (format) {
 		case Prospero::BufferFormat::k8Srgb:
 			return graphics.r8_srgb_views ? vk::Format::eR8Srgb : pixel_format;
@@ -480,7 +483,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage || resource.packed || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
@@ -647,8 +650,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class ==
-	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	    storage ||
+	    resource.numeric_class ==
+	        (resource.packed
+	             ? Prospero::TextureNumericClass::Uint
+	             : Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format)));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -775,8 +781,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
 		// Set after FindImage, whose metadata clears need the attachment-capable format.
-		desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), format, pixel_format,
-		                                          resource.skip_degamma);
+		desc.view_info.format =
+		    SampledViewFormat(m_context.GetGraphics(), resource, format, pixel_format);
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}

@@ -84,6 +84,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.formatted     = decoded.formatted;
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
+	memory.image_packed  = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_PCK;
 	memory.image_r128    = decoded.image_r128;
 	memory.image_cube    = decoded.image_cube;
 	memory.idxen         = decoded.idxen;
@@ -1168,7 +1169,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GET_RESINFO: return IMAGE_GET_RESINFO(inst);
 		case Decoder::Opcode::IMAGE_GET_LOD: return IMAGE_GET_LOD(inst);
 		case Decoder::Opcode::IMAGE_LOAD:
-		case Decoder::Opcode::IMAGE_LOAD_MIP: return IMAGE_LOAD(inst);
+		case Decoder::Opcode::IMAGE_LOAD_MIP:
+		case Decoder::Opcode::IMAGE_LOAD_PCK: return IMAGE_LOAD(inst);
 		case Decoder::Opcode::IMAGE_STORE:
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);

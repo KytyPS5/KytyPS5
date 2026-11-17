@@ -7546,6 +7546,110 @@ void TestFmaskLoadSpecialization() {
 
 // An image operation folded away before tracking leaves its memory entry with its T#'s SGPR
 // quad index, here 2 for s[8:15], in a shader with no image.
+// A packed load reads the texel's DWORD as stored: its image is a resource of its own, typed Uint
+// for an R32Uint view, and only formats of one DWORD the host stores unchanged are taken.
+void TestPackedImageLoad() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Class = Prospero::TextureNumericClass;
+  // With `after_plain` a converting load of the same T# comes first.
+  const auto materializes = [](bool packed, Prospero::BufferFormat format,
+                               bool after_plain = false) {
+    Fixture fixture;
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); i++) words[i] = fixture.UserData(i);
+    const auto image = fixture.Image(words, 4);
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    load.image_address_components = 2;
+    load.dmask = 1;
+    if (after_plain) {
+      const auto plain = fixture.Emit(ValueOpcode::ImageRead,
+                                      {fixture.Image(words, 0), fixture.ImageAddress(), Value(true)},
+                                      fixture.AddMemory(load, 0));
+      fixture.Emit(ValueOpcode::ReferenceU32,
+                   {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {plain, Value(0u)})});
+    }
+    load.image_packed = packed;
+    const auto texel = fixture.Emit(ValueOpcode::ImageRead,
+                                    {image, fixture.ImageAddress(), Value(true)},
+                                    fixture.AddMemory(load, 4));
+    const auto output = fixture.Buffer({Value(0x3000u), Value(0u), Value(12u), Value(0u)}, 12);
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {output, Value(0u), Value(0u), Value(0u),
+                  fixture.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)}), Value(true)},
+                 fixture.AddMemory(store, 12));
+    fixture.PlanAndTrack();
+    const auto &images = fixture.program.info.images;
+    const size_t count = packed && after_plain ? 2u : 1u;
+    Check(images.size() == count && images.back().packed == packed && !(count == 2u && images[0].packed),
+          "a packed load did not get an image resource of its own, apart from converting loads");
+    // The plan a restarted game loads from the shader cache.
+    ResourcePlan plan;
+    Check(LoadResourcePlan(SaveResourcePlan(ExtractResourcePlan(fixture.program)), plan) &&
+              plan.info.images.size() == count && plan.info.images.back().packed == packed,
+          "a packed image load did not survive the plan's cache bytes");
+    const std::array<uint32_t, 8> user_data{
+        0x2000u, static_cast<uint32_t>(format) << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u)};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    if (!MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization)) return false;
+    const auto converted = Prospero::SampledTextureNumericClass(format);
+    Check(specialization.images.size() == count &&
+              specialization.images.back().numeric_class == (packed ? Class::Uint : converted) &&
+              specialization.images[0].numeric_class == (count == 2u || !packed ? converted : Class::Uint),
+          "a packed load is not typed Uint, or a converting load of the same T# lost its type");
+    return true;
+  };
+  for (const auto format : {Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32SInt,
+                            Prospero::BufferFormat::k32Float, Prospero::BufferFormat::k11_11_10Float}) {
+    Check(materializes(true, format), "a packed load of a one-DWORD texel was refused");
+  }
+  for (const auto format : {Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::BufferFormat::k16_16UInt,
+                            Prospero::BufferFormat::k11_11_10UInt, Prospero::BufferFormat::k32_32UInt}) {
+    Check(!materializes(true, format), "a packed load of a format without a raw DWORD view was accepted");
+  }
+  Check(materializes(false, Prospero::BufferFormat::k8_8_8_8UNorm),
+        "a converting load of a texel with several components was refused");
+  Check(materializes(true, Prospero::BufferFormat::k11_11_10Float, true) &&
+            !materializes(true, Prospero::BufferFormat::k8_8_8_8UNorm, true),
+        "a packed load after a converting one of the same image was not checked on its own");
+
+  // A 32-bit atomic swaps the same DWORD.
+  const auto atomic = [](Prospero::BufferFormat format) {
+    Program program;
+    program.resource_tracking_complete = true;
+    ImageResource image;
+    image.source = 0;
+    image.resource_class = ImageResourceClass::Storage;
+    image.dimension = Decoder::ImageDimension::Dim2D;
+    image.read = image.written = image.atomic = true;
+    program.info.images.push_back(image);
+    const std::array<uint32_t, 8> dwords{
+        0x2000u, static_cast<uint32_t>(format) << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u)};
+    program.descriptor_sources.resize(1);
+    program.descriptor_sources[0].dword_count = 8;
+    for (uint32_t i = 0; i < 8u; i++) program.descriptor_sources[0].dwords[i] = Value(dwords[i]);
+    program.srt_plan_complete = true;
+    const auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    return MaterializeResources(plan, {}, snapshot, specialization) &&
+           specialization.images[0].numeric_class == Class::Uint;
+  };
+  Check(atomic(Prospero::BufferFormat::k32UInt) && atomic(Prospero::BufferFormat::k32Float) &&
+            atomic(Prospero::BufferFormat::k11_11_10Float),
+        "a 32-bit atomic of a one-DWORD texel was refused or not typed Uint");
+  Check(!atomic(Prospero::BufferFormat::k11_11_10UInt) && !atomic(Prospero::BufferFormat::k8_8_8_8UNorm),
+        "a 32-bit atomic of a format without a raw DWORD view was accepted");
+}
+
 void TestFoldedImageOperationMemory() {
   Fixture fixture;
   fixture.AddMemory({.kind = ResourceKind::Image, .resource = 2}, 0);
@@ -11870,6 +11974,7 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
+    Run("packed image load", TestPackedImageLoad);
     Run("record heap demand", TestRecordHeapDemand);
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);

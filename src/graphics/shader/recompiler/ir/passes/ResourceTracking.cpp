@@ -5669,7 +5669,7 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
-			    image.atomic64 == atomic64) {
+			    image.atomic64 == atomic64 && image.packed == memory.image_packed) {
 				image.cube |= memory.image_cube;
 				Merge(image, op, pc);
 				return i;
@@ -5684,6 +5684,7 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.cube           = memory.image_cube;
+		image.packed         = memory.image_packed;
 		image.atomic64       = atomic64;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);

@@ -72,6 +72,7 @@ struct MemoryInfo {
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
+	bool                    image_packed = false; // A load without format conversion.
 	bool                    image_r128                                            = false;
 	bool                    image_cube                                            = false;
 	bool                    idxen                                                 = false;
@@ -163,6 +164,7 @@ struct ImageResource {
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
+	bool                          packed            = false; // Loaded without format conversion.
 	bool                          unfiltered_access_only = true;
 	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
@@ -182,6 +184,13 @@ struct ImageResource {
 // A sampled table selects among a draw's candidates, read by shape class.
 [[nodiscard]] constexpr bool SelectsCandidateImages(const ImageResource& root) {
 	return root.resource_class == ImageResourceClass::Sampled;
+}
+
+// One DWORD the host stores as the guest does: packed loads and 32-bit atomics view it as R32Uint.
+[[nodiscard]] constexpr bool IsRawWordFormat(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k32UInt || format == Prospero::BufferFormat::k32SInt ||
+	       format == Prospero::BufferFormat::k32Float ||
+	       format == Prospero::BufferFormat::k11_11_10Float;
 }
 
 [[nodiscard]] constexpr Prospero::BufferFormat

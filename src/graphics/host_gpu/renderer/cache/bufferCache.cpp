@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
+#include "loader/demonsSoulsTitle.h"
 
 #include <algorithm>
 #include <array>
@@ -1745,6 +1746,17 @@ void BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 }
 
+// KYTY_ASYNC_IMAGE_STAGING=0/1: the staging copies of image uploads on the host copy thread (ObtainBufferForImage); by
+// default in Demon's Souls, where it was measured.
+static bool AsyncImageStaging() {
+	static const bool enabled = [] {
+		if (const char* value = std::getenv("KYTY_ASYNC_IMAGE_STAGING"); value != nullptr && value[0] != '\0')
+			return value[0] != '0';
+		return ::Loader::DemonsSoulsTitle::IsSupportedGame();
+	}();
+	return enabled;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
@@ -1759,9 +1771,44 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
+	// The execution thread hands the copy into the staging ring to the host copy thread, as UploadCopies() does
+	// with buffer uploads: RefreshImage() watched the image's pages again before this, so a guest write after it faults
+	// and leaves the image CPU dirty; the copy reads the backing store, every submission waits for it and so does any
+	// guest-visible effect or unmap (HostCopyQueue::Drain()). Demon's Souls streams textures while the camera turns:
+	// ~9 uploads a frame of 2.8-5.6 MiB at Boletaria, ~165 us each copied here (1.5 ms a frame), mostly from its texture
+	// pool, with pages released in it (read as zeros). A copy that does not go to the ring (larger than it) is made here.
+	auto*      host_copies = m_scheduler.HostCopies();
+	const auto ring        = m_staging_buffer.Mapped();
+	const bool hand_over   = host_copies != nullptr && m_staging_buffer.IsCoherent() && GuestGpu::IsGpuThread() &&
+	                         AsyncImageStaging();
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
+		if (hand_over && mapped >= ring.data() && mapped < ring.data() + ring.size()) {
+			// (Handed over at once: the producer's batch of small copies may not fill before the submission.)
+			if (const void* backing = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
+				host_copies->Copy(mapped, backing, size);
+				(void)host_copies->Flush();
+				return;
+			}
+			// (Large images usually span several guest mappings; the parts without backing read as zeros.)
+			thread_local std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
+			if (Libs::LibKernel::Memory::TryGetSparseBackingPieces(vaddr, size, pieces)) {
+				uint64_t offset = 0;
+				for (const auto& [piece, bytes]: pieces) {
+					if (piece != nullptr) {
+						host_copies->Copy(mapped + offset, piece, bytes);
+					} else {
+						host_copies->Call([](void*, uint64_t destination, uint64_t count) {
+							std::memset(reinterpret_cast<void*>(destination), 0, count);
+						}, nullptr, reinterpret_cast<uint64_t>(mapped + offset), bytes);
+					}
+					offset += bytes;
+				}
+				(void)host_copies->Flush();
+				return;
+			}
+		}
 		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}

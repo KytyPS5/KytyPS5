@@ -145,6 +145,9 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // The backing store's bytes of [vaddr, vaddr + size) as one piece per run of contiguous backing, in order; false if a
 // part is not backed.
 bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+// What TryReadSparseBacking() reads, as pieces in order: the runs of contiguous backing, and the parts without backing
+// (null) it reads as zeros; false where it fails. The pointers stay readable as FindBackingPointer()'s do.
+bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
 // Linux: the pages of [address, address + size) of the backing view (an address in the view, as TryGetBackingPieces gives
 // them) freed from every view of them: a hole punched in the store, a later read gets zeros. False elsewhere.
 bool DiscardBacking(uint64_t address, uint64_t size);

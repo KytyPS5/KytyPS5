@@ -292,6 +292,15 @@ public:
 		return split ? nullptr : result;
 	}
 
+	// BackingPieces with the parts not backed as pieces without bytes (null), in order.
+	void SparsePieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
+		pieces.clear();
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t, uint64_t bytes) { pieces.emplace_back(m_backing_base + offset, bytes); },
+		    [&](uint64_t, uint64_t bytes) { pieces.emplace_back(nullptr, bytes); });
+	}
+
 	// The backing bytes of [vaddr, vaddr + size) as one piece per run of contiguous backing, in order (the pieces are
 	// contiguous in the guest range); false if a part is not backed.
 	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
@@ -735,6 +744,26 @@ public:
 
 	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
 		return m_backing->BackingPieces(vaddr, size, pieces);
+	}
+
+	// What CopySparseMemory<false> reads, as pieces: the runs of backing, and the gaps (null) it reads as zeros; false
+	// where it fails.
+	bool SparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		if (m_backing->BackingPieces(vaddr, size, pieces)) {
+			return true;
+		}
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock state(g_memory_state_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return false;
+		}
+		m_backing->SparsePieces(vaddr, size, pieces);
+		return true;
 	}
 
 	bool DiscardBacking(uint64_t address, uint64_t size) { return m_backing->DiscardPages(address, size); }

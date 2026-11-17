@@ -900,6 +900,10 @@ bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<co
 	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
 }
 
+bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+	return g_guest_address_space != nullptr && g_guest_address_space->SparseBackingPieces(vaddr, size, pieces);
+}
+
 bool DiscardBacking(uint64_t address, uint64_t size) {
 	return g_guest_address_space != nullptr && g_guest_address_space->DiscardBacking(address, size);
 }

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <compare>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -166,7 +167,8 @@ private:
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
-	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
+	       SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
+	Image& ResolveScratch(const Image& source, vk::Extent3D extent, uint32_t layers);
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
@@ -175,6 +177,7 @@ private:
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
+	std::unique_ptr<Image> m_resolve_scratch;
 };
 
 namespace ImageOps {

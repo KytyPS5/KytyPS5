@@ -15,6 +15,8 @@
 #include <atomic>
 #include <cstdint>
 #include <fmt/format.h>
+#include <string_view>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -94,6 +96,19 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return usage;
+}
+
+[[nodiscard]] bool BlitConverts(const GraphicContext& graphics, vk::Format source,
+                                vk::Format destination) {
+	const auto integer_class = [](vk::Format format) {
+		const std::string_view numeric = vk::componentNumericFormat(format, 0);
+		return numeric == "UINT" || numeric == "SINT" ? numeric : std::string_view {};
+	};
+	return integer_class(source) == integer_class(destination) &&
+	       static_cast<bool>(graphics.GetFormatProperties(source).optimalTilingFeatures &
+	                         vk::FormatFeatureFlagBits::eBlitSrc) &&
+	       static_cast<bool>(graphics.GetFormatProperties(destination).optimalTilingFeatures &
+	                         vk::FormatFeatureFlagBits::eBlitDst);
 }
 
 void ValidateOptionalRange(GuestRange range, const char* name) {
@@ -415,16 +430,40 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	    std::max(backing.extent.width >> destination_range.base_level, 1u);
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
-	const bool copy = source.backing.samples == 1;
+	const bool copy    = source.backing.samples == 1;
+	const bool convert = !copy && source.backing.format != backing.format;
 	EXIT_IF(layers == 0 ||
 	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
-	              : source.backing.format != backing.format));
+	              : convert && !BlitConverts(m_graphics, source.backing.format, backing.format)));
 	auto resolved_source_range             = source_range;
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
 	const vk::Extent3D resolve_extent {std::min(source_width, destination_width),
 	                                   std::min(source_height, destination_height), 1};
+	if (convert) {
+		auto&                       scratch = ResolveScratch(source, resolve_extent, layers);
+		const ImageSubresourceRange scratch_range {0, 1, 0, layers};
+		scratch.Resolve(source, resolved_source_range, scratch_range);
+		auto command = m_scheduler.Current().Handle();
+		scratch.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		                scratch_range, command);
+		Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		        resolved_destination_range, command);
+		const vk::Offset3D end {static_cast<int32_t>(resolve_extent.width),
+		                        static_cast<int32_t>(resolve_extent.height), 1};
+		vk::ImageBlit      region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, layers};
+		region.srcOffsets[1]  = end;
+		region.dstSubresource = {vk::ImageAspectFlagBits::eColor,
+		                         resolved_destination_range.base_level,
+		                         resolved_destination_range.base_layer, layers};
+		region.dstOffsets[1]  = end;
+		command.blitImage(scratch.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  backing.image, vk::ImageLayout::eTransferDstOptimal, region,
+		                  vk::Filter::eNearest);
+		return;
+	}
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
@@ -453,6 +492,24 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
+}
+
+Image& Image::ResolveScratch(const Image& source, vk::Extent3D extent, uint32_t layers) {
+	const auto& current = m_resolve_scratch;
+	if (current == nullptr || current->backing.format != source.backing.format ||
+	    current->backing.extent != extent || current->backing.layers != layers) {
+		ImageInfo scratch {};
+		scratch.pixel_format    = source.backing.format;
+		scratch.guest_format    = source.info.guest_format;
+		scratch.type            = Prospero::ImageType::kColor2D;
+		scratch.extent          = extent;
+		scratch.resources       = {1, layers};
+		scratch.bytes_per_block = source.info.bytes_per_block;
+		scratch.samples         = 1;
+		m_scheduler.DeferOperation([retired = std::move(m_resolve_scratch)] {});
+		m_resolve_scratch = std::make_unique<Image>(m_graphics, m_scheduler, scratch);
+	}
+	return *m_resolve_scratch;
 }
 
 uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) noexcept {

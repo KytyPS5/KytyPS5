@@ -8434,6 +8434,55 @@ public:
                       vk::ImageLayout::eTransferDstOptimal,
               "Image::Resolve did not retain the single-sample copy path");
 
+      ImageInfo convert_source_info = resolve_source_info;
+      convert_source_info.pixel_format = vk::Format::eR8G8B8A8Srgb;
+      convert_source_info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
+      ImageInfo convert_destination_info = resolve_destination_info;
+      convert_destination_info.pixel_format = vk::Format::eA2B10G10R10UnormPack32;
+      convert_destination_info.guest_format = Prospero::BufferFormat::k10_10_10_2UNorm;
+      Libs::Graphics::Image convert_source(m_runtime_context, scheduler,
+                                           convert_source_info);
+      Libs::Graphics::Image convert_destination(m_runtime_context, scheduler,
+                                                convert_destination_info);
+      const auto convert_command = scheduler.Current().Handle();
+      convert_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {}, convert_command);
+      const vk::ClearColorValue convert_clear{std::array<float, 4>{0.5f, 0.0f, 1.0f, 1.0f}};
+      const vk::ImageSubresourceRange convert_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+                                                    1};
+      convert_command.clearColorImage(convert_source.backing.image,
+                                      vk::ImageLayout::eTransferDstOptimal, &convert_clear, 1,
+                                      &convert_range);
+      convert_destination.Resolve(convert_source, {}, {});
+      constexpr uint32_t convert_texels = 4 * 4;
+      auto convert_readback =
+          CreateHostBuffer(name, convert_texels * sizeof(uint32_t),
+                           vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferImageCopy convert_region{};
+      convert_region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+      convert_region.imageExtent = convert_destination_info.extent;
+      convert_destination.Download(std::span{&convert_region, 1}, convert_readback.buffer, 0,
+                                   convert_readback.size);
+      HostReadBarrier(convert_readback.buffer, convert_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      constexpr uint32_t unorm10_max = 0x3ffu;
+      constexpr uint32_t linear_half_low = 500u;
+      constexpr uint32_t linear_half_high = 525u;
+      const auto convert_words = ReadBuffer(name, convert_readback, convert_texels);
+      Require(name, "MSAA resolve into another color format",
+              std::ranges::all_of(convert_words,
+                                  [](uint32_t word) {
+                                    const uint32_t red = word & unorm10_max;
+                                    return red >= linear_half_low && red <= linear_half_high &&
+                                           ((word >> 10u) & unorm10_max) == 0 &&
+                                           ((word >> 20u) & unorm10_max) == unorm10_max &&
+                                           (word >> 30u) == 3u;
+                                  }),
+              "Image::Resolve did not write the linear resolved samples in the destination format");
+      DestroyBuffer(&convert_readback);
+
       const std::array<uint16_t, 2> multisample_source{0x4000u, 0xc000u};
       std::memcpy(memory + 0x2000, &multisample_source,
                   sizeof(multisample_source));

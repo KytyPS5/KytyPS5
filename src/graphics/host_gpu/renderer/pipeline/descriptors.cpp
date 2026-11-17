@@ -1254,6 +1254,12 @@ static bool TableViewCurrent(const TextureCache& texture_cache, const Image& ima
 	       (!image.is_depth_copy || texture_cache.DepthCopyCurrent(image));
 }
 
+// Whether a view of depth image `image` with the description `desc` samples its stencil plane.
+static bool ReadsStencilPlane(const Image& image, const TextureCache::ImageDesc& desc) {
+	return image.info.HasStencil() && desc.info.data.address >= image.info.stencil.address &&
+	       desc.info.data.End() <= image.info.stencil.End();
+}
+
 // The sampled texture's subresources are in the layout and access its transit would leave them
 // in (see CommitBindings() and Image::GetBarriers()): the transit would change nothing.
 static bool ImageReadReady(const Image& image, const TextureBinding& texture) {
@@ -2379,13 +2385,15 @@ void RenderExecutor::StoreDrawTemplate(uint64_t key, std::span<PreparedBindings*
 				continue;
 			}
 			// Only images the commit left in their read layouts, that the draw does not also
-			// render to or write, and whose state the version follows: depth images and their
-			// color twins and copies are refreshed from each other when acquired.
+			// render to or write, and whose state the version follows: depth and stencil copies
+			// are refreshed from the images they copy, and the stencil plane of a depth image from
+			// its stencil association, when acquired (TextureCache::FindTexture()).
 			const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 			if (image == nullptr || !image->registered || image->version == nullptr ||
 			    image->binding.needs_rebind || image->binding.is_target ||
 			    image->binding.force_general || image->binding.shader_write ||
-			    image->info.IsDepth() || image->is_depth_copy || image->depth_id ||
+			    (image->info.IsDepth() && ReadsStencilPlane(*image, copy.desc)) ||
+			    image->is_depth_copy || image->is_stencil_copy || image->depth_id ||
 			    binding.image_view == nullptr ||
 			    binding.desc.type != TextureCache::BindingType::Texture ||
 			    !ImageReadReady(*image, copy)) {

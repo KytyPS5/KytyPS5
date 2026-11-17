@@ -2361,7 +2361,15 @@ void RenderExecutor::StoreDrawTemplate(uint64_t key, std::span<PreparedBindings*
 			auto&       copy    = stage.images[i];
 			copy.image_id       = binding.image_id;
 			copy.image_view     = binding.image_view;
-			copy.desc           = binding.desc;
+			// An image the stage took from its template, which still holds, has only the type of
+			// its description (see PrepareBindingsFromTemplate()): the template's stays.
+			const bool held = prepared->template_stage != nullptr && i < 64u &&
+			                  ((prepared->template_images >> i) & 1u) != 0;
+			if (!held) {
+				copy.desc = binding.desc;
+			} else if (const auto& source = prepared->template_stage->images[i]; &source != &copy) {
+				copy.desc = source.desc;
+			}
 			copy.layout         = binding.layout;
 			copy.mip_views.clear();
 			copy.lookup             = nullptr;
@@ -2380,7 +2388,7 @@ void RenderExecutor::StoreDrawTemplate(uint64_t key, std::span<PreparedBindings*
 			    image->info.IsDepth() || image->is_depth_copy || image->depth_id ||
 			    binding.image_view == nullptr ||
 			    binding.desc.type != TextureCache::BindingType::Texture ||
-			    !ImageReadReady(*image, binding)) {
+			    !ImageReadReady(*image, copy)) {
 				// Not stored again until the next tick.
 				stored.stage_count  = 0;
 				stored.refused_tick = texture_cache.m_gc_tick;

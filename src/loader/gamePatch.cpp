@@ -50,11 +50,80 @@ bool Fail(std::string* error, std::string message) {
 	return false;
 }
 
+bool VersionsMatch(std::string_view v1, std::string_view v2) {
+	auto trim = [](std::string_view s) {
+		while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
+		while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
+		return s;
+	};
+	const auto t1 = trim(v1);
+	const auto t2 = trim(v2);
+	if (t1.empty() || t2.empty()) {
+		return false;
+	}
+	if (Common::EqualNoCase(t1, t2)) {
+		return true;
+	}
+	auto normalize = [&trim](std::string_view s) {
+		s = trim(s);
+		if (!s.empty() && (s.front() == 'v' || s.front() == 'V')) {
+			if (s.size() > 1 && (std::isdigit(static_cast<unsigned char>(s[1])) || s[1] == '.' ||
+			                     s[1] == '_' || s[1] == '-' || std::isspace(static_cast<unsigned char>(s[1])))) {
+				s.remove_prefix(1);
+				s = trim(s);
+			}
+		}
+		std::vector<std::string> parts;
+		std::string token;
+		for (char c: s) {
+			if (c == '.' || c == '_' || c == '-') {
+				auto tok = trim(token);
+				if (!tok.empty()) {
+					parts.push_back(std::string(tok));
+				}
+				token.clear();
+			} else {
+				token += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+			}
+		}
+		auto tok = trim(token);
+		if (!tok.empty()) parts.push_back(std::string(tok));
+		std::vector<std::string> nums;
+		for (const auto& p: parts) {
+			try {
+				size_t idx = 0;
+				unsigned long long val = std::stoull(p, &idx, 10);
+				if (idx == p.size()) {
+					nums.push_back(std::to_string(val));
+					continue;
+				}
+			} catch (...) {}
+			nums.push_back(p);
+		}
+		while (nums.size() > 1 && nums.back() == "0") {
+			nums.pop_back();
+		}
+		std::string result;
+		for (size_t i = 0; i < nums.size(); ++i) {
+			if (i > 0) result += '.';
+			result += nums[i];
+		}
+		return result;
+	};
+	const auto n1 = normalize(t1);
+	const auto n2 = normalize(t2);
+	return !n1.empty() && n1 == n2;
+}
+
 bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 	if (text.empty() || (text.size() % 2) != 0) {
 		return false;
 	}
-
+	for (char c: text) {
+		if (!std::isxdigit(static_cast<unsigned char>(c))) {
+			return false;
+		}
+	}
 	bytes->resize(text.size() / 2);
 	for (size_t index = 0; index < bytes->size(); index++) {
 		(*bytes)[index] = static_cast<uint8_t>(std::stoul(text.substr(index * 2, 2), nullptr, 16));
@@ -63,38 +132,106 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 }
 
 bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
-	std::ifstream file(path, std::ios::binary);
-	if (!file) {
-		return Fail(error, "could not read cheat file");
-	}
-
-	const auto root = Json::parse(file, nullptr, false);
-	if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
-	    !root.contains("process") || !root.contains("mods")) {
-		return Fail(error, "expected a GoldHEN-style mods JSON file");
-	}
-	plan->title_id = root["id"].get<std::string>();
-	plan->version  = root["version"].get<std::string>();
-	plan->process  = root["process"].get<std::string>();
-
-	for (const auto& mod: root["mods"]) {
-		if (!mod.value("enabled", true)) {
-			continue;
+	try {
+		std::ifstream file(path, std::ios::binary);
+		if (!file) {
+			return Fail(error, "could not read cheat file");
 		}
-		const auto name = mod["name"].get<std::string>();
-		plan->mod_names.push_back(name);
-		for (const auto& entry: mod["memory"]) {
-			Write write;
-			write.source_address = std::stoull(entry["offset"].get<std::string>(), nullptr, 16);
-			if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
-			    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
-			    write.off.size() != write.on.size()) {
-				return Fail(error, "invalid mod memory bytes");
+
+		const auto root = Json::parse(file, nullptr, false);
+		if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
+		    !root.contains("process") || !root.contains("mods")) {
+			return Fail(error, "expected a GoldHEN-style mods JSON file");
+		}
+		if (root.contains("master")) {
+			const auto& m = root["master"];
+			if (!m.is_null() && (!m.is_boolean() || m.get<bool>())) {
+				return Fail(error, "master codes are not supported yet");
 			}
-			plan->writes.push_back(std::move(write));
 		}
+		plan->title_id = root["id"].get<std::string>();
+		plan->version  = root["version"].get<std::string>();
+		plan->process  = root["process"].get<std::string>();
+
+		for (const auto& mod: root["mods"]) {
+			if (!mod.is_object()) {
+				return Fail(error, "invalid mod entry");
+			}
+			if (mod.contains("module_name")) {
+				const auto& mod_name = mod["module_name"];
+				if (!mod_name.is_null() && (!mod_name.is_string() || !mod_name.get<std::string>().empty())) {
+					return Fail(error, "module-specific cheats are not supported yet");
+				}
+			}
+			if (!mod.value("enabled", true)) {
+				continue;
+			}
+			const auto name = mod["name"].get<std::string>();
+			plan->mod_names.push_back(name);
+			if (!mod.contains("memory") || !mod["memory"].is_array() || mod["memory"].empty()) {
+				return Fail(error, "mod memory array is missing or empty");
+			}
+			for (const auto& entry: mod["memory"]) {
+				if (!entry.is_object()) {
+					return Fail(error, "invalid mod memory entry");
+				}
+				if (entry.contains("section")) {
+					const auto& sec = entry["section"];
+					if (!sec.is_null()) {
+						if (sec.is_number_integer()) {
+							if (sec.get<int64_t>() != 0) {
+								return Fail(error, "unsupported memory addressing");
+							}
+						} else if (sec.is_string()) {
+							const auto sec_str = sec.get<std::string>();
+							try {
+								size_t idx = 0;
+								unsigned long long snum = std::stoull(sec_str, &idx, 0);
+								if (idx != sec_str.size() || snum != 0) {
+									return Fail(error, "unsupported memory addressing");
+								}
+							} catch (...) {
+								return Fail(error, "unsupported memory addressing");
+							}
+						} else {
+							return Fail(error, "unsupported memory addressing");
+						}
+					}
+				}
+				if (entry.contains("absolute") && !entry["absolute"].is_null() &&
+				    (!entry["absolute"].is_boolean() || entry["absolute"].get<bool>())) {
+					return Fail(error, "unsupported memory addressing");
+				}
+				if (entry.contains("sectionName") || entry.contains("sectionProtection") ||
+				    entry.contains("logicalOffset") || entry.contains("sectionOffset")) {
+					return Fail(error, "unsupported memory addressing");
+				}
+				Write write;
+				size_t idx = 0;
+				const auto off_str = entry["offset"].get<std::string>();
+				write.source_address = std::stoull(off_str, &idx, 16);
+				if (idx != off_str.size()) {
+					return Fail(error, "invalid mod memory offset");
+				}
+				if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
+				    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
+				    write.off.size() != write.on.size()) {
+					return Fail(error, "invalid mod memory bytes");
+				}
+				if (entry.contains("expected") && !entry["expected"].is_null()) {
+					std::vector<uint8_t> expected;
+					if (!ParseBytes(entry["expected"].get<std::string>(), &expected) ||
+					    expected != write.off) {
+						return Fail(error, "expected memory bytes mismatch");
+					}
+				}
+				plan->writes.push_back(std::move(write));
+			}
+		}
+		return true;
+	} catch (const std::exception& e) {
+		return Fail(error, std::string("cheat parsing error: ") + e.what());
 	}
-	return true;
 }
 
 bool ValidateGame(const Plan& plan, const Program* main_program, std::string* error) {
@@ -106,7 +243,7 @@ bool ValidateGame(const Plan& plan, const Program* main_program, std::string* er
 	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) ||
 	    !SystemContentParamSfoGetString("APP_VER", &version) ||
 	    !Common::EqualNoCase(main_program->file_name.filename().string(), plan.process) ||
-	    !Common::EqualNoCase(title_id, plan.title_id) || version != plan.version) {
+	    !Common::EqualNoCase(title_id, plan.title_id) || !VersionsMatch(version, plan.version)) {
 		return Fail(error, "cheat file does not match the loaded game");
 	}
 	return true;
@@ -122,8 +259,10 @@ void Translate(const Program& program, uint64_t source_base, uint64_t source_add
 }
 
 bool IsInsideProgram(const Program& program, uint64_t address, size_t size) {
-	return size != 0 && address >= program.base_vaddr &&
-	       address + size <= program.base_vaddr + program.mapped_size;
+	if (size == 0 || size > program.mapped_size || address < program.base_vaddr) {
+		return false;
+	}
+	return (address - program.base_vaddr) <= (program.mapped_size - size);
 }
 
 bool IsZero(const std::vector<uint8_t>& bytes) {
@@ -146,7 +285,11 @@ bool TranslateAndValidate(Plan* plan, const Program& program, uint64_t source_ba
 bool Matches(Plan* plan, const Program& program, uint64_t* source_base) {
 	const auto anchor = std::find_if(plan->writes.begin(), plan->writes.end(),
 	                                 [](const Write& write) { return !IsZero(write.off); });
-	if (anchor == plan->writes.end() || program.mapped_size < anchor->off.size()) {
+	if (anchor == plan->writes.end()) {
+		*source_base = 0;
+		return TranslateAndValidate(plan, program, 0);
+	}
+	if (program.mapped_size < anchor->off.size()) {
 		return false;
 	}
 
@@ -196,12 +339,18 @@ bool AllocateCave(Plan* plan, const Program& program, std::string* error) {
 			return Fail(error, "non-zero write is outside the matched module");
 		}
 
+		if (write.target_address > UINT64_MAX - write.off.size()) {
+			return Fail(error, "write target address overflow");
+		}
 		const auto write_end = write.target_address + write.off.size();
-		for (auto page = write.target_address & ~(kPageSize - 1); page < write_end;
-		     page += kPageSize) {
+		for (auto page = write.target_address & ~(kPageSize - 1); page < write_end;) {
 			if (std::find(pages.begin(), pages.end(), page) == pages.end()) {
 				pages.push_back(page);
 			}
+			if (page > UINT64_MAX - kPageSize) {
+				break;
+			}
+			page += kPageSize;
 		}
 	}
 
@@ -271,9 +420,14 @@ bool Apply(const std::filesystem::path& plan_path, Program* main_program,
 }
 
 bool ApplyPending(Program* program) {
+	if (g_pending_plan == nullptr || program == nullptr || program->elf == nullptr) {
+		return true;
+	}
+	if (!Common::EqualNoCase(program->file_name.filename().string(), g_pending_plan->process)) {
+		return true;
+	}
 	uint64_t source_base = 0;
-	if (g_pending_plan == nullptr || program == nullptr || program->elf == nullptr ||
-	    !Matches(g_pending_plan.get(), *program, &source_base)) {
+	if (!Matches(g_pending_plan.get(), *program, &source_base)) {
 		return true;
 	}
 	::printf("Game cheat: matched %s with source base 0x%llx\n",

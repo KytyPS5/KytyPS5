@@ -1311,11 +1311,36 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    style()->standardIcon(QStyle::SP_FileDialogContentsView), tr("View trophies..."));
 	connect(action_view_trophies, &QAction::triggered, this,
 	        &ConfigurationListWidget::ViewTrophies);
-	QAction* action_patches = menu.addAction(tr("Cheats (experimental)..."));
+	QAction* action_patches = menu.addAction(tr("Cheats, Patches & Configs..."));
 	connect(action_patches, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {
-			        auto* dialog = new PatchesDialog(item->GetInfo(), this);
+			        auto* dialog = new PatchesDialog(
+			            item->GetInfo(),
+			            [this, item = QPointer<ConfigurationItem>(item)](
+			                const QJsonDocument& doc, QString* error) -> bool {
+				            if (!item) {
+					            if (error != nullptr) {
+						            *error = tr("Game item is no longer valid.");
+					            }
+					            return false;
+				            }
+				            auto info = CreateConfiguration(*item);
+				            if (!Cheats::ApplyConfigPreset(info.get(), doc, error)) {
+					            return false;
+				            }
+				            const auto game_path = info->game_path;
+				            delete m_custom_infos.take(game_path);
+				            m_custom_infos.insert(game_path, info.release());
+				            item->GetInfo().custom_settings = true;
+				            item->Update();
+				            if (m_selected_item == item) {
+					            SelectItem(item);
+				            }
+				            WriteSettings();
+				            return true;
+			            },
+			            this);
 			        dialog->show();
 		        }
 	        });

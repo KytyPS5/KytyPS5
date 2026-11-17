@@ -47,6 +47,29 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+add_executable(launcher_cheat_repository_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CheatRepositoryTests.cpp"
+	src/cheatFile.cpp
+	src/cheatRepository.cpp
+	src/configuration.cpp
+)
+target_link_libraries(launcher_cheat_repository_tests Qt6::Widgets Qt6::Network common FFmpeg::ffmpeg)
+target_include_directories(launcher_cheat_repository_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_cheat_repository_tests PROPERTIES AUTOMOC ON)
+
+if ((CLANG OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU") AND NOT KYTY_CLANG_CL)
+	target_compile_options(launcher_cheat_repository_tests PRIVATE -frtti -fexceptions)
+	target_link_libraries(launcher_cheat_repository_tests pthread)
+endif()
+
+if(BUILD_TESTING)
+	add_test(NAME launcher_cheat_repository COMMAND $<TARGET_FILE:launcher_cheat_repository_tests>)
+	set_tests_properties(launcher_cheat_repository PROPERTIES TIMEOUT 30)
+	if(TARGET kyty_tests)
+		add_dependencies(kyty_tests launcher_cheat_repository_tests)
+	endif()
+endif()
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

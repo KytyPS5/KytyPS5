@@ -2968,7 +2968,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}
-	m_descriptor_images.resize(image_descriptor_count);
+	// The array only grows: a commit assigns every element it refers to, and clearing the new
+	// elements of a large commit after small ones (GTA V's ray tracing tables take ~82 000
+	// between draws that take a few dozen) wrote ~2 MB each time.
+	if (m_descriptor_images.size() < image_descriptor_count) {
+		m_descriptor_images.resize(image_descriptor_count);
+	}
 	m_descriptor_writes.clear();
 	m_descriptor_copies.clear();
 	m_slot_set_writes.clear();

@@ -24,6 +24,8 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// A wave64 program run as halves orders its LDS accesses with a subgroup barrier (KYTY76_LDS_SYNC=0: off).
+	bool lds_lane_sync = true;
 };
 
 inline constexpr Profile DefaultProfile {};

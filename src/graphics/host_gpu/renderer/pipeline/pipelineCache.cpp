@@ -35,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -521,6 +522,20 @@ std::string PipelineCacheTitleId() {
 	return title_id;
 }
 
+namespace {
+// 76 (torn meshes on RTX 30/40, Ziva on): the LDS lane sync of wave64 programs in halves, on unless KYTY76_LDS_SYNC=0.
+// It is part of the profile, so the shader store's header changes with it.
+bool LdsLaneSyncEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY76_LDS_SYNC");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(on ? "76 LDS lane sync: on (wave64 halves)\n" : "76 LDS lane sync: off\n");
+		return on;
+	}();
+	return enabled;
+}
+} // namespace
+
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
@@ -531,7 +546,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .ray_query              = graphics.ray_query_enabled};
+	        .ray_query              = graphics.ray_query_enabled,
+	        .lds_lane_sync          = LdsLaneSyncEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {

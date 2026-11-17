@@ -9,12 +9,14 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -90,14 +92,12 @@ bool VersionsMatch(std::string_view v1, std::string_view v2) {
 		if (!tok.empty()) parts.push_back(std::string(tok));
 		std::vector<std::string> nums;
 		for (const auto& p: parts) {
-			try {
-				size_t idx = 0;
-				unsigned long long val = std::stoull(p, &idx, 10);
-				if (idx == p.size()) {
-					nums.push_back(std::to_string(val));
-					continue;
-				}
-			} catch (...) {}
+			unsigned long long val = 0;
+			auto [ptr, ec] = std::from_chars(p.data(), p.data() + p.size(), val, 10);
+			if (ec == std::errc{} && ptr == p.data() + p.size()) {
+				nums.push_back(std::to_string(val));
+				continue;
+			}
 			nums.push_back(p);
 		}
 		while (nums.size() > 1 && nums.back() == "0") {
@@ -115,6 +115,13 @@ bool VersionsMatch(std::string_view v1, std::string_view v2) {
 	return !n1.empty() && n1 == n2;
 }
 
+static uint8_t HexNibble(char c) {
+	if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+	if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+	if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+	return 0;
+}
+
 bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 	if (text.empty() || (text.size() % 2) != 0) {
 		return false;
@@ -126,112 +133,122 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 	}
 	bytes->resize(text.size() / 2);
 	for (size_t index = 0; index < bytes->size(); index++) {
-		(*bytes)[index] = static_cast<uint8_t>(std::stoul(text.substr(index * 2, 2), nullptr, 16));
+		(*bytes)[index] = static_cast<uint8_t>((HexNibble(text[index * 2]) << 4) |
+		                                       HexNibble(text[index * 2 + 1]));
 	}
 	return true;
 }
 
 bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
-	try {
-		std::ifstream file(path, std::ios::binary);
-		if (!file) {
-			return Fail(error, "could not read cheat file");
-		}
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		return Fail(error, "could not read cheat file");
+	}
 
-		const auto root = Json::parse(file, nullptr, false);
-		if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
-		    !root.contains("process") || !root.contains("mods")) {
-			return Fail(error, "expected a GoldHEN-style mods JSON file");
+	const auto root = Json::parse(file, nullptr, false);
+	if (root.is_discarded() || !root.is_object() || !root.contains("id") || !root.contains("version") ||
+	    !root.contains("process") || !root.contains("mods")) {
+		return Fail(error, "expected a GoldHEN-style mods JSON file");
+	}
+	if (root.contains("master")) {
+		const auto& m = root["master"];
+		if (!m.is_null() && (!m.is_boolean() || m.get<bool>())) {
+			return Fail(error, "master codes are not supported yet");
 		}
-		if (root.contains("master")) {
-			const auto& m = root["master"];
-			if (!m.is_null() && (!m.is_boolean() || m.get<bool>())) {
-				return Fail(error, "master codes are not supported yet");
-			}
-		}
-		plan->title_id = root["id"].get<std::string>();
-		plan->version  = root["version"].get<std::string>();
-		plan->process  = root["process"].get<std::string>();
+	}
+	plan->title_id = root["id"].get<std::string>();
+	plan->version  = root["version"].get<std::string>();
+	plan->process  = root["process"].get<std::string>();
 
-		for (const auto& mod: root["mods"]) {
-			if (!mod.is_object()) {
-				return Fail(error, "invalid mod entry");
+	for (const auto& mod: root["mods"]) {
+		if (!mod.is_object()) {
+			return Fail(error, "invalid mod entry");
+		}
+		if (mod.contains("module_name")) {
+			const auto& mod_name = mod["module_name"];
+			if (!mod_name.is_null() && (!mod_name.is_string() || !mod_name.get<std::string>().empty())) {
+				return Fail(error, "module-specific cheats are not supported yet");
 			}
-			if (mod.contains("module_name")) {
-				const auto& mod_name = mod["module_name"];
-				if (!mod_name.is_null() && (!mod_name.is_string() || !mod_name.get<std::string>().empty())) {
-					return Fail(error, "module-specific cheats are not supported yet");
-				}
+		}
+		if (!mod.value("enabled", true)) {
+			continue;
+		}
+		const auto name = mod["name"].get<std::string>();
+		plan->mod_names.push_back(name);
+		if (!mod.contains("memory") || !mod["memory"].is_array() || mod["memory"].empty()) {
+			return Fail(error, "mod memory array is missing or empty");
+		}
+		for (const auto& entry: mod["memory"]) {
+			if (!entry.is_object()) {
+				return Fail(error, "invalid mod memory entry");
 			}
-			if (!mod.value("enabled", true)) {
-				continue;
-			}
-			const auto name = mod["name"].get<std::string>();
-			plan->mod_names.push_back(name);
-			if (!mod.contains("memory") || !mod["memory"].is_array() || mod["memory"].empty()) {
-				return Fail(error, "mod memory array is missing or empty");
-			}
-			for (const auto& entry: mod["memory"]) {
-				if (!entry.is_object()) {
-					return Fail(error, "invalid mod memory entry");
-				}
-				if (entry.contains("section")) {
-					const auto& sec = entry["section"];
-					if (!sec.is_null()) {
-						if (sec.is_number_integer()) {
-							if (sec.get<int64_t>() != 0) {
-								return Fail(error, "unsupported memory addressing");
-							}
-						} else if (sec.is_string()) {
-							const auto sec_str = sec.get<std::string>();
-							try {
-								size_t idx = 0;
-								unsigned long long snum = std::stoull(sec_str, &idx, 0);
-								if (idx != sec_str.size() || snum != 0) {
-									return Fail(error, "unsupported memory addressing");
-								}
-							} catch (...) {
-								return Fail(error, "unsupported memory addressing");
-							}
-						} else {
+			if (entry.contains("section")) {
+				const auto& sec = entry["section"];
+				if (!sec.is_null()) {
+					if (sec.is_number()) {
+						if (sec.is_number_float() || sec.get<int64_t>() != 0) {
 							return Fail(error, "unsupported memory addressing");
 						}
+					} else if (sec.is_string()) {
+						const auto sec_str = sec.get<std::string>();
+						std::string_view sv = sec_str;
+						while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) sv.remove_prefix(1);
+						while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back()))) sv.remove_suffix(1);
+						int base = 10;
+						if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X')) {
+							sv.remove_prefix(2);
+							base = 16;
+						}
+						uint64_t snum = 0;
+						auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), snum, base);
+						if (ec != std::errc{} || ptr != sv.data() + sv.size() || snum != 0) {
+							return Fail(error, "unsupported memory addressing");
+						}
+					} else {
+						return Fail(error, "unsupported memory addressing");
 					}
 				}
-				if (entry.contains("absolute") && !entry["absolute"].is_null() &&
-				    (!entry["absolute"].is_boolean() || entry["absolute"].get<bool>())) {
-					return Fail(error, "unsupported memory addressing");
-				}
-				if (entry.contains("sectionName") || entry.contains("sectionProtection") ||
-				    entry.contains("logicalOffset") || entry.contains("sectionOffset")) {
-					return Fail(error, "unsupported memory addressing");
-				}
-				Write write;
-				size_t idx = 0;
-				const auto off_str = entry["offset"].get<std::string>();
-				write.source_address = std::stoull(off_str, &idx, 16);
-				if (idx != off_str.size()) {
-					return Fail(error, "invalid mod memory offset");
-				}
-				if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
-				    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
-				    write.off.size() != write.on.size()) {
-					return Fail(error, "invalid mod memory bytes");
-				}
-				if (entry.contains("expected") && !entry["expected"].is_null()) {
-					std::vector<uint8_t> expected;
-					if (!ParseBytes(entry["expected"].get<std::string>(), &expected) ||
-					    expected != write.off) {
-						return Fail(error, "expected memory bytes mismatch");
-					}
-				}
-				plan->writes.push_back(std::move(write));
 			}
+			if (entry.contains("absolute") && !entry["absolute"].is_null() &&
+			    (!entry["absolute"].is_boolean() || entry["absolute"].get<bool>())) {
+				return Fail(error, "unsupported memory addressing");
+			}
+			if (entry.contains("sectionName") || entry.contains("sectionProtection") ||
+			    entry.contains("logicalOffset") || entry.contains("sectionOffset")) {
+				return Fail(error, "unsupported memory addressing");
+			}
+			Write write;
+			const auto off_str = entry["offset"].get<std::string>();
+			std::string_view sv = off_str;
+			while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) sv.remove_prefix(1);
+			while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back()))) sv.remove_suffix(1);
+			int base = 10;
+			if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X')) {
+				sv.remove_prefix(2);
+				base = 16;
+			}
+			uint64_t addr = 0;
+			auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), addr, base);
+			if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+				return Fail(error, "invalid mod memory offset");
+			}
+			write.source_address = addr;
+			if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
+			    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
+			    write.off.size() != write.on.size()) {
+				return Fail(error, "invalid mod memory bytes");
+			}
+			if (entry.contains("expected") && !entry["expected"].is_null()) {
+				std::vector<uint8_t> expected;
+				if (!ParseBytes(entry["expected"].get<std::string>(), &expected) ||
+				    expected != write.off) {
+					return Fail(error, "expected memory bytes mismatch");
+				}
+			}
+			plan->writes.push_back(std::move(write));
 		}
-		return true;
-	} catch (const std::exception& e) {
-		return Fail(error, std::string("cheat parsing error: ") + e.what());
 	}
+	return true;
 }
 
 bool ValidateGame(const Plan& plan, const Program* main_program, std::string* error) {
@@ -249,13 +266,22 @@ bool ValidateGame(const Plan& plan, const Program* main_program, std::string* er
 	return true;
 }
 
-void Translate(const Program& program, uint64_t source_base, uint64_t source_address,
+bool Translate(const Program& program, uint64_t source_base, uint64_t source_address,
                uint64_t* target_address) {
 	if (source_address >= source_base) {
-		*target_address = program.base_vaddr + source_address - source_base;
-		return;
+		const uint64_t diff = source_address - source_base;
+		if (diff > UINT64_MAX - program.base_vaddr) {
+			return false;
+		}
+		*target_address = program.base_vaddr + diff;
+		return true;
 	}
-	*target_address = program.base_vaddr - (source_base - source_address);
+	const uint64_t diff = source_base - source_address;
+	if (diff > program.base_vaddr) {
+		return false;
+	}
+	*target_address = program.base_vaddr - diff;
+	return true;
 }
 
 bool IsInsideProgram(const Program& program, uint64_t address, size_t size) {
@@ -271,11 +297,15 @@ bool IsZero(const std::vector<uint8_t>& bytes) {
 
 bool TranslateAndValidate(Plan* plan, const Program& program, uint64_t source_base) {
 	for (auto& write: plan->writes) {
-		Translate(program, source_base, write.source_address, &write.target_address);
-		if (!IsZero(write.off) &&
-		    (!IsInsideProgram(program, write.target_address, write.off.size()) ||
-		     std::memcmp(reinterpret_cast<const void*>(write.target_address), write.off.data(),
-		                 write.off.size()) != 0)) {
+		if (!Translate(program, source_base, write.source_address, &write.target_address)) {
+			return false;
+		}
+		if (IsInsideProgram(program, write.target_address, write.off.size())) {
+			if (std::memcmp(reinterpret_cast<const void*>(write.target_address), write.off.data(),
+			                write.off.size()) != 0) {
+				return false;
+			}
+		} else if (!IsZero(write.off)) {
 			return false;
 		}
 	}

@@ -577,6 +577,8 @@ void TestMergeDocumentsAndPrepare() {
 	                                                    QStringLiteral("01.018.001"), nullptr, {}, true);
 	Check(versioned_merge.object().value(QStringLiteral("version")).toString() == QStringLiteral("01.018.001"),
 	      "merge should update version to installed game version");
+	Check(versioned_merge.object().value(QStringLiteral("mods")).toArray()[0].toObject().value(QStringLiteral("enabled")).toBool() == false,
+	      "cross-version merge should safely disable older base mods");
 
 	// Test PrepareForImport
 	const QByteArray raw_import_json = R"({
@@ -696,6 +698,9 @@ void TestValidateImportAndSave() {
 	// Non-zero section
 	test_invalid(R"({"id":"PPSA21567","version":"01.018.000","process":"eboot.bin","mods":[{"name":"A","memory":[{"offset":"0x10","on":"90","off":"00","section":1}]}]})",
 	             "non-zero section");
+	// Fractional section
+	test_invalid(R"({"id":"PPSA21567","version":"01.018.000","process":"eboot.bin","mods":[{"name":"A","memory":[{"offset":"0x10","on":"90","off":"00","section":0.5}]}]})",
+	             "fractional section 0.5");
 	// Unsupported memory addressing: absolute
 	test_invalid(R"({"id":"PPSA21567","version":"01.018.000","process":"eboot.bin","mods":[{"name":"A","memory":[{"offset":"0x10","on":"90","off":"00","absolute":true}]}]})",
 	             "absolute memory addressing");
@@ -856,6 +861,11 @@ void TestConvertTrainer() {
 
 	QByteArray missing_attr_xml = R"(<Trainer Version="1.00"><Cheat Text="A"><Offset>0x10</Offset><ValueOn>90</ValueOn><ValueOff>00</ValueOff></Cheat></Trainer>)";
 	Check(!Cheats::ConvertTrainer(&missing_attr_xml, false).isEmpty(), "trainer without Title ID attribute should report error");
+
+	QByteArray incomplete_write_xml = R"(<Trainer Ppsa="PPSA11111" Version="1.00" Process="eboot.bin">
+		<Cheat Text="Incomplete"><Write><Offset>0x1000</Offset><ValueOn>9090</ValueOn></Write></Cheat>
+	</Trainer>)";
+	Check(!Cheats::ConvertTrainer(&incomplete_write_xml, false).isEmpty(), "incomplete trainer write should report error");
 
 	// 5. Positive and Negative AES-256-CBC Encrypted MC4 Decryption (DEFECT-06)
 	QByteArray corrupt_mc4 = "CorruptedBase64==";

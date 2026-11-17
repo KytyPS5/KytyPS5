@@ -559,12 +559,14 @@ void PatchesDialog::ImportRemote() {
 		return;
 	}
 
-	const bool ver_match = m_version.isEmpty() || Cheats::VersionsMatch(file.version, m_version);
+	const auto doc_ver = m_remote_document.object().value(QStringLiteral("version")).toString().trimmed();
+	const auto effective_ver = !doc_ver.isEmpty() ? doc_ver : file.version;
+	const bool ver_match = m_version.isEmpty() || Cheats::VersionsMatch(effective_ver, m_version);
 	if (!ver_match) {
 		if (QMessageBox::question(
 		        this, tr("Version mismatch"),
 		        tr("This %1 was created for version %2, but your installed game version is %3.\n\nDo you want to import it anyway?")
-		            .arg(Cheats::ModuleTypeToString(file.type).toLower(), file.version, m_version),
+		            .arg(Cheats::ModuleTypeToString(file.type).toLower(), effective_ver, m_version),
 		        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
 			return;
 		}

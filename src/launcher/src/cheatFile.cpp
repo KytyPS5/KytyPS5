@@ -91,7 +91,7 @@ QString ValidateDocument(const QJsonDocument& document) {
 					bool ok = false;
 					const qint64 sec_num = sec.isDouble() ? sec.toInteger()
 					                                      : sec.toString().trimmed().toLongLong(&ok, 0);
-					if ((sec.isDouble() && sec_num != 0) || (sec.isString() && (!ok || sec_num != 0))) {
+					if ((sec.isDouble() && sec.toDouble() != 0.0) || (sec.isString() && (!ok || sec_num != 0))) {
 						return Tr("This cheat file uses memory addressing features that are not supported yet.");
 					}
 				}
@@ -249,32 +249,46 @@ QString ConvertTrainer(QByteArray* data, bool encrypted) {
 		QJsonObject mod {{QStringLiteral("name"), cheat_name}, {QStringLiteral("enabled"), false}};
 		QJsonArray  memory;
 		QJsonObject flat_write;
-		auto flush_flat_write = [&]() {
-			if (!flat_write.value(QStringLiteral("offset")).toString().isEmpty() &&
-			    !flat_write.value(QStringLiteral("on")).toString().isEmpty() &&
-			    !flat_write.value(QStringLiteral("off")).toString().isEmpty()) {
-				memory.append(flat_write);
-				flat_write = QJsonObject();
+		auto flush_flat_write = [&]() -> bool {
+			if (flat_write.isEmpty()) {
+				return true;
 			}
+			if (flat_write.value(QStringLiteral("offset")).toString().isEmpty() ||
+			    flat_write.value(QStringLiteral("on")).toString().isEmpty() ||
+			    flat_write.value(QStringLiteral("off")).toString().isEmpty()) {
+				return false;
+			}
+			memory.append(flat_write);
+			flat_write = QJsonObject();
+			return true;
 		};
-		auto maybe_flush_for_field = [&](const QString& field_name) {
+		auto maybe_flush_for_field = [&](const QString& field_name) -> bool {
 			if (flat_write.contains(field_name)) {
-				flush_flat_write();
+				return flush_flat_write();
 			}
+			return true;
 		};
 		while (xml.readNextStartElement()) {
 			const auto tag = xml.name().toString();
 			if (tag.compare(QLatin1String("Offset"), Qt::CaseInsensitive) == 0) {
-				maybe_flush_for_field(QStringLiteral("offset"));
+				if (!maybe_flush_for_field(QStringLiteral("offset"))) {
+					return Tr("Trainer contains an incomplete cheat write entry.");
+				}
 				flat_write.insert(QStringLiteral("offset"), xml.readElementText().trimmed());
 			} else if (tag.compare(QLatin1String("ValueOn"), Qt::CaseInsensitive) == 0) {
-				maybe_flush_for_field(QStringLiteral("on"));
+				if (!maybe_flush_for_field(QStringLiteral("on"))) {
+					return Tr("Trainer contains an incomplete cheat write entry.");
+				}
 				flat_write.insert(QStringLiteral("on"), clean_bytes(xml.readElementText().trimmed()));
 			} else if (tag.compare(QLatin1String("ValueOff"), Qt::CaseInsensitive) == 0) {
-				maybe_flush_for_field(QStringLiteral("off"));
+				if (!maybe_flush_for_field(QStringLiteral("off"))) {
+					return Tr("Trainer contains an incomplete cheat write entry.");
+				}
 				flat_write.insert(QStringLiteral("off"), clean_bytes(xml.readElementText().trimmed()));
 			} else if (tag.compare(QLatin1String("Section"), Qt::CaseInsensitive) == 0) {
-				maybe_flush_for_field(QStringLiteral("section"));
+				if (!maybe_flush_for_field(QStringLiteral("section"))) {
+					return Tr("Trainer contains an incomplete cheat write entry.");
+				}
 				auto value = xml.readElementText().trimmed();
 				bool ok = false;
 				const auto sec_num = value.toLongLong(&ok, 0);
@@ -284,13 +298,17 @@ QString ConvertTrainer(QByteArray* data, bool encrypted) {
 					flat_write.insert(QStringLiteral("section"), value);
 				}
 			} else if (tag.compare(QLatin1String("Absolute"), Qt::CaseInsensitive) == 0) {
-				maybe_flush_for_field(QStringLiteral("absolute"));
+				if (!maybe_flush_for_field(QStringLiteral("absolute"))) {
+					return Tr("Trainer contains an incomplete cheat write entry.");
+				}
 				auto value = xml.readElementText().trimmed();
 				if (!value.isEmpty() && value != u"0" && value.compare(u"false", Qt::CaseInsensitive) != 0) {
 					flat_write.insert(QStringLiteral("absolute"), true);
 				}
 			} else {
-				flush_flat_write();
+				if (!flush_flat_write()) {
+					return Tr("Trainer contains an incomplete cheat write entry.");
+				}
 				QJsonObject write;
 				while (xml.readNextStartElement()) {
 					const auto field = xml.name().toString();
@@ -323,14 +341,19 @@ QString ConvertTrainer(QByteArray* data, bool encrypted) {
 						xml.skipCurrentElement();
 					}
 				}
-				if (!write.value(QStringLiteral("offset")).toString().isEmpty() &&
-				    !write.value(QStringLiteral("on")).toString().isEmpty() &&
-				    !write.value(QStringLiteral("off")).toString().isEmpty()) {
+				if (!write.isEmpty()) {
+					if (write.value(QStringLiteral("offset")).toString().isEmpty() ||
+					    write.value(QStringLiteral("on")).toString().isEmpty() ||
+					    write.value(QStringLiteral("off")).toString().isEmpty()) {
+						return Tr("Trainer contains an incomplete cheat write entry.");
+					}
 					memory.append(write);
 				}
 			}
 		}
-		flush_flat_write();
+		if (!flush_flat_write()) {
+			return Tr("Trainer contains an incomplete cheat write entry.");
+		}
 		if (!cheat_name.isEmpty() && !memory.isEmpty()) {
 			mod.insert(QStringLiteral("memory"), memory);
 			mods.append(mod);
@@ -709,7 +732,10 @@ bool ApplyConfigPreset(Configuration* config, const QJsonDocument& doc, QString*
 	const auto cpu      = cfg.value(QStringLiteral("cpu")).toObject();
 	const auto audio    = cfg.value(QStringLiteral("audio")).toObject();
 
-	Configuration temp = *config;
+	Configuration temp;
+	temp.CopyEmulatorSettingsFrom(*config);
+	temp.CopyGameInfoFrom(*config);
+	temp.elf = config->elf;
 	temp.custom_settings = true;
 
 	const auto fps_val = graphics.value(QStringLiteral("targetFps"));
@@ -923,7 +949,10 @@ bool ApplyConfigPreset(Configuration* config, const QJsonDocument& doc, QString*
 			return false;
 		}
 	}
-	*config = temp;
+	config->CopyEmulatorSettingsFrom(temp);
+	config->CopyGameInfoFrom(temp);
+	config->elf = temp.elf;
+	config->custom_settings = true;
 	return true;
 }
 
@@ -963,7 +992,7 @@ static bool SanitizeModEntry(const QJsonObject& in_mod, const QString& fallback_
 				bool ok = false;
 				const qint64 sec_num = sec.isDouble() ? sec.toInteger()
 				                                      : sec.toString().trimmed().toLongLong(&ok, 0);
-				if ((sec.isDouble() && sec_num != 0) || (sec.isString() && (!ok || sec_num != 0))) {
+				if ((sec.isDouble() && sec.toDouble() != 0.0) || (sec.isString() && (!ok || sec_num != 0))) {
 					return false;
 				}
 			}
@@ -1185,11 +1214,12 @@ QJsonDocument MergeDocuments(const QJsonDocument& base_doc, const QJsonDocument&
 	} else if (base_id.isEmpty() && !new_id.isEmpty()) {
 		root.insert(QStringLiteral("id"), new_id.trimmed().toUpper());
 	}
-	if (!version.isEmpty()) {
-		root.insert(QStringLiteral("version"), version);
-	} else if (base_ver.isEmpty() && !new_ver.isEmpty()) {
-		root.insert(QStringLiteral("version"), new_ver);
+	const QString target_ver = !version.isEmpty() ? version : (!base_ver.isEmpty() ? base_ver : new_ver);
+	if (!target_ver.isEmpty()) {
+		root.insert(QStringLiteral("version"), target_ver);
 	}
+	const bool base_version_changed = !base_ver.isEmpty() && !target_ver.isEmpty() &&
+	                                  !VersionsMatch(base_ver, target_ver);
 	if (!root.contains(QStringLiteral("process")) ||
 	    root.value(QStringLiteral("process")).toString().trimmed().isEmpty()) {
 		const auto target_proc = !trimmed_process.isEmpty() ? trimmed_process
@@ -1204,6 +1234,18 @@ QJsonDocument MergeDocuments(const QJsonDocument& base_doc, const QJsonDocument&
 		root.insert(QStringLiteral("credits"), new_doc.object().value(QStringLiteral("credits")));
 	}
 	auto base_mods = root.value(QStringLiteral("mods")).toArray();
+	if (base_version_changed) {
+		QJsonArray disabled_base_mods;
+		for (const auto& val: base_mods) {
+			if (val.isObject()) {
+				auto mod_obj = val.toObject();
+				mod_obj.insert(QStringLiteral("enabled"), false);
+				disabled_base_mods.append(mod_obj);
+			}
+		}
+		base_mods = disabled_base_mods;
+		root.insert(QStringLiteral("mods"), base_mods);
+	}
 	QSet<QString> existing_names;
 	for (const auto& val: base_mods) {
 		if (val.isObject()) {

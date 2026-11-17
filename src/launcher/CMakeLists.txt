@@ -49,6 +49,8 @@ set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON
 
 add_executable(launcher_cheat_repository_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/CheatRepositoryTests.cpp"
+	include/cheatRepository.h
+	include/configuration.h
 	src/cheatFile.cpp
 	src/cheatRepository.cpp
 	src/configuration.cpp

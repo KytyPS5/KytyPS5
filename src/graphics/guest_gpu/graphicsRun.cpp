@@ -633,34 +633,44 @@ void GuestGpu::ResolveThread() {
 					}
 				}
 			}
-		} else if (operation->kind == GpuOperationKind::DispatchDirect && operation->dispatch.mode == 0x41u &&
-		           Scout::Mode() == 3 && Scout::Running() &&
-		           executor.TableDispatchHint(operation->state.shaders->GetCs())) {
-			// A dispatch the table serves, most likely: its table evaluation ahead (as a table draw's) and no
-			// resolution.
-			const auto&                   cs  = operation->state.shaders->GetCs();
-			const std::array<uint64_t, 3> key {cs.cs_regs.data_addr, 0, 0xffffffffu};
-			auto& ticket = m_table_tickets[m_table_ticket_next & (TableTicketRing - 1)];
-			if (Scout::EvaluateAhead(key, XXH3_64bits(key.data(), sizeof(key)),
-			                         {cs.cs_user_sgpr.value, std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)},
-			                         {}, ticket)) {
-				operation->table_ticket = &ticket;
-				m_table_ticket_next++;
+		} else if (operation->kind == GpuOperationKind::DispatchDirect ||
+		           operation->kind == GpuOperationKind::DispatchIndirect) {
+			// A dispatch the table serves, most likely (direct, or indirect of thread groups): its table evaluation
+			// ahead (as a table draw's), and no resolution unless a dispatch of its compute stage took the normal path
+			// lately (TableDispatchHint 3).
+			const auto&    cs   = operation->state.shaders->GetCs();
+			const uint32_t hint = (operation->kind == GpuOperationKind::DispatchDirect ||
+			                       (operation->dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) &&
+			                              Scout::Mode() == 3 && Scout::Running()
+			                          ? executor.TableDispatchHint(cs)
+			                          : 0u;
+			if ((hint & 1u) != 0) {
+				const std::array<uint64_t, 3> key {cs.cs_regs.data_addr, 0, 0xffffffffu};
+				auto& ticket = m_table_tickets[m_table_ticket_next & (TableTicketRing - 1)];
+				if (Scout::EvaluateAhead(key, XXH3_64bits(key.data(), sizeof(key)),
+				                         {cs.cs_user_sgpr.value, std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)},
+				                         {}, ticket)) {
+					operation->table_ticket = &ticket;
+					m_table_ticket_next++;
+				}
 			}
-		} else if (operation->kind == GpuOperationKind::DispatchDirect) {
-			const uint32_t groups[] = {operation->dispatch.thread_group_x,
-			                           operation->dispatch.thread_group_y,
-			                           operation->dispatch.thread_group_z};
-			operation->resolved = executor.ResolveDispatchAhead(
-			    *operation->state.context, *operation->state.shaders, groups,
-			    operation->dispatch.mode, operation->processor->IsAsyncComputeQueue());
-		} else if (operation->kind == GpuOperationKind::DispatchIndirect) {
-			// The program does not depend on the GPU-written arguments, only on the registers
-			// and the guest memory its resources read.
-			operation->resolved = executor.ResolveIndirectDispatchAhead(
-			    *operation->state.context, *operation->state.shaders, operation->dispatch.mode,
-			    operation->dispatch.args_addr,
-			    operation->processor->IsAsyncComputeQueue());
+			if (hint == 1u) {
+				// (The table serves it: no resolution.)
+			} else if (operation->kind == GpuOperationKind::DispatchDirect) {
+				const uint32_t groups[] = {operation->dispatch.thread_group_x,
+				                           operation->dispatch.thread_group_y,
+				                           operation->dispatch.thread_group_z};
+				operation->resolved = executor.ResolveDispatchAhead(
+				    *operation->state.context, *operation->state.shaders, groups,
+				    operation->dispatch.mode, operation->processor->IsAsyncComputeQueue());
+			} else {
+				// The program does not depend on the GPU-written arguments, only on the registers
+				// and the guest memory its resources read.
+				operation->resolved = executor.ResolveIndirectDispatchAhead(
+				    *operation->state.context, *operation->state.shaders, operation->dispatch.mode,
+				    operation->dispatch.args_addr,
+				    operation->processor->IsAsyncComputeQueue());
+			}
 		}
 		// See GpuOperation::stream_in_place: the command processor is usually far ahead.
 		if (operation->kind != GpuOperationKind::Callback) {

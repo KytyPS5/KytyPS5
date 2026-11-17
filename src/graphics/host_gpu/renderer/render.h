@@ -339,8 +339,9 @@ public:
 	[[nodiscard]] bool TableDrewDraws() const noexcept { return m_table_drew_draws.load(std::memory_order_relaxed); }
 	// The executing draw's table evaluation, made ahead by the resolve thread (KYTY_SCOUT=3; null: none).
 	void SetTableTicket(const void* ticket) noexcept { m_table_ticket = ticket; }
-	// The resolve thread: whether a plain dispatch of `cs` most likely goes through the table (tableXpr.inc).
-	[[nodiscard]] bool TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept;
+	// The resolve thread: whether a dispatch of `cs` most likely goes through the table (tableXpr.inc), as TableHint
+	// (0 no; 1 yes; 3 yes, but one was refused lately: resolve it ahead all the same).
+	[[nodiscard]] uint32_t TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept;
 	void               TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept;
 	[[nodiscard]] bool TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint32_t count, uint32_t stride,
 	                               uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
@@ -939,9 +940,11 @@ private:
 	                bool storable);
 	// Table dispatches (KYTY_TABLE_DISPATCH): the normal path's plain dispatch teaches the shader pair its table
 	// program (TableDispatchLearn); later dispatches of the pair go through the table (TableDispatch).
-	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute);
-	bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z, uint32_t mode,
-	                   bool async_compute);
+	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute,
+	                        bool thread_dimensions);
+	void TableDispatchSpecial(const HW::ComputeShaderInfo& cs, bool thread_dimensions, const char* why);
+	bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
+	                   uint64_t indirect_args, bool thread_dimensions);
 	// The shader access a table image set adds to target `id` (KYTY_TABLE_TARGET_READ; none: empty).
 	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
 	// The try of the executing draw asked the normal path to store a record.
@@ -953,8 +956,10 @@ private:
 	// take the normal path, which is several times slower without the resolution ahead).
 	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
 	std::atomic<bool>                        m_table_drew_draws {false};
-	// The compute stages whose last plain dispatch went through the table (TableDispatchHint).
+	// The compute stages whose last dispatch went through the table (TableDispatchHint), and the frame until which their
+	// dispatches are resolved ahead all the same (one took the normal path lately).
 	std::array<std::atomic<uint64_t>, 4096> m_table_dispatched {};
+	std::array<std::atomic<uint64_t>, 4096> m_table_dispatch_mixed_until {};
 	std::array<std::atomic<uint64_t>, 16384> m_table_mixed_until {};
 	// Per hashed shader pair and start instance: its table try was refused for good (TableTry: the pair refused) under
 	// that shader map generation. Its draws take the normal path without the try (TableXprTry).

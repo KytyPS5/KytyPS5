@@ -487,8 +487,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 	// A dispatch of a shader pair that learned its table program (tableXpr.inc; KYTY_TABLE_DISPATCH).
-	if (!use_thread_dimensions &&
-	    TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, mode, async_compute)) {
+	if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, 0, use_thread_dimensions)) {
 		TableNoteDispatched(cs_regs, true);
 		m_resolved_draw = nullptr;
 		return;
@@ -512,12 +511,13 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
+		TableDispatchSpecial(cs_regs, use_thread_dimensions, "dispatch: a metadata clear or fill");
 		ResetBindings();
 		return;
 	}
 
-	// The shader pair of a plain dispatch learns its table program (the dispatches after it go through the table).
-	if (!use_thread_dimensions && mode == 0x41u) TableDispatchLearn(cs_regs, *compute_module, async_compute);
+	// The shader pair of the dispatch learns its table program (the dispatches after it go through the table).
+	TableDispatchLearn(cs_regs, *compute_module, async_compute, use_thread_dimensions);
 
 	if (use_thread_dimensions) {
 		thread_group_x = input_info.workgroup_counts[0];
@@ -893,6 +893,13 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	// A dispatch of a shader pair that learned its table program (tableXpr.inc; KYTY_TABLE_DISPATCH).
+	if (TableDispatch(buffer, 0, 0, 0, args_addr, false)) {
+		TableNoteDispatched(cs_regs, true);
+		m_resolved_draw = nullptr;
+		return;
+	}
+	TableNoteDispatched(cs_regs, false);
 	ShaderComputeInputInfo input_info {};
 	m_context.GetImageHeap().BeginDraw();
 	const ShaderModule* compute_module = nullptr;
@@ -902,6 +909,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
 	if (compute_module == nullptr) return;
+	TableDispatchLearn(cs_regs, *compute_module, async_compute, false);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;

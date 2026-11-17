@@ -3071,6 +3071,8 @@ void TableLoadSwitches() {
 				value.store(static_cast<uint32_t>(std::strtoul(text, nullptr, 0)), std::memory_order_relaxed);
 		};
 		load("KYTY_TABLE_XPR", kyty_local_table_xpr_mode);
+		// (Table dispatches are on in Demon's Souls, where they were measured: KYTY_TABLE_DISPATCH=0/1 forces them.)
+		if (::Loader::DemonsSoulsTitle::IsSupportedGame()) kyty_local_table_dispatch_mode.store(1, std::memory_order_relaxed);
 		load("KYTY_TABLE_DISPATCH", kyty_local_table_dispatch_mode);
 		load("KYTY_TABLE_INDIRECT", kyty_local_table_indirect_mode);
 		load("KYTY_TABLE_STORE_BUDGET", kyty_local_table_store_budget);
@@ -3090,6 +3092,10 @@ uint32_t TableXprMode() {
 	TableLoadSwitches();
 	return kyty_local_table_xpr_mode.load(std::memory_order_relaxed);
 }
+uint32_t TableDispatchMode() {
+	TableLoadSwitches();
+	return kyty_local_table_dispatch_mode.load(std::memory_order_relaxed);
+}
 } // namespace
 
 namespace {
@@ -3106,21 +3112,28 @@ uint32_t RenderExecutor::TableHint(const HW::Shader& shaders) const noexcept {
 	return m_table_mixed_until[slot].load(std::memory_order_relaxed) < m_context.FrameNumber() ? 1u : 3u;
 }
 
-// Whether the last plain dispatch of the compute stage's code went through its table program (TableDispatch): the
-// resolve thread makes its table evaluation ahead instead of resolving it (KYTY_SCOUT=3).
-bool RenderExecutor::TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept {
-	if (TableXprMode() == 0 || kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) == 0) return false;
-	const auto tag = (cs.cs_regs.data_addr * 0x9e3779b97f4a7c15ull) | 1ull;
-	return m_table_dispatched[(tag >> 40u) & (m_table_dispatched.size() - 1)].load(std::memory_order_relaxed) == tag;
-}
-void RenderExecutor::TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept {
+// Whether the last dispatch of the compute stage's code went through its table program (TableDispatch): the resolve
+// thread makes its table evaluation ahead instead of resolving it (KYTY_SCOUT=3), and resolves it all the same while a
+// dispatch of that code took the normal path lately (3).
+uint32_t RenderExecutor::TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept {
+	if (TableXprMode() == 0 || TableDispatchMode() == 0) return 0;
 	const auto tag  = (cs.cs_regs.data_addr * 0x9e3779b97f4a7c15ull) | 1ull;
-	auto&      slot = m_table_dispatched[(tag >> 40u) & (m_table_dispatched.size() - 1)];
-	if (tabled) {
-		if (slot.load(std::memory_order_relaxed) != tag) slot.store(tag, std::memory_order_relaxed);
-	} else if (slot.load(std::memory_order_relaxed) == tag) {
-		slot.store(0, std::memory_order_relaxed);
-	}
+	const auto slot = (tag >> 40u) & (m_table_dispatched.size() - 1);
+	if (m_table_dispatched[slot].load(std::memory_order_relaxed) != tag) return 0;
+	return m_table_dispatch_mixed_until[slot].load(std::memory_order_relaxed) < m_context.FrameNumber() ? 1u : 3u;
+}
+// (A compute stage whose dispatch took the normal path after one the table served keeps its resolutions ahead for
+// TableMixedDispatchFrames: Demon's Souls (PPSA01341) at Boletaria alternates ~15 indirect dispatches a frame between
+// the two, whose blocks or sets the table refuses now and then, and each one of those without its resolution chose its
+// program on the execution thread, ~220 us.)
+void RenderExecutor::TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept {
+	static constexpr uint64_t TableMixedDispatchFrames = 120;
+	const auto tag  = (cs.cs_regs.data_addr * 0x9e3779b97f4a7c15ull) | 1ull;
+	const auto slot = (tag >> 40u) & (m_table_dispatched.size() - 1);
+	const bool was  = m_table_dispatched[slot].load(std::memory_order_relaxed) == tag;
+	if (tabled && !was) m_table_dispatched[slot].store(tag, std::memory_order_relaxed);
+	if (!tabled && was)
+		m_table_dispatch_mixed_until[slot].store(m_context.FrameNumber() + TableMixedDispatchFrames, std::memory_order_relaxed);
 }
 
 bool RenderExecutor::TableLikely(const HW::Shader& shaders) const noexcept {
@@ -3250,6 +3263,16 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 }
 
 #if KYTY_CX_DISPATCH
+// KYTY_TABLE_DISPATCH=1 (on by default in Demon's Souls; TableLoadSwitches): a compute shader the normal path dispatched
+// (its resource tables evaluated in full), whose program allows table mode, is dispatched as table draws are drawn: its
+// slots in a block, its read-only V#s resolved once, its written ones obtained as written at every dispatch (the buffer
+// cache tracks the GPU's writes), its images and samplers in a set, the barriers as the normal path's. Direct
+// dispatches of thread groups or of thread counts, and indirect dispatches of thread groups (their arguments read by
+// the GPU); indirect dispatches of thread counts (the normal path reads the counts) and the shaders a special path of
+// the normal path took (metadata clears, fills) stay on the normal path. (chenxiao07's TableDispatch, table-xpr.inc.)
+
+// The compute stage's registers that select the program (ShaderGetStaticInputInfoCS reads them), and whether the
+// dispatch counts threads (another program: ShaderComputeInputInfo::dispatch_thread_dimensions).
 static std::array<uint64_t, 4> TableDispatchWords(const HW::ComputeShaderInfo& cs, bool thread_dimensions) {
 	const auto& r = cs.cs_regs;
 	return {r.data_addr, uint64_t {r.num_thread_x} | uint64_t {r.num_thread_y} << 32u,
@@ -3265,21 +3288,46 @@ static uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool thread_di
 	return TableDispatchKey(TableDispatchWords(cs, thread_dimensions));
 }
 
-// What table dispatches serve: a table program whose shader data fits the push constants.
-static bool TableDispatchServes(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+// What table dispatches serve: a table program whose shader data fits the push constants, without GDS or LDS kept in a
+// device buffer (the table set binds neither), and the thread counts pushed only for a dispatch of thread counts.
+static bool TableDispatchServes(const ShaderRecompiler::IR::CompiledShaderInfo& program, bool thread_dimensions) {
+	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
 	return program.table_mode && program.bindings.UsesPushData() && !program.info.uses_gds &&
-	       program.bindings.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart;
+	       program.bindings.descriptor_counts[static_cast<size_t>(Kind::SharedMemory)] == 0 &&
+	       (thread_dimensions || program.bindings.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart);
 }
 
-// The normal path dispatched `module` (a plain dispatch: mode 0x41, no thread counts): the shader pair of its
-// registers learns the table program for that dispatch's specialization (it compiles on the shader workers meanwhile),
-// and its pipeline. (His TableDispatchSeen counts the sightings and asks for the program of the compute stage's
-// registers itself; the normal path's lookup is what chooses the specialization here.) Programs table mode cannot serve
-// (indirect descriptors and images, GDS, ...) take the normal path for good.
-void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute) {
-	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) == 0 || TableXprMode() == 0) return;
+// The normal path took a dispatch of the compute stage's registers by one of its special paths (`why`: a metadata clear,
+// a fill): the shader stays there for good, as his TableDispatchSeen with a special path marks it.
+void RenderExecutor::TableDispatchSpecial(const HW::ComputeShaderInfo& cs, bool thread_dimensions, const char* why) {
+	if (TableDispatchMode() == 0 || TableXprMode() == 0) return;
 	auto&      table = OwnTable();
-	const auto key   = TableDispatchKey(cs, false);
+	const auto key   = TableDispatchKey(cs, thread_dimensions);
+	auto       it    = table.dispatches.find(key);
+	if (it != table.dispatches.end() && it->second.refused) return;
+	if (it == table.dispatches.end()) {
+		it            = table.dispatches.try_emplace(key).first;
+		it->second.vs = cs.cs_regs.data_addr;
+	}
+	auto& pair = it->second;
+	if (pair.programs[0] != nullptr) {
+		const auto write = CatalogWrite();
+		TableReset(pair);
+	}
+	pair.refused = true;
+	pair.special = why;
+}
+
+// The normal path dispatched `module` (any but an indirect dispatch of thread counts): the shader pair of its registers
+// learns the table program for that dispatch's specialization (it compiles on the shader workers meanwhile), and its
+// pipeline. (His TableDispatchSeen counts the sightings and asks for the program of the compute stage's registers
+// itself; the normal path's lookup is what chooses the specialization here.) Programs table mode cannot serve
+// (indirect descriptors and images, GDS, ...) take the normal path for good.
+void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute,
+                                        bool thread_dimensions) {
+	if (TableDispatchMode() == 0 || TableXprMode() == 0) return;
+	auto&      table = OwnTable();
+	const auto key   = TableDispatchKey(cs, thread_dimensions);
 	auto       it    = table.dispatches.find(key);
 	if (it == table.dispatches.end()) {
 		it     = table.dispatches.try_emplace(key).first;
@@ -3305,7 +3353,8 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const S
 		pair.special = why;
 	};
 	if (plan == nullptr || specialization == nullptr) return refuse("no resource plan");
-	if (program.info.uses_gds || program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart ||
+	if (program.info.uses_gds ||
+	    (!thread_dimensions && program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) ||
 	    program.bindings.ray_query_dword != ShaderRecompiler::IR::PushData::NoStart ||
 	    program.info.uses_image_heap || module.guest_traversal || program.info.bvh ||
 	    !program.info.self_sized_buffers.empty() ||
@@ -3315,7 +3364,8 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const S
 	if (RayTracing::TlasSource source; RayTracing::FindTlasSource(program.info, source))
 		return refuse("native ray tracing");
 	auto compute = std::make_unique<ShaderComputeInputInfo>();
-	compute->async_compute = async_compute;
+	compute->async_compute              = async_compute;
+	compute->dispatch_thread_dimensions = thread_dimensions;
 	// (The buffers the pair saw change format are specialized for none, as a draw's: TableStore.)
 	auto portable = *specialization;
 	for (size_t i = 0; i < portable.buffers.size() && i < 32; ++i) {
@@ -3326,7 +3376,7 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const S
 	const auto result = pipelines.GetComputeProgramTable(cs, *compute, portable);
 	if (result.status == PipelineCache::TableStatus::Pending) return void();
 	if (result.status == PipelineCache::TableStatus::Refused || result.module == nullptr ||
-	    !TableDispatchServes(result.module->info))
+	    !TableDispatchServes(result.module->info, thread_dimensions))
 		return refuse(result.refusal != nullptr ? result.refusal->c_str() : "table mode cannot serve it");
 	compute->stage = {.module = result.module, .resources = &g_table_no_resources};
 	// (Made by a background thread, as a draw pair's: creating it here stalled the execution thread as areas came into
@@ -3346,20 +3396,23 @@ void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const S
 #endif
 }
 
-// A plain dispatch from the shader pair's table program (see TableDispatchLearn): the slots and buffers of the
-// compute stage's plan evaluated into a block, the images and samplers in a descriptor set (TableSet), the block's
-// address pushed with the user data. False: the normal path dispatches.
+// A dispatch from the shader pair's table program (see TableDispatchLearn): the slots and buffers of the compute stage's
+// plan evaluated into a block, the images and samplers in a descriptor set (TableSet), the block's address pushed with
+// the user data. `indirect_args`: the guest address of the GPU-read thread group counts (an indirect dispatch), else
+// `groups_*` are the groups, or the threads with `thread_dimensions`. False: the normal path dispatches.
 bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-                                   uint32_t mode, bool async_compute) {
-	(void)async_compute;
-	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) == 0) return false;
-	if (mode != 0x41u) return false;
+                                   uint64_t indirect_args, bool thread_dimensions) {
+	if (TableDispatchMode() == 0) return false;
+	// (An indirect dispatch of thread counts: the normal path reads the counts the GPU wrote.)
+	if (indirect_args != 0 && thread_dimensions) return false;
 	auto& table = OwnTable();
 	if (table.dispatches.empty() || buffer.IsInvalid()) return false;
+	TableSweepPairs();
 	const auto& sh    = buffer.GetShaders();
 	const auto& cs    = sh.GetCs();
-	const auto  words = TableDispatchWords(cs, false);
-	// (The pair found last again without its hash or lookup: runs of dispatches keep their program.)
+	const auto  words = TableDispatchWords(cs, thread_dimensions);
+	// (The pair found last again without its hash or lookup: runs of dispatches keep their program. A pointer stays
+	// valid until TableSweepPairs, which drops this one.)
 	auto* known = table.found_dispatch_key == words ? table.found_dispatch : nullptr;
 	if (known == nullptr) {
 		const auto found = table.dispatches.find(TableDispatchKey(words));
@@ -3375,13 +3428,23 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	pair.used_frame = m_context.FrameNumber();
 	TablePrefetchNext(table.previous_dispatch, pair);
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0); // census: the dispatches' phases (b)
+	// The sets of the dispatches retire here too (TableXprTry collects them for the draws).
+	NativeXprCollect();
 	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
 		if (ShaderHashAt(pair.vs) != pair.programs[0]->shader_hash) {
 			const auto write = CatalogWrite();
+			pair.portable    = {};
 			TableReset(pair);
 			return false;
 		}
 		pair.Generation(Role()) = generation;
+	}
+	// A buffer whose V#s changed format (TableBlocks): the program is learned again with its format decoded at run time
+	// (TableDispatchLearn, from the normal path's next dispatch of the pair).
+	if (pair.respecialize) {
+		const auto write = CatalogWrite();
+		TableReset(pair);
+		return false;
 	}
 	TablePrefetchArrays(pair, pair.LastSet(Role()));
 	const std::array<std::span<const uint32_t>, 2> user_data {
@@ -3415,10 +3478,17 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
 	const auto registration = cache.RegistrationEpoch(); // (as TableDraw's)
 	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return false;
+	// An indirect dispatch's arguments, as the normal path's DispatchIndirect obtains them.
+	Buffer*  args_owner  = nullptr;
+	uint64_t args_offset = 0;
+	if (indirect_args != 0) {
+		std::tie(args_owner, args_offset) = cache.ObtainBuffer(indirect_args, sizeof(vk::DispatchIndirectCommand), false);
+		if (args_owner == nullptr || (args_offset & 3u) != 0) return false;
+	}
 	if (cache.RegistrationEpoch() != registration) return LiveCounters::Add(LiveCounters::TableRegistered), false;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 4);
-	// Emission, as DispatchDirect's.
+	// Emission, as DispatchDirect's and DispatchIndirect's.
 	buffer.EndRendering();
 	auto       vk_buffer         = buffer.Handle();
 	auto&      dispatch_textures = m_context.GetTextureCache();
@@ -3437,6 +3507,12 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		const auto index = program.info.user_data_registers[i] - program.user_data_base;
 		push_data.dwords[bindings.push_data_start_dword + i] = index < user_data[0].size() ? user_data[0][index] : 0;
 	}
+	// (A dispatch of thread counts: the counts, which the program bounds its threads by, as the normal path pushes them.)
+	if (thread_dimensions && bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		push_data.dwords[bindings.push_data_start_dword + bindings.dispatch_thread_dword]      = groups_x;
+		push_data.dwords[bindings.push_data_start_dword + bindings.dispatch_thread_dword + 1u] = groups_y;
+		push_data.dwords[bindings.push_data_start_dword + bindings.dispatch_thread_dword + 2u] = groups_z;
+	}
 	push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[0]);
 	push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword() + 1] = static_cast<uint32_t>(blocks[0] >> 32u);
 	vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -3446,16 +3522,30 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 	if (storage_writes && !chained) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(groups_x, groups_y, groups_z);
+	if (args_owner != nullptr) {
+		// (As DispatchIndirect: chained, the barrier before the previous dispatch ordered the arguments' writes.)
+		if (!chained) {
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+			                              vk::PipelineStageFlagBits::eTransfer,
+			                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
+		vk_buffer.dispatchIndirect(args_owner->Handle(), args_offset);
+	} else if (thread_dimensions) {
+		// Thread counts: the groups that cover them, as the normal path's.
+		const auto& r      = cs.cs_regs;
+		const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
+		vk_buffer.dispatch(groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y), groups(groups_z, r.num_thread_z));
+	} else {
+		vk_buffer.dispatch(groups_x, groups_y, groups_z);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_deferred_barrier       = true;
 	m_deferred_barrier_queue = m_guest_queue;
-	// The dispatch left the images of its set in the layouts it needs (a target it writes as storage in GENERAL): a
-	// later table draw does its targets' and sets' transits again.
-	table.images_epoch = 0;
-	table.last_state   = nullptr;
-	// (A later table draw binds its pipeline and set again: the graphics state is untouched.)
-	m_context.GetCommandScheduler().GetDynamicState().MoveGeneration();
+	// (A later table draw keeps its pipeline, set and state: the dispatch binds none of the graphics bind point, and an
+	// image its set moved moves TextureCache::ImagesEpoch.)
 	LiveCounters::Add(LiveCounters::TableDispatches);
 	return true;
 }

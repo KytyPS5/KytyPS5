@@ -398,9 +398,10 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 
 uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                     uint32_t index) {
-	// The descriptor range ends where access.length does.
-	if (state.profile.robust_buffer_access && (access.kind == IR::ResourceKind::Buffer ||
-	                                           access.kind == IR::ResourceKind::ScalarBuffer)) {
+	// The descriptor range ends where access.length does. Not a table mode buffer's: it is a device address
+	// (access.physical), which no range bounds, and past the V#'s range the guest's GPU gives zero and drops the stores.
+	if (state.profile.robust_buffer_access && !access.physical &&
+	    (access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer)) {
 		return ConstantBool(state, true);
 	}
 	return EmitMemoryElementInBounds(state, access, index);

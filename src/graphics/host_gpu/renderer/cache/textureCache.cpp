@@ -1513,12 +1513,14 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		// Volume depth is not an array-layer count. A larger depth can retain the
-		// same block-slice layout while requiring a larger native image.
+		// same block-slice layout while requiring a larger native image. With equal levels the
+		// mip layouts match here, so the block slices are the same whatever the width within
+		// the pitch: SAROS (PPSA07631) resizes its volumes with the dynamic resolution and in PS5
+		// Pro mode goes from 96 to 128 slices, once with another width at the same time (8 MiB
+		// over 6 MiB at 0x3205ac0000).
 		if ((requested.IsVolume() || cached.info.IsVolume()) &&
 		    (requested.data.size == cached.info.data.size ||
 		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
-		      requested.extent.width == cached.info.extent.width &&
-		      requested.extent.height == cached.info.extent.height &&
 		      requested.extent.depth > cached.info.extent.depth))) {
 			return {ExpandImage(requested, cached_id)};
 		}

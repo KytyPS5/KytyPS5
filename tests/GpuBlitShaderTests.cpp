@@ -1,4 +1,5 @@
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <gtest/gtest.h>
 #include <spirv/unified1/spirv.hpp>
@@ -7,6 +8,30 @@
 #include <iterator>
 
 namespace {
+
+using namespace Libs;
+
+TEST(VideoOutFormat, DetectsHdrPixelFormats) {
+	EXPECT_TRUE(Graphics::IsHdrVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ));
+	EXPECT_TRUE(Graphics::IsHdrVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ));
+	EXPECT_TRUE(Graphics::IsHdrVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ));
+	EXPECT_TRUE(Graphics::IsHdrVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ));
+	EXPECT_FALSE(Graphics::IsHdrVideoOutPixelFormat(0x8000000022000000ull));
+	EXPECT_FALSE(Graphics::IsHdrVideoOutPixelFormat(0x8100000022000000ull));
+}
+
+TEST(VideoOutFormat, DistinguishesLinearFromPqFormats) {
+	EXPECT_TRUE(Graphics::IsLinearVideoOutPixelFormat(0x8100000622000000ull));
+	EXPECT_TRUE(Graphics::IsLinearVideoOutPixelFormat(0x8100000600000000ull));
+	EXPECT_TRUE(Graphics::IsLinearVideoOutPixelFormat(0xc001000622000000ull));
+	EXPECT_TRUE(Graphics::IsLinearVideoOutPixelFormat(0xc001000600000000ull));
+	EXPECT_TRUE(Graphics::IsLinearVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ));
+	EXPECT_TRUE(Graphics::IsLinearVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ));
+	EXPECT_FALSE(Graphics::IsLinearVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ));
+	EXPECT_FALSE(Graphics::IsLinearVideoOutPixelFormat(Graphics::VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ));
+	EXPECT_FALSE(Graphics::IsLinearVideoOutPixelFormat(0x8000000022000000ull));
+	EXPECT_FALSE(Graphics::IsLinearVideoOutPixelFormat(0x8100000022000000ull));
+}
 
 TEST(GpuBlitShaders, MeshIndirectTaskDeclaresLocalSize) {
 	bool local_size    = false;

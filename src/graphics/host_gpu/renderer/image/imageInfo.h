@@ -308,6 +308,18 @@ inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT210
 	}
 }
 
+[[nodiscard]] constexpr bool IsLinearVideoOutPixelFormat(uint64_t format) {
+	switch (format) {
+		case 0x8100000622000000ull:
+		case 0x8100000600000000ull:
+		case 0xc001000622000000ull:
+		case 0xc001000600000000ull:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return true;
+		default: return false;
+	}
+}
+
 inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},

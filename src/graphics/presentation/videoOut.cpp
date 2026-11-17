@@ -203,6 +203,12 @@ struct VideoOutConfig {
 	std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
 };
 
+static bool IsHdrAllowedForTitle() {
+	int32_t attribute = 0;
+	return !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
+	       (attribute & 0x20000000) != 0;
+}
+
 class FlipQueue {
 public:
 	FlipQueue(Graphics::Presenter& presenter, uint32_t width, uint32_t height)
@@ -274,6 +280,9 @@ public:
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
 	bool                     IsHdrSupported() const noexcept { return m_presenter.IsHdrSupported(); }
+	bool                     IsHdrActive() const noexcept {
+		return IsHdrAllowedForTitle() && IsHdrSupported();
+	}
 
 	void VblankBegin();
 	void VblankEnd();
@@ -985,6 +994,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	bool                current = false;
 	bool                premultiplied_alpha = false;
 	bool                hdr                 = false;
+	bool                linear              = false;
 	bool                headset             = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
@@ -1001,6 +1011,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			const auto& group   = cfg->groups[surface.group_index];
 			source_info         = group.ImageInfo(surface);
 			hdr                 = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
+			linear              = Graphics::IsLinearVideoOutPixelFormat(group.attribute.pixel_format);
 			premultiplied_alpha = (group.attribute.option &
 			                       VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
 		}
@@ -1020,7 +1031,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(m_width, m_height,
 		                                       index == VIDEO_OUT_BUFFER_INDEX_BLACK, &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset, linear);
 		if (headset) {
 			g_headset_mirror = true;
 		}
@@ -1729,14 +1740,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 
 	int32_t attribute3 = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
-	int32_t attribute = 0;
-	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
-	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
-	status->dynamicRange = hdr_allowed && driver.IsHdrSupported() ? 2u : 1u;
+	status->dynamicRange = driver.IsHdrActive() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ

@@ -446,7 +446,13 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
 			break;
 		case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
-		case SDL_EVENT_WINDOW_HDR_STATE_CHANGED: RefreshDisplayLuminance(window); break;
+		case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
+			RefreshDisplayLuminance(window);
+			{
+				Common::LockGuard lock(mutex);
+				surface_dirty = true;
+			}
+			break;
 		default:
 			LOGF("Window %" PRIu32 " got unknown event %" PRIu32 "\n", window_event.windowID,
 			     static_cast<uint32_t>(window_event.type));

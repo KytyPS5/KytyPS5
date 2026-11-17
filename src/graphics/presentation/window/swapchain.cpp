@@ -36,6 +36,7 @@ struct Presenter::Frame {
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
 	bool          hdr          = false;
+	bool          linear       = false;
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
@@ -253,8 +254,9 @@ public:
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
 	bool SetHdr(bool hdr) {
-		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
-		m_hdr_requested = hdr;
+		const bool target_hdr = (hdr || Config::HdrEnabled()) && IsHdrSupported();
+		const bool changed    = m_hdr_active != target_hdr;
+		m_hdr_requested       = target_hdr;
 		return changed;
 	}
 
@@ -346,7 +348,7 @@ vk::SurfaceFormatKHR Swapchain::SelectFormat() {
 		           vk::FormatFeatureFlagBits::eBlitDst);
 	});
 	m_hdr_supported        = Config::HdrEnabled() && hdr_format != formats.end();
-	m_hdr_active           = m_hdr_requested && IsHdrSupported();
+	m_hdr_active           = (m_hdr_requested || Config::HdrEnabled()) && IsHdrSupported();
 	if (m_hdr_active) {
 		return *hdr_format;
 	}
@@ -378,7 +380,8 @@ void Swapchain::Create() {
 	// during creation, the next presentation will detect the newer size.
 	{
 		Common::LockGuard lock(m_window.mutex);
-		m_window_extent = {graphics.screen_width, graphics.screen_height};
+		m_window_extent        = {graphics.screen_width, graphics.screen_height};
+		m_window.surface_dirty = false;
 	}
 	EXIT_IF(m_window_extent.width == 0);
 	EXIT_IF(m_window_extent.height == 0);
@@ -569,7 +572,8 @@ void Swapchain::Recreate(bool surface_lost) {
 
 bool Swapchain::NeedsResize() const {
 	Common::LockGuard lock(m_window.mutex);
-	return m_handle == nullptr || m_window_extent.width != m_window.graphic_ctx.screen_width ||
+	return m_handle == nullptr || m_window.surface_dirty ||
+	       m_window_extent.width != m_window.graphic_ctx.screen_width ||
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
@@ -725,10 +729,10 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
 	// The main bus ignores alpha.
-	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
-	                       (frame.hdr ? 4u : 0u) |
-	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
-	                       (layer.bus == 0 ? 16u : 0u);
+	const uint32_t flags =
+	    (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
+	    ((frame.linear || frame.image.format == vk::Format::eR16G16B16A16Sfloat) ? 8u : 0u) |
+	    (layer.bus == 0 ? 16u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -758,7 +762,8 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	auto       vk_command      = command.Handle();
-	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
+	const bool convert_source =
+	    source != nullptr && (source->hdr != m_hdr_active || source->linear);
 	const bool blit_source     = source != nullptr && !convert_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
@@ -797,7 +802,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
 	                               ? FitAspect(aspect_source->image.extent, m_extent)
 	                               : vk::Rect2D {{0, 0}, m_extent};
-	if (source == nullptr || game_rect.extent != m_extent) {
+	if (source == nullptr || convert_source || game_rect.extent != m_extent) {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
 		                           &black, 1, &to_transfer.subresourceRange);
@@ -936,7 +941,7 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 Presenter::~Presenter() = default;
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
-                                          bool headset) {
+                                          bool headset, bool linear) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -946,8 +951,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	frame->hdr   = hdr;
-	frame->blank = false;
+	frame->hdr    = hdr;
+	frame->linear = linear;
+	frame->blank  = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -970,8 +976,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->hdr   = false;
-	frame->blank = true;
+	frame->hdr    = false;
+	frame->linear = false;
+	frame->blank  = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;

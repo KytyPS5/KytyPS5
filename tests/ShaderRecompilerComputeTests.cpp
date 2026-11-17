@@ -2507,7 +2507,29 @@ public:
             pixelsMatch(render(nit_source, 4u | 8u | 16u),
                         {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
             "linear-nit pixels were not converted to opaque sRGB");
+    Require(name, "linear-nit HDR target",
+            pixelsMatch(render(nit_source, 2u | 4u | 8u | 16u),
+                        {0xff000000u, 0xff828282u, 0xff9a9a9au, 0xff6b7f8cu}),
+            "linear-nit pixels were not converted to opaque HDR10 PQ");
 
+    auto sdr_source = CreateImage2D(
+        name, 4, 1, vk::Format::eR8G8B8A8Unorm, vk::ImageUsageFlagBits::eSampled,
+        {0x00000000u, 0x00808080u, 0x00ffffffu, 0x004080c0u}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "SDR linear source",
+            pixelsMatch(render(sdr_source, 8u | 16u),
+                        {0xff000000u, 0xffbcbcbcu, 0xffffffffu, 0xff89bce1u}),
+            "SDR linear pixels were not converted to opaque sRGB");
+    Require(name, "SDR sRGB to HDR target",
+            pixelsMatch(render(sdr_source, 2u | 16u),
+                        {0xff000000u, 0xff727272u, 0xff9a9a9au, 0xff597482u}),
+            "SDR sRGB pixels were not converted to opaque HDR10 PQ");
+    Require(name, "SDR linear to HDR target",
+            pixelsMatch(render(sdr_source, 2u | 8u | 16u),
+                        {0xff000000u, 0xff878787u, 0xff9a9a9au, 0xff79888eu}),
+            "SDR linear pixels were not converted to opaque HDR10 PQ");
+
+    DestroyImage(&sdr_source);
     DestroyImage(&nit_source);
     DestroyImage(&pq_source);
     DestroyImage(&target);

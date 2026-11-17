@@ -56,6 +56,7 @@ struct WindowContext {
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
+	bool                           surface_dirty = false;
 
 	Common::Mutex mutex;
 };

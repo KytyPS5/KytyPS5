@@ -8521,6 +8521,273 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // A draw that names the table offsets it can select gives only those probes elements, and a
+  // probe no draw named gives its element up at the suspend point of a frame that used its view.
+  // A draw that names none can select any probe: its view has every element for the frames an
+  // idle table stays, as a view no draw uses keeps what it has.
+  void CheckImageHeapDemand() {
+    constexpr const char *name = "ImageHeapDemand";
+    constexpr uintptr_t base = 0x0000000207800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t small_table = base + 0x180000;
+    constexpr uint64_t table_size = 0x10000;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // A 4x4 linear 2D texture per index.
+    const auto texture = [](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+    const auto descriptor = [&](uint32_t index, Format format) {
+      const uint64_t address = texture(index);
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(address >> 8u);
+      words[1] = static_cast<uint32_t>(address >> 40u) | (static_cast<uint32_t>(format) << 20u);
+      words[2] = 3u | (3u << 14u);
+      words[3] = DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    // Probe 9 is the only one of its kind.
+    for (uint32_t probe = 0; probe < 16u; ++probe) {
+      const auto words =
+          descriptor(probe, probe == 9u ? Format::k8_8_8_8UInt : Format::k8_8_8_8UNorm);
+      std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(), sizeof(words));
+      std::memcpy(reinterpret_cast<void *>(small_table + probe * 32u), words.data(),
+                  sizeof(words));
+    }
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      using Offsets = std::vector<uint32_t>;
+      const auto acquire = [&](const Offsets *demand, uint64_t address = table,
+                               uint64_t size = table_size) {
+        return heap.Acquire({address, size, 32u, 0u, size / 32u, &sampled, demand}, view);
+      };
+      const auto draw = [&] {
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+      };
+      const auto suspend = [&] {
+        heap.RunGarbageCollector();
+        heap.BeginDraw();
+      };
+      const auto write = [&](uint64_t probe, const std::array<uint32_t, 8> &words) {
+        Libs::LibKernel::Memory::WriteBacking(table + probe * 32u, words.data(), sizeof(words));
+        Require(name, "table write", context.InvalidateMemory(table + probe * 32u, sizeof(words)),
+                "the table was not mapped");
+      };
+      // Whether an image of the texture exists, and whether an element pins it.
+      const auto images = [&](uint32_t index) {
+        return TextureCacheTestAccess::FindImages(textures, texture(index), 64u);
+      };
+      const auto pinned = [&](uint32_t index) {
+        const auto found = images(index);
+        return found.size() == 1u && textures.GetImage(found[0]).heap_refs.load() != 0u;
+      };
+
+      const Offsets first{3u * 32u, 5u * 32u};
+      Require(name, "named view",
+              acquire(&first) && view.kinds.size() == 2u && view.slot_count == table_size / 4u,
+              "a view lost the kind of a probe no draw named");
+      const auto &named = *ImageHeapTestAccess::Views(heap)[0];
+      const auto &slots = named.slots;
+      Require(name, "named slots",
+              slots[24] != 0u && slots[40] != 0u && slots[0] == 0u && slots[72] == 0u &&
+                  named.populated_count == 2u && ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "a draw's offsets did not select exactly their probes");
+      draw();
+      Require(name, "named images",
+              pinned(3) && pinned(5) && images(0).empty() && images(9).empty(),
+              "a probe no draw named resolved its image");
+      // A second draw adds its probes. An offset off the lattice or past the table names none.
+      const Offsets second{7u * 32u, 4u * 32u + 4u, static_cast<uint32_t>(table_size) + 64u};
+      Require(name, "second draw",
+              acquire(&second) && slots[56] != 0u && slots[24] != 0u && slots[32] == 0u &&
+                  slots[33] == 0u && named.populated_count == 3u,
+              "the draws of a frame did not add up, or a stray offset selected a probe");
+      draw();
+      suspend();
+      Require(name, "named frame", slots[24] != 0u && slots[40] != 0u && slots[56] != 0u,
+              "a suspend point released probes its frame named");
+      const Offsets third{5u * 32u};
+      Require(name, "third draw", acquire(&third) && slots[24] != 0u && slots[56] != 0u,
+              "a probe was released before the suspend point of a frame that did not name it");
+      draw();
+      suspend();
+      Require(name, "unnamed probes",
+              slots[24] == 0u && slots[56] == 0u && slots[40] != 0u && !pinned(3) &&
+                  !pinned(7) && pinned(5) && named.populated_count == 1u,
+              "a suspend point kept the probes its frame did not name");
+
+      // A rewritten table gives new elements to its named probes only.
+      write(5, descriptor(20, Format::k8_8_8_8UNorm));
+      write(3, descriptor(21, Format::k8_8_8_8UNorm));
+      Require(name, "rewritten table", acquire(&third), "the view was declined");
+      draw();
+      Require(name, "rewritten probes",
+              pinned(20) && !pinned(5) && slots[24] == 0u && images(21).empty(),
+              "a rewritten table missed a named probe or resolved an unnamed one");
+
+      // A draw that names nothing can select any probe.
+      Require(name, "whole view",
+              acquire(nullptr) && slots[0] != 0u && slots[72] != 0u && slots[24] != 0u &&
+                  named.populated_count == named.count,
+              "a draw that named no offsets did not get every probe");
+      draw();
+      Require(name, "whole images", pinned(0) && pinned(9) && pinned(21),
+              "a whole view did not resolve its images");
+      suspend();
+      // The view keeps them for the 32 frames an idle table of its size stays.
+      for (uint32_t frame = 1; frame < 32u; ++frame) {
+        Require(name, "kept whole", acquire(&third) && slots[0] != 0u,
+                "a whole view gave up elements before 32 frames without such a draw");
+        draw();
+        suspend();
+      }
+      Require(name, "last whole frame", pinned(0) && acquire(&third), "the view was declined");
+      draw();
+      suspend();
+      Require(name, "aged whole view",
+              slots[0] == 0u && !pinned(0) && slots[40] != 0u && pinned(20) &&
+                  named.populated_count == 1u,
+              "a whole view kept its elements after 32 frames without such a draw");
+
+      // A view no draw of a frame uses keeps its probes, for the 32 frames an idle table stays.
+      // The table lives on through its other view.
+      auto unfiltered = sampled;
+      unfiltered.unfiltered_access_only = true;
+      const auto acquire_other = [&] {
+        return heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &unfiltered, &third},
+                            view);
+      };
+      for (uint32_t frame = 1; frame < 32u; ++frame) {
+        Require(name, "unused view", acquire_other() && slots[40] != 0u,
+                "a view gave up a probe in a frame that did not use it");
+        draw();
+        suspend();
+      }
+      const auto &other = *ImageHeapTestAccess::Views(heap)[1];
+      Require(name, "last unused frame",
+              named.populated_count == 1u && other.populated_count == 1u && acquire_other(),
+              "the view was declined");
+      draw();
+      suspend();
+      Require(name, "aged unused view",
+              slots[40] == 0u && named.populated_count == 0u && other.populated_count == 1u &&
+                  pinned(20),
+              "a view kept its probes after 32 frames without a draw, or its neighbour lost one");
+      Require(name, "used again", acquire(&third) && slots[40] != 0u, "the view was declined");
+      draw();
+      suspend();
+      Require(name, "used view", slots[40] != 0u && named.populated_count == 1u,
+              "a view lost a probe its frame named");
+
+      // A table grows and shrinks inside a word of probe bits: a probe past the new end gives
+      // its element up, and has none when the table grows back until a draw names it again. The
+      // last offset lies past the grown table, inside that word.
+      constexpr uint32_t tail = static_cast<uint32_t>(table_size) + 22u * 32u;
+      write(tail / 32u, descriptor(30, Format::k8_8_8_8UNorm));
+      const Offsets grown{5u * 32u, tail, static_cast<uint32_t>(table_size) + 42u * 32u};
+      Require(name, "grown table",
+              acquire(&grown, table, table_size + 0x400u) && slots[tail / 4u] != 0u &&
+                  named.populated_count == 2u,
+              "a grown table did not give exactly its named new probe an element");
+      draw();
+      Require(name, "shrunk table",
+              acquire(&third, table, table_size + 0x200u) &&
+                  view.slot_count == (table_size + 0x200u) / 4u && !pinned(30) &&
+                  named.populated_count == 1u,
+              "a shrunk table kept a probe past its end");
+      draw();
+      Require(name, "regrown table",
+              acquire(&third, table, table_size + 0x400u) && slots[tail / 4u] == 0u,
+              "a regrown table gave an unnamed probe its element back");
+      draw();
+      Require(name, "renamed probe",
+              acquire(&grown, table, table_size + 0x400u) && slots[tail / 4u] != 0u &&
+                  named.populated_count == 2u,
+              "a probe released by a shrink could not be named again");
+      draw();
+      Require(name, "restored table", acquire(&third), "the view was declined");
+      draw();
+      size_t bits = 0;
+      for (const auto word : named.populated) bits += std::popcount(word);
+      Require(name, "probe bits", bits == named.populated_count,
+              "the probe bits and their count disagree");
+
+      // A smaller table's whole view does not outlive a frame without such a draw.
+      constexpr uint64_t small_size = table_size / 2u;
+      Require(name, "small whole view", acquire(nullptr, small_table, small_size),
+              "a smaller table was declined");
+      draw();
+      suspend();
+      Require(name, "small named view", acquire(&third, small_table, small_size),
+              "a smaller table was declined");
+      const auto &small_slots = ImageHeapTestAccess::Slots(heap, 1u);
+      Require(name, "small kept", small_slots[0] != 0u,
+              "a whole view gave up elements before its frame's suspend point");
+      draw();
+      suspend();
+      Require(name, "small released",
+              small_slots[0] == 0u && small_slots[40] != 0u && !pinned(1) && pinned(5),
+              "a smaller table's whole view outlived a frame without such a draw");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   // A resident table holding a BC texture and a raw block view of its bytes (PPSA02015) keeps both
   // images: heap passes create none after the first and queue no heap change. A GPU write to the
   // raw image replaces the BC image and tells the heap.
@@ -64721,6 +64988,7 @@ int main(int argc, char **argv) {
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckImageHeapDemand();
     vulkan.CheckImageHeapBcAliases();
     vulkan.CheckParameterKeyPages();
     CheckFiniteFirstLaneImageChoice(vulkan);
@@ -64921,6 +65189,7 @@ int main(int argc, char **argv) {
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckImageHeapDemand();
   vulkan.CheckImageHeapBcAliases();
   vulkan.CheckParameterKeyPages();
   vulkan.CheckPartialResidency();

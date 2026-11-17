@@ -26,6 +26,11 @@ constexpr uint64_t MinTableBytes        = 64ull * 1024ull;
 constexpr uint32_t LargeTableIdleFrames = 32;
 constexpr uint32_t ElementMask          = (1u << IR::ImageHeapKindShift) - 1u;
 
+// Suspend points a table stays without a frame acquiring it.
+uint32_t IdleFrames(uint64_t size) {
+	return size < MinTableBytes ? 1u : LargeTableIdleFrames;
+}
+
 template <typename Pred, typename Fn>
 void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
 	while (begin < end) {
@@ -192,6 +197,8 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .profile = profile});
 		created->slots.resize(bytes / 4u + 1u);
 		created->buffer = SlotBuffer(m_context, bytes);
+		created->populated.resize((count + 63u) / 64u);
+		created->demanded.resize(created->populated.size());
 		UpdateProbes(*created, 0u, bytes);
 		// The first upload also clears the slots no probe selects.
 		created->dirty_begin = 0;
@@ -202,6 +209,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
 		(*view)->changed_begin = (*view)->changed_end = 0;
 	}
+	Demand(**view, request.demand);
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	const auto& selected = **view;
 	result = {.slots      = selected.buffer->BufferDeviceAddress(),
@@ -318,7 +326,59 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 		dead.erase(found);
 	}
 	const auto kind = IR::ImageHeapKind(profile, key.value);
-	Assign(view, offset, kind == 0u ? 0u : Intern(view, kind, key));
+	if ((view.populated[probe / 64u] >> (probe % 64u) & 1u) != 0u) {
+		Assign(view, offset, kind == 0u ? 0u : Intern(view, kind, key));
+	} else if (kind != 0u) {
+		// The kinds of a view do not depend on which probes have elements.
+		Arm(view, kind, key.value);
+	}
+}
+
+void ImageHeap::Demand(View& view, const std::vector<uint32_t>* offsets) {
+	const auto populate = [&](uint64_t probe) {
+		auto&      word = view.populated[probe / 64u];
+		const auto bit  = uint64_t {1} << (probe % 64u);
+		if ((word & bit) != 0u) return;
+		word |= bit;
+		++view.populated_count;
+		UpdateProbe(view, probe);
+	};
+	view.idle = 0;
+	if (offsets == nullptr) {
+		view.whole_idle = 0;
+		for (uint64_t probe = 0; view.populated_count != view.count && probe < view.count;
+		     ++probe) {
+			populate(probe);
+		}
+		return;
+	}
+	for (const auto offset: *offsets) {
+		if (offset < view.first || (offset - view.first) % view.step != 0u) continue;
+		const auto probe = (offset - view.first) / view.step;
+		if (probe >= view.count) continue;
+		view.demanded[probe / 64u] |= uint64_t {1} << (probe % 64u);
+		populate(probe);
+	}
+}
+
+// At a suspend point: in a view the frame used, the probes no draw named give their elements up.
+// A view some draw needed whole, or that no draw used, keeps them for the frames its table would
+// stay idle.
+void ImageHeap::ReleaseIdle(View& view) {
+	const auto frames = IdleFrames(view.memory.size);
+	const bool keep   = view.whole_idle < frames || (view.idle != 0u && view.idle < frames);
+	view.idle += view.idle != UINT32_MAX ? 1u : 0u;
+	view.whole_idle += view.whole_idle != UINT32_MAX ? 1u : 0u;
+	for (size_t word = 0; word < view.populated.size(); ++word) {
+		uint64_t released = keep ? 0u : view.populated[word] & ~view.demanded[word];
+		view.populated[word] &= ~released;
+		view.populated_count -= std::popcount(released);
+		for (; released != 0u; released &= released - 1u) {
+			const auto probe = word * 64u + std::countr_zero(released);
+			Assign(view, (view.first + probe * view.step) / 4u, 0u);
+		}
+		view.demanded[word] = 0u;
+	}
 }
 
 void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
@@ -327,13 +387,18 @@ void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 	if (previous != entry) Widen(view.dirty_begin, view.dirty_end, slot, slot + 1u);
 }
 
-uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
+uint32_t ImageHeap::Arm(View& view, uint32_t kind, const DescriptorValue& value) {
 	const auto arm = static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) -
 	                                       view.kind_keys.begin());
 	if (arm == view.kind_keys.size()) {
 		view.kind_keys.push_back(kind);
-		view.kinds.push_back(key.value);
+		view.kinds.push_back(value);
 	}
+	return arm;
+}
+
+uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
+	const auto arm         = Arm(view, kind, key.value);
 	auto [found, inserted] = m_index.try_emplace(key, 0u);
 	if (inserted) {
 		found->second = Allocate();
@@ -476,8 +541,15 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 		const auto count = std::min(view->limit, Probes(size, view->first, view->step));
 		for (auto probe = count; probe < view->count; ++probe) {
 			Assign(*view, (view->first + probe * view->step) / 4u, 0u);
+			auto&      word = view->populated[probe / 64u];
+			const auto bit  = uint64_t {1} << (probe % 64u);
+			view->populated_count -= (word & bit) != 0u ? 1u : 0u;
+			word &= ~bit;
+			view->demanded[probe / 64u] &= ~bit;
 		}
 		view->count       = count;
+		view->populated.resize((count + 63u) / 64u);
+		view->demanded.resize(view->populated.size());
 		const auto slots  = view->slots.size();
 		view->slots.resize(size / 4u + 1u);
 		view->dirty_end   = std::min(view->dirty_end, view->slots.size());
@@ -687,12 +759,16 @@ void ImageHeap::RunGarbageCollector() {
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
 		memory->idle = memory->draw > m_suspend_draw ? 0u : memory->idle + 1u;
-		if (memory->idle < (memory->size < MinTableBytes ? 1u : LargeTableIdleFrames)) {
+		if (memory->idle < IdleFrames(memory->size)) {
 			return false;
 		}
 		Drop(*memory);
 		return true;
 	});
+	for (const auto& memory: m_memories) {
+		for (const auto& view: memory->views)
+			ReleaseIdle(*view);
+	}
 	m_suspend_draw = m_draw;
 }
 

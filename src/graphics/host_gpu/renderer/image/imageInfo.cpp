@@ -219,6 +219,83 @@ ImageLinearLayout ImageInfo::LinearLayout() const {
 	return layout;
 }
 
+namespace {
+
+bool MatchStoredMipChain(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                         uint32_t view_levels, uint32_t& base_level,
+                         const vk::Extent3D* rebased_extent) {
+	ImageInfo physical = info;
+	if (rebased_extent != nullptr) {
+		physical.extent = *rebased_extent;
+	}
+	physical.resources.levels = physical_levels;
+	physical.UpdateSize();
+	info.UpdateSize();
+	const auto same_mip = [&](uint32_t target, uint32_t source) {
+		return physical.mip_layout[target] == info.mip_layout[source] &&
+		       physical.MipExtent(target) == info.MipExtent(source);
+	};
+	if (physical.first_tail_level == info.first_tail_level &&
+	    physical.tiled_slice_stride == info.tiled_slice_stride &&
+	    physical.data.size == info.data.size) {
+		bool matches = true;
+		for (uint32_t level = 0; level < physical_levels; ++level) {
+			matches &= same_mip(level, level);
+		}
+		if (matches) {
+			return true;
+		}
+	}
+	if (metadata ||
+	    (info.TransferLayers() > 1 && physical.tiled_slice_stride != info.tiled_slice_stride)) {
+		return false;
+	}
+	// T# addresses the last mip. A view can select the same stored subresources
+	// with different mip indices; inaccessible mips need no host representation.
+	for (uint32_t base = 0; base + view_levels <= physical_levels; ++base) {
+		bool matches = true;
+		for (uint32_t i = 0; i < view_levels; ++i) {
+			const auto source = base_level + i;
+			const auto target = base + i;
+			if (!same_mip(target, source) ||
+			    (target >= physical.first_tail_level) != (source >= info.first_tail_level)) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) {
+			info       = std::move(physical);
+			base_level = base;
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
+bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                           uint32_t view_levels, uint32_t& base_level) {
+	if (!info.IsTiled()) {
+		return false;
+	}
+	// A view entirely past MAX_MIP may address its own chain starting at its base mip (PPSA02110
+	// compresses mip 1 through a T# that declares one level). A render-target mip that is not
+	// tiled as its own image still lies in the stored chain, which is matched instead.
+	if (base_level >= physical_levels) {
+		const ImageInfo saved = info;
+		const auto      mip   = info.MipExtent(base_level);
+		const vk::Extent3D extent {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
+		uint32_t           rebased_base = base_level;
+		if (MatchStoredMipChain(info, view_levels, metadata, view_levels, rebased_base, &extent)) {
+			base_level = rebased_base;
+			return true;
+		}
+		info = saved;
+	}
+	return MatchStoredMipChain(info, physical_levels, metadata, view_levels, base_level, nullptr);
+}
+
 uint32_t ImageInfo::DataAlignment() const {
 	if (!IsTiled()) {
 		return 256;

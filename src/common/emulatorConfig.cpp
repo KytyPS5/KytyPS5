@@ -269,6 +269,10 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
+const std::string& GetLaunchActivity() {
+	return g_config->launch_activity;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

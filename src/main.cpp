@@ -96,6 +96,7 @@ static void PrintUsage() {
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
 	::printf("  --playgo-hack                        Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable ASCII chars).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -337,6 +338,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.user_name = value;
+		} else if (arg == "--launch-activity") {
+			if (value.empty() || value.size() > 32 ||
+			    !std::ranges::all_of(value, [](char c) { return c >= ' ' && c <= '~'; })) {
+				::printf("invalid activity ID: must contain 1-32 printable ASCII characters\n");
+				return false;
+			}
+			options.config.launch_activity = value;
 		} else if (arg == "--user-id") {
 			if (!ParseUserId(value, options.config.user_id)) {
 				::printf("invalid user ID: %s\n", value.c_str());

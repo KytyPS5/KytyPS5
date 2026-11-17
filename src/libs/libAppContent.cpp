@@ -118,7 +118,7 @@ int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
 		LOGF("\t TITLE_ID missing\n");
 	}
 
-	SystemService::NotifyEntitlementUpdate();
+	SystemService::NotifyEvent(SystemService::SYSTEM_SERVICE_EVENT_ENTITLEMENT_UPDATE);
 	return OK;
 }
 

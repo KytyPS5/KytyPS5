@@ -402,8 +402,8 @@ private:
 	// Bindless table elements resolved for one root image, by T#. Most of a table is unchanged
 	// from dispatch to dispatch, and resolving an element repeats the same texture-cache lookup
 	// while no image in its range was registered or unregistered and the guest backing did not
-	// change. Elements with DCC metadata are resolved again on every use: their lookup
-	// materializes fast clears.
+	// change. Elements with DCC metadata are resolved again whenever their metadata may hold a
+	// fast clear to apply: their lookup materializes it.
 	struct TableElementResolution {
 		// What every preparation of a table reads comes first, on one cache line: a table names
 		// thousands of elements.
@@ -424,6 +424,8 @@ private:
 		// The global image-set epoch at which the element was last known valid: while it holds,
 		// no image anywhere changed and the range needs no check.
 		uint64_t       checked_epoch = 0;
+		// TextureCache::ColorClearSettled()'s memo for an element with DCC metadata.
+		uint64_t       clear_memo    = 0;
 		GuestRange     range; // Guest memory whose images decide the lookup, if any.
 		GuestRange     metadata_range;
 		TableViewMemo  view;

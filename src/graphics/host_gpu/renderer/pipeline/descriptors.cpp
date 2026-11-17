@@ -1708,7 +1708,16 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 	if (!m_table_changed_slots.empty()) {
 		PatchTableSlots(program, snapshot, state, stamp);
 	}
+	// An element with DCC metadata whose lookup would find no fast clear to apply binds as the
+	// others do (GTA V's ray tracing tables have ~35, each resolved again for ~1.2 us).
+	auto& texture_cache = m_context.GetTextureCache();
 	for (const auto element: state.always) {
+		auto& resolution = *state.elements[element].resolution;
+		if (resolution.volatile_dcc &&
+		    (state.compute || !DepthTableElement(texture_cache, resolution.texture)) &&
+		    texture_cache.ColorClearSettled(resolution.texture.desc, resolution.clear_memo)) {
+			continue;
+		}
 		MarkTableElement(state, element);
 	}
 	MarkTableChanges(state);

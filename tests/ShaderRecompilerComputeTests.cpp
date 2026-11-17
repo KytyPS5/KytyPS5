@@ -29568,6 +29568,30 @@ TestCase VectorBfeI32SignExtendsField() {
   return test;
 }
 
+TestCase VectorMsadU8SkipsZeroReferenceBytes() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 vgpr = 0; vgpr < 3; vgpr++) {
+    AppendVMovU32(&code, 30, vgpr * sizeof(u32));
+    AppendBufferLoadDword(&code, vgpr, 30);
+  }
+  AppendVop3(&code, 0x171, 10, Vgpr(0), Vgpr(1), Vgpr(2));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorMsadU8SkipsZeroReferenceBytes";
+  test.code = std::move(code);
+  // Byte differences 0x10, 0xfe and 0xdf in both directions; byte 0 has a zero
+  // reference and is skipped. The accumulation wraps at 32 bits.
+  test.initial = {0x10ff2080u, 0x2001ff00u, 0xfffffff0u};
+  test.expected = {0x1ddu};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MSAD_U8,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorBfmDropsMaskBitsPastBit31() {
   using O = ShaderOpcode;
 
@@ -49177,6 +49201,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
+  AddCase(VectorMsadU8SkipsZeroReferenceBytes);
   AddCase(VectorBfmDropsMaskBitsPastBit31);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorPermSelectsBytesSignsAndFills);
@@ -57317,6 +57342,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
     RunCase(&vulkan, VectorVop3IntegerOps());
+    RunCase(&vulkan, VectorMsadU8SkipsZeroReferenceBytes());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {

@@ -102,8 +102,11 @@ public:
 	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
 	bool        custom_settings = false;
 	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
+	bool        activity_intent = false; /* launchActivity in sce_sys/param.json gameIntent */
 	GameStatus  game_status     = GameStatus::Unknown;
 	QString     game_comment;
+	// Activity to launch into for one run; not saved.
+	QString launch_activity;
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
@@ -219,6 +222,7 @@ public:
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
 		pro_supported   = other.pro_supported;
+		activity_intent = other.activity_intent;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}

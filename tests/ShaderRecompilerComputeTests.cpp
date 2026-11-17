@@ -52513,6 +52513,121 @@ void CheckMaterialWordImageTable(VulkanHarness &vulkan) {
       std::printf("[compute] %s count=%u wave=%u ok\n", test.name, count, wave);
     }
 }
+// The key of a raw-pointer image table is word 2 of a 16-byte record, loaded alone or with the
+// whole record (BUFFER_LOAD_DWORDX4) and walked lane by lane. The record index is itself loaded
+// from a buffer, so only the records bound the keys (PPSA02015, cs e00ba67f43ced053).
+void CheckRecordLoadImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table = 19216u, records = 8192u, indices = 8448u;
+  constexpr u32 exec_lo = 126u;
+  constexpr std::array<u32, 4> keys{1u, 2u, 4u, 2u};
+  for (const u32 words : {1u, 4u})
+  for (const u32 wave : {32u, 64u}) {
+    const bool wide = wave == 64u;
+    TestCase test;
+    test.name = words == 4u ? "RecordLoadImageTable" : "RecordWordLoadImageTable";
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table + 160u * 32u) / 4u);
+    for (u32 record = 0; record < keys.size(); ++record) {
+      const std::array<u32, 4> words{0xdead0000u + record, 150u, keys[record], 151u};
+      std::copy(words.begin(), words.end(), test.initial.begin() + (records + record * 16u) / 4u);
+    }
+    for (u32 lane = 0; lane < wave; ++lane) test.initial[indices / 4u + lane] = lane & 3u;
+    for (u32 key = 0; key < 160u; ++key) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = key + 1u;
+      image[3] = DstSel(4, 0, 0, 1) |
+                 (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (base + table + key * 32u) / 4u);
+    }
+    test.user_data[0] = base;
+    test.user_data[3] = 3u << 28u;
+    // A valid format: the records of a buffer without one read as zero.
+    auto records_descriptor =
+        MakeStructuredStorageBufferData(16u, static_cast<u32>(keys.size()), false, 5);
+    records_descriptor[0] = records;
+    std::copy_n(records_descriptor.begin(), 4, test.user_data.begin() + 8);
+    auto indices_descriptor = MakeStructuredStorageBufferData(4u, wave, false, 5);
+    indices_descriptor[0] = indices;
+    std::copy_n(indices_descriptor.begin(), 4, test.user_data.begin() + 12);
+    const auto output = MakeStructuredStorageBufferData(0u, wave * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    const u32 mov = wide ? 0x04u : 0x03u, ff1 = wide ? 0x14u : 0x13u;
+    const u32 and_saveexec = wide ? 0x24u : 0x3cu, andn2 = wide ? 0x15u : 0x14u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 8, 0u);
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    code.insert(code.end(), {EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(2, 12 / 4u, 0),
+                             EncodeSopp(0x0c)}); // buffer_load_dword v2, v0, s[12:15]
+    // buffer_load_dwordx4 v[40:43] of the record, or buffer_load_dword v42 of its third word.
+    code.insert(code.end(),
+                {words == 4u ? EncodeMubuf0(0x0f, 0, true, false) : EncodeMubuf0(0x0c, 8, true, false),
+                 EncodeMubuf1(words == 4u ? 40 : 42, 8 / 4u, 2), EncodeSopp(0x0c)});
+    code.push_back(EncodeSop1(mov, 64, exec_lo));     // s_mov s64, exec
+    code.push_back(EncodeSop1(mov, 66, exec_lo));     // s_mov s66, exec
+    const auto walk = code.size();
+    code.push_back(EncodeSop1(ff1, 68, 66));          // s_ff1_i32 s68, s66
+    AppendVop3(&code, 0x360, 69, Vgpr(42), 68);       // v_readlane_b32 s69, v42, s68
+    AppendVop3(&code, 0xc2, 70, 69, Vgpr(42));        // v_cmp_eq_u32 s70, s69, v42
+    code.push_back(EncodeSop1(and_saveexec, 72, 70)); // s_and_saveexec s72, s70
+    const auto skip = code.size();
+    code.push_back(0u);                               // s_cbranch_execz skip
+    code.insert(code.end(),
+                {EncodeSop2(0x1e, 81, 69, InlineU32(5)), // s_lshl_b32 s81, s69, 5
+                 EncodeSmem0(0x03, 84, 0), EncodeSmem1(table, 81), // s_load_dwordx8 s[84:91]
+                 EncodeSopp(0x0c), EncodeMimg0(0x00, 1),
+                 EncodeMimg1(4, 20, 84 / 4u), // image_load v4, v[20:21]
+                 EncodeSopp(0x0c), EncodeVop1(0x01, 8, Vgpr(4))}); // v_mov_b32 v8, v4
+    code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+    code.push_back(EncodeSop2(andn2, 66, 66, 70));             // s_andn2 s66, s66, s70
+    code.push_back(EncodeSop1(mov, exec_lo, 72));              // s_mov exec, s72
+    code.push_back(EncodeSopp(0x05, walk - code.size() - 1u)); // s_cbranch_scc1 walk
+    code.push_back(EncodeSop1(mov, exec_lo, 64));              // s_mov exec, s64
+    AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 0u);
+    AppendEnd(&code);
+    test.opcodes = {O::BUFFER_LOAD_DWORD, O::S_FF1_I32_B32,   O::V_READLANE_B32,
+                    O::V_CMP_EQ_U32,      O::S_LSHL_B32,      O::S_LOAD_DWORDX8,
+                    O::IMAGE_LOAD,        O::S_CBRANCH_EXECZ, O::S_CBRANCH_SCC1,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    if (words == 4u) test.opcodes.push_back(O::BUFFER_LOAD_DWORDX4);
+    if (wide) test.opcodes.push_back(O::S_FF1_I32_B64);
+    test.opcodes.push_back(wide ? O::S_AND_SAVEEXEC_B64 : O::S_AND_SAVEEXEC_B32);
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    // Each buffer binds the bytes its descriptor names.
+    BindDescriptorRanges(test, compiled, [](const auto &value) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4, descriptor.fields);
+      return std::pair{u32(descriptor.Base48()), std::max(4u, u32(descriptor.GetSize()))};
+    });
+    // The four records hold three distinct keys; a record index past the buffer reads zero.
+    Require(test.name, "record-load candidates", compiled.resources.candidate_images.size() == 4u,
+            "the keys of a 4-dword record load did not name the descriptors of their records");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : ImageDescriptors(compiled))
+      images.push_back(vulkan.CreateImage2D(
+          test.name, 1, 1, vk::Format::eR32Sfloat, vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, vk::Sampler{},
+                    images);
+    std::vector<u32> expected(wave);
+    for (u32 lane = 0; lane < wave; ++lane)
+      expected[lane] = std::bit_cast<u32>(static_cast<float>(keys[lane & 3u] + 1u));
+    CompareWords(test, "each lane's record selects the T# its third word names", expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    for (auto &image : images)
+      vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
+  }
+}
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -64984,6 +65099,7 @@ int main(int argc, char **argv) {
     CheckLoopSelectedPointerImageTable(vulkan);
     CheckGlobalRecordWordImageTable(vulkan);
     CheckMaterialWordImageTable(vulkan);
+    CheckRecordLoadImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -65185,6 +65301,7 @@ int main(int argc, char **argv) {
   CheckLoopSelectedPointerImageTable(vulkan);
   CheckGlobalRecordWordImageTable(vulkan);
   CheckMaterialWordImageTable(vulkan);
+  CheckRecordLoadImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);

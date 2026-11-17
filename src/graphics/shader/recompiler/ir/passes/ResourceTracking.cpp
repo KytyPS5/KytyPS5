@@ -2112,13 +2112,17 @@ private:
 		if (read == nullptr) return nullptr;
 		uint32_t lane = 0;
 		const auto op = read->GetOpcode();
-		if (op == ValueOpcode::CompositeExtractU32x2 || op == ValueOpcode::CompositeExtractU32x3) {
-			const bool x3 = op == ValueOpcode::CompositeExtractU32x3;
-			if (!ImmediateU32(read->Arg(1), lane) || lane >= (x3 ? 3u : 2u)) return nullptr;
+		// A word of a record load of two, three or four dwords.
+		const auto words = op == ValueOpcode::CompositeExtractU32x2   ? 2u
+		                   : op == ValueOpcode::CompositeExtractU32x3 ? 3u
+		                   : op == ValueOpcode::CompositeExtractU32x4 ? 4u
+		                                                              : 0u;
+		if (words != 0u) {
+			constexpr std::array loads {ValueOpcode::LoadBufferU32x2, ValueOpcode::LoadBufferU32x3,
+			                            ValueOpcode::LoadBufferU32x4};
+			if (!ImmediateU32(read->Arg(1), lane) || lane >= words) return nullptr;
 			read = read->Arg(0).Resolve().TryInstruction();
-			if (read == nullptr ||
-			    read->GetOpcode() != (x3 ? ValueOpcode::LoadBufferU32x3 : ValueOpcode::LoadBufferU32x2))
-				return nullptr;
+			if (read == nullptr || read->GetOpcode() != loads[words - 2u]) return nullptr;
 		} else if (op != ValueOpcode::LoadBufferU32) {
 			return nullptr;
 		}

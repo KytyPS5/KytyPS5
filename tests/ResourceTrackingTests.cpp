@@ -4949,8 +4949,9 @@ void TestUniformizedMaterialImageKeys() {
 
 void TestIndexedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // With record_words 4 the fields are words 2 and 3 of one 4-dword load of the record.
   const auto make_program = [](ShaderType stage = ShaderType::Compute, bool shared = false,
-                               bool storage = false) {
+                               bool storage = false, uint32_t record_words = 1u) {
     Fixture f(stage);
     auto *entry = f.block, *body = f.AddBlock();
     auto *later = shared ? f.AddBlock() : nullptr;
@@ -4982,9 +4983,12 @@ void TestIndexedMaterialImageKeys() {
         MemoryInfo memory;
         memory.kind = ResourceKind::Buffer;
         memory.idxen = true;
-        memory.offset = field;
-        const auto loaded = f.Emit(ValueOpcode::LoadBufferU32,
+        memory.offset = record_words == 4u ? 56u : field;
+        memory.data_dwords = record_words;
+        auto loaded = f.Emit(record_words == 4u ? ValueOpcode::LoadBufferU32x4 : ValueOpcode::LoadBufferU32,
             {material, lane, Value(0u), Value(0u), active}, f.AddMemory(memory, field), entry);
+        if (record_words == 4u)
+          loaded = f.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value((field - 56u) / 4u)}, 0, entry);
         const auto selected = f.Emit(ValueOpcode::SelectU32, {active, loaded, Value(0xdeadbeefu)}, 0, entry);
         key = shared && index == 0u
             ? f.Emit(ValueOpcode::ReadLane, {selected, Value(0u)}, 0, entry)
@@ -5094,6 +5098,30 @@ void TestIndexedMaterialImageKeys() {
   };
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
                            .read_specialization_memory = read};
+  {
+    // A word of a 4-dword record load selects as a 1-dword load of that word does.
+    auto wide_program = make_program(ShaderType::Compute, false, false, 4u);
+    const auto wide_plan = ExtractResourcePlan(wide_program);
+    Check(wide_plan.info.images.size() == 3u && wide_plan.selector_keys.size() == 2u,
+          "words of a 4-dword record load were not taken as indexed material keys");
+    for (size_t image = 0; image < 3u; ++image) {
+      const auto &narrow = *plan.descriptor_sources[plan.info.images[image].source].indirect_descriptor;
+      const auto &wide =
+          *wide_plan.descriptor_sources[wide_plan.info.images[image].source].indirect_descriptor;
+      Check(wide.table_scalar && wide.selector && wide.selector->offset == narrow.selector->offset &&
+                wide.selector->stride == 0u && wide.key_count.IsEmpty(),
+            "a word of a 4-dword record load lost its offset in the record");
+    }
+    auto wide_memory = memory;
+    const SrtRuntime wide_runtime{.user_data = user_data, .userdata = &wide_memory,
+                                  .read_specialization_memory = read};
+    ResourceSnapshot wide_snapshot;
+    ResourceSpecialization wide_specialization;
+    Check(MaterializeResources(wide_plan, wide_runtime, wide_snapshot, wide_specialization) &&
+              wide_memory.selectors == 2u && wide_memory.descriptors == 6u &&
+              wide_snapshot.candidate_images.size() == 6u,
+          "keys of a 4-dword record load did not reach the descriptors of their records");
+  }
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   // The descriptors the three tables reach: each table reads its two as slots of one class.

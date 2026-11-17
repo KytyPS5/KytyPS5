@@ -243,6 +243,12 @@ inline bool ImageInfo::IsDepth() const noexcept {
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
 	const auto* policy = FindGuestDepthFormatPolicy(info.guest_format);
+	if (info.pixel_format == vk::Format::eS8Uint) {
+		return info.guest_format == Prospero::BufferFormat::k8UInt && info.bytes_per_block == 1 &&
+		       !info.HasStencil() && info.samples == 1 && info.resources.levels == 1 &&
+		       info.metadata.kind != ImageMetadataKind::Dcc &&
+		       info.metadata.kind != ImageMetadataKind::Cmask;
+	}
 	return policy != nullptr && info.bytes_per_block == policy->bytes_per_element &&
 	       (info.HasStencil() ? IsStencilAttachmentFormat(*policy, info.pixel_format)
 	                          : info.pixel_format == policy->depth_attachment_format);

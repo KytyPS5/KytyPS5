@@ -17969,6 +17969,55 @@ public:
           "inactive stencil state changed a depth-only HTile attachment");
       RenderExecutorTestAccess::ResetBindings(executor);
 
+      constexpr uint64_t stencil_only_address = base + 0x2c0000;
+      constexpr uint64_t stencil_only_htile_address = base + 0x2d0000;
+      HW::DepthRenderTarget stencil_only_target{};
+      stencil_only_target.z_info.htile_acceleration = true;
+      stencil_only_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      stencil_only_target.stencil_info.texture_compatibility =
+          Prospero::TextureCompatibleStencil::kEnable;
+      stencil_only_target.stencil_info.htile_stencil_disabled = false;
+      stencil_only_target.stencil_read_base_addr = stencil_only_address;
+      stencil_only_target.stencil_write_base_addr = stencil_only_address;
+      stencil_only_target.htile_data_base_addr = stencil_only_htile_address;
+      stencil_only_target.size = {63, 63, true};
+      registers.SetDepthRenderTarget(stencil_only_target);
+      HW::DepthControl stencil_only_control{};
+      stencil_only_control.z_enable = true;
+      stencil_only_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+      stencil_only_control.stencil_enable = true;
+      stencil_only_control.stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+      registers.SetDepthControl(stencil_only_control);
+      HW::RenderControl stencil_only_render_control{};
+      stencil_only_render_control.stencil_clear_enable = true;
+      registers.SetRenderControl(stencil_only_render_control);
+      registers.SetStencilControl({});
+      registers.SetStencilMask({});
+      RenderDepthInfo stencil_only{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), stencil_only);
+      const auto stencil_only_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, stencil_only);
+      Require(
+          name, "stencil-only HTile target",
+          stencil_only.image_id &&
+              stencil_only.desc.view_info.aspect == vk::ImageAspectFlagBits::eStencil &&
+              stencil_only.desc.info.data.address == stencil_only_address &&
+              stencil_only.desc.info.stencil.Empty() &&
+              stencil_only.desc.info.metadata.kind == ImageMetadataKind::Htile &&
+              stencil_only.desc.info.metadata.range.address == stencil_only_htile_address &&
+              stencil_only.desc.info.metadata.stencil_compressed &&
+              !stencil_only.depth_test_enable && !stencil_only.depth_write_enable &&
+              stencil_only.stencil_test_enable && stencil_only.stencil_clear_enable &&
+              stencil_only.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil &&
+              stencil_only_rendering.depth_stencil_attachment.image_view != nullptr &&
+              !stencil_only_rendering.depth_stencil_attachment.has_depth &&
+              stencil_only_rendering.depth_stencil_attachment.has_stencil &&
+              stencil_only_rendering.depth_stencil_attachment.stencil_clear,
+          "a stencil-only HTile target with an enabled depth test and no Z surface was rejected "
+          "or exposed a depth plane");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
       const auto sampled_width = depth_only.desc.info.extent.width - 1u;
       const auto sampled_height = depth_only.desc.info.extent.height - 1u;
       const auto sampled_address = depth_only_address >> 8u;
@@ -53745,6 +53794,19 @@ void CheckDepthTargetFootprints() {
               stencil.size == 0x280000 && stencil.align == 0x10000 &&
               htile.size == 0,
           "captured Z16S8 footprint disagrees with Prospero block rules");
+  TileSizeAlign paired_stencil{};
+  TileSizeAlign paired_htile{};
+  Require("DepthTargetFootprints", "2560x1440 S8 with HTile and no Z surface",
+          TileGetDepthSize(2560, 1440, Prospero::DepthFormat::kZ32F,
+                           Prospero::StencilFormat::k8UInt, true, paired_stencil,
+                           paired_htile, depth) &&
+              TileGetDepthSize(2560, 1440, Prospero::DepthFormat::kInvalid,
+                               Prospero::StencilFormat::k8UInt, true, stencil,
+                               htile, depth) &&
+              depth.size == 0 && depth.align == 0 &&
+              stencil.size == paired_stencil.size && stencil.align == 0x10000 &&
+              htile.size == paired_htile.size && htile.align == 0x8000,
+          "a stencil-only surface did not keep its stencil and HTile footprint");
   struct TargetFormatCase {
     const char *name;
     vk::Format host_format;

@@ -79,7 +79,10 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}
-	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
+	const bool stencil_attachment =
+	    info.pixel_format == vk::Format::eS8Uint &&
+	    HasFormatFeature(properties, vk::FormatFeatureFlagBits::eDepthStencilAttachment);
+	if (info.IsDepth() || stencil_attachment) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
 		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
@@ -118,6 +121,13 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 		default: return vk::ImageAspectFlagBits::eColor;
 	}
+}
+
+vk::ImageAspectFlags Image::PrimaryAspect(vk::Format format) noexcept {
+	const auto aspects = FullAspectMask(format);
+	return aspects == vk::ImageAspectFlagBits::eStencil
+	           ? aspects
+	           : aspects & ~vk::ImageAspectFlagBits::eStencil;
 }
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
@@ -354,10 +364,8 @@ void Image::CopyImage(Image& source) {
 	} else if (backing.image_type == vk::ImageType::e3D) {
 		base_depth = backing.extent.depth;
 	}
-	const auto source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	const auto source_aspect      = PrimaryAspect(source.backing.format);
+	const auto destination_aspect = PrimaryAspect(backing.format);
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
@@ -466,10 +474,8 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
-	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	const auto     source_aspect      = PrimaryAspect(source.backing.format);
+	const auto     destination_aspect = PrimaryAspect(backing.format);
 	const auto     source_bytes      = DepthAspectTransferBytes(source.backing.format) != 0
 	                                       ? DepthAspectTransferBytes(source.backing.format)
 	                                       : source.info.bytes_per_block;
@@ -637,7 +643,8 @@ void Validate(const ImageInfo& info) {
 		EXIT("multisampled images cannot have mip levels\n");
 	}
 
-	if (info.metadata.stencil_compressed && !info.HasStencil()) {
+	if (info.metadata.stencil_compressed && !info.HasStencil() &&
+	    info.pixel_format != vk::Format::eS8Uint) {
 		EXIT("compressed stencil metadata requires a stencil plane\n");
 	}
 	switch (info.metadata.kind) {

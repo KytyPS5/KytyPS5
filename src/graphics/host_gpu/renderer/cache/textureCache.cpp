@@ -1138,9 +1138,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 
 void TextureCache::RefreshImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id &&
-	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
-	     m_slot_images[image.depth_id].info.samples != 1)) {
+	if ((image.depth_id && (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
+	                        m_slot_images[image.depth_id].info.samples != 1)) ||
+	    (image.info.pixel_format == vk::Format::eS8Uint &&
+	     image.info.metadata.stencil_compressed)) {
 		return;
 	}
 	TrackImage(id);

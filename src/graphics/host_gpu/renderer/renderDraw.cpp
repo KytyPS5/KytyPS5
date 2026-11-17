@@ -488,6 +488,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		// Apply pending clears to compressed stencil as well as depth.
 		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
+		depth.load_clear_aspects &= ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		if (meta_clear &&
 		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");

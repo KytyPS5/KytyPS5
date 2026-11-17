@@ -1218,8 +1218,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto subtract_saturate = [&](IR::U32 lhs, IR::U32 rhs) {
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
+			const bool indirect  = options.input_info.vertex->indirect_draw;
+			const auto workgroup = [&](uint32_t axis, uint32_t base_dword) {
+				const auto id = builtin(IR::StageInputKind::WorkgroupId, axis);
+				return indirect ? id : entry_ir.IAdd(id, draw(base_dword));
+			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto group = builtin(IR::StageInputKind::WorkgroupId, 0);
+			const auto group           = workgroup(0, IR::PushData::MeshBaseGroupDword);
+			const auto instance        = workgroup(1, IR::PushData::MeshBaseInstanceDword);
 			const auto primitive_chunk = mesh.fast_launch ? group :
 			    entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
@@ -1253,11 +1259,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			// Instance IDs exclude the start instance, which shaders add from user data. An
 			// indirect record's bases reach only the user SGPRs its packet patches; NGG user
 			// SGPRs start at s8.
-			const bool  indirect = options.input_info.vertex->indirect_draw;
-			const auto& offsets  = options.input_info.vertex->indirect_offsets;
+			const auto& offsets = options.input_info.vertex->indirect_offsets;
 			for (const auto [slot, parameter]:
 			     {std::pair {offsets.vertex, 1u},
-			      std::pair {offsets.instance, IR::PushData::MeshDrawDwordCount}}) {
+			      std::pair {offsets.instance, IR::PushData::MeshTaskFirstInstanceDword}}) {
 				if (indirect && 8u + slot < options.user_data_count) {
 					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(8u + slot), draw(parameter));
 				}
@@ -1268,8 +1273,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (mesh.fast_launch) {
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), vertex_index(group));
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6), instance);
 			} else {
 				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 				// center in every subgroup; strip winding follows the global primitive.
@@ -1314,8 +1318,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				     entry_ir.IMul(index_bytes, u32(8))}));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      vertex_index(entry_ir.Select(indexed, index, input_vertex)));
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8), instance);
 			}
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), active_lane_count());

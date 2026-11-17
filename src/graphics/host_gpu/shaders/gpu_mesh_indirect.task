@@ -52,7 +52,7 @@ void main() {
 	payload[5] = record.dwords[base + 1];
 	uint groups =
 	    count < params.primitive_size ? 0 : (count - params.primitive_size) / params.group_step + 1;
-	// Past the host launch limits, where direct draws exit, the record draws nothing.
+	// Past the host launch limits the record draws nothing.
 	if (groups > params.max_groups || instances > params.max_instances ||
 	    uint64_t(groups) * instances > params.max_total) {
 		groups = 0;

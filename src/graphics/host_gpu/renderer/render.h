@@ -750,6 +750,13 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	// A replicating fill of `count` dwords from a pattern of `pattern` (TryConsumeComputeFill): written on the CPU, or
+	// copied on the GPU when the source holds GPU writes; false leaves the dispatch to its program.
+	[[nodiscard]] bool ConsumeReplicate(const ShaderBufferResource& destination, const ShaderBufferResource& source,
+	                                    uint64_t count, uint64_t pattern, uint32_t group_x);
+	// Demon's Souls' copy shader, from the dispatch registers alone (see m_linear_copy_shader).
+	[[nodiscard]] bool TryLinearCopy(const HW::ComputeShaderInfo& cs, uint32_t group_x, uint32_t group_y,
+	                                 uint32_t group_z, uint32_t mode);
 	void CreatePssrPipeline();
 	struct UpscalerFeature;
 	// The feature the upscaler evaluates the request with: the context's, or a new one (and `reset`
@@ -839,6 +846,15 @@ private:
 	bool                                               m_deferred_barrier        = false;
 	uint32_t                                           m_deferred_barrier_queue  = 0;
 	bool                                               m_dispatch_chained        = false;
+	// Demon's Souls' copy shader (the engine's cs_memset32: TryLinearCopy()), once a dispatch of it was consumed as a
+	// replicating fill whose V#s, count and pattern its registers give: its code address and the shader map generation
+	// before that dispatch chose its program; and its uses since, every 64th of which takes the normal path again.
+	uint64_t                                           m_linear_copy_shader      = 0;
+	uint64_t                                           m_linear_copy_generation  = 0;
+	uint32_t                                           m_linear_copy_uses        = 0;
+	// The copy the replicating fill of the dispatch being executed made (ConsumeReplicate()): destination, source,
+	// count and pattern; a count of 0 when it made none.
+	std::array<uint64_t, 4>                            m_replicated {};
 	// Reused by every draw; see AcquireDrawRenderState().
 	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
 	                                                                               nullptr};

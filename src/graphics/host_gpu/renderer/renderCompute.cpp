@@ -26,6 +26,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
+#include "loader/demonsSoulsTitle.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -227,6 +228,64 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+bool RenderExecutor::ConsumeReplicate(const ShaderBufferResource& destination, const ShaderBufferResource& source,
+                                      uint64_t count, uint64_t pattern, uint32_t group_x) {
+	const auto plain = [](const ShaderBufferResource& buffer) {
+		const auto format = buffer.Format();
+		return buffer.Stride() == 4 && !buffer.SwizzleEnabled() && buffer.IndexStride() == 0 &&
+		       !buffer.AddTid() && buffer.Base48() != 0 &&
+		       (format == Prospero::BufferFormat::k32UInt ||
+		        format == Prospero::BufferFormat::k32SInt ||
+		        format == Prospero::BufferFormat::k32Float);
+	};
+	if (!plain(destination) || !plain(source) || destination.Format() != source.Format() ||
+	    destination.DstSelX() != source.DstSelX() || uint64_t {group_x} * 64u < count ||
+	    count > destination.NumRecords() || pattern > source.NumRecords() ||
+	    !m_context.IsMapped(destination.Base48(), count * 4u) ||
+	    !m_context.IsMapped(source.Base48(), pattern * 4u) ||
+	    m_context.GetTextureCache().IsRegionRegistered(destination.Base48(), count * 4u))
+		return false;
+	auto& buffers = m_context.GetBufferCache();
+	if (buffers.ReplicateBuffer(destination.Base48(), count, source.Base48(), pattern)) {
+		m_replicated = {destination.Base48(), source.Base48(), count, pattern};
+		return true;
+	}
+	// The source holds GPU writes (the CPU cannot copy it): when its period covers the count the program copies
+	// count dwords, which a GPU copy does without the dispatch, and a snapshot of the destination taken behind it
+	// serves the guest's read of the result (Demon's Souls' cs_memset32: ~60 of its ~1 KB results a frame, each a
+	// fault and a readback). Overlapping ranges keep the program (its order of reads and writes).
+	const uint64_t bytes = count * 4u;
+	if (pattern < count || (destination.Base48() < source.Base48() + bytes &&
+	                        source.Base48() < destination.Base48() + bytes))
+		return false;
+	buffers.CopyBuffer(destination.Base48(), source.Base48(), bytes, false, false);
+	buffers.ScheduleCopyFeedback(destination.Base48(), bytes);
+	m_replicated = {destination.Base48(), source.Base48(), count, pattern};
+	return true;
+}
+
+// Demon's Souls' copy shader (the engine's cs_memset32: s[0:3] the source V#, s[4:7] the destination's, s[8:11] a
+// buffer whose first two dwords are the count and the pattern size; RecognizeReplicateFill) read from the registers:
+// the V#s from the user data and the count and pattern from guest memory the GPU did not write, then copied as its
+// replicating fill. False for any other dispatch shape, or parameters the GPU wrote: the normal path takes it.
+bool RenderExecutor::TryLinearCopy(const HW::ComputeShaderInfo& cs, uint32_t group_x, uint32_t group_y,
+                                   uint32_t group_z, uint32_t mode) {
+	const auto& regs = cs.cs_regs;
+	if (regs.user_sgpr != 12 || mode != 0x41u || regs.wave_size != 64 || regs.num_thread_x != 64 ||
+	    regs.num_thread_y != 1 || regs.num_thread_z != 1 || !regs.tgid_x_en || regs.tgid_y_en || regs.tgid_z_en ||
+	    regs.tg_size_en || regs.tidig_comp_cnt != 0 || group_y != 1 || group_z != 1)
+		return false;
+	ShaderBufferResource source, destination, parameters;
+	std::memcpy(source.fields, cs.cs_user_sgpr.value, sizeof(source.fields));
+	std::memcpy(destination.fields, cs.cs_user_sgpr.value + 4, sizeof(destination.fields));
+	std::memcpy(parameters.fields, cs.cs_user_sgpr.value + 8, sizeof(parameters.fields));
+	std::array<uint32_t, 2> controls {};
+	if (parameters.Base48() == 0 || (parameters.Base48() & 3u) != 0 || parameters.GetSize() < sizeof(controls) ||
+	    !LibKernel::Memory::TryReadGpuCleanBacking(parameters.Base48(), controls.data(), sizeof(controls)))
+		return false;
+	return controls[0] != 0 && ConsumeReplicate(destination, source, controls[0], controls[1], group_x);
+}
+
 bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
                                           CommandBuffer& command, uint32_t group_x,
                                           uint32_t group_y, uint32_t group_z, uint32_t mode) {
@@ -245,38 +304,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
 		const auto source =
 		    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.source]);
-		const auto plain = [](const ShaderBufferResource& buffer) {
-			const auto format = buffer.Format();
-			return buffer.Stride() == 4 && !buffer.SwizzleEnabled() && buffer.IndexStride() == 0 &&
-			       !buffer.AddTid() && buffer.Base48() != 0 &&
-			       (format == Prospero::BufferFormat::k32UInt ||
-			        format == Prospero::BufferFormat::k32SInt ||
-			        format == Prospero::BufferFormat::k32Float);
-		};
-		const uint64_t count   = fill.bounded_elements;
-		const uint64_t pattern = fill.pattern_elements;
-		if (!plain(destination) || !plain(source) || destination.Format() != source.Format() ||
-		    destination.DstSelX() != source.DstSelX() || uint64_t {group_x} * 64u < count ||
-		    count > destination.NumRecords() || pattern > source.NumRecords() ||
-		    !m_context.IsMapped(destination.Base48(), count * 4u) ||
-		    !m_context.IsMapped(source.Base48(), pattern * 4u) ||
-		    cache.IsRegionRegistered(destination.Base48(), count * 4u))
-			return false;
-		auto& buffers = m_context.GetBufferCache();
-		if (buffers.ReplicateBuffer(destination.Base48(), count, source.Base48(), pattern)) {
-			return true;
-		}
-		// The source holds GPU writes (the CPU cannot copy it): when its period covers the count the program copies
-		// count dwords, which a GPU copy does without the dispatch, and a snapshot of the destination taken behind it
-		// serves the guest's read of the result (Demon's Souls' cs_memset32: ~60 of its ~1 KB results a frame, each a
-		// fault and a readback). Overlapping ranges keep the program (its order of reads and writes).
-		const uint64_t bytes = count * 4u;
-		if (pattern < count || (destination.Base48() < source.Base48() + bytes &&
-		                        source.Base48() < destination.Base48() + bytes))
-			return false;
-		buffers.CopyBuffer(destination.Base48(), source.Base48(), bytes, false, false);
-		buffers.ScheduleCopyFeedback(destination.Base48(), bytes);
-		return true;
+		return ConsumeReplicate(destination, source, fill.bounded_elements, fill.pattern_elements, group_x);
 	}
 	if (fill.kind == ShaderRecompiler::IR::UniformFillKind::Image) {
 		if (mode != 0x41u || input.dispatch_thread_dimensions || fill.value > 255 ||
@@ -469,6 +497,17 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	const auto& cs_regs = sh_ctx.GetCs();
 
+	// Demon's Souls' copy shader, while its code stands: copied from the registers, without its program (~520 copies a
+	// frame at Boletaria, each one taking the program of the same shader and the evaluation of its resources first, ~1
+	// us). Every 64th use takes the normal path, which proves the shader again.
+	const auto shader_generation = ShaderMapGeneration(); // (before the program reads the code)
+	if (m_linear_copy_shader != 0 && cs_regs.cs_regs.data_addr == m_linear_copy_shader &&
+	    shader_generation == m_linear_copy_generation && (++m_linear_copy_uses & 63u) != 0 &&
+	    TryLinearCopy(cs_regs, thread_group_x, thread_group_y, thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
+
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	const bool use_thread_dimensions =
@@ -507,11 +546,30 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 
 	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
+	m_replicated[2] = 0;
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
 		TableDispatchSpecial(cs_regs, use_thread_dimensions, "dispatch: a metadata clear or fill");
+		// A replicating fill in Demon's Souls whose registers give the same copy: its shader is the copy shader.
+		if (m_replicated[2] != 0 && ::Loader::DemonsSoulsTitle::IsSupportedGame() &&
+		    (cs_regs.cs_regs.data_addr != m_linear_copy_shader || shader_generation != m_linear_copy_generation) &&
+		    cs_regs.cs_regs.user_sgpr == 12) {
+			ShaderBufferResource source, destination, parameters;
+			std::memcpy(source.fields, cs_regs.cs_user_sgpr.value, sizeof(source.fields));
+			std::memcpy(destination.fields, cs_regs.cs_user_sgpr.value + 4, sizeof(destination.fields));
+			std::memcpy(parameters.fields, cs_regs.cs_user_sgpr.value + 8, sizeof(parameters.fields));
+			std::array<uint32_t, 2> controls {};
+			if (destination.Base48() == m_replicated[0] && source.Base48() == m_replicated[1] &&
+			    parameters.Base48() != 0 && (parameters.Base48() & 3u) == 0 &&
+			    LibKernel::Memory::TryReadGpuCleanBacking(parameters.Base48(), controls.data(), sizeof(controls)) &&
+			    controls[0] == m_replicated[2] && controls[1] == m_replicated[3]) {
+				m_linear_copy_shader     = cs_regs.cs_regs.data_addr;
+				m_linear_copy_generation = shader_generation;
+				m_linear_copy_uses       = 0;
+			}
+		}
 		ResetBindings();
 		return;
 	}

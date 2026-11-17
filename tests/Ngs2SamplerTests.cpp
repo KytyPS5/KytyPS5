@@ -953,6 +953,23 @@ void TestMasteringGain() {
 	      "mastering gain was not clamped or applied per full band and LFE channel");
 }
 
+void TestMasteringUnknownControl() {
+	Ngs2Internal system;
+	system.option = Ngs2DefaultSystemOption();
+	Ngs2RackOptionUnion mastering_option {};
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	mastering_option.common.max_voices = 1;
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& mastering = master.Voice();
+	// Trackmania sends control 2 with an 8-byte payload; it is accepted and ignored.
+	struct {
+		Ngs2VoiceParamHeader header {16, 0, 0x30000002};
+		uint32_t             values[2] = {};
+	} unknown;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &unknown.header) == OK,
+	      "unknown mastering control 2 was not accepted");
+}
+
 void TestMasteringDownmix() {
 	Ngs2Internal system;
 	system.option                   = Ngs2DefaultSystemOption();
@@ -2450,6 +2467,7 @@ int main() {
 	TestPatchToRackHandle();
 	TestMasteringGain();
 	TestMasteringDownmix();
+	TestMasteringUnknownControl();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();

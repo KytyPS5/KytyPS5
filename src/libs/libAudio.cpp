@@ -75,6 +75,17 @@ static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /
 	return 0;
 }
 
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceCreate(
+    AudioPropagationHandle /*system_handle*/, AudioPropagationHandle* out_source_handle) {
+	PRINT_NAME();
+
+	if (out_source_handle != nullptr) {
+		*out_source_handle = AudioPropagationNextHandle();
+	}
+
+	return 0;
+}
+
 static int32_t KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
     AudioPropagationHandle /*system_handle*/, const void* /*material*/,
     AudioPropagationHandle* out_material_handle) {
@@ -110,6 +121,7 @@ LIB_DEFINE(InitAudio_1_AudioPropagation) {
 	LIB_FUNC("7xyAxrusLko", LibAudioPropagation::AudioPropagationSystemQueryMemory);
 	LIB_FUNC("aNEqtSHdUSo", LibAudioPropagation::AudioPropagationSystemCreate);
 	LIB_FUNC("8bI5h8req30", LibAudioPropagation::AudioPropagationRoomCreate);
+	LIB_FUNC("d84otraxt2s", LibAudioPropagation::AudioPropagationSourceCreate);
 	LIB_FUNC("CPLV6G-eXmk", LibAudioPropagation::AudioPropagationSystemRegisterMaterial);
 	LIB_FUNC("kIdb+iQUzCs", LibAudioPropagation::AudioPropagationSystemSetAttributes);
 	LIB_FUNC("ht-QXT3zGxo", LibAudioPropagation::AudioPropagationSystemGetRays);

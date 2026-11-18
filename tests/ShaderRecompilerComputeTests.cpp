@@ -42512,7 +42512,66 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
-TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
+// Two records whose bits differ; the second holds no half-float NaN.
+constexpr std::array<std::array<u32, 4>, 2> FormattedRecords{{
+    {0x80ff7f01u, 0x8001ff00u, 0x40003c00u, 0x3fc00000u},
+    {0xc4003e80u, 0x12345678u, 0x9abcdef0u, 0x0f1e2d3cu},
+}};
+
+// The value of source component `component` of a record, apart from the emitter. A normalized
+// component is its integer times the rounded reciprocal of its maximum, as hosts fold the
+// division. A half-float NaN has no value here: its bits are the host's choice.
+std::optional<u32> FormattedComponentReference(
+    const ShaderRecompiler::Format::BufferFormatInfo &info, u32 component,
+    const std::array<u32, 4> &record) {
+  using T = ShaderRecompiler::Format::ComponentType;
+  const u32 bits = info.component_bits[component];
+  const u32 byte = component * (info.component_bits[0] / 8u);
+  const u32 raw = info.packed_bitfield ? record[0] >> info.component_bit_offset[component]
+                                       : record[byte / 4u] >> (byte % 4u * 8u);
+  const u32 field = bits == 32u ? raw : raw & ((1u << bits) - 1u);
+  const auto extended = static_cast<int32_t>(field << (32u - bits)) >> (32u - bits);
+  const auto float_bits = [](float value) { return std::bit_cast<u32>(value); };
+  switch (info.type) {
+  case T::Uint:
+    return field;
+  case T::Sint:
+    return static_cast<u32>(extended);
+  case T::Uscaled:
+    return float_bits(static_cast<float>(field));
+  case T::Sscaled:
+    return float_bits(static_cast<float>(extended));
+  case T::Unorm:
+    return float_bits(static_cast<float>(field) * (1.0f / static_cast<float>((1u << bits) - 1u)));
+  case T::Snorm:
+    return float_bits(std::max(static_cast<float>(extended) *
+                                   (1.0f / static_cast<float>((1u << (bits - 1u)) - 1u)),
+                               -1.0f));
+  case T::Float: {
+    if (bits == 32u) return field;
+    // A half has a sign and ten mantissa bits; the 11- and 10-bit floats have no sign and six
+    // and five.
+    const u32 mantissa_bits = bits == 16u ? 10u : bits - 5u;
+    const u32 mantissa = field & ((1u << mantissa_bits) - 1u);
+    const u32 exponent = (field >> mantissa_bits) & 31u;
+    const u32 sign = bits == 16u ? (field >> 15u) << 31u : 0u;
+    if (exponent == 31u) {
+      if (bits == 16u && mantissa != 0u) return std::nullopt;
+      return sign | 0x7f800000u | mantissa << (23u - mantissa_bits);
+    }
+    if (exponent == 0u) {
+      return sign | float_bits(std::ldexp(static_cast<float>(mantissa),
+                                          1 - 15 - static_cast<int>(mantissa_bits)));
+    }
+    return sign | (exponent + 112u) << 23u | mantissa << (23u - mantissa_bits);
+  }
+  default:
+    return 0u;
+  }
+}
+
+// `values`: every source component of every format from both records, and nothing else.
+TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load, bool values = false) {
   using O = ShaderOpcode;
   const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
   const bool byte = load == O::BUFFER_LOAD_UBYTE;
@@ -42525,9 +42584,24 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     u32 expected;
     bool zero_payload = false;
     bool unmapped = false;
+    u32 record = 0;
   };
   std::vector<DescriptorCase> cases;
-  if (formatted) {
+  if (values) {
+    for (u32 format = 0; format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
+      const auto info = ShaderRecompiler::Format::GetFormatInfo(static_cast<F>(format));
+      for (u32 selector = 4; selector < 8u && info.component_count != 0u; ++selector) {
+        for (u32 record = 0; record < FormattedRecords.size(); ++record) {
+          const auto value = FormattedComponentReference(
+              info, (selector - 4u) % info.component_count, FormattedRecords[record]);
+          if (value) {
+            cases.push_back({static_cast<F>(format), selector, 16, 1, 0, 0, 0, 0, false, *value,
+                             false, false, record});
+          }
+        }
+      }
+    }
+  } else if (formatted) {
     cases = {
       {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
       {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
@@ -42608,7 +42682,8 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   }
   // Visit every geometry entry and every selector. Zero payloads have exact zero
   // results in all numeric classes; selector ONE depends only on integer vs float.
-  for (u32 format = 0; formatted && format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
+  for (u32 format = 0;
+       formatted && !values && format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
     const auto info = ShaderRecompiler::Format::GetFormatInfo(static_cast<F>(format));
     using T = ShaderRecompiler::Format::ComponentType;
     for (u32 selector = 0; selector < 8u; ++selector) {
@@ -42618,7 +42693,8 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     }
   }
   TestCase test;
-  test.name = formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
+  test.name = values ? (wave == 32 ? "BufferLoadFormatXValues32" : "BufferLoadFormatXValues64")
+            : formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
                                       : "BufferLoadFormatXGpuSelectedDescriptors64")
                         : byte ? (wave == 32 ? "BufferLoadUbyteGpuSelectedDescriptors32"
                                               : "BufferLoadUbyteGpuSelectedDescriptors64")
@@ -42626,11 +42702,14 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
                                              : "BufferLoadUshortGpuSelectedDescriptors64");
   const auto align256 = [](u32 bytes) { return (bytes + 255u) & ~255u; };
   const auto selection_base = align256(static_cast<u32>(cases.size()) * 4u);
+  // The selection load reaches its table by a 12-bit offset.
+  Require(test.name, "cases", selection_base <= 0xfffu,
+          "the cases outgrew the selection table's offset");
   const auto descriptor_base = align256(selection_base + static_cast<u32>(cases.size()) * 4u);
   const auto payload_base = align256(descriptor_base + static_cast<u32>(cases.size()) * 32u);
   test.initial.resize((payload_base + cases.size() * 64u) / 4u);
-  constexpr std::array payload{0x80ff7f01u, 0x8001ff00u, 0x40003c00u, 0x3fc00000u};
   for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &payload = FormattedRecords[cases[i].record];
     const auto &input = cases[i];
     const u32 data_offset = payload_base + i * 64;
     const uint64_t data_address = GuestBase + (input.unmapped ? 0x100000u : data_offset);
@@ -42674,7 +42753,8 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
   test.has_compute_info = true;
-  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
+                         formatted ? "indirect_buffer_format_kinds" : "Volatile"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
                                          "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
@@ -42692,7 +42772,9 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
 // BUFFER_LOAD_FORMAT_XYZW through a GPU-selected V#: each component reads the channel its
 // DST_SEL names (DS2 cs 0x1a054b815fefc8a5 decodes XYZ this way). A V# based past the guest's
 // GPU space reads as unmapped; its page index truncated to 32 bits is the mapped test page.
-TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave) {
+//
+// `values`: every format's components in three orders from one of the two records instead.
+TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave, std::optional<u32> values = {}) {
   using O = ShaderOpcode;
   using F = Prospero::BufferFormat;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
@@ -42704,7 +42786,7 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave) {
     std::array<u32, 4> expected;
     bool beyond_space = false;
   };
-  const std::vector<DescriptorCase> cases = {
+  std::vector<DescriptorCase> cases = {
       {F::k32_32_32_32UInt, {4, 5, 6, 7}, {11, 22, 33, 44}, {11, 22, 33, 44}},
       {F::k32_32_32_32UInt, {6, 5, 4, 7}, {11, 22, 33, 44}, {33, 22, 11, 44}},
       {F::k32_32_32_32UInt, {4, 0, 1, 7}, {11, 22, 33, 44}, {11, 0, 1, 44}},
@@ -42716,9 +42798,40 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave) {
   TestCase test;
   test.name = wave == 32u ? "BufferLoadFormatXyzwGpuSelectedDescriptors32"
                           : "BufferLoadFormatXyzwGpuSelectedDescriptors64";
+  if (values) {
+    constexpr std::array<const char *, 4> names{
+        "BufferLoadFormatXyzwValues32Record0", "BufferLoadFormatXyzwValues32Record1",
+        "BufferLoadFormatXyzwValues64Record0", "BufferLoadFormatXyzwValues64Record1"};
+    test.name = names[(wave == 32u ? 0u : 2u) + *values];
+    cases.clear();
+    constexpr std::array<std::array<u32, 4>, 3> orders{{{4, 5, 6, 7}, {7, 6, 5, 4}, {6, 1, 4, 0}}};
+    const auto &record = FormattedRecords[*values];
+    for (u32 format = 0; format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
+      const auto info = ShaderRecompiler::Format::GetFormatInfo(static_cast<F>(format));
+      using T = ShaderRecompiler::Format::ComponentType;
+      for (const auto &order : orders) {
+        DescriptorCase read{static_cast<F>(format), order, record, {}};
+        bool defined = info.component_count != 0u;
+        for (u32 channel = 0; defined && channel < 4u; ++channel) {
+          if (order[channel] < 4u) {
+            const u32 one = info.type == T::Uint || info.type == T::Sint ? 1u : 0x3f800000u;
+            read.expected[channel] = order[channel] == 1u ? one : 0u;
+            continue;
+          }
+          const auto value = FormattedComponentReference(
+              info, (order[channel] - 4u) % info.component_count, record);
+          defined = value.has_value();
+          read.expected[channel] = value.value_or(0u);
+        }
+        if (defined) cases.push_back(read);
+      }
+    }
+  }
   const auto align256 = [](u32 bytes) { return (bytes + 255u) & ~255u; };
   const u32 count = static_cast<u32>(cases.size());
   const auto selection_base = align256(count * 16u);
+  Require(test.name, "cases", selection_base <= 0xfffu,
+          "the cases outgrew the selection table's offset");
   const auto descriptor_base = align256(selection_base + count * 4u);
   const auto payload_base = align256(descriptor_base + count * 32u);
   test.initial.resize((payload_base + count * 64u) / 4u);
@@ -42789,6 +42902,10 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors64() {
 
 TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
   return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
+}
+
+TestCase BufferLoadFormatXValues(u32 wave) {
+  return BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_X, true);
 }
 
 TestCase BufferLoadUshortGpuSelectedDescriptors() {
@@ -50168,10 +50285,13 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
         u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
         bool geometry_pure = true;
-        // The format table: one Private variable whose initializer has a row per format.
+        // The format table: one Private variable whose initializer has a row per format. The
+        // kind table: one whose initializer has an entry per distinct conversion.
         constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-        u32 table = 0, table_initializer = 0, conversion_switch_cases = 0;
-        bool table_private = false, geometry_clamps = false;
+        u32 table = 0, table_initializer = 0, kind_table = 0, kind_initializer = 0;
+        u32 conversion_branches = 0, real_calls = 0;
+        bool table_private = false, kind_table_private = false, geometry_clamps = false;
+        bool conversion_pure = true;
         std::map<u32, size_t> composite_operands;
         std::map<u32, u32> uint_constants, access_base;
         for (size_t offset = 5; offset < compiled.spirv.size();) {
@@ -50183,12 +50303,17 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             if (name == "convert_indirect_buffer_format") conversion_function = words[1];
             if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
             if (name == "indirect_buffer_formats") table = words[1];
+            if (name == "indirect_buffer_format_kinds") kind_table = words[1];
           }
           if (opcode == spv::OpConstant && words.size() == 4u) uint_constants[words[2]] = words[3];
           if (opcode == spv::OpConstantComposite) composite_operands[words[2]] = words.size() - 3u;
           if (opcode == spv::OpVariable && words.size() == 5u && words[2] == table) {
             table_private = words[3] == spv::StorageClassPrivate;
             table_initializer = words[4];
+          }
+          if (opcode == spv::OpVariable && words.size() == 5u && words[2] == kind_table) {
+            kind_table_private = words[3] == spv::StorageClassPrivate;
+            kind_initializer = words[4];
           }
           if (opcode == spv::OpAccessChain) access_base[words[2]] = words[3];
           if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
@@ -50198,6 +50323,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             function = words[2];
             conversion_definitions += function == conversion_function;
             geometry_definitions += function == geometry_function;
+            real_calls += (words[3] & spv::FunctionControlDontInlineMask) != 0u;
           }
           // Geometry reads only the format table, and formats past it read row zero.
           if (function == geometry_function && function != 0u) {
@@ -50208,11 +50334,13 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                                uint_constants.contains(words[4]) &&
                                uint_constants[words[4]] == formats;
           }
-          // Conversion switches over conversion kinds, never over formats: its constant data
-          // must not grow with the format list, which inlined copies multiply per read.
-          if (function == conversion_function && function != 0u && opcode == spv::OpSwitch) {
-            conversion_switch_cases = std::max<u32>(conversion_switch_cases,
-                                                    static_cast<u32>((words.size() - 3u) / 2u));
+          // Conversion takes its kind from the tables and picks among results it computed: a
+          // branch per kind or format is a block per read once a driver inlines it.
+          if (function == conversion_function && function != 0u) {
+            conversion_branches += opcode == spv::OpSwitch || opcode == spv::OpBranchConditional;
+            conversion_pure &= opcode != spv::OpStore && opcode != spv::OpFunctionCall &&
+                               (opcode != spv::OpLoad || access_base[words[3]] == table ||
+                                access_base[words[3]] == kind_table);
           }
           if (opcode == spv::OpFunctionCall) {
             if (bda_functions.contains(words[3])) ++bda_calls;
@@ -50235,9 +50363,16 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                     composite_operands.contains(table_initializer) &&
                     composite_operands[table_initializer] == formats,
                 "the formats' rows are not one Private table with a row per format");
-        Require(test.name, "format-independent conversion",
-                conversion_switch_cases != 0u && conversion_switch_cases <= 32u,
-                "formatted conversion switches over formats; its constants scale with each read");
+        Require(test.name, "one kind table",
+                kind_table != 0u && kind_table_private &&
+                    composite_operands.contains(kind_initializer) &&
+                    composite_operands[kind_initializer] != 0u &&
+                    composite_operands[kind_initializer] <= 32u,
+                "the conversions are not one Private table with an entry per kind");
+        Require(test.name, "branch-free conversion", conversion_branches == 0u && conversion_pure,
+                "formatted conversion branches or reads more than the two tables");
+        Require(test.name, "no real call", real_calls == 0u,
+                "a helper is kept out of line: a real call per read costs the shader its speed");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
                     (wave > vulkan.SubgroupSize() ? 2 : 1),
@@ -56663,6 +56798,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyzwGpuSelectedDescriptors32);
   AddCase(BufferLoadFormatXyzwGpuSelectedDescriptors64);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
+  for (const u32 wave : {32u, 64u}) {
+    cases.push_back(BufferLoadFormatXValues(wave));
+    for (const u32 record : {0u, 1u})
+      cases.push_back(BufferLoadFormatXyzwGpuSelectedDescriptors(wave, record));
+  }
   AddCase(BufferLoadUshortGpuSelectedDescriptors);
   AddCase(BufferLoadUshortGpuSelectedDescriptors64);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors);
@@ -64784,6 +64924,13 @@ int main(int argc, char **argv) {
     CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
+    for (const u32 wave : {32u, 64u}) {
+      RunCase(&vulkan, BufferLoadFormatXValues(wave));
+      RunCase(&vulkan, BufferLoadFormatXyzwGpuSelectedDescriptors32());
+      for (const u32 record : {0u, 1u})
+        RunCase(&vulkan, BufferLoadFormatXyzwGpuSelectedDescriptors(wave, record));
+    }
+    RunCase(&vulkan, BufferLoadFormatXyzwGpuSelectedDescriptors64());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());

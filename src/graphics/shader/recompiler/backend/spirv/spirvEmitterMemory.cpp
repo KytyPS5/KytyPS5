@@ -1293,19 +1293,31 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 	});
 }
 
-// A formatted indirect read takes its format's geometry and conversion from one table per module:
-// per format a row of what the read needs, so the shader's constant data does not grow with its
-// reads. Per-format switches did: a driver that inlines each call keeps a copy of their constants
-// per call, and past the hardware constant bank (64 KiB) the dispatch fails at launch
+// A formatted indirect read takes its format's geometry and conversion from two tables per module,
+// a row per format and an entry per conversion kind, so the shader's constant data does not grow
+// with its reads. Per-format switches did: a driver that inlines each call keeps a copy of their
+// constants per call, and past the hardware constant bank (64 KiB) the dispatch fails at launch
 // (PPSA02015, NVIDIA SKEDCHECK23_CONSTANT_BUFFER_SIZE, device lost).
 //
 // Row words: 0 = byte size | component count << 8 | packed << 12 | signed << 13 | unknown << 14 |
 // integer << 15; 1 and 2 = components 0-1 and 2-3, 16 bits each (bit offset, bit count << 5,
 // conversion kind << 11); 3 = first component bytes | read alignment mask << 8.
+// Kind words: 0 = the conversion, 1 = the factor of a scaled or normalized component.
 struct IndirectFormatKind {
 	Format::ComponentType type = Format::ComponentType::Unknown;
 	uint32_t              bits = 0;
 	bool                  operator==(const IndirectFormatKind&) const = default;
+};
+
+// Bits pass through; a factor scales the component's integer, with a floor of -1 when signed and
+// normalized; the floats widen to 32 bits.
+enum class IndirectFormatConversion : uint32_t {
+	Bits,
+	Factor,
+	FactorFloor,
+	Half,
+	Float11,
+	Float10
 };
 
 void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
@@ -1315,9 +1327,8 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	constexpr auto format_count =
 	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
 
-	// Each distinct conversion is emitted once; rows name it by index. Integers pass their bits
-	// through and scaled formats convert whole values, so only normalized and float components
-	// convert by their width.
+	// Rows name each distinct conversion by index. Integers pass their bits through and scaled
+	// formats convert whole values, so only normalized and float components convert by their width.
 	std::vector<IndirectFormatKind> kinds;
 	const auto kind_of = [&](Format::ComponentType component_type, uint32_t bits) {
 		using Type          = Format::ComponentType;
@@ -1364,6 +1375,39 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	    state.builder.Constant(spv::OpConstantComposite, table_type,
 	                           std::span<const uint32_t> {rows}));
 	state.builder.AddName(table, "indirect_buffer_formats");
+	const auto            kind_type = TypeU32Composite(state, 2);
+	std::vector<uint32_t> conversions;
+	for (const auto& kind: kinds) {
+		using Type       = Format::ComponentType;
+		auto  conversion = IndirectFormatConversion::Bits;
+		float factor     = 0.0f;
+		if (kind.type == Type::Uscaled || kind.type == Type::Sscaled) {
+			conversion = IndirectFormatConversion::Factor;
+			factor     = 1.0f;
+		} else if (kind.type == Type::Unorm || kind.type == Type::Snorm) {
+			// The reciprocal a host folds its division by the constant maximum into.
+			const auto value_bits = kind.bits - (kind.type == Type::Snorm ? 1u : 0u);
+			EXIT_IF(value_bits == 0u || value_bits > 24u);
+			conversion = kind.type == Type::Snorm ? IndirectFormatConversion::FactorFloor
+			                                      : IndirectFormatConversion::Factor;
+			factor     = 1.0f / static_cast<float>((1u << value_bits) - 1u);
+		} else if (kind.type == Type::Float && kind.bits != 32u) {
+			conversion = kind.bits == 16u   ? IndirectFormatConversion::Half
+			             : kind.bits == 11u ? IndirectFormatConversion::Float11
+			                                : IndirectFormatConversion::Float10;
+		}
+		conversions.push_back(
+		    state.builder.Constant(spv::OpConstantComposite, kind_type,
+		                           ConstantU32(state, static_cast<uint32_t>(conversion)),
+		                           ConstantU32(state, std::bit_cast<uint32_t>(factor))));
+	}
+	const auto kind_table_type = state.builder.Type(
+	    spv::OpTypeArray, kind_type, ConstantU32(state, static_cast<uint32_t>(kinds.size())));
+	const auto kind_table = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassPrivate, kind_table_type), spv::StorageClassPrivate,
+	    state.builder.Constant(spv::OpConstantComposite, kind_table_type,
+	                           std::span<const uint32_t> {conversions}));
+	state.builder.AddName(kind_table, "indirect_buffer_format_kinds");
 	// A format past the table reads as format 0, as the switches' default case did.
 	const auto load_row = [&](uint32_t format) {
 		const auto index   = Select(state, type,
@@ -1402,7 +1446,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		                      "indirect_buffer_format_geometry");
 		state.builder.AddFunction(spv::OpFunction, row_type,
 		                          state.indirect_format_geometry_function,
-		                          spv::FunctionControlDontInlineMask, function_type);
+		                          spv::FunctionControlMaskNone, function_type);
 		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 		EmitLabel(state, state.builder.AllocateId());
 		const auto row    = load_row(format);
@@ -1426,7 +1470,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlDontInlineMask, function_type);
+	                          spv::FunctionControlMaskNone, function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
@@ -1471,14 +1515,42 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	                          Unary(state, spv::OpBitcast, TypeI32(state), raw), offset, bits);
 	const auto extracted = Select(state, type, is_signed,
 	                              Unary(state, spv::OpBitcast, type, signed_value), unsigned_value);
-	const auto converted = EmitIndexSwitch(
-	    state, kind, static_cast<uint32_t>(kinds.size()), type, [&](uint32_t index) {
-		    Format::BufferFormatInfo info {};
-		    info.type              = kinds[index].type;
-		    info.component_count   = 1u;
-		    info.component_bits[0] = kinds[index].bits;
-		    return NormalizeFormatComponent(state, info, 0u, extracted);
-	    });
+	// Every conversion is computed and the kind's picked: no branch, and no constant per format.
+	const auto kind_pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassPrivate, kind_type), kind_pointer,
+	                          kind_table, kind);
+	const auto kind_words = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, kind_type, kind_words, kind_pointer);
+	const auto conversion = word_of(kind_words, 0u);
+	const auto scaled =
+	    Binary(state, spv::OpFMul, TypeF32(state),
+	           Select(state, TypeF32(state), is_signed,
+	                  Unary(state, spv::OpConvertSToF, TypeF32(state), signed_value),
+	                  Unary(state, spv::OpConvertUToF, TypeF32(state), unsigned_value)),
+	           Unary(state, spv::OpBitcast, TypeF32(state), word_of(kind_words, 1u)));
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450FMax, scaled, ConstantF32Value(state, -1.0f));
+	const auto widened = [&](uint32_t float_bits) {
+		Format::BufferFormatInfo info {};
+		info.type              = Format::ComponentType::Float;
+		info.component_count   = 1u;
+		info.component_bits[0] = float_bits;
+		return NormalizeFormatComponent(state, info, 0u, extracted);
+	};
+	auto       converted = extracted;
+	const auto pick      = [&](IndirectFormatConversion picked, uint32_t value) {
+		converted = Select(state, type,
+		                   Binary(state, spv::OpIEqual, TypeBool(state), conversion,
+		                          ConstantU32(state, static_cast<uint32_t>(picked))),
+		                   value, converted);
+	};
+	pick(IndirectFormatConversion::Factor, Unary(state, spv::OpBitcast, type, scaled));
+	pick(IndirectFormatConversion::FactorFloor, Unary(state, spv::OpBitcast, type, floored));
+	pick(IndirectFormatConversion::Half, widened(16u));
+	pick(IndirectFormatConversion::Float11, widened(11u));
+	pick(IndirectFormatConversion::Float10, widened(10u));
 	const auto value = Select(
 	    state, type,
 	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector, ConstantU32(state, 4)),

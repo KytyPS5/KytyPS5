@@ -964,7 +964,8 @@ bool ApplyConfigPreset(Configuration* config, const QJsonDocument& doc, QString*
 }
 
 static bool SanitizeModEntry(const QJsonObject& in_mod, const QString& fallback_source,
-                             const QString& fallback_author, QJsonObject* out_mod) {
+                             const QString& fallback_author, QJsonObject* out_mod,
+                             const QString& fallback_version = QString()) {
 	if (out_mod == nullptr) {
 		return false;
 	}
@@ -1053,6 +1054,12 @@ static bool SanitizeModEntry(const QJsonObject& in_mod, const QString& fallback_
 	} else if (!fallback_author.isEmpty()) {
 		clean_mod.insert(QStringLiteral("author"), fallback_author);
 	}
+	const auto mod_version = in_mod.value(QStringLiteral("version")).toString().trimmed();
+	if (!mod_version.isEmpty()) {
+		clean_mod.insert(QStringLiteral("version"), mod_version);
+	} else if (!fallback_version.isEmpty()) {
+		clean_mod.insert(QStringLiteral("version"), fallback_version);
+	}
 	*out_mod = clean_mod;
 	return true;
 }
@@ -1088,6 +1095,8 @@ QJsonDocument PrepareForImport(const QJsonDocument& doc, const QString& source,
 		root.insert(QStringLiteral("process"),
 		            trimmed_proc.isEmpty() ? QStringLiteral("eboot.bin") : trimmed_proc);
 	}
+	const auto doc_ver = !version.trimmed().isEmpty() ? version.trimmed()
+	                                                  : root.value(QStringLiteral("version")).toString().trimmed();
 	auto mods = root.value(QStringLiteral("mods")).toArray();
 	QJsonArray clean_mods;
 	QSet<QString> seen_names;
@@ -1101,7 +1110,7 @@ QJsonDocument PrepareForImport(const QJsonDocument& doc, const QString& source,
 			continue;
 		}
 		QJsonObject clean_mod;
-		if (!SanitizeModEntry(mod, source, author, &clean_mod)) {
+		if (!SanitizeModEntry(mod, source, author, &clean_mod, doc_ver)) {
 			continue;
 		}
 		seen_names.insert(name.toLower());
@@ -1266,34 +1275,64 @@ QJsonDocument MergeDocuments(const QJsonDocument& base_doc, const QJsonDocument&
 				}
 				auto mod_obj = val.toObject();
 				mod_obj.insert(QStringLiteral("enabled"), false);
+				if (!mod_obj.contains(QStringLiteral("version")) ||
+				    mod_obj.value(QStringLiteral("version")).toString().trimmed().isEmpty()) {
+					if (!base_ver.isEmpty()) {
+						mod_obj.insert(QStringLiteral("version"), base_ver);
+					}
+				}
 				disabled_base_mods.append(mod_obj);
 			}
 		}
 		base_mods = disabled_base_mods;
 		root.insert(QStringLiteral("mods"), base_mods);
 	}
-	QSet<QString> existing_names;
-	for (const auto& val: base_mods) {
-		if (val.isObject()) {
-			existing_names.insert(val.toObject().value(QStringLiteral("name")).toString().trimmed().toLower());
-		}
-	}
 	const auto new_mods = new_doc.object().value(QStringLiteral("mods")).toArray();
+	const auto incoming_doc_ver = !new_ver.isEmpty() ? new_ver : target_ver;
+	QSet<QString> seen_in_new;
 	for (const auto& val: new_mods) {
 		if (!val.isObject()) {
 			continue;
 		}
 		const auto mod = val.toObject();
 		const auto name = mod.value(QStringLiteral("name")).toString().trimmed();
-		if (name.isEmpty() || existing_names.contains(name.toLower())) {
+		const auto name_lower = name.toLower();
+		if (name.isEmpty() || seen_in_new.contains(name_lower)) {
 			continue;
 		}
+		seen_in_new.insert(name_lower);
+
 		QJsonObject clean_mod;
-		if (!SanitizeModEntry(mod, source, author, &clean_mod)) {
+		if (!SanitizeModEntry(mod, source, author, &clean_mod, incoming_doc_ver)) {
 			continue;
 		}
-		existing_names.insert(name.toLower());
-		base_mods.append(clean_mod);
+
+		int match_idx = -1;
+		for (qsizetype i = 0; i < base_mods.size(); ++i) {
+			if (base_mods[i].isObject() &&
+			    base_mods[i].toObject().value(QStringLiteral("name")).toString().trimmed().toLower() == name_lower) {
+				match_idx = static_cast<int>(i);
+				break;
+			}
+		}
+
+		if (match_idx >= 0) {
+			const auto existing_obj = base_mods[match_idx].toObject();
+			QString existing_mod_ver = existing_obj.value(QStringLiteral("version")).toString().trimmed();
+			if (existing_mod_ver.isEmpty() && !base_ver.isEmpty()) {
+				existing_mod_ver = base_ver;
+			}
+			const auto clean_mod_ver = clean_mod.value(QStringLiteral("version")).toString().trimmed();
+			const auto cmp_ver = !clean_mod_ver.isEmpty() ? clean_mod_ver : target_ver;
+			if (!existing_mod_ver.isEmpty() && !cmp_ver.isEmpty() &&
+			    !VersionsMatch(existing_mod_ver, cmp_ver)) {
+				base_mods[match_idx] = clean_mod;
+			} else {
+				continue;
+			}
+		} else {
+			base_mods.append(clean_mod);
+		}
 	}
 	if (base_mods.isEmpty()) {
 		if (error != nullptr) {

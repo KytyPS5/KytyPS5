@@ -651,6 +651,112 @@ void TestMergeDocumentsAndPrepare() {
 	Check(!mismatched_sel.isObject(), "WithSelection should reject mask size mismatch");
 }
 
+void TestSuccessiveCrossVersionMerge() {
+	const QByteArray v1_json = R"({
+		"id": "PPSA21567",
+		"version": "01.00",
+		"process": "eboot.bin",
+		"mods": [
+			{
+				"name": "Mod A",
+				"source": "KytyPS5-Modules",
+				"author": "Author1",
+				"enabled": true,
+				"memory": [{"offset": "0x1000", "on": "9090", "off": "0000"}]
+			},
+			{
+				"name": "Mod B",
+				"source": "KytyPS5-Modules",
+				"author": "Author2",
+				"enabled": true,
+				"memory": [{"offset": "0x2000", "on": "9090", "off": "0000"}]
+			}
+		]
+	})";
+
+	// Import 1: Target game version is upgraded to 01.01, but the remote module only provides Mod A for 01.01
+	const QByteArray v2_modA_json = R"({
+		"id": "PPSA21567",
+		"version": "01.01",
+		"process": "eboot.bin",
+		"mods": [
+			{
+				"name": "Mod A",
+				"memory": [{"offset": "0x1100", "on": "9090", "off": "0000"}]
+			}
+		]
+	})";
+
+	const auto doc_v1 = QJsonDocument::fromJson(v1_json);
+	const auto doc_v2_a = QJsonDocument::fromJson(v2_modA_json);
+
+	const auto merge1 = Cheats::MergeDocuments(doc_v1, doc_v2_a, QStringLiteral("KytyPS5-Modules"),
+	                                           QStringLiteral("Author1"), QStringLiteral("eboot.bin"),
+	                                           QStringLiteral("01.01"), nullptr, {}, true);
+	Check(merge1.isObject(), "merge1 should succeed");
+	Check(merge1.object().value(QStringLiteral("version")).toString() == QStringLiteral("01.01"),
+	      "merge1 should update root version to 01.01");
+	const auto merge1_mods = merge1.object().value(QStringLiteral("mods")).toArray();
+	Check(merge1_mods.size() == 2, "merge1 should retain both Mod A and Mod B");
+
+	QJsonObject mod_a1, mod_b1;
+	for (const auto& v : merge1_mods) {
+		const auto obj = v.toObject();
+		if (obj.value(QStringLiteral("name")).toString() == QStringLiteral("Mod A")) mod_a1 = obj;
+		if (obj.value(QStringLiteral("name")).toString() == QStringLiteral("Mod B")) mod_b1 = obj;
+	}
+	Check(!mod_a1.isEmpty(), "Mod A should be present in merge1");
+	Check(!mod_b1.isEmpty(), "Mod B should be present in merge1");
+	Check(mod_a1.value(QStringLiteral("memory")).toArray()[0].toObject().value(QStringLiteral("offset")).toString() == QStringLiteral("0x1100"),
+	      "Mod A should have updated offset 0x1100 in merge1");
+	Check(mod_b1.value(QStringLiteral("enabled")).toBool() == false,
+	      "retained Mod B should be disabled because it was from version 01.00");
+	Check(mod_b1.value(QStringLiteral("version")).toString() == QStringLiteral("01.00"),
+	      "retained Mod B must preserve its origin version 01.00");
+
+	// Import 2: Successive import where base_doc already has version 01.01, now importing Mod B for 01.01
+	const QByteArray v2_modB_json = R"({
+		"id": "PPSA21567",
+		"version": "01.01",
+		"process": "eboot.bin",
+		"mods": [
+			{
+				"name": "Mod B",
+				"memory": [{"offset": "0x2200", "on": "9090", "off": "0000"}]
+			}
+		]
+	})";
+	const auto doc_v2_b = QJsonDocument::fromJson(v2_modB_json);
+
+	const auto merge2 = Cheats::MergeDocuments(merge1, doc_v2_b, QStringLiteral("KytyPS5-Modules"),
+	                                           QStringLiteral("Author2"), QStringLiteral("eboot.bin"),
+	                                           QStringLiteral("01.01"), nullptr, {}, true);
+	Check(merge2.isObject(), "merge2 should succeed");
+	const auto merge2_mods = merge2.object().value(QStringLiteral("mods")).toArray();
+	Check(merge2_mods.size() == 2, "merge2 should still have 2 mods");
+
+	QJsonObject mod_a2, mod_b2;
+	for (const auto& v : merge2_mods) {
+		const auto obj = v.toObject();
+		if (obj.value(QStringLiteral("name")).toString() == QStringLiteral("Mod A")) mod_a2 = obj;
+		if (obj.value(QStringLiteral("name")).toString() == QStringLiteral("Mod B")) mod_b2 = obj;
+	}
+	Check(!mod_a2.isEmpty(), "Mod A should still be present in merge2");
+	Check(!mod_b2.isEmpty(), "Mod B should be present in merge2");
+	Check(mod_b2.value(QStringLiteral("memory")).toArray()[0].toObject().value(QStringLiteral("offset")).toString() == QStringLiteral("0x2200"),
+	      "successive import must replace stale 01.00 Mod B with new 01.01 offset 0x2200");
+	Check(mod_b2.value(QStringLiteral("version")).toString() == QStringLiteral("01.01"),
+	      "Mod B version must now be 01.01");
+
+	// Import 3: Importing Mod B for 01.01 again should preserve existing Mod B (conflict deduplication)
+	const auto merge3 = Cheats::MergeDocuments(merge2, doc_v2_b, QStringLiteral("KytyPS5-Modules"),
+	                                           QStringLiteral("Author2"), QStringLiteral("eboot.bin"),
+	                                           QStringLiteral("01.01"), nullptr, {}, true);
+	Check(merge3.isObject(), "merge3 should succeed");
+	const auto merge3_mods = merge3.object().value(QStringLiteral("mods")).toArray();
+	Check(merge3_mods.size() == 2, "merge3 should not duplicate Mod B");
+}
+
 void TestValidateImportAndSave() {
 	const QByteArray valid_json = R"({
 		"id": "PPSA21567",
@@ -979,6 +1085,7 @@ int main(int argc, char** argv) {
 		TestParseIndex();
 		TestConfigPreset();
 		TestMergeDocumentsAndPrepare();
+		TestSuccessiveCrossVersionMerge();
 		TestValidateImportAndSave();
 		TestConvertTrainer();
 		TestCheatRepositoryClass();

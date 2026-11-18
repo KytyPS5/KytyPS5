@@ -287,7 +287,7 @@ bool Translate(const Program& program, uint64_t source_base, uint64_t source_add
 		return true;
 	}
 	const uint64_t diff = source_base - source_address;
-	if (diff > program.base_vaddr) {
+	if (diff >= program.base_vaddr) {
 		return false;
 	}
 	*target_address = program.base_vaddr - diff;
@@ -379,11 +379,18 @@ bool AllocateCave(Plan* plan, const Program& program, std::string* error) {
 			return Fail(error, "non-zero write is outside the matched module");
 		}
 
+		if (write.target_address == 0) {
+			return Fail(error, "code-cave target address cannot be null");
+		}
+
 		if (write.target_address > UINT64_MAX - write.off.size()) {
 			return Fail(error, "write target address overflow");
 		}
 		const auto write_end = write.target_address + write.off.size();
 		for (auto page = write.target_address & ~(kPageSize - 1); page < write_end;) {
+			if (page == 0) {
+				return Fail(error, "code-cave page cannot be null");
+			}
 			if (std::find(pages.begin(), pages.end(), page) == pages.end()) {
 				pages.push_back(page);
 			}
@@ -395,10 +402,14 @@ bool AllocateCave(Plan* plan, const Program& program, std::string* error) {
 	}
 
 	for (const auto page: pages) {
+		if (page == 0) {
+			ReleaseCaves(&plan->cave_pages);
+			return Fail(error, "code-cave page cannot be null");
+		}
 		const auto allocated = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    page, kPageSize, Common::VirtualMemory::Mode::ExecuteReadWrite, "game_cheat_code_cave",
 		    true);
-		if (allocated != page) {
+		if (allocated == 0 || allocated != page) {
 			if (allocated != 0) {
 				Libs::LibKernel::Memory::FreeGuestMemory(allocated, kPageSize);
 			}

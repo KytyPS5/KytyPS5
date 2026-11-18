@@ -261,18 +261,35 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	m_download_images.erase(id);
-	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-		// Only the last image to acquire an HTile range releases its clear state.
-		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
-		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
-			m_surface_metas.erase(metadata);
-		}
-	}
+	ReleaseHtileOwner(id, image.info.metadata);
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
+	}
+}
+
+void TextureCache::ReleaseHtileOwner(ImageId id, const ImageMetadataInfo& released) {
+	if (released.kind != ImageMetadataKind::Htile) {
+		return;
+	}
+	const auto metadata = m_surface_metas.find(released.range.address);
+	if (metadata == m_surface_metas.end() || metadata->second.owner != id) {
+		return;
+	}
+	ImageId heir;
+	m_slot_images.ForEach([&](ImageId other, const Image& candidate) {
+		if (other != id && candidate.registered &&
+		    candidate.info.metadata.kind == ImageMetadataKind::Htile &&
+		    candidate.info.metadata.range.address == metadata->first) {
+			heir = other;
+		}
+	});
+	if (heir) {
+		metadata->second.owner = heir;
+	} else {
+		m_surface_metas.erase(metadata);
 	}
 }
 
@@ -1215,6 +1232,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		ReleaseHtileOwner(association, record.info.metadata);
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1447,6 +1465,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             desc.info.resources.layers};
 	}
 	image.info.stencil = desc.info.stencil;
+	if (image.info.metadata.range.address != desc.info.metadata.range.address) {
+		ReleaseHtileOwner(id, image.info.metadata);
+	}
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);

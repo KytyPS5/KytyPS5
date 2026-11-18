@@ -9,7 +9,6 @@
 #include "libs/errno.h"
 #include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
-#include "loader/jit.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
@@ -5806,58 +5805,76 @@ void TestSmallFiberStacksAndMigration() {
 
 } // namespace
 
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-KYTY_MS_ABI uint8_t* TlsStubTestAddress() {
-	return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x123456789abcull));
-}
-
-void TestTlsStubsPreserveFlags() {
-	const char*    test      = "TlsStubsPreserveFlags";
-	const uint64_t stub_size = Loader::Jit::SafeCall::GetSize();
+void TestGuestTlsReadsUseThreadTcb() {
+	const char*        test      = "GuestTlsReadsUseThreadTcb";
 	constexpr uint64_t CODE_SIZE = 0x1000;
-	constexpr uint8_t  REG       = 1;
 	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
-	    0x0000000906000000ull, stub_size + CODE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
-	    "tls_stub_test");
-	Check(test, mapping != 0, "failed to allocate TLS stub test code");
-	auto* safe_call = new (reinterpret_cast<void*>(mapping)) Loader::Jit::SafeCall;
-	safe_call->SetFunc(TlsStubTestAddress);
-	const auto stub_address = mapping + Loader::Jit::TlsRegStub::GetOffset(REG);
-	auto*      stub         = new (reinterpret_cast<void*>(stub_address)) Loader::Jit::TlsRegStub;
-	stub->SetFunc(mapping);
-	stub->SetOutputReg(REG);
+	    0x0000000906000000ull, CODE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "tls_read_test");
+	Check(test, mapping != 0, "failed to allocate TLS read test code");
 
-	using Fixture  = uint64_t(KYTY_SYSV_ABI*)(uint64_t*);
-	bool preserved = true;
-	for (const auto [input, status]: {std::pair {uint8_t {0x7f}, uint64_t {0x890}},
-	                                  std::pair {uint8_t {0xff}, uint64_t {0x055}}}) {
-		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping + stub_size));
-		code.push(code.rbx);
-		code.mov(code.rbx, code.rdi);
-		code.mov(code.rax, 0x5555555555555555ull);
-		code.mov(code.al, input);
-		code.add(code.al, 1);
-		code.mov(code.r11, stub_address);
-		code.call(code.r11);
-		code.mov(code.qword[code.rbx], code.rcx);
-		code.mov(code.qword[code.rbx + 8], code.rax);
-		code.pushf();
-		code.pop(code.rax);
-		code.pop(code.rbx);
-		code.ret();
-		Check(test, Xbyak::GetError() == 0, "failed to generate TLS stub fixture");
-		Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, stub_size + CODE_SIZE),
-		      "failed to flush TLS stub test code");
-		std::array<uint64_t, 2> registers {};
-		const auto flags = reinterpret_cast<Fixture>(mapping + stub_size)(registers.data());
-		const auto rax   = (0x5555555555555555ull & ~0xffull) | static_cast<uint8_t>(input + 1u);
-		preserved &= (flags & 0x8d5u) == status && registers[0] == 0x123456789abcull &&
-		             registers[1] == rax;
-	}
-	Libs::LibKernel::Memory::FreeGuestMemory(mapping, stub_size + CODE_SIZE);
-	Check(test, preserved, "TLS stubs changed the caller's flags or registers");
+	// Reads the TCB through fs:[0] into rax, into rax behind 66 prefixes and into r9.
+	Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
+		for (const auto byte: bytes) {
+			code.db(byte);
+		}
+	};
+	emit({0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0});
+	code.mov(code.qword[code.rdi], code.rax);
+	emit({0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0});
+	code.mov(code.qword[code.rdi + 8], code.rax);
+	emit({0x64, 0x4c, 0x8b, 0x0c, 0x25, 0, 0, 0, 0});
+	code.mov(code.qword[code.rdi + 16], code.r9);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate TLS read fixture");
+	Loader::RuntimeLinker::PatchGuestCode(mapping, code.getSize());
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE),
+	      "failed to flush TLS read test code");
+
+	Loader::RuntimeLinker::CreateThreadTls();
+	std::array<uint64_t, 3> out {};
+	reinterpret_cast<void(KYTY_SYSV_ABI*)(uint64_t*)>(mapping)(out.data());
+	const auto tcb = reinterpret_cast<uint64_t>(Loader::RuntimeLinker::GetThreadTcb());
+	Loader::RuntimeLinker::DeleteThreadTls();
+	Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE);
+
+	Check(test, out[0] == tcb && out[1] == tcb && out[2] == tcb,
+	      "patched fs:[0] reads did not return the thread TCB");
+	std::printf("[host]    %-48s ok\n", test);
 }
-#endif
+
+void TestGuestTlsGetAddrUsesPerThreadBlocks() {
+	const char* test = "GuestTlsGetAddrUsesPerThreadBlocks";
+
+	const std::array<uint8_t, 4> image {1, 2, 3, 4};
+	Loader::Program              module;
+	module.tls = {reinterpret_cast<uint64_t>(image.data()), image.size(), 64, 7};
+	const auto initialized = [&](const uint8_t* block) {
+		return std::equal(image.begin(), image.end(), block) &&
+		       std::all_of(block + image.size(), block + 64, [](uint8_t b) { return b == 0; });
+	};
+
+	Loader::RuntimeLinker::CreateThreadTls();
+	auto* block = Loader::RuntimeLinker::TlsGetAddr(&module);
+	block[4]    = 5;
+	const bool same_block = Loader::RuntimeLinker::TlsGetAddr(&module) == block;
+
+	uint8_t* other_block = nullptr;
+	bool     other_ok    = false;
+	std::thread([&] {
+		Loader::RuntimeLinker::CreateThreadTls();
+		other_block = Loader::RuntimeLinker::TlsGetAddr(&module);
+		other_ok    = initialized(other_block);
+		Loader::RuntimeLinker::DeleteThreadTls();
+	}).join();
+	Loader::RuntimeLinker::DeleteThreadTls();
+
+	Check(test, same_block, "a module's TLS block changed within a thread");
+	Check(test, other_block != block && other_ok,
+	      "a second thread did not get its own initialized TLS block");
+	std::printf("[host]    %-48s ok\n", test);
+}
 
 int RunTrinityTests();
 
@@ -6055,9 +6072,8 @@ int main(int argc, char** argv) {
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	RunTest(TestTlsStubsPreserveFlags);
-#endif
+	RunTest(TestGuestTlsReadsUseThreadTcb);
+	RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
 	// Memory callbacks remain registered for the rest of the process.
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);

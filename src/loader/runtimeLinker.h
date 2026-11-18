@@ -9,7 +9,6 @@
 
 #include <filesystem>
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 namespace Loader {
@@ -54,24 +53,10 @@ struct LibraryId {
 };
 
 struct ThreadLocalStorage {
-	struct Block {
-		uint8_t*                     ptr        = nullptr;
-		application_heap_free_func_t free_func  = nullptr;
-		bool                         vm_alloc   = false;
-		uint64_t                     alloc_size = 0;
-	};
-
-	~ThreadLocalStorage();
-
-	uint64_t image_vaddr   = 0;
-	uint64_t init_size     = 0;
-	uint64_t image_size    = 0;
-	uint64_t tcb_offset    = 0;
-	uint64_t handler_vaddr = 0;
-
-	std::vector<uint8_t>           init_image;
-	std::unordered_map<int, Block> tlss;
-	Common::Mutex                  mutex;
+	uint64_t image_vaddr = 0;
+	uint64_t init_size   = 0;
+	uint64_t image_size  = 0;
+	uint32_t index       = 0; // DTV slot; 0 is the main program's static TLS
 };
 
 struct DynamicInfo {
@@ -165,7 +150,6 @@ public:
 	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func);
 	int   StopModule(Program* program, size_t args, const void* argp, module_func_t func);
 	void  StopAllModules();
-	void  DeleteTlss(int thread_id);
 	void  SetApplicationHeapApi(void* const api[10]);
 	void* ApplicationHeapMalloc(uint64_t size);
 	void* ApplicationHeapMemalign(uint64_t alignment, uint64_t size);
@@ -180,8 +164,13 @@ public:
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
 
+	// CreateThreadTls runs on each guest thread before its first guest instruction.
+	static void     CreateThreadTls();
+	static void     DeleteThreadTls();
+	static void*    GetThreadTcb();
+	static void     SetThreadTcb(void* tcb);
 	static uint8_t* TlsGetAddr(Program* program);
-	static void     DeleteTls(Program* program, int thread_id);
+	static void     PatchGuestCode(uint64_t address, uint64_t size);
 
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
@@ -191,7 +180,6 @@ private:
 	static void CreateSymbolDatabase(Program* program);
 	static void Relocate(Program* program);
 	static void DeleteProgram(Program* program);
-	static void SetupTlsHandler(Program* program);
 
 	static const ModuleId*  FindModule(const Program& program, const std::string& id);
 	static const LibraryId* FindLibrary(const Program& program, const std::string& id);

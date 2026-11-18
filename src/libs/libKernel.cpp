@@ -1036,9 +1036,11 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
 		if (!guest_context) {
 			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx]() mutable {
+			std::thread([thread, signum, handler, ctx,
+			             tcb = Loader::RuntimeLinker::GetThreadTcb()]() mutable {
 				SignalDispatchScope helper_scope;
-				auto*               previous_self = PthreadSwapSelfForSignal(thread);
+				Loader::RuntimeLinker::SetThreadTcb(tcb);
+				auto* previous_self = PthreadSwapSelfForSignal(thread);
 				handler(signum, &ctx);
 				PthreadSwapSelfForSignal(previous_self);
 			}).detach();

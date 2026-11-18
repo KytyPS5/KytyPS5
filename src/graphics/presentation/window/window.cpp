@@ -320,6 +320,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	// A new mapping changes how SDL translates the device. SDL sends no release or neutral axis
 	// events for the old mapping, so held input would stay stuck: reset it on every player.
 	if (f.remapped) {
+		HostInputResetGamepadTouchPad(f.id);
 		Controller::ResetInputState();
 		return;
 	}

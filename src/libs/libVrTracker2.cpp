@@ -21,6 +21,7 @@ namespace VrTracker2 {
 constexpr int32_t ERROR_NOT_INIT            = -1972109311; // 0x8a740001
 constexpr int32_t ERROR_ALREADY_INITIALIZED = -1972109310; // 0x8a740002
 constexpr int32_t ERROR_ARGUMENT_INVALID    = -1972109306; // 0x8a740006
+constexpr int32_t ERROR_NOT_AVAILABLE_IN_CURRENT_PLAY_AREA_MODE = -1972109279; // 0x8a740021
 
 constexpr uint32_t MEMORY_SIZE      = 32u << 20u;
 constexpr uint32_t MEMORY_ALIGNMENT = 0x10000;
@@ -107,6 +108,12 @@ struct SceVrTracker2ResultData {
 	uint32_t reserved02;
 };
 
+struct SceVrTracker2PlayAreaBoundaryGeometryData {
+	uint32_t          sizeOfThis;
+	uint32_t          numPoints;
+	Hmd2::SceFVector3 point[256];
+};
+
 static_assert(sizeof(SceVrTracker2QueryMemoryResult) == 0x20);
 static_assert(sizeof(SceVrTracker2InitializeParam) == 0x48);
 static_assert(offsetof(SceVrTracker2InitializeParam, memoryPointer) == 0x20);
@@ -120,6 +127,7 @@ static_assert(offsetof(SceVrTracker2ResultData, flipArg) == 0x58);
 static_assert(offsetof(SceVrTracker2ResultData, hmdInfo.devicePose) == 0x60);
 static_assert(offsetof(SceVrTracker2ResultData, hmdInfo.gazeOriginPose) == 0x160);
 static_assert(offsetof(SceVrTracker2ResultData, vrControllerInfo.lastValidVisionTimestamp) == 0xa0);
+static_assert(sizeof(SceVrTracker2PlayAreaBoundaryGeometryData) == 0xc08);
 
 static std::atomic<bool> g_initialized = false;
 // Handle registered for each device type.
@@ -216,6 +224,20 @@ static int32_t KYTY_SYSV_ABI GetResult(const SceVrTracker2GetResultParam* param,
 	return OK;
 }
 
+// There is no room-scale play area, and a stationary one has no boundary geometry.
+static int32_t KYTY_SYSV_ABI
+GetPlayAreaBoundaryGeometry(SceVrTracker2PlayAreaBoundaryGeometryData* geometry) {
+	PRINT_NAME();
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INIT;
+	}
+	if (geometry == nullptr || geometry->sizeOfThis != sizeof(*geometry)) {
+		return ERROR_ARGUMENT_INVALID;
+	}
+	*geometry = {sizeof(*geometry)};
+	return ERROR_NOT_AVAILABLE_IN_CURRENT_PLAY_AREA_MODE;
+}
+
 } // namespace VrTracker2
 
 LIB_DEFINE(InitVrTracker2_1) {
@@ -223,6 +245,7 @@ LIB_DEFINE(InitVrTracker2_1) {
 	LIB_FUNC("6Jy73SRfG-o", VrTracker2::Initialize);
 	LIB_FUNC("Dog+g25QYjw", VrTracker2::RegisterDevice);
 	LIB_FUNC("J4Vh3VVX0iU", VrTracker2::GetResult);
+	LIB_FUNC("SCph4ZbkqzU", VrTracker2::GetPlayAreaBoundaryGeometry);
 }
 
 } // namespace Libs

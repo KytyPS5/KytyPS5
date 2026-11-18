@@ -598,6 +598,14 @@ add_executable(playgo_tests EXCLUDE_FROM_ALL
 target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
 target_include_directories(playgo_tests PRIVATE ${inc_headers})
 
+add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VrTracker2Tests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libVrTracker2.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
+target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -741,6 +749,7 @@ if(BUILD_TESTING)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
+	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -863,6 +872,7 @@ if(BUILD_TESTING)
 		http_uri_parse_tests
 		rtc_tests
 		playgo_tests
+		vr_tracker2_tests
 	)
 endif()
 

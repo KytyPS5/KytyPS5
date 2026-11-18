@@ -911,18 +911,16 @@ struct Tcb {
 };
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static DWORD TcbSlot() {
-	static const DWORD slot = TlsAlloc();
-	EXIT_IF(slot >= 64); // later slots are not at a fixed TEB offset
-	return slot;
-}
+// Allocated before main: host libraries loaded later can use up the slots at a fixed TEB offset.
+static const DWORD g_tcb_slot = TlsAlloc();
 
 static uint32_t TcbGsOffset() {
-	return 0x1480 + 8 * TcbSlot();
+	return 0x1480 + 8 * g_tcb_slot;
 }
 
 void RuntimeLinker::SetThreadTcb(void* tcb) {
-	EXIT_IF(TlsSetValue(TcbSlot(), tcb) == 0);
+	EXIT_IF(g_tcb_slot >= 64); // later slots are not at a fixed TEB offset
+	EXIT_IF(TlsSetValue(g_tcb_slot, tcb) == 0);
 }
 #elif defined(__APPLE__)
 static pthread_key_t TcbKey() {

@@ -1097,7 +1097,8 @@ struct IndirectFormattedRecord {
 	uint32_t row       = 0;
 	uint32_t count     = 0;
 	uint32_t spacing   = 0;
-	uint32_t base      = 0;
+	uint32_t dword     = 0; // The address of the DWORD it starts in,
+	uint32_t byte      = 0; // and the byte of that DWORD it starts at.
 	uint32_t in_memory = 0;
 };
 
@@ -1123,51 +1124,91 @@ IndirectFormattedRecord PrepareIndirectFormattedRecord(EmitterState&            
 		                            ConstantU32(state, count));
 	};
 	const auto bytes     = field(0u, 0u, 8u);
-	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3u, 8u, 8u));
+	const auto alignment = field(3u, 8u, 8u);
+	const auto low       = Unary(state, spv::OpUConvert, type, buffer.address);
 	return {
-	    .row       = row,
-	    .count     = EmitUMax32(state, field(0u, 8u, 4u), ConstantU32(state, 1)),
-	    .spacing   = field(3u, 0u, 8u),
-	    .base      = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
-	                        Unary(state, spv::OpNot, TypeU64(state), alignment)),
+	    .row     = row,
+	    .count   = EmitUMax32(state, field(0u, 8u, 4u), ConstantU32(state, 1)),
+	    .spacing = field(3u, 0u, 8u),
+	    .dword   = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+	                      ConstantU64(state, ~uint64_t {3})),
+	    .byte    = Binary(state, spv::OpBitwiseAnd, type, low,
+	                      Binary(state, spv::OpBitwiseAnd, type,
+	                             Unary(state, spv::OpNot, type, alignment), ConstantU32(state, 3))),
 	    .in_memory = AndCondition(
 	        state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
 	        IndirectBufferInBounds(state, buffer, 0u, bytes, true)),
 	};
 }
 
-// One component of a formatted read: `selector` is that component's DST_SEL.
-uint32_t LoadIndirectFormattedComponent(ValueEmitContext&              ctx,
-                                        const IndirectFormattedRecord& record, uint32_t selector) {
-	auto&      state     = ctx.state;
-	const auto component = Binary(
-	    state, spv::OpUMod, TypeU32(state),
-	    Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)), record.count);
-	const auto address =
-	    Binary(state, spv::OpIAdd, TypeU64(state), record.base,
-	           Unary(state, spv::OpUConvert, TypeU64(state),
-	                 Binary(state, spv::OpIMul, TypeU32(state), component, record.spacing)));
-	const auto raw = EmitValueOrZeroIfCondition(
-	    state,
-	    AndCondition(state, record.in_memory,
-	                 Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
-	                        ConstantU32(state, 4))),
-	    [&]() {
-		    // Format alignment and component spacing keep every selected component within one DWORD.
-		    const auto word = LoadBdaDword(
-		        ctx, Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
-		                    ConstantU64(state, ~uint64_t {3})));
-		    const auto byte = Binary(
-		        state, spv::OpBitwiseAnd, TypeU32(state),
-		        Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-		    return Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
-		                  Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
-		                         ConstantU32(state, 3)));
-	    });
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
-	                          state.indirect_format_function, record.row, selector, component, raw);
-	return result;
+// A formatted read: each component takes the channel its DST_SEL names from the same record.
+uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                               uint32_t components) {
+	auto&      state  = ctx.state;
+	const auto u32    = TypeU32(state);
+	const auto u64    = TypeU64(state);
+	const auto record = PrepareIndirectFormattedRecord(state, buffer);
+	// Format alignment and component spacing keep every selected component within one DWORD:
+	// `dword` is that DWORD's offset from the record's first, `shift` the component's bit in it.
+	struct Component {
+		uint32_t selector = 0;
+		uint32_t index    = 0;
+		uint32_t dword    = 0;
+		uint32_t shift    = 0;
+		uint32_t reads    = 0;
+	};
+	std::array<Component, 4> read {};
+	for (uint32_t component = 0; component < components; ++component) {
+		auto& [selector, index, dword, shift, reads] = read[component];
+		selector = EmitBitFieldUExtract(state, buffer.dst_sel, ConstantU32(state, component * 3u),
+		                                ConstantU32(state, 3u));
+		index =
+		    Binary(state, spv::OpUMod, u32,
+		           Binary(state, spv::OpISub, u32, selector, ConstantU32(state, 4)), record.count);
+		const auto byte = Binary(state, spv::OpIAdd, u32, record.byte,
+		                         Binary(state, spv::OpIMul, u32, index, record.spacing));
+		dword           = Binary(state, spv::OpBitwiseAnd, u32, byte, ConstantU32(state, ~3u));
+		shift           = Binary(state, spv::OpShiftLeftLogical, u32,
+		                         Binary(state, spv::OpBitwiseAnd, u32, byte, ConstantU32(state, 3)),
+		                         ConstantU32(state, 3));
+		reads = AndCondition(state, record.in_memory,
+		                     Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+		                            ConstantU32(state, 4)));
+	}
+	const auto address_of = [&](uint32_t dword) {
+		return Binary(state, spv::OpIAdd, u64, record.dword,
+		              Unary(state, spv::OpUConvert, u64, dword));
+	};
+	const auto bits_of = [&](const Component& component, uint32_t word) {
+		return Binary(state, spv::OpShiftRightLogical, u32, word, component.shift);
+	};
+	// An address outside the guest's space reads zeros and tells the host nothing.
+	const auto outside = ConstantU64(state, ~uint64_t {0} << BufferCache::CACHING_PAGEBITS);
+	std::array<uint32_t, 4> bits {};
+	if (state.bda_pointer_function != 0) {
+		// A BVH program's lookup reads a missing page as all ones, so its reads keep their guard.
+		for (uint32_t component = 0; component < components; ++component) {
+			bits[component] = EmitValueOrZeroIfCondition(state, read[component].reads, [&]() {
+				return bits_of(read[component],
+				               LoadBdaDword(ctx, address_of(read[component].dword)));
+			});
+		}
+	} else {
+		// A component that takes nothing looks the outside address up instead of branching.
+		for (uint32_t component = 0; component < components; ++component) {
+			const auto address = Select(state, u64, read[component].reads,
+			                            address_of(read[component].dword), outside);
+			bits[component]    = bits_of(read[component], LoadBdaDword(ctx, address));
+		}
+	}
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; ++component) {
+		values[component] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, u32, values[component],
+		                          state.indirect_format_function, record.row,
+		                          read[component].selector, read[component].index, bits[component]);
+	}
+	return ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1600,16 +1641,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 				result =
 				    LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			} else {
-				// Each component reads the channel its DST_SEL names from the same record.
-				const auto              record = PrepareIndirectFormattedRecord(state, buffer);
-				std::array<uint32_t, 4> values {};
-				for (uint32_t component = 0; component < components; ++component)
-					values[component] = LoadIndirectFormattedComponent(
-					    ctx, record,
-					    EmitBitFieldUExtract(state, buffer.dst_sel,
-					                         ConstantU32(state, component * 3u),
-					                         ConstantU32(state, 3u)));
-				result = ConstructU32Composite(state, components, values);
+				result = LoadIndirectFormatted(ctx, buffer, components);
 			}
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);

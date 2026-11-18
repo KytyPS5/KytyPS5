@@ -42774,7 +42774,23 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
 // GPU space reads as unmapped; its page index truncated to 32 bits is the mapped test page.
 //
 // `values`: every format's components in three orders from one of the two records instead.
-TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave, std::optional<u32> values = {}) {
+// `placement`: one read of a record across two pages instead.
+constexpr uint64_t FormattedPlacedBase = 0x0000000120000000ull;
+
+// A record of which `before` bytes lie in the page at FormattedPlacedBase and the rest in the
+// next. A page with a buffer has one of the test buffer's last two pages, the second page the
+// earlier one.
+struct FormattedPlacement {
+  const char *name;
+  Prospero::BufferFormat format;
+  std::array<u32, 4> selectors;
+  u32 before;
+  bool first_backed = true;
+  bool second_backed = true;
+};
+
+TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave, std::optional<u32> values = {},
+                                                    const FormattedPlacement *placement = nullptr) {
   using O = ShaderOpcode;
   using F = Prospero::BufferFormat;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
@@ -42827,6 +42843,10 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave, std::optional<u32>
       }
     }
   }
+  if (placement != nullptr) {
+    test.name = placement->name;
+    cases = {{placement->format, placement->selectors, {}, {}}};
+  }
   const auto align256 = [](u32 bytes) { return (bytes + 255u) & ~255u; };
   const u32 count = static_cast<u32>(cases.size());
   const auto selection_base = align256(count * 16u);
@@ -42836,10 +42856,43 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave, std::optional<u32>
   const auto payload_base = align256(descriptor_base + count * 32u);
   test.initial.resize((payload_base + count * 64u) / 4u);
   test.expected.resize(count * 4u);
+  test.bda_mappings = {{GuestBase, 0}};
+  constexpr u32 page = BufferCache::CACHING_PAGESIZE;
+  const uint64_t placed = FormattedPlacedBase + page - (placement != nullptr ? placement->before : 0u);
+  if (placement != nullptr) {
+    // Every DWORD of the two pages differs, so a read through the wrong mapping shows.
+    const u32 pages = (static_cast<u32>(test.initial.size()) * 4u + page - 1u) / page * page;
+    test.initial.resize((pages + 2u * page) / 4u);
+    for (u32 index = pages / 4u; index < test.initial.size(); ++index) {
+      test.initial[index] = 0xa0000000u + index;
+    }
+    if (placement->first_backed) test.bda_mappings.push_back({FormattedPlacedBase, pages + page});
+    if (placement->second_backed) test.bda_mappings.push_back({FormattedPlacedBase + page, pages});
+    std::array<u32, 4> record{};
+    for (u32 dword = 0; dword < 4u; ++dword) {
+      const u32 offset = page - placement->before + dword * 4u;
+      const bool backed = offset < page ? placement->first_backed : placement->second_backed;
+      if (backed) record[dword] = test.initial[(pages + (offset < page ? page : 0u) + offset % page) / 4u];
+    }
+    const auto info = ShaderRecompiler::Format::GetFormatInfo(placement->format);
+    using T = ShaderRecompiler::Format::ComponentType;
+    for (u32 channel = 0; channel < 4u; ++channel) {
+      const auto selector = placement->selectors[channel];
+      const u32 one = info.type == T::Uint || info.type == T::Sint ? 1u : 0x3f800000u;
+      cases[0].expected[channel] =
+          selector == 1u  ? one
+          : selector < 4u ? 0u
+                          : FormattedComponentReference(info, (selector - 4u) % info.component_count,
+                                                        record)
+                                .value();
+    }
+  }
   for (u32 i = 0; i < count; ++i) {
     const auto &input = cases[i];
     const u32 data_offset = payload_base + i * 64u;
-    const uint64_t address = (input.beyond_space ? BeyondSpace : GuestBase) + data_offset;
+    const uint64_t address = placement != nullptr
+                                 ? placed
+                                 : (input.beyond_space ? BeyondSpace : GuestBase) + data_offset;
     const u32 dst_sel = input.selectors[0] | (input.selectors[1] << 3u) |
                         (input.selectors[2] << 6u) | (input.selectors[3] << 9u);
     const std::array<u32, 8> row{static_cast<u32>(address),
@@ -42878,7 +42931,6 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors(u32 wave, std::optional<u32>
   code.push_back(EncodeSopc(0x0a, 28, 29));
   code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
   AppendEnd(&code);
-  test.bda_mappings = {{GuestBase, 0}};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
@@ -42896,8 +42948,135 @@ TestCase BufferLoadFormatXyzwGpuSelectedDescriptors32() {
   return BufferLoadFormatXyzwGpuSelectedDescriptors(32u);
 }
 
+TestCase FormattedRead(const FormattedPlacement &placement) {
+  return BufferLoadFormatXyzwGpuSelectedDescriptors(32u, {}, &placement);
+}
+
+// Both pages have a buffer, and the second page's is not behind the first's.
+TestCase FormattedReadCrossesPages() {
+  auto test = FormattedRead({.name = "FormattedReadCrossesPages",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {4, 5, 6, 7},
+                             .before = 8});
+  test.bda_used_addresses = std::vector<uint64_t>{FormattedPlacedBase};
+  return test;
+}
+
+// The lowest DWORD the read takes is not its first component's, and one it takes none for.
+TestCase FormattedReadOrdersItsDwords() {
+  return FormattedRead({.name = "FormattedReadOrdersItsDwords",
+                        .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                        .selectors = {7, 6, 1, 5},
+                        .before = 8});
+}
+
+// Two components share each DWORD, and the record's DWORDs are a page apart.
+TestCase FormattedReadSharesDwords() {
+  return FormattedRead({.name = "FormattedReadSharesDwords",
+                        .format = Prospero::BufferFormat::k16_16_16_16UNorm,
+                        .selectors = {6, 4, 7, 5},
+                        .before = 4});
+}
+
+// The page the record ends in has no buffer: its components read zero, and the page is recorded.
+TestCase FormattedReadEndsInUnbackedPage() {
+  auto test = FormattedRead({.name = "FormattedReadEndsInUnbackedPage",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {4, 5, 6, 7},
+                             .before = 8,
+                             .second_backed = false});
+  test.fault_address = FormattedPlacedBase + BufferCache::CACHING_PAGESIZE;
+  return test;
+}
+
+// The page the record starts in has none.
+TestCase FormattedReadStartsInUnbackedPage() {
+  auto test = FormattedRead({.name = "FormattedReadStartsInUnbackedPage",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {4, 5, 6, 7},
+                             .before = 8,
+                             .first_backed = false});
+  test.fault_address = FormattedPlacedBase;
+  return test;
+}
+
+// A read that takes nothing from the page its record ends in does not look that page up: nothing
+// is recorded for a page the guest did not read. The reserved selectors would name its DWORDs.
+TestCase FormattedReadLeavesLastPageAlone() {
+  auto test = FormattedRead({.name = "FormattedReadLeavesLastPageAlone",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {5, 4, 3, 2},
+                             .before = 8,
+                             .second_backed = false});
+  test.fault_free_address = FormattedPlacedBase + BufferCache::CACHING_PAGESIZE;
+  return test;
+}
+
+// Nor from the page it starts in.
+TestCase FormattedReadLeavesFirstPageAlone() {
+  auto test = FormattedRead({.name = "FormattedReadLeavesFirstPageAlone",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {7, 0, 6, 1},
+                             .before = 8,
+                             .first_backed = false});
+  test.fault_free_address = FormattedPlacedBase;
+  return test;
+}
+
+// A read of constants alone looks no page of its record up.
+TestCase FormattedReadOfConstantsLooksNothingUp() {
+  auto test = FormattedRead({.name = "FormattedReadOfConstantsLooksNothingUp",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {1, 0, 1, 0},
+                             .before = 16,
+                             .first_backed = false});
+  test.fault_free_address = FormattedPlacedBase;
+  return test;
+}
+
+// Nor any other page: not the one the low bits of the address it looks up instead would name.
+TestCase FormattedReadOfConstantsTellsOfNoPage() {
+  auto test = FormattedRead({.name = "FormattedReadOfConstantsTellsOfNoPage",
+                             .format = Prospero::BufferFormat::k32_32_32_32UInt,
+                             .selectors = {0, 1, 0, 1},
+                             .before = 8});
+  test.fault_free_address = 0;
+  return test;
+}
+
 TestCase BufferLoadFormatXyzwGpuSelectedDescriptors64() {
   return BufferLoadFormatXyzwGpuSelectedDescriptors(64u);
+}
+
+// A program that intersects a BVH reads its memory through the traversal's lookup, where a page
+// without a buffer reads all ones; its formatted reads do too. The intersection is behind a
+// branch the dispatch never takes.
+TestCase FormattedReadInBvhProgram() {
+  auto test = BufferLoadFormatXyzwGpuSelectedDescriptors(32u);
+  test.name = "FormattedReadInBvhProgram";
+  std::vector<u32> bvh;
+  AppendSMovLiteral(&bvh, 8, 0x100);
+  AppendSMovLiteral(&bvh, 9, 0);
+  AppendSMovLiteral(&bvh, 10, 256);
+  AppendSMovLiteral(&bvh, 11, 0x80000000u);
+  bvh.push_back(EncodeVop2(0x1a, 1, InlineU32(6), 0));
+  for (u32 offset : {0u, 4u, 8u}) {
+    bvh.insert(bvh.end(), {EncodeMubuf0(offset == 8u ? 0x0f : 0x0e, offset * 4u),
+                           EncodeMubuf1(4u + offset, 0, 1)});
+  }
+  bvh.insert(bvh.end(), {EncodeMimg0(0xe6, 15, 0, false, 0, true), EncodeMimg1(20, 4, 2)});
+  AppendBufferStoreDword(&bvh, 20, 31);
+  // The loop left SCC clear.
+  test.code.pop_back();
+  test.code.push_back(EncodeSopp(0x04, static_cast<u32>(bvh.size())));
+  test.code.insert(test.code.end(), bvh.begin(), bvh.end());
+  AppendEnd(&test.code);
+  // The last iteration reads the record past the guest's space.
+  std::fill_n(test.expected.begin(), 3, ~0u);
+  test.opcodes.clear();
+  test.required_spirv = {"get_bda_pointer", "load_indirect_buffer_32x4_formatted"};
+  test.forbidden_spirv = {"get_bda_dword", "get_bda_run"};
+  return test;
 }
 
 TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
@@ -56810,6 +56989,16 @@ std::vector<TestCase> MakeCases() {
     for (const u32 record : {0u, 1u})
       cases.push_back(BufferLoadFormatXyzwGpuSelectedDescriptors(wave, record));
   }
+  AddCase(FormattedReadCrossesPages);
+  AddCase(FormattedReadOrdersItsDwords);
+  AddCase(FormattedReadSharesDwords);
+  AddCase(FormattedReadEndsInUnbackedPage);
+  AddCase(FormattedReadStartsInUnbackedPage);
+  AddCase(FormattedReadLeavesLastPageAlone);
+  AddCase(FormattedReadLeavesFirstPageAlone);
+  AddCase(FormattedReadOfConstantsLooksNothingUp);
+  AddCase(FormattedReadOfConstantsTellsOfNoPage);
+  AddCase(FormattedReadInBvhProgram);
   AddCase(BufferLoadUshortGpuSelectedDescriptors);
   AddCase(BufferLoadUshortGpuSelectedDescriptors64);
   AddCase(BufferLoadUbyteGpuSelectedDescriptors);
@@ -64938,6 +65127,16 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, BufferLoadFormatXyzwGpuSelectedDescriptors(wave, record));
     }
     RunCase(&vulkan, BufferLoadFormatXyzwGpuSelectedDescriptors64());
+    RunCase(&vulkan, FormattedReadCrossesPages());
+    RunCase(&vulkan, FormattedReadOrdersItsDwords());
+    RunCase(&vulkan, FormattedReadSharesDwords());
+    RunCase(&vulkan, FormattedReadEndsInUnbackedPage());
+    RunCase(&vulkan, FormattedReadStartsInUnbackedPage());
+    RunCase(&vulkan, FormattedReadLeavesLastPageAlone());
+    RunCase(&vulkan, FormattedReadLeavesFirstPageAlone());
+    RunCase(&vulkan, FormattedReadOfConstantsLooksNothingUp());
+    RunCase(&vulkan, FormattedReadOfConstantsTellsOfNoPage());
+    RunCase(&vulkan, FormattedReadInBvhProgram());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());

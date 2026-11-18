@@ -63,12 +63,26 @@ public:
 		constexpr int64_t Second  = 1000000000;
 		uint64_t          matched = 0;
 		for (auto& window: s_windows) {
-			// The id names one opening of this entry; a changed id means the entry was reused.
-			const auto id    = window.id.load(std::memory_order_acquire);
-			const auto start = window.start.load(std::memory_order_acquire);
-			const auto end   = window.end.load(std::memory_order_acquire);
-			if (id == 0 || vaddr < start || vaddr >= end ||
-			    window.id.load(std::memory_order_acquire) != id) {
+			// The id names one opening of this entry (Open's seqlock). Read it with the range until
+			// both belong to the same opening: the entry may be reopening for a range that holds
+			// vaddr. id 0 on an owned entry means Open is writing it.
+			uint64_t id    = 0;
+			uint64_t start = 0;
+			uint64_t end   = 0;
+			for (;;) {
+				id    = window.id.load(std::memory_order_acquire);
+				start = window.start.load(std::memory_order_relaxed);
+				end   = window.end.load(std::memory_order_relaxed);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				const bool stable = window.id.load(std::memory_order_relaxed) == id;
+				if (stable && (id != 0 || !window.owned.load(std::memory_order_acquire))) {
+					break;
+				}
+#if defined(_M_X64) || defined(__x86_64__)
+				_mm_pause();
+#endif
+			}
+			if (id == 0 || vaddr < start || vaddr >= end) {
 				continue;
 			}
 			const auto begin  = Now();
@@ -122,11 +136,14 @@ private:
 
 	static Window* Open(uint64_t start, uint64_t end) noexcept {
 		auto& window = *Claim();
+		// Seqlock: id 0 while the range changes, then the new id publishes the range.
+		window.id.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 		window.closed_ns.store(0, std::memory_order_relaxed);
-		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
-		                std::memory_order_relaxed);
 		window.start.store(start, std::memory_order_relaxed);
-		window.end.store(end, std::memory_order_seq_cst);
+		window.end.store(end, std::memory_order_relaxed);
+		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
+		                std::memory_order_seq_cst);
 		return &window;
 	}
 

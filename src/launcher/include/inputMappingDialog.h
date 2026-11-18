@@ -13,6 +13,7 @@ class QPushButton;
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QSpinBox;
 class QTabWidget;
 class QWidget;
 
@@ -45,6 +46,10 @@ private:
 	QString                      m_selected;
 	QLabel*                      m_status          = nullptr;
 	QDoubleSpinBox*              m_sensitivity     = nullptr;
+	QDoubleSpinBox*              m_sensitivity_y   = nullptr;
+	QSpinBox*                    m_deadzone        = nullptr;
+	QCheckBox*                   m_invert_y        = nullptr;
+	QCheckBox*                   m_auto_capture    = nullptr;
 	QComboBox*                   m_particle_skin   = nullptr;
 	QCheckBox*                   m_touch_cursor    = nullptr;
 	bool                         m_custom_bindings = false;

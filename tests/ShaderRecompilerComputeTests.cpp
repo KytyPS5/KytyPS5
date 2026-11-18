@@ -14717,6 +14717,32 @@ public:
                 "a sampled sRGB texture chose the wrong view format");
         RenderExecutorTestAccess::ResetBindings(executor);
       }
+      // An array instruction reads a texture without slices through an array view of its layer.
+      {
+        const ShaderTextureResource descriptor{{static_cast<u32>((base + 0x8000u) >> 8u),
+            (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) | (1u << 30u),
+            1u << 14u,
+            DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        ShaderRecompiler::IR::ImageResource resource{};
+        resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        resource.numeric_class = Prospero::TextureNumericClass::Float;
+        resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+        resource.read = true;
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Require(name, "array view of a plain texture",
+                binding.image_id && binding.desc.info.resources.layers == 1 &&
+                    binding.desc.view_info.type == vk::ImageViewType::e2DArray &&
+                    binding.desc.view_info.base_layer == 0 &&
+                    binding.desc.view_info.layer_count == 1 &&
+                    context.GetTextureCache().FindTexture(binding.image_id, binding.desc),
+                "a texture without slices did not take an array view of its one layer");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
@@ -48630,6 +48656,74 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
   test.user_data[4] = 1u | (1u << 16u);
   test.has_user_data = true;
   test.required_spirv = {"image_8"};
+  test.forbidden_spirv = {"OpImageQuerySizeLod"};
+  return test;
+}
+
+// An array instruction reads a texture without slices whatever its slice: the load takes the
+// texel, and the size query one layer.
+TestCase ImageLoadArrayReadsPlainTexture() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  AppendVMovU32(&code, 22, 3);
+  code.push_back(EncodeMimg0(0x00, 0x1, 0, false, 5));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendVMovU32(&code, 24, 0);
+  code.push_back(EncodeMimg0(0x0e, 0x7, 0, false, 5));
+  code.push_back(EncodeMimg1(1, 24));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadArrayReadsPlainTexture";
+  test.code = code;
+  test.expected = {0xcafebabeu, 4, 2, 1};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::IMAGE_GET_RESINFO, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.image_width = 4;
+  test.image_height = 2;
+  test.sampled_image_rgba = {0, 0, 0, 0, 0, 0, 0xcafebabeu, 0};
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  test.required_spirv = {"OpImageQuerySizeLod"};
+  return test;
+}
+
+// The sampler clamps the slice of an array instruction to the one layer of a plain texture.
+TestCase ImageSampleArrayReadsPlainTexture() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, 0x3f200000u);
+  AppendVMovLiteral(&code, 21, 0x3ec00000u);
+  AppendVMovLiteral(&code, 22, 0x40400000u);
+  code.push_back(EncodeMimg0(0x20, 0xf, 0, false, 5));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u);
+
+  TestCase test;
+  test.name = "ImageSampleArrayReadsPlainTexture";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.has_user_data = true;
   return test;
 }
 
@@ -56572,6 +56666,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGather3DUsesFootprintOfNearestSlice);
   AddCase(ImageLoad1DArrayUsesLayerCoordinate);
   AddCase(ImageLoad1DArrayDescriptorUsesSelectedLayer);
+  AddCase(ImageLoadArrayReadsPlainTexture);
+  AddCase(ImageSampleArrayReadsPlainTexture);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);
   AddCase(ImageLoadMipNsaUsesSelectedAddressVgprs);
   AddCase(ImageLoadA16UintCoordsOnGpu);
@@ -65045,6 +65141,15 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--array-slice-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageLoad1DArrayUsesLayerCoordinate());
+    RunCase(&vulkan, ImageLoad1DArrayDescriptorUsesSelectedLayer());
+    RunCase(&vulkan, ImageLoadArrayReadsPlainTexture());
+    RunCase(&vulkan, ImageSampleArrayReadsPlainTexture());
+    vulkan.CheckSampledSrgbViews();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--aa-mask-only") == 0) {

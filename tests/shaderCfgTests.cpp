@@ -3445,6 +3445,64 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   }
 }
 
+// An array instruction loads the one slice of a view with one layer, which is how it reads a
+// texture without slices: the load asks the view for its layers, at no level when multisampled.
+void TestArrayImageLoadCountsLayers() {
+  using namespace ShaderRecompiler;
+  constexpr uint32_t OpImageFetch = 95;
+  constexpr uint32_t OpImageQuerySizeLod = 103;
+  constexpr uint32_t OpImageQuerySize = 104;
+  struct Load {
+    uint32_t dim;
+    Prospero::ImageType type;
+    Decoder::ImageDimension dimension;
+    uint32_t leveled;
+    uint32_t unleveled;
+  };
+  const Load loads[] = {
+      {1, Prospero::ImageType::kColor2D, Decoder::ImageDimension::Dim2D, 0, 0},
+      {5, Prospero::ImageType::kColor2D, Decoder::ImageDimension::Dim2DArray, 1, 0},
+      {5, Prospero::ImageType::kColor2DArray, Decoder::ImageDimension::Dim2DArray, 1, 0},
+      {7, Prospero::ImageType::kColor2DMsaa, Decoder::ImageDimension::Dim2DMsaaArray, 0, 1},
+  };
+  for (const auto &load : loads) {
+    const bool multisampled = load.type == Prospero::ImageType::kColor2DMsaa;
+    const uint32_t shader[] = {
+        EncodeMimg0(0x00, 0x1, false, load.dim), EncodeMimg1(2, 2, 0, 0), // image_load v2, v0.., s[8:15]
+        EncodeSopp(0x0c, 0x3f70),                                         // s_waitcnt vmcnt(0)
+        EncodeMubuf0(0x1c), EncodeMubuf1(2, 1, 0),                        // buffer_store_dword v2
+        EncodeSopp(0x01)};
+    std::array<uint32_t, 16> user_data{};
+    user_data[4] = 0x12340000u;
+    user_data[6] = 64u;
+    user_data[7] = 0x00027000u;
+    user_data[8] = 0x10000u;
+    user_data[9] = static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
+    user_data[10] = 3u | (3u << 14u);
+    user_data[11] = DstSel(4, 5, 6, 7) | (multisampled ? 1u << 16u : 0u) |
+                    (static_cast<uint32_t>(load.type) << 28u);
+    user_data[13] = multisampled ? 1u << 4u : 0u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    auto translated = TranslateProgram(shader, options);
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    IR::ResourceSnapshot resources;
+    IR::ResourceSpecialization specialization;
+    const IR::SrtRuntime runtime{.user_data = options.user_data,
+                                 .read_specialization_memory = ReadHostTestMemory};
+    Check(IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              specialization.images.size() == 1u &&
+              specialization.images[0].dimension == load.dimension,
+          "an image load did not take the form its instruction reads the texture in");
+    const auto compiled = CompileProgram(std::move(translated), options, specialization);
+    Check(SpirvInstructionOpcodeCount(compiled.spirv, OpImageFetch) == 1u &&
+              SpirvInstructionOpcodeCount(compiled.spirv, OpImageQuerySizeLod) == load.leveled &&
+              SpirvInstructionOpcodeCount(compiled.spirv, OpImageQuerySize) == load.unleveled,
+          "an array load did not ask its view for its layers, or a plain load did");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
 // DS2 material pixel shaders read 68-76 distinct T#s from one table.
 void TestManyDistinctImagesBindPerStage() {
   using namespace ShaderRecompiler;
@@ -13873,6 +13931,7 @@ int main() {
   TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   TestManyDistinctImagesBindPerStage();
+  TestArrayImageLoadCountsLayers();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.

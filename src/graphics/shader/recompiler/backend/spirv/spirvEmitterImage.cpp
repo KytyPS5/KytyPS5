@@ -215,6 +215,30 @@ uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 	return result;
 }
 
+// A view of one layer is a texture without slices: an address reads it whatever its slice.
+uint32_t SliceOfView(EmitterState& state, uint32_t image, uint32_t coord, bool multisampled) {
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto size = state.builder.AllocateId();
+	if (multisampled) {
+		state.builder.AddFunction(spv::OpImageQuerySize, TypeU32Vector(state, 3), size, image);
+	} else {
+		state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 3), size, image,
+		                          ConstantU32(state, 0));
+	}
+	const auto last = [&](uint32_t vector) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, vector, 2u);
+		return value;
+	};
+	const auto one_layer =
+	    Binary(state, spv::OpIEqual, TypeBool(state), last(size), ConstantU32(state, 1));
+	const auto slice = Select(state, TypeU32(state), one_layer, ConstantU32(state, 0), last(coord));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeU32Vector(state, 3), result, slice, coord,
+	                          2u);
+	return result;
+}
+
 uint32_t LodU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                 ImageDimension dimension) {
 	const auto component = ImageDimensionInfoFor(dimension).coordinate_components;
@@ -1070,7 +1094,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				        const auto& dimension_info = ImageDimensionInfoFor(dimension);
 				        const auto descriptor = LoadImageDescriptor(state, resource, 0u, array_index);
 				        const auto fetched = state.builder.AllocateId();
-				        const auto coord = CoordU32(ctx, mem, *address, dimension);
+				        const auto  address_coord = CoordU32(ctx, mem, *address, dimension);
+				        const auto  coord = dimension_info.arrayed != 0u
+				                                ? SliceOfView(state, descriptor, address_coord,
+				                                              dimension_info.multisampled != 0u)
+				                                : address_coord;
 				        if (dimension_info.multisampled != 0u) {
 					        state.builder.AddFunction(
 					            spv::OpImageFetch, result_type, fetched,

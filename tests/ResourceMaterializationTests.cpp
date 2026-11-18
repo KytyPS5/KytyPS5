@@ -1511,6 +1511,92 @@ void TestImageTableClassesBehindFmask() {
         "the compiled program numbered the classes of the table otherwise");
 }
 
+// The array form of an instruction reads a sampled texture without slices as its one slice: plain
+// textures and arrays are one specialization of an image and one class of a table.
+void TestArrayInstructionReadsPlainTextures() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Type = Libs::Graphics::Prospero::ImageType;
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  // Two textures whose types are user data. An instruction samples the first and another stores
+  // to it; a table selects both. A multisampled texture is sampled alone.
+  const auto build = [](Dimension declared, bool multisampled) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 2u;
+    auto &block = AddValueBlock(program);
+    for (uint32_t index = 0; index < 2u; ++index) {
+      DescriptorSource texture;
+      texture.dword_count = 8u;
+      texture.dwords.fill(Value(0u));
+      texture.dwords[0] = Value(0x100u + index);
+      texture.dwords[1] = Value(uint32_t(BufferFormat::k32Float) << 20u);
+      texture.dwords[3] =
+          Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(index))}));
+      if (multisampled) texture.dwords[5] = Value(1u << 4u);
+      program.descriptor_sources.push_back(texture);
+    }
+    DescriptorSource table;
+    table.dword_count = 8u;
+    table.dwords.fill(Value(0u));
+    table.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+    program.descriptor_sources.push_back(table);
+    program.info.images.push_back({.source = 0u,
+        .resource_class = ImageResourceClass::Sampled, .dimension = declared});
+    if (!multisampled) {
+      program.info.images.push_back({.source = 0u,
+          .resource_class = ImageResourceClass::Storage, .dimension = declared, .written = true});
+      program.info.images.push_back({.source = 2u,
+          .resource_class = ImageResourceClass::Sampled, .dimension = declared});
+    }
+    return Extract(program);
+  };
+  const auto materialize = [](const ResourcePlan &plan, Type first, Type second) {
+    const auto word = [](Type type) {
+      const bool multisampled = type == Type::kColor2DMsaa || type == Type::kColor2DMsaaArray;
+      return Libs::Graphics::DstSel(4, 5, 6, 7) | (multisampled ? 1u << 16u : 0u) |
+             uint32_t(type) << 28u;
+    };
+    const std::array<uint32_t, 2> types{word(first), word(second)};
+    const SrtRuntime runtime{.user_data = types};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "an image instruction rejected a texture of its own family");
+    return specialization;
+  };
+
+  const auto array_2d = build(Dimension::Dim2DArray, false);
+  const auto plain = materialize(array_2d, Type::kColor2D, Type::kColor2D);
+  const auto arrays = materialize(array_2d, Type::kColor2DArray, Type::kColor2DArray);
+  const auto both = materialize(array_2d, Type::kColor2D, Type::kColor2DArray);
+  // The image, its storing twin, the table and the table's one class.
+  Check(plain.images.size() == 4u && plain.images[0].dimension == Dimension::Dim2DArray &&
+            plain.images[3].dimension == Dimension::Dim2DArray && plain == both &&
+            arrays.images.size() == 4u && plain.images[0] == arrays.images[0] &&
+            plain.images[2] == arrays.images[2] && plain.images[3] == arrays.images[3],
+        "a plain texture and an array did not share the specialization of an array instruction");
+  Check(plain.images[1].dimension == Dimension::Dim2D &&
+            arrays.images[1].dimension == Dimension::Dim2DArray,
+        "a storing array instruction did not keep the form of its texture");
+  // Another family keeps its own form: its coordinates do not line up with the instruction's.
+  Check(materialize(array_2d, Type::kColor1D, Type::kColor1D).images[0].dimension ==
+                Dimension::Dim1D &&
+            materialize(build(Dimension::Dim1DArray, false), Type::kColor2D, Type::kColor2D)
+                    .images[0].dimension == Dimension::Dim2D,
+        "an array instruction took a texture of another family as its slice");
+  Check(materialize(build(Dimension::Dim1DArray, false), Type::kColor1D, Type::kColor1D)
+                    .images[0].dimension == Dimension::Dim1DArray &&
+            materialize(build(Dimension::Dim2DMsaaArray, true), Type::kColor2DMsaa,
+                        Type::kColor2DMsaa).images[0].dimension == Dimension::Dim2DMsaaArray,
+        "a 1D or multisampled array instruction did not read a plain texture as one slice");
+  // An instruction without slices reads the first slice of an array, as before.
+  Check(materialize(build(Dimension::Dim2D, false), Type::kColor2DArray, Type::kColor2D)
+                .images[0].dimension == Dimension::Dim2D,
+        "a plain instruction did not read an array as its first slice");
+}
+
 // A gather table's candidate takes a descriptor per mip, and its mapping word a 16-bit slot beside
 // the mip count: a stage's block ends at 65,536 descriptors.
 void TestGatherTableBlock() {
@@ -1667,6 +1753,7 @@ int main() {
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestImageTableClassesBehindFmask();
+  TestArrayInstructionReadsPlainTextures();
   TestGatherTableBlock();
   TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");

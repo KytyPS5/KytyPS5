@@ -878,6 +878,10 @@ void TestImageHeapKinds() {
             ImageHeapKind(root, volume) == 0u &&
             std::ranges::all_of(volume.dwords, [](uint32_t word) { return word == 0u; }),
         "heap kinds did not separate typed entries or null mismatched ones");
+  // A texture without slices is the one slice of an array root, in its own family alone.
+  Check(kind_of(Format::k32_32_32_32Float, Type::kColor2D) == float_kind &&
+            kind_of(Format::k32_32_32_32Float, Type::kColor1D) == 0u,
+        "an array root did not take the plain textures of its family, and no others");
   const auto resource = ImageHeapResource(root, uint_kind);
   const auto cube_resource = ImageHeapResource(root, cube_kind);
   auto other = root;
@@ -944,6 +948,21 @@ void TestBoundedImageViewEligibility() {
             snapshot.candidate_images[1].resource == 1u &&
             snapshot.candidate_images[0].resource == snapshot.candidate_images[2].resource,
         "typed table eligibility changed byte offsets or discarded compatible views");
+
+  // An array instruction reads the plain views as arrays of one slice, in the class of the array.
+  plan.info.images[0].dimension = Decoder::ImageDimension::Dim2DArray;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 4u &&
+            snapshot.candidate_images[0].value.dwords == descriptor(0x20u, Type::kColor2D) &&
+            snapshot.candidate_images[1].value.dwords == descriptor(0x21u, Type::kCube) &&
+            snapshot.candidate_images[2].value.dwords == descriptor(0x23u, Type::kColor2DArray) &&
+            snapshot.candidate_images[3].value.dwords == descriptor(0x24u, Type::kColor2D) &&
+            dimension(0u) == Decoder::ImageDimension::Dim2DArray &&
+            snapshot.candidate_images[0].resource == snapshot.candidate_images[2].resource &&
+            snapshot.candidate_images[0].resource == snapshot.candidate_images[3].resource &&
+            snapshot.candidate_images[0].resource != snapshot.candidate_images[1].resource,
+        "an array table did not take its plain views as arrays of one slice");
+  plan.info.images[0].dimension = Decoder::ImageDimension::Dim2D;
 
   // CS127daf PC0x163c: an overlapping heap tuple is not a valid texture view.
   const std::array<uint32_t, 8> invalid_view{

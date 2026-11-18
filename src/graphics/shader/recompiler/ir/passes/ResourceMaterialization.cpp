@@ -29,13 +29,20 @@ bool SpecializationFail(std::string_view message) {
 	return false;
 }
 
-Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
-                                            Decoder::ImageDimension requested) {
-	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
-	                      requested == Decoder::ImageDimension::Dim2DArray ||
-	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
+// The array form of a sampled read takes a texture without slices as its one slice.
+Decoder::ImageDimension DescriptorDimension(const DescriptorValue& descriptor,
+                                            const ImageResource&   reader) {
+	const auto requested = reader.dimension;
+	const bool is_array  = requested == Decoder::ImageDimension::Dim1DArray ||
+	                       requested == Decoder::ImageDimension::Dim2DArray ||
+	                       requested == Decoder::ImageDimension::Dim2DMsaaArray;
+	const bool sampled   = reader.resource_class == ImageResourceClass::Sampled;
+	const auto one_slice = [&](Decoder::ImageDimension plain, Decoder::ImageDimension array) {
+		return sampled && requested == array ? array : plain;
+	};
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
-		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
+		case Prospero::ImageType::kColor1D:
+			return one_slice(Decoder::ImageDimension::Dim1D, Decoder::ImageDimension::Dim1DArray);
 		case Prospero::ImageType::kColor1DArray:
 			if (is_array) {
 				return Decoder::ImageDimension::Dim1DArray;
@@ -53,8 +60,11 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
 				return Decoder::ImageDimension::Dim2DMsaaArray;
 			}
 			return Decoder::ImageDimension::Dim2DMsaa;
-		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2D:
+			return one_slice(Decoder::ImageDimension::Dim2D, Decoder::ImageDimension::Dim2DArray);
+		case Prospero::ImageType::kColor2DMsaa:
+			return one_slice(Decoder::ImageDimension::Dim2DMsaa,
+			                 Decoder::ImageDimension::Dim2DMsaaArray);
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }
@@ -1170,7 +1180,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			continue;
 		}
-		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
+		const auto descriptor_dimension = DescriptorDimension(descriptor, base);
 		if (descriptor_dimension == Decoder::ImageDimension::Unknown) {
 			return SpecializationFail(fmt::format(
 			    "image descriptor {} has unsupported type {}: {:08x},{:08x},{:08x},{:08x},"
@@ -2034,10 +2044,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        // A sample of a T# whose channels all select 0 reads 0 at any address.
-				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				        if (NullImageDescriptor(value) ||
+				            !ValidImageDescriptor(value, image.r128) ||
 				            (image.sample_access_only && !image.depth_compare &&
 				             DescriptorImageSwizzle(value) == 0u) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+				            (bounded_table && DescriptorDimension(value, image) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
@@ -2108,8 +2119,9 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 	const auto numeric_class =
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
 	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
-	    DescriptorDimension(value, root.dimension) != root.dimension ||
-	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||
+	    DescriptorDimension(value, root) != root.dimension ||
+	    Prospero::IsFmaskTextureFormat(format) ||
+	    format == Prospero::BufferFormat::k11_11_10UNorm ||
 	    ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid ||
 	    (root.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
 	     tile == Prospero::TileMode::kDepth) ||

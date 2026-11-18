@@ -1246,9 +1246,24 @@ QJsonDocument MergeDocuments(const QJsonDocument& base_doc, const QJsonDocument&
 	}
 	auto base_mods = root.value(QStringLiteral("mods")).toArray();
 	if (base_version_changed) {
+		QSet<QString> new_names;
+		const auto new_mods_arr = new_doc.object().value(QStringLiteral("mods")).toArray();
+		for (const auto& val: new_mods_arr) {
+			if (val.isObject()) {
+				const auto n = val.toObject().value(QStringLiteral("name")).toString().trimmed().toLower();
+				if (!n.isEmpty()) {
+					new_names.insert(n);
+				}
+			}
+		}
+
 		QJsonArray disabled_base_mods;
 		for (const auto& val: base_mods) {
 			if (val.isObject()) {
+				const auto n = val.toObject().value(QStringLiteral("name")).toString().trimmed().toLower();
+				if (new_names.contains(n)) {
+					continue;
+				}
 				auto mod_obj = val.toObject();
 				mod_obj.insert(QStringLiteral("enabled"), false);
 				disabled_base_mods.append(mod_obj);

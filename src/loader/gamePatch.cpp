@@ -146,8 +146,11 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 	}
 
 	const auto root = Json::parse(file, nullptr, false);
-	if (root.is_discarded() || !root.is_object() || !root.contains("id") || !root.contains("version") ||
-	    !root.contains("process") || !root.contains("mods")) {
+	if (root.is_discarded() || !root.is_object() ||
+	    !root.contains("id") || !root["id"].is_string() ||
+	    !root.contains("version") || !root["version"].is_string() ||
+	    !root.contains("process") || !root["process"].is_string() ||
+	    !root.contains("mods") || !root["mods"].is_array()) {
 		return Fail(error, "expected a GoldHEN-style mods JSON file");
 	}
 	if (root.contains("master")) {
@@ -164,14 +167,17 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		if (!mod.is_object()) {
 			return Fail(error, "invalid mod entry");
 		}
+		if (!mod.value("enabled", true)) {
+			continue;
+		}
 		if (mod.contains("module_name")) {
 			const auto& mod_name = mod["module_name"];
 			if (!mod_name.is_null() && (!mod_name.is_string() || !mod_name.get<std::string>().empty())) {
 				return Fail(error, "module-specific cheats are not supported yet");
 			}
 		}
-		if (!mod.value("enabled", true)) {
-			continue;
+		if (!mod.contains("name") || !mod["name"].is_string()) {
+			return Fail(error, "invalid mod entry");
 		}
 		const auto name = mod["name"].get<std::string>();
 		plan->mod_names.push_back(name);
@@ -179,7 +185,10 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 			return Fail(error, "mod memory array is missing or empty");
 		}
 		for (const auto& entry: mod["memory"]) {
-			if (!entry.is_object()) {
+			if (!entry.is_object() ||
+			    !entry.contains("offset") || !entry["offset"].is_string() ||
+			    !entry.contains("off") || !entry["off"].is_string() ||
+			    !entry.contains("on") || !entry["on"].is_string()) {
 				return Fail(error, "invalid mod memory entry");
 			}
 			if (entry.contains("section")) {
@@ -237,6 +246,9 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 				return Fail(error, "invalid mod memory bytes");
 			}
 			if (entry.contains("expected") && !entry["expected"].is_null()) {
+				if (!entry["expected"].is_string()) {
+					return Fail(error, "invalid expected memory bytes");
+				}
 				std::vector<uint8_t> expected;
 				if (!ParseBytes(entry["expected"].get<std::string>(), &expected) ||
 				    expected != write.off) {

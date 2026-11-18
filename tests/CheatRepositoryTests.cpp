@@ -580,6 +580,27 @@ void TestMergeDocumentsAndPrepare() {
 	Check(versioned_merge.object().value(QStringLiteral("mods")).toArray()[0].toObject().value(QStringLiteral("enabled")).toBool() == false,
 	      "cross-version merge should safely disable older base mods");
 
+	// Test cross-version replacement of duplicate mod name with updated version
+	const QByteArray update_patch_json = R"({
+		"id": "PPSA21567",
+		"version": "01.018.001",
+		"process": "eboot.bin",
+		"mods": [
+			{
+				"name": "Base Patch",
+				"memory": [{"offset": "0x1050", "on": "9090", "off": "0000"}]
+			}
+		]
+	})";
+	const auto updated_merge = Cheats::MergeDocuments(base_doc, QJsonDocument::fromJson(update_patch_json),
+	                                                  QStringLiteral("Source"), QStringLiteral("Author"),
+	                                                  QStringLiteral("eboot.bin"), QStringLiteral("01.018.001"),
+	                                                  nullptr, {}, true);
+	const auto upd_mods = updated_merge.object().value(QStringLiteral("mods")).toArray();
+	Check(upd_mods.size() == 1, "updated version should replace stale mod of same name");
+	Check(upd_mods[0].toObject().value(QStringLiteral("memory")).toArray()[0].toObject().value(QStringLiteral("offset")).toString() == QStringLiteral("0x1050"),
+	      "updated mod offset should take precedence on version upgrade");
+
 	// Test PrepareForImport
 	const QByteArray raw_import_json = R"({
 		"id": "PPSA21567",

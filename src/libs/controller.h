@@ -60,9 +60,11 @@ struct PadData;
 struct PadVibrationParam;
 struct PadLightBarParam;
 struct PadTriggerEffectParam;
-struct PadTriggerEffectStateInformation;
+struct PadTriggerEffectStateInformation {
+	int32_t state[2];
+};
 
-inline int controller_get_axis(int min, int max, int value) {
+constexpr int controller_get_axis(int min, int max, int value) {
 	int v = (255 * (value - min)) / (max - min);
 	if (v < 0) {
 		return 0;
@@ -72,6 +74,9 @@ inline int controller_get_axis(int min, int max, int value) {
 	}
 	return v;
 }
+
+// The stick dead zone around the 0x80 center that controller information reports.
+constexpr uint8_t PAD_STICK_DEAD_ZONE = controller_get_axis(-32768, 32767, 8000) - 128;
 
 void Connect(int id);
 void Disconnect(int id);
@@ -116,10 +121,22 @@ int PadVrCheckHandle(int handle);
 int PadVrClose(int handle);
 
 struct PadVrControllerData;
+struct PadVrControllerDeviceInformation {
+	uint32_t hand_type; // 0 while disconnected, 1 for the left and 2 for the right hand.
+	uint8_t  stick_dead_zone;
+	uint8_t  connection_type;
+	uint8_t  connected_count;
+	bool     connected;
+	uint8_t  reserve[24];
+};
 
 int KYTY_SYSV_ABI PadVrControllerReadState(int handle, PadVrControllerData* data);
+int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int                               handle,
+                                                      PadVrControllerDeviceInformation* info);
 int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_handle,
                                                    const PadTriggerEffectParam* param);
+int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectStates(int left_handle, int right_handle,
+                                                        PadTriggerEffectStateInformation* info);
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);

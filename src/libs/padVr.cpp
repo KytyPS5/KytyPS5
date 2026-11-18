@@ -53,6 +53,8 @@ static_assert(offsetof(PadVrControllerData, orientation) == 44);
 static_assert(offsetof(PadVrControllerData, connected) == 64);
 static_assert(offsetof(PadVrControllerData, timestamp) == 72);
 
+static_assert(sizeof(PadVrControllerDeviceInformation) == 32);
+
 static std::atomic<bool> g_open[2];
 
 int PadVrPortHand(int type) {
@@ -141,6 +143,36 @@ int KYTY_SYSV_ABI PadVrControllerReadState(int handle, PadVrControllerData* data
 	return OK;
 }
 
+int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int                               handle,
+                                                      PadVrControllerDeviceInformation* info) {
+	PRINT_NAME();
+
+	if (!PadInitialized()) {
+		return PAD_ERROR_NOT_INITIALIZED;
+	}
+	if (info == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+	PadVrControllerData data {};
+	if (const auto error = PadVrControllerReadState(handle, &data); error != OK) {
+		return error;
+	}
+	*info                 = {};
+	info->connected_count = data.connected_count;
+	if (data.connected) {
+		info->hand_type       = PadVrHand(handle) + 1;
+		info->stick_dead_zone = PAD_STICK_DEAD_ZONE;
+		info->connected       = true;
+	}
+	return OK;
+}
+
+// True when both handles are open and name the left and the right Sense controller, in order.
+static bool PadVrHandlePair(int left_handle, int right_handle) {
+	return left_handle == PAD_HANDLE_VR_LEFT && right_handle == PAD_HANDLE_VR_LEFT + 1 &&
+	       g_open[0].load() && g_open[1].load();
+}
+
 int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_handle,
                                                    const PadTriggerEffectParam* param) {
 	PRINT_NAME();
@@ -148,11 +180,27 @@ int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_ha
 	     "\t right_handle = %d\n",
 	     left_handle, right_handle);
 
-	if (PadVrHand(left_handle) != 0 || PadVrCheckHandle(left_handle) != OK ||
-	    PadVrHand(right_handle) != 1 || PadVrCheckHandle(right_handle) != OK) {
+	if (!PadVrHandlePair(left_handle, right_handle)) {
 		return PAD_ERROR_INVALID_HANDLE;
 	}
 	return param != nullptr ? OK : PAD_ERROR_INVALID_ARG;
+}
+
+int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectStates(int left_handle, int right_handle,
+                                                        PadTriggerEffectStateInformation* info) {
+	PRINT_NAME();
+
+	if (!PadInitialized()) {
+		return PAD_ERROR_NOT_INITIALIZED;
+	}
+	if (info == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+	if (!PadVrHandlePair(left_handle, right_handle)) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	*info = {}; // PadVrControllerSetTriggerEffects applies no effect, so both triggers are off.
+	return OK;
 }
 
 } // namespace Libs::Controller

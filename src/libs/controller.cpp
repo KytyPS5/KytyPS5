@@ -72,10 +72,6 @@ struct PadTriggerEffectParam {
 	PadTriggerEffectCommand command[2];
 };
 
-struct PadTriggerEffectStateInformation {
-	int32_t state[2];
-};
-
 static_assert(sizeof(PadTriggerEffectCommand) == 56);
 static_assert(sizeof(PadTriggerEffectParam) == 120);
 static_assert(sizeof(PadTriggerEffectStateInformation) == 8);
@@ -1374,8 +1370,8 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 	info->touch_pixel_density   = 44.86f;
 	info->touch_resolution_x    = 1920;
 	info->touch_resolution_y    = 943;
-	info->stick_dead_zone_left  = controller_get_axis(-32768, 32767, 8000) - 128;
-	info->stick_dead_zone_right = controller_get_axis(-32768, 32767, 8000) - 128;
+	info->stick_dead_zone_left  = PAD_STICK_DEAD_ZONE;
+	info->stick_dead_zone_right = PAD_STICK_DEAD_ZONE;
 	info->connection_type       = 0;
 	info->connected_count       = static_cast<uint8_t>(std::min(connected_count, 255));
 	info->connected             = connected;

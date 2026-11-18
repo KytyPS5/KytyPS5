@@ -177,7 +177,9 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
 	LIB_FUNC("iA-DdobUen8", Controller::PadVrControllerReadState);
+	LIB_FUNC("mbJHDdjhVeY", Controller::PadVrControllerGetDeviceInformation);
 	LIB_FUNC("v8P+9PRqg10", Controller::PadVrControllerSetTriggerEffects);
+	LIB_FUNC("AVr6AKXGc0M", Controller::PadVrControllerGetTriggerEffectStates);
 }
 
 namespace LibMouse {

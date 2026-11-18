@@ -63,12 +63,26 @@ public:
 		constexpr int64_t Second  = 1000000000;
 		uint64_t          matched = 0;
 		for (auto& window: s_windows) {
-			if (vaddr < window.start.load(std::memory_order_acquire) ||
-			    vaddr >= window.end.load(std::memory_order_acquire)) {
+			// The id names one opening of this entry; a changed id means the entry was reused.
+			const auto id    = window.id.load(std::memory_order_acquire);
+			const auto start = window.start.load(std::memory_order_acquire);
+			const auto end   = window.end.load(std::memory_order_acquire);
+			if (id == 0 || vaddr < start || vaddr >= end ||
+			    window.id.load(std::memory_order_acquire) != id) {
 				continue;
 			}
-			const auto begin = Now();
-			for (uint32_t spins = 0; window.closed_ns.load(std::memory_order_acquire) == 0; spins++) {
+			const auto begin  = Now();
+			int64_t    closed = 0;
+			for (uint32_t spins = 0;; spins++) {
+				closed = window.closed_ns.load(std::memory_order_acquire);
+				if (closed != 0) {
+					break;
+				}
+				// Reuse needs the original Scope to have closed first.
+				if (window.id.load(std::memory_order_acquire) != id) {
+					closed = Now();
+					break;
+				}
 				if (Now() - begin > Second * 10) {
 					return 0; // never closed: report the fault
 				}
@@ -81,8 +95,8 @@ public:
 				}
 			}
 			// The fault may be handled after the mapping is already back.
-			if (Now() - window.closed_ns.load(std::memory_order_acquire) < Second) {
-				matched = std::max(matched, window.id.load(std::memory_order_acquire));
+			if (Now() - closed < Second) {
+				matched = std::max(matched, id);
 			}
 		}
 		return matched;

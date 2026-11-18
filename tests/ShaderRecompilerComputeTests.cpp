@@ -42756,7 +42756,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load, bool valu
   test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge",
                          formatted ? "indirect_buffer_format_kinds" : "Volatile"};
   if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
-                                         "indirect_buffer_format_geometry"};
+                                         "indirect_buffer_formats"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
                   O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
                   O::S_BUFFER_LOAD_DWORDX8, load,
@@ -42930,12 +42930,16 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
     for (const auto &test : {BufferLoadsGpuSelectedDescriptors(1u, wave),
                             BufferLoadsGpuSelectedDescriptors(1u, wave, true),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_FORMAT_X),
+                            BufferLoadFormatXyzwGpuSelectedDescriptors(wave),
                             BufferLoadsGpuSelectedDescriptors(3u, wave),
                             BufferLoadsGpuSelectedDescriptors(4u, wave),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_UBYTE),
                             BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_USHORT)}) {
       auto compiled = CompileCase(test, vulkan.SubgroupSize());
-      struct Profile { u32 components = 0, uses = 0, definitions = 0, calls = 0, reads = 0; };
+      struct Profile {
+        u32 components = 0, uses = 0, definitions = 0, calls = 0, reads = 0, rows = 0;
+        bool formatted = false;
+      };
       std::map<std::string, Profile> profiles;
       for (const auto *block : compiled.program.blocks)
         for (const auto &inst : *block) {
@@ -42948,11 +42952,12 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
                             (memory.formatted ? "_formatted" : "");
           auto &profile = profiles[name];
           profile.components = components;
+          profile.formatted = memory.formatted;
           ++profile.uses;
         }
       std::map<u32, std::string> functions;
-      std::set<u32> bda;
-      u32 function = 0, inline_reads = 0;
+      std::set<u32> bda, row_pointers;
+      u32 function = 0, inline_reads = 0, format_table = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -42960,11 +42965,15 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
           if (name.starts_with("get_bda_")) bda.insert(words[1]);
+          if (name == "indirect_buffer_formats") format_table = words[1];
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
           if (functions.contains(function)) ++profiles[functions.at(function)].definitions;
         }
+        if (opcode == spv::OpAccessChain && words[3] == format_table) row_pointers.insert(words[2]);
+        if (opcode == spv::OpLoad && row_pointers.contains(words[3]) && functions.contains(function))
+          ++profiles[functions.at(function)].rows;
         if (opcode == spv::OpFunctionCall) {
           if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
           if (bda.contains(words[3])) {
@@ -42979,8 +42988,10 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
       for (const auto &[name, profile] : profiles)
         Require(test.name, name.c_str(), profile.uses != 0u && profile.definitions == 1u &&
                     profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u ? 2u : 1u) &&
-                    profile.reads == profile.components,
-                "indirect load helpers duplicated definitions, calls or component reads");
+                    profile.reads == profile.components &&
+                    profile.rows == (profile.formatted ? 1u : 0u),
+                "indirect load helpers duplicated definitions, calls, component reads or the "
+                "format's row");
       auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
       vulkan.Dispatch(test, compiled, buffer);
       CompareWords(test, "shared indirect loads, lane addressing, EXEC and bounds", test.expected,
@@ -50281,16 +50292,17 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
         std::set<u32> bda_functions;
-        u32 conversion_function = 0, geometry_function = 0, function = 0;
+        std::set<u32> read_functions;
+        u32 conversion_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
-        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
-        bool geometry_pure = true;
+        u32 row_loads = 0;
+        bool row_in_read = true;
         // The format table: one Private variable whose initializer has a row per format. The
         // kind table: one whose initializer has an entry per distinct conversion.
         constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
         u32 table = 0, table_initializer = 0, kind_table = 0, kind_initializer = 0;
         u32 conversion_branches = 0, real_calls = 0;
-        bool table_private = false, kind_table_private = false, geometry_clamps = false;
+        bool table_private = false, kind_table_private = false, row_clamps = false;
         bool conversion_pure = true;
         std::map<u32, size_t> composite_operands;
         std::map<u32, u32> uint_constants, access_base;
@@ -50301,7 +50313,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
             if (name.starts_with("get_bda_")) bda_functions.insert(words[1]);
             if (name == "convert_indirect_buffer_format") conversion_function = words[1];
-            if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
+            if (name.starts_with("load_indirect_buffer_")) read_functions.insert(words[1]);
             if (name == "indirect_buffer_formats") table = words[1];
             if (name == "indirect_buffer_format_kinds") kind_table = words[1];
           }
@@ -50322,30 +50334,26 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           if (opcode == spv::OpFunction) {
             function = words[2];
             conversion_definitions += function == conversion_function;
-            geometry_definitions += function == geometry_function;
             real_calls += (words[3] & spv::FunctionControlDontInlineMask) != 0u;
           }
-          // Geometry reads only the format table, and formats past it read row zero.
-          if (function == geometry_function && function != 0u) {
-            geometry_pure &= opcode != spv::OpStore && opcode != spv::OpFunctionCall &&
-                             (opcode != spv::OpLoad || access_base[words[3]] == table);
-            geometry_switches += opcode == spv::OpSwitch;
-            geometry_clamps |= opcode == spv::OpULessThan &&
-                               uint_constants.contains(words[4]) &&
-                               uint_constants[words[4]] == formats;
+          // The read takes its format's row itself, and formats past the table read row zero.
+          if (opcode == spv::OpLoad && access_base.contains(words[3]) &&
+              access_base[words[3]] == table) {
+            ++row_loads;
+            row_in_read &= read_functions.contains(function);
           }
+          row_clamps |= read_functions.contains(function) && opcode == spv::OpULessThan &&
+                        uint_constants.contains(words[4]) && uint_constants[words[4]] == formats;
           // Conversion takes its kind from the tables and picks among results it computed: a
           // branch per kind or format is a block per read once a driver inlines it.
           if (function == conversion_function && function != 0u) {
             conversion_branches += opcode == spv::OpSwitch || opcode == spv::OpBranchConditional;
             conversion_pure &= opcode != spv::OpStore && opcode != spv::OpFunctionCall &&
-                               (opcode != spv::OpLoad || access_base[words[3]] == table ||
-                                access_base[words[3]] == kind_table);
+                               (opcode != spv::OpLoad || access_base[words[3]] == kind_table);
           }
           if (opcode == spv::OpFunctionCall) {
             if (bda_functions.contains(words[3])) ++bda_calls;
             if (words[3] == conversion_function) ++conversion_calls;
-            if (words[3] == geometry_function) ++geometry_calls;
           }
           if (opcode == spv::OpFunctionEnd) function = 0;
           offset += words.size();
@@ -50353,11 +50361,10 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         Require(test.name, "one shared formatted conversion",
                 conversion_definitions == 1u && conversion_calls == 1u,
                 "formatted loads must call one conversion function across virtual halves");
-        Require(test.name, "one shared pure format geometry",
-                geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 0u && geometry_clamps && geometry_pure,
-                "format geometry duplicated, lost its format-zero default or read more than the "
-                "format table");
+        Require(test.name, "one format row per read",
+                row_loads == conversion_calls && row_in_read && row_clamps,
+                "the format's row is read outside the read, more than once in it, or lost its "
+                "format-zero default");
         Require(test.name, "one format table",
                 table != 0u && table_private &&
                     composite_operands.contains(table_initializer) &&
@@ -50370,7 +50377,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                     composite_operands[kind_initializer] <= 32u,
                 "the conversions are not one Private table with an entry per kind");
         Require(test.name, "branch-free conversion", conversion_branches == 0u && conversion_pure,
-                "formatted conversion branches or reads more than the two tables");
+                "formatted conversion branches or reads more than the kind table");
         Require(test.name, "no real call", real_calls == 0u,
                 "a helper is kept out of line: a real call per read costs the shader its speed");
         Require(test.name, "one shared indirect store per virtual half",
@@ -50489,7 +50496,7 @@ void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
       if (count == 2u || count == 3u) {
         test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
         test.forbidden_spirv = {"PhysicalStorageBuffer", "convert_indirect_buffer_format",
-                               "indirect_buffer_format_geometry"};
+                               "indirect_buffer_formats"};
         // Three rows add the empty record, a class of its own beside the populated ones.
         (count == 2u ? test.forbidden_spirv : test.required_spirv).push_back("OpSwitch");
       } else if (count == 6u) test.required_spirv = {"OpSwitch"};
@@ -50623,7 +50630,7 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
       // Every load decodes its descriptor in the shader; an empty table has none to decode.
       if (table_bytes == 0u)
         test.forbidden_spirv = {"convert_indirect_buffer_format", "load_indirect_buffer_",
-                               "indirect_buffer_format_geometry"};
+                               "indirect_buffer_formats"};
       else
         test.required_spirv = {"get_bda_", "convert_indirect_buffer_format"};
       CheckSpirvEmission(test, compiled.spirv);

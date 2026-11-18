@@ -143,7 +143,7 @@ struct EmitterState {
 	std::unordered_map<const IR::Inst*, BdaRunPointers> bda_run_pointers;
 	uint32_t                                           indirect_search_function          = 0;
 	uint32_t                                         indirect_format_function = 0;
-	uint32_t                                         indirect_format_geometry_function = 0;
+	uint32_t                                            indirect_format_table             = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         bvh8_result_type       = 0;

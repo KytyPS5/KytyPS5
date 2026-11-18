@@ -964,7 +964,6 @@ struct IndirectBufferAccess {
 	uint32_t stride;
 	uint32_t swizzle;
 	uint32_t format;
-	uint32_t selector;
 	uint32_t dst_sel; // DST_SEL_XYZW of a formatted read, three bits per component.
 	uint32_t mode;
 	uint32_t records;
@@ -1013,7 +1012,6 @@ IndirectBufferAccess PrepareIndirectBuffer(EmitterState& state,
 	    .stride           = stride,
 	    .swizzle          = swizzle,
 	    .format           = field(word3, 12, 7),
-	    .selector         = formatted ? field(word3, 0, 3) : 0u,
 	    .dst_sel          = formatted ? field(word3, 0, 12) : 0u,
 	    .mode             = field(word3, 28, 2),
 	    .records          = records,
@@ -1091,36 +1089,69 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
-// One component of a formatted read: `selector` is that component's DST_SEL.
-uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, IndirectBufferAccess buffer,
-                                        uint32_t selector) {
-	auto& state         = ctx.state;
-	buffer.selector     = selector;
-	const auto geometry = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
-	                          state.indirect_format_geometry_function, buffer.format);
-	const auto field = [&](uint32_t index) {
+constexpr auto IndirectFormatCount =
+    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+
+// What the components of a formatted read share: their format's row and the record they read.
+struct IndirectFormattedRecord {
+	uint32_t row       = 0;
+	uint32_t count     = 0;
+	uint32_t spacing   = 0;
+	uint32_t base      = 0;
+	uint32_t in_memory = 0;
+};
+
+IndirectFormattedRecord PrepareIndirectFormattedRecord(EmitterState&               state,
+                                                       const IndirectBufferAccess& buffer) {
+	const auto type     = TypeU32(state);
+	const auto row_type = TypeU32Composite(state, 4);
+	// A format past the table reads row 0, as an unknown format does.
+	const auto index   = Select(state, type,
+	                            Binary(state, spv::OpULessThan, TypeBool(state), buffer.format,
+	                                   ConstantU32(state, IndirectFormatCount)),
+	                            buffer.format, ConstantU32(state, 0));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassPrivate, row_type), pointer,
+	                          state.indirect_format_table, index);
+	const auto row = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, row_type, row, pointer);
+	const auto field = [&](uint32_t word, uint32_t offset, uint32_t count) {
 		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, geometry, index);
-		return value;
+		state.builder.AddFunction(spv::OpCompositeExtract, type, value, row, word);
+		return EmitBitFieldUExtract(state, value, ConstantU32(state, offset),
+		                            ConstantU32(state, count));
 	};
-	const auto bytes = field(0);
+	const auto bytes     = field(0u, 0u, 8u);
+	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3u, 8u, 8u));
+	return {
+	    .row       = row,
+	    .count     = EmitUMax32(state, field(0u, 8u, 4u), ConstantU32(state, 1)),
+	    .spacing   = field(3u, 0u, 8u),
+	    .base      = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+	                        Unary(state, spv::OpNot, TypeU64(state), alignment)),
+	    .in_memory = AndCondition(
+	        state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
+	        IndirectBufferInBounds(state, buffer, 0u, bytes, true)),
+	};
+}
+
+// One component of a formatted read: `selector` is that component's DST_SEL.
+uint32_t LoadIndirectFormattedComponent(ValueEmitContext&              ctx,
+                                        const IndirectFormattedRecord& record, uint32_t selector) {
+	auto&      state     = ctx.state;
 	const auto component = Binary(
 	    state, spv::OpUMod, TypeU32(state),
-	    Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)), field(1));
-	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3));
-	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
-	                         Unary(state, spv::OpNot, TypeU64(state), alignment));
-	const auto address = Binary(
-	    state, spv::OpIAdd, TypeU64(state), base,
-	    Unary(state, spv::OpUConvert, TypeU64(state),
-	          Binary(state, spv::OpIMul, TypeU32(state), component, field(2))));
-	const auto memory = AndCondition(
-	    state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
-	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
-	           ConstantU32(state, 4)));
+	    Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)), record.count);
+	const auto address =
+	    Binary(state, spv::OpIAdd, TypeU64(state), record.base,
+	           Unary(state, spv::OpUConvert, TypeU64(state),
+	                 Binary(state, spv::OpIMul, TypeU32(state), component, record.spacing)));
 	const auto raw = EmitValueOrZeroIfCondition(
-	    state, AndCondition(state, memory, IndirectBufferInBounds(state, buffer, 0u, bytes, true)),
+	    state,
+	    AndCondition(state, record.in_memory,
+	                 Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector,
+	                        ConstantU32(state, 4))),
 	    [&]() {
 		    // Format alignment and component spacing keep every selected component within one DWORD.
 		    const auto word = LoadBdaDword(
@@ -1135,8 +1166,7 @@ uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, IndirectBufferAcc
 	    });
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
-	                          state.indirect_format_function, buffer.format, buffer.selector,
-	                          component, raw);
+	                          state.indirect_format_function, record.row, selector, component, raw);
 	return result;
 }
 
@@ -1322,10 +1352,8 @@ enum class IndirectFormatConversion : uint32_t {
 
 void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
-	const auto type = TypeU32(state);
-	const auto     row_type = TypeU32Composite(state, 4);
-	constexpr auto format_count =
-	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+	const auto type     = TypeU32(state);
+	const auto row_type = TypeU32Composite(state, 4);
 
 	// Rows name each distinct conversion by index. Integers pass their bits through and scaled
 	// formats convert whole values, so only normalized and float components convert by their width.
@@ -1341,8 +1369,8 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		return static_cast<uint32_t>(found - kinds.begin());
 	};
 	std::vector<uint32_t> rows;
-	rows.reserve(format_count);
-	for (uint32_t format = 0; format < format_count; ++format) {
+	rows.reserve(IndirectFormatCount);
+	for (uint32_t format = 0; format < IndirectFormatCount; ++format) {
 		const auto info    = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(format));
 		const bool unknown = info.type == Format::ComponentType::Unknown;
 		const bool integer =
@@ -1369,12 +1397,13 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	}
 	EXIT_IF(kinds.empty() || kinds.size() > 32u);
 	const auto table_type =
-	    state.builder.Type(spv::OpTypeArray, row_type, ConstantU32(state, format_count));
+	    state.builder.Type(spv::OpTypeArray, row_type, ConstantU32(state, IndirectFormatCount));
 	const auto table = state.builder.DefineGlobalVariable(
 	    TypePointer(state, spv::StorageClassPrivate, table_type), spv::StorageClassPrivate,
 	    state.builder.Constant(spv::OpConstantComposite, table_type,
 	                           std::span<const uint32_t> {rows}));
 	state.builder.AddName(table, "indirect_buffer_formats");
+	state.indirect_format_table     = table;
 	const auto            kind_type = TypeU32Composite(state, 2);
 	std::vector<uint32_t> conversions;
 	for (const auto& kind: kinds) {
@@ -1408,20 +1437,6 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	    state.builder.Constant(spv::OpConstantComposite, kind_table_type,
 	                           std::span<const uint32_t> {conversions}));
 	state.builder.AddName(kind_table, "indirect_buffer_format_kinds");
-	// A format past the table reads as format 0, as the switches' default case did.
-	const auto load_row = [&](uint32_t format) {
-		const auto index   = Select(state, type,
-		                            Binary(state, spv::OpULessThan, TypeBool(state), format,
-		                                   ConstantU32(state, format_count)),
-		                            format, ConstantU32(state, 0));
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain,
-		                          TypePointer(state, spv::StorageClassPrivate, row_type), pointer,
-		                          table, index);
-		const auto row = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, row_type, row, pointer);
-		return row;
-	};
 	const auto word_of = [&](uint32_t row, uint32_t index) {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, type, value, row, index);
@@ -1438,45 +1453,22 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 		              ConstantU32(state, 0));
 	};
 
-	{
-		const auto function_type = state.builder.Type(spv::OpTypeFunction, row_type, type);
-		state.indirect_format_geometry_function = state.builder.AllocateId();
-		const auto format = state.builder.AllocateId();
-		state.builder.AddName(state.indirect_format_geometry_function,
-		                      "indirect_buffer_format_geometry");
-		state.builder.AddFunction(spv::OpFunction, row_type,
-		                          state.indirect_format_geometry_function,
-		                          spv::FunctionControlMaskNone, function_type);
-		state.builder.AddFunction(spv::OpFunctionParameter, type, format);
-		EmitLabel(state, state.builder.AllocateId());
-		const auto row    = load_row(format);
-		const auto head   = word_of(row, 0u);
-		const auto tail   = word_of(row, 3u);
-		const auto count  = bits_of(head, 8u, 4u);
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeConstruct, row_type, result,
-		                          bits_of(head, 0u, 8u),
-		                          EmitUMax32(state, count, ConstantU32(state, 1)),
-		                          bits_of(tail, 0u, 8u), bits_of(tail, 8u, 8u));
-		state.builder.AddFunction(spv::OpReturnValue, result);
-		state.builder.AddFunction(spv::OpFunctionEnd);
-	}
-
-	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type, type, type, type);
+	// The read hands its format's row over: the table is read once for all its components.
+	const auto function_type =
+	    state.builder.Type(spv::OpTypeFunction, type, row_type, type, type, type);
 	state.indirect_format_function = state.builder.AllocateId();
-	const auto format = state.builder.AllocateId();
+	const auto row                 = state.builder.AllocateId();
 	const auto selector = state.builder.AllocateId();
 	const auto component = state.builder.AllocateId();
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
 	                          spv::FunctionControlMaskNone, function_type);
-	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
+	state.builder.AddFunction(spv::OpFunctionParameter, row_type, row);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, raw);
 	EmitLabel(state, state.builder.AllocateId());
-	const auto row       = load_row(format);
 	const auto head      = word_of(row, 0u);
 	const auto packed    = flag(head, 12u);
 	const auto is_signed = flag(head, 13u);
@@ -1607,14 +1599,13 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			if (!memory.formatted) {
 				result =
 				    LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
-			} else if (components == 1u) {
-				result = LoadIndirectFormattedComponent(ctx, buffer, buffer.selector);
 			} else {
-				// Each component reads the channel its DST_SEL names from the same element.
+				// Each component reads the channel its DST_SEL names from the same record.
+				const auto              record = PrepareIndirectFormattedRecord(state, buffer);
 				std::array<uint32_t, 4> values {};
 				for (uint32_t component = 0; component < components; ++component)
 					values[component] = LoadIndirectFormattedComponent(
-					    ctx, buffer,
+					    ctx, record,
 					    EmitBitFieldUExtract(state, buffer.dst_sel,
 					                         ConstantU32(state, component * 3u),
 					                         ConstantU32(state, 3u)));

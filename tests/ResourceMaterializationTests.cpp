@@ -803,16 +803,21 @@ void TestFiniteImageRefreshReusesScalarReads() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto capacities = [&] {
-    return std::array{snapshot.images.capacity(), snapshot.flattened_srt.capacity(),
-                      snapshot.specialization_reads.capacity(), specialization.images.capacity()};
+    return std::array{snapshot.images.capacity(), snapshot.candidate_images.capacity(),
+                      snapshot.flattened_srt.capacity(), snapshot.specialization_reads.capacity(),
+                      specialization.images.capacity()};
   };
-  const auto check_mapping = [&](std::array<uint32_t, 4> ordinals) {
-    const auto offset = specialization.images[0].indirect_mapping_offset;
-    Check(snapshot.images.size() == 2 && snapshot.flattened_srt[offset] == 4,
+  // The table's own entry is null; its two descriptors are slots of one class.
+  const auto check_mapping = [&](std::array<uint32_t, 4> slots) {
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+    Check(snapshot.images.size() == 2 && snapshot.candidate_images.size() == 2 &&
+              specialization.images.size() == 2 && specialization.images[1].indirect_root == 0 &&
+              snapshot.flattened_srt[offset] == 4,
           "finite image candidates were not deduplicated");
-    for (uint32_t key = 0; key < ordinals.size(); ++key) {
+    for (uint32_t key = 0; key < slots.size(); ++key) {
       Check(snapshot.flattened_srt[offset + 1u + key * 2u] == key &&
-                snapshot.flattened_srt[offset + 2u + key * 2u] == ordinals[key],
+                snapshot.flattened_srt[offset + 2u + key * 2u] ==
+                    (1u << CandidateClassShift | slots[key]),
             "finite image selector mapping is stale or incorrect");
     }
   };
@@ -828,7 +833,8 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh failed after descriptor changes");
   Check(reads.counts == std::array<uint32_t, 3>{2, 2, 2} &&
             snapshot.specialization_reads.size() == 3 &&
-            snapshot.images[0].dwords[0] == 0x300u && snapshot.images[1].dwords[0] == 0x400u,
+            snapshot.candidate_images[0].value.dwords[0] == 0x300u &&
+            snapshot.candidate_images[1].value.dwords[0] == 0x400u,
         "finite image refresh retained old scalar values or repeated reads");
   check_mapping({0, 0, 1, 0});
   Check(capacities() == warm_capacities,
@@ -1377,6 +1383,9 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   auto &first = program.descriptor_sources[0];
   first.dwords[0] = Value(0x100u);
   first.dwords[1] = Value(static_cast<uint32_t>(BufferFormat::k8UNorm) << 20u);
+  // A sampled T# whose channels all select zero reads as null: the candidates select R, G, B, A.
+  program.descriptor_sources[1].dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+      static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   first.dwords[3] = program.descriptor_sources[1].dwords[3];
   program.descriptor_sources[1].dwords[1] = Value(static_cast<uint32_t>(
       mixed ? BufferFormat::k8UInt : BufferFormat::k8UNorm) << 20u);
@@ -1396,23 +1405,30 @@ void TestIndirectImageSamplerClasses(bool mixed) {
                            .read_specialization_memory = RejectSpecializationRead};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The table's own entry is null; its two descriptors are slots of a class per numeric class.
+  const uint32_t classes = mixed ? 2u : 1u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0 &&
-            snapshot.images.size() == 2 && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[1].dwords[0] == 1u &&
-            specialization.images[0].numeric_class == TextureNumericClass::Float &&
-            specialization.images[1].numeric_class ==
+            snapshot.images.size() == 1u + classes && snapshot.candidate_images.size() == 2 &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[1].value.dwords[0] == 1u &&
+            snapshot.candidate_images[0].resource == 1u &&
+            snapshot.candidate_images[1].resource == classes &&
+            specialization.images[1].numeric_class == TextureNumericClass::Float &&
+            specialization.images[classes].numeric_class ==
                 (mixed ? TextureNumericClass::Uint : TextureNumericClass::Float),
         "indirect image materialization rejected or changed a typed candidate");
-  const auto offset = specialization.images[0].indirect_mapping_offset;
+  const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
   Check(snapshot.flattened_srt[offset] == 3u &&
-            snapshot.flattened_srt[offset + 2u] == 0u &&
-            snapshot.flattened_srt[offset + 4u] == 1u &&
-            snapshot.flattened_srt[offset + 6u] == 0u,
-        "mixed image classes changed selector ordinals or duplicated candidates");
+            snapshot.flattened_srt[offset + 2u] == 1u << CandidateClassShift &&
+            snapshot.flattened_srt[offset + 4u] == (classes << CandidateClassShift | 1u) &&
+            snapshot.flattened_srt[offset + 6u] == 1u << CandidateClassShift,
+        "mixed image classes changed selector slots or duplicated candidates");
   ApplyResourceSpecialization(program, specialization);
-  Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0, 1}) &&
+  Check(program.info.images[0].indirect_resources ==
+                (mixed ? std::vector<uint32_t>({0, 1, 2}) : std::vector<uint32_t>({0, 1})) &&
+            program.info.images[0].candidate && program.info.images[1].candidate &&
             snapshot.samplers.size() == 1 && program.info.samplers.size() == (mixed ? 2u : 1u),
-        "indirect images lost candidates or created unnecessary sampler variants");
+        "indirect images lost classes or created unnecessary sampler variants");
   user_data[0] = 0x33333333u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed image sampler refresh failed");
@@ -1423,6 +1439,240 @@ void TestIndirectImageSamplerClasses(bool mixed) {
               sampler.integer_border == (index != 0u) &&
               snapshot.samplers[sampler.snapshot_index].dwords[0] == user_data[0],
           "typed sampler variants lost filtering, border class, or shared live descriptor");
+  }
+}
+
+// A sampled table numbers the classes of its candidates as the compiled program does, past an
+// FMASK that leaves the image list, and keeps a null entry of its own whichever texture is first.
+void TestImageTableClassesBehindFmask() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 2u;
+  auto &block = AddValueBlock(program);
+  // Two textures whose formats are user data, an FMASK, and the table of the two textures.
+  for (uint32_t index = 0; index < 2u; ++index) {
+    DescriptorSource texture;
+    texture.dword_count = 8u;
+    texture.dwords.fill(Value(0u));
+    texture.dwords[0] = Value(0x100u + index);
+    texture.dwords[1] =
+        Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(index))}));
+    texture.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(texture);
+  }
+  constexpr std::array<uint32_t, 8> fmask_words{
+      0x303ac300u, 0xca100000u, 0x021bc3bfu, 0x91800004u, 0u, 0x00700000u, 0u, 0u};
+  DescriptorSource fmask;
+  fmask.dword_count = 8u;
+  for (uint32_t word = 0; word < fmask_words.size(); ++word)
+    fmask.dwords[word] = Value(fmask_words[word]);
+  program.descriptor_sources.push_back(fmask);
+  DescriptorSource root;
+  root.dword_count = 8u;
+  root.dwords.fill(Value(0u));
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(root);
+  const auto dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  for (const uint32_t source : {2u, 3u})
+    program.info.images.push_back({.source = source,
+        .resource_class = ImageResourceClass::Sampled, .dimension = dimension});
+  const auto plan = Extract(program);
+  std::array<uint32_t, 2> formats{uint32_t(BufferFormat::k32Float) << 20u,
+                                  uint32_t(BufferFormat::k32UInt) << 20u};
+  const SrtRuntime runtime{.user_data = formats};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  // The specialization lists the FMASK, the table, its float class and its integer class; the
+  // snapshot and the compiled program drop the FMASK.
+  const auto classes = [&](uint32_t first, uint32_t second) {
+    return specialization.images.size() == 4u && specialization.images[0].fmask &&
+           snapshot.images.size() == 3u && snapshot.candidate_images.size() == 2u &&
+           snapshot.candidate_images[0].resource == first &&
+           snapshot.candidate_images[1].resource == second;
+  };
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && classes(1u, 2u),
+        "table candidates did not name their classes past the FMASK image");
+  const auto ordered = specialization;
+  std::swap(formats[0], formats[1]);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && classes(2u, 1u) &&
+            specialization == ordered,
+        "the first texture of a table changed its specialization");
+  ApplyResourceSpecialization(program, specialization);
+  const auto &images = program.info.images;
+  Check(images.size() == 3u && images[0].candidate &&
+            images[0].indirect_resources == std::vector<uint32_t>({0, 1, 2}) &&
+            images[1].candidate && images[1].numeric_class == TextureNumericClass::Float &&
+            images[2].candidate && images[2].numeric_class == TextureNumericClass::Uint,
+        "the compiled program numbered the classes of the table otherwise");
+}
+
+// The array form of an instruction reads a sampled texture without slices as its one slice: plain
+// textures and arrays are one specialization of an image and one class of a table.
+void TestArrayInstructionReadsPlainTextures() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Type = Libs::Graphics::Prospero::ImageType;
+  using Dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  // Two textures whose types are user data. An instruction samples the first and another stores
+  // to it; a table selects both. A multisampled texture is sampled alone.
+  const auto build = [](Dimension declared, bool multisampled) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 2u;
+    auto &block = AddValueBlock(program);
+    for (uint32_t index = 0; index < 2u; ++index) {
+      DescriptorSource texture;
+      texture.dword_count = 8u;
+      texture.dwords.fill(Value(0u));
+      texture.dwords[0] = Value(0x100u + index);
+      texture.dwords[1] = Value(uint32_t(BufferFormat::k32Float) << 20u);
+      texture.dwords[3] =
+          Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(index))}));
+      if (multisampled) texture.dwords[5] = Value(1u << 4u);
+      program.descriptor_sources.push_back(texture);
+    }
+    DescriptorSource table;
+    table.dword_count = 8u;
+    table.dwords.fill(Value(0u));
+    table.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+    program.descriptor_sources.push_back(table);
+    program.info.images.push_back({.source = 0u,
+        .resource_class = ImageResourceClass::Sampled, .dimension = declared});
+    if (!multisampled) {
+      program.info.images.push_back({.source = 0u,
+          .resource_class = ImageResourceClass::Storage, .dimension = declared, .written = true});
+      program.info.images.push_back({.source = 2u,
+          .resource_class = ImageResourceClass::Sampled, .dimension = declared});
+    }
+    return Extract(program);
+  };
+  const auto materialize = [](const ResourcePlan &plan, Type first, Type second) {
+    const auto word = [](Type type) {
+      const bool multisampled = type == Type::kColor2DMsaa || type == Type::kColor2DMsaaArray;
+      return Libs::Graphics::DstSel(4, 5, 6, 7) | (multisampled ? 1u << 16u : 0u) |
+             uint32_t(type) << 28u;
+    };
+    const std::array<uint32_t, 2> types{word(first), word(second)};
+    const SrtRuntime runtime{.user_data = types};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "an image instruction rejected a texture of its own family");
+    return specialization;
+  };
+
+  const auto array_2d = build(Dimension::Dim2DArray, false);
+  const auto plain = materialize(array_2d, Type::kColor2D, Type::kColor2D);
+  const auto arrays = materialize(array_2d, Type::kColor2DArray, Type::kColor2DArray);
+  const auto both = materialize(array_2d, Type::kColor2D, Type::kColor2DArray);
+  // The image, its storing twin, the table and the table's one class.
+  Check(plain.images.size() == 4u && plain.images[0].dimension == Dimension::Dim2DArray &&
+            plain.images[3].dimension == Dimension::Dim2DArray && plain == both &&
+            arrays.images.size() == 4u && plain.images[0] == arrays.images[0] &&
+            plain.images[2] == arrays.images[2] && plain.images[3] == arrays.images[3],
+        "a plain texture and an array did not share the specialization of an array instruction");
+  Check(plain.images[1].dimension == Dimension::Dim2D &&
+            arrays.images[1].dimension == Dimension::Dim2DArray,
+        "a storing array instruction did not keep the form of its texture");
+  // Another family keeps its own form: its coordinates do not line up with the instruction's.
+  Check(materialize(array_2d, Type::kColor1D, Type::kColor1D).images[0].dimension ==
+                Dimension::Dim1D &&
+            materialize(build(Dimension::Dim1DArray, false), Type::kColor2D, Type::kColor2D)
+                    .images[0].dimension == Dimension::Dim2D,
+        "an array instruction took a texture of another family as its slice");
+  Check(materialize(build(Dimension::Dim1DArray, false), Type::kColor1D, Type::kColor1D)
+                    .images[0].dimension == Dimension::Dim1DArray &&
+            materialize(build(Dimension::Dim2DMsaaArray, true), Type::kColor2DMsaa,
+                        Type::kColor2DMsaa).images[0].dimension == Dimension::Dim2DMsaaArray,
+        "a 1D or multisampled array instruction did not read a plain texture as one slice");
+  // An instruction without slices reads the first slice of an array, as before.
+  Check(materialize(build(Dimension::Dim2D, false), Type::kColor2DArray, Type::kColor2D)
+                .images[0].dimension == Dimension::Dim2D,
+        "a plain instruction did not read an array as its first slice");
+}
+
+// A gather table's candidate takes a descriptor per mip, and its mapping word a 16-bit slot beside
+// the mip count: a stage's block ends at 65,536 descriptors.
+void TestGatherTableBlock() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  constexpr uint32_t type = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  // A table of `count` textures: the first takes its mip range from user data, the rest have 16.
+  const auto make = [](uint32_t count) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 1u;
+    auto &block = AddValueBlock(program);
+    DescriptorSource root;
+    root.dword_count = 8u;
+    root.dwords.fill(Value(0u));
+    auto &sources = root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources;
+    for (uint32_t index = 0; index < count; ++index) {
+      DescriptorSource texture;
+      texture.dword_count = 8u;
+      texture.dwords.fill(Value(0u));
+      texture.dwords[0] = Value(0x100u + index);
+      texture.dwords[1] = Value(uint32_t(BufferFormat::k32Float) << 20u);
+      texture.dwords[3] = index == 0u
+          ? Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}))
+          : Value(type | 15u << 16u);
+      program.descriptor_sources.push_back(texture);
+      sources.push_back(index);
+    }
+    program.descriptor_sources.push_back(root);
+    program.info.images.push_back({.source = count,
+        .resource_class = ImageResourceClass::Sampled,
+        .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+        .mip_mode = ImageMipMode::Dynamic});
+    return Extract(program);
+  };
+  constexpr uint32_t full = (1u << CandidateMipShift) / 16u;
+  std::array<uint32_t, 1> range{type | 15u << 16u};
+  const SrtRuntime runtime{.user_data = range};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto word = [&](uint32_t key) {
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+    return snapshot.flattened_srt[offset + (key + 1u) * 2u];
+  };
+  constexpr uint32_t first_class = 1u << CandidateClassShift;
+  const auto filled = make(full);
+  Check(MaterializeResources(filled, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == full &&
+            snapshot.candidate_images.back().slot == (full - 1u) * 16u &&
+            snapshot.candidate_images.back().mips == 16u &&
+            word(full - 1u) == (first_class | 15u << CandidateMipShift | (full - 1u) * 16u),
+        "a gather table's candidates did not fill a block of 65,536 descriptors");
+  // One descriptor more does not fit the slot.
+  const auto over = make(full + 1u);
+  range[0] = type;
+  Check(!MaterializeResources(over, runtime, snapshot, specialization),
+        "a gather table's block passed the slot its mapping words hold");
+  // A candidate's views are its base level to its last.
+  const auto pair = make(2u);
+  range[0] = type | 5u << 16u | 2u << 12u;
+  Check(MaterializeResources(pair, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 2u && snapshot.candidate_images[0].slot == 0u &&
+            snapshot.candidate_images[0].mips == 4u && snapshot.candidate_images[1].slot == 4u &&
+            word(0u) == (first_class | 3u << CandidateMipShift) &&
+            word(1u) == (first_class | 15u << CandidateMipShift | 4u),
+        "a gather candidate did not take the mip views of its level range");
+  // A T# whose base level is past its last level is no texture: its row reads as null.
+  for (const uint32_t base_level : {1u, 3u}) {
+    range[0] = type | base_level << 12u;
+    Check(MaterializeResources(pair, runtime, snapshot, specialization) &&
+              snapshot.candidate_images.size() == 1u && snapshot.candidate_images[0].slot == 0u &&
+              snapshot.candidate_images[0].mips == 16u && word(0u) == 0u &&
+              word(1u) == (first_class | 15u << CandidateMipShift),
+          "a gather candidate without a level range was given descriptors");
   }
 }
 
@@ -1502,6 +1752,9 @@ int main() {
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestImageTableClassesBehindFmask();
+  TestArrayInstructionReadsPlainTextures();
+  TestGatherTableBlock();
   TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

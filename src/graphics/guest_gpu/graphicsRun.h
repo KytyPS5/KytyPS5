@@ -36,7 +36,7 @@ public:
 	void Submit(std::span<const uint32_t> commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
-	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
+	// Insert an ordered graphics drain; returns once the CP has read the graphics before it.
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
@@ -82,6 +82,11 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
+	// Suspend points wait on these, under m_queue_mutex.
+	Common::CondVar m_suspend_point_progress;
+	uint64_t        m_suspend_points_queued  = 0;
+	uint64_t        m_suspend_points_reached = 0;
+	bool            m_graphics_stalled       = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -125,6 +126,27 @@ struct FontGlyphMetrics {
 	} vertical;
 };
 
+struct FontPointF {
+	float x;
+	float y;
+};
+
+// FreeType FT_Outline with float points: tag 1 on-curve, 0 quadratic, 2 cubic.
+struct FontGlyphOutline {
+	int16_t     contours_count;
+	int16_t     points_count;
+	FontPointF* points;
+	uint8_t*    tags;
+	uint16_t*   contour_end_points;
+};
+static_assert(offsetof(FontGlyphOutline, points) == 0x08);
+static_assert(offsetof(FontGlyphOutline, tags) == 0x10);
+static_assert(offsetof(FontGlyphOutline, contour_end_points) == 0x18);
+
+constexpr uint8_t FONT_OUTLINE_TAG_CONIC = 0;
+constexpr uint8_t FONT_OUTLINE_TAG_ON    = 1;
+constexpr uint8_t FONT_OUTLINE_TAG_CUBIC = 2;
+
 struct FontKerning {
 	float offset_x;
 	float offset_y;
@@ -233,6 +255,11 @@ struct GlyphState {
 	FontGlyphMetrics                                               metrics;
 	std::vector<uint8_t>                                           image;
 	FontTransImage                                                 trans_image;
+	std::vector<FontPointF>                                        outline_points;
+	std::vector<uint8_t>                                           outline_tags;
+	std::vector<uint16_t>                                          outline_contours;
+	FontGlyphOutline                                               outline;
+	bool                                                           has_outline;
 };
 
 union FontTextParseResult {
@@ -934,6 +961,91 @@ static void init_image(std::vector<uint8_t>* image, FontTransImage* trans_image,
 	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
+}
+
+static void close_outline_contour(GlyphState* glyph, size_t contour_begin) {
+	auto& points = glyph->outline_points;
+	auto& tags   = glyph->outline_tags;
+	if (points.size() <= contour_begin) {
+		return;
+	}
+
+	// stb closes each contour explicitly; outline contours are closed implicitly.
+	const auto& first = points[contour_begin];
+	const auto& last  = points.back();
+	if (points.size() - contour_begin > 1 && tags.back() == FONT_OUTLINE_TAG_ON &&
+	    last.x == first.x && last.y == first.y) {
+		points.pop_back();
+		tags.pop_back();
+	}
+
+	glyph->outline_contours.push_back(static_cast<uint16_t>(points.size() - 1));
+}
+
+// Pixel units with y growing upwards, like a FreeType outline.
+static void init_outline(GlyphState* glyph, FontState* font) {
+	glyph->has_outline = false;
+	glyph->outline_points.clear();
+	glyph->outline_tags.clear();
+	glyph->outline_contours.clear();
+
+	if (!ensure_stb_font(font)) {
+		return;
+	}
+
+	const auto  code    = stb_supported_codepoint(font, glyph->code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+
+	stbtt_vertex* vertices = nullptr;
+	const int     num_vertices =
+	    stbtt_GetCodepointShape(&font->font_info, static_cast<int>(code), &vertices);
+
+	auto add_point = [&](int x, int y, uint8_t tag) {
+		glyph->outline_points.push_back(
+		    {static_cast<float>(x) * scale_x, static_cast<float>(y) * scale_y});
+		glyph->outline_tags.push_back(tag);
+	};
+
+	size_t contour_begin = 0;
+	for (int i = 0; i < num_vertices; i++) {
+		const auto& v = vertices[i];
+		switch (v.type) {
+			case STBTT_vmove:
+				close_outline_contour(glyph, contour_begin);
+				contour_begin = glyph->outline_points.size();
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			case STBTT_vline: add_point(v.x, v.y, FONT_OUTLINE_TAG_ON); break;
+			case STBTT_vcurve:
+				add_point(v.cx, v.cy, FONT_OUTLINE_TAG_CONIC);
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			case STBTT_vcubic:
+				add_point(v.cx, v.cy, FONT_OUTLINE_TAG_CUBIC);
+				add_point(v.cx1, v.cy1, FONT_OUTLINE_TAG_CUBIC);
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			default: break;
+		}
+	}
+	close_outline_contour(glyph, contour_begin);
+	stbtt_FreeShape(&font->font_info, vertices);
+
+	// The counts are 16-bit; no real glyph comes close.
+	if (glyph->outline_points.size() > 0x7fffu || glyph->outline_contours.size() > 0x7fffu) {
+		glyph->outline_points.clear();
+		glyph->outline_tags.clear();
+		glyph->outline_contours.clear();
+		return;
+	}
+
+	glyph->outline.contours_count     = static_cast<int16_t>(glyph->outline_contours.size());
+	glyph->outline.points_count       = static_cast<int16_t>(glyph->outline_points.size());
+	glyph->outline.points             = glyph->outline_points.data();
+	glyph->outline.tags               = glyph->outline_tags.data();
+	glyph->outline.contour_end_points = glyph->outline_contours.data();
+	glyph->has_outline                = true;
 }
 
 static void fill_render_result(FontState* font, FontRenderSurface* surf, float x, float y,
@@ -2171,6 +2283,7 @@ int KYTY_SYSV_ABI FontGenerateCharGlyph(FontHandle font_handle, uint32_t code,
 	glyph->code = code;
 	fill_metrics_for_code(&glyph->metrics, font, code);
 	init_image(&glyph->image, &glyph->trans_image, code, font);
+	init_outline(glyph, font);
 	register_glyph(glyph);
 
 	*font_glyph = glyph;
@@ -2214,6 +2327,18 @@ int KYTY_SYSV_ABI FontGlyphDefineAttribute(void* font_glyph, int attribute, int*
 	     attribute);
 
 	return OK;
+}
+
+const FontGlyphOutline* KYTY_SYSV_ABI FontGlyphRefersOutline(void* font_glyph) {
+	PRINT_NAME();
+
+	auto* glyph = (is_known_glyph(font_glyph) ? static_cast<GlyphState*>(font_glyph) : nullptr);
+	const auto* outline = (glyph != nullptr && glyph->has_outline ? &glyph->outline : nullptr);
+
+	LOGF("\t glyph = 0x%016" PRIx64 ", outline = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(font_glyph), reinterpret_cast<uint64_t>(outline));
+
+	return outline;
 }
 
 int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uint32_t code,
@@ -2276,6 +2401,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("sDuhHGNhHvE", Font::FontGetKerning);
 	LIB_FUNC("IQtleGLL5pQ", Font::FontGetRenderCharGlyphMetrics);
 	LIB_FUNC("8-zmgsxkBek", Font::FontGlyphDefineAttribute);
+	LIB_FUNC("R1T4i+DOhNY", Font::FontGlyphRefersOutline);
 	LIB_FUNC("whrS4oksXc4", Font::FontMemoryInit);
 	LIB_FUNC("h6hIgxXEiEc", Font::FontMemoryTerm);
 	LIB_FUNC("JzCH3SCFnAU", Font::FontOpenFontInstance);

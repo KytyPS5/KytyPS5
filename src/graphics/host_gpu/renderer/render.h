@@ -65,7 +65,8 @@ struct DrawAutoArgs {
 };
 
 struct SubmitInfo {
-	static constexpr uint32_t MaxSemaphores = 3;
+	// One wait and one signal are kept for CommandScheduler::Submit: sparse binds and the master.
+	static constexpr uint32_t MaxSemaphores = 4;
 
 	std::array<vk::Semaphore, MaxSemaphores>          wait_semaphores {};
 	std::array<uint64_t, MaxSemaphores>               wait_ticks {};
@@ -154,8 +155,11 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// Plane owner: a stored stencil plane resolves to its depth image, for a caller that writes
+	// the plane natively.
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            bool plane_owner = false);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -178,13 +182,15 @@ private:
 	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
+	void               PlanDrawEqaa(CommandBuffer& buffer, const DrawRenderState& state);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
-	                                               std::span<PreparedBindings* const> stages = {});
+	                                               std::span<PreparedBindings* const> stages = {},
+	                                               const EqaaPlan* eqaa = nullptr);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);
@@ -222,6 +228,10 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// The draw's candidate buffers, every stage's block, and each slot's record.
+	std::vector<vk::DescriptorBufferInfo> m_candidate_buffers;
+	std::vector<uint32_t>                 m_candidate_records;
+	std::vector<vk::DescriptorImageInfo>  m_candidate_images;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;

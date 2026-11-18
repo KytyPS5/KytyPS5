@@ -15,6 +15,8 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -103,9 +105,9 @@ public:
 	Id       AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format);
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
-	bool     AudioOutHasDevice(Id handle);
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
-	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
+	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true,
+	                         bool cushion = false);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
 
 	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
@@ -127,6 +129,10 @@ private:
 		bool        queue_primed = false;
 		int         channels_num = 0;
 		int         volume[12]   = {};
+		bool        cushion_queued    = false;
+		int64_t     trim_window_min   = INT64_MAX;
+		uint32_t    trim_window_count = 0;
+		int64_t     trim_floor        = -1;
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
@@ -162,8 +168,12 @@ private:
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer, float gain,
 	                                           const float* gains);
-	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
-	                          const float* gains);
+	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, bool cushion,
+	                          float gain, const float* gains);
+	static int TrimLatency(PortOut* port, int64_t queued, uint32_t grain_size, uint32_t target_size,
+	                       const void* data);
+	static const void* ShortenGrain(const PortOut& port, const void* data, uint32_t frames_out,
+	                                std::vector<uint8_t>* buffer);
 };
 
 static Audio* g_audio = nullptr;
@@ -185,11 +195,7 @@ void AudioOutClose(int handle) {
 	}
 }
 
-bool AudioOutHasDevice(int handle) {
-	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
-}
-
-uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
+uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking, bool cushion) {
 	if (g_audio == nullptr || params == nullptr || num == 0) {
 		return 0;
 	}
@@ -208,7 +214,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	}
 
 	return g_audio->AudioOutOutputs(output_params.data(),
-	                                static_cast<uint32_t>(output_params.size()), blocking);
+	                                static_cast<uint32_t>(output_params.size()), blocking, cushion);
 }
 
 } // namespace AudioInternal
@@ -370,7 +376,69 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
+// -1 drops a silent grain, N > 0 plays this grain N frames shorter, 0 leaves it as it is.
+int Audio::TrimLatency(PortOut* port, int64_t queued, uint32_t grain_size, uint32_t target_size,
+                       const void* data) {
+	port->trim_window_min = std::min(port->trim_window_min, queued);
+	if (++port->trim_window_count >= 32) {
+		port->trim_floor        = port->trim_window_min;
+		port->trim_window_min   = INT64_MAX;
+		port->trim_window_count = 0;
+	}
+	// A steady caller finds the queue one grain below the target at each put.
+	const auto steady = static_cast<int64_t>(target_size) - static_cast<int64_t>(grain_size);
+	if (port->trim_floor <= steady || queued <= steady) {
+		return 0;
+	}
+	if (port->trim_floor > steady + 2 * static_cast<int64_t>(grain_size)) {
+		const auto samples = grain_size / BytesPerSample(port->format);
+		bool       silent  = true;
+		for (uint32_t i = 0; i < samples && silent; i++) {
+			silent = FormatIsFloat(port->format)
+			             ? std::abs(static_cast<const float*>(data)[i]) < 1e-4f
+			             : std::abs(static_cast<const int16_t*>(data)[i]) <= 3;
+		}
+		if (silent) {
+			port->trim_floor -= grain_size;
+			return -1;
+		}
+	}
+	const auto trim = std::max<uint32_t>(1, port->samples_num / 256);
+	port->trim_floor -= static_cast<int64_t>(grain_size / port->samples_num) * trim;
+	return static_cast<int>(trim);
+}
+
+const void* Audio::ShortenGrain(const PortOut& port, const void* data, uint32_t frames_out,
+                                std::vector<uint8_t>* buffer) {
+	const auto           channels  = OutputChannels(port);
+	const auto           frames_in = port.samples_num;
+	std::vector<uint8_t> out(static_cast<size_t>(frames_out) * channels *
+	                         BytesPerSample(port.format));
+	for (uint32_t frame = 0; frame < frames_out; frame++) {
+		const double pos =
+		    frames_out > 1 ? static_cast<double>(frame) * (frames_in - 1) / (frames_out - 1) : 0.0;
+		const auto   i0   = std::min(static_cast<uint32_t>(pos), frames_in - 1);
+		const auto   i1   = std::min(i0 + 1, frames_in - 1);
+		const double frac = pos - i0;
+		for (uint32_t ch = 0; ch < channels; ch++) {
+			if (FormatIsFloat(port.format)) {
+				const auto* src = static_cast<const float*>(data);
+				reinterpret_cast<float*>(out.data())[frame * channels + ch] = static_cast<float>(
+				    src[i0 * channels + ch] * (1.0 - frac) + src[i1 * channels + ch] * frac);
+			} else {
+				const auto* src = static_cast<const int16_t*>(data);
+				reinterpret_cast<int16_t*>(out.data())[frame * channels + ch] =
+				    static_cast<int16_t>(std::lround(src[i0 * channels + ch] * (1.0 - frac) +
+				                                     src[i1 * channels + ch] * frac));
+			}
+		}
+	}
+	// data may point into *buffer.
+	*buffer = std::move(out);
+	return buffer->data();
+}
+
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, bool cushion, float gain,
                           const float* gains) {
 	EXIT_IF(port == nullptr);
 
@@ -384,14 +452,50 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
+	const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+	const auto buffers =
+	    buffer_us != 0
+	        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
+	        : 2u;
+	const auto target_size = prepared_size * std::clamp(buffers, 2u, 16u);
+
 	uint32_t min_queued_size = 0;
+	uint32_t put_size        = prepared_size;
+	if (!blocking && cushion) {
+		// The caller paces this port, so the queue only covers its jitter.
+		auto queued = SDL_GetAudioStreamQueued(port->stream);
+		if (queued > static_cast<int>(target_size * 4)) {
+			SDL_ClearAudioStream(port->stream);
+			port->cushion_queued = false;
+			queued               = 0;
+		}
+		const int trim = queued >= static_cast<int>(prepared_size)
+		                     ? TrimLatency(port, queued, prepared_size, target_size, prepared_data)
+		                     : 0;
+		if (trim < 0) {
+			return true;
+		}
+		if (trim > 0) {
+			const auto frame_size = prepared_size / port->samples_num;
+			prepared_data =
+			    ShortenGrain(*port, prepared_data, port->samples_num - trim, &prepared_buffer);
+			put_size = (port->samples_num - trim) * frame_size;
+		}
+		if (queued >= 0 && queued < static_cast<int>(prepared_size)) {
+			if (port->cushion_queued) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+			}
+			port->cushion_queued    = true;
+			port->trim_window_min   = INT64_MAX;
+			port->trim_window_count = 0;
+			port->trim_floor        = -1;
+			const std::vector<uint8_t> silence(target_size - prepared_size, 0);
+			(void)SDL_PutAudioStreamData(port->stream, silence.data(),
+			                             static_cast<int>(silence.size()));
+		}
+	}
 	if (blocking) {
-		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
-		const auto buffers =
-		    buffer_us != 0
-		        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
-		        : 2u;
-		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
+		min_queued_size            = target_size;
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
 		while (queued > static_cast<int>(min_queued_size)) {
@@ -411,7 +515,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		}
 	}
 
-	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
+	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(put_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		port->queue_primed = false;
 		return false;
@@ -500,13 +604,6 @@ bool Audio::AudioOutValid(Id handle) {
 	        m_out_ports[handle.GetId()].used);
 }
 
-bool Audio::AudioOutHasDevice(Id handle) {
-	Common::LockGuard lock(m_mutex);
-
-	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
-	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].stream != nullptr);
-}
-
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
 	Common::LockGuard lock(m_mutex);
 
@@ -544,7 +641,7 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 	return false;
 }
 
-uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
+uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking, bool cushion) {
 	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
 
@@ -577,7 +674,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking, gain, params[i].gains)) {
+			if (QueueSdlAudio(&port, params[i].data, blocking, cushion, gain, params[i].gains)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}

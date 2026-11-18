@@ -167,6 +167,7 @@ static HW::AaConfig ParseAaConfig(uint32_t value) {
 	r.aa_mask_centroid_dtmn = KYTY_PM4_GET(value, PA_SC_AA_CONFIG, AA_MASK_CENTROID_DTMN) != 0;
 	r.max_sample_dist       = KYTY_PM4_GET(value, PA_SC_AA_CONFIG, MAX_SAMPLE_DIST);
 	r.msaa_exposed_samples  = KYTY_PM4_GET(value, PA_SC_AA_CONFIG, MSAA_EXPOSED_SAMPLES);
+	r.coverage_to_shader_select = KYTY_PM4_GET(value, PA_SC_AA_CONFIG, COVERAGE_TO_SHADER_SELECT);
 
 	return r;
 }
@@ -215,6 +216,11 @@ static HW::EqaaControl ParseEqaaControl(uint32_t value) {
 	r.incoherent_eqaa_reads      = KYTY_PM4_GET(value, DB_EQAA, INCOHERENT_EQAA_READS) != 0;
 	r.interpolate_comp_z         = KYTY_PM4_GET(value, DB_EQAA, INTERPOLATE_COMP_Z) != 0;
 	r.static_anchor_associations = KYTY_PM4_GET(value, DB_EQAA, STATIC_ANCHOR_ASSOCIATIONS) != 0;
+	r.interpolate_src_z          = KYTY_PM4_GET(value, DB_EQAA, INTERPOLATE_SRC_Z) != 0;
+	r.alpha_to_mask_eqaa_disable = KYTY_PM4_GET(value, DB_EQAA, ALPHA_TO_MASK_EQAA_DISABLE) != 0;
+	r.overrasterization_amount   = KYTY_PM4_GET(value, DB_EQAA, OVERRASTERIZATION_AMOUNT);
+	r.enable_postz_overrasterization =
+	    KYTY_PM4_GET(value, DB_EQAA, ENABLE_POSTZ_OVERRASTERIZATION) != 0;
 
 	return r;
 }
@@ -482,27 +488,9 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0038e00);
 
-	const auto buffer_size = buffer[0];
-	auto* dst = reinterpret_cast<volatile uint32_t*>((buffer[1] & 0xffffffc0u) |
-	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
-
-	if (Config::LodStatsEnabled()) {
-		// Bit 18 or 19 resets the counters after the report.
-		cp.GetLodStats(dst, buffer_size, (buffer[3] & 0xc0000u) != 0);
-		return 4;
-	}
-
-	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
-	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
-	// samples. A non-zero dword 0 then marks the report complete.
-	if (dst != nullptr && buffer_size >= 64) {
-		const auto slots = std::min((buffer_size - 64) / 8, 256u);
-		for (uint32_t slot = 0; slot < slots; slot++) {
-			dst[16 + slot * 2]     = slot << 24u;
-			dst[16 + slot * 2 + 1] = 15u << 24u;
-		}
-		dst[0] = 1;
-	}
+	const auto dst = (buffer[1] & 0xffffffc0u) | (static_cast<uint64_t>(buffer[2]) << 32u);
+	// Bit 18 or 19 resets the counters after the report.
+	cp.GetLodStats(dst, buffer[0], (buffer[3] & 0xc0000u) != 0);
 
 	return 4;
 }
@@ -1813,9 +1801,6 @@ static constexpr auto MakeContextIndirectTable() {
 	                             Pm4::PA_SC_FSR_ENABLE,
 	                             Pm4::FSR_RECURSIONS0,
 	                             Pm4::FSR_RECURSIONS1,
-	                             Pm4::PA_SC_MODE_CNTL_1,
-	                             Pm4::PA_SC_AA_MASK_X0Y0_X1Y0,
-	                             Pm4::PA_SC_AA_MASK_X0Y1_X1Y1,
 	                             Pm4::PA_SU_VTX_CNTL,
 	                             Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK,
 	                             Pm4::PA_SC_BINNER_CNTL_0,
@@ -1823,6 +1808,19 @@ static constexpr auto MakeContextIndirectTable() {
 	                             Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL,
 	                             Pm4::PA_SC_SHADER_CONTROL}) {
 		table[cmd_offset] = IgnoreRegister;
+	}
+	table[Pm4::PA_SC_MODE_CNTL_1] = [](KYTY_HW_REG_ARGS) {
+		cp.GetCtx().SetPsIterSample(KYTY_PM4_GET(value, PA_SC_MODE_CNTL_1, PS_ITER_SAMPLE) != 0);
+	};
+	for (const auto cmd_offset: {Pm4::PA_SC_AA_MASK_X0Y0_X1Y0, Pm4::PA_SC_AA_MASK_X0Y1_X1Y1}) {
+		table[cmd_offset] = [](KYTY_HW_REG_ARGS) {
+			auto mask = cp.GetCtx().GetAaMask();
+			if (cmd_offset == Pm4::PA_SC_AA_MASK_X0Y0_X1Y0)
+				mask.x0y0_x1y0 = value;
+			else
+				mask.x0y1_x1y1 = value;
+			cp.GetCtx().SetAaMask(mask);
+		};
 	}
 	table[Pm4::PA_CL_VS_OUT_CNTL]  = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetClVsOutCntl(value); };
 	table[Pm4::GE_NGG_SUBGRP_CNTL] = [](KYTY_HW_REG_ARGS) { cp.GetCtx().SetNggSubgrpCntl(value); };

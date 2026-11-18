@@ -274,21 +274,26 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 
 } // namespace ImageViewOps
 
-vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
-	const auto& image      = backing;
-	auto        normalized = view_info;
-	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
-	const auto  image_aspect = FullAspectMask(image.format);
+ImageViewInfo Image::NormalizeView(const ImageViewInfo& view_info) const {
+	auto       normalized   = view_info;
+	const auto image_aspect = FullAspectMask(backing.format);
 	if (image_aspect & vk::ImageAspectFlagBits::eDepth &&
 	    ImageViewOps::IsFormatDepthCompatible(normalized.format)) {
-		normalized.format = image.format;
+		normalized.format = backing.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eDepth;
 	}
 	if (image_aspect & vk::ImageAspectFlagBits::eStencil &&
 	    IsStencilViewFormat(normalized.format)) {
-		normalized.format = image.format;
+		normalized.format = backing.format;
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
+	return normalized;
+}
+
+vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+	const auto& image      = backing;
+	auto        normalized = NormalizeView(view_info);
+	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {

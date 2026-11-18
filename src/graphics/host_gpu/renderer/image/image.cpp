@@ -120,6 +120,18 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+bool Image::Creatable(GraphicContext& graphics, const ImageInfo& info,
+                      vk::ImageCreateFlags extra_flags, vk::ImageUsageFlags required) {
+	const auto                usage = ImageUsageFlags(graphics, info);
+	const auto                flags = ImageCreateFlags(graphics, info, usage) | extra_flags;
+	vk::ImageFormatProperties properties {};
+	return (usage & required) == required &&
+	       graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+	                                         vk::ImageTiling::eOptimal, usage, flags,
+	                                         &properties) == vk::Result::eSuccess &&
+	       static_cast<bool>(properties.sampleCounts & vulkan_sample_count(info.samples));
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
@@ -129,6 +141,20 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
+	}
+	constexpr auto any_write =
+	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	    vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eMemoryWrite |
+	    vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	if (destination_access & any_write) {
+		++content_stamp;
+	}
+	if (eqaa != nullptr && !eqaa_settling &&
+	    (eqaa->dirty & (vk::ImageAspectFlagBits::eColor | vk::ImageAspectFlagBits::eDepth))) {
+		EXIT("EQAA shadow not settled: image=0x%016" PRIx64 " layout=%s access=0x%" PRIx64 "\n",
+		     info.data.address, vk::to_string(destination_layout).c_str(),
+		     static_cast<uint64_t>(static_cast<vk::AccessFlags2::MaskType>(destination_access)));
 	}
 
 	const bool partial =
@@ -160,6 +186,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
+					barrier.pNext                           = barrier_sample_locations;
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
 					barrier.dstStageMask                    = destination_stage;
@@ -194,6 +221,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		}
 
 		vk::ImageMemoryBarrier2 barrier {};
+		barrier.pNext                           = barrier_sample_locations;
 		barrier.srcStageMask                    = state.pl_stage;
 		barrier.srcAccessMask                   = state.access_mask;
 		barrier.dstStageMask                    = destination_stage;
@@ -562,28 +590,33 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	// Each source level lands on the destination level as many steps below `mip`.
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
-	        layer >= backing.layers);
+	        source.backing.mip_levels > backing.mip_levels - mip || layer >= backing.layers);
 	m_scheduler.EndRendering();
-	const auto width  = std::max(backing.extent.width >> mip, 1u);
-	const auto height = std::max(backing.extent.height >> mip, 1u);
-	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
-	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
+	const auto depth = std::max(backing.extent.depth >> mip, 1u);
+	EXIT_IF(std::max(backing.extent.width >> mip, 1u) != source.backing.extent.width ||
+	        std::max(backing.extent.height >> mip, 1u) != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
-	std::array<vk::ImageCopy, 2> copies {};
-	uint32_t                     copy_count = 0;
-	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
-	                         vk::ImageAspectFlagBits::eStencil}) {
-		if (!static_cast<bool>(aspects & aspect)) {
-			continue;
+	std::vector<vk::ImageCopy> copies;
+	for (uint32_t level = 0; level < source.backing.mip_levels; ++level) {
+		const auto target = mip + level;
+		for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
+		                         vk::ImageAspectFlagBits::eStencil}) {
+			if (!static_cast<bool>(aspects & aspect)) {
+				continue;
+			}
+			auto& copy          = copies.emplace_back();
+			copy.srcSubresource = {aspect, level, 0, source_layers};
+			copy.dstSubresource = {aspect, target, layer, destination_layers};
+			copy.extent         = {std::max(backing.extent.width >> target, 1u),
+			                       std::max(backing.extent.height >> target, 1u),
+			                       std::max(backing.extent.depth >> target, 1u)};
 		}
-		auto& copy          = copies[copy_count++];
-		copy.srcSubresource = {aspect, 0, 0, source_layers};
-		copy.dstSubresource = {aspect, mip, layer, destination_layers};
-		copy.extent         = {width, height, depth};
 	}
+	const auto copy_count = static_cast<uint32_t>(copies.size());
 	auto command = m_scheduler.Current().Handle();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
@@ -678,7 +711,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 } // namespace ImageOps
 
-Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
+Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
+             vk::ImageCreateFlags extra_flags)
     : info(image_info),
       stencil_subresources {0, image_info.resources.levels, 0, image_info.resources.layers},
       m_graphics(graphics), m_scheduler(scheduler) {
@@ -692,7 +726,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 
 	vk::ImageCreateInfo create {};
 	create.usage         = ImageUsageFlags(graphics, info);
-	create.flags         = ImageCreateFlags(graphics, info, create.usage);
+	create.flags         = ImageCreateFlags(graphics, info, create.usage) | extra_flags;
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
 	create.mipLevels     = info.resources.levels;
@@ -714,7 +748,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), info.samples);
 	}
 
-	if (!graphics.CreateImage(create, backing)) {
+	if (!graphics.CreateImage(create, backing, info.first_level)) {
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);

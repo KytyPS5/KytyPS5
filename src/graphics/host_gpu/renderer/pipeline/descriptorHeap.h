@@ -20,6 +20,11 @@ public:
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
+	// A set whose variable-count binding holds `count` descriptors.
+	[[nodiscard]] vk::DescriptorSet CommitVariable(vk::DescriptorSetLayout layout, uint32_t count);
+
+	// Descriptors of `type` one pool holds; a set that needs more can never be allocated.
+	[[nodiscard]] static uint32_t PoolCapacity(vk::DescriptorType type);
 
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
@@ -30,12 +35,16 @@ private:
 	};
 
 	void CreateDescriptorPool();
+	void NextPool();
+	void CreateCandidateLayouts();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;
 	vk::DescriptorPool                                  m_current_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
+	vk::DescriptorSetLayout                             m_candidate_buffer_layout = nullptr;
+	vk::DescriptorSetLayout                             m_candidate_image_layout  = nullptr;
 };
 
 } // namespace Libs::Graphics

@@ -75,6 +75,21 @@ struct ImageDefinition {
 	uint32_t sampled_type = 0;
 };
 
+// Scalar loads of one pointer that follow each other share the page lookup of the first.
+struct BdaRun {
+	const IR::Inst* first    = nullptr;
+	uint32_t        distance = 0;
+	uint32_t        length   = 0;
+};
+
+// What the first load of a run looked up, in the mapping of its page and of the run's last.
+struct BdaRunPointers {
+	uint32_t first_page  = 0;
+	uint32_t last_page   = 0;
+	uint32_t page_offset = 0;
+	uint32_t label       = 0;
+};
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -113,13 +128,22 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
+	// The draw's candidate buffers by storage_buffers element width, and the slots' records.
+	std::array<uint32_t, 4>                            candidate_buffer_variables {};
+	uint32_t                                           candidate_record_variable = 0;
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
-	uint32_t                                         bda_pointer_function    = 0;
+	// BVH programs keep bda_pointer_function, zero for a missing page; the others read zeros.
+	uint32_t                                            bda_pointer_function = 0;
+	uint32_t                                            bda_dword_function   = 0;
+	uint32_t                                            bda_run_function     = 0;
+	std::unordered_map<const IR::Inst*, BdaRun>         bda_runs;
+	std::unordered_map<const IR::Inst*, BdaRunPointers> bda_run_pointers;
+	uint32_t                                           indirect_search_function          = 0;
 	uint32_t                                         indirect_format_function = 0;
-	uint32_t                                         indirect_format_geometry_function = 0;
+	uint32_t                                            indirect_format_table             = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         bvh8_result_type       = 0;
@@ -138,6 +162,8 @@ struct EmitterState {
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
+	// The draw's candidate images, one view of the same runtime array per image type.
+	std::array<ImageDefinition, IR::ImageBindingCount> candidate_images {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   sampler_type                          = 0;
 	uint32_t                   sampler_pointer_type                  = 0;
@@ -168,6 +194,8 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
+	// The push dwords the shader data may take end here.
+	uint32_t push_data_end = IR::PushData::DwordCount;
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -307,6 +335,14 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr);
 
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 
+// A per-sample PS reads barycentrics only through interpolation functions.
+bool PixelShaderIsPerSample(const EmitterState& state);
+
+// This pixel shader tests its pixel's bit of the draw's PA_SC_AA_MASK.
+inline bool PixelShaderTestsAaMask(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel && state.input_info.pixel->ps_aa_mask;
+}
+
 Format::ComponentType VertexParameterScalarKind(const EmitterState& state, uint32_t location);
 
 uint32_t VertexParameterComponentCount(const InputBinding& input);
@@ -402,8 +438,6 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
-uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
-
 void EmitMemoryBindings(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
@@ -420,17 +454,18 @@ struct MemoryResourceAccess {
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
-uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource);
+// The resource a key selects through the mapping in slot `mapping_slot`, or default_resource.
+uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_slot,
+                                   bool searched, uint32_t default_resource);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
-uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
+uint32_t             EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_slot);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
-                                                 uint32_t array_index = 0u);
+                                                 uint32_t candidate_slot = 0u);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        BufferDefinition& buffer,
-                                                        uint32_t array_index = 0);
+                                                        BufferDefinition&     buffer,
+                                                        uint32_t              candidate_slot = 0);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
@@ -523,6 +558,7 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void     DefineIndirectKeySearch(EmitterState& state);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);

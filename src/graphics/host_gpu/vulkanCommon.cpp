@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/graphicContext.h"
 
 #include <array>
 
@@ -121,6 +122,24 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 		EXIT("%s failed: %s (%d)\n", operation, vk::to_string(result).c_str(),
 		     static_cast<int>(result));
 	}
+}
+
+void GraphicContext::QuerySampleLocations(bool extension_enabled) {
+	sample_locations_enabled = false;
+	sample_location_counts   = {};
+	if (!extension_enabled || physical_device == nullptr) {
+		return;
+	}
+	vk::PhysicalDeviceSampleLocationsPropertiesEXT properties {};
+	vk::PhysicalDeviceProperties2                  properties2 {};
+	properties2.pNext = &properties;
+	physical_device.getProperties2(&properties2);
+	sample_location_range          = {properties.sampleLocationCoordinateRange[0],
+	                                  properties.sampleLocationCoordinateRange[1]};
+	sample_location_sub_pixel_bits = properties.sampleLocationSubPixelBits;
+	// Every supported count takes at least a 1x1 grid, the only one the planner emits.
+	sample_location_counts   = properties.sampleLocationSampleCounts;
+	sample_locations_enabled = static_cast<bool>(sample_location_counts);
 }
 
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {

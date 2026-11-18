@@ -5,11 +5,13 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/eqaaPlan.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <atomic>
 #include <compare>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -20,6 +22,7 @@ namespace Libs::Graphics {
 
 class Buffer;
 class CommandScheduler;
+class Image;
 class TileManager;
 struct ImageTestAccess;
 
@@ -35,6 +38,26 @@ struct ImageUsage {
 	bool video_out     = false;
 };
 
+// A host-only multisampled render proxy of one view of an image: of a single-sample image, or
+// of a depth image that stores every sample of a full-depth plan.
+struct EqaaShadow {
+	std::unique_ptr<Image>            image;
+	HostSamplePattern                 pattern;
+	const vk::SampleLocationsInfoEXT* locations     = nullptr;
+	uint32_t                          mip           = 0;
+	uint32_t                          base_layer    = 0;
+	uint32_t                          layers        = 1;
+	uint16_t                          anchor_select = 0;
+	// Aspects whose newest content is only in the shadow's anchor samples.
+	vk::ImageAspectFlags dirty;
+	// Aspects in which every host sample holds the same value.
+	vk::ImageAspectFlags samples_equal;
+	// The owner's content stamp at which every clean aspect matched it.
+	uint64_t synced    = UINT64_MAX;
+	uint64_t last_tick = 0;
+	uint64_t bytes     = 0;
+};
+
 struct ImageBinding {
 	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
 	vk::AccessFlags2 attachment_access;
@@ -47,10 +70,13 @@ struct ImageBinding {
 
 class Image final {
 public:
-	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
+	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info,
+	      vk::ImageCreateFlags extra_flags = {});
 	~Image();
 	KYTY_CLASS_NO_COPY(Image);
 
+	// A depth- or stencil-compatible view format selects that plane of a depth image.
+	[[nodiscard]] ImageViewInfo NormalizeView(const ImageViewInfo& view_info) const;
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
@@ -114,7 +140,8 @@ public:
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
-		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
+		return (backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024)) +
+		       (eqaa != nullptr ? eqaa->bytes : 0);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
@@ -139,6 +166,11 @@ public:
 	static inline std::vector<HeapChange> heap_changes;
 	static inline std::atomic<uint64_t>   serials {0};
 
+	// Whether an image of `info` with these extra flags can be created with `required` usage.
+	[[nodiscard]] static bool Creatable(GraphicContext& graphics, const ImageInfo& info,
+	                                    vk::ImageCreateFlags extra_flags,
+	                                    vk::ImageUsageFlags  required);
+
 	// Unique per image, unlike ImageId: freed slots are reused.
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
 	ImageInfo        info;
@@ -154,10 +186,24 @@ public:
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
+	// The color image of a depth image's guest bytes or of a stencil plane's, or the reverse:
+	// both stay cached while the guest uses the bytes both ways.
+	ImageId twin {};
+	// The twin's content stamp when this image last held the same contents.
+	uint64_t         twin_stamp         = 0;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
+	// A clean BC alias of its bytes is cached beside it, until either takes GPU writes.
+	bool bc_alias_cached = false;
+	// Advances whenever a barrier hands the backing to a writer.
+	uint64_t                    content_stamp = 0;
+	std::unique_ptr<EqaaShadow> eqaa;
+	// Set while the shadow writes its anchors back; any other transition of a dirty owner exits.
+	bool eqaa_settling = false;
+	// Custom sample locations that layout transitions of this depth image must preserve.
+	const vk::SampleLocationsInfoEXT* barrier_sample_locations = nullptr;
 
 private:
 	friend struct ImageTestAccess;

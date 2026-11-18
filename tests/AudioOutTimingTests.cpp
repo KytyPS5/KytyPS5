@@ -36,6 +36,7 @@ bool                                 pad_connected = false, pad_bluetooth = fals
 uint64_t                             pad_queue_us = 0;
 const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+int                                  put_count = 0;
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -89,6 +90,7 @@ bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 	if (fail_put) {
 		return false;
 	}
+	put_count++;
 	auto& state = GetStream(stream);
 	const auto* pcm = static_cast<const uint8_t*>(data);
 	state.pcm.assign(pcm, pcm + bytes);
@@ -183,6 +185,7 @@ struct Fixture {
 		now        = 1000000;
 		processing = oversleep = 0;
 		clears                 = 0;
+		put_count              = 0;
 		fail_open = fail_put = stalled = false;
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
@@ -454,6 +457,165 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+// Pushes 480-frame (10 ms) cushioned grains every `interval` us; returns the final queue in frames.
+uint64_t RunCushionedStream(Fixture& f, Audio::Id port, uint32_t grains, uint64_t interval, float level) {
+	std::fill(f.pcm.begin(), f.pcm.end(), level);
+	Audio::OutputParam output {port, f.pcm.data()};
+	for (uint32_t i = 0; i < grains; i++) {
+		f.audio.AudioOutOutputs(&output, 1, false, true);
+		now += interval;
+	}
+	Drain(*streams.back());
+	return streams.back()->frames / 1000000;
+}
+
+void TestCushionLatencyStaysOnTarget() {
+	{
+		// A producer 0.15% fast must not build up delay.
+		Fixture    f;
+		const auto port   = f.Open(480);
+		const auto queued = RunCushionedStream(f, port, 6000, 9985, 0.25f);
+		Check(queued >= 480 && queued <= 5 * 480, "a slightly fast producer accumulated latency");
+		f.audio.AudioOutClose(port);
+	}
+	{
+		// A burst of 8 late grains on top of the cushion drains back near the target.
+		Fixture    f;
+		const auto port = f.Open(480);
+		RunCushionedStream(f, port, 100, 10000, 0.0f);
+		RunCushionedStream(f, port, 8, 0, 0.0f);
+		const auto silent = RunCushionedStream(f, port, 300, 10000, 0.0f);
+		Check(silent <= 5 * 480, "silent excess latency was not dropped");
+		const auto puts_before = put_count;
+		RunCushionedStream(f, port, 8, 0, 0.25f);
+		const auto loud = RunCushionedStream(f, port, 6000, 10000, 0.25f);
+		Check(loud >= 480 && loud <= 5 * 480, "audible excess latency was not trimmed");
+		Check(put_count - puts_before == 6008, "an audible grain was dropped");
+		f.audio.AudioOutClose(port);
+	}
+	{
+		// A queue that fell below its target is left alone, whatever the last window measured.
+		Fixture    f;
+		const auto port = f.Open(480);
+		RunCushionedStream(f, port, 100, 10000, 0.25f);
+		RunCushionedStream(f, port, 4, 0, 0.25f);
+		RunCushionedStream(f, port, 80, 10000, 0.25f);
+		Check(streams.back()->pcm.size() == 479 * 2 * sizeof(float), "the excess was not being trimmed");
+		now += 45000;
+		RunCushionedStream(f, port, 1, 0, 0.25f);
+		Check(streams.back()->pcm.size() == 480 * 2 * sizeof(float),
+		      "a grain was shortened while the queue was below its target");
+		f.audio.AudioOutClose(port);
+	}
+	{
+		// A new cushion is not trimmed for the latency of the queue before it.
+		Fixture    f;
+		const auto port = f.Open(480);
+		RunCushionedStream(f, port, 100, 10000, 0.25f);
+		RunCushionedStream(f, port, 8, 0, 0.25f);
+		RunCushionedStream(f, port, 80, 10000, 0.25f);
+		Check(streams.back()->pcm.size() == 479 * 2 * sizeof(float), "the excess was not being trimmed");
+		now += 1000000;
+		for (int i = 0; i < 3; i++) {
+			RunCushionedStream(f, port, 1, 0, 0.25f);
+			Check(streams.back()->pcm.size() == 480 * 2 * sizeof(float),
+			      "a new cushion was trimmed by the window before it");
+		}
+		f.audio.AudioOutClose(port);
+	}
+	for (const float level: {0.0f, 0.25f}) {
+		// A caller that delivers two grains every 20 ms keeps its cushion: the trim follows the
+		// low point of the queue and stops there.
+		Fixture            f;
+		const auto         port = f.Open(480);
+		Audio::OutputParam output {port, f.pcm.data()};
+		std::fill(f.pcm.begin(), f.pcm.end(), level);
+		const auto pairs = [&](int count) {
+			for (int i = 0; i < count; i++) {
+				f.audio.AudioOutOutputs(&output, 1, false, true);
+				f.audio.AudioOutOutputs(&output, 1, false, true);
+				now += 20000;
+			}
+			Drain(*streams.back());
+			return streams.back()->frames / 1000000;
+		};
+		Check(pairs(100) == 3 * 480, "a caller in pairs did not keep its cushion");
+		RunCushionedStream(f, port, 3, 0, level);
+		const auto low = pairs(3000);
+		Check(low >= 3 * 480 - 8 && low <= 3 * 480, "the trim did not stop at the low point of the queue");
+		f.audio.AudioOutClose(port);
+	}
+	{
+		// The trim shortens a grain by at most 0.4% and keeps its end samples.
+		Fixture    f;
+		const auto port = f.Open(512);
+		RunCushionedStream(f, port, 100, 10667, 0.25f);
+		RunCushionedStream(f, port, 6, 0, 0.25f);
+		for (size_t i = 0; i < f.pcm.size(); i++) {
+			f.pcm[i] = static_cast<float>(i / 2) / 1024.0f;
+		}
+		Audio::OutputParam output {port, f.pcm.data()};
+		bool               trimmed = false;
+		for (int i = 0; i < 200 && !trimmed; i++) {
+			f.audio.AudioOutOutputs(&output, 1, false, true);
+			now += 10667;
+			const auto& pcm = streams.back()->pcm;
+			if (pcm.size() == 510 * 2 * sizeof(float)) {
+				float first = 0.0f;
+				float last  = 0.0f;
+				std::memcpy(&first, pcm.data(), sizeof(first));
+				std::memcpy(&last, pcm.data() + pcm.size() - sizeof(last), sizeof(last));
+				Check(first == 0.0f && last == 511.0f / 1024.0f, "trimmed grain lost its end samples");
+				trimmed = true;
+			} else {
+				Check(pcm.size() == 512 * 2 * sizeof(float), "grain trimmed by more than 0.4%");
+			}
+		}
+		Check(trimmed, "excess audible latency was never trimmed");
+		f.audio.AudioOutClose(port);
+	}
+}
+
+void TestAsyncJitterCushion() {
+	Fixture            f;
+	const auto         port = f.Open();
+	Audio::OutputParam output {port, f.pcm.data()};
+	Common::DebugCounters::SetEnabled(true);
+	const auto underruns = []() {
+		return Common::DebugCounters::Get(Common::DebugCounters::Counter::AudioUnderruns);
+	};
+	const auto underruns_before = underruns();
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {8 * 256} * 1000000,
+	      "starved asynchronous stream was not given a 40 ms cushion");
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {9 * 256} * 1000000,
+	      "a fed asynchronous stream received another cushion");
+	now += 1000000;
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {8 * 256} * 1000000,
+	      "an underrun asynchronous stream was not re-cushioned");
+	Check(underruns() == underruns_before + 1, "a cushioned stream's underrun was not counted once");
+	// More than four cushions queued is a backlog nothing will play in time.
+	for (int i = 0; i < 25; i++) {
+		f.audio.AudioOutOutputs(&output, 1, false, true);
+	}
+	Check(clears == 0, "a cushioned stream within four times its target was cleared");
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Check(clears == 1, "a cushioned stream far over its target was not cleared");
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {8 * 256} * 1000000,
+	      "a cleared asynchronous stream was not re-cushioned");
+	Check(underruns() == underruns_before + 1, "a cleared stream counted as an underrun");
+	Common::DebugCounters::SetEnabled(false);
+	f.audio.AudioOutOutputs(&output, 1, false, false);
+	Check(sleeps.empty(), "asynchronous output slept");
+	f.audio.AudioOutClose(port);
+}
 } // namespace
 
 int main() {
@@ -468,6 +630,8 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestAsyncJitterCushion();
+	TestCushionLatencyStaysOnTarget();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

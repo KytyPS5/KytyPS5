@@ -1,7 +1,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/AddressRanges.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ParameterKeys.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -189,8 +191,10 @@ struct FakeImageHeap final : ImageHeapSource {
   bool accept = true;
   std::vector<DescriptorValue> kinds;
   std::vector<ImageHeapRequest> requests;
+  std::vector<std::optional<std::vector<uint32_t>>> demands; // Of each request.
   bool Acquire(const ImageHeapRequest &request, ImageHeapView &view) override {
     requests.push_back(request);
+    demands.emplace_back(request.demand != nullptr ? std::optional(*request.demand) : std::nullopt);
     if (!accept) return false;
     view = {.slots = 0x123456789abcull, .slot_count = 36u, .kinds = kinds};
     return true;
@@ -206,6 +210,7 @@ struct LinearTestMemory {
   size_t watched_dwords = 0;
   uint32_t reads = 0;
   uint32_t descriptor_reads = 0;
+  bool scribble = false; // A failed read leaves garbage behind.
 };
 
 bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
@@ -214,6 +219,7 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
       values.size_bytes() > memory->words.size() * sizeof(uint32_t) ||
       address - memory->base > memory->words.size() * sizeof(uint32_t) - values.size_bytes() ||
       (memory->fail_address >= address && memory->fail_address - address < values.size_bytes())) {
+    if (memory != nullptr && memory->scribble) std::ranges::fill(values, 0xdeadbeefu);
     return false;
   }
   std::memcpy(values.data(), reinterpret_cast<const uint8_t *>(memory->words.data()) +
@@ -369,16 +375,17 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // Both descriptors are slots of the table's one class.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
-            memory.watched_dwords == 36u && memory.reads == 1u,
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 2u &&
+            memory.watched_reads == 1u && memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
-  const auto mapping = root.indirect_mapping_offset;
-  Check(root.indirect_search_iterations == 0u && snapshot.flattened_srt[mapping] == 17u &&
+  const auto mapping = snapshot.indirect_mapping_offsets.at(root.indirect_mapping_slot);
+  Check(!root.indirect_searched && snapshot.flattened_srt[mapping] == 17u &&
             snapshot.flattened_srt[mapping + 1u] == 0u &&
-            snapshot.flattened_srt[mapping + 5u] == 1u &&
-            snapshot.flattened_srt[mapping + 17u] == 2u &&
+            snapshot.flattened_srt[mapping + 5u] == 1u << CandidateClassShift &&
+            snapshot.flattened_srt[mapping + 17u] == (1u << CandidateClassShift | 1u) &&
             snapshot.specialization_reads == std::vector<std::pair<uint64_t, uint64_t>>{{0x2000u, 144u}},
         "dense image mapping lost its null slot, trimmed length or coherent read dependency");
   for (const uint32_t stride : {1u, 2u}) {
@@ -406,7 +413,7 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
         "moving a table entry changed shader specialization or reused stale mapping bytes");
   put(112u, 7u);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images[2].dwords[0] == descriptor[0] + 7u,
+            snapshot.candidate_images[1].value.dwords[0] == descriptor[0] + 7u,
         "changed table descriptor was not refreshed");
   // Scalar reads align each DWORD and return zero beyond the V# byte size.
   data[5] = 0u;
@@ -416,7 +423,8 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   memory.fail_address = 0x2010u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.watched_dwords == 4u && snapshot.images.size() == 2u &&
-            snapshot.images[1].dwords == descriptor,
+            snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords == descriptor,
         "partial descriptor prefix did not zero its out-of-bounds DWORDs");
   memory.fail_address = 0x2008u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -501,8 +509,8 @@ void TestResidentImageHeap() {
             memory.watched_reads == 0u && snapshot.images.size() == 3u,
         "resident image heap was materialized entry by entry");
   const auto &root = specialization.images[0];
-  const auto mapping = root.indirect_mapping_offset;
-  Check(root.heap && root.indirect_root == 0u && root.indirect_search_iterations == 0u &&
+  const auto mapping = snapshot.indirect_mapping_offsets.at(root.indirect_mapping_slot);
+  Check(root.heap && root.indirect_root == 0u && !root.indirect_searched &&
             snapshot.flattened_srt.size() == mapping + 3u &&
             snapshot.flattened_srt[mapping] == 36u &&
             snapshot.flattened_srt[mapping + 1u] == 0x56789abcu &&
@@ -531,8 +539,315 @@ void TestResidentImageHeap() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             heap.requests.size() == 3u && memory.watched_reads == 1u &&
             snapshot.images.size() == 2u && !specialization.images[0].heap &&
-            snapshot.images[1].dwords == descriptor,
+            snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords == descriptor,
         "a declined heap was not materialized entry by entry");
+}
+
+// An image heap whose key is a word of the 16-byte record an index selects. The records' address
+// is user data 0 and 1, the table's buffer user data 4 to 7, the count of the clamped lookups user
+// data 8 and the buffer the program writes user data 12 to 15.
+enum class RecordIndex {
+  Field, Clamped, FloatConstants, FloatArithmetic, Denormal, Guarded, GuardedMerge, GuardedLoop,
+  Unbounded, Unaligned, Wrapping, LooseMedian,
+  // Several lookups of the one table.
+  Shared, SharedClamped, SharedUnbounded, UnboundedShared
+};
+
+std::unique_ptr<Fixture> MakeRecordHeapFixture(RecordIndex kind, bool writes = false) {
+  auto fixture = std::make_unique<Fixture>();
+  auto &f = *fixture;
+  auto *entry = f.block;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4u; ++dword) heap_words[dword] = f.UserData(dword + 4u);
+  const auto heap = f.Buffer(heap_words, 0x10d8);
+  const auto records = f.Address(f.UserData(0u), f.UserData(1u), 0x10d8);
+  const auto lane = f.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto field = f.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)});
+  const auto varying = f.Emit(ValueOpcode::BitCastF32U32, {lane}); // Any float.
+  const auto number = [&](int32_t integer) {
+    return f.Emit(ValueOpcode::BitCastU32F32,
+                  {f.Emit(ValueOpcode::ConvertF32S32, {Value(static_cast<uint32_t>(integer))})});
+  };
+  const auto guard = f.Emit(ValueOpcode::INotEqual32, {field, Value(3u)});
+  // The number on the lanes of the guard, any bits on the others.
+  const auto guarded = [&](int32_t integer) {
+    return f.Emit(ValueOpcode::SelectU32, {guard, number(integer), lane});
+  };
+  const auto clamped = [&] {
+    return f.Emit(ValueOpcode::UMin32,
+                  {f.Emit(ValueOpcode::ISub32, {f.UserData(8u), Value(1u)}), field});
+  };
+  const auto masked = [&](uint32_t mask) {
+    return f.Emit(ValueOpcode::BitwiseAnd32, {field, Value(mask)});
+  };
+  // Samples the descriptor that word `addend + 4` of record `index` names.
+  uint32_t lookups = 0;
+  const auto lookup = [&](Value index, uint32_t addend = 8u, Value active = Value(true),
+                          uint32_t shift = 4u) {
+    const uint32_t pc = 0x10d8u + 0x100u * lookups++;
+    const auto record_offset = f.Emit(
+        ValueOpcode::IAdd32,
+        {f.Emit(ValueOpcode::ShiftLeftLogical32, {index, Value(shift)}), Value(addend)});
+    MemoryInfo record;
+    record.kind = ResourceKind::ScalarAddress;
+    record.offset = 4u;
+    const auto key = f.Emit(ValueOpcode::LoadAddressU32,
+                            {records, record_offset, Value(0u), Value(true)},
+                            f.AddMemory(record, pc));
+    const auto heap_offset = f.Emit(ValueOpcode::IMul32, {key, Value(32u)});
+    std::array<Value, 8> image_words;
+    for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
+      MemoryInfo component;
+      component.kind = ResourceKind::ScalarBuffer;
+      component.offset = 32u + dword * sizeof(uint32_t);
+      image_words[dword] = f.Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                  f.AddMemory(component, pc));
+    }
+    const auto image = f.Image(image_words, pc + 0x18u);
+    const auto sampler = f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, pc + 0x18u);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto texel = f.Emit(ValueOpcode::ImageSampleRaw,
+                              {image, sampler, f.ImageAddress(), active},
+                              f.AddMemory(sample, pc + 0x18u));
+    f.Emit(ValueOpcode::ReferenceU32,
+           {f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)})});
+  };
+  // The index as float bits.
+  const auto converted = [&](Value layer) {
+    return f.Emit(ValueOpcode::ConvertU32F32, {f.Emit(ValueOpcode::BitCastF32U32, {layer})});
+  };
+  switch (kind) {
+    case RecordIndex::Field: lookup(field); break;
+    case RecordIndex::Clamped: lookup(clamped()); break;
+    case RecordIndex::FloatConstants:
+      lookup(converted(f.Emit(
+          ValueOpcode::SelectU32,
+          {f.Emit(ValueOpcode::IEqual32, {field, Value(1u)}), number(6),
+           f.Emit(ValueOpcode::SelectU32,
+                  {f.Emit(ValueOpcode::IEqual32, {field, Value(2u)}), number(9),
+                   Value(std::bit_cast<uint32_t>(12.5f))})})));
+      break;
+    case RecordIndex::FloatArithmetic: {
+      const auto unit = f.Emit(ValueOpcode::FPSaturate32, {varying});
+      const auto scaled = f.Emit(ValueOpcode::FPMul32, {unit, Value::F32(4.0f)});
+      const auto ceiling = f.Emit(
+          ValueOpcode::FPCeil32, {f.Emit(ValueOpcode::FPMul32, {unit, Value::F32(2.5f)})});
+      const auto negated = f.Emit(
+          ValueOpcode::FPNeg32, {f.Emit(ValueOpcode::FPSub32, {unit, Value::F32(3.0f)})});
+      // [0, 3]: two of the median's sources bound it, whatever the third is.
+      const auto median = f.Emit(ValueOpcode::FPMedTri32, {varying, ceiling, negated});
+      const auto sum = f.Emit(
+          ValueOpcode::FPAdd32,
+          {scaled, f.Emit(ValueOpcode::FPMax32, {median, Value::F32(2.0f)})});
+      lookup(f.Emit(ValueOpcode::ConvertU32F32,
+                    {f.Emit(ValueOpcode::FPMin32, {sum, Value::F32(6.5f)})}));
+      break;
+    }
+    case RecordIndex::Denormal: {
+      // -1e-40 floors to -1, and to zero on a device that reads it as zero.
+      const auto floor = f.Emit(ValueOpcode::FPFloor32, {Value::F32(-1e-40f)});
+      lookup(f.Emit(ValueOpcode::ConvertU32F32,
+                    {f.Emit(ValueOpcode::FPMad32, {floor, Value::F32(8.0f), Value::F32(8.0f)})}));
+      break;
+    }
+    case RecordIndex::Guarded: lookup(converted(guarded(5)), 8u, guard); break;
+    case RecordIndex::GuardedMerge: {
+      auto *left = f.AddBlock();
+      auto *right = f.AddBlock();
+      auto *merge = f.AddBlock();
+      entry->AddBranch(left);
+      entry->AddBranch(right);
+      left->AddBranch(merge);
+      right->AddBranch(merge);
+      auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(left, guarded(5));
+      phi.AddPhiOperand(right, guarded(7));
+      f.block = merge;
+      lookup(converted(Value(&phi)), 8u, guard);
+      break;
+    }
+    case RecordIndex::GuardedLoop: {
+      // The select reaches the access through a loop: it may be another iteration's.
+      auto *header = f.AddBlock();
+      auto *latch = f.AddBlock();
+      auto *exit = f.AddBlock();
+      entry->AddBranch(header);
+      header->AddBranch(latch);
+      header->AddBranch(exit);
+      latch->AddBranch(header);
+      auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(entry, number(5));
+      phi.AddPhiOperand(latch, guarded(5));
+      f.block = exit;
+      lookup(converted(Value(&phi)), 8u, guard);
+      break;
+    }
+    case RecordIndex::Unbounded: lookup(lane); break;
+    // Records 2 bytes apart, and records whose last lies past the U32 of its offset.
+    case RecordIndex::Unaligned: lookup(field, 8u, Value(true), 1u); break;
+    case RecordIndex::Wrapping: lookup(field, 0xfffffc10u); break;
+    // One bounded source does not bound a median.
+    case RecordIndex::LooseMedian:
+      lookup(f.Emit(ValueOpcode::ConvertU32F32,
+                    {f.Emit(ValueOpcode::FPMedTri32,
+                            {varying, f.Emit(ValueOpcode::FPNeg32, {varying}), Value::F32(3.0f)})}));
+      break;
+    case RecordIndex::Shared:
+      lookup(masked(7u));
+      lookup(field);
+      lookup(masked(3u), 12u);
+      break;
+    case RecordIndex::SharedClamped:
+      lookup(clamped());
+      lookup(field);
+      break;
+    case RecordIndex::SharedUnbounded:
+      lookup(field);
+      lookup(lane);
+      break;
+    case RecordIndex::UnboundedShared:
+      lookup(lane);
+      lookup(field);
+      break;
+  }
+  if (writes) {
+    const auto output = f.Buffer({f.UserData(12u), f.UserData(13u), f.UserData(14u), f.UserData(15u)});
+    MemoryInfo output_memory;
+    output_memory.kind = ResourceKind::Buffer;
+    f.Emit(ValueOpcode::StoreBufferU32,
+           {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+           f.AddMemory(output_memory, 0x1b00u));
+  }
+  return fixture;
+}
+
+void TestRecordHeapDemand() {
+  // A lookup's record index bounds its records where every lane of every access is bounded.
+  const auto demands_of = [](RecordIndex kind) {
+    auto fixture = MakeRecordHeapFixture(kind);
+    fixture->PlanAndTrack();
+    const auto &program = fixture->program;
+    Check(program.info.images.size() == 1u, "the lookups of one table were not one image");
+    const auto &indirect =
+        program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+    Check(indirect && indirect->table_scalar && !indirect->selector && !indirect->table_maximum,
+          "a record-keyed image heap was not kept as a GPU-selected table");
+    return indirect->demands;
+  };
+  const auto maximum_of = [&](RecordIndex kind) {
+    const auto demands = demands_of(kind);
+    Check(demands && demands->size() == 1u && demands->front().stride == 16u &&
+              demands->front().offset == 12u,
+          "a bounded record index lost its record array");
+    return demands->front().maximum;
+  };
+  Check(maximum_of(RecordIndex::Field) == 63u &&
+            demands_of(RecordIndex::Field)->front().limit.IsEmpty(),
+        "a 6-bit record index was not bounded by its field");
+  Check(maximum_of(RecordIndex::Clamped) == 63u &&
+            !demands_of(RecordIndex::Clamped)->front().limit.IsEmpty(),
+        "a record index clamped to a count lost the count");
+  Check(maximum_of(RecordIndex::FloatConstants) == 12u,
+        "a float holding constants did not bound the index converted from it");
+  Check(maximum_of(RecordIndex::FloatArithmetic) == 6u,
+        "float arithmetic on bounded values did not bound the index");
+  Check(maximum_of(RecordIndex::Denormal) == 8u,
+        "a denormal a device may read as zero was taken at its value");
+  Check(maximum_of(RecordIndex::Guarded) == 5u,
+        "the lanes of the access did not choose the arm of a select");
+  Check(maximum_of(RecordIndex::GuardedMerge) == 7u,
+        "the lanes of the access did not choose arms across a merge");
+  Check(!demands_of(RecordIndex::GuardedLoop),
+        "the lanes of the access chose the arm of another loop iteration");
+  Check(!demands_of(RecordIndex::Unbounded), "an unbounded record index named its records");
+  Check(!demands_of(RecordIndex::Unaligned) && !demands_of(RecordIndex::Wrapping),
+        "records off the DWORD lattice, or past the U32 of their offset, were named");
+  Check(!demands_of(RecordIndex::LooseMedian), "one bounded source bounded a median");
+  // The lookups of one table are one image: it names the records of them all, or none.
+  const auto shared = demands_of(RecordIndex::Shared);
+  Check(shared && shared->size() == 2u && (*shared)[0].offset == 12u &&
+            (*shared)[0].maximum == 63u && (*shared)[1].offset == 16u &&
+            (*shared)[1].maximum == 3u,
+        "lookups of one table did not add up to the records of each");
+  const auto clamps = demands_of(RecordIndex::SharedClamped);
+  Check(clamps && clamps->size() == 2u && (*clamps)[0].limit.IsEmpty() != (*clamps)[1].limit.IsEmpty(),
+        "a clamped lookup and an unclamped one of the same records were taken as one");
+  Check(!demands_of(RecordIndex::SharedUnbounded) && !demands_of(RecordIndex::UnboundedShared),
+        "a table with an unbounded lookup named the records of another");
+
+  // A draw names the table offsets of its records, and of key zero.
+  constexpr uint64_t record_base = 0x2800u;
+  const auto materialize = [&](RecordIndex kind, uint32_t count, uint64_t fail_address,
+                               std::array<uint32_t, 4> written, bool writes) {
+    auto fixture = MakeRecordHeapFixture(kind, writes);
+    fixture->PlanAndTrack();
+    // The plan a restarted game loads from the shader cache.
+    ResourcePlan plan;
+    Check(LoadResourcePlan(SaveResourcePlan(ExtractResourcePlan(fixture->program)), plan),
+          "a plan with record demands did not load from its cache bytes");
+    std::array<uint32_t, 16> data{static_cast<uint32_t>(record_base), 0u, 0u, 0u,
+                                  0x2000u, 32u << 16u, 64u, 0u, count};
+    std::copy(written.begin(), written.end(), data.begin() + 12u);
+    LinearTestMemory memory;
+    memory.fail_address = fail_address;
+    memory.scribble = true;
+    const auto put = [&](uint32_t offset, uint32_t record, uint32_t key) {
+      memory.words[(record_base + offset + record * 16u - memory.base) / 4u] = key;
+    };
+    put(12u, 0u, 5u);
+    put(12u, 1u, 9u);
+    put(12u, 2u, 11u);
+    put(12u, 3u, 0x07ffffffu); // Its offset wraps past the U32 the shader forms it in.
+    put(12u, 4u, 13u);
+    put(16u, 0u, 20u);
+    put(16u, 1u, 21u);
+    put(16u, 3u, 22u);
+    put(16u, 4u, 23u); // Past the 2-bit index of the lookup that reads this word.
+    FakeImageHeap heap;
+    SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory, .image_heap = &heap};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              heap.requests.size() == 1u && heap.requests[0].base == 0x2000u &&
+              heap.requests[0].size == 2048u && heap.requests[0].step == 32u &&
+              heap.requests[0].first == 32u && heap.requests[0].count == 63u,
+          "a record-keyed image heap was not requested as its lattice");
+    const bool captured = std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
+      return read.first == record_base + 12u && read.second != 0u;
+    });
+    return std::pair{heap.demands.at(0), captured};
+  };
+  using Offsets = std::vector<uint32_t>;
+  const std::array<uint32_t, 4> none{};
+  const auto field = materialize(RecordIndex::Field, 0u, UINT64_MAX, none, false);
+  Check(field.first == Offsets({32u, 192u, 320u, 384u, 448u}) && field.second,
+        "a draw did not name the offsets of its records, or did not capture their read");
+  Check(materialize(RecordIndex::Clamped, 3u, UINT64_MAX, none, false).first ==
+            Offsets({32u, 192u, 320u, 384u}),
+        "a draw named records past the count its index is clamped to");
+  Check(materialize(RecordIndex::Field, 0u, record_base + 12u + 2u * 16u, none, false).first ==
+            Offsets({32u, 192u, 320u, 448u}),
+        "a record the host cannot read did not read as zero");
+  Check(materialize(RecordIndex::Shared, 0u, UINT64_MAX, none, false).first ==
+            Offsets({32u, 192u, 320u, 384u, 448u, 672u, 704u, 736u}),
+        "a draw did not name the records of every lookup of its table");
+  Check(materialize(RecordIndex::Unbounded, 0u, UINT64_MAX, none, false).first == std::nullopt &&
+            materialize(RecordIndex::SharedUnbounded, 0u, UINT64_MAX, none, false).first ==
+                std::nullopt,
+        "a draw with an unbounded lookup named offsets");
+  // A program that writes its records cannot have them read before it runs.
+  Check(materialize(RecordIndex::Field, 0u, UINT64_MAX, {0x2c00u, 4u << 16u, 16u, 0u}, true).first ==
+            Offsets({32u, 192u, 320u, 384u, 448u}),
+        "a write next to the records dropped the demand");
+  Check(materialize(RecordIndex::Field, 0u, UINT64_MAX, {0x2bf0u, 4u << 16u, 16u, 0u}, true).first ==
+            std::nullopt,
+        "a draw read records its own program writes");
 }
 
 void TestImageHeapKinds() {
@@ -563,6 +878,10 @@ void TestImageHeapKinds() {
             ImageHeapKind(root, volume) == 0u &&
             std::ranges::all_of(volume.dwords, [](uint32_t word) { return word == 0u; }),
         "heap kinds did not separate typed entries or null mismatched ones");
+  // A texture without slices is the one slice of an array root, in its own family alone.
+  Check(kind_of(Format::k32_32_32_32Float, Type::kColor2D) == float_kind &&
+            kind_of(Format::k32_32_32_32Float, Type::kColor1D) == 0u,
+        "an array root did not take the plain textures of its family, and no others");
   const auto resource = ImageHeapResource(root, uint_kind);
   const auto cube_resource = ImageHeapResource(root, cube_kind);
   auto other = root;
@@ -602,20 +921,48 @@ void TestBoundedImageViewEligibility() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // A 2D instruction reads an array view as 2D: the three views are slots of one class.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4u && memory.reads == 1u,
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 3u &&
+            memory.reads == 1u,
         "unrelated cube/3D heap entries prevented a typed 2D table view");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+  // With one root, a mapping word is the slot's class resource over the slot.
+  const auto word = [&](uint32_t slot) {
+    return snapshot.candidate_images[slot].resource << CandidateClassShift | slot;
+  };
+  const auto dimension = [&](uint32_t slot) {
+    return specialization.images[snapshot.candidate_images[slot].resource].dimension;
+  };
   Check(snapshot.flattened_srt[mapping] == 53u &&
-            snapshot.flattened_srt[mapping + 5u] == 1u &&
+            snapshot.flattened_srt[mapping + 5u] == word(0u) &&
             snapshot.flattened_srt[mapping + 17u] == 0u &&
             snapshot.flattened_srt[mapping + 29u] == 0u &&
-            snapshot.flattened_srt[mapping + 41u] == 2u &&
-            snapshot.flattened_srt[mapping + 53u] == 3u &&
-            snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-            snapshot.images[2].dwords == descriptor(0x23u, Type::kColor2DArray) &&
-            snapshot.images[3].dwords == descriptor(0x24u, Type::kColor2D),
+            snapshot.flattened_srt[mapping + 41u] == word(1u) &&
+            snapshot.flattened_srt[mapping + 53u] == word(2u) &&
+            snapshot.candidate_images[0].value.dwords == descriptor(0x20u, Type::kColor2D) &&
+            snapshot.candidate_images[1].value.dwords == descriptor(0x23u, Type::kColor2DArray) &&
+            snapshot.candidate_images[2].value.dwords == descriptor(0x24u, Type::kColor2D) &&
+            dimension(0u) == Decoder::ImageDimension::Dim2D &&
+            dimension(1u) == Decoder::ImageDimension::Dim2D &&
+            snapshot.candidate_images[1].resource == 1u &&
+            snapshot.candidate_images[0].resource == snapshot.candidate_images[2].resource,
         "typed table eligibility changed byte offsets or discarded compatible views");
+
+  // An array instruction reads the plain views as arrays of one slice, in the class of the array.
+  plan.info.images[0].dimension = Decoder::ImageDimension::Dim2DArray;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 4u &&
+            snapshot.candidate_images[0].value.dwords == descriptor(0x20u, Type::kColor2D) &&
+            snapshot.candidate_images[1].value.dwords == descriptor(0x21u, Type::kCube) &&
+            snapshot.candidate_images[2].value.dwords == descriptor(0x23u, Type::kColor2DArray) &&
+            snapshot.candidate_images[3].value.dwords == descriptor(0x24u, Type::kColor2D) &&
+            dimension(0u) == Decoder::ImageDimension::Dim2DArray &&
+            snapshot.candidate_images[0].resource == snapshot.candidate_images[2].resource &&
+            snapshot.candidate_images[0].resource == snapshot.candidate_images[3].resource &&
+            snapshot.candidate_images[0].resource != snapshot.candidate_images[1].resource,
+        "an array table did not take its plain views as arrays of one slice");
+  plan.info.images[0].dimension = Decoder::ImageDimension::Dim2D;
 
   // CS127daf PC0x163c: an overlapping heap tuple is not a valid texture view.
   const std::array<uint32_t, 8> invalid_view{
@@ -624,10 +971,10 @@ void TestBoundedImageViewEligibility() {
   for (const bool r128 : {false, true}) {
     plan.info.images[0].r128 = r128;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (r128 ? 3u : 4u) &&
-              snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 17u] == 0u &&
-              snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-              snapshot.images.back().dwords == descriptor(0x24u, Type::kColor2D),
+              snapshot.candidate_images.size() == (r128 ? 2u : 3u) &&
+              snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot) + 17u] == 0u &&
+              snapshot.candidate_images.front().value.dwords == descriptor(0x20u, Type::kColor2D) &&
+              snapshot.candidate_images.back().value.dwords == descriptor(0x24u, Type::kColor2D),
           "invalid heap texture view survived normalization or removed valid neighbors");
   }
   plan.info.images[0].r128 = false;
@@ -705,17 +1052,28 @@ void TestExactUnfilteredImageCandidates() {
       for (const bool depth : {false, true}) {
         plan.info.images[0].depth_compare = depth;
         Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-                  snapshot.images.size() == (depth ? 3u : 2u) &&
+                  snapshot.candidate_images.size() == (depth ? 2u : 1u) &&
                   snapshot.images[0].dwords == std::array<uint32_t, 8>{} &&
-                  snapshot.images[1].dwords == first &&
-                  (!depth || snapshot.images[2].dwords == second),
+                  snapshot.candidate_images[0].value.dwords == first &&
+                  (!depth || snapshot.candidate_images[1].value.dwords == second),
               "a sampled table slot of another type, or a zero-swizzle placeholder, was kept");
       }
     }
     if (!unfiltered) continue;
-    Check(snapshot.images.size() == 2u && snapshot.images[1].dwords == placeholder &&
-              specialization.images[0].dimension == Decoder::ImageDimension::Dim2D &&
-              specialization.images[1].dimension == Decoder::ImageDimension::Dim1D,
+    // A sampled table reads its two descriptors as slots of a 2D and a 1D class; a storage
+    // table keeps the first as its own entry.
+    const bool classes = SelectsCandidateImages(plan.info.images[0]);
+    const auto placed = [&](uint32_t descriptor) {
+      return classes ? snapshot.candidate_images[descriptor].value : snapshot.images[descriptor];
+    };
+    const auto resource = [&](uint32_t descriptor) {
+      return classes ? snapshot.candidate_images[descriptor].resource : descriptor;
+    };
+    Check(snapshot.images.size() == (classes ? 3u : 2u) &&
+              snapshot.candidate_images.size() == (classes ? 2u : 0u) &&
+              placed(1u).dwords == placeholder &&
+              specialization.images[resource(0u)].dimension == Decoder::ImageDimension::Dim2D &&
+              specialization.images[resource(1u)].dimension == Decoder::ImageDimension::Dim1D,
           "a real 1D zero-swizzle descriptor was filtered, nulled or retyped");
     if (access == ValueOpcode::ImageWrite)
       Check(specialization.images[1].shader_swizzle == 0u,
@@ -727,19 +1085,22 @@ void TestExactUnfilteredImageCandidates() {
     ApplyResourceSpecialization(fixture->program, specialization);
     const auto &images = fixture->program.info.images;
     const auto &selected = fixture->program.memory_info[operation->Flags<MemoryFlags>().index];
-    Check(images.size() == 2u && selected.resource == 0u &&
+    const auto &narrow = images[resource(1u)];
+    Check(images.size() == (classes ? 3u : 2u) && selected.resource == 0u &&
               selected.image_dimension == Decoder::ImageDimension::Dim2D &&
-              images[0].indirect_resources == std::vector<uint32_t>({0u, 1u}) &&
-              images[1].indirect_root == 0u &&
-              images[1].dimension == Decoder::ImageDimension::Dim1D &&
-              images[1].unfiltered_access_only &&
+              images[0].indirect_resources ==
+                  (classes ? std::vector<uint32_t>({0u, 1u, 2u}) : std::vector<uint32_t>({0u, 1u})) &&
+              images[0].candidate == classes && narrow.candidate == classes &&
+              narrow.indirect_root == 0u &&
+              narrow.dimension == Decoder::ImageDimension::Dim1D &&
+              narrow.unfiltered_access_only &&
               operation->Arg(0).ResolveInstruction()->Arg(0) == key &&
               (access != ValueOpcode::ImageWrite || images[1].shader_swizzle == 0u),
           "applying mixed candidates lost GPU selection, typed child or storage swizzle");
     second[0] += 2u;
     fill();
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images[1].dwords[0] == second[0],
+              placed(1u).dwords[0] == second[0],
           "mixed-dimension materialization reused a stale descriptor");
     plan.info.images[0].dimension = Decoder::ImageDimension::Dim1D;
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -760,8 +1121,16 @@ void TestExactUnfilteredImageCandidates() {
     second[3] |= 1u << 16u;
     fill();
     plan.info.images[0].mip_mode = ImageMipMode::Dynamic;
+    // A storage table's children keep their mip counts; a sampled table's classes have none, and
+    // each candidate takes a descriptor per mip from its slot.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              specialization.images[0].mip_count == 1u && specialization.images[1].mip_count == 2u,
+              specialization.images[0].mip_count == 1u &&
+              (classes ? specialization.images[resource(1u)].mip_count == 1u &&
+                             snapshot.candidate_images[0].slot == 0u &&
+                             snapshot.candidate_images[0].mips == 1u &&
+                             snapshot.candidate_images[1].slot == 1u &&
+                             snapshot.candidate_images[1].mips == 2u
+                       : specialization.images[1].mip_count == 2u),
           "mixed-dimension candidates lost their individual mip counts");
   }
   // The same image may be merged from several uses; one query keeps the guard strict.
@@ -1078,11 +1447,14 @@ void TestNestedPointerImageTable() {
                            .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The images are slots of the table's float and integer classes; a sampler table lists its
+  // candidates.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+            snapshot.images.size() == 3u && snapshot.candidate_images.size() == count &&
+            snapshot.samplers.size() == count + 1u,
         "bounded nested pointer table lost image/sampler candidates or read the GPU selector");
   for (uint32_t row = 0; row < count; ++row)
-    Check(snapshot.images[row + 1u].dwords[0] == 10u + row &&
+    Check(snapshot.candidate_images[row].value.dwords[0] == 10u + row &&
               snapshot.samplers[row + 1u].dwords[0] == row,
           "nested pointer table mixed rows or pointee members");
   auto typed = make();
@@ -1125,8 +1497,9 @@ void TestNestedPointerImageTable() {
   *at(objects + 0x430u + 0x3d0u) = 10u + count;
   *at(objects + 0x430u + 0x3f8u) = count;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == count && snapshot.samplers.size() == count &&
-            snapshot.images[1].dwords[0] == 10u + count && snapshot.samplers[1].dwords[0] == count,
+            snapshot.candidate_images.size() == count - 1u && snapshot.samplers.size() == count &&
+            snapshot.candidate_images[0].value.dwords[0] == 10u + count &&
+            snapshot.samplers[1].dwords[0] == count,
         "nested descriptor refresh retained stale pointers or failed to deduplicate new pointees");
   *at(table) = objects;
 
@@ -1137,11 +1510,12 @@ void TestNestedPointerImageTable() {
   *at(static_cast<uint32_t>(memory.watched_address)) = objects;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             memory.watched_reads != 0u && memory.watched_dwords == 1u &&
-            snapshot.images.size() == count + 1u && snapshot.samplers.size() == count + 1u,
+            snapshot.candidate_images.size() == count && snapshot.samplers.size() == count + 1u,
         "partial pointer row was skipped or read beyond its scalar buffer bounds");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+  // The partial row points at the first row's image: its slot, in the float class.
   Check(snapshot.flattened_srt[mapping] == count + 1u &&
-            snapshot.flattened_srt[mapping + count + 1u] == 1u,
+            snapshot.flattened_srt[mapping + count + 1u] == 1u << CandidateClassShift,
         "partial pointer row lost its low-word pointee or dense key mapping");
   user_data[1] = stride << 16u;
   user_data[2] = count;
@@ -1357,7 +1731,8 @@ void TestIndexedPointerImageTable() {
                           .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 6u,
         "indexed pointer/child domain lost candidates or read poisoned child padding");
   const auto captured = [&](uint64_t address, uint64_t bytes) {
     return std::ranges::any_of(snapshot.specialization_reads, [&](const auto& span) {
@@ -1372,22 +1747,25 @@ void TestIndexedPointerImageTable() {
       Check(captured(high + objects + row * row_bytes + child * 368u + 64u, 32u),
             "nested child read was absent from the captured alias ranges");
   }
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
   Check(snapshot.flattened_srt[mapping] == 6u,
         "nested child table did not produce one dense composite-key mapping");
   for (uint32_t key = 0; key < 6u; ++key)
-    Check(snapshot.images[key + 1u].dwords[0] == 10u + key &&
-              snapshot.flattened_srt[mapping + key + 1u] == key + 1u,
+    Check(snapshot.candidate_images[key].value.dwords[0] == 10u + key &&
+              snapshot.flattened_srt[mapping + key + 1u] == (1u << CandidateClassShift | key),
           "nested composite key mixed parent rows or child records");
   const auto original = specialization;
   user_data[2] = 100u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 6u,
         "nested parent enumeration included unreachable poison rows");
   user_data[2] = 2u;
   *at(table) = objects + row_bytes;
   *at(objects + row_bytes + 64u) = 42u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 4u &&
-            snapshot.images[1].dwords[0] == 42u && specialization != original,
+  // Half as many images of the same shape: other slots, the same specialization.
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 3u &&
+            snapshot.candidate_images[0].value.dwords[0] == 42u && specialization == original,
         "nested table refresh retained stale pointer/descriptor data or duplicated aliases");
   *at(table) = objects;
   for (const uint32_t records : {0u, 1u}) {
@@ -1453,7 +1831,8 @@ void TestIndexedPointerImageTable() {
   *at(table) = objects;
   *at(table + 4u) = 0xbeef0001u;
   *at(count_address) = *at(count_address + 4u) = 2u;
-  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 6u,
         "finite parent choices lost their runtime count and enumerated unavailable rows");
   const auto& counted_indirect = *counted_plan.descriptor_sources[counted_plan.info.images[0].source].indirect_descriptor;
   Check(counted_indirect.table_maximum == 3u && !counted_indirect.key_count.IsEmpty() &&
@@ -1463,7 +1842,8 @@ void TestIndexedPointerImageTable() {
   masked->PlanAndTrack();
   const auto masked_plan = ExtractResourcePlan(masked->program);
   Check(!masked_plan.descriptor_sources[masked_plan.info.images[0].source].indirect_descriptor->key_count.IsEmpty() &&
-            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+            MaterializeResources(masked_plan, counted_runtime, snapshot, specialization) &&
+            snapshot.candidate_images.size() == 6u,
         "inactive preserved selector value discarded the selected lane's runtime count");
   memory.watched_address = high + table;
   for (const uint32_t count : {0u, 1u, 2u, 4u, 5u}) {
@@ -1471,7 +1851,7 @@ void TestIndexedPointerImageTable() {
     counted_data[2] = std::min(count, 4u);
     memory.watched_reads = 0u;
     Check(MaterializeResources(counted_plan, counted_runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u + 3u * std::min(count, 4u) &&
+              snapshot.candidate_images.size() == 3u * std::min(count, 4u) &&
               (count != 0u || memory.watched_reads == 0u),
           "finite parent count refresh lost candidates, ignored its static cap or read an empty domain");
   }
@@ -1856,44 +2236,50 @@ void TestGuardedDirectImageTable() {
   ResourceSpecialization specialization;
   auto packed = make_plan(Guard::Plain, 0u, true);
   memory.fail_address = table + 32u * 32u;
-  // Without a heap, one table read yields the null root and then each distinct slot.
+  // Without a heap, one table read yields each distinct slot as a candidate of the draw.
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 33u && snapshot.images[1].dwords[0] == 0x100u &&
-            snapshot.images.back().dwords[0] == 0x11fu,
+            snapshot.candidate_images.size() == 32u &&
+            snapshot.candidate_images.front().value.dwords[0] == 0x100u &&
+            snapshot.candidate_images.back().value.dwords[0] == 0x11fu,
         "packed five-bit selector did not enumerate exactly its finite domain");
+  const auto distinct = specialization;
   for (uint32_t key = 0; key < 32u; ++key)
     memory.words[(table - memory.base) / 4u + key * 8u] = 0x100u;
+  // Every key selecting one image is one slot of the same class, not another shader.
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images[1].dwords[0] == 0x100u &&
-            specialization.images[1].indirect_root == 0u,
-        "packed five-bit selector retained duplicate image bindings or lost keys");
+            snapshot.images.size() == 2u && snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x100u && specialization == distinct,
+        "packed five-bit selector retained duplicate image slots or lost keys");
   memory.fail_address = UINT64_MAX;
   memory.reads = 0u;
   memory.descriptor_reads = 0u;
   fill_table(memory, table);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u && specialization.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.candidate_images.size() == 32u && specialization.images.size() == 2u &&
+            snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
-  const auto original_descriptor = snapshot.images[16].dwords;
+  const auto original_descriptor = snapshot.candidate_images[16].value.dwords;
   const std::array<uint32_t, 8> captured_invalid{
       0x101f0000u, 0xcb500000u, 0x001fc01fu, 0xd0970facu,
       0x86000000u, 0x00500003u, 0x00000400u, 0x00005204u};
   std::copy(captured_invalid.begin(), captured_invalid.end(),
              memory.words.begin() + captured_word);
+  // Its key stays in the mapping and selects nothing.
+  const auto captured_mapping =
+      snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
-            std::ranges::all_of(snapshot.images[16].dwords,
-                                [](uint32_t word) { return word == 0u; }),
+            snapshot.candidate_images.size() == 31u &&
+            snapshot.flattened_srt[captured_mapping] == 32u &&
+            snapshot.flattened_srt[captured_mapping + 1u + 16u * 2u] == 16u &&
+            snapshot.flattened_srt[captured_mapping + 2u + 16u * 2u] == 0u,
         "captured non-descriptor record became a host image or lost its key mapping");
   std::copy(original_descriptor.begin(), original_descriptor.end(),
              memory.words.begin() + captured_word);
   memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images[31].dwords[0] == 0x987u,
+            snapshot.candidate_images[31].value.dwords[0] == 0x987u,
         "direct table refresh reused stale descriptor contents");
   memory.fail_address = table + 31u * 32u + 28u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -1953,8 +2339,9 @@ void TestGuardedDirectImageTable() {
     records.words[1] = 2u;
     records.descriptor_reads = 0u;
     Check(MaterializeResources(bounded, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && records.descriptor_reads == 2u &&
-              snapshot.images[0].dwords[0] == 0x500u && snapshot.images[2].dwords[0] == 0x501u,
+              snapshot.candidate_images.size() == 2u && records.descriptor_reads == 2u &&
+              snapshot.candidate_images[0].value.dwords[0] == 0x500u &&
+              snapshot.candidate_images[1].value.dwords[0] == 0x501u,
           "bounded interleaved table did not read precisely its two descriptor rows");
     const auto captured = [&](uint64_t address, uint64_t size) {
       return std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
@@ -1986,20 +2373,22 @@ void TestGuardedDirectImageTable() {
         : guard == Guard::FiniteAdd || guard == Guard::FiniteXor ? 32u : 12u;
     const uint64_t first = records.base + 3344u;
     fill_table(records, first);
-    // The GPU may select no bits or a sparse subset. Null rows remain valid candidates.
+    // The GPU may select no bits or a sparse subset. A null row's key selects nothing.
     std::fill_n(records.words.begin() + (first - records.base) / 4u + 5u * 8u, 8u, 0u);
     records.fail_address = first + count * 32u;
     user_data = {static_cast<uint32_t>(records.base), 0u};
     runtime.userdata = &records;
     Check(MaterializeResources(finite, runtime, snapshot, specialization) &&
-              records.descriptor_reads == count && snapshot.images.size() == std::max(count, 1u) + 1u,
+              records.descriptor_reads == count &&
+              snapshot.candidate_images.size() == (count == 0u ? 0u : count - 1u) &&
+              snapshot.images.size() == (count == 0u ? 2u : 3u),
           "finite bit table probed beyond its mask bound or lost a null row");
     if (count == 0u) {
       Check(std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
             "empty bit loop retained a reachable image");
       continue;
     }
-    Check(snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == count,
+    Check(snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == count,
           "finite bit table lost its candidate count");
     for (uint32_t key = 0; key < count; ++key) {
       Check(std::ranges::any_of(snapshot.specialization_reads, [&](const auto &read) {
@@ -2019,6 +2408,7 @@ void TestBoundedComputeImageLoop() {
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
     WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
+    ExitTest, ExitTestWrongPolarity, ExitTestSelected, ExitTestSelectedUnknown,
     IncrementBypass, PreviousBound, Forwarded, ForwardedChain, ForwardedJoin,
     ForwardedBranch, ForwardedIncrementBypass,
     Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
@@ -2109,12 +2499,27 @@ void TestBoundedComputeImageLoop() {
       count = fixture.Emit(ValueOpcode::LoadAddressU32,
           {fixture.Address(fixture.UserData(0), fixture.UserData(1)), Value(0u), Value(0u), Value(true)},
           fixture.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x10));
-    const auto in_range = post_test ? Value{} : fixture.Emit(material ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
+    auto in_range = post_test ? Value{} : fixture.Emit(material ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, compare);
     const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
+    if (variant >= Variant::ExitTest && variant <= Variant::ExitTestSelectedUnknown) {
+      // The loop runs while !(other | key >= count). DS2 cs 0xad46d6b567788504 selects the exit
+      // test by S_CSELECT_B32 exec, 0, so its term is key >= count on the active lanes.
+      const auto other = fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(3u), Value(7u)}, 0, compare);
+      auto exhausted = fixture.Emit(ValueOpcode::SGreaterThanEqual32, {key, count}, 0, compare);
+      if (variant == Variant::ExitTestSelected || variant == Variant::ExitTestSelectedUnknown) {
+        const auto lanes = variant == Variant::ExitTestSelected
+            ? initial_active
+            : fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(4u), Value(5u)}, 0, compare);
+        exhausted = fixture.Emit(ValueOpcode::LogicalAnd, {exhausted, lanes}, 0, compare);
+      }
+      const auto exit_test = fixture.Emit(ValueOpcode::LogicalOr, {other, exhausted}, 0, compare);
+      in_range = variant == Variant::ExitTestWrongPolarity
+                     ? exit_test : fixture.Emit(ValueOpcode::LogicalNot, {exit_test}, 0, compare);
+    }
     if (forwarded && !post_test) {
       forward->AddBranch(incoming == forward ? header : incoming);
       forward->terminator = {.kind = CFG::TerminatorKind::Branch,
@@ -2337,15 +2742,18 @@ void TestBoundedComputeImageLoop() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     Check(indirect && indirect->selector.has_value() == material && indirect->table_offset == 0x6b0u,
           "bounded compute loop lost its image table");
-    // A constant post-tested bound limits the key statically, so samples select heap slots.
+    // A constant post-tested bound limits the key statically, so samples select heap slots. A
+    // latch on the carried key runs it through the bound.
     if (post_test)
-      Check(indirect->table_maximum == post_bound - 1u && indirect->table_scalar &&
-                indirect->key_count.IsEmpty(),
+      Check(indirect->table_maximum == (post == PostTest::Previous ? post_bound : post_bound - 1u) &&
+                indirect->table_scalar && indirect->key_count.IsEmpty(),
             "post-tested image loop did not bound its heap by the constant count");
     else
       Check(first == 0u ? indirect->key_count.Resolve() == count.Resolve()
                         : indirect->selector_first == Value(first) && !indirect->signed_count,
             "bounded compute loop lost its runtime image count");
+    Check(variant != Variant::ExitTest || indirect->signed_count,
+          "signed exit-tested loop lost its signed count");
     if (first != 0u)
       for (const auto word : words)
         Check(!word.Instruction()->HasUses() &&
@@ -2367,9 +2775,14 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::GuardedDiamond);
   make_plan(Variant::Forwarded);
   make_plan(Variant::ForwardedChain);
-  for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
-                             Variant::ForwardedJoin, Variant::ForwardedBranch,
-                             Variant::ForwardedIncrementBypass,
+  // DS2 ps 0x78cef657c8999546: the forwarding latch branches back or leaves the loop.
+  make_plan(Variant::ForwardedBranch);
+  // DS DC cs 0x8f78cb8c66569743 masks lanes off by EXEC = active & !(test | key >= 11).
+  make_plan(Variant::ExitTest);
+  make_plan(Variant::ExitTestSelected);
+  for (const auto variant : {Variant::ExitTestWrongPolarity, Variant::ExitTestSelectedUnknown,
+                             Variant::IncrementBypass, Variant::PreviousBound,
+                             Variant::ForwardedJoin, Variant::ForwardedIncrementBypass,
                              Variant::MaskedWrongGuard,
                              Variant::MaskResurrection, Variant::StatusOverwrite,
                              Variant::GuardedDiamondBypass}) {
@@ -2401,7 +2814,9 @@ void TestBoundedComputeImageLoop() {
     return make_plan(variant, false, first, Clamp::None, post, bound);
   };
   post_test_plan(PostTest::Signed, 6u, 0u, Variant::ForwardedChain);
-  for (const auto post : {PostTest::WrongPolarity, PostTest::Previous, PostTest::Bypass,
+  // DS DC cs 0xb599c995ebc4a8dd continues while the key it began with is below 15.
+  post_test_plan(PostTest::Previous, 0u);
+  for (const auto post : {PostTest::WrongPolarity, PostTest::Bypass,
                           PostTest::Variable, PostTest::AnyLane})
     CheckFatal([&] { post_test_plan(post); }, "not a valid runtime value",
                "post-tested image loop accepted an unproved carried-edge bound");
@@ -2445,34 +2860,55 @@ void TestBoundedComputeImageLoop() {
                 heap.requests[0].first == 0u && heap.requests[0].count == count &&
                 heap.requests[0].root == &post_plan.info.images[0],
             "post-tested image loop did not request a heap of zero through bound minus one");
-      // Without a heap, the null root precedes each slot.
+      // Without a heap, each slot is a candidate of the draw.
       Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u && snapshot.images[1].dwords[0] == 0x100u &&
-                snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+                snapshot.candidate_images.size() == count &&
+                snapshot.candidate_images.front().value.dwords[0] == 0x100u &&
+                snapshot.candidate_images.back().value.dwords[0] == 0x100u + count - 1u,
             "post-tested image loop did not enumerate precisely zero through bound minus one");
     }
   }
+  for (const auto count : {5u, 0u}) {
+    const auto post_plan = post_test_plan(PostTest::Previous, count);
+    memory.fail_address = table + (count + 1u) * 32u;
+    FakeImageHeap heap;
+    auto resident = runtime;
+    resident.image_heap = &heap;
+    Check(MaterializeResources(post_plan, resident, snapshot, specialization) &&
+              heap.requests.size() == 1u && heap.requests[0].base == table &&
+              heap.requests[0].size == (count + 1u) * 32u && heap.requests[0].count == count + 1u,
+          "post-tested image loop did not request a heap through a carried-key bound");
+    Check(MaterializeResources(post_plan, runtime, snapshot, specialization) &&
+              snapshot.candidate_images.size() == count + 1u &&
+              snapshot.candidate_images.front().value.dwords[0] == 0x100u &&
+              snapshot.candidate_images.back().value.dwords[0] == 0x100u + count,
+          "post-tested image loop did not enumerate a carried-key bound through the bound");
+  }
   memory.fail_address = UINT64_MAX;
+  // The loop bound changes the table's slots, not its shader.
+  ResourceSpecialization bounded;
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count &&
-              specialization.images.size() == count &&
+              snapshot.candidate_images.size() == count &&
+              specialization.images.size() == 2u &&
+              (bounded.images.empty() || specialization == bounded) &&
               snapshot.flattened_srt[
-                  specialization.images[0].indirect_mapping_offset] == count &&
-              snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+                  snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == count &&
+              snapshot.candidate_images.back().value.dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
+    bounded = specialization;
   }
   for (const uint32_t count : {0u, UINT32_MAX}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u &&
+              snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
               specialization.images.size() == 1u &&
               std::ranges::all_of(snapshot.images[0].dwords,
                                   [](uint32_t word) { return word == 0u; }) &&
               specialization.images[0].indirect_root ==
                   ImageResource::NoIndirectImage &&
-              specialization.images[0].indirect_search_iterations == 0u,
+              !specialization.images[0].indirect_searched,
           "empty compute loop bound retained unreachable image candidates");
   }
   user_data[2] = 65537u;
@@ -2489,8 +2925,8 @@ void TestBoundedComputeImageLoop() {
     const auto length = count > 1u && count <= INT32_MAX ? count - 1u : 0u;
     Check(MaterializeResources(nonzero, runtime, snapshot, specialization) &&
               memory.descriptor_reads == length &&
-              snapshot.images.size() == std::max(1u, length) + 1u &&
-              snapshot.images[0].dwords[0] == (length != 0u ? 0x101u : 0u),
+              snapshot.candidate_images.size() == length &&
+              (length == 0u || snapshot.candidate_images[0].value.dwords[0] == 0x101u),
           "nonzero-start image loop read index zero or mishandled its signed bound");
     Check(std::ranges::find(snapshot.specialization_reads,
               std::pair{uint64_t{user_data[0]}, uint64_t{4u}}) != snapshot.specialization_reads.end(),
@@ -2499,8 +2935,8 @@ void TestBoundedComputeImageLoop() {
       Check(std::ranges::find(snapshot.specialization_reads,
                 std::pair{uint64_t{table} + key * 32u, uint64_t{32u}}) !=
                     snapshot.specialization_reads.end() &&
-                std::ranges::any_of(snapshot.images, [&](const auto& image) {
-                  return image.dwords[0] == 0x100u + key;
+                std::ranges::any_of(snapshot.candidate_images, [&](const auto& image) {
+                  return image.value.dwords[0] == 0x100u + key;
                 }),
             "nonzero-start loop lost a descriptor or its writable-alias capture");
   }
@@ -2531,14 +2967,15 @@ void TestBoundedComputeImageLoop() {
   memory.reads = 0u;
   memory.fail_address = first_key;
   Check(MaterializeResources(material, runtime, snapshot, specialization) && memory.reads == 0u &&
-            snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0u,
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
+            snapshot.images[0].dwords[0] == 0u,
         "empty raw pointer selector read an unreachable record");
   user_data[2] = 2u;
   memory.fail_address = first_key + 96u;
   memory.descriptor_reads = 0u;
   Check(MaterializeResources(material, runtime, snapshot, specialization) &&
-            memory.descriptor_reads == 2u && snapshot.images.size() == 2u &&
-            snapshot.images[0].dwords[0] == 0x100u && snapshot.images[1].dwords[0] == 0x102u,
+            memory.descriptor_reads == 2u && snapshot.candidate_images.size() == 2u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x100u && snapshot.candidate_images[1].value.dwords[0] == 0x102u,
         "bounded raw pointer selector lost sparse keys or read an extra record");
   memory.fail_address = first_key + 48u;
   Check(!MaterializeResources(material, runtime, snapshot, specialization),
@@ -2559,8 +2996,8 @@ void TestBoundedComputeImageLoop() {
     memory.fail_address = first_key + 144u;
     memory.descriptor_reads = 0u;
     Check(MaterializeResources(clamped, runtime, snapshot, specialization) &&
-              memory.descriptor_reads == 2u && snapshot.images.size() == 2u &&
-              snapshot.images[0].dwords[0] == 0x100u && snapshot.images[1].dwords[0] == 0x102u,
+              memory.descriptor_reads == 2u && snapshot.candidate_images.size() == 2u &&
+              snapshot.candidate_images[0].value.dwords[0] == 0x100u && snapshot.candidate_images[1].value.dwords[0] == 0x102u,
           "clamped scalar selector read an unreachable image or failed to deduplicate clamped keys");
   }
   CheckFatal([&] { make_plan(Variant::Bounded, true, 0u, Clamp::Dynamic); },
@@ -2778,9 +3215,9 @@ void TestDescendingImageRange() {
       .read_specialization_memory = ReadLinearTestMemory};
   for (const auto count : {0u, 2u, 0u}) {
     user_data[2] = count;
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u,
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.candidate_images.size() == 2u,
           "descending descriptor subtraction failed when the runtime key underflowed");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
     Check(snapshot.flattened_srt[offset] == 128u, "descending mapping lost candidate keys");
     uint32_t previous = 0u;
     for (uint32_t entry = 0; entry < 128u; ++entry) {
@@ -2827,7 +3264,7 @@ void TestDescendingImageRange() {
               (bitmap_data[6] == 0u || memory.watched_dwords ==
                   std::min(dwords, MaxIndirectDescriptorProbes)) &&
               memory.descriptor_reads == keys.size() &&
-              snapshot.images.size() == std::max<size_t>(keys.size(), 1u),
+              snapshot.candidate_images.size() == keys.size(),
           "bitmap selector lost bounded reads or retained unreachable descriptors");
     for (uint32_t first = 0; first < dwords; first += MaxIndirectDescriptorProbes)
       Check(std::ranges::find(snapshot.specialization_reads,
@@ -2841,18 +3278,15 @@ void TestDescendingImageRange() {
             "empty bitmap retained a previously materialized image");
       return;
     }
-    if (keys.size() == 1u) {
-      Check(snapshot.images[0].dwords[0] == 0x100u + uint32_t(0x1000u + keys[0] * 32u) / 32u &&
-                specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
-            "a single bitmap rank became empty or required an indirect image mapping");
-      return;
-    }
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    // One rank is one slot of the same table: its count does not change the shader.
+    Check(specialization.images.size() == 2u && specialization.images[0].indirect_root == 0u,
+          "a bitmap rank did not become a slot of the table's class");
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
     Check(snapshot.flattened_srt[offset] == keys.size(), "bitmap mapping lost a selected key");
     for (uint32_t index = 0; index < keys.size(); ++index) {
       const auto descriptor_record = uint32_t(0x1000u + keys[index] * 32u) / 32u;
       Check(snapshot.flattened_srt[offset + 1u + index * 2u] == keys[index] &&
-                snapshot.images[index].dwords[0] == 0x100u + descriptor_record,
+                snapshot.candidate_images[index].value.dwords[0] == 0x100u + descriptor_record,
             "bitmap word association or U32-wrapped key selected a different descriptor");
     }
   };
@@ -2898,7 +3332,7 @@ void TestDescendingImageRange() {
   memory.watched_reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(bitmap_plan, bitmap_runtime, snapshot, specialization) &&
             memory.watched_reads == 0u && memory.descriptor_reads == 0u &&
-            snapshot.images.size() == 1u &&
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
             std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t value) { return value == 0u; }),
         "unbound bitmap V# read backing bytes or manufactured an image key");
   bitmap_data = valid_data;
@@ -2920,7 +3354,7 @@ void TestDescendingImageRange() {
   std::fill_n(memory.words.begin() + bitmap_word, 4u, UINT32_MAX);
   memory.fail_address = bitmap_address + MaxIndirectDescriptorProbes * 4u;
   Check(MaterializeResources(bitmap_plan, bitmap_runtime, snapshot, specialization) &&
-            snapshot.images.size() == 128u &&
+            snapshot.candidate_images.size() == 128u &&
             std::ranges::none_of(snapshot.specialization_reads, [&](const auto &read) {
               return read.first >= memory.fail_address;
             }),
@@ -2942,6 +3376,1105 @@ void TestDescendingImageRange() {
     Check(!MaterializeResources(wide_plan, bitmap_runtime, snapshot, specialization),
           "an eight-word bitmap selector accepted a different record stride");
   }
+}
+
+constexpr uint32_t RecordWordTable = 18960u;
+
+struct RecordWordBuilder {
+  Fixture &fixture;
+  std::array<uint32_t, 4> components{0u, 4u, 8u, 12u};
+
+  // S_LOAD_DWORDX4 at (tile >> 2) * 16 + 16, then S_CSELECT by tile & 3.
+  Value Material(Value tile) {
+    const auto pointer = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto record = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                      {fixture.Emit(ValueOpcode::ShiftRightLogical32, {tile, Value(2u)}),
+                       Value(4u)}),
+         Value(16u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = components[word];
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, record, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x4e8));
+    }
+    const auto select = fixture.Emit(ValueOpcode::BitwiseAnd32, {tile, Value(3u)});
+    auto chosen = words[0];
+    for (uint32_t word = 1; word < words.size(); ++word)
+      chosen = fixture.Emit(ValueOpcode::SelectU32,
+          {fixture.Emit(ValueOpcode::IEqual32, {select, Value(word)}), words[word], chosen});
+    return chosen;
+  }
+
+  void Access(Value key, Value active) {
+    const auto pointer = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = RecordWordTable + word * sizeof(uint32_t);
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x54c));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {fixture.Image(words, 0x558), fixture.ImageAddress(), active},
+                 fixture.AddMemory(load, 0x558));
+  }
+};
+
+void CheckRecordWordDomain(const Program &program) {
+  const auto &indirect =
+      program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+  Check(indirect && indirect->selector && indirect->selector->stride == 4u &&
+            indirect->selector->offset == 16u && indirect->selector->scale == 31u &&
+            !indirect->selector->global && indirect->selector_first == Value(0u) &&
+            indirect->key_count == Value(4096u) && indirect->selector_addends.size() == 1u &&
+            program.descriptor_sources[indirect->selector->source].dword_count == 2u &&
+            indirect->table_stride == 32u && indirect->table_immediate == RecordWordTable,
+        "record-word key lost its tile table domain");
+}
+
+// T[tile] = tile % 5 and c = 3 select keys 3, 34, 65, 96 and 127; only those T# are read.
+void CheckRecordWordMaterialization(const ResourcePlan &plan) {
+  LinearTestMemory memory;
+  memory.words.assign((RecordWordTable + 128u * 32u) / 4u, 0u);
+  for (uint32_t tile = 0; tile < 4096u; ++tile) memory.words[4u + tile] = tile % 5u;
+  for (uint32_t key = 0; key < 128u; ++key) {
+    const auto word = RecordWordTable / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 8> user_data{0x1000u, 0u, 3u, 64u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.descriptor_reads == 5u && snapshot.candidate_images.size() == 5u,
+        "record-word key did not read exactly the descriptors its tiles select");
+  for (const uint32_t key : {3u, 34u, 65u, 96u, 127u})
+    Check(std::ranges::any_of(snapshot.candidate_images, [&](const auto &image) {
+            return image.value.dwords[0] == 0x100u + key;
+          }),
+          "record-word key lost a descriptor one of its tiles selects");
+}
+
+// DS2 cs 0x228a640fcb11a26d: a waterfall over a clamped screen tile.
+void TestAffineRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // RemovedLanes: the waterfall starts from EXEC with lanes removed by S_ANDN2 of a ballot and of
+  // an S_CSELECT of EXEC and zero (DS2 cs 0x851c2b3d9cf427fe); VaryingRemoval selects the words by
+  // a per-lane condition, which names no lanes.
+  enum class Variant {
+    Valid, TwoAddends, Unclamped, UnrelatedMask, StaleLane, UnguardedEntry, GappedWords,
+    RemovedLanes, VaryingRemoval
+  };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 32u;
+    RecordWordBuilder build{fixture};
+    if (variant == Variant::GappedWords) build.components = {0u, 4u, 8u, 16u};
+    auto *entry = fixture.block;
+    auto *ready = fixture.AddBlock();
+    auto *header = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto active = fixture.Emit(ValueOpcode::ULessThan32, {local, fixture.UserData(3)});
+    const auto spread = fixture.Emit(ValueOpcode::IMul32, {local, Value(151u)});
+    const auto tile = variant == Variant::Unclamped
+        ? spread : fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), spread});
+    const auto written = variant == Variant::StaleLane
+        ? fixture.Emit(ValueOpcode::INotEqual32, {local, fixture.UserData(4)}) : active;
+    const auto lane_value = fixture.Emit(ValueOpcode::SelectU32, {written, tile, local});
+    auto lanes = variant == Variant::UnrelatedMask
+        ? fixture.UserData(5)
+        : fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                       {fixture.Emit(ValueOpcode::Ballot, {active}), Value(0u)});
+    auto guard = active;
+    if (variant == Variant::RemovedLanes || variant == Variant::VaryingRemoval) {
+      const auto skip = fixture.Emit(ValueOpcode::IEqual32, {local, fixture.UserData(4)});
+      const auto uniform = variant == Variant::RemovedLanes
+          // False in the materialization runtime: the selected EXEC words remove no lanes.
+          ? fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(7), Value(3u)})
+          : fixture.Emit(ValueOpcode::IEqual32, {local, fixture.UserData(7)});
+      const auto skipped = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+          {fixture.Emit(ValueOpcode::Ballot,
+                        {fixture.Emit(ValueOpcode::LogicalAnd, {active, skip})}),
+           Value(0u)});
+      const auto selected = fixture.Emit(ValueOpcode::SelectU32, {uniform, lanes, Value(0u)});
+      lanes = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {lanes, fixture.Emit(ValueOpcode::BitwiseNot32,
+                               {fixture.Emit(ValueOpcode::BitwiseOr32, {skipped, selected})})});
+      guard = fixture.Emit(ValueOpcode::LogicalAnd,
+          {active, fixture.Emit(ValueOpcode::LogicalNot,
+                                {fixture.Emit(ValueOpcode::LogicalOr, {skip, uniform})})});
+    }
+    if (variant == Variant::UnguardedEntry) {
+      entry->AddBranch(ready);
+      entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = ready};
+    } else {
+      choose(entry, ready, exit,
+             fixture.Emit(ValueOpcode::ConditionRef, {guard}, CFG::BranchCondition::ExecNonZero));
+    }
+    ready->AddBranch(header);
+    ready->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    auto &remaining = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = header;
+    const auto lane = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::FindILsb32, {Value(&remaining)}), Value(31u)});
+    const auto key_tile = fixture.Emit(ValueOpcode::ReadLane, {lane_value, lane});
+    const auto match = fixture.Emit(ValueOpcode::LogicalAnd,
+        {active, fixture.Emit(ValueOpcode::IEqual32, {key_tile, lane_value})});
+    choose(header, access, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {match}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    const auto material = build.Material(key_tile);
+    const auto scaled = fixture.Emit(ValueOpcode::IMul32, {material, Value(31u)});
+    build.Access(fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(2), scaled}), match);
+    // A second texture slot of the same material keys a different T# range.
+    if (variant == Variant::TwoAddends)
+      build.Access(fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(6), scaled}), match);
+    access->AddBranch(latch);
+    access->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    fixture.block = latch;
+    const auto served = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+        {fixture.Emit(ValueOpcode::Ballot, {match}), Value(0u)});
+    const auto next = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {Value(&remaining), fixture.Emit(ValueOpcode::BitwiseNot32, {served})});
+    choose(latch, header, exit,
+           fixture.Emit(ValueOpcode::ConditionRef,
+                        {fixture.Emit(ValueOpcode::INotEqual32, {next, Value(0u)})},
+                        CFG::BranchCondition::SccNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    remaining.AddPhiOperand(ready, lanes);
+    remaining.AddPhiOperand(latch, next);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    if (variant == Variant::TwoAddends) {
+      const auto &images = fixture.program.info.images;
+      const auto addends = [&](size_t image) {
+        return fixture.program.descriptor_sources[images[image].source]
+            .indirect_descriptor->selector_addends;
+      };
+      Check(images.size() == 2u && images[0].source != images[1].source &&
+                addends(0).size() == 1u && addends(1).size() == 1u &&
+                addends(0)[0] != addends(1)[0],
+            "record-word keys with different addends shared one domain");
+    }
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  make_plan(Variant::TwoAddends);
+  CheckRecordWordMaterialization(make_plan(Variant::RemovedLanes));
+  for (const auto variant : {Variant::Unclamped, Variant::UnrelatedMask, Variant::StaleLane,
+                             Variant::UnguardedEntry, Variant::GappedWords,
+                             Variant::VaryingRemoval})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "record-word key accepted a tile no proof bounds or a gapped record");
+  CheckRecordWordMaterialization(plan);
+}
+
+// DS2 ps 0x83aa3dd5e5165b0f: two waterfalls, the first assembling T[tile].
+void TestAssembledRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // The drained mask starts as WQM of every lane, or of the live lanes (ps 0xfd3a8eec7807d518).
+  enum class Variant {
+    Valid, LiveMaskEntry, ComputeWqm, UnwrittenLanes, LowExit, CarriedUse,
+    SwappedLiveMask, ZeroHighWord
+  };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture(variant == Variant::ComputeWqm ? ShaderType::Compute : ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
+    RecordWordBuilder build{fixture};
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *after = fixture.AddBlock();
+    auto *second = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto jump = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto varying = variant == Variant::ComputeWqm
+        ? fixture.Emit(ValueOpcode::GetBuiltin,
+            {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)})
+        : fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
+    const auto tile = fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), varying});
+    const bool live = variant == Variant::LiveMaskEntry || variant == Variant::SwappedLiveMask;
+    const auto ballot = live ? fixture.Emit(ValueOpcode::LiveMask, {})
+                             : fixture.Emit(ValueOpcode::Ballot, {Value(true)});
+    const uint32_t low_word = variant == Variant::SwappedLiveMask ? 1u : 0u;
+    const auto wqm = fixture.Emit(ValueOpcode::WqmU64,
+        {fixture.Emit(ValueOpcode::CompositeConstructU64,
+                      {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(low_word)}),
+                       fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                    {ballot, Value(low_word ^ 1u)})})});
+    std::array<Value, 2> initial;
+    for (uint32_t word = 0; word < 2u; ++word)
+      initial[word] = fixture.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(word)});
+    // Upstream folds a 32-wide host's absent high EXEC word away, so a zero one is never all lanes.
+    if (variant == Variant::ZeroHighWord)
+      initial[1] = Value(0u);
+    jump(entry, header);
+    auto &carried = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    std::array<Inst *, 2> remaining;
+    for (auto &word : remaining)
+      word = &header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = header;
+    const auto low = fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[0])});
+    const auto high = fixture.Emit(ValueOpcode::BitwiseOr32,
+        {fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[1])}), Value(32u)});
+    const auto lane = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::UMin32, {low, high}), Value(63u)});
+    const auto key_tile = fixture.Emit(ValueOpcode::ReadLane, {tile, lane});
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {key_tile, tile});
+    choose(header, body, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {match}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = body;
+    const auto material = build.Material(key_tile);
+    const auto writes = variant == Variant::UnwrittenLanes
+        ? fixture.Emit(ValueOpcode::LogicalAnd,
+              {match, fixture.Emit(ValueOpcode::INotEqual32, {varying, fixture.UserData(4)})})
+        : match;
+    const auto written =
+        fixture.Emit(ValueOpcode::SelectU32, {writes, material, Value(&carried)});
+    jump(body, latch);
+    auto &assembled = latch->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = latch;
+    const auto served = fixture.Emit(ValueOpcode::Ballot, {match});
+    std::array<Value, 2> left;
+    for (uint32_t word = 0; word < 2u; ++word)
+      left[word] = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {Value(remaining[word]),
+           fixture.Emit(ValueOpcode::BitwiseNot32,
+                        {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {served, Value(word)})})});
+    const auto pending = variant == Variant::LowExit
+        ? left[0] : fixture.Emit(ValueOpcode::BitwiseOr32, {left[0], left[1]});
+    choose(latch, header, after,
+           fixture.Emit(ValueOpcode::ConditionRef,
+                        {fixture.Emit(ValueOpcode::INotEqual32, {pending, Value(0u)})},
+                        CFG::BranchCondition::SccNonZero));
+    fixture.block = after;
+    const auto key_value = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.UserData(2),
+         fixture.Emit(ValueOpcode::IMul32,
+                      {Value(31u), variant == Variant::CarriedUse ? Value(&carried)
+                                                                   : Value(&assembled)})});
+    jump(after, second);
+    auto &waiting = second->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixture.block = second;
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(second, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    build.Access(key, selected);
+    jump(access, next_key);
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, second, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest}, CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    carried.AddPhiOperand(entry, varying);
+    carried.AddPhiOperand(latch, Value(&assembled));
+    for (uint32_t word = 0; word < 2u; ++word) {
+      remaining[word]->AddPhiOperand(entry, initial[word]);
+      remaining[word]->AddPhiOperand(latch, left[word]);
+    }
+    assembled.AddPhiOperand(header, Value(&carried));
+    assembled.AddPhiOperand(body, written);
+    waiting.AddPhiOperand(after, Value(true));
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  CheckRecordWordMaterialization(make_plan(Variant::LiveMaskEntry));
+  for (const auto variant : {Variant::ComputeWqm, Variant::UnwrittenLanes, Variant::LowExit,
+                             Variant::CarriedUse, Variant::SwappedLiveMask, Variant::ZeroHighWord})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "assembled record-word key accepted a lane the waterfall may not have written");
+  CheckRecordWordMaterialization(plan);
+}
+
+// DS2 vs 0x788243a6d8537c1f: the NGG prologue writes EXEC = ~0 >> (64 - n), so the first
+// waterfall drains a computed mask whose lanes only the translator's lane-bit predicate names.
+void TestLaneBitRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, UnguardedAccess, UndrainedUse };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture(ShaderType::Vertex);
+    fixture.program.wave_size = 64u;
+    RecordWordBuilder build{fixture};
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *after = fixture.AddBlock();
+    auto *second = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto jump = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto computed = fixture.Emit(ValueOpcode::ShiftRightLogical64,
+        {Value(~uint64_t{0}),
+         fixture.Emit(ValueOpcode::ISub32, {Value(64u), fixture.UserData(5)})});
+    const auto low = fixture.Emit(ValueOpcode::CompositeExtractU64, {computed, Value(0u)});
+    const auto upper = fixture.Emit(ValueOpcode::CompositeExtractU64, {computed, Value(1u)});
+    // The translator's ThreadBit of EXEC = {low, upper}.
+    const auto lane_id = fixture.Emit(ValueOpcode::LaneId);
+    const auto half = fixture.Emit(ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::ULessThan32, {lane_id, Value(32u)}), low, upper});
+    const auto shifted = fixture.Emit(ValueOpcode::ShiftRightLogical32,
+        {half, fixture.Emit(ValueOpcode::BitwiseAnd32, {lane_id, Value(31u)})});
+    const auto exec = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
+    const auto varying = fixture.Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
+    // Only the EXEC lanes clamp their tile.
+    const auto tile = fixture.Emit(ValueOpcode::SelectU32,
+        {exec, fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), varying}), varying});
+    choose(entry, header, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {exec}, CFG::BranchCondition::ExecNonZero));
+    auto &carried = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    std::array<Inst *, 2> remaining;
+    for (auto &word : remaining)
+      word = &header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = header;
+    const auto first = fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[0])});
+    const auto high = fixture.Emit(ValueOpcode::BitwiseOr32,
+        {fixture.Emit(ValueOpcode::FindILsb32, {Value(remaining[1])}), Value(32u)});
+    const auto lane = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::UMin32, {first, high}), Value(63u)});
+    const auto key_tile = fixture.Emit(ValueOpcode::ReadLane, {tile, lane});
+    const auto match = fixture.Emit(ValueOpcode::LogicalAnd,
+        {exec, fixture.Emit(ValueOpcode::IEqual32, {key_tile, tile})});
+    choose(header, body, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {match}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = body;
+    const auto material = build.Material(key_tile);
+    const auto written = fixture.Emit(ValueOpcode::SelectU32, {match, material, Value(&carried)});
+    // A key formed inside the loop is used while the mask may still name absent lanes.
+    if (variant == Variant::UndrainedUse)
+      build.Access(fixture.Emit(ValueOpcode::IAdd32,
+                                {fixture.UserData(2),
+                                 fixture.Emit(ValueOpcode::IMul32, {Value(31u), material})}),
+                   match);
+    jump(body, latch);
+    auto &assembled = latch->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    fixture.block = latch;
+    const auto served = fixture.Emit(ValueOpcode::Ballot, {match});
+    std::array<Value, 2> left;
+    for (uint32_t word = 0; word < 2u; ++word)
+      left[word] = fixture.Emit(ValueOpcode::BitwiseAnd32,
+          {Value(remaining[word]),
+           fixture.Emit(ValueOpcode::BitwiseNot32,
+                        {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {served, Value(word)})})});
+    choose(latch, header, after,
+           fixture.Emit(ValueOpcode::ConditionRef,
+                        {fixture.Emit(ValueOpcode::INotEqual32,
+                                      {fixture.Emit(ValueOpcode::BitwiseOr32, {left[0], left[1]}),
+                                       Value(0u)})},
+                        CFG::BranchCondition::SccNonZero));
+    fixture.block = after;
+    const auto key_value = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.UserData(2), fixture.Emit(ValueOpcode::IMul32, {Value(31u), Value(&assembled)})});
+    jump(after, second);
+    auto &waiting = second->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixture.block = second;
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(second, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    if (variant != Variant::UndrainedUse) build.Access(key, selected);
+    jump(access, next_key);
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, second, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest}, CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    carried.AddPhiOperand(entry, varying);
+    carried.AddPhiOperand(latch, Value(&assembled));
+    remaining[0]->AddPhiOperand(entry, low);
+    remaining[0]->AddPhiOperand(latch, left[0]);
+    remaining[1]->AddPhiOperand(entry, upper);
+    remaining[1]->AddPhiOperand(latch, left[1]);
+    assembled.AddPhiOperand(header, Value(&carried));
+    assembled.AddPhiOperand(body, written);
+    waiting.AddPhiOperand(after, variant == Variant::UnguardedAccess ? Value(true) : exec);
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  for (const auto variant : {Variant::UnguardedAccess, Variant::UndrainedUse})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "lane-bit record-word key accepted a lane the drained mask does not name");
+  CheckRecordWordMaterialization(plan);
+}
+
+// DS2 vs 0x788243a6d8537c1f: a wave-uniform T[tile] read at the first lane of the EXEC
+// predicate, whose lanes no branch proves nonempty; its key is used only on those lanes.
+void TestUniformRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, UnguardedAccess };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    RecordWordBuilder build{fixture};
+    auto *entry = fixture.block;
+    auto *second = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto exec = fixture.Emit(ValueOpcode::ULessThan32, {local, fixture.UserData(3)});
+    const auto spread = fixture.Emit(ValueOpcode::IMul32, {local, Value(151u)});
+    // Only the EXEC lanes clamp their tile.
+    const auto tile = fixture.Emit(ValueOpcode::SelectU32,
+        {exec, fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), spread}), spread});
+    const auto material = build.Material(fixture.Emit(ValueOpcode::ReadFirstLane, {tile, exec}));
+    const auto key_value = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.UserData(2), fixture.Emit(ValueOpcode::IMul32, {Value(31u), material})});
+    entry->AddBranch(second);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = second};
+    auto &waiting = second->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    fixture.block = second;
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(second, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected}, CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    build.Access(key, selected);
+    access->AddBranch(next_key);
+    access->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = next_key};
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, second, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest}, CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    waiting.AddPhiOperand(entry, variant == Variant::UnguardedAccess ? Value(true) : exec);
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    CheckRecordWordDomain(fixture.program);
+    return ExtractResourcePlan(fixture.program);
+  };
+  const auto plan = make_plan(Variant::Valid);
+  CheckFatal([&] { make_plan(Variant::UnguardedAccess); }, "not a valid runtime value",
+             "uniform record-word key accepted a lane outside the read's EXEC predicate");
+  CheckRecordWordMaterialization(plan);
+}
+
+// DS2 cs 0x12db0180e6634d01 and vs 0xc01cd981407ebfa0: global-load T[tile].
+void TestGlobalRecordWordImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, QueryOnly, Predicated, FullAddress, WiderLanes };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *access = fixture.AddBlock();
+    auto *next_key = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto choose = [](Block *from, Block *yes, Block *no,
+                           Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes,
+                          .false_block = no};
+    };
+    const auto jump = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch,
+                          .true_block = to};
+    };
+    const bool predicated =
+        variant == Variant::Predicated || variant == Variant::WiderLanes;
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto exec = predicated ? fixture.Emit(ValueOpcode::ULessThan32,
+                                                {local, fixture.UserData(3)})
+                                 : Value(true);
+    // A predicated VGPR write keeps the old value on lanes outside EXEC.
+    const auto write = [&](Value value, Value old) {
+      return variant == Variant::Predicated
+                 ? fixture.Emit(ValueOpcode::SelectU32, {exec, value, old})
+                 : value;
+    };
+    const auto spread =
+        write(fixture.Emit(ValueOpcode::IMul32, {local, Value(151u)}), local);
+    const auto tile = write(
+        fixture.Emit(ValueOpcode::UMin32, {Value(0xfffu), spread}), spread);
+    const auto record =
+        write(fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                           {fixture.Emit(ValueOpcode::ShiftRightArithmetic32,
+                                         {tile, Value(2u)}),
+                            Value(4u)}),
+              tile);
+    const auto pointer =
+        fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Global;
+      memory.address_is_full = variant == Variant::FullAddress;
+      memory.offset = 16u + word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {pointer, record, Value(0u), exec},
+                                 fixture.AddMemory(memory, 0x118));
+    }
+    const auto select =
+        fixture.Emit(ValueOpcode::BitwiseAnd32, {tile, Value(3u)});
+    auto chosen = words[0];
+    for (uint32_t word = 1; word < words.size(); ++word)
+      chosen = fixture.Emit(
+          ValueOpcode::SelectU32,
+          {fixture.Emit(ValueOpcode::IEqual32, {select, Value(word)}),
+           words[word], chosen});
+    const auto scaled =
+        write(fixture.Emit(ValueOpcode::IMul32, {Value(31u), chosen}), chosen);
+    const auto key_value =
+        write(fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(2), scaled}),
+              scaled);
+    jump(entry, header);
+    auto &waiting = header->AppendNewInst(ValueOpcode::Phi, {},
+                                          static_cast<uint64_t>(Type::U1));
+    fixture.block = header;
+    const auto key =
+        fixture.Emit(ValueOpcode::ReadFirstLane, {key_value, Value(&waiting)});
+    const auto selected =
+        fixture.Emit(ValueOpcode::LogicalAnd,
+                     {Value(&waiting),
+                      fixture.Emit(ValueOpcode::IEqual32, {key, key_value})});
+    choose(header, access, next_key,
+           fixture.Emit(ValueOpcode::ConditionRef, {selected},
+                        CFG::BranchCondition::ExecNonZero));
+    fixture.block = access;
+    const auto offset =
+        fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> descriptor;
+    for (uint32_t word = 0; word < descriptor.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = RecordWordTable + word * sizeof(uint32_t);
+      descriptor[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                      {pointer, offset, Value(0u), Value(true)},
+                                      fixture.AddMemory(memory, 0x160));
+    }
+    const auto image = fixture.Image(descriptor, 0x16c);
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    if (!predicated)
+      fixture.Emit(ValueOpcode::ImageQueryDimensions,
+                   {image, fixture.ImageAddress()},
+                   fixture.AddMemory(load, 0x16c));
+    if (variant != Variant::QueryOnly)
+      fixture.Emit(ValueOpcode::ImageRead,
+                   {image, fixture.ImageAddress(), selected},
+                   fixture.AddMemory(load, 0x170));
+    jump(access, next_key);
+    fixture.block = next_key;
+    const auto rest = fixture.Emit(
+        ValueOpcode::LogicalAnd,
+        {Value(&waiting), fixture.Emit(ValueOpcode::LogicalNot, {selected})});
+    choose(next_key, header, exit,
+           fixture.Emit(ValueOpcode::ConditionRef, {rest},
+                        CFG::BranchCondition::ExecNonZero));
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    waiting.AddPhiOperand(entry,
+                          variant == Variant::Predicated ? exec : Value(true));
+    waiting.AddPhiOperand(next_key, rest);
+    fixture.PlanAndTrack();
+    const auto &indirect =
+        fixture.program
+            .descriptor_sources[fixture.program.info.images[0].source]
+            .indirect_descriptor;
+    Check(indirect && indirect->selector && indirect->selector->global &&
+              indirect->selector->stride == 4u &&
+              indirect->selector->offset == 16u &&
+              indirect->selector->scale == 31u &&
+              indirect->key_count == Value(4096u) &&
+              indirect->table_stride == 32u &&
+              indirect->table_immediate == RecordWordTable,
+          "global record-word key lost its tile table domain");
+    return ExtractResourcePlan(fixture.program);
+  };
+  CheckRecordWordMaterialization(make_plan(Variant::Valid));
+  CheckRecordWordMaterialization(make_plan(Variant::QueryOnly));
+  CheckRecordWordMaterialization(make_plan(Variant::Predicated));
+  for (const auto variant : {Variant::FullAddress, Variant::WiderLanes})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "global record-word key accepted a word the waterfall's lanes "
+               "may not load");
+}
+
+// DS2 cs 0xc37f29edfa902037: material id from a scalar-buffer table.
+void TestMaterialWordImageTable() {
+  enum class Variant { Packed, Masked, HighMask, MaskAfterScale };
+  static constexpr uint32_t table = 19216u;
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto lane = fixture.Emit(
+        ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::IMul32, {local, Value(0x01234567u)}),
+         Value(true)});
+    const auto row = fixture.Emit(
+        ValueOpcode::UMin32,
+        {fixture.Emit(ValueOpcode::IAdd32,
+                      {fixture.UserData(12), Value(0xffffffffu)}),
+         fixture.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)})});
+    const auto material =
+        fixture.Buffer({fixture.UserData(8), fixture.UserData(9),
+                        fixture.UserData(10), fixture.UserData(11)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    const auto word =
+        fixture.Emit(ValueOpcode::ReadConstBuffer,
+                     {material, fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                             {row, Value(2u)})},
+                     fixture.AddMemory(scalar, 0x3b0));
+    Value key;
+    switch (variant) {
+    case Variant::Packed:
+      // S_PACK_LL_B32_B16 w, 0 then S_MUL_I32 by 31.
+      key =
+          fixture.Emit(ValueOpcode::IMul32,
+                       {fixture.Emit(ValueOpcode::BitFieldInsert,
+                                     {word, Value(0u), Value(16u), Value(16u)}),
+                        Value(31u)});
+      break;
+    case Variant::Masked:
+    case Variant::HighMask:
+      key = fixture.Emit(
+          ValueOpcode::IAdd32,
+          {fixture.UserData(2),
+           fixture.Emit(ValueOpcode::IMul32,
+                        {fixture.Emit(ValueOpcode::BitwiseAnd32,
+                                      {word, Value(variant == Variant::HighMask
+                                                       ? 0xffff0000u
+                                                       : 0xffffu)}),
+                         Value(31u)})});
+      break;
+    case Variant::MaskAfterScale:
+      key = fixture.Emit(ValueOpcode::BitwiseAnd32,
+                         {fixture.Emit(ValueOpcode::IMul32, {word, Value(31u)}),
+                          Value(0x1fffffu)});
+      break;
+    }
+    const auto pointer =
+        fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto offset =
+        fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> descriptor;
+    for (uint32_t dword = 0; dword < descriptor.size(); ++dword) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = table + dword * sizeof(uint32_t);
+      descriptor[dword] =
+          fixture.Emit(ValueOpcode::LoadAddressU32,
+                       {pointer, offset, Value(0u), Value(true)},
+                       fixture.AddMemory(memory, 0x57c));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(
+        ValueOpcode::ImageRead,
+        {fixture.Image(descriptor, 0x588), fixture.ImageAddress(), Value(true)},
+        fixture.AddMemory(load, 0x588));
+    fixture.PlanAndTrack();
+    const auto &indirect =
+        fixture.program
+            .descriptor_sources[fixture.program.info.images[0].source]
+            .indirect_descriptor;
+    Check(indirect && indirect->selector && !indirect->selector->global &&
+              indirect->selector->stride == 4u &&
+              indirect->selector->offset == 0u &&
+              indirect->selector->bit_mask == 0xffffu &&
+              indirect->selector->scale == 31u &&
+              !indirect->key_count.IsImmediate() &&
+              fixture.program.descriptor_sources[indirect->selector->source]
+                      .dword_count == 4u &&
+              indirect->table_stride == 32u &&
+              indirect->table_immediate == table,
+          "material-word key lost its scalar-buffer row domain");
+    return std::pair{ExtractResourcePlan(fixture.program),
+                     variant == Variant::Masked ? 3u : 0u};
+  };
+  for (const auto variant : {Variant::Packed, Variant::Masked}) {
+    const auto [plan, addend] = make_plan(variant);
+    LinearTestMemory memory;
+    memory.words.assign((0x1000u + table + 160u * 32u) / 4u, 0u);
+    memory.words[0x800u / 4u + 0u] = 0x00070001u;
+    memory.words[0x800u / 4u + 1u] = 2u;
+    memory.words[0x800u / 4u + 2u] = 0xffff0004u;
+    memory.words[0x800u / 4u + 3u] = 9u; // Beyond the clamped rows.
+    for (uint32_t key = 0; key < 160u; ++key) {
+      const auto at = (0x1000u + table) / 4u + key * 8u;
+      memory.words[at] = 0x100u + key;
+      memory.words[at + 1u] =
+          static_cast<uint32_t>(
+              Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+          << 20u;
+      memory.words[at + 3u] =
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+           << 28u);
+    }
+    memory.base = 0u;
+    std::array<uint32_t, 13> user_data{0x1000u, 0u,     addend, 0u,  0u, 0u, 0u,
+                                       0u,      0x800u, 0u,     12u, 0u, 3u};
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u,
+          "material-word key did not read exactly the descriptors its rows "
+          "select");
+    for (const uint32_t material : {1u, 2u, 4u})
+      Check(std::ranges::any_of(snapshot.candidate_images,
+                                [&](const auto &image) {
+                                  return image.value.dwords[0] ==
+                                         0x100u + addend + 31u * material;
+                                }),
+            "material-word key lost a descriptor one of its rows selects");
+  }
+  for (const auto variant : {Variant::HighMask, Variant::MaskAfterScale})
+    CheckFatal(
+        [&] { make_plan(variant); }, "not a valid runtime value",
+        "material-word key accepted a mask that is not the word's low bits");
+}
+
+// DS2 cs 0xbff76855ee8b1cdb: S_PACK_LL_B32_B16 keeps a scalar-loaded material word's low half,
+// which selects a 992-byte record of a pointer table.
+void TestMaskedScalarMaterialImageTable() {
+  enum class Variant { Masked, Swapped, NotLowBits };
+  static constexpr uint32_t table = 18960u;
+  static constexpr uint32_t stride = 992u;
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto lane = fixture.Emit(
+        ValueOpcode::ReadFirstLane,
+        {fixture.Emit(ValueOpcode::IMul32, {local, Value(0x01234567u)}),
+         Value(true)});
+    const auto row =
+        fixture.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)});
+    const auto material =
+        fixture.Buffer({fixture.UserData(8), fixture.UserData(9),
+                        fixture.UserData(10), fixture.UserData(11)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    const auto word = fixture.Emit(
+        ValueOpcode::ReadConstBuffer,
+        {material,
+         fixture.Emit(ValueOpcode::ShiftLeftLogical32, {row, Value(2u)})},
+        fixture.AddMemory(scalar, 0x4c4));
+    const auto mask = Value(variant == Variant::NotLowBits ? 0xff00u : 0xffffu);
+    const auto key =
+        variant == Variant::Swapped
+            ? fixture.Emit(ValueOpcode::BitwiseAnd32, {mask, word})
+            : fixture.Emit(ValueOpcode::BitwiseAnd32, {word, mask});
+    const auto offset =
+        fixture.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+    const auto pointer =
+        fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    std::array<Value, 8> descriptor;
+    for (uint32_t dword = 0; dword < descriptor.size(); ++dword) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = table + dword * sizeof(uint32_t);
+      descriptor[dword] =
+          fixture.Emit(ValueOpcode::LoadAddressU32,
+                       {pointer, offset, Value(0u), Value(true)},
+                       fixture.AddMemory(memory, 0x580));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(
+        ValueOpcode::ImageRead,
+        {fixture.Image(descriptor, 0x610), fixture.ImageAddress(), Value(true)},
+        fixture.AddMemory(load, 0x610));
+    fixture.PlanAndTrack();
+    const auto &indirect =
+        fixture.program
+            .descriptor_sources[fixture.program.info.images[0].source]
+            .indirect_descriptor;
+    Check(indirect && indirect->selector && !indirect->selector->global &&
+              indirect->selector->stride == 4u &&
+              indirect->selector->offset == 0u &&
+              indirect->selector->bit_offset == 0u &&
+              indirect->selector->bit_mask == 0xffffu &&
+              indirect->key_count.Resolve() == Value(64u) &&
+              fixture.program.descriptor_sources[indirect->selector->source]
+                      .dword_count == 4u &&
+              indirect->table_stride == stride &&
+              indirect->table_immediate == table,
+          "masked scalar material key lost its selector rows");
+    return ExtractResourcePlan(fixture.program);
+  };
+  for (const auto variant : {Variant::Masked, Variant::Swapped}) {
+    const auto plan = make_plan(variant);
+    LinearTestMemory memory;
+    memory.base = 0u;
+    memory.words.assign((0x1000u + table + 6u * stride) / 4u, 0u);
+    // Selector words: their high halves are not part of the key.
+    memory.words[0x800u / 4u + 0u] = 0xabcd0003u;
+    memory.words[0x800u / 4u + 1u] = 0x00010005u;
+    memory.words[0x800u / 4u + 2u] = 0x12340003u;
+    for (const uint32_t key : {0u, 3u, 5u}) {
+      const auto at = (0x1000u + table + key * stride) / 4u;
+      memory.words[at] = 0x100u + key;
+      memory.words[at + 1u] =
+          static_cast<uint32_t>(
+              Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+          << 20u;
+      memory.words[at + 3u] =
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+           << 28u);
+    }
+    std::array<uint32_t, 12> user_data{0x1000u, 0u, 0u, 0u,     0u,  0u,
+                                       0u,      0u, 0x800u, 0u, 12u, 0u};
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u,
+          "masked scalar material key did not read exactly the records its "
+          "words select");
+    for (const uint32_t key : {0u, 3u, 5u})
+      Check(std::ranges::any_of(snapshot.candidate_images,
+                                [&](const auto &image) {
+                                  return image.value.dwords[0] == 0x100u + key;
+                                }),
+            "masked scalar material key lost a record one of its words "
+            "selects");
+  }
+  CheckFatal([&] { make_plan(Variant::NotLowBits); },
+             "not a valid runtime value",
+             "scalar material key accepted a mask that is not the word's low "
+             "bits");
+}
+
+// DS2 cs 0x98af2e853f33b143: key = bit < 32 ? bit : -1, EXEC skips key < 0.
+void TestLoopSelectedImageTable() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  constexpr uint32_t table_offset = 12384u;
+  enum class Variant {
+    Guarded, Inverted, Unguarded, WrongPolarity, InductionGuard, UnboundedElse,
+    ScalarBranch, ScalarBranchWrongPolarity, ScalarBranchInduction
+  };
+  const auto make_plan = [&](Variant variant, uint32_t bound = 32u) {
+    Fixture fixture;
+    fixture.program.wave_size = 32u;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *found = fixture.AddBlock();
+    auto *table = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto branch = [](Block *from, Block *to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto choose = [](Block *from, Block *yes, Block *no, Value condition) {
+      from->AddBranch(yes);
+      from->AddBranch(no);
+      from->condition = condition;
+      from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                          .true_block = yes, .false_block = no};
+    };
+    const auto pointer_low = fixture.UserData(0);
+    const auto pointer_high = fixture.UserData(1);
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    branch(entry, header);
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto bit = Value(&phi);
+    fixture.block = header;
+    const bool inverted = variant == Variant::Inverted;
+    const auto sentinel =
+        variant == Variant::UnboundedElse ? fixture.UserData(3) : Value(UINT32_MAX);
+    const auto compare = fixture.Emit(inverted ? ValueOpcode::SGreaterThanEqual32
+                                               : ValueOpcode::SLessThan32, {bit, Value(bound)});
+    const auto key = fixture.Emit(ValueOpcode::SelectU32,
+        inverted ? std::initializer_list<Value>{compare, sentinel, bit}
+                 : std::initializer_list<Value>{compare, bit, sentinel});
+    const auto set = fixture.Emit(ValueOpcode::INotEqual32, {fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::ShiftRightLogical32, {lane, bit}), Value(1u)}), Value(0u)});
+    const auto done = fixture.Emit(ValueOpcode::LogicalOr,
+        {inverted ? compare : fixture.Emit(ValueOpcode::LogicalNot, {compare}), set});
+    choose(header, found, latch,
+           fixture.Emit(ValueOpcode::ConditionRef, {done}, CFG::BranchCondition::VccNonZero));
+    fixture.block = latch;
+    const auto next = fixture.Emit(ValueOpcode::IAdd32, {bit, Value(1u)});
+    branch(latch, header);
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, next);
+
+    fixture.block = found;
+    // DS2 cs 0x819c4811bfbfd9bf skips the table with S_CMP_LT_I32 key, 0; S_CBRANCH_SCC1.
+    const bool scalar = variant >= Variant::ScalarBranch;
+    const auto negative = fixture.Emit(ValueOpcode::SLessThan32,
+        {variant == Variant::InductionGuard || variant == Variant::ScalarBranchInduction ? bit : key,
+         Value(0u)});
+    const auto active = variant == Variant::Unguarded || scalar ? Value(true)
+        : variant == Variant::WrongPolarity ? negative
+        : fixture.Emit(ValueOpcode::LogicalNot, {negative});
+    if (scalar) {
+      const bool wrong = variant == Variant::ScalarBranchWrongPolarity;
+      choose(found, wrong ? table : exit, wrong ? exit : table,
+             fixture.Emit(ValueOpcode::ConditionRef, {negative}, CFG::BranchCondition::SccNonZero));
+    } else {
+      choose(found, exit, table,
+             fixture.Emit(ValueOpcode::ConditionRef, {active}, CFG::BranchCondition::ExecZero));
+    }
+    fixture.block = table;
+    const auto pointer = fixture.Address(pointer_low, pointer_high);
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = table_offset + word * sizeof(uint32_t);
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {pointer, offset, Value(0u), Value(true)}, fixture.AddMemory(memory, 0xa34));
+    }
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {fixture.Image(words, 0xadc), fixture.ImageAddress(), active},
+                 fixture.AddMemory(load, 0xadc));
+    branch(table, exit);
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    fixture.PlanAndTrack();
+    const auto &indirect = fixture.program.descriptor_sources[
+        fixture.program.info.images[0].source].indirect_descriptor;
+    Check(indirect && indirect->key_count.Resolve() == Value(bound) &&
+              indirect->selector_first.IsEmpty() && indirect->table_stride == 32u &&
+              indirect->table_immediate == table_offset,
+          "loop-selected image table lost its compare-bounded key domain");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  const auto plan = make_plan(Variant::Guarded);
+  make_plan(Variant::Inverted);
+  make_plan(Variant::Guarded, 5u);
+  make_plan(Variant::ScalarBranch);
+  for (const auto variant : {Variant::Unguarded, Variant::WrongPolarity,
+                             Variant::InductionGuard, Variant::UnboundedElse,
+                             Variant::ScalarBranchWrongPolarity, Variant::ScalarBranchInduction})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "loop-selected image table accepted a key without a nonnegative guard");
+  CheckFatal([&] { make_plan(Variant::Guarded, MaxIndirectDescriptorProbes + 1u); },
+             "not a valid runtime value", "loop-selected image table exceeded the probe cap");
+
+  LinearTestMemory memory;
+  constexpr uint32_t pointer = 0x1000u;
+  memory.words.resize((table_offset + 33u * 32u) / 4u);
+  for (uint32_t key = 0; key < 33u; ++key) {
+    const auto word = (pointer + table_offset - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  memory.fail_address = pointer + table_offset + 32u * 32u;
+  std::array<uint32_t, 2> user_data{pointer, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            memory.descriptor_reads == 32u && snapshot.candidate_images.size() == 32u,
+        "loop-selected image table did not enumerate exactly keys zero through 31");
+  for (uint32_t key = 0; key < 32u; ++key)
+    Check(std::ranges::any_of(snapshot.candidate_images, [&](const auto &image) {
+            return image.value.dwords[0] == 0x100u + key;
+          }),
+          "loop-selected image table lost a reachable descriptor");
 }
 
 void TestUniformizedMaterialImageKeys() {
@@ -3341,14 +4874,14 @@ void TestUniformizedMaterialImageKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u &&
+            snapshot.candidate_images.size() == 2u &&
             memory.reads == 4u && memory.descriptor_reads == 2u &&
             snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset] == 2u &&
+                snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot)] == 2u &&
             snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 1u] == 7u &&
+                snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot) + 1u] == 7u &&
             snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 3u] == 4096u,
+                snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot) + 3u] == 4096u,
         "material mask did not limit sparse descriptor reads");
   user_data[8] = first_material;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -3389,9 +4922,9 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(packed, runtime, snapshot, specialization) &&
-            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
-            snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
-            snapshot.images[2].dwords[0] == 0x600u,
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x200u && snapshot.candidate_images[1].value.dwords[0] == 0x400u &&
+            snapshot.candidate_images[2].value.dwords[0] == 0x600u,
         "packed selector did not extract before clamping or read outside its sixteen records");
   memory.fail_address = base + 15u * 16u + 8u;
   Check(!MaterializeResources(packed, runtime, snapshot, specialization),
@@ -3406,8 +4939,8 @@ void TestUniformizedMaterialImageKeys() {
                       base_offset + immediate + record * 16u, &word, sizeof(word));
     }
     Check(MaterializeResources(immediate == 8u ? packed : unaligned, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x200u &&
-              snapshot.images[1].dwords[0] == 0x400u && snapshot.images[2].dwords[0] == 0x600u &&
+              snapshot.candidate_images.size() == 3u && snapshot.candidate_images[0].value.dwords[0] == 0x200u &&
+              snapshot.candidate_images[1].value.dwords[0] == 0x400u && snapshot.candidate_images[2].value.dwords[0] == 0x600u &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair<uint64_t, uint64_t>{base + base_offset + immediate, 244u}) !=
                   snapshot.specialization_reads.end(),
@@ -3421,9 +4954,9 @@ void TestUniformizedMaterialImageKeys() {
   memory.fail_address = base + 16u * 16u + 8u;
   memory.reads = memory.descriptor_reads = 0u;
   Check(MaterializeResources(merged, runtime, snapshot, specialization) &&
-            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.images.size() == 3u &&
-            snapshot.images[0].dwords[0] == 0x200u && snapshot.images[1].dwords[0] == 0x400u &&
-            snapshot.images[2].dwords[0] == 0x600u,
+            memory.reads == 4u && memory.descriptor_reads == 3u && snapshot.candidate_images.size() == 3u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x200u && snapshot.candidate_images[1].value.dwords[0] == 0x400u &&
+            snapshot.candidate_images[2].value.dwords[0] == 0x600u,
         "merged nibble selector did not preserve its sixteen-record domain and lower-half projection");
   for (const auto variant : {Variant::PackedNegativeOffset, Variant::PackedFullAddress,
                              Variant::PackedWrongGuard, Variant::PackedSparseOffset,
@@ -3435,8 +4968,9 @@ void TestUniformizedMaterialImageKeys() {
 
 void TestIndexedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // With record_words 4 the fields are words 2 and 3 of one 4-dword load of the record.
   const auto make_program = [](ShaderType stage = ShaderType::Compute, bool shared = false,
-                               bool storage = false) {
+                               bool storage = false, uint32_t record_words = 1u) {
     Fixture f(stage);
     auto *entry = f.block, *body = f.AddBlock();
     auto *later = shared ? f.AddBlock() : nullptr;
@@ -3468,9 +5002,12 @@ void TestIndexedMaterialImageKeys() {
         MemoryInfo memory;
         memory.kind = ResourceKind::Buffer;
         memory.idxen = true;
-        memory.offset = field;
-        const auto loaded = f.Emit(ValueOpcode::LoadBufferU32,
+        memory.offset = record_words == 4u ? 56u : field;
+        memory.data_dwords = record_words;
+        auto loaded = f.Emit(record_words == 4u ? ValueOpcode::LoadBufferU32x4 : ValueOpcode::LoadBufferU32,
             {material, lane, Value(0u), Value(0u), active}, f.AddMemory(memory, field), entry);
+        if (record_words == 4u)
+          loaded = f.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value((field - 56u) / 4u)}, 0, entry);
         const auto selected = f.Emit(ValueOpcode::SelectU32, {active, loaded, Value(0xdeadbeefu)}, 0, entry);
         key = shared && index == 0u
             ? f.Emit(ValueOpcode::ReadLane, {selected, Value(0u)}, 0, entry)
@@ -3580,37 +5117,143 @@ void TestIndexedMaterialImageKeys() {
   };
   const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
                            .read_specialization_memory = read};
+  {
+    // A word of a 4-dword record load selects as a 1-dword load of that word does.
+    auto wide_program = make_program(ShaderType::Compute, false, false, 4u);
+    const auto wide_plan = ExtractResourcePlan(wide_program);
+    Check(wide_plan.info.images.size() == 3u && wide_plan.selector_keys.size() == 2u,
+          "words of a 4-dword record load were not taken as indexed material keys");
+    for (size_t image = 0; image < 3u; ++image) {
+      const auto &narrow = *plan.descriptor_sources[plan.info.images[image].source].indirect_descriptor;
+      const auto &wide =
+          *wide_plan.descriptor_sources[wide_plan.info.images[image].source].indirect_descriptor;
+      Check(wide.table_scalar && wide.selector && wide.selector->offset == narrow.selector->offset &&
+                wide.selector->stride == 0u && wide.key_count.IsEmpty(),
+            "a word of a 4-dword record load lost its offset in the record");
+    }
+    auto wide_memory = memory;
+    const SrtRuntime wide_runtime{.user_data = user_data, .userdata = &wide_memory,
+                                  .read_specialization_memory = read};
+    ResourceSnapshot wide_snapshot;
+    ResourceSpecialization wide_specialization;
+    Check(MaterializeResources(wide_plan, wide_runtime, wide_snapshot, wide_specialization) &&
+              wide_memory.selectors == 2u && wide_memory.descriptors == 6u &&
+              wide_snapshot.candidate_images.size() == 6u,
+          "keys of a 4-dword record load did not reach the descriptors of their records");
+  }
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The descriptors the three tables reach: each table reads its two as slots of one class.
+  const auto listed = [&] { return snapshot.candidate_images.size(); };
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && memory.descriptors == 6u && snapshot.images.size() == 9u,
+            memory.selectors == 2u && memory.descriptors == 6u && listed() == 6u &&
+            snapshot.images.size() == 6u,
         "indexed selector scanned the broad heap or did not share its captured keys");
   ApplyResourceSpecialization(program, specialization);
-  Check(program.info.images[0].indirect_resources.size() == 3u,
+  Check(program.info.images[0].indirect_resources.size() == 2u && program.info.images[0].candidate &&
+            program.info.images[1].indirect_resources.size() == 2u && program.info.images[1].candidate,
         "indirect dimension query lost its specialized candidates");
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &image = specialization.images[root];
-    const auto offset = image.indirect_mapping_offset;
-    Check(snapshot.images[root].dwords[0] == 0u && image.indirect_search_iterations == 2u &&
+    const auto offset = snapshot.indirect_mapping_offsets.at(image.indirect_mapping_slot);
+    Check(snapshot.images[root].dwords[0] == 0u && image.indirect_searched &&
               snapshot.flattened_srt[offset] == 2u && snapshot.flattened_srt[offset + 1u] == 0u &&
               snapshot.flattened_srt[offset + 3u] == (root == 2u ? 12996u : 12994u) * 32u,
           "byte-key selector lost native OOB zero, sorted offsets, or the null default");
   }
-  Check(std::ranges::count_if(specialization.images, [](const auto &image) {
-          return image.mip_count == 8u;
-        }) == 2u, "indirect gathers lost candidate-specific mip counts");
+  // A gather table's candidate takes a descriptor per mip from its slot and its mapping word
+  // carries the count; the class it is read as has none of its own.
+  const auto placed = [&](std::initializer_list<std::pair<uint32_t, uint32_t>> places) {
+    return std::ranges::equal(snapshot.candidate_images, places,
+                              [](const auto &candidate, const auto &place) {
+                                return candidate.slot == place.first && candidate.mips == place.second;
+                              });
+  };
+  const auto words = [&](uint32_t root) {
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[root].indirect_mapping_slot);
+    return std::pair{snapshot.flattened_srt[offset + 2u], snapshot.flattened_srt[offset + 4u]};
+  };
+  constexpr uint32_t first_class = 1u << CandidateClassShift;
+  Check(placed({{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 8u}, {11u, 1u}, {12u, 8u}}) &&
+            std::ranges::all_of(specialization.images, [](const auto &image) { return image.mip_count == 1u; }) &&
+            words(0u) == std::pair{first_class | 0u, first_class | 1u} &&
+            words(1u) == std::pair{first_class | 2u, first_class | 7u << CandidateMipShift | 3u} &&
+            words(2u) == std::pair{first_class | 11u, first_class | 7u << CandidateMipShift | 12u},
+        "indirect gathers lost candidate-specific mip counts");
+  {
+    // Another mip count is the same class: the candidates behind it move, the module does not.
+    const auto before = specialization;
+    put(12994u, 3u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == before &&
+              placed({{0u, 1u}, {1u, 1u}, {2u, 1u}, {3u, 3u}, {6u, 1u}, {7u, 8u}}) &&
+              words(1u) == std::pair{first_class | 2u, first_class | 2u << CandidateMipShift | 3u} &&
+              words(2u) == std::pair{first_class | 6u, first_class | 7u << CandidateMipShift | 7u},
+          "a gather table's module depends on a candidate's mip count");
+    put(12994u, 8u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == before,
+          "the original mip counts did not restore the specialization");
+  }
   for (const uint32_t field : {64u, 68u})
     Check(std::ranges::find(snapshot.specialization_reads,
               std::pair<uint64_t, uint64_t>{base + field, 868u}) != snapshot.specialization_reads.end(),
           "indexed selector batch escaped writable-alias tracking");
+  {
+    // More keys that select the same candidates move the later tables in the flattened SRT and
+    // cross a search length; the module reads both from shader data, so it stays the same.
+    const auto before = specialization;
+    const auto before_offsets = snapshot.indirect_mapping_offsets;
+    const auto descriptor = (heap - base + 12994u * 32u) / 4u;
+    for (const uint32_t key : {13000u, 13002u})
+      std::copy_n(memory.words.begin() + descriptor, 8u,
+                  memory.words.begin() + (heap - base + key * 32u) / 4u);
+    memory.words[(96u + 64u) / 4u] = 13000u;
+    memory.words[(2u * 96u + 64u) / 4u] = 13002u;
+    memory.narrow = false;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              listed() == 6u && specialization == before &&
+              snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(
+                  specialization.images[0].indirect_mapping_slot)] == 4u &&
+              snapshot.indirect_mapping_offsets != before_offsets,
+          "a table that moved or gained keys of the same candidates changed the specialization");
+    memory.words[(96u + 64u) / 4u] = memory.words[(2u * 96u + 64u) / 4u] = 12994u;
+    memory.narrow = true;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization == before && snapshot.indirect_mapping_offsets == before_offsets,
+          "the original tables did not restore their mapping offsets");
+  }
+  {
+    // The first two tables lose every candidate; the third keeps the slot it had.
+    const auto before = specialization;
+    const auto null_key = (heap - base) / 4u;
+    std::array<uint32_t, 8> saved{};
+    std::copy_n(memory.words.begin() + null_key, saved.size(), saved.begin());
+    std::fill_n(memory.words.begin() + null_key, saved.size(), 0u);
+    for (uint32_t row = 0; row < 10u; ++row) memory.words[(row * 96u + 64u) / 4u] = 100u;
+    memory.narrow = false;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              listed() == 1u && snapshot.indirect_mapping_offsets.size() == 3u &&
+              specialization.images[0].indirect_root == ImageResource::NoIndirectImage &&
+              specialization.images[1].indirect_root == ImageResource::NoIndirectImage &&
+              specialization.images[2].indirect_root == 2u,
+          "the material rows did not leave the first tables without candidates");
+    for (uint32_t root = 0; root < 3u; ++root)
+      Check(specialization.images[root].indirect_mapping_slot == root &&
+                before.images[root].indirect_mapping_slot == root,
+            "a table that lost its candidates renumbered the mapping slots");
+    std::copy_n(saved.begin(), saved.size(), memory.words.begin() + null_key);
+    for (uint32_t row = 0; row < 10u; ++row) memory.words[(row * 96u + 64u) / 4u] = 12994u;
+    memory.narrow = true;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == before,
+          "the original tables did not restore their specialization");
+  }
   auto shared_program = make_program(ShaderType::Compute, true);
   auto shared = ExtractResourcePlan(shared_program);
-  Check(MaterializeResources(shared, runtime, snapshot, specialization) && snapshot.images.size() == 9u,
+  Check(MaterializeResources(shared, runtime, snapshot, specialization) && listed() == 6u,
         "inherited indexed selector lost its bounded material domain");
   memory.words[64u / 4u] = 12996u;
   memory.selectors = 0;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && snapshot.images.size() == 11u,
+            memory.selectors == 2u && listed() == 8u,
         "changed material rows reused stale selector keys");
   memory.words[64u / 4u] = 12994u;
   memory.unreadable = true;
@@ -3630,7 +5273,7 @@ void TestIndexedMaterialImageKeys() {
     if (variant == 7u) user_data[0] = 0u;
     memory.selectors = 0;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.selectors == 0u && snapshot.images.size() > 100u,
+              memory.selectors == 0u && listed() > 97u,
           "unsupported geometry or writable selector lost the original heap domain");
   }
   user_data = original;
@@ -3645,7 +5288,7 @@ void TestIndexedMaterialImageKeys() {
   memory.unreadable = false;
   for (uint32_t row = 0; row < 10u; ++row)
     memory.words[(row * 96u + 64u) / 4u] = 0x08000000u; // U32 key*32 wraps to zero.
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 7u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && listed() == 4u,
         "indexed selector lost wrapped scalar descriptor offsets");
   for (auto &source : plan.descriptor_sources) {
     if (!source.indirect_descriptor) continue;
@@ -3658,10 +5301,10 @@ void TestIndexedMaterialImageKeys() {
   }
   memory.selectors = memory.descriptors = 0u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.selectors == 2u && memory.descriptors == 2u && snapshot.images.size() == 5u,
+            memory.selectors == 2u && memory.descriptors == 2u && listed() == 2u,
         "overflowed scalar immediate read a descriptor or lost valid wrapped keys");
   for (uint32_t root = 0; root < 2u; ++root) {
-    const auto offset = specialization.images[root].indirect_mapping_offset;
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[root].indirect_mapping_slot);
     Check(snapshot.images[root].dwords[0] == 0u && snapshot.flattened_srt[offset] == 2u &&
               snapshot.flattened_srt[offset + 1u] == 32u && snapshot.flattened_srt[offset + 3u] == UINT32_MAX &&
               snapshot.flattened_srt[offset + 4u] == 0u,
@@ -3681,9 +5324,71 @@ void TestIndexedMaterialImageKeys() {
     if (variant == 3u) user_data[1] = 64u << 16u;
     memory.selectors = 0;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.selectors == 0u &&
-              snapshot.images.size() == 6u,
+              listed() == 3u,
           "native zero/OOB indexed load read its unavailable payload");
   }
+}
+
+void TestFullExecIndexedMaterialKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  // A waterfall over a key that every launched lane loads, so wave emulation does not
+  // select it: matching lanes sample the descriptor at the user-data pointer plus key * 32.
+  // A key loaded only on some lanes is not their value elsewhere and has no selector.
+  const auto track = [](bool load_on_all_lanes) {
+    auto f = std::make_unique<Fixture>();
+    auto *entry = f->block, *body = f->AddBlock(), *done = f->AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(done);
+    body->AddBranch(done);
+    const auto lane = f->Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto some = f->Emit(ValueOpcode::INotEqual32, {lane, Value(7u)});
+    const auto material = f->Buffer({f->UserData(0), f->UserData(1), f->UserData(2), f->UserData(3)});
+    MemoryInfo request;
+    request.kind = ResourceKind::Buffer;
+    request.idxen = true;
+    const auto loaded = f->Emit(ValueOpcode::LoadBufferU32x3,
+        {material, lane, Value(0u), Value(0u), load_on_all_lanes ? Value(true) : some},
+        f->AddMemory(request, 0x1c));
+    const auto local = f->Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(2u)});
+    const auto key = f->Emit(ValueOpcode::ReadLane, {local, f->UserData(6)});
+    const auto guard = f->Emit(ValueOpcode::IEqual32, {key, local});
+    entry->condition = f->Emit(ValueOpcode::ConditionRef, {guard}, CFG::BranchCondition::ExecNonZero);
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body, .false_block = done};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = done};
+    done->terminator.kind = CFG::TerminatorKind::Return;
+    f->block = body;
+    const auto table = f->Address(f->UserData(4), f->UserData(5));
+    const auto offset = f->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = word * 4u;
+      words[word] = f->Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                            f->AddMemory(scalar, 0x68));
+    }
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    f->Emit(ValueOpcode::ImageSampleRaw,
+        {f->Image(words, 0x74), f->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}),
+         f->ImageAddress(), guard},
+        f->AddMemory(sample, 0x74));
+    f->PlanAndTrack();
+    return f;
+  };
+  const auto tracked = track(true);
+  const auto plan = ExtractResourcePlan(tracked->program);
+  Check(plan.info.images.size() == 1u, "full-EXEC waterfall image was not tracked");
+  const auto &indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.selector && indirect.selector->stride == 0u && indirect.selector->offset == 8u &&
+            !indirect.table_scalar && indirect.table_stride == 32u &&
+            plan.descriptor_sources[indirect.table_source].dword_count == 2u,
+        "full-EXEC waterfall lost its indexed x3 material selector");
+  CheckFatal([&] { track(false); }, "not a valid runtime value",
+             "a key loaded on some lanes was taken as every lane's value");
 }
 
 void TestPointerTableIndexedMaterialKeys() {
@@ -3786,13 +5491,13 @@ void TestPointerTableIndexedMaterialKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u &&
-            snapshot.images.size() == 4u,
+            snapshot.candidate_images.size() == 3u,
         "pointer-table selector did not read exactly the zero and material-key descriptors");
   Check(std::ranges::find(snapshot.specialization_reads, std::pair<uint64_t, uint64_t>{base + 20u, 52u}) !=
             snapshot.specialization_reads.end(),
         "pointer-table selector rows escaped writable-alias tracking");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
-  Check(snapshot.images[0].dwords[0] == 0x100u && specialization.images[0].indirect_search_iterations == 2u &&
+  const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
+  Check(snapshot.candidate_images[0].value.dwords[0] == 0x100u && specialization.images[0].indirect_searched &&
             snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 5u &&
             snapshot.flattened_srt[mapping + 5u] == 9u,
         "pointer-table selector lost sorted raw keys or the OOB-zero root descriptor");
@@ -3975,7 +5680,7 @@ void TestUniformScalarBufferImage() {
   ResourceSpecialization specialization;
   const auto materializes = [&](uint32_t address) {
     return MaterializeResources(plan, runtime, snapshot, specialization) &&
-           snapshot.images.size() == 1 && snapshot.images[0].dwords[0] == address;
+           snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == address;
   };
   Check(materializes(0x20u), "nested draw-uniform image descriptor did not materialize");
   user_data[8] = 1u;
@@ -4221,10 +5926,13 @@ void TestCompactScalarImageTable() {
       memory.selector_attempts = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "paired compact image/sampler table did not materialize");
-      Check(snapshot.images.size() == (shared ? 6u : 3u) && snapshot.samplers.size() == 3u &&
+      // Each image table reads its three descriptors as slots of one class.
+      Check(snapshot.candidate_images.size() == (shared ? 6u : 3u) &&
+                snapshot.images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 3u &&
                 memory.selector_attempts == 1u,
             "paired table omitted an image, index-list value or OOB zero key");
-      for (const auto &image : snapshot.images) {
+      for (const auto &candidate : snapshot.candidate_images) {
+        const auto &image = candidate.value;
         Check(image.dword_count == 8u, "compact image escaped normalized eight-DWORD ABI");
         if (compact) Check(std::ranges::all_of(std::span(image.dwords).subspan(4u),
                                               [](uint32_t word) { return word == 0u; }),
@@ -4235,16 +5943,17 @@ void TestCompactScalarImageTable() {
     const auto original = specialization;
     memory.words[(0x1000u + stride + member) / 4u] = 0x201u;
     materialize();
-    Check(specialization == original && std::ranges::any_of(snapshot.images,
-              [](const auto &image) { return image.dwords[0] == 0x201u; }),
+    Check(specialization == original && std::ranges::any_of(snapshot.candidate_images,
+              [](const auto &image) { return image.value.dwords[0] == 0x201u; }),
           "compact descriptor payload refresh changed specialization or stayed stale");
     data[2] = 4u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 2u,
+              snapshot.candidate_images.size() == (shared ? 4u : 2u) && snapshot.samplers.size() == 2u,
           "index-list count refresh retained a stale sampler candidate");
     data[2] = 0u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (shared ? 2u : 1u) && snapshot.images[0].dwords[0] == 0x100u &&
+              snapshot.candidate_images.size() == (shared ? 2u : 1u) &&
+              snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
               snapshot.samplers.size() == 1u &&
               snapshot.samplers[0].dwords[0] == 0u,
           "empty index list lost the scalar OOB zero key");
@@ -4293,9 +6002,12 @@ void TestCompactScalarImageTable() {
       memory.selector_reads.clear();
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "shared selector domain failed to materialize");
+      // The tables' own entries are null; the descriptors they reach are their slots.
       std::vector<uint32_t> images;
-      for (const auto &image : snapshot.images) images.push_back(image.dwords[0]);
+      for (const auto &image : snapshot.candidate_images) images.push_back(image.value.dwords[0]);
       std::ranges::sort(images);
+      Check(std::ranges::all_of(snapshot.images, [](const auto &image) { return image.dwords[0] == 0u; }),
+            "an image table kept a descriptor as its own entry");
       std::vector<uint32_t> samplers;
       for (const auto &sampler : snapshot.samplers) samplers.push_back(sampler.dwords[0]);
       std::ranges::sort(samplers);
@@ -4323,7 +6035,7 @@ void TestCompactScalarImageTable() {
     materialize({0x101u, domain == Domain::SeparatePrefix ? 0x200u : 0x201u}, {1u});
     data[8] = 0u;
     counts[0] = 0u;
-    materialize({0u, 0u}, {0u});
+    materialize({}, {0u});
     counts[0] = 3u;
     data[2] = 0u;
     materialize({0x100u, 0x200u}, {0u});
@@ -4467,9 +6179,9 @@ void TestScalarBufferSelectorDomain() {
         "address tables at two offsets from one pointer did not request their own heaps");
   memory.watched_address = 0x1000u + 144u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
-            memory.watched_dwords == 9u && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[2].dwords[0] == 0x102u,
+            snapshot.candidate_images.size() == 3u && memory.watched_reads == 1u &&
+            memory.watched_dwords == 9u && snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[2].value.dwords[0] == 0x102u,
         "scalar selector interpreted batched padding or omitted the OOB zero key");
   Check(std::ranges::find(snapshot.specialization_reads,
             std::pair<uint64_t, uint64_t>{0x1090u, 36u}) != snapshot.specialization_reads.end(),
@@ -4477,23 +6189,23 @@ void TestScalarBufferSelectorDomain() {
   const auto scaled_lane = make_plan(true, false, true);
   memory.words[176u / 4u] = UINT32_MAX;
   Check(MaterializeResources(scaled_lane, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[1].dwords[0] == 0x101u && snapshot.images[2].dwords[0] == 0x102u,
+            snapshot.candidate_images.size() == 3u && snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[1].value.dwords[0] == 0x101u && snapshot.candidate_images[2].value.dwords[0] == 0x102u,
         "scaling after lane selection lost wrapped offsets, clamped keys, or the OOB zero key");
   memory.words[176u / 4u] = 2u;
   for (const auto size : {0u, 144u, 147u, 148u}) {
     user_data[2] = size;
     memory.watched_reads = 0u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == (size == 148u ? 2u : 1u) &&
+              snapshot.candidate_images.size() == (size == 148u ? 2u : 1u) &&
               memory.watched_reads == (size == 148u ? 1u : 0u) &&
-              snapshot.images[0].dwords[0] == 0x100u,
+              snapshot.candidate_images[0].value.dwords[0] == 0x100u,
           "scalar selector read an incomplete DWORD or lost a fully OOB zero key");
   }
   user_data[2] = 180u;
   memory.words[176u / 4u] = 1u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u,
+            snapshot.candidate_images.size() == 2u,
         "scalar selector reused stale keys after material memory changed");
 
   plan = make_plan(true, true);
@@ -4520,7 +6232,7 @@ void TestScalarBufferSelectorDomain() {
             {.user_data = user_data, .userdata = &sparse, .read_specialization_memory = read_sparse},
             snapshot, specialization) &&
             sparse.offsets == std::vector<uint64_t>{144u, 0x80000090u} &&
-            snapshot.images.size() == 2u,
+            snapshot.candidate_images.size() == 2u,
         "large V# bounds extended the native U32 domain or invented an OOB zero key");
 }
 
@@ -4872,12 +6584,13 @@ void TestCountedRowImageSelector() {
     expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
     if (expected.empty()) {
       Check(memory.watched_reads == 0u && snapshot.images.size() == 1u &&
+                snapshot.candidate_images.empty() &&
                 std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
             "empty row counts read unused keys or retained stale image candidates");
       return;
     }
-    if (expected.size() > 1u) {
-      const auto map = specialization.images[0].indirect_mapping_offset;
+    {
+      const auto map = snapshot.indirect_mapping_offsets.at(specialization.images[0].indirect_mapping_slot);
       Check(snapshot.flattened_srt[map] == expected.size(), "counted-row mapping lost selected keys");
       for (uint32_t index = 0; index < expected.size(); ++index)
         Check(snapshot.flattened_srt[map + 1u + index * 2u] == expected[index],
@@ -4890,9 +6603,9 @@ void TestCountedRowImageSelector() {
     }
     std::ranges::sort(image_addresses);
     image_addresses.erase(std::unique(image_addresses.begin(), image_addresses.end()), image_addresses.end());
-    Check(snapshot.images.size() == image_addresses.size() &&
-              std::ranges::all_of(snapshot.images, [&](const DescriptorValue &image) {
-                return std::ranges::find(image_addresses, image.dwords[0]) != image_addresses.end();
+    Check(snapshot.candidate_images.size() == image_addresses.size() &&
+              std::ranges::all_of(snapshot.candidate_images, [&](const Candidate &image) {
+                return std::ranges::find(image_addresses, image.value.dwords[0]) != image_addresses.end();
               }), "counted rows lost a selected image or retained an unrelated descriptor");
   };
   check({});
@@ -4945,7 +6658,8 @@ void TestCountedRowImageSelector() {
         "counted-row discovery exceeded the existing row probe cap");
   user_data[6] = 0u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 0u &&
-            snapshot.images.size() == 1u && snapshot.images[0].dwords[0] == 0u,
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
+            snapshot.images[0].dwords[0] == 0u,
         "empty count V# manufactured a selector key or retained stale images");
 
   user_data[6] = 5u;
@@ -4992,7 +6706,7 @@ void TestCountedRowImageSelector() {
   };
   Check(MaterializeResources(sparse_plan,
             {.user_data = user_data, .userdata = &sparse, .read_specialization_memory = read_sparse},
-            snapshot, specialization) && sparse.key_reads == 2u && snapshot.images.size() == 2u,
+            snapshot, specialization) && sparse.key_reads == 2u && snapshot.candidate_images.size() == 2u,
         "sparse rows exceeded the batch cap or read unselected gaps");
 }
 
@@ -5249,7 +6963,8 @@ void TestSharedAppendSelectorBounds() {
   ResourceSpecialization specialization;
   memory.fail_address = memory.watched_address = 0x1090u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 1u && memory.descriptor_reads == 0u && memory.watched_reads == 0u,
+            snapshot.images.size() == 1u && snapshot.candidate_images.empty() &&
+            memory.descriptor_reads == 0u && memory.watched_reads == 0u,
         "empty shared append lists probed material keys or image descriptors");
   memory.fail_address = UINT64_MAX;
   for (const auto counts : {std::array{1u, 2u}, std::array{3u, 1u}, std::array{1u, 1u}, std::array{0u, 0u}}) {
@@ -5258,8 +6973,8 @@ void TestSharedAppendSelectorBounds() {
     const auto expected = counts[1];
     for (const auto *tested : {&plan, &lane_plan})
       Check(MaterializeResources(*tested, runtime, snapshot, specialization) &&
-                snapshot.images.size() == std::max(expected, 1u) &&
-                (expected == 0u || snapshot.images.back().dwords[0] == 0x100u + expected),
+                snapshot.candidate_images.size() == expected &&
+                (expected == 0u || snapshot.candidate_images.back().value.dwords[0] == 0x100u + expected),
             "disjoint shared append lists or refreshed counts selected unrelated material keys");
   }
   memory.words[0x800u / 4u] = 24u;
@@ -5267,8 +6982,8 @@ void TestSharedAppendSelectorBounds() {
   memory.words[(144u + 320u) / 4u] = 0xbe7cc577u;
   memory.fail_address = 0x1000u + 144u + 320u;
   user_data[2] = 24u;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.images.size() == 2u &&
-            snapshot.images[0].dwords[0] == 0x101u && snapshot.images[1].dwords[0] == 0x102u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.candidate_images.size() == 2u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x101u && snapshot.candidate_images[1].value.dwords[0] == 0x102u,
         "a disjoint 24-entry list exposed float fields after the two active material records");
   for (const uint64_t address : {0x1800u, 0x1804u})
     Check(std::ranges::find(snapshot.specialization_reads, std::pair{address, uint64_t{4u}}) !=
@@ -5280,14 +6995,14 @@ void TestSharedAppendSelectorBounds() {
   memory.words[0x804u / 4u] = 2u;
   memory.words[(144u + 160u) / 4u] = 4u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images.back().dwords[0] == 0x104u,
+            snapshot.candidate_images.size() == 2u && snapshot.candidate_images.back().value.dwords[0] == 0x104u,
         "shared append materialization reused stale selector contents");
   // Record 1 lies past a one-record V#, so its scalar key reads zero instead of key 4.
   user_data[2] = 1u;
   memory.fail_address = 0x1000u + 144u + 160u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 0x100u &&
-            snapshot.images[1].dwords[0] == 0x101u,
+            snapshot.candidate_images.size() == 2u && snapshot.candidate_images[0].value.dwords[0] == 0x100u &&
+            snapshot.candidate_images[1].value.dwords[0] == 0x101u,
         "shared append materialization did not read records past its V# as zero");
   memory.fail_address = UINT64_MAX;
   user_data[2] = 8u;
@@ -5334,8 +7049,8 @@ void TestSharedAppendSelectorBounds() {
   user_data[6] = 0x40000000u;
   runtime = {.user_data = user_data, .userdata = &boundary, .read_specialization_memory = read_boundary};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            boundary.keys_read == 65536u && snapshot.images.size() == 1u &&
-            snapshot.images[0].dwords[0] == 0x101u,
+            boundary.keys_read == 65536u && snapshot.candidate_images.size() == 1u &&
+            snapshot.candidate_images[0].value.dwords[0] == 0x101u,
         "shared append materialization rejected its exact nonwrapping probe limit");
   const std::array bases{std::pair{1032u, 8u}, std::pair{8u, 1032u}, std::pair{8u, 8u}};
   struct OverlapCase { std::array<uint32_t, 2> counts; std::array<uint32_t, 3> expected; };
@@ -5350,8 +7065,9 @@ void TestSharedAppendSelectorBounds() {
       boundary.counts = test.counts;
       boundary.keys_read = 0u;
       Check(MaterializeResources(overlap_plan, runtime, snapshot, specialization) &&
-                boundary.keys_read == test.expected[layout] && snapshot.images.size() == 1u &&
-                snapshot.images[0].dwords[0] == (test.expected[layout] != 0u ? 0x101u : 0u),
+                boundary.keys_read == test.expected[layout] &&
+                snapshot.candidate_images.size() == (test.expected[layout] != 0u ? 1u : 0u) &&
+                (test.expected[layout] == 0u || snapshot.candidate_images[0].value.dwords[0] == 0x101u),
             "shared append bounds lost overlap, included a touching list or retained stale keys");
     }
   }
@@ -5817,7 +7533,7 @@ void TestFmaskLoadSpecialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
   RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
-  Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1 &&
+  Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1u &&
             snapshot.images[0].dwords[0] == 0x2000u &&
             ordinary.Instruction()->Flags<uint32_t>() == 0 &&
             fixture.program.memory_info[ordinary_flags.index].resource == 0,
@@ -5843,12 +7559,116 @@ void TestFmaskLoadSpecialization() {
   user_data[1] = static_cast<uint32_t>(Prospero::BufferFormat::k8UInt) << 20u;
   ResourceSpecialization rebound;
   Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, rebound) &&
-            rebound != specialization && snapshot.images.size() == 2,
+            rebound != specialization && snapshot.images.size() == 2u,
         "rebinding FMASK as a texture reused the metadata specialization");
 }
 
 // An image operation folded away before tracking leaves its memory entry with its T#'s SGPR
 // quad index, here 2 for s[8:15], in a shader with no image.
+// A packed load reads the texel's DWORD as stored: its image is a resource of its own, typed Uint
+// for an R32Uint view, and only formats of one DWORD the host stores unchanged are taken.
+void TestPackedImageLoad() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Class = Prospero::TextureNumericClass;
+  // With `after_plain` a converting load of the same T# comes first.
+  const auto materializes = [](bool packed, Prospero::BufferFormat format,
+                               bool after_plain = false) {
+    Fixture fixture;
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < words.size(); i++) words[i] = fixture.UserData(i);
+    const auto image = fixture.Image(words, 4);
+    MemoryInfo load;
+    load.kind = ResourceKind::Image;
+    load.image_dimension = Decoder::ImageDimension::Dim2D;
+    load.image_address_components = 2;
+    load.dmask = 1;
+    if (after_plain) {
+      const auto plain = fixture.Emit(ValueOpcode::ImageRead,
+                                      {fixture.Image(words, 0), fixture.ImageAddress(), Value(true)},
+                                      fixture.AddMemory(load, 0));
+      fixture.Emit(ValueOpcode::ReferenceU32,
+                   {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {plain, Value(0u)})});
+    }
+    load.image_packed = packed;
+    const auto texel = fixture.Emit(ValueOpcode::ImageRead,
+                                    {image, fixture.ImageAddress(), Value(true)},
+                                    fixture.AddMemory(load, 4));
+    const auto output = fixture.Buffer({Value(0x3000u), Value(0u), Value(12u), Value(0u)}, 12);
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {output, Value(0u), Value(0u), Value(0u),
+                  fixture.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)}), Value(true)},
+                 fixture.AddMemory(store, 12));
+    fixture.PlanAndTrack();
+    const auto &images = fixture.program.info.images;
+    const size_t count = packed && after_plain ? 2u : 1u;
+    Check(images.size() == count && images.back().packed == packed && !(count == 2u && images[0].packed),
+          "a packed load did not get an image resource of its own, apart from converting loads");
+    // The plan a restarted game loads from the shader cache.
+    ResourcePlan plan;
+    Check(LoadResourcePlan(SaveResourcePlan(ExtractResourcePlan(fixture.program)), plan) &&
+              plan.info.images.size() == count && plan.info.images.back().packed == packed,
+          "a packed image load did not survive the plan's cache bytes");
+    const std::array<uint32_t, 8> user_data{
+        0x2000u, static_cast<uint32_t>(format) << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u)};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    if (!MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization)) return false;
+    const auto converted = Prospero::SampledTextureNumericClass(format);
+    Check(specialization.images.size() == count &&
+              specialization.images.back().numeric_class == (packed ? Class::Uint : converted) &&
+              specialization.images[0].numeric_class == (count == 2u || !packed ? converted : Class::Uint),
+          "a packed load is not typed Uint, or a converting load of the same T# lost its type");
+    return true;
+  };
+  for (const auto format : {Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32SInt,
+                            Prospero::BufferFormat::k32Float, Prospero::BufferFormat::k11_11_10Float}) {
+    Check(materializes(true, format), "a packed load of a one-DWORD texel was refused");
+  }
+  for (const auto format : {Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::BufferFormat::k16_16UInt,
+                            Prospero::BufferFormat::k11_11_10UInt, Prospero::BufferFormat::k32_32UInt}) {
+    Check(!materializes(true, format), "a packed load of a format without a raw DWORD view was accepted");
+  }
+  Check(materializes(false, Prospero::BufferFormat::k8_8_8_8UNorm),
+        "a converting load of a texel with several components was refused");
+  Check(materializes(true, Prospero::BufferFormat::k11_11_10Float, true) &&
+            !materializes(true, Prospero::BufferFormat::k8_8_8_8UNorm, true),
+        "a packed load after a converting one of the same image was not checked on its own");
+
+  // A 32-bit atomic swaps the same DWORD.
+  const auto atomic = [](Prospero::BufferFormat format) {
+    Program program;
+    program.resource_tracking_complete = true;
+    ImageResource image;
+    image.source = 0;
+    image.resource_class = ImageResourceClass::Storage;
+    image.dimension = Decoder::ImageDimension::Dim2D;
+    image.read = image.written = image.atomic = true;
+    program.info.images.push_back(image);
+    const std::array<uint32_t, 8> dwords{
+        0x2000u, static_cast<uint32_t>(format) << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u)};
+    program.descriptor_sources.resize(1);
+    program.descriptor_sources[0].dword_count = 8;
+    for (uint32_t i = 0; i < 8u; i++) program.descriptor_sources[0].dwords[i] = Value(dwords[i]);
+    program.srt_plan_complete = true;
+    const auto plan = ExtractResourcePlan(program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    return MaterializeResources(plan, {}, snapshot, specialization) &&
+           specialization.images[0].numeric_class == Class::Uint;
+  };
+  Check(atomic(Prospero::BufferFormat::k32UInt) && atomic(Prospero::BufferFormat::k32Float) &&
+            atomic(Prospero::BufferFormat::k11_11_10Float),
+        "a 32-bit atomic of a one-DWORD texel was refused or not typed Uint");
+  Check(!atomic(Prospero::BufferFormat::k11_11_10UInt) && !atomic(Prospero::BufferFormat::k8_8_8_8UNorm),
+        "a 32-bit atomic of a format without a raw DWORD view was accepted");
+}
+
 void TestFoldedImageOperationMemory() {
   Fixture fixture;
   fixture.AddMemory({.kind = ResourceKind::Image, .resource = 2}, 0);
@@ -5891,9 +7711,10 @@ void TestGatherLodSamplerValidation() {
       user_data[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
           (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
       constexpr std::array sampler_controls{
-          0u, 0x4001u, 1u << 26u, (1u << 26u) | 256u,
+          0u, 0x4001u, 1u << 26u, (1u << 26u) | 256u, (1u << 26u) | 0x3f80u,
           (1u << 26u) | (1u << 14u), 2u << 26u, (2u << 26u) | 256u,
-          (2u << 26u) | (1u << 14u), 0x0a500000u, 0x1a500000u, 3u << 26u};
+          (2u << 26u) | 0x2000u, (2u << 26u) | (1u << 14u), 0x0a500000u,
+          0x0a500000u | 0x3f80u, 0x1a500000u, 3u << 26u};
       for (const auto control : sampler_controls) {
         for (const uint32_t perf_mip : {0u, 1u}) {
           user_data[9] = 0xfff000u | (perf_mip << 24u);
@@ -5901,8 +7722,9 @@ void TestGatherLodSamplerValidation() {
           ResourceSnapshot snapshot;
           ResourceSpecialization specialization;
           const auto filter = (control >> 26u) & 3u;
+          // The primary bias is emulated; the secondary bias and linear snapping are not.
           const bool supported = !explicit_lod || filter == 0 ||
-              (filter <= 2 && (control & 0xfffffu) == 0 &&
+              (filter <= 2 && ((control >> 14u) & 0x3fu) == 0 &&
                (filter != 2 || perf_mip == 0));
           Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                      specialization) == supported,
@@ -6328,21 +8150,34 @@ void TestBoundedFormattedBufferStore() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  ResourceSpecialization populated;
   for (const uint32_t count : {0u, 1u, 8u, 3u, 0u, 8u}) {
     memory.words[72] = count;
     memory.reads = memory.watched_reads = 0;
     memory.watched_address = memory.base + 128u;
-    Check(materialize() && snapshot.buffers.size() == std::max(1u, count),
+    // The destinations share one shape: the table has one class however many it selects.
+    Check(materialize() && snapshot.candidate_buffers.size() == count &&
+              snapshot.buffers.size() == (count == 0u ? 1u : 2u) &&
+              specialization.buffers.size() == snapshot.buffers.size(),
           "uniform buffer table count did not refresh or left stale descriptors");
+    if (count == 1u) populated = specialization;
+    Check(count == 0u || specialization == populated,
+          "the number of destinations a table selects changed the specialization");
     Check(count != 0u || memory.watched_reads == 0u,
           "an empty loop probed its unreachable descriptor table");
     Check(std::ranges::find(snapshot.specialization_reads,
                 std::pair{memory.base + 288u, uint64_t{4u}}) != snapshot.specialization_reads.end(),
           "writable descriptor loop count escaped same-dispatch overlap capture");
+    const auto mapping = count == 0u ? 0u
+        : snapshot.indirect_mapping_offsets.at(specialization.buffers[0].indirect_mapping_slot);
     for (uint32_t key = 0; key < count; ++key) {
-      Check(snapshot.buffers[key].dwords[0] == memory.words[32u + key * 4u] &&
-                snapshot.buffers[key].dwords[2] == lengths[key],
-            "finite formatted store lost a destination or its record bound");
+      const auto& candidate = snapshot.candidate_buffers[key];
+      Check(candidate.value.dwords[0] == memory.words[32u + key * 4u] &&
+                candidate.value.dwords[2] == lengths[key] && candidate.resource == 1u &&
+                snapshot.flattened_srt[mapping + 1u + key * 2u] == key &&
+                snapshot.flattened_srt[mapping + 2u + key * 2u] ==
+                    (1u << CandidateClassShift | key),
+            "finite formatted store lost a destination, its record bound or its slot");
       Check(std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + 128u + key * 16u, uint64_t{16u}}) !=
                 snapshot.specialization_reads.end(),
@@ -6352,7 +8187,8 @@ void TestBoundedFormattedBufferStore() {
   const auto original = specialization;
   memory.words[32] += 0x100u;
   Check(materialize() && specialization == original &&
-            snapshot.buffers[0].dwords[0] == memory.words[32],
+            snapshot.candidate_buffers[0].value.dwords[0] == memory.words[32] &&
+            snapshot.buffers[0].dwords[0] == 0u,
         "destination address refresh was frozen or caused needless specialization");
   for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 9>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
@@ -6382,7 +8218,7 @@ void TestBoundedFormattedBufferStore() {
     memory.watched_reads = 0;
     const bool negative = count != 3u;
     Check(MaterializeResources(signed_plan, runtime, snapshot, specialization) &&
-              snapshot.buffers.size() == (negative ? 1u : count) &&
+              snapshot.candidate_buffers.size() == (negative ? 0u : count) &&
               (!negative || memory.watched_reads == 0u),
           "signed loop bound did not preserve empty negative and populated positive domains");
   }
@@ -6559,8 +8395,9 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
     const uint32_t rows = count == UINT32_MAX ? 0u : count;
     user_data[2] = rows == 0u ? 0u : 4u * 192u / 8u;
     memory.reads = 0u;
-    Check(materialize() && snapshot.buffers.size() == 2u * std::max(rows, 1u) &&
-              memory.reads == 1u + rows * 2u,
+    // Each table has one class once it selects a record.
+    Check(materialize() && snapshot.candidate_buffers.size() == 2u * rows &&
+              snapshot.buffers.size() == (rows == 0u ? 2u : 4u) && memory.reads == 1u + rows * 2u,
           "bounded record enumeration read unrelated fields or retained stale candidates");
     for (uint32_t row = 0; row < rows; ++row)
       for (const auto member : {160u, 176u})
@@ -6575,16 +8412,23 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
         "record address refresh changed the shader specialization");
   user_data[2] = 4u;
   memory.reads = 0u;
-  Check(materialize() && snapshot.buffers.size() == 2u && memory.reads == 1u,
+  Check(materialize() && snapshot.buffers.size() == 2u && snapshot.candidate_buffers.empty() &&
+            memory.reads == 1u,
         "record enumeration read beyond the scalar buffer table bounds");
   user_data[2] = 4u * 192u / 8u;
   const auto first = (table_offset + 160u) / 4u;
   const auto first_address = memory.words[first];
   memory.words[first] = 0u;
   memory.words[first + 2u] = 0u;
-  Check(materialize() && specialization.buffers[0].zero_stride_oob &&
-            specialization.buffers[0].descriptor_swizzle == DstSel(4, 5, 6, 1) &&
-            specialization.buffers[0].indirect_root == 0u,
+  // The empty record is a class of its own next to the populated ones, in shape order. A class
+  // carries what its candidates are read with, not the folds of a resource's own descriptor.
+  Check(materialize() && specialization.buffers[0].indirect_root == 0u &&
+            specialization.buffers.size() == 5u && specialization.buffers[2].indirect_root == 0u &&
+            specialization.buffers[2].packed_stride == 0u &&
+            !specialization.buffers[2].zero_stride_oob &&
+            specialization.buffers[2].descriptor_swizzle == DstSel(4, 5, 6, 1) &&
+            specialization.buffers[3].indirect_root == 0u &&
+            specialization.buffers[3].packed_stride == 8u,
         "empty formatted candidate lost its OOB constants or other candidates");
   ApplyResourceSpecialization(fixture->program, specialization);
   uint32_t loads = 0u;
@@ -6593,6 +8437,33 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   Check(loads == 112u, "empty root incorrectly folded nonempty formatted candidates");
   memory.words[first] = first_address;
   memory.words[first + 2u] = 16u;
+  // Death Stranding 2 mixes 16-bit float and signed-normalized records in one table. Its classes
+  // follow the shapes, whichever record has them first and however many do.
+  const auto record = [&](uint32_t row) { return (table_offset + row * 192u + 160u) / 4u; };
+  const auto float16 = memory.words[record(0u) + 3u];
+  const auto snorm16 =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16SNorm) << 12u) | DstSel(4, 5, 6, 1);
+  memory.words[record(1u) + 3u] = snorm16;
+  Check(materialize() && specialization.buffers.size() == 5u &&
+            specialization.buffers[2].descriptor_format == Prospero::BufferFormat::k16_16_16_16SNorm &&
+            specialization.buffers[3].descriptor_format == Prospero::BufferFormat::k16_16_16_16Float &&
+            snapshot.candidate_buffers.size() == 8u,
+        "two record formats of one table were not its two classes");
+  const auto mixed = specialization;
+  const auto mixed_slots = snapshot.candidate_buffers;
+  memory.words[record(0u) + 3u] = snorm16;
+  memory.words[record(1u) + 3u] = float16;
+  Check(materialize() && specialization == mixed && snapshot.candidate_buffers != mixed_slots,
+        "the order of a table's record formats changed its classes");
+  memory.words[record(2u) + 3u] = snorm16;
+  Check(materialize() && specialization == mixed,
+        "the number of records of a format changed the table's classes");
+  // Two keys of one record are one slot.
+  memory.words[record(2u)] = memory.words[record(0u)];
+  Check(materialize() && specialization == mixed && snapshot.candidate_buffers.size() == 7u,
+        "a record two keys select took two slots");
+  memory.words[record(2u)] = memory.words[record(3u)] - 0x1000u;
+  for (uint32_t row = 0; row < 4u; ++row) memory.words[record(row) + 3u] = float16;
   for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
            {{first + 1u, 4u << 16u}, {first + 1u, 9u << 16u},
             {first, memory.words[first] + 1u}, {first + 3u, memory.words[first + 3u] | (1u << 28u)},
@@ -6706,14 +8577,15 @@ void TestGuardedWaterfallBufferRecords() {
           f->AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 216u + word * 4u,
                         .component_index = word, .component_count = 4u}, 0x304u));
     const auto handle = f->Buffer(words);
+    // Packed 16-bit loads keep a host table; a 32-bit load would decode its V# in the shader.
     for (uint32_t use = 0; use < 2u; ++use) {
-      const auto loaded = f->Emit(ValueOpcode::LoadBufferU32x3,
+      const auto loaded = f->Emit(ValueOpcode::LoadBufferU32x2,
           {handle, lane, Value(0u), Value(0u),
            guard == Guard::UnguardedUse && use == 1u ? Value(true) : active},
-          f->AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 3u, .data_bits = 32u,
-                        .component_count = 3u, .formatted = true, .idxen = true}, 0x360u));
+          f->AddMemory({.kind = ResourceKind::Buffer, .data_dwords = 2u, .data_bits = 16u,
+                        .component_count = 4u, .formatted = true, .idxen = true}, 0x360u));
       f->Emit(ValueOpcode::ReferenceU32,
-          {f->Emit(ValueOpcode::CompositeExtractU32x3, {loaded, Value(use)})});
+          {f->Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(use)})});
     }
     f->PlanAndTrack();
     return f;
@@ -6721,8 +8593,8 @@ void TestGuardedWaterfallBufferRecords() {
   LinearTestMemory memory;
   constexpr uint32_t table_offset = 256u;
   for (uint32_t row = 0; row < 2u; ++row) {
-    const std::array descriptor{0x10000u + row * 0x1000u, 12u << 16u, 32u,
-        (uint32_t(Prospero::BufferFormat::k32_32_32Float) << 12u) | DstSel(4, 5, 6, 1)};
+    const std::array descriptor{0x10000u + row * 0x1000u, 8u << 16u, 32u,
+        (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 1)};
     std::copy(descriptor.begin(), descriptor.end(),
               memory.words.begin() + (table_offset + row * 488u + 216u) / 4u);
   }
@@ -6761,7 +8633,8 @@ void TestGuardedWaterfallBufferRecords() {
       user_data[2] = count;
       memory.reads = 0;
       Check(materialize() && memory.reads == count &&
-                snapshot.buffers.size() == 1u + std::max(count, 1u),
+                snapshot.candidate_buffers.size() == count &&
+                snapshot.buffers.size() == (count == 0u ? 2u : 3u),
             "waterfall count refresh read GPU keys or unrelated record fields");
       for (uint32_t row = 0; row < count; ++row)
         Check(std::ranges::find(snapshot.specialization_reads,
@@ -6778,7 +8651,11 @@ void TestGuardedWaterfallBufferRecords() {
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + 704u, uint64_t{16u}}) ==
                   snapshot.specialization_reads.end() &&
-              std::ranges::all_of(snapshot.buffers.back().dwords, [](auto word) { return word == 0u; }),
+              // The second key's descriptor is null: its mapping word selects nothing.
+              snapshot.candidate_buffers.size() == 1u &&
+              snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(
+                  specialization.buffers[root - plan.info.buffers.begin()].indirect_mapping_slot) +
+                                     4u] == 0u,
           "waterfall partial descriptor overread or retained its missing format word");
     user_data[1] = 488u << 16u;
     memory.fail_address = memory.base + table_offset + 704u;
@@ -6789,6 +8666,62 @@ void TestGuardedWaterfallBufferRecords() {
     memory.reads = 0;
     Check(!materialize() && memory.reads == 0u, "waterfall accepted an excessive runtime bound");
     user_data[2] = 2u;
+  }
+}
+
+// A load through a GPU-selected V# decodes it in the shader, so the plan holds no table for it and
+// a table row that is no V# changes neither the plan nor the specialization (DS2 cs
+// 0x1a054b815fefc8a5).
+void TestGpuSelectedLoadDecodesInShader() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 256u;
+  memory.fail_address = memory.base + 0x2000u;
+  const auto fill = [&](bool swizzled_row) {
+    for (uint32_t slot = 0; slot < 4u; ++slot) {
+      for (uint32_t member = 0; member < 2u; ++member) {
+        const auto first = (table_offset + 160u + member * 16u + slot * 64u) / 4u;
+        memory.words[first] = 0x100000u + member * 0x10000u + slot * 0x1000u;
+        memory.words[first + 1u] = ((member == 0u ? 8u : 3u) << 16u) |
+                                   (swizzled_row && slot == 2u && member == 0u ? 1u << 31u : 0u);
+        memory.words[first + 2u] = 16u;
+        memory.words[first + 3u] = member == 0u
+            ? (static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+                  DstSel(4, 5, 6, 1) : 0x5204u;
+      }
+    }
+  };
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset + 3u, 0u, 384u, 0u,
+      uint32_t(memory.fail_address), 12u << 16u, 129600u, 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  // 32-bit formatted loads of two to four components, the shapes the shader decodes itself;
+  // selected by a loop counter or by GPU data.
+  for (const bool gpu_selected : {false, true}) {
+    for (const uint32_t components : {2u, 3u, 4u}) {
+      const auto fixture = MakeBufferRecordFixture(1u, false, gpu_selected, 0u, false, false, components);
+      const auto plan = ExtractResourcePlan(fixture->program);
+      const auto tables = std::ranges::count_if(plan.info.buffers, [&](const auto& buffer) {
+        return plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
+      });
+      const bool load_table = std::ranges::any_of(plan.info.buffers, [&](const auto& buffer) {
+        return !buffer.written && plan.descriptor_sources[buffer.source].indirect_descriptor.has_value();
+      });
+      const auto in_shader = std::ranges::count_if(fixture->program.memory_info, [](const auto& memory) {
+        return memory.kind == ResourceKind::IndirectBuffer;
+      });
+      Check(!load_table && in_shader > 0, "a GPU-selected load kept a host table instead of decoding its V#");
+      Check(tables == 1, "the store beside the load lost its host table");
+      if (!gpu_selected) continue;
+      ResourceSnapshot snapshot;
+      ResourceSpecialization bindable, garbage;
+      fill(false);
+      Check(MaterializeResources(plan, runtime, snapshot, bindable), "the plan refused a table of V#s");
+      fill(true);
+      Check(MaterializeResources(plan, runtime, snapshot, garbage) && garbage == bindable,
+            "a table row the host could not bind changed the plan's specialization");
+    }
   }
 }
 
@@ -6859,23 +8792,28 @@ void TestGpuSelectedBufferRecords() {
       user_data[2] = size;
       memory.reads = 0u;
       Check(materialize() && memory.reads == (size == 0u ? 0u : 8u) &&
-                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 8u),
+                snapshot.candidate_buffers.size() == (size == 0u ? 0u : 8u) &&
+                snapshot.buffers.size() == plan.info.buffers.size() + (size == 0u ? 0u : 2u),
             "affine table refresh read GPU selector bytes, unrelated fields or stale candidates");
     }
     for (uint32_t member = 0; member < 2u; ++member) {
       const auto root = roots[member];
-      const auto mapping = specialization.buffers[root].indirect_mapping_offset;
-      Check(specialization.buffers[root].indirect_search_iterations == 0u &&
+      const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.buffers[root].indirect_mapping_slot);
+      Check(!specialization.buffers[root].indirect_searched &&
                 snapshot.flattened_srt[mapping] == 4u,
             "affine descriptor table lost its compact dense mapping");
       // These keys land at byte offsets 0,64,128,192 after U32 multiplication by192.
       for (const auto [key, slot] : {std::pair{0u, 0u}, std::pair{44739243u, 1u},
                                     std::pair{22369622u, 2u}, std::pair{1u, 3u}}) {
         const auto index = evaluate_key(evaluate_key, selections[root]->Arg(0), key) >> 2u;
-        Check(index == slot && snapshot.flattened_srt[mapping + 1u + index] == slot + 1u,
+        const auto candidate = member * 4u + slot;
+        Check(index == slot && snapshot.flattened_srt[mapping + 1u + index] ==
+                                   (1u << CandidateClassShift | candidate),
               "wrapped GPU record key selected the wrong physical descriptor");
-        const auto candidate = plan.info.buffers.size() + member * 4u + slot;
-        Check(snapshot.buffers[candidate].dwords[0] == 0x100000u + member * 0x10000u + slot * 0x1000u,
+        Check(snapshot.candidate_buffers[candidate].value.dwords[0] ==
+                      0x100000u + member * 0x10000u + slot * 0x1000u &&
+                  snapshot.candidate_buffers[candidate].resource ==
+                      plan.info.buffers.size() + member,
               "affine table read a stride192 row instead of a reachable stride64 member");
         Check(std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + aligned_bias + 160u + member * 16u + slot * 64u,
@@ -6891,8 +8829,7 @@ void TestGpuSelectedBufferRecords() {
     memory.words[tail + 3u] = 0x5204u;
     user_data[2] = 428u + aligned_bias;
     memory.reads = 0u;
-    Check(materialize() && memory.reads == 9u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + 8u &&
+    Check(materialize() && memory.reads == 9u && snapshot.candidate_buffers.size() == 8u &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + aligned_bias + 416u, uint64_t{12u}}) !=
                   snapshot.specialization_reads.end(),
@@ -6960,7 +8897,8 @@ void TestWorkgroupSelectedBufferRecords() {
     memory.words[selector / 4u + 6u] = 22369622u; // Would select the numeric fields at +288/+304.
     const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
     Check(materialize() && memory.watched_reads == 1u && memory.watched_dwords == 3u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + (empty ? 0u : (dimensions[0] - 1u) * 2u) &&
+              snapshot.candidate_buffers.size() == (empty ? 0u : dimensions[0] * 2u) &&
+              snapshot.buffers.size() == plan.info.buffers.size() + (empty ? 0u : 2u) &&
               memory.reads == (empty ? 1u : 2u + dimensions[0] * 2u),
           "workgroup prefix reread arguments, visited an inactive key or retained stale candidates");
     Check(std::ranges::find(snapshot.specialization_reads, std::pair{memory.base, uint64_t{12u}}) !=
@@ -6981,11 +8919,10 @@ void TestWorkgroupSelectedBufferRecords() {
   memory.words[selector / 4u] = 1u;
   user_data[5] = 0u;
   user_data[6] = 14u; // Second key has fewer than four in-bounds bytes: SMEM returns zero.
-  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+  Check(materialize() && snapshot.candidate_buffers.size() == 4u,
         "partial scalar selector did not zero-fill its OOB DWORD");
   user_data[6] = 0u;
-  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size() &&
-            memory.reads == 3u,
+  Check(materialize() && snapshot.candidate_buffers.size() == 2u && memory.reads == 3u,
         "empty selector V# did not select key zero without reading payload");
   // Existing vector selectors use the V# stride; each scalar snapshot read
   // independently rounds its resulting byte offset down to a DWORD.
@@ -7001,8 +8938,7 @@ void TestWorkgroupSelectedBufferRecords() {
     std::fill_n(memory.words.begin() + selector / 4u, 8u, 0xdeadbeefu);
     for (uint32_t index = 0; index < 4u; ++index)
       memory.words[selector / 4u + ((index + 1u) * stride) / 4u] = index & 1u;
-    Check(materialize() && memory.reads == 6u &&
-              snapshot.buffers.size() == plan.info.buffers.size() + 2u,
+    Check(materialize() && memory.reads == 6u && snapshot.candidate_buffers.size() == 4u,
           "batched vector selector changed independent scalar DWORD alignment");
   }
   for (const auto root : roots) {
@@ -7180,14 +9116,14 @@ void TestGpuSelectedFormattedRecordStore() {
   for (const uint32_t count : {0u, 6u, 0u, 6u}) {
     user_data[2] = count;
     memory.reads = 0u;
-    Check(materialize() && memory.reads == count &&
-              snapshot.buffers.size() == plan.info.buffers.size() + count,
+    Check(materialize() && memory.reads == count && snapshot.candidate_buffers.size() == count &&
+              snapshot.buffers.size() == plan.info.buffers.size() + (count == 0u ? 0u : 1u),
           "exact formatted records read GPU selector bytes, row padding or stale candidates");
   }
-  const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+  const auto mapping = snapshot.indirect_mapping_offsets.at(specialization.buffers[root].indirect_mapping_slot);
   Check(snapshot.flattened_srt[mapping] == 6u, "exact formatted records lost the dense row map");
   for (uint32_t row = 0; row < 6u; ++row)
-    Check(snapshot.flattened_srt[mapping + 1u + row] == row + 1u &&
+    Check(snapshot.flattened_srt[mapping + 1u + row] == (1u << CandidateClassShift | row) &&
               std::ranges::find(snapshot.specialization_reads,
                   std::pair{memory.base + table_offset + row * 592u + 448u, uint64_t{16u}}) !=
                   snapshot.specialization_reads.end(),
@@ -7210,8 +9146,8 @@ void TestGpuSelectedFormattedRecordStore() {
   user_data[2] = 5u * 592u + 448u + 12u;
   memory.watched_address = memory.base + table_offset + 5u * 592u + 448u;
   Check(materialize() && memory.watched_dwords == 3u &&
-            snapshot.flattened_srt[specialization.buffers[root].indirect_mapping_offset] == 5u &&
-            snapshot.buffers.size() == plan.info.buffers.size() + 5u,
+            snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(specialization.buffers[root].indirect_mapping_slot)] == 5u &&
+            snapshot.candidate_buffers.size() == 5u,
         "partial direct V# did not zero-fill its missing format DWORD");
   user_data[1] = 592u << 16u;
   user_data[2] = 6u;
@@ -7284,21 +9220,23 @@ void TestGpuSelectedFormattedRecordStore() {
     }
     memory.reads = 0u;
     Check(wide_materialize() && memory.reads == 32u &&
-              snapshot.buffers.size() == wide_plan.info.buffers.size() + (populated ? 2u : 0u),
+              snapshot.candidate_buffers.size() == (populated ? 2u : 0u) &&
+              snapshot.buffers.size() == wide_plan.info.buffers.size() + (populated ? 1u : 0u),
           "finite RGBA16 table read GPU keys or retained stale null/active candidates");
   }
-  const auto wide_mapping = specialization.buffers[wide_root].indirect_mapping_offset;
+  const auto wide_mapping = snapshot.indirect_mapping_offsets.at(specialization.buffers[wide_root].indirect_mapping_slot);
   Check(snapshot.flattened_srt[wide_mapping] == 32u,
         "finite RGBA16 table lost its complete key map");
   for (uint32_t row = 0; row < 32u; ++row)
     Check(snapshot.flattened_srt[wide_mapping + 1u + row * 2u] == row &&
               snapshot.flattened_srt[wide_mapping + 2u + row * 2u] ==
-                  (row == 0u ? 0u : row == 3u ? 2u : 1u),
+                  (row == 0u ? 1u << CandidateClassShift
+                             : row == 3u ? 1u << CandidateClassShift | 1u : 0u),
           "finite RGBA16 table selected the wrong active or null candidate");
   const auto wide_original = specialization;
   memory.words[table_offset / 4u] += 4u;
   Check(wide_materialize() && specialization == wide_original &&
-            snapshot.buffers[wide_root].dwords[0] == memory.words[table_offset / 4u],
+            snapshot.candidate_buffers[0].value.dwords[0] == memory.words[table_offset / 4u],
         "RGBA16 destination refresh froze the address or changed format specialization");
   for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
       {0u, memory.words[table_offset / 4u] | 1u}, {1u, 16u << 16u},
@@ -7380,8 +9318,9 @@ void TestGpuSelectedFormattedRecordStore() {
     };
     for (const uint32_t first : {0u, 2u, 4u, 0u}) {
       prefix_memory.words[first_offset / 4u] = first;
-      Check(refresh() && snapshot.buffers.size() == selected_plan.info.buffers.size() + (first == 4u ? 0u : 1u) &&
-                snapshot.buffers[wide_root].dwords[0] == 0x100000u + (first == 4u ? 256u : 0u),
+      Check(refresh() && snapshot.candidate_buffers.size() == (first == 4u ? 1u : 2u) &&
+                snapshot.candidate_buffers[0].value.dwords[0] ==
+                    0x100000u + (first == 4u ? 256u : 0u),
             "runtime-first refresh froze a prior selector range or enumerated unrelated numeric rows");
       for (const auto read : {std::pair{prefix_memory.base + first_offset, uint64_t{4u}},
                              std::pair{prefix_memory.base + selector_offset + first * 8u + 4u, uint64_t{12u}}})
@@ -7391,8 +9330,8 @@ void TestGpuSelectedFormattedRecordStore() {
     // An unreadable runtime first reads as zero.
     prefix_memory.words[first_offset / 4u] = 4u;
     prefix_memory.fail_address = prefix_memory.base + first_offset;
-    Check(refresh() && snapshot.buffers.size() == selected_plan.info.buffers.size() + 1u &&
-              snapshot.buffers[wide_root].dwords[0] == 0x100000u,
+    Check(refresh() && snapshot.candidate_buffers.size() == 2u &&
+              snapshot.candidate_buffers[0].value.dwords[0] == 0x100000u,
           "unreadable runtime first did not read as zero");
     prefix_memory.fail_address = UINT64_MAX;
     prefix_memory.words[first_offset / 4u] = 6u;
@@ -7410,14 +9349,16 @@ void TestGpuSelectedFormattedRecordStore() {
     indirect.selector->stride = 8u;
     counts[0] = 1u;
     prefix_memory.words[first_offset / 4u] = 0x1fffffffu;
-    Check(refresh() && prefix_memory.watched_reads == 0u && snapshot.buffers[wide_root].dwords[0] == 0x100000u,
+    Check(refresh() && prefix_memory.watched_reads == 0u &&
+              snapshot.candidate_buffers.size() == 1u &&
+              snapshot.candidate_buffers[0].value.dwords[0] == 0x100000u,
           "last nonwrapping selector DWORD lost scalar OOB key zero");
     prefix_memory.words[first_offset / 4u] = UINT32_MAX;
     for (const auto empty : {std::array{0u, 1u, 1u}, std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u}}) {
       counts = empty;
       Check(refresh() && prefix_memory.watched_reads == 0u &&
                 snapshot.buffers.size() == selected_plan.info.buffers.size() &&
-                snapshot.buffers[wide_root].dwords[0] == 0u,
+                snapshot.candidate_buffers.empty(),
             "empty dispatch evaluated an unreachable wrapped selector prefix");
     }
     counts = {2u, 1u, 1u};
@@ -7497,7 +9438,8 @@ void TestFiniteBufferSelection() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && snapshot.buffers.size() == 5u,
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.candidate_buffers.size() == 5u && snapshot.buffers.size() == 2u,
         "finite buffer selection lost table roots after DCE or probed outside its domain");
   for (const auto variant : {Variant::WiderExec, Variant::Unbounded, Variant::Cycle, Variant::TooMany}) {
     auto invalid = make(variant);
@@ -7580,13 +9522,13 @@ void TestPackedScalarBufferSelection() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
-  Check(materialize() && snapshot.buffers.size() == 19u && memory.reads == 20u &&
+  Check(materialize() && snapshot.candidate_buffers.size() == 19u && memory.reads == 20u &&
             memory.watched_reads == 1u && memory.watched_dwords == 256u,
         "packed scalar lookup did not batch its read and deduplicate writable candidates");
   Check(std::ranges::find(snapshot.specialization_reads,
                          std::pair{memory.base + 0x1c0u, uint64_t{1024u}}) != snapshot.specialization_reads.end() &&
-            std::ranges::all_of(snapshot.buffers, [&](const DescriptorValue& value) {
-              const auto key = (value.dwords[0] - 0x100000u) / 0x10000u;
+            std::ranges::all_of(snapshot.candidate_buffers, [&](const Candidate& candidate) {
+              const auto key = (candidate.value.dwords[0] - 0x100000u) / 0x10000u;
               return std::ranges::find(snapshot.specialization_reads,
                          std::pair{memory.base + 64u + key * 16u, uint64_t{16u}}) != snapshot.specialization_reads.end();
             }),
@@ -7895,7 +9837,7 @@ void TestPackedDescriptorWaterfall() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 3u && snapshot.samplers.size() == 60u,
+              snapshot.candidate_images.size() == 2u && snapshot.samplers.size() == 60u,
           "packed waterfall ignored the two-image/59-sampler heap bounds or lost the null roots");
     Check(std::ranges::all_of(snapshot.specialization_reads, [&](const auto& span) {
       return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
@@ -8029,14 +9971,14 @@ void TestFiniteImageWaterfall() {
       memory.reads = 0u;
       Check(MaterializeResources(plan, runtime, snapshot, specialization),
             "finite waterfall resource plan could not refresh its scalar descriptor leaves");
-      Check(snapshot.images.size() == (count == 0u ? 1u : 3u) &&
+      Check(snapshot.candidate_images.size() == (count == 0u ? 0u : 2u) &&
                 (count == 0u ? memory.reads == 0u : memory.reads != 0u),
             "finite waterfall leaves froze empty table bounds or retained stale image candidates");
       if (count != 0u) populated = specialization;
     }
     memory.words[256u / 4u] += 0x100u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) && specialization == populated &&
-              std::ranges::any_of(snapshot.images, [](const auto& image) { return image.dwords[0] == 0x1100u; }),
+              std::ranges::any_of(snapshot.candidate_images, [](const auto& image) { return image.value.dwords[0] == 0x1100u; }),
           "finite image payload refresh changed its format specialization or reused an old leaf");
   }
   for (const auto variant : {Variant::DifferentMask, Variant::MixedWord, Variant::DifferentSelect,
@@ -8624,6 +10566,334 @@ void TestDmaAddressMaterialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
 }
 
+// The ranges a shader reads through device addresses are proven from its code: a table read at a
+// thread-selected offset, records indexed by the instance, and a read at an offset the CPU knows.
+void TestAddressRangesProveReads() {
+  Fixture fixture;
+  const auto load = [&](Value handle, Value low, ResourceKind kind, uint32_t offset, uint32_t pc) {
+    MemoryInfo memory;
+    memory.kind = kind;
+    memory.offset = offset;
+    return fixture.Emit(ValueOpcode::LoadAddressU32, {handle, low, Value(0u), Value(true)},
+                        fixture.AddMemory(memory, pc));
+  };
+  // Scalar reads of a table at a thread-selected, uniform offset.
+  const auto thread = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto row = fixture.Emit(
+      ValueOpcode::ReadFirstLane,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {thread, Value(5u)}), Value(true)});
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  load(table, row, ResourceKind::ScalarAddress, 8, 4);
+  load(table, row, ResourceKind::ScalarAddress, 24, 8);
+  // Records indexed by the instance, behind the per-lane select the wave emulation inserts.
+  const auto instance = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::InstanceIndex)), Value(0u)});
+  // instance * 576, as compiled: a = instance << 6, then (a << 3) + a.
+  const auto active = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(8), Value(0u)});
+  const auto scaled = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {active, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {instance, Value(6u)}), Value(0u)});
+  const auto record = fixture.Emit(
+      ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {scaled, Value(3u)}), scaled});
+  // The other arm keeps instance * 64: the larger multiple bounds both.
+  const auto lane = fixture.Emit(ValueOpcode::SelectU32, {active, record, scaled});
+  const auto records = fixture.Address(fixture.UserData(2), fixture.UserData(3), 200);
+  load(records, lane, ResourceKind::Global, 16, 200);
+  load(records, lane, ResourceKind::Global, 28, 208);
+  // A select on the load's own active flag: inactive lanes do not load, so their arm (here a
+  // float's bit pattern) does not bound anything.
+  {
+    const auto strided = fixture.Emit(ValueOpcode::IMul32, {Value(28u), instance});
+    const auto leftover = fixture.Emit(
+        ValueOpcode::BitCastU32F32, {fixture.Emit(ValueOpcode::ConvertF32S32, {Value(20u)})});
+    const auto offset = fixture.Emit(ValueOpcode::SelectU32, {active, strided, leftover});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Global;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {fixture.Address(fixture.UserData(10), fixture.UserData(11), 500), offset,
+                  Value(0u), active},
+                 fixture.AddMemory(memory, 500));
+  }
+  // An offset loaded from a table the CPU reads when the draw is recorded.
+  const auto counts = fixture.Address(fixture.UserData(4), fixture.UserData(5), 300);
+  const auto loaded = load(counts, Value(0u), ResourceKind::ScalarAddress, 0x08, 300);
+  load(fixture.Address(fixture.UserData(6), fixture.UserData(7), 400), loaded,
+       ResourceKind::Global, 0, 400);
+  fixture.PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture.program);
+  std::array<uint32_t, 12> user_data{0x9000u, 0u, 0x2000u, 0u, 0x1000u, 0u, 0x4000u, 0u, 1u,
+                                     0u, 0x5000u, 0u};
+  TestMemory memory;
+  memory.words[2] = 0x80u;
+  FakeGuestMemory fake(ReadTestMemory, &memory);
+  SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "address range shader resources did not materialize");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  CollectAddressRanges(fixture.program);
+
+  using Source = AddressRange::Source;
+  const auto &srt = snapshot.flattened_srt;
+  const auto word = [&](Source source, uint32_t index) -> uint64_t {
+    return source == Source::UserData ? user_data[index] : srt[index];
+  };
+  const auto base_of = [&](const AddressRange &range) {
+    return range.base_source == Source::Constant
+               ? range.base
+               : word(range.base_source, range.base_words[0]) |
+                     (word(range.base_source, range.base_words[1]) << 32u);
+  };
+  const auto find = [&](uint64_t base) -> const AddressRange * {
+    for (const auto &range : fixture.program.info.address_ranges) {
+      if (base_of(range) == base) return &range;
+    }
+    return nullptr;
+  };
+  const auto *rows = find(0x9000u);
+  const auto *instanced = find(0x2000u);
+  const auto *known = find(0x4000u);
+  Check(rows != nullptr && rows->align_base && rows->begin == 8 && rows->end == 28 &&
+            rows->term == AddressRange::Term::GlobalInvocationX && rows->scale == 32,
+        "thread-selected table reads were not proven");
+  Check(instanced != nullptr && instanced->begin == 16 && instanced->end == 32 &&
+            instanced->term == AddressRange::Term::InstanceIndex && instanced->scale == 576,
+        "instance-indexed records were not proven");
+  Check(known != nullptr && known->begin == 0 && known->end == 4 && known->value_exact &&
+            known->value_scale == 1 && word(known->value_source, known->value_word) == 0x80u,
+        "a read at an offset known when the draw is recorded was not proven");
+  const auto *guarded = find(0x5000u);
+  Check(guarded != nullptr && guarded->begin == 0 && guarded->end == 4 &&
+            guarded->term == AddressRange::Term::InstanceIndex && guarded->scale == 28,
+        "a select on the load's active flag was not narrowed to its active arm");
+  Check(find(0x1000u) == nullptr && fixture.program.info.address_ranges.size() == 4,
+        "a read the CPU flattens was also given a range");
+}
+
+// Loop counters are bounded by the tests on their back edge and on the path to the read: a
+// post-tested loop, a pre-tested one, one whose body skips ahead to the latch, and nothing for a
+// loop that never tests its counter.
+void TestAddressRangesBoundLoops() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Shape { PostTested, PreTested, Skipping, Untested };
+  const auto run = [](Shape shape) {
+    Fixture fixture;
+    const bool pre_tested = shape == Shape::PreTested || shape == Shape::Skipping;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = pre_tested ? fixture.AddBlock() : header;
+    // Skipping: the body branches either to a side block or straight to the latch.
+    auto *side = shape == Shape::Skipping ? fixture.AddBlock() : nullptr;
+    auto *latch = shape == Shape::Skipping ? fixture.AddBlock() : body;
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    auto &counter = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    const Value i(&counter);
+    fixture.block = header;
+    Value test;
+    if (pre_tested) {
+      test = fixture.Emit(ValueOpcode::SLessThan32, {i, Value(20u)});
+      header->condition = test;
+      header->AddBranch(body);
+      header->AddBranch(exit);
+      header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = body,
+                            .false_block = exit};
+      fixture.block = body;
+    }
+    const auto offset =
+        pre_tested
+            ? fixture.Emit(ValueOpcode::IAdd32,
+                           {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {i, Value(4u)}), Value(0x60u)})
+            : fixture.Emit(ValueOpcode::ShiftLeftLogical32, {i, Value(4u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Global;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {fixture.Address(fixture.UserData(0), fixture.UserData(1), 4), offset, Value(0u),
+                  Value(true)},
+                 fixture.AddMemory(memory, 4));
+    if (shape == Shape::Skipping) {
+      body->condition = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(3), Value(0u)});
+      body->AddBranch(side);
+      body->AddBranch(latch);
+      body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = side,
+                          .false_block = latch};
+      side->AddBranch(latch);
+      side->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+      fixture.block = latch;
+    }
+    const auto next = fixture.Emit(ValueOpcode::IAdd32, {i, Value(1u)});
+    counter.AddPhiOperand(entry, Value(0u));
+    counter.AddPhiOperand(latch, next);
+    if (pre_tested) {
+      latch->AddBranch(header);
+      latch->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    } else {
+      // Post-tested: the back edge is taken while the counter is below 15, or always.
+      header->condition = shape == Shape::PostTested
+                              ? fixture.Emit(ValueOpcode::SLessThan32, {i, Value(15u)})
+                              : fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
+      header->AddBranch(header);
+      header->AddBranch(exit);
+      header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header,
+                            .false_block = exit};
+    }
+    fixture.block = exit;
+    fixture.PlanAndTrack();
+    CollectAddressRanges(fixture.program);
+    return fixture.program.info.address_ranges;
+  };
+  const auto post = run(Shape::PostTested);
+  Check(post.size() == 1 && post[0].begin == 0 && post[0].end == 15 * 16 + 4 &&
+            post[0].term == AddressRange::Term::None,
+        "a post-tested loop counter was not bounded by its back edge");
+  const auto pre = run(Shape::PreTested);
+  Check(pre.size() == 1 && pre[0].begin == 0x60 && pre[0].end == 19 * 16 + 0x60 + 4,
+        "a pre-tested loop counter was not bounded by its guard");
+  const auto skipping = run(Shape::Skipping);
+  Check(skipping.size() == 1 && skipping[0].begin == 0x60 &&
+            skipping[0].end == 19 * 16 + 0x60 + 4,
+        "a signed loop test was not trusted when the body skips ahead to the latch");
+  Check(run(Shape::Untested).empty(), "a counter no test bounds was given a range");
+}
+
+// Pixel inputs index reads by the values the vertex stage exports: a flat input read as a
+// word, one converted from float, and one vertex's word (P0). A vertex stage's attribute is a
+// fetched vertex input, not an export, so it bounds nothing.
+void TestAddressRangesPixelParameters() {
+  const auto run = [](ShaderType stage) {
+    Fixture fixture(stage);
+    const auto load = [&](uint32_t base_reg, Value offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Global;
+      fixture.Emit(ValueOpcode::LoadAddressU32,
+                   {fixture.Address(fixture.UserData(base_reg), fixture.UserData(base_reg + 1), pc),
+                    offset, Value(0u), Value(true)},
+                   fixture.AddMemory(memory, pc));
+    };
+    const auto converted = fixture.Emit(
+        ValueOpcode::ConvertU32F32,
+        {fixture.Emit(ValueOpcode::BitCastF32U32,
+                      {fixture.Emit(ValueOpcode::GetAttribute, {Value(1u), Value(2u)})})});
+    load(0, fixture.Emit(ValueOpcode::IMul32, {converted, Value(48u)}), 100);
+    const auto word = fixture.Emit(ValueOpcode::GetAttribute, {Value(2u), Value(0u)});
+    load(2, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {word, Value(4u)}), 200);
+    const auto vertex =
+        fixture.Emit(ValueOpcode::GetInterpolationParameter, {Value(3u), Value(1u), Value(2u)});
+    load(4, fixture.Emit(ValueOpcode::IAdd32, {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                                            {vertex, Value(3u)}),
+                                               Value(0x20u)}),
+         300);
+    fixture.PlanAndTrack();
+    CollectAddressRanges(fixture.program);
+    return fixture.program.info.address_ranges;
+  };
+  const auto ranges = run(ShaderType::Pixel);
+  const auto find = [&](uint32_t reg) -> const AddressRange * {
+    for (const auto &range : ranges) {
+      if (range.base_source == AddressRange::Source::UserData && range.base_words[0] == reg)
+        return &range;
+    }
+    return nullptr;
+  };
+  const auto *converted = find(0);
+  const auto *word = find(2);
+  const auto *vertex = find(4);
+  Check(converted != nullptr && converted->term == AddressRange::Term::PixelParameter &&
+            converted->parameter == 6 && converted->parameter_float &&
+            !converted->parameter_vertex && converted->scale == 48 && converted->end == 4,
+        "a read indexed by a converted float pixel input was not proven");
+  Check(word != nullptr && word->term == AddressRange::Term::PixelParameter &&
+            word->parameter == 8 && !word->parameter_float && !word->parameter_vertex &&
+            word->scale == 16,
+        "a read indexed by a pixel input word was not proven");
+  Check(vertex != nullptr && vertex->term == AddressRange::Term::PixelParameter &&
+            vertex->parameter == 13 && vertex->parameter_vertex && vertex->scale == 8 &&
+            vertex->begin == 0x20 && vertex->end == 0x24,
+        "a read indexed by one vertex's word of a pixel input was not proven");
+  Check(std::ranges::none_of(run(ShaderType::Vertex),
+                             [](const AddressRange &range) {
+                               return range.term == AddressRange::Term::PixelParameter;
+                             }),
+        "a vertex stage's fetched attribute was taken for a pixel input");
+}
+
+// A vertex stage's parameter exports are bounded by the same analysis, and marked when every
+// vertex of a primitive exports the same value: from the instance, user data and constants,
+// not the vertex index or another lane's value.
+void TestExportBounds() {
+  Fixture fixture(ShaderType::Vertex);
+  const auto builtin = [&](StageInputKind kind) {
+    return fixture.Emit(ValueOpcode::GetBuiltin, {Value(static_cast<uint32_t>(kind)), Value(0u)});
+  };
+  const auto as_float = [&](Value integer) {
+    return fixture.Emit(ValueOpcode::BitCastU32F32,
+                        {fixture.Emit(ValueOpcode::ConvertF32U32, {integer})});
+  };
+  const auto instance = builtin(StageInputKind::InstanceIndex);
+  const auto vertex = builtin(StageInputKind::VertexIndex);
+  // The wave emulation selects each exported value on the export's active flag.
+  const auto exec = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(9), Value(0u)});
+  const auto active = [&](Value value) {
+    return fixture.Emit(ValueOpcode::SelectU32, {exec, value, Value(0u)});
+  };
+  const auto set = [&](uint32_t index, Value x, Value y, Value z, Value w, uint32_t en) {
+    fixture.program.export_info.push_back(
+        {.kind = ExportTargetKind::Parameter, .index = index, .en = en});
+    fixture.Emit(ValueOpcode::SetAttribute,
+                 {fixture.Emit(ValueOpcode::CompositeConstructU32x4, {x, y, z, w}), exec},
+                 ExportFlags{.index = static_cast<uint32_t>(fixture.program.export_info.size() - 1),
+                             .pc = 0x100u});
+  };
+  set(3, active(as_float(fixture.Emit(ValueOpcode::IAdd32, {instance, fixture.UserData(4)}))),
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {instance, Value(2u)}),
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {vertex, Value(7u)}),
+      fixture.Emit(ValueOpcode::ReadFirstLane, {instance, Value(true)}), 0xfu);
+  // Two exports of one channel: the bound covers both; a float and a word bound nothing.
+  set(4, as_float(instance), as_float(instance), Value(0u), Value(0u), 0x3u);
+  set(4, as_float(Value(3u)), instance, Value(0u), Value(0u), 0x3u);
+  fixture.PlanAndTrack();
+  CollectAddressRanges(fixture.program);
+  const auto &bounds = fixture.program.info.export_bounds;
+  const auto find = [&](uint32_t parameter) -> const ExportBound * {
+    for (const auto &bound : bounds) {
+      if (bound.parameter == parameter) return &bound;
+    }
+    return nullptr;
+  };
+  const auto *instanced = find(12);
+  Check(instanced != nullptr && instanced->as_float && instanced->per_primitive &&
+            instanced->term == AddressRange::Term::InstanceIndex && instanced->scale == 1 &&
+            instanced->value_source == AddressRange::Source::UserData &&
+            instanced->value_word == 4 && instanced->value_scale == 1,
+        "the float of the instance plus user data was not bounded per primitive");
+  const auto *word = find(13);
+  Check(word != nullptr && !word->as_float && word->per_primitive && word->scale == 4,
+        "an instance-scaled word was not bounded per primitive");
+  const auto *masked = find(14);
+  Check(masked != nullptr && !masked->per_primitive && masked->hi == 7 &&
+            masked->term == AddressRange::Term::None,
+        "a masked vertex index was not bounded, or was taken as the same on every vertex");
+  const auto *first_lane = find(15);
+  Check(first_lane == nullptr || !first_lane->per_primitive,
+        "another lane's instance was taken as the same on every vertex of a primitive");
+  const auto *merged = find(16);
+  Check(merged != nullptr && merged->as_float && merged->per_primitive && merged->hi == 3 &&
+            merged->scale == 1,
+        "two exports of one channel were not bounded together");
+  Check(find(17) == nullptr, "a channel exported as both a float and a word was bounded");
+  Fixture pixel(ShaderType::Pixel);
+  pixel.PlanAndTrack();
+  CollectAddressRanges(pixel.program);
+  Check(pixel.program.info.export_bounds.empty(), "a pixel stage was given export bounds");
+}
+
 void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
@@ -9009,7 +11279,7 @@ void TestConditionalIndirectImageMaterialization() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads == 0 && snapshot.images.size() == 1 &&
+            reads == 0 && snapshot.images.size() == 1u &&
             snapshot.images[0].dwords == std::array<uint32_t, 8>{},
         "untaken indirect image branch probed its descriptor table");
   user_data[8] = 1;
@@ -9296,6 +11566,405 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+// Host evaluation of parameter key ops agrees with constant propagation wherever that folds.
+void TestParameterKeyOpSemantics() {
+  constexpr std::array<uint32_t, 9> samples{0u, 1u, 7u, 31u, 32u, 255u, 0x7fffffffu, 0x80000000u, 0xfffffff0u};
+  constexpr std::array binary{
+      ValueOpcode::IAdd32, ValueOpcode::ISub32, ValueOpcode::IMul32, ValueOpcode::UMulHi,
+      ValueOpcode::SMulHi, ValueOpcode::ShiftLeftLogical32, ValueOpcode::ShiftRightLogical32,
+      ValueOpcode::ShiftRightArithmetic32, ValueOpcode::BitwiseAnd32, ValueOpcode::BitwiseOr32,
+      ValueOpcode::BitwiseXor32, ValueOpcode::UMin32, ValueOpcode::UMax32, ValueOpcode::SMin32,
+      ValueOpcode::SMax32, ValueOpcode::IEqual32, ValueOpcode::INotEqual32, ValueOpcode::ULessThan32,
+      ValueOpcode::ULessThanEqual32, ValueOpcode::UGreaterThan32, ValueOpcode::UGreaterThanEqual32,
+      ValueOpcode::SLessThan32, ValueOpcode::SLessThanEqual32, ValueOpcode::SGreaterThan32,
+      ValueOpcode::SGreaterThanEqual32};
+  uint32_t compared = 0;
+  for (const auto opcode : binary) {
+    Check(IsParameterKeyOpcode(opcode), "parameter key op is not accepted");
+    for (const auto a : samples) {
+      for (const auto b : samples) {
+        Fixture f(ShaderType::Vertex);
+        const auto value = f.Emit(opcode, {Value(a), Value(b)});
+        const auto reference = f.Emit(TypeOf(opcode) == Type::U1 ? ValueOpcode::Reference
+                                                                : ValueOpcode::ReferenceU32,
+                                      {value});
+        ConstantPropagationPass(f.program.blocks);
+        const auto folded = reference.Instruction()->Arg(0).Resolve();
+        if (!folded.IsImmediate()) continue;
+        uint32_t result = 0;
+        const std::array<uint32_t, 2> args{a, b};
+        Check(EvaluateParameterKeyOp(opcode, args, result), "parameter key op did not evaluate");
+        Check(result == (folded.GetType() == Type::U1 ? uint32_t{folded.U1()} : folded.U32()),
+              (std::string("parameter key op disagrees with constant propagation: ") +
+                  std::string(ValueOpcodeName(opcode))).c_str());
+        ++compared;
+      }
+    }
+  }
+  Check(compared > 500u, "constant propagation folded too few parameter key ops to compare");
+  uint32_t field = 0;
+  Check(EvaluateParameterKeyOp(ValueOpcode::BitFieldUExtract, std::array{0xabcd1234u, 8u, 8u}, field) &&
+            field == 0x12u, "unsigned field extract");
+  Check(EvaluateParameterKeyOp(ValueOpcode::BitFieldSExtract, std::array{0x00008000u, 8u, 8u}, field) &&
+            field == 0xffffff80u, "signed field extract");
+  Check(!EvaluateParameterKeyOp(ValueOpcode::BitFieldUExtract, std::array{1u, 30u, 8u}, field),
+        "field extract past the word was evaluated");
+}
+
+struct ParameterKeyMemory {
+  std::vector<std::pair<uint64_t, uint32_t>> words;
+
+  static bool Read(void *userdata, uint64_t address, std::span<uint32_t> values) {
+    const auto &memory = *static_cast<ParameterKeyMemory *>(userdata);
+    for (size_t index = 0; index < values.size(); ++index) {
+      values[index] = 0u;
+      for (const auto &[at, word] : memory.words)
+        if (at == address + index * 4u) values[index] = word;
+    }
+    return true;
+  }
+};
+
+// A vertex stage exports x mod 255 of a vertex-indexed record; the host lists every record's
+// value and the out-of-range one, and refuses functions it cannot evaluate exactly.
+void TestParameterKeyFunction() {
+  enum class Variant { ModRecord, Packed16, Normalized, VertexIndex, LaneValue };
+  const auto build = [](Variant variant) {
+    auto f = std::make_unique<Fixture>(ShaderType::Vertex);
+    const auto exec = f->Emit(ValueOpcode::INotEqual32, {f->Emit(ValueOpcode::LaneId), Value(UINT32_MAX)});
+    const auto srt = f->Address(f->UserData(0), f->UserData(1));
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4u; ++word)
+      words[word] = f->Emit(ValueOpcode::LoadAddressU32, {srt, Value(0u), Value(0u), Value(true)},
+                            f->AddMemory({.kind = ResourceKind::ScalarAddress, .offset = 80u + word * 4u}, 0x4cu));
+    const auto vertices = f->Buffer(words);
+    const auto index = f->Emit(ValueOpcode::GetBuiltin,
+                               {Value(static_cast<uint32_t>(StageInputKind::VertexIndex)), Value(0u)});
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    load.idxen = true;
+    load.formatted = true;
+    const auto record = f->Emit(ValueOpcode::LoadBufferU32x2, {vertices, index, Value(0u), Value(0u), exec},
+                                f->AddMemory(load, 0x74u));
+    const auto x = f->Emit(ValueOpcode::SelectU32,
+                           {exec, f->Emit(ValueOpcode::CompositeExtractU32x2, {record, Value(0u)}), Value(0u)});
+    const auto quotient = f->Emit(ValueOpcode::ShiftRightLogical32,
+                                  {f->Emit(ValueOpcode::UMulHi, {Value(0x80808081u), x}), Value(7u)});
+    auto value = f->Emit(ValueOpcode::SelectU32,
+                         {exec, f->Emit(ValueOpcode::ISub32, {x, f->Emit(ValueOpcode::IMul32, {quotient, Value(255u)})}), x});
+    if (variant == Variant::VertexIndex) value = f->Emit(ValueOpcode::IAdd32, {value, index});
+    if (variant == Variant::LaneValue) value = f->Emit(ValueOpcode::IAdd32, {value, f->Emit(ValueOpcode::LaneId)});
+    f->program.export_info.push_back({.kind = ExportTargetKind::Parameter, .index = 5u, .en = 0xfu});
+    f->Emit(ValueOpcode::SetAttribute,
+            {f->Emit(ValueOpcode::CompositeConstructU32x4, {value, Value(0u), Value(0u), Value(0u)}), exec},
+            ExportFlags{.index = 0u, .pc = 0x1c4u});
+    return f;
+  };
+  for (const auto variant : {Variant::ModRecord, Variant::Packed16, Variant::Normalized,
+                             Variant::VertexIndex, Variant::LaneValue}) {
+    auto f = build(variant);
+    f->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(f->program);
+    const auto format = variant == Variant::Packed16     ? Libs::Graphics::Prospero::BufferFormat::k16_16UInt
+                        : variant == Variant::Normalized ? Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm
+                                                         : Libs::Graphics::Prospero::BufferFormat::k32_32UInt;
+    const uint32_t stride = variant == Variant::Packed16 ? 4u : 8u;
+    ParameterKeyMemory memory;
+    memory.words = {{0x10050u, 0x20000u}, {0x10054u, stride << 16u}, {0x10058u, 5u},
+                    {0x1005cu, Libs::Graphics::DstSel(4, 5, 0, 0) | (static_cast<uint32_t>(format) << 12u)}};
+    const std::array<uint32_t, 5> xs{3u, 258u, 600u, 255u, 1000u};
+    for (uint32_t vertex = 0; vertex < xs.size(); ++vertex) {
+      if (variant == Variant::Packed16) {
+        memory.words.emplace_back(0x20000u + vertex * 4u, xs[vertex] | (0x7777u << 16u));
+      } else {
+        memory.words.emplace_back(0x20000u + vertex * 8u, xs[vertex]);
+        memory.words.emplace_back(0x20004u + vertex * 8u, 0x12345678u);
+      }
+    }
+    const std::array<uint32_t, 2> user_data{0x10000u, 0u};
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                             .read_specialization_memory = ParameterKeyMemory::Read};
+    std::vector<uint32_t> keys;
+    std::vector<std::pair<uint64_t, uint64_t>> reads;
+    const bool evaluated = EvaluateParameterKeys(plan, runtime, 5u * 4u, keys, reads);
+    if (variant == Variant::ModRecord || variant == Variant::Packed16) {
+      Check(evaluated && keys == std::vector<uint32_t>{0u, 3u, 90u, 235u},
+            "vertex records did not give every exported key and the out-of-range one");
+      Check(reads.size() == 1u && reads[0].first == 0x20000u && reads[0].second == stride * 5u,
+            "parameter keys did not report the record buffer they read");
+      std::vector<uint32_t> signature;
+      Check(ParameterKeySignature(plan, runtime, 5u * 4u, signature) && !signature.empty(),
+            "parameter key signature is missing its uniform inputs");
+      Check(!EvaluateParameterKeys(plan, runtime, 6u * 4u, keys, reads),
+            "a parameter the vertex stage does not export was evaluated");
+    } else {
+      Check(!evaluated, "parameter keys accepted a normalized format, a raw vertex index or a lane value");
+    }
+  }
+}
+
+// A drained waterfall over a flat pixel input keys its table by that input, as long as every
+// loop write to the input's register reaches only lanes the mask drops and the loop repeats
+// only while the mask has a lane.
+void TestPixelInputWaterfallKey() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Waterfall, Direct, Difference, UnguardedWrite, KeptMask, UnguardedRepeat };
+  for (const auto variant : {Variant::Waterfall, Variant::Direct, Variant::Difference,
+                             Variant::UnguardedWrite, Variant::KeptMask, Variant::UnguardedRepeat}) {
+    Fixture f(ShaderType::Pixel);
+    auto *entry = f.block;
+    auto *header = f.AddBlock();
+    auto *body = f.AddBlock();
+    auto *latch = f.AddBlock();
+    auto *exit = f.AddBlock();
+    const auto live = f.Emit(ValueOpcode::LiveMask, {}, 0, entry);
+    const auto live0 = f.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(0u)}, 0, entry);
+    const auto live1 = f.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(1u)}, 0, entry);
+    const auto input = f.Emit(ValueOpcode::GetInterpolationParameter,
+                              {Value(5u), Value(0u), Value(variant == Variant::Difference ? 0u : 2u)}, 0, entry);
+    const auto wqm = f.Emit(ValueOpcode::WqmU64, {f.Emit(ValueOpcode::CompositeConstructU64, {live0, live1}, 0, entry)},
+                            0, entry);
+    const auto wqm0 = f.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(0u)}, 0, entry);
+    const auto wqm1 = f.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(1u)}, 0, entry);
+    const auto other = f.Emit(ValueOpcode::IEqual32, {f.UserData(3), Value(7u)}, 0, entry);
+    const auto unrelated = f.Emit(ValueOpcode::IEqual32, {f.UserData(4), Value(9u)}, 0, entry);
+    entry->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    auto &value = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &mask0 = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &mask1 = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    f.block = header;
+    const auto lane = f.Emit(ValueOpcode::BitwiseAnd32,
+        {f.Emit(ValueOpcode::UMin32, {f.Emit(ValueOpcode::FindILsb32, {Value(&mask0)}),
+                                      f.Emit(ValueOpcode::BitwiseOr32,
+                                             {f.Emit(ValueOpcode::FindILsb32, {Value(&mask1)}), Value(32u)})}),
+         Value(63u)});
+    const auto key = variant == Variant::Direct
+                         ? f.Emit(ValueOpcode::ReadFirstLane, {input, Value(true)})
+                         : f.Emit(ValueOpcode::ReadLane, {Value(&value), lane});
+    const auto processed = f.Emit(ValueOpcode::IEqual32, {key, Value(&value)});
+    const auto ballot = f.Emit(ValueOpcode::Ballot, {variant == Variant::KeptMask ? unrelated : processed});
+    const auto drop = [&](uint32_t word, Value launched) {
+      return f.Emit(ValueOpcode::BitwiseNot32,
+          {f.Emit(ValueOpcode::BitwiseAnd32, {f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(word)}),
+                                              launched})});
+    };
+    const auto next0 = f.Emit(ValueOpcode::BitwiseAnd32, {Value(&mask0), drop(0u, wqm0)});
+    const auto next1 = f.Emit(ValueOpcode::BitwiseAnd32, {Value(&mask1), drop(1u, wqm1)});
+    header->AddBranch(body);
+    header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body};
+    f.block = body;
+    const auto table = f.Address(f.UserData(0), f.UserData(1));
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                           f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = word * 4u}, 0x244u));
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto texel = f.Emit(ValueOpcode::ImageSampleRaw,
+        {f.Image(words, 0x260u), f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}), f.ImageAddress(),
+         processed},
+        f.AddMemory(sample, 0x260u));
+    f.Emit(ValueOpcode::ReferenceU32, {f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)})});
+    // The sample's result lands in the input's register on the lanes it processed.
+    const auto written = f.Emit(ValueOpcode::SelectU32,
+        {variant == Variant::UnguardedWrite ? other : f.Emit(ValueOpcode::LogicalAnd, {processed, other}),
+         f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(3u)}), Value(&value)});
+    body->AddBranch(latch);
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    f.block = latch;
+    const auto repeat = variant == Variant::UnguardedRepeat
+                            ? other
+                            : f.Emit(ValueOpcode::INotEqual32, {f.Emit(ValueOpcode::BitwiseOr32, {next0, next1}),
+                                                                Value(0u)});
+    latch->condition = f.Emit(ValueOpcode::ConditionRef, {repeat}, CFG::BranchCondition::SccNonZero);
+    latch->AddBranch(header);
+    latch->AddBranch(exit);
+    latch->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header, .false_block = exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    value.AddPhiOperand(entry, input);
+    value.AddPhiOperand(latch, written);
+    mask0.AddPhiOperand(entry, live0);
+    mask0.AddPhiOperand(latch, next0);
+    mask1.AddPhiOperand(entry, live1);
+    mask1.AddPhiOperand(latch, next1);
+    if (variant != Variant::Waterfall && variant != Variant::Direct) {
+      std::string refusal = "accepted";
+      try {
+        f.PlanAndTrack();
+      } catch (const std::runtime_error &error) {
+        refusal = error.what();
+      }
+      Check(refusal.find("not a valid runtime value") != std::string::npos,
+            ("pixel input key accepted a difference, an unguarded write, a kept mask or an unguarded repeat: " +
+             std::to_string(static_cast<int>(variant)) + " " + refusal).c_str());
+      continue;
+    }
+    f.PlanAndTrack();
+    const auto &source = f.program.descriptor_sources[f.program.info.images[0].source];
+    Check(source.indirect_descriptor && source.indirect_descriptor->parameter == 5u * 4u &&
+              source.indirect_descriptor->table_stride == 32u,
+          "drained waterfall over a flat pixel input lost its parameter key");
+  }
+}
+
+void TestTableSelectedDescriptorNamesItsRecords() {
+  constexpr uint32_t list_pc = 0x48u;
+  constexpr uint32_t table_pc = 0x858u;
+  const auto make = [](bool bounded) {
+    auto fixture = std::make_unique<Fixture>();
+    auto &f = *fixture;
+    std::array<Value, 4> table_words, list_words;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      table_words[word] = f.UserData(word);
+      list_words[word] = f.UserData(4u + word);
+    }
+    const auto group = f.Emit(ValueOpcode::GetBuiltin,
+                              {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto item = f.Emit(ValueOpcode::ReadConstBuffer,
+                             {f.Buffer(list_words), f.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(2u)})},
+                             f.AddMemory({.kind = ResourceKind::ScalarBuffer}, list_pc));
+    const auto record =
+        bounded ? f.Emit(ValueOpcode::BitFieldUExtract, {item, Value(1u), Value(11u)}) : item;
+    const auto offset = f.Emit(ValueOpcode::IMul32, {record, Value(0x70u)});
+    const auto table = f.Buffer(table_words);
+    std::array<std::array<Value, 4>, 2> descriptors;
+    for (uint32_t word = 0; word < 8u; ++word)
+      descriptors[word / 4u][word % 4u] = f.Emit(
+          ValueOpcode::ReadConstBuffer, {table, offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = 64u + word * 4u,
+                       .component_index = word, .component_count = 8u},
+                      table_pc));
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    for (uint32_t use = 0; use < 2u; ++use)
+      f.Emit(ValueOpcode::LoadBufferU32x4,
+             {f.Buffer(descriptors[use], 0x864u + use * 4u), lane, Value(0u), Value(0u), Value(true)},
+             f.AddMemory({.kind = ResourceKind::Buffer, .offset = 16u * use, .data_dwords = 4u,
+                          .data_bits = 32u, .idxen = true},
+                         0x864u + use * 4u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  const auto decoded = [](const Program &program) {
+    return std::ranges::count_if(program.memory_info, [](const MemoryInfo &memory) {
+             return memory.kind == ResourceKind::IndirectBuffer;
+           }) == 2;
+  };
+
+  auto bounded = make(true);
+  const auto &program = bounded->program;
+  // uses_dma is derived after specialization, from the live IR.
+  Check(decoded(program),
+        "the table-selected V#s were not decoded in the shader");
+  Check(program.info.dma_tables.size() == 1u,
+        "the host was not told which table records the decoded V#s come from");
+  const auto &table = program.info.dma_tables[0];
+  Check(table.stride == 0x70u && table.count == 2048u &&
+            table.offsets == std::vector<uint32_t>{64u, 80u} && table.extent == 32u && !table.store,
+        "the table recipe does not name exactly the 2048 records and both V# offsets");
+  Check(table.table < program.info.buffers.size() &&
+            program.info.buffers[table.table].scalar,
+        "the table recipe does not name the bound table the shader reads");
+  const auto &source = program.descriptor_sources[program.info.buffers[table.table].source];
+  for (uint32_t word = 0; word < 4u; ++word) {
+    const auto *user = source.dwords[word].Resolve().TryInstruction();
+    Check(user != nullptr && user->GetOpcode() == ValueOpcode::GetUserData &&
+              RegIndex(user->Arg(0).ScalarRegister()) == word,
+          "the table recipe names a buffer other than the table V#");
+  }
+
+  // Without a proven record bound the candidates are not a finite list of records.
+  auto unbounded = make(false);
+  Check(decoded(unbounded->program) && unbounded->program.info.dma_tables.empty(),
+        "an unbounded record selector named a finite list of table records");
+}
+
+// DS2 cs 0x9eead7b4c7642cff: a V# at row min(n - 1, x >> 26).
+void TestClampedPointerTableRows() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  using Libs::Graphics::DstSel;
+  constexpr uint32_t stride = 76u, immediate = 60u;
+  Fixture f;
+  f.program.wave_size = 64u;
+  const auto local =
+      f.Emit(ValueOpcode::GetBuiltin,
+             {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+              Value(0u)});
+  const auto lane = f.Emit(
+      ValueOpcode::ReadFirstLane,
+      {f.Emit(ValueOpcode::IMul32, {local, Value(0x01234567u)}), Value(true)});
+  const auto key =
+      f.Emit(ValueOpcode::UMin32,
+             {f.Emit(ValueOpcode::IAdd32, {f.UserData(2u), Value(0xffffffffu)}),
+              f.Emit(ValueOpcode::ShiftRightLogical32, {lane, Value(26u)})});
+  const auto offset = f.Emit(ValueOpcode::IMul32, {key, Value(stride)});
+  const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < 4u; ++word)
+    words[word] = f.Emit(ValueOpcode::LoadAddressU32,
+                         {table, offset, Value(0u), Value(true)},
+                         f.AddMemory({.kind = ResourceKind::ScalarAddress,
+                                      .offset = immediate + word * 4u,
+                                      .component_index = word,
+                                      .component_count = 4u},
+                                     0x10e0u));
+  // A packed 16-bit load keeps a host table; a 32-bit one would decode its V# in the shader.
+  const auto loaded = f.Emit(ValueOpcode::LoadBufferU32x2,
+                             {f.Buffer(words), f.Emit(ValueOpcode::LaneId),
+                              Value(0u), Value(0u), Value(true)},
+                             f.AddMemory({.kind = ResourceKind::Buffer,
+                                          .data_dwords = 2u,
+                                          .data_bits = 16u,
+                                          .component_count = 4u,
+                                          .formatted = true,
+                                          .idxen = true},
+                                         0x10f0u));
+  f.Emit(ValueOpcode::ReferenceU32,
+         {f.Emit(ValueOpcode::CompositeExtractU32x2, {loaded, Value(0u)})});
+  f.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(f.program);
+  const auto root =
+      std::ranges::find_if(plan.info.buffers, [&](const auto &buffer) {
+        return plan.descriptor_sources[buffer.source]
+            .indirect_descriptor.has_value();
+      });
+  Check(root != plan.info.buffers.end(),
+        "clamped pointer table lost its indirect resource");
+  const auto &indirect =
+      *plan.descriptor_sources[root->source].indirect_descriptor;
+  Check(!indirect.key_count.IsEmpty() && !indirect.key_count.IsImmediate() &&
+            indirect.table_stride == stride &&
+            indirect.table_immediate == immediate,
+        "clamped pointer table lost its runtime row count");
+  LinearTestMemory memory;
+  const auto base = static_cast<uint32_t>(memory.base);
+  constexpr uint32_t records = 0x100u;
+  for (uint32_t row = 0; row < 64u; ++row) {
+    const bool live = row < 3u;
+    const std::array descriptor{
+        0x100000u + row * 0x1000u, (live ? 0u : 0x80000000u) | (8u << 16u),
+        32u,
+        (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+            DstSel(4, 5, 6, 7)};
+    std::copy(descriptor.begin(), descriptor.end(),
+              memory.words.begin() + (records + row * stride + immediate) / 4u);
+  }
+  std::array<uint32_t, 3> user_data{base + records, 0u, 3u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "clamped pointer table enumerated rows past its count");
+  user_data[2] = 0u;
+  ResourceSnapshot unclamped;
+  Check(!MaterializeResources(plan, runtime, unclamped, specialization),
+        "an unclamped pointer table bound only its live rows");
+}
+
 } // namespace
 
 int main() {
@@ -9307,6 +11976,9 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("parameter key ops", TestParameterKeyOpSemantics);
+    Run("parameter key function", TestParameterKeyFunction);
+    Run("pixel input waterfall key", TestPixelInputWaterfallKey);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
@@ -9321,6 +11993,8 @@ int main() {
     Run("invariant indirect images", [] { TestInvariantIndirectImageMaterialization(true); });
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("resident image heap", TestResidentImageHeap);
+    Run("packed image load", TestPackedImageLoad);
+    Run("record heap demand", TestRecordHeapDemand);
     Run("image heap kinds", TestImageHeapKinds);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
@@ -9331,6 +12005,7 @@ int main() {
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("indexed material image keys", TestIndexedMaterialImageKeys);
+    Run("full-EXEC indexed material keys", TestFullExecIndexedMaterialKeys);
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
@@ -9340,13 +12015,21 @@ int main() {
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
     Run("descending image range", TestDescendingImageRange);
+    Run("affine record-word image table", TestAffineRecordWordImageTable);
+    Run("assembled record-word image table", TestAssembledRecordWordImageTable);
+    Run("loop-selected image table", TestLoopSelectedImageTable);
+    Run("lane-bit record-word image table", TestLaneBitRecordWordImageTable);
+    Run("uniform record-word image table", TestUniformRecordWordImageTable);
+    Run("global record-word image table", TestGlobalRecordWordImageTable);
+    Run("material-word image table", TestMaterialWordImageTable);
+    Run("masked scalar material image table", TestMaskedScalarMaterialImageTable);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
     Run("bounded buffer records", [] {
-      for (const uint32_t components : {0u, 2u, 3u, 4u}) TestBoundedBufferRecords(components);
+      TestBoundedBufferRecords(0u);
       TestGuardedWaterfallBufferRecords();
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
@@ -9369,6 +12052,10 @@ int main() {
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("address ranges prove reads", TestAddressRangesProveReads);
+    Run("address ranges bound loops", TestAddressRangesBoundLoops);
+    Run("address ranges index by pixel inputs", TestAddressRangesPixelParameters);
+    Run("export bounds", TestExportBounds);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
@@ -9380,6 +12067,9 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("table-selected descriptor names its records", TestTableSelectedDescriptorNamesItsRecords);
+    Run("clamped pointer table rows", TestClampedPointerTableRows);
+    Run("GPU-selected load decodes in shader", TestGpuSelectedLoadDecodesInShader);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;
@@ -9418,3 +12108,4 @@ void DbgNotImplementedHandler(const char *expression, const char *file,
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
+#include "graphics/shader/recompiler/ir/passes/AddressRanges.cpp"

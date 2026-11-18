@@ -308,7 +308,12 @@ struct EqaaControl {
 	bool    high_quality_intersections = false;
 	bool    incoherent_eqaa_reads      = false;
 	bool    interpolate_comp_z         = false;
+	bool    interpolate_src_z          = false;
 	bool    static_anchor_associations = false;
+	bool    alpha_to_mask_eqaa_disable = false;
+	// Log2 of the OR-reduction applied to the raster mask before the colour write.
+	uint8_t overrasterization_amount       = 0;
+	bool    enable_postz_overrasterization = false;
 };
 
 struct ColorControl {
@@ -342,6 +347,13 @@ struct AaConfig {
 	bool    aa_mask_centroid_dtmn = false;
 	uint8_t max_sample_dist       = 0;
 	uint8_t msaa_exposed_samples  = 0;
+	uint8_t coverage_to_shader_select = 0;
+};
+
+// PA_SC_AA_MASK_X0Y0_X1Y0 and PA_SC_AA_MASK_X0Y1_X1Y1: 16 sample bits per quad pixel.
+struct AaMask {
+	uint32_t x0y0_x1y0 = 0xffffffffu;
+	uint32_t x0y1_x1y1 = 0xffffffffu;
 };
 
 struct Viewport {
@@ -787,6 +799,10 @@ public:
 	void SetAaSampleControl(const AaSampleControl& control) { m_aa_sample_control = control; }
 	[[nodiscard]] const AaConfig& GetAaConfig() const { return m_aa_config; }
 	void                          SetAaConfig(const AaConfig& config) { m_aa_config = config; }
+	[[nodiscard]] const AaMask&   GetAaMask() const { return m_aa_mask; }
+	void                          SetAaMask(const AaMask& mask) { m_aa_mask = mask; }
+	[[nodiscard]] bool            GetPsIterSample() const { return m_ps_iter_sample; }
+	void                          SetPsIterSample(bool enable) { m_ps_iter_sample = enable; }
 
 	[[nodiscard]] float GetDepthClearValue() const { return m_depth_clear_value; }
 	void                SetDepthClearValue(float clear_value) { m_depth_clear_value = clear_value; }
@@ -848,6 +864,8 @@ private:
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;
+	AaMask          m_aa_mask;
+	bool            m_ps_iter_sample = false;
 
 	uint32_t m_shader_stages = 0;
 

@@ -316,6 +316,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
+		// The binds of sparse images created for this recording execute first.
+		if (graphics.sparse_binding != nullptr) {
+			const auto sparse = graphics.sparse_binding->Flush();
+			if (sparse.value != 0) submit.AddWait(sparse.semaphore, sparse.value);
+		}
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
 		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;

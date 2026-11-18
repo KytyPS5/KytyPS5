@@ -43,7 +43,103 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
+bool ReadCleanTable(uint64_t address, void* data, uint64_t size) {
+	return LibKernel::Memory::TryReadBufferBacking(address, data, size);
+}
 } // namespace
+
+std::vector<std::pair<uint64_t, uint64_t>>
+DescriptorTableRanges(const ShaderRecompiler::IR::DmaTable& recipe,
+                      const ShaderBufferResource&           table,
+                      bool (*read)(uint64_t address, void* data, uint64_t size)) {
+	constexpr uint64_t DescriptorBytes = sizeof(ShaderBufferResource);
+	// Bounds one table read; a dense table takes few reads, a sparse one never reads its gaps.
+	constexpr uint64_t ChunkBytes = 64 * 1024;
+
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	if (recipe.offsets.empty() || recipe.count == 0u || recipe.stride == 0u || table.Type() != 0u ||
+	    table.Base48() == 0u) {
+		return ranges;
+	}
+	// A scalar load past the table's size reads zero, which names no buffer.
+	const auto size    = table.GetSize() & ~uint64_t {3};
+	const auto offsets = std::span(recipe.offsets);
+
+	static thread_local std::vector<uint32_t> words;
+	for (size_t group = 0; group < offsets.size();) {
+		// Offsets close enough to read together, as one span per record.
+		size_t next = group + 1u;
+		while (next < offsets.size() &&
+		       offsets[next] - offsets[group] + DescriptorBytes <= ChunkBytes) {
+			++next;
+		}
+		const uint64_t first = offsets[group];
+		const uint64_t span  = offsets[next - 1u] - first + DescriptorBytes;
+		const uint64_t batch = (ChunkBytes - span) / recipe.stride + 1u;
+		for (uint64_t record = 0; record < recipe.count; record += batch) {
+			const auto begin = record * recipe.stride + first;
+			if (begin + DescriptorBytes > size) {
+				break;
+			}
+			const auto last = std::min<uint64_t>(record + batch, recipe.count) - 1u;
+			const auto end  = std::min(size, last * recipe.stride + first + span);
+			words.resize((end - begin) / sizeof(uint32_t));
+			if (!read(table.Base48() + begin, words.data(), end - begin)) {
+				continue;
+			}
+			for (auto current = record; current <= last; ++current) {
+				for (auto offset = group; offset < next; ++offset) {
+					const auto at = current * recipe.stride + offsets[offset];
+					if (at + DescriptorBytes > end) {
+						break;
+					}
+					ShaderBufferResource descriptor;
+					std::memcpy(descriptor.fields, words.data() + (at - begin) / sizeof(uint32_t),
+					            DescriptorBytes);
+					if (descriptor.Type() != 0u || descriptor.RawFormat() == 0u ||
+					    descriptor.Base48() == 0u || descriptor.GetSize() == 0u) {
+						continue;
+					}
+					ranges.emplace_back(descriptor.Base48(),
+					                    descriptor.Base48() + descriptor.GetSize() + recipe.extent);
+				}
+			}
+		}
+		group = next;
+	}
+	std::ranges::sort(ranges);
+	size_t merged = 0;
+	for (const auto& range: ranges) {
+		if (merged != 0 && range.first <= ranges[merged - 1].second) {
+			ranges[merged - 1].second = std::max(ranges[merged - 1].second, range.second);
+		} else {
+			ranges[merged++] = range;
+		}
+	}
+	ranges.resize(merged);
+	return ranges;
+}
+
+void PrefetchDescriptorTables(RenderContext& context, const ShaderRecompiler::IR::ShaderInfo& info,
+                              std::span<const ShaderRecompiler::IR::DescriptorValue> buffers) {
+	for (const auto& recipe: info.dma_tables) {
+		if (recipe.table >= buffers.size() || buffers[recipe.table].dword_count < 4u) {
+			continue;
+		}
+		// A table the GPU still owns would need a drain to read; its misses still fault in.
+		const auto table = DecodeNativeDescriptor<ShaderBufferResource>(buffers[recipe.table]);
+		auto&      cache = context.GetBufferCache();
+		if (table.Base48() == 0u || table.GetSize() == 0u ||
+		    cache.IsRegionGpuModified(table.Base48(), table.GetSize())) {
+			continue;
+		}
+		for (const auto& [begin, end]: DescriptorTableRanges(recipe, table, ReadCleanTable)) {
+			if (end - begin <= UINT32_MAX) {
+				(void)cache.FindBuffer(begin, end - begin);
+			}
+		}
+	}
+}
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	const auto image_class = ShaderRecompiler::IR::ImageBindingResourceClass(kind);
@@ -306,10 +402,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    ShaderRecompiler::IR::RawSignedStorageFormat(resource, format) != Prospero::BufferFormat::kInvalid;
 	const auto numeric_class =
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
-	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic && !resource.atomic64;
+	const bool raw_word_atomic = ShaderRecompiler::IR::IsRawWordFormat(format) && uint_resource &&
+	                             resource.atomic && !resource.atomic64;
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_word_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -342,10 +438,13 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 }
 
-// sRGB views decode before filtering; a sampler that skips degamma reads through a UNorm view.
-static vk::Format SampledViewFormat(const GraphicContext& graphics, Prospero::BufferFormat format,
-                                    vk::Format pixel_format, bool skip_degamma) {
-	if (skip_degamma) return SrgbUnormViewFormat(pixel_format);
+// A packed load reads the texel's DWORD. sRGB views decode before filtering; a sampler that skips
+// degamma reads through a UNorm view.
+static vk::Format SampledViewFormat(const GraphicContext&                      graphics,
+                                    const ShaderRecompiler::IR::ImageResource& resource,
+                                    Prospero::BufferFormat format, vk::Format pixel_format) {
+	if (resource.packed) return vk::Format::eR32Uint;
+	if (resource.skip_degamma) return SrgbUnormViewFormat(pixel_format);
 	switch (format) {
 		case Prospero::BufferFormat::k8Srgb:
 			return graphics.r8_srgb_views ? vk::Format::eR8Srgb : pixel_format;
@@ -384,7 +483,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage || resource.packed || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
@@ -476,7 +575,8 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool plane_owner) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -550,8 +650,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool shader_conversion =
 	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
-	    storage || resource.numeric_class ==
-	                   Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	    storage ||
+	    resource.numeric_class ==
+	        (resource.packed
+	             ? Prospero::TextureNumericClass::Uint
+	             : Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format)));
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
@@ -612,6 +715,20 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		}
 	} else {
 		desc.info.UpdateSize();
+		// A streamer clamps a texture to its resident mips with the T# MIN_LOD and packs the next
+		// texture over the bytes its larger mips would take. A sampler never reaches those levels
+		// (the view carries the clamp), so the image keeps neither pixels nor memory for them and
+		// owns only the guest bytes of the rest.
+		const uint32_t clamp_level = descriptor.MinLod() >> 8u;
+		if (!storage && !multisampled && clamp_level > view_base &&
+		    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic &&
+		    !desc.info.IsDepth() && m_context.GetGraphics().sparse_residency_image2d_enabled) {
+			if (const auto chain = desc.info.MipChainFrom(clamp_level)) {
+				desc.info.first_level = clamp_level;
+				desc.info.data.size   = chain->data.size;
+			}
+		}
 	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
 	// their layout.
@@ -643,7 +760,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
 	}
-	auto*      image               = &texture_cache.GetImage(id);
+	auto* image = &texture_cache.GetImage(id);
+	if (image->depth_id && storage && !plane_owner) {
+		// A depth image takes no storage view: a shader stores to its stencil plane through
+		// the plane's color twin.
+		id    = texture_cache.StencilTwin(id, desc.info);
+		image = &texture_cache.GetImage(id);
+	}
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
@@ -658,8 +781,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
 		// Set after FindImage, whose metadata clears need the attachment-capable format.
-		desc.view_info.format = SampledViewFormat(m_context.GetGraphics(), format, pixel_format,
-		                                          resource.skip_degamma);
+		desc.view_info.format =
+		    SampledViewFormat(m_context.GetGraphics(), resource, format, pixel_format);
 		(void)SelectSampledColorView(image->info.pixel_format, desc.view_info.format,
 		                             descriptor.DstSelXYZW());
 	}
@@ -688,6 +811,32 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
+
+namespace {
+struct StageImageRef {
+	const ShaderRecompiler::IR::ImageResource&   resource;
+	const ShaderRecompiler::IR::DescriptorValue& value;
+};
+
+// The image a stage binds at `index`: its own images, then its tables' candidates, each read as
+// the class of its shape.
+StageImageRef StageImage(const ShaderStageRuntime& runtime, uint32_t index) {
+	const auto& images = runtime.module->info.info.images;
+	if (index < images.size()) {
+		return {images[index], runtime.resources->images[index]};
+	}
+	const auto& candidate = runtime.resources->candidate_images[index - images.size()];
+	return {images[candidate.resource], candidate.value};
+}
+
+// The mip views a stage binds of the image at `index` when its instructions select a mip: a
+// candidate has its own count.
+uint32_t StageImageMips(const ShaderStageRuntime& runtime, uint32_t index) {
+	const auto& images = runtime.module->info.info.images;
+	return index < images.size() ? images[index].mip_count
+	                             : runtime.resources->candidate_images[index - images.size()].mips;
+}
+} // namespace
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
@@ -726,15 +875,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
-	prepared.images.resize(program.info.images.size());
+	prepared.images.resize(program.info.images.size() + snapshot.candidate_images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		if (program.info.images[i].heap) {
+	for (uint32_t i = 0; i < prepared.images.size(); i++) {
+		const auto [resource, value] = StageImage(runtime, i);
+		// A heap, and a table with its classes, bind nothing of their own.
+		if (resource.heap || (resource.candidate && i < program.info.images.size())) {
 			prepared.images[i] = {};
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		auto binding = ResolveTexture(resource, value);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
@@ -750,6 +901,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	ShaderRecompiler::IR::WriteIndirectMappingOffsets(program.bindings, snapshot,
+	                                                  prepared.shader_data);
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
@@ -758,60 +911,88 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
+	// The guest range a V# binds, with the cache buffer that holds it.
+	const auto find = [&](const ShaderRecompiler::IR::BufferResource&  metadata,
+	                      const ShaderRecompiler::IR::DescriptorValue& value) {
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(value);
+		const auto address    = descriptor.Base48();
+		auto       size       = descriptor.GetSize();
+		if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
+		    !metadata.scalar) {
+			// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
+			// still needs its full payload when NumRecords is smaller than it.
+			size = std::max(size, uint64_t {metadata.max_byte_extent});
+		}
+		if (address == 0 || size == 0) {
+			return PreparedBindings::BufferSource {};
+		}
+		if (descriptor.NumRecords() == UINT32_MAX) {
+			if (metadata.written) {
+				// Sentinel write ranges end before tables captured by any bound stage.
+				for (const auto* reader: stages) {
+					for (const auto [read_address, read_size]:
+					     reader->runtime->resources->specialization_reads) {
+						if (read_size == 0) continue;
+						if (read_address > address) {
+							size = std::min(size, read_address - address);
+						} else if (address - read_address < read_size) {
+							EXIT("scalar resource reads overlap a shader buffer write\n");
+						}
+					}
+				}
+			}
+			//  PPSA15246
+			const auto& graphics = m_context.GetGraphics();
+			const auto  limit =
+			    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+			    (graphics.StorageMinAlignment() - 1);
+			size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+		}
+		// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
+		if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
+			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+		}
+		return PreparedBindings::BufferSource {address, size, cache.FindBuffer(address, size)};
+	};
+	uint32_t candidates       = 0;
+	uint32_t image_candidates = 0;
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
+		PrefetchDescriptorTables(m_context, program.info, snapshot.buffers);
 		const auto& layout   = program.bindings;
-		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
-			continue;
-		}
+		prepared.buffer_sources.resize(
+		    layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
-			auto& source = prepared.buffer_sources[metadata.descriptor_index];
-			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
-			const auto address = descriptor.Base48();
-			auto size = descriptor.GetSize();
-			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
-			    !metadata.scalar) {
-				// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
-				// still needs its full payload when NumRecords is smaller than it.
-				size = std::max(size, uint64_t {metadata.max_byte_extent});
-			}
-			if (address == 0 || size == 0) {
-				source = {};
-				continue;
-			}
-			if (descriptor.NumRecords() == UINT32_MAX) {
-				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
-					for (const auto* reader: stages) {
-						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
-							if (read_size == 0) continue;
-							if (read_address > address) {
-								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
-							}
-						}
-					}
-				}
-				//  PPSA15246
-				const auto& graphics = m_context.GetGraphics();
-				const auto  limit =
-				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
-				    (graphics.StorageMinAlignment() - 1);
-				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
-			}
-			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
-			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			prepared.buffer_sources[metadata.descriptor_index] =
+			    find(metadata, snapshot.buffers[resource]);
 		}
+		// Each stage's candidates take a block of the draw's arrays, in slot order.
+		prepared.candidate_base       = candidates;
+		prepared.candidate_image_base = image_candidates;
+		prepared.candidate_sources.clear();
+		if (program.info.uses_candidate_images) {
+			// A candidate takes a descriptor per mip view, from its slot.
+			if (!snapshot.candidate_images.empty()) {
+				const auto& last = snapshot.candidate_images.back();
+				image_candidates += last.slot + last.mips;
+			}
+			prepared.shader_data[layout.candidate_image_dword] = prepared.candidate_image_base;
+		}
+		if (!program.info.uses_candidate_buffers) continue;
+		for (const auto& candidate: snapshot.candidate_buffers) {
+			prepared.candidate_sources.push_back(
+			    find(program.info.buffers[candidate.resource], candidate.value));
+		}
+		candidates += static_cast<uint32_t>(prepared.candidate_sources.size());
+		prepared.shader_data[layout.candidate_buffer_dword] = prepared.candidate_base;
 	}
+	m_candidate_buffers.resize(candidates);
+	m_candidate_records.resize(size_t {candidates} * ShaderRecompiler::IR::CandidateRecordDwords);
+	m_candidate_images.resize(image_candidates);
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -839,6 +1020,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
+	for (uint32_t slot = 0; slot < prepared.candidate_sources.size(); ++slot) {
+		const auto& source         = prepared.candidate_sources[slot];
+		const auto  index          = prepared.candidate_base + slot;
+		uint32_t    buffer_offset  = 0;
+		m_candidate_buffers[index] = NativeStorageBuffer(
+		    m_context, source, program.info.buffers[snapshot.candidate_buffers[slot].resource],
+		    buffer_offset);
+		auto* record =
+		    &m_candidate_records[size_t {index} * ShaderRecompiler::IR::CandidateRecordDwords];
+		record[0] = static_cast<uint32_t>(source.size + buffer_offset);
+		record[1] = buffer_offset;
+	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
@@ -849,28 +1042,26 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
-	const auto& program       = prepared.runtime->module->info;
-	const auto& snapshot      = *prepared.runtime->resources;
-	auto&       images        = prepared.images;
-	auto&       texture_cache = m_context.GetTextureCache();
+	auto& images        = prepared.images;
+	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	for (uint32_t i = 0; i < images.size(); i++) {
 		if (!images[i].image_id) continue;
-		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
+		const auto [resource, value] = StageImage(*prepared.runtime, i);
+		auto& old_image              = texture_cache.m_slot_images[images[i].image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
 			old_image.binding = {};
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			images[i]         = ResolveTexture(resource, value);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
-		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
-			binding.mip_views.reserve(resource.mip_count);
-			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
+			const auto mips = StageImageMips(*prepared.runtime, i);
+			EXIT_IF(mips == 0u || mips != binding.desc.view_info.level_count);
+			binding.mip_views.reserve(mips);
+			for (uint32_t mip = 0; mip < mips; mip++) {
 				auto desc = binding.desc;
 				desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
@@ -965,7 +1156,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			auto& binding = descriptors.images[i];
 			if (!binding.image_id) continue;
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
@@ -1067,12 +1258,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& resource = program.info.images[i];
 			const auto& texture = descriptors.images[i];
-			if (resource.heap) continue;
+			if (resource.heap || resource.candidate) continue;
 			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
 			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
 				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
+			}
+		}
+		const auto& candidates = prepared->runtime->resources->candidate_images;
+		for (size_t index = 0; index < candidates.size(); ++index) {
+			const auto& texture = descriptors.images[program.info.images.size() + index];
+			const auto  first   = descriptors.candidate_image_base + candidates[index].slot;
+			for (uint32_t mip = 0; mip < candidates[index].mips; ++mip) {
+				m_candidate_images[first + mip] = MakeImageInfo(texture, mip);
 			}
 		}
 
@@ -1104,6 +1303,55 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+
+	if (pipeline.uses_candidate_buffers) {
+		namespace IR         = ShaderRecompiler::IR;
+		const auto& graphics = m_context.GetGraphics();
+		const auto  count    = static_cast<uint32_t>(m_candidate_buffers.size());
+		if (count == 0 || count > graphics.max_candidate_buffers) {
+			EXIT("a draw selects %u candidate buffers; the device binds 1 to %u\n", count,
+			     graphics.max_candidate_buffers);
+		}
+		const auto set =
+		    m_context.GetDescriptorHeap().CommitVariable(graphics.candidate_buffer_layout, count);
+		const auto records = NativeUpload(m_context, m_candidate_records);
+		std::array<vk::WriteDescriptorSet, 2> writes {};
+		writes[0].dstSet          = set;
+		writes[0].dstBinding      = IR::CandidateRecordBinding;
+		writes[0].descriptorCount = 1;
+		writes[0].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[0].pBufferInfo     = &records;
+		writes[1].dstSet          = set;
+		writes[1].dstBinding      = IR::CandidateBufferBinding;
+		writes[1].descriptorCount = count;
+		writes[1].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[1].pBufferInfo     = m_candidate_buffers.data();
+		graphics.device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0,
+		                                     nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             IR::CandidateBufferSet, 1, &set, 0, nullptr);
+	}
+
+	if (pipeline.uses_candidate_images) {
+		namespace IR         = ShaderRecompiler::IR;
+		const auto& graphics = m_context.GetGraphics();
+		const auto  count    = static_cast<uint32_t>(m_candidate_images.size());
+		if (count == 0 || count > graphics.max_candidate_images) {
+			EXIT("a draw selects %u candidate images; the device binds 1 to %u\n", count,
+			     graphics.max_candidate_images);
+		}
+		const auto set =
+		    m_context.GetDescriptorHeap().CommitVariable(graphics.candidate_image_layout, count);
+		vk::WriteDescriptorSet write {};
+		write.dstSet          = set;
+		write.dstBinding      = IR::CandidateImageBinding;
+		write.descriptorCount = count;
+		write.descriptorType  = vk::DescriptorType::eSampledImage;
+		write.pImageInfo      = m_candidate_images.data();
+		graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             IR::CandidateImageSet, 1, &set, 0, nullptr);
 	}
 }
 

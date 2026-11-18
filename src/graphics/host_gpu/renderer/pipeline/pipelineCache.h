@@ -8,6 +8,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/eqaaPlan.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -20,7 +21,9 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+
 #include <queue>
+
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -32,6 +35,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
+class ParameterKeyCache;
 
 namespace ShaderRecompiler {
 struct CompileOptions;
@@ -70,6 +74,11 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	HostSamplePattern          sample_pattern;
+	// Without a pixel shader, a host fragment shader applies the draw's PA_SC_AA_MASK.
+	bool aa_mask_fragment = false;
+	// Keys are hashed as bytes, so the key's tail must hold no padding.
+	uint8_t sample_pattern_padding[2] = {};
 };
 
 struct PipelineRenderingState {
@@ -132,6 +141,8 @@ struct DrawTargets {
 	RenderDepthInfo depth;
 	RenderColorInfo colors[RENDER_COLOR_ATTACHMENTS_MAX];
 	uint32_t        color_count = 0;
+	// How the targets emulate EQAA's fragment/sample split.
+	EqaaPlan        eqaa;
 };
 
 // A draw's topology and shader stages (from PipelineCache::GetGraphicsPrograms).
@@ -146,6 +157,12 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// Output: the vertex stage exports straight to the pixel inputs.
+	bool parameters_linked = false;
+	// Output: the quad pixels PA_SC_AA_MASK covers, bit (y & 1) * 2 + (x & 1).
+	uint32_t aa_quad_mask = 0xf;
+	// Output: the fragment stage reads it from PushData::AaMaskDword.
+	bool aa_mask_read = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -182,7 +199,8 @@ class PipelineCache {
 public:
 	// Without a shader store path nothing is kept across runs.
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
-	              const std::filesystem::path& shader_store = {});
+	              ParameterKeyCache*           parameter_keys = nullptr,
+	              const std::filesystem::path& shader_store   = {});
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
@@ -195,8 +213,10 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
-		bool                    uses_push_descriptors = false;
-		bool                    uses_image_heap       = false;
+		bool                    uses_push_descriptors  = false;
+		bool                    uses_image_heap        = false;
+		bool                    uses_candidate_buffers = false;
+		bool                    uses_candidate_images  = false;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -224,7 +244,7 @@ private:
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         uint32_t push_data_cursor, uint32_t push_data_end);
 	};
 
 	struct ProgramKey {
@@ -234,6 +254,22 @@ private:
 		std::vector<uint32_t> static_state;
 
 		bool operator==(const ProgramKey&) const = default;
+	};
+
+	// The values a draw's vertex stage can export to the pixel inputs that key its descriptors.
+	struct DrawParameterKeys final: ShaderRecompiler::IR::ParameterKeySource {
+		DrawParameterKeys(PipelineCache& cache, const ShaderPixelInputInfo& pixel,
+		                  const ShaderParams& vertex, ShaderVertexInputInfo& vertex_info,
+		                  bool linked)
+		    : cache(cache), pixel(pixel), vertex(vertex), vertex_info(vertex_info), linked(linked) {
+		}
+		bool Keys(uint32_t parameter, std::vector<uint32_t>& keys) override;
+
+		PipelineCache&              cache;
+		const ShaderPixelInputInfo& pixel;
+		const ShaderParams&         vertex;
+		ShaderVertexInputInfo&      vertex_info;
+		bool linked; // The vertex stage exports straight to the pixel inputs.
 	};
 
 	// Variants of one source share a bucket; ProgramKey equality compares the state.
@@ -249,6 +285,12 @@ private:
 
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	ParameterKeyCache*                     m_parameter_keys;
+	// Set while the pixel program of a draw is obtained.
+	ShaderRecompiler::IR::ParameterKeySource* m_pixel_parameter_keys = nullptr;
+	// Plans of vertex stages translated to list their exports before their module is compiled.
+	std::unordered_map<ProgramKey, ShaderRecompiler::IR::ResourcePlan, ProgramKeyHash>
+	                                                        m_vertex_plans;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
@@ -264,8 +306,12 @@ private:
 	ShaderStoreWriter m_store;
 
 	template <typename InputInfo>
-	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
+	const ShaderModule*
+	GetProgram(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	           uint32_t push_data_end = ShaderRecompiler::IR::PushData::DwordCount);
+	// The resource plan of a vertex stage without calls, translating it if need be.
+	const ShaderRecompiler::IR::ResourcePlan* VertexPlan(const ShaderParams&    params,
+	                                                     ShaderVertexInputInfo& input_info);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,

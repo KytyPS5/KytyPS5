@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_set>
@@ -59,14 +60,28 @@ public:
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// With `eqaa` the pass draws into the image's EQAA shadow: the shadow is left unsettled.
+	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc,
+	                                             bool eqaa = false);
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            bool eqaa = false);
+	// Whether the plan's shadow can stand in for this target.
+	[[nodiscard]] bool EqaaShadowSupported(ImageId id, const EqaaPlan& plan);
+	// The shadow view an AnchorShadow pass draws through.
+	[[nodiscard]] vk::ImageView AcquireEqaaShadow(ImageId id, const ImageDesc& desc,
+	                                              const EqaaPlan& plan, vk::ImageAspectFlags writes,
+	                                              vk::ImageAspectFlags cleared);
+	// The shadow's backing, for the pass's barriers.
+	[[nodiscard]] Image& EqaaShadowImage(ImageId id) { return *m_slot_images[id].eqaa->image; }
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// The color image a shader stores through over a stencil plane, whose depth image takes no
+	// storage view; the plane itself where the two do not copy into each other.
+	[[nodiscard]] ImageId StencilTwin(ImageId plane, const ImageInfo& requested);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -90,6 +105,9 @@ public:
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
+	// At a suspend point: frees images the frame that ended did not use, oldest first, until
+	// `bytes` are freed. Returns the bytes freed.
+	uint64_t ReclaimIdle(uint64_t bytes);
 
 private:
 	struct MetaDataInfo {
@@ -229,7 +247,23 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	// A depth image and the color image of the same guest bytes are twins, and so are a stencil
+	// plane and the color image of its bytes. Whether the image's twin holds contents the image
+	// lacks.
+	[[nodiscard]] bool TwinNewer(const Image& image) const;
+	// Copies the twin's newer contents into the image.
+	void SyncTwin(ImageId id);
+	// Copies a stencil plane between its depth image and the color image of its bytes.
+	void CopyStencil(ImageId plane, ImageId color, bool to_color);
+	// Resident heaps that sample the written image's twin resolve again: to the image, or to a
+	// copy of its contents.
+	void TwinWritten(const Image& image) const;
+	// Frees the image's twin, a second holder of the contents the image holds.
+	void FreeTwin(Image& image);
+	// The depth twin in place of a color image that lacks its contents, for a sampled view of
+	// `requested` that a depth view provides.
+	[[nodiscard]] ImageId       SampledTwin(ImageId id, const ImageInfo& requested) const;
+	void RefreshImage(ImageId id, vk::ImageAspectFlags settle = EqaaAllAspects);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
@@ -239,6 +273,7 @@ private:
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	void FreeBcAliases(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
@@ -248,7 +283,23 @@ private:
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
-	void RefreshCopySource(ImageId id);
+	void       RefreshCopySource(ImageId id, vk::ImageAspectFlags settle = EqaaAllAspects);
+
+	static constexpr vk::ImageAspectFlags EqaaAllAspects = vk::ImageAspectFlagBits::eColor |
+	                                                       vk::ImageAspectFlagBits::eDepth |
+	                                                       vk::ImageAspectFlagBits::eStencil;
+	// Writes the shadow's newest `aspects` back into its owner.
+	void SettleEqaa(Image& image, vk::ImageAspectFlags aspects);
+	// Forgets the shadow's newest `aspects`: the owner's are about to be replaced wholesale.
+	static void DiscardEqaa(Image& image, vk::ImageAspectFlags aspects);
+	void        ExpandEqaa(Image& image, vk::ImageAspectFlags aspects);
+	void        DropShadow(Image& image);
+	void        DropIdleShadows(uint64_t tick);
+	// Frees an idle image the collector may take, downloading its GPU-written contents when
+	// `download`; false when it stays.
+	[[nodiscard]] bool EvictIdle(ImageId id, bool download);
+	[[nodiscard]] const vk::SampleLocationsInfoEXT*
+	                      InternSampleLocations(const HostSamplePattern& pattern);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	// The depth image's stencil plane record covering exactly range, or none.
@@ -282,6 +333,14 @@ private:
 	bool     m_readback_linear_images  = false;
 	bool     m_readback_tiled_images   = false;
 	bool     m_readback_storage_images = false;
+	// Owners of an EQAA shadow, and the never-freed sample-location tables barriers point at.
+	std::vector<ImageId> m_eqaa_images;
+	struct InternedSampleLocations {
+		HostSamplePattern                     pattern;
+		std::array<vk::SampleLocationEXT, 16> locations {};
+		vk::SampleLocationsInfoEXT            info;
+	};
+	std::vector<std::unique_ptr<InternedSampleLocations>> m_sample_locations;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

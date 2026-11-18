@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <span>
 #include <vector>
 
@@ -190,7 +191,21 @@ struct AudioOut2PortStateEntry {
 	std::array<float, 16>  gains {};
 	uint32_t               ambisonics        = UINT32_MAX;
 	bool                   attributes_locked = false;
+	bool                   pcm_fresh         = false;
 	std::vector<uint8_t>   pcm_data;
+};
+
+struct AudioOut2GrainPort {
+	AudioOut2PortHandle   port         = 0;
+	int                   audio_handle = 0;
+	std::vector<uint8_t>  pcm;
+	std::array<float, 16> gains {};
+};
+
+// One grain of a context's output: its device ports and its mixed object bus.
+struct AudioOut2Grain {
+	std::vector<AudioOut2GrainPort> ports;
+	std::vector<float>              object_mix;
 };
 
 struct AudioOut2ContextState {
@@ -200,10 +215,14 @@ struct AudioOut2ContextState {
 	uint32_t               queued              = 0;
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
+	bool                   idle                = true;
 	int                    object_audio_handle = 0;
 	uint32_t               max_ports           = 0;
 	// Channel slots precede object slots; each partition has its own creation limit.
 	std::vector<AudioOut2PortStateEntry> ports;
+	// Grains committed by an advance and not pushed yet, oldest first.
+	std::deque<AudioOut2Grain> advanced;
+	bool                       uses_advance = false;
 };
 struct AudioOut2SpeakerArrayState {
 	bool                        used          = false;
@@ -348,8 +367,9 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
+	// The modelled output takes one grain per tick of a free-running clock, like a hardware mixer.
 	const auto now = audioout2_clock();
-	if (state->last_update == 0 || state->queued == 0) {
+	if (state->last_update == 0) {
 		state->last_update = now;
 		return;
 	}
@@ -357,16 +377,55 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
-	const auto grain   = uint64_t {state->num_grains} * 125;
-	const auto drained = std::min<uint64_t>(state->queued, (now - state->last_update) / grain);
-	if (drained == 0) {
+	const auto grain = uint64_t {state->num_grains} * 125;
+	const auto ticks = (now - state->last_update) / grain;
+	if (ticks == 0) {
 		return;
 	}
 
+	const auto drained = std::min<uint64_t>(state->queued, ticks);
 	state->queued -= static_cast<uint32_t>(drained);
-	state->last_update += drained * grain;
-	if (state->queued == 0) {
-		state->last_update = now;
+	if (ticks > drained) {
+		state->idle = true;
+	}
+	state->last_update += ticks * grain;
+}
+
+static void audioout2_accept_grain_locked(AudioOut2ContextState* state) {
+	if (state->queued == 0 && state->idle) {
+		// The output ran dry, so its clock restarts with this grain.
+		state->last_update = audioout2_clock();
+		state->idle        = false;
+	}
+	if (state->queued < state->queue_depth) {
+		state->queued++;
+	}
+}
+
+static uint64_t audioout2_micros_to_next_tick_locked(const AudioOut2ContextState& state) {
+	const auto grain_micros = uint64_t {audioout2_grain_micros(state.num_grains)};
+	const auto next_tick    = state.last_update + uint64_t {state.num_grains} * 125;
+	const auto now          = audioout2_clock();
+	return next_tick > now ? std::min((next_tick - now + 5) / 6, grain_micros + 1) : 1;
+}
+
+// A synchronous push returns once the queue can take another grain.
+static void audioout2_wait_for_free_slot(AudioOut2ContextHandle ctx) {
+	for (;;) {
+		uint64_t sleep_micros = 0;
+		g_audioout2_state_mutex.Lock();
+		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+			audioout2_update_context_locked(state);
+			if (state->queued >= state->queue_depth) {
+				sleep_micros = audioout2_micros_to_next_tick_locked(*state);
+			}
+		}
+		g_audioout2_state_mutex.Unlock();
+
+		if (sleep_micros == 0) {
+			return;
+		}
+		Common::Thread::SleepMicro(static_cast<uint32_t>(sleep_micros));
 	}
 }
 
@@ -388,20 +447,6 @@ static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
 	    (state.data_format & 0x7fu) == 1 ? sizeof(int16_t) : sizeof(float);
 	return static_cast<size_t>(state.samples_num) *
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
-}
-
-static bool audioout2_context_has_queueable_device(const AudioOut2ContextState& context) {
-	for (const auto& state: context.ports) {
-		if (state.used && !state.pcm_data.empty()) {
-			const int handle = audioout2_port_type_is_object(state.port_type)
-			                       ? context.object_audio_handle
-			                       : state.audio_handle;
-			if (AudioInternal::AudioOutHasDevice(handle)) {
-				return true;
-			}
-		}
-	}
-	return false;
 }
 
 static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
@@ -434,8 +479,48 @@ static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
 	}
 }
 
-static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2Submission& out,
-                                          bool blocking) {
+// fresh_only silences a port given no new PCM since the last advance; consume takes the ports' PCM.
+static AudioOut2Grain audioout2_snapshot_context_locked(AudioOut2ContextState& context,
+                                                        bool fresh_only, bool consume) {
+	AudioOut2Grain grain;
+	for (auto& state: context.ports) {
+		if (!state.used || state.pcm_data.empty()) {
+			continue;
+		}
+		const bool stale = fresh_only && !state.pcm_fresh;
+		if (audioout2_port_type_is_object(state.port_type)) {
+			if (stale) {
+				if (grain.object_mix.empty()) {
+					grain.object_mix.resize(static_cast<size_t>(context.num_grains) * 2, 0.0f);
+				}
+			} else {
+				audioout2_mix_object(grain.object_mix, context.num_grains, state);
+			}
+		} else if (state.audio_handle > 0 && grain.ports.size() < AudioInternal::OUT_PORTS_MAX) {
+			auto pcm = stale     ? std::vector<uint8_t>(state.pcm_data.size(), 0)
+			           : consume ? std::move(state.pcm_data)
+			                     : state.pcm_data;
+			grain.ports.push_back(
+			    AudioOut2GrainPort {state.handle, state.audio_handle, std::move(pcm), state.gains});
+		}
+		if (consume) {
+			state.pcm_data.clear();
+		}
+	}
+	return grain;
+}
+
+static void audioout2_drop_dead_ports_locked(AudioOut2Grain* grain, int object_audio_handle) {
+	std::erase_if(grain->ports, [](const AudioOut2GrainPort& entry) {
+		const auto* state = audioout2_find_port_locked(entry.port);
+		return state == nullptr || state->audio_handle != entry.audio_handle;
+	});
+	if (object_audio_handle <= 0) {
+		grain->object_mix.clear();
+	}
+}
+
+static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2Submission& out) {
 	Common::LockGuard submit_lock(out.mutex);
 	g_audioout2_state_mutex.Lock();
 	auto* context = audioout2_find_context_locked(ctx);
@@ -443,34 +528,62 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 		g_audioout2_state_mutex.Unlock();
 		return;
 	}
-	out.object_mix.clear();
+	AudioOut2Grain grain;
+	if (!context->advanced.empty()) {
+		grain = std::move(context->advanced.front());
+		context->advanced.pop_front();
+		audioout2_drop_dead_ports_locked(&grain, context->object_audio_handle);
+	} else if (context->uses_advance) {
+		// A push with no new advance is an underrun; replaying the last grain buzzes.
+		grain = audioout2_snapshot_context_locked(*context, false, false);
+		for (auto& port: grain.ports) {
+			std::fill(port.pcm.begin(), port.pcm.end(), uint8_t {0});
+		}
+		std::fill(grain.object_mix.begin(), grain.object_mix.end(), 0.0f);
+	} else {
+		// A port's PCM covers one grain: the push consumes it, so a port the game stops feeding
+		// falls silent.
+		grain = audioout2_snapshot_context_locked(*context, false, true);
+	}
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	// A port's PCM covers one grain: the push consumes it, so a port the game stops feeding
-	// falls silent.
-	for (auto& state: context->ports) {
-		if (!state.used || state.pcm_data.empty()) {
-			continue;
-		}
-		if (audioout2_port_type_is_object(state.port_type)) {
-			audioout2_mix_object(out.object_mix, context->num_grains, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			const auto i = params.size();
-			out.pcm[i].swap(state.pcm_data);
-			out.gains[i] = state.gains;
-			params.push_back({state.audio_handle, out.pcm[i].data(), out.gains[i].data()});
-		}
-		state.pcm_data.clear();
+	for (auto& port: grain.ports) {
+		const auto i = params.size();
+		out.pcm[i].swap(port.pcm);
+		out.gains[i] = port.gains;
+		params.push_back({port.audio_handle, out.pcm[i].data(), out.gains[i].data()});
 	}
+	out.object_mix = std::move(grain.object_mix);
 	if (!out.object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
 		params.push_back({context->object_audio_handle, out.object_mix.data()});
 	}
 	g_audioout2_state_mutex.Unlock();
 	if (!params.empty()) {
+		// The modelled queue paces every push, so the device only needs a jitter cushion.
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-		                                     blocking);
+		                                     false, true);
 	}
 }
+
+static void audioout2_wait_for_advanced_grain(AudioOut2ContextHandle ctx) {
+	const auto start = LibKernel::KernelGetProcessTime();
+	for (;;) {
+		uint64_t limit = 0;
+		{
+			Common::LockGuard lock(g_audioout2_state_mutex);
+			auto*             state = audioout2_find_context_locked(ctx);
+			if (state == nullptr || !state->uses_advance || !state->advanced.empty()) {
+				return;
+			}
+			limit = 2ull * audioout2_grain_micros(state->num_grains);
+		}
+		if (LibKernel::KernelGetProcessTime() - start >= limit) {
+			return;
+		}
+		Common::Thread::SleepMicro(250);
+	}
+}
+
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle > 0) {
 		AudioInternal::AudioOutClose(audio_handle);
@@ -615,9 +728,17 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+		auto grain = audioout2_snapshot_context_locked(*state, true, false);
 		audioout2_update_context_locked(state);
+		state->uses_advance = true;
+		state->advanced.push_back(std::move(grain));
+		const size_t limit = 2 * std::max<size_t>(state->queue_depth, 4);
+		while (state->advanced.size() > limit) {
+			state->advanced.pop_front();
+		}
 		for (auto& port: state->ports) {
 			port.attributes_locked = false;
+			port.pcm_fresh         = false;
 		}
 	}
 	g_audioout2_state_mutex.Unlock();
@@ -626,30 +747,29 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
-	uint32_t sleep_micros = audioout2_grain_micros(512);
+	uint64_t sleep_micros = audioout2_grain_micros(512);
+
+	if (blocking != 0) {
+		audioout2_wait_for_advanced_grain(ctx);
+	}
 
 	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
+		// Every push, synchronous or not, takes a slot of the modelled queue.
 		g_audioout2_state_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
 			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
+			if (state->queued < state->queue_depth) {
+				audioout2_accept_grain_locked(state);
 				auto& submission = audioout2_submission(*state);
 				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
+				audioout2_queue_context_audio(ctx, submission);
+				// Wwise renders only into a free slot after a synchronous push returns.
+				if (blocking != 0) {
+					audioout2_wait_for_free_slot(ctx);
+				}
 				return OK;
 			}
+			sleep_micros = audioout2_micros_to_next_tick_locked(*state);
 		}
 		g_audioout2_state_mutex.Unlock();
 
@@ -657,7 +777,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 			return AUDIO_OUT2_ERROR_NOT_READY;
 		}
 
-		Common::Thread::SleepMicro(sleep_micros);
+		Common::Thread::SleepMicro(static_cast<uint32_t>(sleep_micros));
 	}
 }
 
@@ -672,13 +792,17 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
 	audioout2_update_context_locked(state);
+	// Grains advanced but not yet pushed hold their queue entries already.
+	const auto backlog =
+	    state->advanced.size() > 1 ? static_cast<uint32_t>(state->advanced.size() - 1) : 0u;
+	const auto level = std::min(state->queued + backlog, state->queue_depth);
 	if (queue_level != nullptr) {
-		*queue_level = state->queued;
+		*queue_level = level;
 	}
 	if (available_queues != nullptr) {
-		*available_queues = state->queue_depth - state->queued;
+		*available_queues = state->queue_depth - level;
 	}
-	return state->queued < state->queue_depth ? OK : AUDIO_OUT2_ERROR_NOT_READY;
+	return level < state->queue_depth ? OK : AUDIO_OUT2_ERROR_NOT_READY;
 }
 
 // PPSA28180 calls this with rsp off the 16-byte alignment; the host device open needs it.
@@ -874,6 +998,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 		} else {
 			state->pcm_data.clear();
 		}
+		state->pcm_fresh         = !state->pcm_data.empty();
 		state->attributes_locked = audioout2_port_type_is_object(state->port_type);
 	}
 	return OK;

@@ -39,8 +39,17 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 
 class Buffer {
 public:
+	// A sparse buffer has no memory of its own: its owner binds SparseBinding pages into it.
+	enum class Sparse : uint8_t {
+		None,
+		Residency,
+		// A page may be bound into more than one buffer.
+		Aliased,
+	};
+
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       Sparse sparse = Sparse::None);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -48,6 +57,8 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool               IsDeviceLocal() const noexcept { return m_device_local; }
+	[[nodiscard]] bool               IsSparse() const noexcept { return m_sparse != Sparse::None; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
@@ -91,7 +102,9 @@ private:
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
 	uint64_t                      m_size;
-	bool                          m_coherent = false;
+	bool                          m_coherent     = false;
+	bool                          m_device_local = false;
+	Sparse                        m_sparse       = Sparse::None;
 	std::span<uint8_t>            m_mapped;
 };
 

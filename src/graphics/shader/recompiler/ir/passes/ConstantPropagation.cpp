@@ -140,6 +140,43 @@ bool IsComplementPair(const Inst& inst, ValueOpcode negation) {
 	return false;
 }
 
+// S_WQM_B64 of a pixel shader's entry EXEC (its live lanes) holds every lane that runs.
+bool IsLaunchedLaneWord(Value value, uint32_t word) {
+	const auto* extract = value.TryInstruction();
+	if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU64 ||
+	    !IsImmediate(Arg(*extract, 1), Type::U32) || Arg(*extract, 1).U32() != word)
+		return false;
+	const auto* wqm  = Arg(*extract, 0).TryInstruction();
+	const auto* wide = wqm != nullptr && wqm->GetOpcode() == ValueOpcode::WqmU64
+	                       ? Arg(*wqm, 0).TryInstruction()
+	                       : nullptr;
+	if (wide == nullptr || wide->GetOpcode() != ValueOpcode::CompositeConstructU64) return false;
+	for (uint32_t half = 0; half < 2u; ++half) {
+		const auto lanes = Arg(*wide, half);
+		// A wave32 EXEC has no high word, and quads never span words.
+		if (half == 1u && word == 0u && IsImmediate(lanes, Type::U32) && lanes.U32() == 0u)
+			continue;
+		const auto* live = lanes.TryInstruction();
+		const auto* mask =
+		    live != nullptr && live->GetOpcode() == ValueOpcode::CompositeExtractU32x4 &&
+		            IsImmediate(Arg(*live, 1), Type::U32) && Arg(*live, 1).U32() == half
+		        ? Arg(*live, 0).TryInstruction()
+		        : nullptr;
+		if (mask == nullptr || mask->GetOpcode() != ValueOpcode::LiveMask) return false;
+	}
+	return true;
+}
+
+bool IsBallotUnderLaunchedLanes(const Inst& inst, uint32_t arm) {
+	const auto* extract = Arg(inst, arm).TryInstruction();
+	if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+	    !IsImmediate(Arg(*extract, 1), Type::U32))
+		return false;
+	const auto* ballot = Arg(*extract, 0).TryInstruction();
+	return ballot != nullptr && ballot->GetOpcode() == ValueOpcode::Ballot &&
+	       IsLaunchedLaneWord(Arg(inst, arm ^ 1u), Arg(*extract, 1).U32());
+}
+
 bool FoldSelect(Inst& inst) {
 	const auto condition   = Arg(inst, 0);
 	const auto true_value  = Arg(inst, 1);
@@ -566,6 +603,12 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitwiseAnd32:
 			if (FoldBinary(inst, [](uint32_t a, uint32_t b) { return a & b; }) ||
 			    ReplaceBinaryIdentity(inst, Type::U32, UINT32_MAX)) return;
+			for (uint32_t arm = 0; arm < 2u; ++arm) {
+				if (IsBallotUnderLaunchedLanes(inst, arm)) {
+					Replace(inst, Arg(inst, arm));
+					return;
+				}
+			}
 			for (uint32_t arm = 0; arm < 2u; ++arm) {
 				const auto mask = Arg(inst, arm);
 				if (!IsImmediate(mask, Type::U32)) continue;

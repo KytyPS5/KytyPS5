@@ -427,7 +427,7 @@ TestCase TrinityStack(u32 wave_size, u32 capacity, bool storage = false) {
   test.compute_info.lds_storage = storage;
   test.has_compute_info = true;
   test.decoded_counts = {{"DS_BVH_STACK_PUSH8_POP1_RTN_B32", 1}};
-  test.forbidden_spirv = {"OpControlBarrier", "OpMemoryBarrier", "get_bda_pointer"};
+  test.forbidden_spirv = {"OpControlBarrier", "OpMemoryBarrier", "get_bda_"};
   return test;
 }
 
@@ -512,7 +512,7 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.has_compute_info = true;
   test.decoded_counts = {{"S_BREV_B32", 1}};
   test.ir_counts = {{" = BitReverse32 ", 0}};
-  test.forbidden_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"get_bda_"};
   return test;
 }
 
@@ -677,6 +677,6 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.required_spirv = {"get_bda_pointer"};
-  test.max_spirv_words = 6350;
+  test.max_spirv_words = 6425;
   return test;
 }

@@ -43,6 +43,7 @@ struct RenderState {
 		case 2: return vk::SampleCountFlagBits::e2;
 		case 4: return vk::SampleCountFlagBits::e4;
 		case 8: return vk::SampleCountFlagBits::e8;
+		case 16: return vk::SampleCountFlagBits::e16;
 		default: return {};
 	}
 }

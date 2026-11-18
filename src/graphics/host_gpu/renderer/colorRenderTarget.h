@@ -19,6 +19,12 @@ struct RenderColorInfo {
 	uint32_t                        guest_mip_level   = 0;
 	uint32_t                        guest_array_layer = 0;
 	Prospero::ColorComponentMapping export_mapping;
+	// The host attachment's sample count when it differs from the guest image's (0: same).
+	uint32_t attachment_samples = 0;
+
+	[[nodiscard]] uint32_t AttachmentSamples() const {
+		return attachment_samples != 0 ? attachment_samples : desc.info.samples;
+	}
 
 	[[nodiscard]] vk::Extent2D Extent() const {
 		return {std::max(desc.info.extent.width >> guest_mip_level, 1u),

@@ -1134,6 +1134,18 @@ void TestNativeShaderResourceDependencies() {
   set_buffer(2, 0x2000, 0x3FFF, UINT32_MAX);
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a maximum-size strided buffer");
+  // A table's own descriptor is null; the buffers it writes are its candidates.
+  set_buffer(2, 0, 0, 0);
+  resources.candidate_buffers = {{.value = resources.buffers[1], .resource = 2u}};
+  Check(HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate lost a written table candidate");
+  resources.candidate_buffers[0].resource = 1u;
+  Check(!HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate included a read-only table candidate");
+  resources.candidate_buffers = {{.value = resources.buffers[2], .resource = 2u}};
+  Check(!HasShaderBufferWrites(runtime),
+        "graphics/compute write predicate included a null table candidate");
+  resources.candidate_buffers.clear();
 
   const vk::Buffer buffer{reinterpret_cast<vk::Buffer::CType>(uintptr_t{1})};
   const auto gds_barrier = MakeGdsDependency(buffer);
@@ -2627,6 +2639,55 @@ void TestImageAtomicWidthDecoder() {
   }
 }
 
+void TestImageLoadPckDecoder() {
+  using namespace ShaderRecompiler::Decoder;
+  // Captured PPSA02015 pixel shader d02edc1ab2a97eef: image_load_pck v3, v[0:2], s[28:35] and
+  // its NSA form image_load_pck v6, [v3, v1, v5], s[28:35], both of a 3D image.
+  const uint32_t captured[] = {0xf0080110u, 0x00070300u};
+  const uint32_t captured_nsa[] = {0xf0080112u, 0x00070600u, 0x00000501u};
+  Instruction decoded;
+  DecodeInstruction(captured, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_LOAD_PCK && decoded.word_count == 2u &&
+            decoded.dmask == 1u && decoded.dst.reg == 3u && decoded.src0.reg == 0u &&
+            decoded.image_address_components == 3u,
+        "captured IMAGE_LOAD_PCK did not decode as a one-DWORD load at three coordinates");
+  DecodeInstruction(captured_nsa, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_LOAD_PCK && decoded.word_count == 3u &&
+            decoded.dmask == 1u && decoded.dst.reg == 6u,
+        "captured NSA IMAGE_LOAD_PCK did not decode");
+  // Only the first DWORD of the texel as stored has a defined place.
+  for (uint32_t mask = 0; mask < 16u; ++mask) {
+    const uint32_t words[] = {EncodeMimg0(0x02u, mask, false), captured[1]};
+    DecodeInstruction(words, 0, decoded);
+    Check((decoded.opcode == Opcode::IMAGE_LOAD_PCK) == (mask == 1u) &&
+              (decoded.opcode == Opcode::UNSUPPORTED) == (mask != 1u),
+          "IMAGE_LOAD_PCK accepted a data mask beyond its first DWORD");
+  }
+  const uint32_t d16[] = {captured[0], captured[1] | (1u << 31u)};
+  DecodeInstruction(d16, 0, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED, "IMAGE_LOAD_PCK accepted D16 data");
+
+  // Translation marks the image as loaded without conversion.
+  static ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  compute.thread_ids_num = 3;
+  static const std::array<uint32_t, 16> user_data{};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+  for (const bool packed : {true, false}) {
+    // image_load_pck / image_load v3, v[0:2], s[28:35]; s_endpgm.
+    const uint32_t code[] = {packed ? captured[0] : captured[0] & ~(0x7fu << 18u), captured[1],
+                             0xbf810000u};
+    const auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    const auto &memory = translated.program.memory_info;
+    Check(memory.size() == 1u && memory[0].kind == ShaderRecompiler::IR::ResourceKind::Image &&
+              memory[0].image_packed == packed,
+          "translation did not mark the load of an IMAGE_LOAD_PCK, or marked a plain load");
+  }
+}
+
 void TestImageGatherDecoder() {
   using namespace ShaderRecompiler::Decoder;
   struct Gather {
@@ -3384,6 +3445,144 @@ void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   }
 }
 
+// An array instruction loads the one slice of a view with one layer, which is how it reads a
+// texture without slices: the load asks the view for its layers, at no level when multisampled.
+void TestArrayImageLoadCountsLayers() {
+  using namespace ShaderRecompiler;
+  constexpr uint32_t OpImageFetch = 95;
+  constexpr uint32_t OpImageQuerySizeLod = 103;
+  constexpr uint32_t OpImageQuerySize = 104;
+  struct Load {
+    uint32_t dim;
+    Prospero::ImageType type;
+    Decoder::ImageDimension dimension;
+    uint32_t leveled;
+    uint32_t unleveled;
+  };
+  const Load loads[] = {
+      {1, Prospero::ImageType::kColor2D, Decoder::ImageDimension::Dim2D, 0, 0},
+      {5, Prospero::ImageType::kColor2D, Decoder::ImageDimension::Dim2DArray, 1, 0},
+      {5, Prospero::ImageType::kColor2DArray, Decoder::ImageDimension::Dim2DArray, 1, 0},
+      {7, Prospero::ImageType::kColor2DMsaa, Decoder::ImageDimension::Dim2DMsaaArray, 0, 1},
+  };
+  for (const auto &load : loads) {
+    const bool multisampled = load.type == Prospero::ImageType::kColor2DMsaa;
+    const uint32_t shader[] = {
+        EncodeMimg0(0x00, 0x1, false, load.dim), EncodeMimg1(2, 2, 0, 0), // image_load v2, v0.., s[8:15]
+        EncodeSopp(0x0c, 0x3f70),                                         // s_waitcnt vmcnt(0)
+        EncodeMubuf0(0x1c), EncodeMubuf1(2, 1, 0),                        // buffer_store_dword v2
+        EncodeSopp(0x01)};
+    std::array<uint32_t, 16> user_data{};
+    user_data[4] = 0x12340000u;
+    user_data[6] = 64u;
+    user_data[7] = 0x00027000u;
+    user_data[8] = 0x10000u;
+    user_data[9] = static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
+    user_data[10] = 3u | (3u << 14u);
+    user_data[11] = DstSel(4, 5, 6, 7) | (multisampled ? 1u << 16u : 0u) |
+                    (static_cast<uint32_t>(load.type) << 28u);
+    user_data[13] = multisampled ? 1u << 4u : 0u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    auto translated = TranslateProgram(shader, options);
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    IR::ResourceSnapshot resources;
+    IR::ResourceSpecialization specialization;
+    const IR::SrtRuntime runtime{.user_data = options.user_data,
+                                 .read_specialization_memory = ReadHostTestMemory};
+    Check(IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              specialization.images.size() == 1u &&
+              specialization.images[0].dimension == load.dimension,
+          "an image load did not take the form its instruction reads the texture in");
+    const auto compiled = CompileProgram(std::move(translated), options, specialization);
+    Check(SpirvInstructionOpcodeCount(compiled.spirv, OpImageFetch) == 1u &&
+              SpirvInstructionOpcodeCount(compiled.spirv, OpImageQuerySizeLod) == load.leveled &&
+              SpirvInstructionOpcodeCount(compiled.spirv, OpImageQuerySize) == load.unleveled,
+          "an array load did not ask its view for its layers, or a plain load did");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+}
+
+// DS2 material pixel shaders read 68-76 distinct T#s from one table.
+void TestManyDistinctImagesBindPerStage() {
+  using namespace ShaderRecompiler;
+  constexpr uint32_t ImageCount = 72;
+  std::vector<uint32_t> table(ImageCount * 8u);
+  for (uint32_t index = 0; index < ImageCount; ++index) {
+    table[index * 8u] = 0x10000u + index * 0x1000u;
+    table[index * 8u + 1u] = static_cast<uint32_t>(Prospero::BufferFormat::k8UNorm) << 20u;
+    table[index * 8u + 2u] = UINT32_MAX;
+    table[index * 8u + 3u] = static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u;
+  }
+  std::vector<uint32_t> shader;
+  for (uint32_t index = 0; index < ImageCount; ++index) {
+    shader.insert(shader.end(), {
+        EncodeSmem0(0x03, 8, 0), (125u << 25u) | (index * 32u), // s_load_dwordx8 s[8:15], s[0:1]
+        EncodeSopp(0x0c, 0xc07f),                                // s_waitcnt lgkmcnt(0)
+        EncodeMimg0(0x00, 0x1), EncodeMimg1(2, 2, 0, 0),         // image_load v2, v[0:1], s[8:15]
+        EncodeSopp(0x0c, 0x3f70),                                // s_waitcnt vmcnt(0)
+        EncodeVop2(0x25, 3, 256 + 2, 3)});                       // v_add_nc_u32 v3, v2, v3
+  }
+  shader.insert(shader.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(3, 1, 0), // buffer_store_dword v3
+                               EncodeSopp(0x01)});
+  std::array<uint32_t, 16> user_data{};
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  user_data[0] = static_cast<uint32_t>(table_address);
+  user_data[1] = static_cast<uint32_t>(table_address >> 32u);
+  user_data[4] = 0x12340000u;
+  user_data[6] = 64u;
+  user_data[7] = 0x00027000u;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  const auto compile = [&](const Spirv::Profile &profile) {
+    options.profile = &profile;
+    auto translated = TranslateProgram(shader, options);
+    const auto plan = IR::ExtractResourcePlan(translated.program);
+    IR::ResourceSnapshot resources;
+    IR::ResourceSpecialization specialization;
+    const IR::SrtRuntime runtime{.user_data = options.user_data,
+                                 .read_specialization_memory = ReadHostTestMemory};
+    Check(IR::MaterializeResources(plan, runtime, resources, specialization) &&
+              resources.images.size() == ImageCount,
+          "distinct T#s did not materialize one image each");
+    return CompileProgram(std::move(translated), options, specialization);
+  };
+  const auto image_descriptors = [](const IR::Program &program) {
+    uint32_t count = 0;
+    for (uint32_t index = 0; index < program.bindings.descriptor_counts.size(); ++index) {
+      if (IR::ImageBindingResourceClass(static_cast<IR::DescriptorBindingKind>(index)) !=
+          IR::ImageResourceClass::None) {
+        count += program.bindings.descriptor_counts[index];
+      }
+    }
+    return count;
+  };
+
+  const auto unbounded = compile(Spirv::DefaultProfile);
+  Check(unbounded.program.info.images.size() == ImageCount &&
+            image_descriptors(unbounded.program) == ImageCount,
+        "distinct T#s did not each bind their own descriptor");
+  CheckSpirvBinaryValidates(unbounded.spirv);
+
+  const auto limited = [](uint32_t images) {
+    Spirv::Profile profile;
+    profile.descriptor_limits.sampled_images = images;
+    profile.descriptor_limits.storage_images = images;
+    return profile;
+  };
+  const auto fits = limited(ImageCount);
+  CheckSpirvBinaryValidates(compile(fits).spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const auto over = limited(ImageCount - 1u);
+  ExpectFatal([&] { (void)compile(over); },
+              "a stage past the device's image limit did not terminate emission");
+  Spirv::Profile resources;
+  resources.descriptor_limits.resources = ImageCount;
+  ExpectFatal([&] { (void)compile(resources); },
+              "a stage past the device's per-stage resource limit did not terminate emission");
+#endif
+}
+
 void TestNewShaderRecompilerScalarMemoryBindingDomains() {
   const auto count_live_memory_ops =
       [](const ShaderRecompiler::IR::Program &program,
@@ -3438,11 +3637,114 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 2u,
         "raw scalar load did not remain a live typed address operation");
-  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 2u,
-        "aligned scalar DWORDs must each use one BDA lookup");
+  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 1u,
+        "the DWORDs of a scalar load must share one page lookup");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
   CheckSpirvBinaryValidates(raw.spirv);
+
+  // The live DWORDs of a scalar load follow each other from one pointer: they are a run with one
+  // lookup, which a page of zeros keeps free of guards. The only conditionals are the helpers'
+  // one each. Loads of other pointers have lookups of their own.
+  constexpr uint32_t OpFunction = 54;
+  constexpr uint32_t OpFunctionCall = 57;
+  constexpr uint32_t OpSelectionMerge = 247;
+  struct Run {
+    std::vector<uint32_t> loads;
+    uint32_t calls;
+    bool run_helper;
+  };
+  // s_load_dwordxN s[destination..], s[2 * base..], s0 offset
+  const auto load = [](uint32_t opcode, uint32_t destination, uint32_t offset, uint32_t base = 4) {
+    return std::vector<uint32_t>{EncodeSmem0(opcode, destination, base), offset};
+  };
+  const auto both = [](std::vector<uint32_t> first, const std::vector<uint32_t> &second) {
+    first.insert(first.end(), second.begin(), second.end());
+    return first;
+  };
+  const Run runs[] = {
+      {load(0x00, 12, 0), 1, false},
+      {load(0x03, 12, 0), 1, true},
+      {load(0x04, 12, 4), 1, true},
+      {both(load(0x00, 12, 0), load(0x00, 16, 0, 5)), 2, false},
+  };
+  for (const auto &run : runs) {
+    // The shader exports s12 and s16: the first DWORD of the load and, of a wider one, the fifth.
+    auto shader = run.loads;
+    shader.insert(shader.end(), {EncodeVop1(0x01, 0, 12), EncodeVop1(0x01, 1, 16),
+                                 EncodeExp0(0x00, 0x3), EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01)});
+    const auto compiled = RecompileForTest(shader, raw_options);
+    Check(SpirvInstructionOpcodeCount(compiled.spirv, OpFunctionCall) == run.calls,
+          "scalar loads did not take one page lookup for each run");
+    Check(SpirvInstructionOpcodeCount(compiled.spirv, OpFunction) == (run.run_helper ? 3u : 2u) &&
+              SpirvInstructionOpcodeCount(compiled.spirv, OpSelectionMerge) ==
+                  (run.run_helper ? 2u : 1u),
+          "a scalar load is guarded, or a lookup helper is missing or unused");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+
+  // A run is loads of one pointer and one offset value. Here the second DWORD of a two-DWORD
+  // load is given another offset value, the pointer of the load before it, or a full address:
+  // it then has a lookup of its own.
+  using ScalarLoads = std::vector<ShaderRecompiler::IR::Inst *>;
+  const auto lookups = [&](const std::function<void(ShaderRecompiler::IR::Program &,
+                                                    const ScalarLoads &)> &edit) {
+    auto shader = both(load(0x00, 16, 0, 5), load(0x01, 12, 0));
+    shader.insert(shader.end(), {EncodeVop1(0x01, 0, 12), EncodeVop1(0x01, 1, 13),
+                                 EncodeVop1(0x01, 2, 16), EncodeExp0(0x00, 0x7),
+                                 EncodeExp1(0, 1, 2, 0), EncodeSopp(0x01)});
+    auto translated = ShaderRecompiler::TranslateProgram(shader, raw_options);
+    ScalarLoads loads;
+    for (auto *block : translated.program.blocks) {
+      for (auto &inst : *block) {
+        if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::LoadAddressU32) continue;
+        const auto &memory = translated.program.memory_info.at(
+            inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index);
+        if (memory.kind == ShaderRecompiler::IR::ResourceKind::ScalarAddress &&
+            !memory.planning_only) {
+          loads.push_back(&inst);
+        }
+      }
+    }
+    Check(loads.size() == 3u, "the scalar loads of the run test were not translated one for one");
+    edit(translated.program, loads);
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = raw_options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(shader.data()),
+        .read_specialization_memory = ReadHostTestMemory};
+    Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "the run test's resources did not materialize");
+    const auto compiled =
+        ShaderRecompiler::CompileProgram(std::move(translated), raw_options, specialization);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    return SpirvInstructionOpcodeCount(compiled.spirv, OpFunctionCall);
+  };
+  Check(lookups([](auto &, const auto &) {}) == 2u,
+        "the two DWORDs of a scalar load did not share a lookup beside another pointer's load");
+  Check(lookups([](auto &, const auto &loads) {
+          loads[2]->SetArg(1, ShaderRecompiler::IR::Value(0u));
+        }) == 3u,
+        "a load with another offset value joined a run");
+  Check(lookups([](auto &, const auto &loads) { loads[2]->SetArg(0, loads[0]->Arg(0)); }) == 3u,
+        "a load of another pointer joined a run");
+  Check(lookups([](auto &program, const auto &loads) {
+          program.memory_info
+              .at(loads[2]->template Flags<ShaderRecompiler::IR::MemoryFlags>().index)
+              .address_is_full = true;
+        }) == 3u,
+        "a load of a full address joined a run");
+  const auto moved = [&](uint32_t offset) {
+    return lookups([offset](auto &program, const auto &loads) {
+      program.memory_info
+          .at(loads[2]->template Flags<ShaderRecompiler::IR::MemoryFlags>().index)
+          .offset = offset;
+    });
+  };
+  Check(moved(60) == 2u && moved(64) == 3u && moved(static_cast<uint32_t>(-4)) == 3u,
+        "a run did not end 64 bytes after its first load, or took a load before it");
 
   const uint32_t buffer_shader[] = {
       EncodeSmem0(0x08, 12, 4),
@@ -3784,6 +4086,23 @@ void TestCustomVintrpMovTranslation() {
   Check(SpirvHasDecorationValue(mixed_linear_result.spirv, 11u, 5287u),
         "mixed linear input did not use BaryCoordNoPerspKHR");
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
+
+  // A plain BaryCoordKHR load under sampleShadingEnable hits an int3 in NVIDIA's compiler.
+  for (const bool no_perspective : {false, true}) {
+    mixed_ps_info.ps_no_perspective = no_perspective;
+    mixed_ps_info.ps_sample_shading = true;
+    auto sample_result = RecompileForTest(mixed_shader, options);
+    const auto sample_source = DisassembleSpirvBinary(sample_result.spirv);
+    const std::string builtin = no_perspective ? "%gl_BaryCoordNoPerspKHR" : "%gl_BaryCoordKHR";
+    Check(SpirvContainsCapability(sample_result.spirv, 52u) &&
+              SpirvHasDecorationValue(sample_result.spirv, 11u, 18u) &&
+              sample_source.find("InterpolateAtSample " + builtin) != std::string::npos &&
+              !SpirvSourceHasInstructionUsing(sample_source, "OpAccessChain", builtin.c_str()) &&
+              !SpirvSourceHasInstructionUsing(sample_source, "OpLoad", builtin.c_str()),
+          "per-sample per-vertex input did not interpolate its barycentrics at SampleId");
+    CheckSpirvBinaryValidates(sample_result.spirv);
+  }
+  mixed_ps_info.ps_sample_shading = false;
 }
 
 void TestVop3F16InterpolationTranslation() {
@@ -3871,8 +4190,9 @@ void TestPerspectiveCentroidInputs() {
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
           "centroid input changed the shared center builtin's interpolation location");
     if (center != UINT32_MAX) {
-      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
-            "center pair lost its ordinary barycentric loads when centroid was enabled");
+      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float ") ||
+                source.find("InterpolateAtOffset %gl_BaryCoordKHR") != std::string::npos,
+            "center pair lost its pixel-center barycentric reads when centroid was enabled");
     }
     CheckSpirvBinaryValidates(result.spirv);
   }
@@ -3915,8 +4235,42 @@ void TestPerspectiveSampleInputs() {
           "sample I/J did not evaluate BaryCoordKHR Y/Z at SampleId");
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u),
           "sample interpolation changed the shared barycentric input location");
+    if ((inputs & 2u) != 0) {
+      Check(source.find("InterpolateAtOffset %gl_BaryCoordKHR") != std::string::npos &&
+                !SpirvSourceHasInstructionUsing(source, "OpAccessChain", "%gl_BaryCoordKHR"),
+            "center I/J of a per-sample shader was not evaluated at the pixel center");
+    }
     CheckSpirvBinaryValidates(result.spirv);
   }
+
+  // Without sample-located I/J the barycentrics keep their default interpolation location.
+  const std::vector<uint32_t> center_shader = {EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 0, 1),
+                                               EncodeSopp(0x01)};
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(center_shader.data());
+  ShaderMappedData mapped{};
+  mapped.code_size_bytes = center_shader.size() * sizeof(uint32_t);
+  ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+  HW::ShaderRegisters sh{};
+  sh.ps_input_ena = sh.ps_input_addr = 2u;
+  sh.m_cbShaderMask = 0xf;
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  ShaderPixelInputInfo pixel{};
+  (void)PrepareProgram(regs, sh, mappings, pixel);
+  Check(!pixel.ps_sample_shading, "center-only I/J enabled sample shading");
+  const auto center_key = MakeStageStaticKey(pixel);
+  pixel.ps_sample_shading = true;
+  Check(center_key != MakeStageStaticKey(pixel), "sample shading is missing from shader key");
+  pixel.ps_sample_shading = false;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto result = RecompileForTest(center_shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
+            !SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u) &&
+            source.find("InterpolateAtOffset") == std::string::npos,
+        "center-only I/J changed the barycentric interpolation location");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestPsInputCountRegisterDecode() {
@@ -6068,7 +6422,7 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   const auto root = std::ranges::find_if(buffers, [](const auto& resource) {
     return resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;
   });
-  Check(root != buffers.end() && snapshot.flattened_srt[root->indirect_mapping_offset] == 2u &&
+  Check(root != buffers.end() && snapshot.flattened_srt[snapshot.indirect_mapping_offsets.at(root->indirect_mapping_slot)] == 2u &&
             buffers.size() == plan.info.buffers.size() + 1u,
         "bounded material range did not select exactly its two writable buffers");
   const auto root_index = static_cast<size_t>(root - buffers.begin());
@@ -10517,6 +10871,105 @@ void TestAutomaticObjectPrimitiveId() {
 #endif
 }
 
+void TestAaMaskPixelShader() {
+  using namespace ShaderRecompiler::IR;
+  constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
+  constexpr uint32_t CapabilityDemoteToHelperInvocation = 5379;
+  constexpr uint32_t OpKill = 252;
+  constexpr uint32_t OpDemoteToHelperInvocation = 5380;
+  constexpr uint32_t OpIsHelperInvocation = 5381;
+
+  // Exports the number of live lanes.
+  const uint32_t shader[] = {
+      EncodeSop1(0x10, 0, 126),  // s_bcnt1_i32_b64 s0, exec
+      EncodeVop1(0x01, 0, 0),    // v_mov_b32 v0, s0
+      EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0), 0xbf810000u};
+  ShaderPixelInputInfo pixel;
+  pixel.ps_early_z = true;
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto mask_dword_reads = [](const std::string &source) {
+    size_t count = 0;
+    for (size_t line = 0; line < source.size();) {
+      const auto end = std::min(source.find('\n', line), source.size());
+      const auto text = std::string_view(source).substr(line, end - line);
+      count += text.find("OpAccessChain %_ptr_PushConstant_uint") != std::string_view::npos &&
+               text.ends_with(" %uint_31");
+      line = end + 1;
+    }
+    return count;
+  };
+
+  const auto ordinary_key = MakeStageStaticKey(pixel);
+  const auto ordinary = RecompileForTest(shader, options);
+  const auto ordinary_source = DisassembleSpirvBinary(ordinary.spirv);
+  Check(SpirvInstructionOpcodeCount(ordinary.spirv, OpDemoteToHelperInvocation) == 0 &&
+            SpirvInstructionOpcodeCount(ordinary.spirv, OpIsHelperInvocation) == 0 &&
+            !SpirvContainsCapability(ordinary.spirv, CapabilityDemoteToHelperInvocation) &&
+            ordinary_source.find("BuiltIn HelperInvocation") != std::string::npos &&
+            ordinary_source.find("BuiltIn FragCoord") == std::string::npos &&
+            ordinary_source.find("PushConstant") == std::string::npos &&
+            SpirvContainsExecutionMode(ordinary.spirv, ExecutionModeEarlyFragmentTests),
+        "a pixel shader without an AA mask tests one");
+
+  pixel.ps_aa_mask = true;
+  Check(MakeStageStaticKey(pixel) != ordinary_key,
+        "the AA mask was omitted from the shader identity");
+  options.push_data_end = PushData::AaMaskDword;
+  const auto masked = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(masked.spirv);
+  Check(SpirvInstructionOpcodeCount(masked.spirv, OpDemoteToHelperInvocation) == 1 &&
+            SpirvInstructionOpcodeCount(masked.spirv, OpKill) == 0 &&
+            SpirvContainsCapability(masked.spirv, CapabilityDemoteToHelperInvocation) &&
+            source.find("OpExtension \"SPV_EXT_demote_to_helper_invocation\"") !=
+                std::string::npos,
+        "a masked pixel is not demoted to a helper invocation");
+  Check(source.find("BuiltIn FragCoord") != std::string::npos && mask_dword_reads(source) == 1 &&
+            !masked.program.bindings.UsesPushData(),
+        "the mask is not read from the draw's dword by the pixel's position");
+  // The live mask is taken after the demotion, and sees it.
+  const auto demote = source.find("OpDemoteToHelperInvocation");
+  const auto helper = source.find("OpIsHelperInvocationEXT");
+  Check(SpirvInstructionOpcodeCount(masked.spirv, OpIsHelperInvocation) == 1 &&
+            demote != std::string::npos && helper != std::string::npos && demote < helper &&
+            source.find("BuiltIn HelperInvocation") == std::string::npos,
+        "the live lanes of a masked shader include the pixels its mask demoted");
+  Check(!SpirvContainsExecutionMode(masked.spirv, ExecutionModeEarlyFragmentTests),
+        "the depth test of a masked shader writes depth before the mask is applied");
+  CheckSpirvBinaryValidates(masked.spirv);
+
+  // A draw's mask picks the module of a shader whose tests run early, and of no other.
+  ShaderPixelInputInfo early;
+  early.ps_early_z = true;
+  Check(!ShaderPixelTestsAaMask(early, false) && ShaderPixelTestsAaMask(early, true),
+        "a shader whose tests run early does not test the mask of its masked draws alone");
+  Check(!ShaderPixelDelaysTests(early, false) && ShaderPixelDelaysTests(early, true),
+        "a mask does not delay the early tests of its masked draws alone");
+  auto kills = early;
+  kills.ps_pixel_kill_enable = true;
+  auto exports_depth = early;
+  exports_depth.ps_depth_export_enable = true;
+  auto exports_coverage = early;
+  exports_coverage.ps_sample_mask_export_enable = true;
+  for (auto late : {ShaderPixelInputInfo{}, kills, exports_depth, exports_coverage}) {
+    Check(ShaderPixelTestsAaMask(late, false) && ShaderPixelTestsAaMask(late, true),
+          "a shader whose tests run late has a module for unmasked draws alone");
+    Check(!ShaderPixelDelaysTests(late, false) && !ShaderPixelDelaysTests(late, true),
+          "a mask delays tests that run late whatever the draw");
+    options.input_info.pixel = &late;
+    options.push_data_end = PushData::DwordCount;
+    Check(!SpirvContainsExecutionMode(RecompileForTest(shader, options).spirv,
+                                      ExecutionModeEarlyFragmentTests),
+          "a shader whose tests run late asks for early ones");
+  }
+  options.input_info.pixel = &pixel;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  options.push_data_end = PushData::DwordCount;
+  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
+              "a masked pixel shader was emitted without its mask dword kept free");
+#endif
+}
+
 void TestRenderTargetReverseExportMapping() {
   const auto format = TextureGetRenderTargetFormat(
       NativeRenderTargetHost(), Prospero::ChannelLayout::k16_16_16_16,
@@ -11726,7 +12179,8 @@ void TestBoundedScalarMaterialImageKeys() {
   for (const uint32_t stride : {160u, 16u}) {
     memory = {.stride = stride, .records = stride == 160u ? 409u : 20u};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.key_reads == 2 && memory.images == 4 && snapshot.images.size() == 4,
+              memory.key_reads == 2 && memory.images == 4 && snapshot.images.size() == 4 &&
+              snapshot.candidate_images.size() == 4,
           "scalar material selection used V# stride as its instruction stride or scanned unused keys");
     for (const uint32_t field : {0x7cu, 0x94u})
       Check(std::ranges::find(snapshot.specialization_reads,
@@ -11736,21 +12190,21 @@ void TestBoundedScalarMaterialImageKeys() {
     for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
       const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
       const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
-      const auto offset = specialization.images[root].indirect_mapping_offset;
+      const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[root].indirect_mapping_slot);
       Check(snapshot.flattened_srt[offset] == 2u &&
                 snapshot.flattened_srt[offset + 1u] == first &&
                 snapshot.flattened_srt[offset + 3u] == first + 15u,
             "scalar material image mapping changed descriptor-index keys into byte offsets");
     }
   }
+  // One key is one slot of each image table's class: the same image state as two keys.
+  const auto two_keys = specialization.images;
   for (const bool same_key : {false, true}) {
     memory = {.count = same_key ? 2u : 1u, .same_key = same_key};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               memory.key_reads == 2 && memory.images == 2 &&
-              snapshot.images.size() == 2 &&
-              std::ranges::all_of(specialization.images, [](const auto &image) {
-                return image.indirect_root == ImageResource::NoIndirectImage;
-              }), "single-candidate scalar material loop retained an indirect image mapping");
+              snapshot.candidate_images.size() == 2 && specialization.images == two_keys,
+          "a single-candidate scalar material loop changed its image tables");
   }
   memory = {.count = 0};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -11773,17 +12227,18 @@ void TestBoundedScalarMaterialImageKeys() {
   for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
     const auto &selector =
         *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
-    const auto offset = specialization.images[root].indirect_mapping_offset;
+    const auto offset = snapshot.indirect_mapping_offsets.at(specialization.images[root].indirect_mapping_slot);
     Check(snapshot.flattened_srt[offset + 1u] == (selector.offset == 0x94u ? 0u : 5567u),
           "scalar material key past its V# did not read as zero");
   }
   memory = {.mixed = true};
+  // The table with the integer texture has a class for it beside its float class.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4 && specialization.images.size() == 4,
+            snapshot.candidate_images.size() == 4 && specialization.images.size() == 5,
         "selected material fields rejected mixed native numeric classes");
-  for (uint32_t i = 0; i < snapshot.images.size(); ++i) {
-    Check(specialization.images[i].numeric_class ==
-              (snapshot.images[i].dwords[0] == 5588u
+  for (const auto &candidate : snapshot.candidate_images) {
+    Check(specialization.images[candidate.resource].numeric_class ==
+              (candidate.value.dwords[0] == 5588u
                   ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float),
           "selected material fields lost a candidate's native numeric class");
   }
@@ -11793,7 +12248,8 @@ void TestBoundedScalarMaterialImageKeys() {
   ApplyResourceSpecialization(translated.program, specialization);
   Check(translated.program.info.images.size() == 4 &&
             translated.program.info.images[0].indirect_resources.size() == 2 &&
-            translated.program.info.images[1].indirect_resources.size() == 2,
+            translated.program.info.images[1].indirect_resources.size() == 2 &&
+            std::ranges::all_of(translated.program.info.images, &ImageResource::candidate),
         "native image reads lost their distinct material field dispatches");
 }
 
@@ -12662,6 +13118,21 @@ void TestGraphicsPushConstantPlacement() {
   spill.program.bindings.AdvancePushData(cursor);
   Check(cursor == 29, "spilled shader data consumed push space");
   CheckSpirvBinaryValidates(spill.spirv);
+
+  // The stages of a draw under an AA mask leave the mask's dword alone.
+  using ShaderRecompiler::IR::PushData;
+  Check(PushData::AaMaskDword == 31 && PushData::CanFit(27, 4, PushData::AaMaskDword) &&
+            !PushData::CanFit(28, 4, PushData::AaMaskDword) &&
+            PushData::StartFor(28, 4, PushData::AaMaskDword) == PushData::NoStart &&
+            PushData::StartFor(28, 4) == 28,
+        "the AA mask dword is not the last push dword, or shader data may take it");
+  options.push_data_end = PushData::AaMaskDword;
+  const auto below = RecompileForTest(shader, options, 27);
+  Check(below.program.bindings.push_data_start_dword == 27,
+        "shader data that ends before the AA mask dword left the push block");
+  const auto reserved = RecompileForTest(shader, options, 28);
+  Check(reserved.program.bindings == spill.program.bindings && reserved.spirv == spill.spirv,
+        "shader data took the AA mask dword");
 }
 
 void TestCapturedBufferLoadUbyteD16Decode() {
@@ -13562,11 +14033,14 @@ int main() {
   TestNewShaderRecompilerVop1SdwaNotDestination();
   TestVop2SdwaMulI24Destination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
+  TestManyDistinctImagesBindPerStage();
+  TestArrayImageLoadCountsLayers();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestScalarAshrI64Decoder();
   TestImageAtomicWidthDecoder();
+  TestImageLoadPckDecoder();
   TestImageGatherDecoder();
   TestDsReturningAtomic64Decoder();
   TestDsCompareStore32Decoder();
@@ -13692,6 +14166,7 @@ int main() {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestAutomaticObjectPrimitiveId();
+  TestAaMaskPixelShader();
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
   TestLogicalAlphaBlendExport();

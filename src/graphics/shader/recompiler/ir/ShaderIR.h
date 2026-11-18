@@ -72,6 +72,7 @@ struct MemoryInfo {
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
+	bool                    image_packed = false; // A load without format conversion.
 	bool                    image_r128                                            = false;
 	bool                    image_cube                                            = false;
 	bool                    idxen                                                 = false;
@@ -88,13 +89,15 @@ struct MemoryInfo {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
-		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		return data_bits == 32u && (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x2 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x3 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x4
+		                                      : opcode == ValueOpcode::ReadConstBuffer ||
+		                                            opcode == ValueOpcode::LoadBufferU32 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x2 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x3 ||
+		                                            opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -112,6 +115,9 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// Modules read a mapping's flattened-SRT offset, ResourceSnapshot::indirect_mapping_offsets[slot].
+inline constexpr uint32_t NoIndirectMappingSlot = UINT32_MAX;
+
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
@@ -128,9 +134,9 @@ struct BufferResource {
 	bool                   formatted          = false;
 	bool                   scalar             = false;
 	bool                   live               = false;
-	uint32_t               indirect_root              = NoIndirectBuffer;
-	uint32_t               indirect_mapping_offset    = 0;
-	uint32_t               indirect_search_iterations = 0;
+	uint32_t               indirect_root         = NoIndirectBuffer;
+	uint32_t               indirect_mapping_slot = NoIndirectMappingSlot;
+	bool                   indirect_searched     = false;
 	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
@@ -158,6 +164,7 @@ struct ImageResource {
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
+	bool                          packed            = false; // Loaded without format conversion.
 	bool                          unfiltered_access_only = true;
 	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
@@ -165,13 +172,26 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
-	uint32_t                      indirect_root     = NoIndirectImage;
-	uint32_t                      indirect_mapping_offset   = 0;
-	uint32_t                      indirect_search_iterations = 0;
+	bool                          candidate = false; // Per-draw candidate table or class.
+	uint32_t                      indirect_root          = NoIndirectImage;
+	uint32_t                      indirect_mapping_slot  = NoIndirectMappingSlot;
+	bool                          indirect_searched      = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
 };
+
+// A sampled table selects among a draw's candidates, read by shape class.
+[[nodiscard]] constexpr bool SelectsCandidateImages(const ImageResource& root) {
+	return root.resource_class == ImageResourceClass::Sampled;
+}
+
+// One DWORD the host stores as the guest does: packed loads and 32-bit atomics view it as R32Uint.
+[[nodiscard]] constexpr bool IsRawWordFormat(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k32UInt || format == Prospero::BufferFormat::k32SInt ||
+	       format == Prospero::BufferFormat::k32Float ||
+	       format == Prospero::BufferFormat::k11_11_10Float;
+}
 
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
@@ -197,9 +217,9 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
 	uint32_t snapshot_index        = 0;
-	uint32_t indirect_root = NoIndirectSampler;
-	uint32_t indirect_mapping_offset = 0;
-	uint32_t indirect_search_iterations = 0;
+	uint32_t              indirect_root         = NoIndirectSampler;
+	uint32_t              indirect_mapping_slot = NoIndirectMappingSlot;
+	bool                  indirect_searched     = false;
 	std::vector<uint32_t> indirect_resources;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
@@ -347,6 +367,19 @@ inline constexpr uint32_t ImageBindingCount           = 50u;
 inline constexpr uint32_t ImageHeapSet                = 1u;
 inline constexpr uint32_t ImageHeapCapacity           = 65536u;
 inline constexpr uint32_t ImageHeapKindShift          = 20u;
+// GPU-selected buffer tables read a per-draw set: a record of range size and base offset per
+// slot, then the buffers. A mapping word is (class + 1) << CandidateClassShift | slot; 0 is none.
+inline constexpr uint32_t CandidateBufferSet     = 2u;
+inline constexpr uint32_t CandidateRecordBinding = 0u;
+inline constexpr uint32_t CandidateBufferBinding = 1u;
+inline constexpr uint32_t CandidateClassShift    = 20u;
+inline constexpr uint32_t CandidateRecordDwords  = 2u;
+// Sampled image tables read a per-draw set of their own: one array of the images. A table
+// whose instructions select a mip gives a candidate a descriptor per mip; its mapping words
+// keep the candidate's last mip from CandidateMipShift up, below the class.
+inline constexpr uint32_t CandidateImageSet     = 3u;
+inline constexpr uint32_t CandidateImageBinding = 0u;
+inline constexpr uint32_t CandidateMipShift     = 16u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -374,6 +407,9 @@ struct PushData {
 
 	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
 	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
+	// The quad pixels a draw's PA_SC_AA_MASK covers, bit (y & 1) * 2 + (x & 1). The shader data
+	// of such a draw's stages ends before it.
+	static constexpr uint32_t AaMaskDword = DwordCount - 1;
 
 	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
 	                                                           uint32_t user_clip_planes = 0) {
@@ -383,11 +419,13 @@ struct PushData {
 		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
 	}
 
-	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
-		return size != 0 && start <= DwordCount && size <= DwordCount - start;
+	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size,
+	                                           uint32_t end = DwordCount) {
+		return size != 0 && start <= end && size <= end - start;
 	}
-	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
-		return CanFit(cursor, size) ? cursor : NoStart;
+	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size,
+	                                                 uint32_t end = DwordCount) {
+		return CanFit(cursor, size, end) ? cursor : NoStart;
 	}
 };
 
@@ -497,6 +535,12 @@ struct Bindings {
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
+	// Flattened-SRT offsets of the indirect mappings, one dword per slot.
+	uint32_t indirect_mapping_dword = 0;
+	uint32_t indirect_mapping_count = 0;
+	// Where the stage's block starts in the draw's candidate buffer array.
+	uint32_t candidate_buffer_dword = PushData::NoStart;
+	uint32_t candidate_image_dword  = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -521,9 +565,70 @@ struct Bindings {
 	bool operator==(const Bindings& other) const = default;
 };
 
+// Guest bytes a shader reads through device addresses: [base + begin, base + end + scale * term +
+// value_scale * value), term bounded by the draw or dispatch, value known when it is recorded.
+struct AddressRange {
+	enum class Term : uint8_t {
+		None,
+		InstanceIndex,
+		GlobalInvocationX,
+		GlobalInvocationY,
+		GlobalInvocationZ,
+		WorkgroupX,
+		WorkgroupY,
+		WorkgroupZ,
+		PixelParameter, // a pixel input's vertex values, `parameter` = location * 4 + channel
+	};
+	enum class Source : uint8_t { None, Constant, Srt, UserData };
+
+	Source                  base_source = Source::None;
+	std::array<uint32_t, 2> base_words {};
+	uint64_t                base       = 0;
+	bool                    align_base = false; // scalar reads drop the base's two low bits
+	int64_t                 begin      = 0;
+	int64_t                 end        = 0;
+	Term                    term       = Term::None;
+	uint64_t                scale      = 0;
+	uint32_t                parameter  = 0;
+	bool     parameter_vertex = false; // one vertex's word (P0), not the interpolated input
+	bool     parameter_float  = false; // converted from float to an integer
+	uint64_t offset_max   = 0; // with the terms, must stay below 2^32 or the offset wraps
+	Source   value_source = Source::None;
+	uint32_t value_word   = 0;
+	uint64_t value_scale  = 0;
+	bool     value_exact  = false;
+
+	bool operator==(const AddressRange& other) const = default;
+};
+
+// A bound on what a vertex stage exports to a parameter channel, in AddressRange terms.
+struct ExportBound {
+	uint32_t             parameter     = 0;     // export index * 4 + channel
+	bool                 as_float      = false; // the float of the bounded integer
+	bool                 per_primitive = false; // the same on every vertex of a primitive
+	uint64_t             hi            = 0;
+	AddressRange::Term   term          = AddressRange::Term::None;
+	uint64_t             scale         = 0;
+	AddressRange::Source value_source  = AddressRange::Source::None;
+	uint32_t             value_word    = 0;
+	uint64_t             value_scale   = 0;
+
+	bool operator==(const ExportBound& other) const = default;
+};
+
+// V#s the shader decodes from a bound table at a GPU-selected record below `count`.
+struct DmaTable {
+	uint32_t              table  = 0; // The buffer resource holding the records.
+	uint32_t              stride = 0;
+	uint32_t              count  = 0;
+	std::vector<uint32_t> offsets;    // Ascending byte offsets of the V#s within record 0.
+	uint32_t              extent = 0; // Bytes an access can reach beyond a V#'s size.
+	bool                  store  = false;
+
+	bool operator==(const DmaTable& other) const = default;
+};
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
-	static constexpr uint32_t MaxImages       = 64;
 	static constexpr uint32_t MaxSamplers     = 32;
 
 	std::vector<BufferResource>      buffers;
@@ -533,6 +638,8 @@ struct ShaderInfo {
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
+	std::vector<AddressRange>            address_ranges;
+	std::vector<ExportBound>             export_bounds;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
@@ -546,6 +653,8 @@ struct ShaderInfo {
 	bool                            uses_gds                      = false;
 	bool                            uses_flattened_srt            = false;
 	bool                            uses_image_heap               = false;
+	bool                                 uses_candidate_buffers        = false;
+	bool                                 uses_candidate_images         = false;
 	bool                            uses_device_address           = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
@@ -570,6 +679,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	std::vector<DmaTable>                dma_tables;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -600,6 +710,8 @@ struct DescriptorSource {
 			bool non_negative = false; // Signed-negative fields read as zero before the maximum.
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
+			// Keys are addend + scale * value (U32) for each of the descriptor's selector addends.
+			uint32_t scale  = 1;
 			bool global = false;
 			// Four or eight DWORD bitmap words per record; set ranks subtract from the last key.
 			bool bitset = false;
@@ -618,9 +730,22 @@ struct DescriptorSource {
 
 			bool operator==(const PointerTable& other) const = default;
 		};
+		// A record array that image heap keys are words of, read at a bounded record index.
+		struct Demand {
+			uint32_t source  = UINT32_MAX; // The array's address.
+			uint32_t stride  = 0;
+			uint32_t offset  = 0;
+			uint32_t maximum = 0; // Of the record index.
+			Value    limit;       // A host-evaluable value the index is clamped to as well.
+
+			bool operator==(const Demand& other) const = default;
+		};
 		std::optional<SelectorRead> selector;
 		std::optional<uint32_t> table_maximum;
 		std::optional<PointerTable> pointer_table;
+		// The arrays of every lookup of an image heap: a draw selects only the descriptors their
+		// words name. None where a lookup has no such array.
+		std::optional<std::vector<Demand>> demands;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
@@ -633,11 +758,15 @@ struct DescriptorSource {
 		// Nonzero shift: workgroup keys are (selector_first + ID) * multiplier >> shift.
 		uint32_t workgroup_multiplier = 0;
 		uint32_t workgroup_shift      = 0;
+		// Pixel input (location * 4 + channel) whose vertex values the draw lists as keys.
+		uint32_t parameter = UINT32_MAX;
 		Value    key_count;
 		// First selector index, workgroup key base, or first descriptor key for a direct or bitmap
 		// range.
 		Value                 selector_first;
 		Value    selector_mask;
+		// Host-evaluable terms added to scaled selector values; empty adds zero.
+		std::vector<Value>    selector_addends;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
@@ -685,6 +814,15 @@ struct UniformFillPlan {
 	Value                element_count;
 };
 
+// A vertex stage's exported parameter component (location * 4 + channel) as a function of
+// user data, scalar memory and buffer records indexed by the vertex index.
+struct ParameterKey {
+	uint32_t parameter = 0;
+	Value    value;
+
+	bool operator==(const ParameterKey& other) const = default;
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -713,6 +851,7 @@ struct ResourcePlan {
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
+	std::vector<ParameterKey>                              parameter_keys;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
@@ -722,6 +861,7 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
+	uint32_t                              indirect_mapping_slots = 0; // One per indirect root.
 	// GPU-thread scratch for walker results and material keys.
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
@@ -751,7 +891,6 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
-
 };
 
 uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory);

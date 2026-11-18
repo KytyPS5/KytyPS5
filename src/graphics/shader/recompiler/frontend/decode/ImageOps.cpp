@@ -277,6 +277,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 	switch (opcode) {
 		case 0x00u: return Opcode::IMAGE_LOAD;
 		case 0x01u: return Opcode::IMAGE_LOAD_MIP;
+		case 0x02u: return Opcode::IMAGE_LOAD_PCK;
 		case 0x08u: return Opcode::IMAGE_STORE;
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
@@ -305,6 +306,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
+		case 0x02u:
 		case 0x08u:
 		case 0x60u: return ImageCoordComponents(dimension);
 		default: return 0;
@@ -418,6 +420,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 				               "MIMG 64-bit image atomic opcode is not implemented");
 			}
 		}
+	}
+	// The texel as stored: its first DWORD only, wider texels have no layout here yet.
+	if (inst.opcode == Opcode::IMAGE_LOAD_PCK && inst.dmask != 0x1u) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "MIMG packed load of more than the first DWORD is not implemented");
 	}
 	const bool supports_d16 = sampled != nullptr || opcode == 0x00u || opcode == 0x01u ||
 	                          opcode == 0x08u || opcode == 0x09u;

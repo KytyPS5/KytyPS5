@@ -32,6 +32,10 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
 }
 
+bool PixelShaderIsPerSample(const EmitterState& state) {
+	return state.program.stage == ShaderType::Pixel && state.input_info.pixel->ps_sample_shading;
+}
+
 uint32_t MrtOutputType(EmitterState& state, uint32_t index) {
 	const auto& pixel = *state.input_info.pixel;
 	if ((pixel.target_sint_mask & (1u << index)) != 0u) return TypeI32Vector(state, 4);
@@ -155,7 +159,10 @@ void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id, spv::Capabil
 
 ImageDefinition& ImageDescriptorDefinition(EmitterState& state, const IR::ImageResource& image,
                                            IR::DescriptorBindingKind kind) {
-	return (image.heap ? state.heap_images : state.images)[IR::ImageBindingIndex(kind)];
+	auto& family = image.heap        ? state.heap_images
+	               : image.candidate ? state.candidate_images
+	                                 : state.images;
+	return family[IR::ImageBindingIndex(kind)];
 }
 } // namespace
 
@@ -216,7 +223,7 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
-	EXIT_IF(!kind.has_value() || (image.heap && array_index == 0u));
+	EXIT_IF(!kind.has_value() || ((image.heap || image.candidate) && array_index == 0u));
 	if (array_index == 0u) {
 		array_index = ConstantU32(state, image.descriptor_index + mip);
 	}

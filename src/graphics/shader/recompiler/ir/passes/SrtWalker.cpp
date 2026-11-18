@@ -99,6 +99,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
+		case ValueOpcode::SMin32:
 		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -490,9 +491,17 @@ void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
 			}
 		}
 		for (const auto source: indirect->sources) add(source);
+		if (indirect->demands) {
+			for (const auto& demand: *indirect->demands) {
+				add(demand.source);
+				AddOutput(demand.limit, root);
+			}
+		}
 		AddOutput(indirect->key_count, root);
 		AddOutput(indirect->selector_first, root);
 		AddOutput(indirect->selector_mask, root);
+		for (const auto addend: indirect->selector_addends)
+			AddOutput(addend, root);
 	};
 	for (const auto& buffer: m_plan.info.buffers) consume(buffer.source);
 	for (const auto& image: m_plan.info.images) consume(image.source);
@@ -1072,6 +1081,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::UMax32:
 			c.cmp(c.eax, c.ecx);
 			c.cmovb(c.eax, c.ecx);
+			break;
+		case ValueOpcode::SMin32:
+			c.cmp(c.eax, c.ecx);
+			c.cmovg(c.eax, c.ecx);
 			break;
 		case ValueOpcode::SMax32:
 			c.cmp(c.eax, c.ecx);

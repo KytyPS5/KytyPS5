@@ -23,6 +23,8 @@ public:
 	void                  ProcessFaultBuffer();
 
 private:
+	void ApplyUseBitmap(const uint8_t* bitmap);
+
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
 	BufferCache&                               m_buffer_cache;

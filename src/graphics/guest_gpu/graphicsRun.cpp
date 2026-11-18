@@ -56,6 +56,7 @@ void GuestGpu::Shutdown() {
 		m_accepting = false;
 		m_stopping  = true;
 		m_work_available.SignalAll();
+		m_suspend_point_progress.SignalAll();
 	}
 	if (m_thread.joinable()) {
 		m_thread.join();
@@ -149,6 +150,14 @@ void GuestGpu::SuspendPoint() {
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
+	// The guest may rewrite a buffer once this returns, so wait until the CP has read it.
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		const auto        point = ++m_suspend_points_queued;
+		while (m_suspend_points_reached < point && !m_graphics_stalled && !m_stopping) {
+			m_suspend_point_progress.Wait(&m_queue_mutex);
+		}
+	}
 	m_done_num++;
 }
 
@@ -299,11 +308,14 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
+	auto& buffers = m_renderer.GetBufferCache();
+	if (!write_one_address) {
+		buffers.WriteMemory(reinterpret_cast<uint64_t>(dst), src,
+		                    uint64_t {dw_num} * sizeof(uint32_t));
+		return;
+	}
 	for (uint32_t i = 0; i < dw_num; i++) {
-		*output = src[i];
-		output += !write_one_address;
+		buffers.WriteMemory(reinterpret_cast<uint64_t>(dst), src + i, sizeof(uint32_t));
 	}
 }
 
@@ -314,7 +326,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	m_renderer.GetBufferCache().WriteMemory(dst_address, &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -323,21 +335,27 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
-void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset) {
+void CommandProcessor::GetLodStats(uint64_t dst_address, uint32_t size, bool reset) {
 	auto& counters = m_renderer.GetRenderExecutor().m_mip_stats;
 	// Each of up to 256 2-dword slots after the 16-dword header holds the clamped sample count
 	// (dword 0 bits 0-23), the slot id (bits 24-31), the unclamped sample count (dword 1 bits 0-23)
 	// and the finest mip sampled (bits 24-27, 15 for none). A non-zero header dword 0 then marks
-	// the report complete.
-	if (dst != nullptr && size >= 64) {
-		const auto slots = std::min((size - 64) / 8, 256u);
+	// the report complete. Nothing is counted without --lod-stats: every slot reports no samples.
+	if (dst_address != 0 && size >= 64) {
+		const auto                slots = std::min((size - 64) / 8, 256u);
+		std::array<uint32_t, 512> report;
 		for (uint32_t slot = 0; slot < slots; slot++) {
 			const auto& counter = counters[slot];
-			dst[16 + slot * 2]  = (slot << 24u) | uint32_t {counter.clamped};
-			dst[16 + slot * 2 + 1] =
+			report[slot * 2]    = (slot << 24u) | uint32_t {counter.clamped};
+			report[slot * 2 + 1] =
 			    (uint32_t {counter.finest_level} << 24u) | uint32_t {counter.unclamped};
 		}
-		dst[0] = 1;
+		auto& buffers = m_renderer.GetBufferCache();
+		if (slots != 0) {
+			buffers.WriteMemory(dst_address + 64, report.data(), uint64_t {slots} * 8);
+		}
+		const uint32_t complete = 1;
+		buffers.WriteMemory(dst_address, &complete, sizeof(complete));
 	}
 	if (reset) {
 		counters = {};
@@ -483,6 +501,11 @@ void GuestGpu::ThreadRun(void* data) {
 		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (submission.queue_id == 0) {
+			gpu->m_graphics_stalled = !complete;
+			gpu->m_suspend_points_reached += submission.type == SubmissionType::SuspendPoint;
+			gpu->m_suspend_point_progress.SignalAll();
+		}
 		if (!complete) {
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));

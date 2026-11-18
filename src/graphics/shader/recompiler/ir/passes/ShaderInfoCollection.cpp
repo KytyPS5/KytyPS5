@@ -113,6 +113,10 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,
 			         pixel->ps_no_perspective ? "gl_BaryCoordNoPerspKHR" : "gl_BaryCoordKHR");
+			// A per-sample shader interpolates them at its sample.
+			if (pixel->ps_sample_shading) {
+				AddInput(info, StageInputKind::SampleId, 0, 1, "gl_SampleID");
+			}
 			break;
 		}
 	}
@@ -608,6 +612,10 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	                           std::ranges::any_of(info.images, uses_mapping) ||
 	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
+	info.uses_candidate_images  = std::ranges::any_of(info.images, &ImageResource::candidate);
+	info.uses_candidate_buffers = std::ranges::any_of(info.buffers, [](const auto& buffer) {
+		return buffer.live && buffer.indirect_root != BufferResource::NoIndirectBuffer;
+	});
 	switch (program.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local: CollectVertexInputs(input_info.vertex, info, inputs.components); break;

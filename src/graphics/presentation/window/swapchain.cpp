@@ -606,6 +606,19 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
+// The layer shader's push constants.
+struct LayerPush {
+	uint32_t flags  = 0;
+	int32_t  width  = 0;
+	int32_t  height = 0;
+};
+
+// Whether the frame is shown smaller than it is along an axis.
+static bool Shrinks(const Presenter::Frame* frame, const vk::Rect2D& rect) {
+	return frame != nullptr && (rect.extent.width < frame->image.extent.width ||
+	                            rect.extent.height < frame->image.extent.height);
+}
+
 static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& target) {
 	const uint64_t src_w = std::max(source.width, 1u);
 	const uint64_t src_h = std::max(source.height, 1u);
@@ -642,7 +655,8 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 		RequireVulkanSuccess(
 		    device.createDescriptorSetLayout(&descriptors, nullptr, &m_overlay_descriptors),
 		    "create video-out overlay descriptor layout");
-		const vk::PushConstantRange alpha {vk::ShaderStageFlagBits::eFragment, 0, sizeof(uint32_t)};
+		const vk::PushConstantRange  alpha {vk::ShaderStageFlagBits::eFragment, 0,
+		                                    sizeof(LayerPush)};
 		vk::PipelineLayoutCreateInfo layout {};
 		layout.setLayoutCount         = 1;
 		layout.pSetLayouts            = &m_overlay_descriptors;
@@ -727,8 +741,10 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	// The main bus ignores alpha.
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
 	                       frame.source_flags | (layer.bus == 0 ? 16u : 0u);
-	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(flags), &flags);
+	const LayerPush push {flags, static_cast<int32_t>(rect.extent.width),
+	                      static_cast<int32_t>(rect.extent.height)};
+	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(push),
+	                      &push);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = m_image_views[m_image_index];
@@ -755,17 +771,23 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
-	auto       vk_command      = command.Handle();
+	auto        vk_command    = command.Handle();
+	const auto* aspect_source = source != nullptr ? source : overlay.frame;
+	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
+	                                ? FitAspect(aspect_source->image.extent, m_extent)
+	                                : vk::Rect2D {{0, 0}, m_extent};
+	// A blit reads two source pixels per axis; the layer shader filters a frame shown smaller.
 	const bool convert_source =
 	    source != nullptr && VideoOutSourceNeedsDraw(source->source_flags, m_hdr_active);
-	const bool blit_source     = source != nullptr && !convert_source;
+	const bool draw_source     = convert_source || Shrinks(source, game_rect);
+	const bool blit_source     = source != nullptr && !draw_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
+	const bool draw_attachment = draw_source || draw_overlay || draw_system_overlay;
 	if (blit_source) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
 	}
-	if (convert_source) {
+	if (draw_source) {
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
 	}
@@ -792,10 +814,6 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
-	const auto* aspect_source = source != nullptr ? source : overlay.frame;
-	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
-	                               ? FitAspect(aspect_source->image.extent, m_extent)
-	                               : vk::Rect2D {{0, 0}, m_extent};
 	if (source == nullptr || game_rect.extent != m_extent) {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -865,7 +883,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 			                           &to_present);
 		};
-		if (convert_source) {
+		if (draw_source) {
 			DrawLayer(vk_command, {source, 0, false}, game_rect);
 			if (draw_overlay || draw_system_overlay) {
 				attachment_barrier();

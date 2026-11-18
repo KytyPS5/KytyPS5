@@ -1,15 +1,16 @@
 #include "common/assert.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <fmt/format.h>
-#include <xbyak/xbyak.h>
+#include <algorithm>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <map>
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -168,10 +169,12 @@ bool EquivalentSelectorDomain(const ResourcePlan& program,
 	return left.selector == right.selector && left.signed_count == right.signed_count &&
 	       left.workgroup_axis == right.workgroup_axis &&
 	       left.workgroup_multiplier == right.workgroup_multiplier &&
-	       left.workgroup_shift == right.workgroup_shift &&
+	       left.workgroup_shift == right.workgroup_shift && left.parameter == right.parameter &&
 	       EquivalentValue(program, left.key_count, right.key_count) &&
 	       EquivalentValue(program, left.selector_first, right.selector_first) &&
-	       EquivalentValue(program, left.selector_mask, right.selector_mask);
+	       EquivalentValue(program, left.selector_mask, right.selector_mask) &&
+	       std::ranges::equal(left.selector_addends, right.selector_addends,
+	                          [&](Value a, Value b) { return EquivalentValue(program, a, b); });
 }
 
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {

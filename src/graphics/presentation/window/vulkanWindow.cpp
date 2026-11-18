@@ -62,6 +62,8 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	        .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 	        .descriptorBindingUpdateUnusedWhilePending    = VK_TRUE,
 	        .descriptorBindingPartiallyBound              = VK_TRUE,
+	        .descriptorBindingVariableDescriptorCount     = VK_TRUE,
+	        .runtimeDescriptorArray                       = VK_TRUE,
 	        .timelineSemaphore                            = VK_TRUE,
 	        .bufferDeviceAddress                          = VK_TRUE,
 	        .shaderOutputViewportIndex                    = VK_TRUE,
@@ -69,7 +71,9 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 }
 
 vk::PhysicalDeviceVulkan13Features WindowContext::RequiredVulkan13Features() noexcept {
-	return {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE};
+	return {.shaderDemoteToHelperInvocation = VK_TRUE,
+	        .synchronization2               = VK_TRUE,
+	        .dynamicRendering               = VK_TRUE};
 }
 
 static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, const char* name) {
@@ -249,10 +253,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "descriptorBindingUpdateUnusedWhilePending");
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
+		check_feature(features12.descriptorBindingVariableDescriptorCount,
+		              "descriptorBindingVariableDescriptorCount");
+		check_feature(features12.runtimeDescriptorArray, "runtimeDescriptorArray");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering");
 		check_feature(features13.synchronization2, "synchronization2");
+		check_feature(features13.shaderDemoteToHelperInvocation, "shaderDemoteToHelperInvocation");
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
@@ -441,6 +449,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
 	}
+	// Custom sample locations place EQAA's guest samples natively.
+	add(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
@@ -500,10 +510,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
 	    vk::PhysicalDeviceRobustness2PropertiesEXT, vk::PhysicalDeviceVulkan11Properties,
 	    vk::PhysicalDeviceSubgroupSizeControlProperties, vk::PhysicalDevicePushDescriptorProperties,
-	    vk::PhysicalDeviceMeshShaderPropertiesEXT>
+	    vk::PhysicalDeviceMaintenance4Properties, vk::PhysicalDeviceMeshShaderPropertiesEXT>
 	    properties;
 	auto& [properties2, float_controls, robustness2_props, properties11, subgroup_control,
-	       push_descriptor, mesh_properties] = properties;
+	       push_descriptor, maintenance4, mesh_properties] = properties;
 	if (!graphics.mesh_shader_enabled) {
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
@@ -511,6 +521,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
+	graphics.max_buffer_size            = maintenance4.maxBufferSize;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
 
@@ -554,6 +565,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	graphics.QuerySampleLocations(
+	    HasExtension(device_extensions, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME));
+	LOGF("Vulkan sample locations: %s counts=0x%x range=[%g, %g] sub_pixel_bits=%u\n",
+	     graphics.sample_locations_enabled ? "true" : "false",
+	     static_cast<vk::SampleCountFlags::MaskType>(graphics.sample_location_counts),
+	     graphics.sample_location_range[0], graphics.sample_location_range[1],
+	     graphics.sample_location_sub_pixel_bits);
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -591,6 +609,34 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	{
+		// Textures the T# MIN_LOD clamps become sparse 2D images with their unsampled levels
+		// unbound; the binds go on the one queue, so its family must take them.
+		const auto families = graphics.physical_device.getQueueFamilyProperties();
+		const bool queue_sparse =
+		    queue_family < families.size() && static_cast<bool>(families[queue_family].queueFlags &
+		                                                        vk::QueueFlagBits::eSparseBinding);
+		const bool sparse = queue_sparse && supported2.features.sparseBinding == VK_TRUE;
+		graphics.sparse_residency_image2d_enabled =
+		    sparse && supported2.features.sparseResidencyImage2D == VK_TRUE;
+		// Guest buffers and the BDA page table take memory only for the pages in use; the
+		// windows of the guest buffers overlap, which is what aliasing allows.
+		graphics.sparse_residency_buffer_enabled =
+		    sparse && Config::SparseBuffersEnabled() &&
+		    supported2.features.sparseResidencyBuffer == VK_TRUE;
+		graphics.sparse_residency_aliased_enabled =
+		    graphics.sparse_residency_buffer_enabled &&
+		    supported2.features.sparseResidencyAliased == VK_TRUE;
+		device_features.sparseBinding =
+		    graphics.sparse_residency_image2d_enabled || graphics.sparse_residency_buffer_enabled;
+		device_features.sparseResidencyImage2D = graphics.sparse_residency_image2d_enabled;
+		device_features.sparseResidencyBuffer  = graphics.sparse_residency_buffer_enabled;
+		device_features.sparseResidencyAliased = graphics.sparse_residency_aliased_enabled;
+		LOGF("Vulkan sparse 2D images: %s, buffers: %s, aliased: %s\n",
+		     graphics.sparse_residency_image2d_enabled ? "true" : "false",
+		     graphics.sparse_residency_buffer_enabled ? "true" : "false",
+		     graphics.sparse_residency_aliased_enabled ? "true" : "false");
+	}
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =

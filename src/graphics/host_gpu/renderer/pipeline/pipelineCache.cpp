@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -232,6 +233,28 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 	return formats;
 }
 
+ShaderRecompiler::Spirv::StageDescriptorLimits
+DeviceStageDescriptorLimits(const GraphicContext& graphics) {
+	// A stage's set also has to fit one descriptor pool when it is not pushed, and leave the
+	// device room for a draw's candidate buffers, their records and its candidate images.
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	const auto  bound  = [](uint32_t device, vk::DescriptorType type) {
+		return std::min(device, DescriptorHeap::PoolCapacity(type));
+	};
+	const auto candidates =
+	    graphics.candidate_buffer_layout ? graphics.max_candidate_buffers + 1u : 0u;
+	return {.storage_buffers = bound(limits.maxPerStageDescriptorStorageBuffers - candidates,
+	                                 vk::DescriptorType::eStorageBuffer),
+	        .samplers = bound(limits.maxPerStageDescriptorSamplers, vk::DescriptorType::eSampler),
+	        .sampled_images =
+	            bound(limits.maxPerStageDescriptorSampledImages -
+	                      (graphics.candidate_image_layout ? graphics.max_candidate_images : 0u),
+	                  vk::DescriptorType::eSampledImage),
+	        .storage_images =
+	            bound(limits.maxPerStageDescriptorStorageImages, vk::DescriptorType::eStorageImage),
+	        .resources = limits.maxPerStageResources};
+}
+
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
@@ -244,7 +267,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .ray_query              = graphics.ray_query_enabled};
+	        .ray_query              = graphics.ray_query_enabled,
+	        .descriptor_limits      = DeviceStageDescriptorLimits(graphics)};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -282,13 +306,15 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 uint32_t push_data_cursor) {
+                                                 uint32_t push_data_cursor,
+                                                 uint32_t push_data_end) {
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
-		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-		        push_data_cursor, layout.ShaderDataDwords()) ||
+		if (layout.push_data_start_dword !=
+		        ShaderRecompiler::IR::PushData::StartFor(
+		            push_data_cursor, layout.ShaderDataDwords(), push_data_end) ||
 		    candidate.specialization != specialization) {
 			continue;
 		}
@@ -359,7 +385,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
-                                              uint32_t& push_data_cursor) {
+                                              uint32_t& push_data_cursor, uint32_t push_data_end) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -382,6 +408,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 		options.stage            = ShaderType::Pixel;
 		options.input_info.pixel = &input_info;
+		runtime.parameter_keys   = m_pixel_parameter_keys;
 	} else {
 		static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
 		options.stage              = ShaderType::Compute;
@@ -406,9 +433,11 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
+			if (!source_changed) {
+				module = cached.FindModule<true>(runtime, push_data_cursor, push_data_end);
+			}
 		} else {
-			module = cached.FindModule<false>(runtime, push_data_cursor);
+			module = cached.FindModule<false>(runtime, push_data_cursor, push_data_end);
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -418,6 +447,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	options.push_data_end   = push_data_end;
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -457,7 +487,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    program.resource_plan, runtime, program.resources, program.specialization));
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data_cursor)) {
+		if (const auto* module =
+		        entry->second.FindModule<true>(runtime, push_data_cursor, push_data_end)) {
 			return bind(*module);
 		}
 	}
@@ -465,10 +496,58 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	                          push_data_cursor));
 }
 
-PipelineCache::PipelineCache(GraphicContext&                         graphics,
+const ShaderRecompiler::IR::ResourcePlan*
+PipelineCache::VertexPlan(const ShaderParams& params, ShaderVertexInputInfo& input_info) {
+	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
+	options.stage             = input_info.logical_stage;
+	options.input_info.vertex = &input_info;
+	options.user_data_base    = 8;
+	if (options.stage != ShaderType::Vertex) return nullptr;
+	ProgramKey key {
+	    .stage = options.stage, .hash = params.hash, .user_data_count = params.user_data_count};
+	BuildStageStaticKey(input_info, key.static_state);
+	// A call source re-extracts its plan, so only plans that stay put are evaluated.
+	if (const auto found = m_program_cache.find(key); found != m_program_cache.end()) {
+		return found->second.call_source || found->second.skip_dispatch
+		           ? nullptr
+		           : &found->second.resource_plan;
+	}
+	if (const auto found = m_vertex_plans.find(key); found != m_vertex_plans.end())
+		return &found->second;
+	options.shader_hash = params.hash;
+	options.user_data   = std::span(params.user_data).first(params.user_data_count);
+	options.back_code   = params.back_code;
+	options.dump_ir     = false;
+	const auto source   = ShaderRecompiler::PrepareShaderSource(params.code, options);
+	if (source.unsupported_call_pc != UINT32_MAX || !source.calls.empty()) return nullptr;
+	auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	return &m_vertex_plans
+	            .emplace(std::move(key),
+	                     ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+	            .first->second;
+}
+
+bool PipelineCache::DrawParameterKeys::Keys(uint32_t parameter, std::vector<uint32_t>& keys) {
+	const auto location = parameter / 4u;
+	if (!linked || cache.m_parameter_keys == nullptr ||
+	    !ShaderPixelParameterIsExported(pixel, location))
+		return false;
+	const auto* plan = cache.VertexPlan(vertex, vertex_info);
+	if (plan == nullptr) return false;
+	const ShaderRecompiler::IR::SrtRuntime runtime {
+	    .user_data                  = std::span(vertex.user_data).first(vertex.user_data_count),
+	    .shader_base                = vertex.Base(),
+	    .read_specialization_memory = ReadShaderGuestMemory,
+	};
+	const auto exported = ShaderPixelParameterMappedLocation(pixel, location) * 4u + parameter % 4u;
+	return cache.m_parameter_keys->Keys(*plan, runtime, exported, keys);
+}
+
+PipelineCache::PipelineCache(GraphicContext&                        graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
+                             ParameterKeyCache*                     parameter_keys,
                              const std::filesystem::path&           shader_store)
-    : m_graphics(graphics), m_image_heap(image_heap),
+    : m_graphics(graphics), m_image_heap(image_heap), m_parameter_keys(parameter_keys),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
@@ -647,6 +726,25 @@ void PipelineCache::WriteDriverCache() const {
 	                 Common::PathToString(m_driver_cache_path));
 }
 
+// The quad pixels PA_SC_AA_MASK covers, bit (y & 1) * 2 + (x & 1). Where every target stores one
+// sample, sample 0 decides a pixel; a multisampled draw keeps them all.
+static uint32_t AaQuadMask(const HW::Context& context, uint32_t color_output_mask) {
+	if ((context.GetScanModeControl().msaa_enable && context.GetAaConfig().msaa_num_samples != 0) ||
+	    context.GetDepthRenderTarget().z_info.num_samples != 0) {
+		return 0xf;
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if ((color_output_mask & (1u << slot)) != 0 && target.base.addr != 0 &&
+		    (target.attrib.num_samples != 0 || target.attrib.num_fragments != 0)) {
+			return 0xf;
+		}
+	}
+	const auto& mask = context.GetAaMask();
+	return (mask.x0y0_x1y0 & 1u) | ((mask.x0y0_x1y0 >> 15u) & 2u) | ((mask.x0y1_x1y1 & 1u) << 2u) |
+	       ((mask.x0y1_x1y1 >> 13u) & 8u);
+}
+
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
@@ -753,6 +851,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			vertex_info[0].indirect_draw    = true;
 		}
 	}
+	state.aa_quad_mask = AaQuadMask(context, color_output_mask);
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
@@ -768,6 +867,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
+		pixel_info.ps_aa_mask = ShaderPixelTestsAaMask(pixel_info, state.aa_quad_mask != 0xf);
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
@@ -864,8 +964,21 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	state.aa_mask_read       = pixel_active ? pixel_info.ps_aa_mask : state.aa_quad_mask != 0xf;
+	const auto push_data_end = state.aa_mask_read ? ShaderRecompiler::IR::PushData::AaMaskDword
+	                                              : ShaderRecompiler::IR::PushData::DwordCount;
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		// Pixel inputs reach the fragment shader straight from the vertex stage's exports.
+		state.parameters_linked = !tess_active && !mesh_active &&
+		                          vertex_info[0].logical_stage == ShaderType::Vertex &&
+		                          pixel_info.parameter_mode != ShaderPixelParameterMode::Rectangle;
+		DrawParameterKeys parameter_keys(*this, pixel_info, vertex_params[0], vertex_info[0],
+		                                 state.parameters_linked);
+		m_pixel_parameter_keys    = &parameter_keys;
+		const auto* pixel_program =
+		    GetProgram(pixel_params, pixel_info, push_data_cursor, push_data_end);
+		m_pixel_parameter_keys    = nullptr;
+		const auto& pixel_module  = *pixel_program;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -875,7 +988,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor, push_data_end);
 	}
 }
 
@@ -897,6 +1010,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto  vertex_info   = state.VertexStages();
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
+	const auto& sample_pattern = targets.eqaa.pattern;
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	const bool ps_active    = state.ps_active;
@@ -936,10 +1050,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
-			attachment_samples = colors[i].desc.info.samples;
-		} else if (attachment_samples != colors[i].desc.info.samples) {
+			attachment_samples = colors[i].AttachmentSamples();
+		} else if (attachment_samples != colors[i].AttachmentSamples()) {
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].desc.info.samples);
+			     attachment_samples, colors[i].AttachmentSamples());
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
@@ -1000,12 +1114,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;
 		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
+			attachment_samples = depth.AttachmentSamples();
+		} else if (attachment_samples != depth.AttachmentSamples()) {
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+			     depth.AttachmentSamples());
 		}
 	}
+	// AaQuadMask masks only draws whose targets store one sample each.
+	EXIT_IF(state.aa_quad_mask != 0xf && attachment_samples > 1);
 	if (color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
 		EXIT_IF(!static_cast<bool>(
@@ -1021,9 +1137,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.topology                 = state.topology;
 	static_params.primitive_restart_enable = state.primitive_restart_enable;
 	static_params.samples                  = attachment_samples;
+	EXIT_IF(sample_pattern.count != 0 && sample_pattern.count != attachment_samples);
+	static_params.sample_pattern = sample_pattern;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
+	static_params.aa_mask_fragment         = !ps_active && state.aa_quad_mask != 0xf;
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
+#include "graphics/host_gpu/renderer/pipeline/parameterKeys.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "kernel/eventQueue.h"
@@ -29,6 +30,16 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+
+// Term extents of a draw or dispatch for its shaders' address ranges; 0 when unknown.
+struct AddressRangeExtents {
+	uint64_t                instance_end = 0; // first instance + instance count
+	std::array<uint64_t, 3> invocations {};
+	std::array<uint64_t, 3> workgroups {};
+	// A draw's vertex stage, when it exports straight to these pixel inputs.
+	const ShaderStageRuntime*   exporter     = nullptr;
+	const ShaderPixelInputInfo* pixel_inputs = nullptr;
+};
 
 class RenderContext {
 public:
@@ -48,8 +59,11 @@ public:
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
 	ImageHeap&          GetImageHeap() { return m_image_heap; }
+	ParameterKeyCache&  GetParameterKeys() { return m_parameter_keys; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
+	// Before recording, so the stage's first device-address read already finds its memory.
+	void BackAddressRanges(const ShaderStageRuntime& stage, const AddressRangeExtents& extents);
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
@@ -87,6 +101,7 @@ private:
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
+	ParameterKeyCache         m_parameter_keys;
 	OcclusionQueries          m_occlusion_queries;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;

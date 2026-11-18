@@ -5,8 +5,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
-// ResourceSnapshot and therefore do not create shader permutations.
+// Canonical module-affecting resource state. Runtime addresses, descriptor payloads and where
+// indirect mappings sit in the flattened SRT remain in ResourceSnapshot and therefore do not
+// create shader permutations.
 struct ResourceSpecialization {
 	struct Buffer {
 		uint32_t               packed_stride                   = 0;
@@ -15,8 +16,8 @@ struct ResourceSpecialization {
 		bool                   zero_stride_oob                 = false;
 		bool                   scalar_empty                    = false;
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
-		uint32_t               indirect_mapping_offset         = 0;
-		uint32_t               indirect_search_iterations      = 0;
+		uint32_t               indirect_mapping_slot           = NoIndirectMappingSlot;
+		bool                   indirect_searched               = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 
@@ -28,8 +29,8 @@ struct ResourceSpecialization {
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
 		Prospero::BufferFormat        srgb_decode                = Prospero::BufferFormat::kInvalid;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
-		uint32_t                      indirect_mapping_offset    = 0;
-		uint32_t                      indirect_search_iterations = 0;
+		uint32_t                      indirect_mapping_slot      = NoIndirectMappingSlot;
+		bool                          indirect_searched          = false;
 		bool                          cube                       = false;
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
@@ -38,10 +39,10 @@ struct ResourceSpecialization {
 	};
 
 	struct Sampler {
-		uint32_t indirect_root = SamplerResource::NoIndirectSampler;
-		uint32_t indirect_mapping_offset = 0;
-		uint32_t indirect_search_iterations = 0;
-		bool operator==(const Sampler&) const = default;
+		uint32_t indirect_root                    = SamplerResource::NoIndirectSampler;
+		uint32_t indirect_mapping_slot            = NoIndirectMappingSlot;
+		bool     indirect_searched                = false;
+		bool     operator==(const Sampler&) const = default;
 	};
 
 	std::vector<Buffer> buffers;
@@ -66,6 +67,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+
+// Writes the snapshot's mapping offsets into the shader data of a module compiled for it.
+void WriteIndirectMappingOffsets(const Bindings& bindings, const ResourceSnapshot& snapshot,
+                                 std::span<uint32_t> shader_data);
 
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
 // null. Entries of one kind specialize identically.

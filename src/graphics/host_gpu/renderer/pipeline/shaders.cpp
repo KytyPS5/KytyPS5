@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_aa_mask_spv.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -125,10 +126,18 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
-	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
+	std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout,
+	                        graphics.candidate_buffer_layout, graphics.candidate_image_layout};
+	EXIT_IF((pipeline.uses_candidate_buffers && !graphics.candidate_buffer_layout) ||
+	        (pipeline.uses_candidate_images && !graphics.candidate_image_layout));
+	// A set the pipeline does not use may take any layout.
+	if (!set_layouts[1]) set_layouts[1] = set_layouts[2];
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = pipeline.uses_image_heap ? 2u : 1u;
+	pipeline_layout_info.setLayoutCount         = pipeline.uses_candidate_images    ? 4u
+	                                              : pipeline.uses_candidate_buffers ? 3u
+	                                              : pipeline.uses_image_heap        ? 2u
+	                                                                                : 1u;
 	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
@@ -158,6 +167,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 	const auto       task_module =
 	    vertex.mesh_task ? CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device) : vk::ShaderModule {};
+	const auto mask_module = static_params.aa_mask_fragment
+	                             ? CompileSPV(GPU_AA_MASK_SPV, graphics.device)
+	                             : vk::ShaderModule {};
 
 	if (rect_list) {
 		std::span<const RectListParameter> parameters;
@@ -180,6 +192,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
 		                                       .module = task_module,
 		                                       .pName  = "main"};
+	}
+	if (mask_module) {
+		shader_stages[shader_stage_count++] = {
+		    .stage = vk::ShaderStageFlagBits::eFragment, .module = mask_module, .pName = "main"};
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =
@@ -254,6 +270,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	multisampling.minSampleShading     = 1.0f;
 	multisampling.alphaToCoverageEnable =
 	    static_params.alpha_to_coverage_enable ? VK_TRUE : VK_FALSE;
+	const auto&                                   pattern = static_params.sample_pattern;
+	std::array<vk::SampleLocationEXT, 16>         sample_locations {};
+	vk::PipelineSampleLocationsStateCreateInfoEXT sample_locations_state {};
+	if (pattern.count != 0) {
+		EXIT_IF(pattern.count != static_params.samples || pattern.count > sample_locations.size());
+		for (uint32_t index = 0; index < pattern.count; index++) {
+			sample_locations[index] = {static_cast<float>(pattern.xy[index] & 0xfu) / 16.0f,
+			                           static_cast<float>(pattern.xy[index] >> 4u) / 16.0f};
+		}
+		auto& info                                   = sample_locations_state.sampleLocationsInfo;
+		info.sampleLocationsPerPixel                 = vulkan_sample_count(pattern.count);
+		info.sampleLocationGridSize                  = vk::Extent2D {1, 1};
+		info.sampleLocationsCount                    = pattern.count;
+		info.pSampleLocations                        = sample_locations.data();
+		sample_locations_state.sampleLocationsEnable = VK_TRUE;
+		multisampling.pNext                          = &sample_locations_state;
+	}
 
 	vk::PipelineColorBlendAttachmentState color_blend_attachment[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < rendering.color_count; i++) {
@@ -293,6 +326,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			const auto native_stage = NativeShaderStage(stage->info.stage);
 			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
 			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			pipeline.uses_candidate_buffers |= stage->info.info.uses_candidate_buffers;
+			pipeline.uses_candidate_images |= stage->info.info.uses_candidate_images;
 			pipeline.push_stages |= native_stage;
 		}
 	}
@@ -360,6 +395,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	graphics.device.destroyShaderModule(task_module, nullptr);
+	graphics.device.destroyShaderModule(mask_module, nullptr);
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
@@ -378,8 +414,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
-	pipeline.uses_image_heap = module.info.info.uses_image_heap;
-	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
+	pipeline.uses_image_heap        = module.info.info.uses_image_heap;
+	pipeline.uses_candidate_buffers = module.info.info.uses_candidate_buffers;
+	pipeline.uses_candidate_images  = module.info.info.uses_candidate_images;
+	pipeline.push_stages            = vk::ShaderStageFlagBits::eCompute;
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::ComputePipelineCreateInfo info {};

@@ -59,9 +59,9 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, Sparse sparse)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_size(size) {
+      m_size(size), m_sparse(sparse) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -70,9 +70,30 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	if (sparse != Sparse::None) {
+		EXIT_IF(usage != MemoryUsage::DeviceLocal || !graphics.sparse_residency_buffer_enabled ||
+		        (sparse == Sparse::Aliased && !graphics.sparse_residency_aliased_enabled) ||
+		        (flags & ~SparseBufferUsage) != vk::BufferUsageFlags {});
+		buffer_info.flags =
+		    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		if (sparse == Sparse::Aliased) {
+			buffer_info.flags |= vk::BufferCreateFlagBits::eSparseAliased;
+		}
+		const auto result = graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer);
+		if (result != vk::Result::eSuccess) {
+			EXIT("cannot create a sparse buffer of %" PRIu64 " bytes: %s\n", size,
+			     vk::to_string(result).c_str());
+		}
+		if (with_bda) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+			EXIT_IF(m_device_address == 0);
+		}
+		return;
+	}
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags          = AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -80,13 +101,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+	const auto        allocate      = [&](const VmaAllocationCreateInfo& info) {
+		return vmaCreateBuffer(graphics.allocator,
+		                       static_cast<const VkBufferCreateInfo*>(buffer_info), &info,
+		                       &native_buffer, &m_allocation, &allocation_result);
+	};
+	// Device-local buffers move to host memory once the device is out of budget: host-visible
+	// memory, the only kind no driver keeps on the device.
+	if (usage != MemoryUsage::DeviceLocal ||
+	    !graphics.AllocateDeviceLocal(size, allocation_info, allocate)) {
+		if (usage == MemoryUsage::DeviceLocal) {
+			allocation_info.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+			allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+		}
+		if (allocate(allocation_info) != VK_SUCCESS) {
+			graphics.LogMemoryBudget();
+			EXIT("out of memory for a buffer of %" PRIu64 " bytes\n", size);
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -98,7 +130,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
-	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_coherent     = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	m_device_local = (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
@@ -106,7 +139,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (IsSparse()) {
+		// Binds still queued would name a destroyed buffer.
+		m_graphics->sparse_binding->Forget(m_buffer);
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

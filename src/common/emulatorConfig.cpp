@@ -249,6 +249,10 @@ bool NativeRtEnabled() {
 	return g_config->native_rt;
 }
 
+bool SparseBuffersEnabled() {
+	return g_config->sparse_buffers_enabled;
+}
+
 bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }

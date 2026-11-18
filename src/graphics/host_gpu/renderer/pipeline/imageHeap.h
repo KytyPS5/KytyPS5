@@ -24,11 +24,14 @@ struct ImageHeapTestAccess;
 // Guest image tables that shaders index by GPU-computed offsets, kept resident in one bindless
 // sampled-image array. A table is keyed by its base and follows its descriptor's size. Each view
 // of a table owns device slot words, one per table dword, that select an array element; one
-// element serves a descriptor and profile in every view. CPU writes to a table fault in its
-// snapshot, which each draw refreshes once; a view takes the changes when a draw first acquires
-// it. Images behind elements report their changes through Image::heap_changes. A smaller table
-// leaves at a suspend point if the frame did not acquire it, a larger one after
-// LargeTableIdleFrames such frames.
+// element serves a descriptor and profile in every view. A probe has its element while draws
+// can select it: a draw that names the offsets it can select keeps those until a frame that
+// uses the view names them no more; a draw that cannot keeps every probe, and a view no draw
+// uses keeps its own, for the frames an idle table stays. CPU
+// writes to a table fault in its snapshot, which each draw refreshes once; a view takes the
+// changes when a draw first acquires it. Images behind elements report their changes through
+// Image::heap_changes. A smaller table leaves at a suspend point if the frame did not acquire
+// it, a larger one after LargeTableIdleFrames such frames.
 class ImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
 public:
 	ImageHeap(RenderContext& context, PageManager& page_manager);
@@ -92,6 +95,12 @@ private:
 		size_t                       dirty_end     = 0;
 		size_t                       changed_begin = 0; // Table bytes changed since it was probed.
 		size_t                       changed_end   = 0;
+		// One bit per probe: it has its element, not only its kind.
+		std::vector<uint64_t> populated;
+		uint64_t              populated_count = 0;
+		std::vector<uint64_t> demanded;       // Named by a draw since the last suspend point.
+		uint32_t              idle       = 0; // Suspend points since a draw used the view.
+		uint32_t              whole_idle = UINT32_MAX; // Since a draw could select any probe.
 	};
 
 	struct Memory {
@@ -113,7 +122,10 @@ private:
 	void     Drop(Memory& memory);
 	void     UpdateProbes(View& view, uint64_t begin, uint64_t end);
 	void     UpdateProbe(View& view, uint64_t probe);
+	void     Demand(View& view, const std::vector<uint32_t>* offsets);
+	void     ReleaseIdle(View& view);
 	void     Assign(View& view, size_t slot, uint32_t entry);
+	uint32_t Arm(View& view, uint32_t kind, const DescriptorValue& value);
 	uint32_t Intern(View& view, uint32_t kind, const Key& key);
 	void     Release(uint32_t entry);
 	void     Retire();
@@ -143,6 +155,8 @@ private:
 	std::vector<uint32_t>                             m_held; // Another extent holds the address.
 	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
+	// Serial, image: targets whose newest pixels are in an EQAA shadow.
+	std::vector<std::pair<uint64_t, ImageId>>         m_unsettled;
 	uint64_t                                          m_held_serial = 0; // Image::serials.
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
 	std::vector<std::pair<size_t, size_t>>            m_runs;

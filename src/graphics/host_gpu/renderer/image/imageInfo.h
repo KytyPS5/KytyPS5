@@ -12,6 +12,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -84,6 +85,9 @@ struct ImageInfo {
 	TileTextureBlockLayout        tiling;
 	uint64_t                      tiled_slice_stride = 0;
 	uint32_t                      first_tail_level   = 16;
+	// Levels below it are never sampled (the T# MIN_LOD clamps them), so they hold no pixels and
+	// need no memory; `data` then covers only the guest bytes of the levels from it on.
+	uint32_t first_level = 0;
 
 	void                                           UpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
@@ -139,6 +143,9 @@ struct ImageInfo {
 		return -1;
 	}
 	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
+	// The chain of this image's levels from `level` on, as an image of its own at the same guest
+	// address, when those levels lie at exactly the same bytes (PS5 stores a chain smallest first).
+	[[nodiscard]] std::optional<ImageInfo> MipChainFrom(uint32_t level) const;
 };
 
 struct ImageViewInfo {

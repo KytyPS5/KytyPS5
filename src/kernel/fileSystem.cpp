@@ -308,7 +308,7 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 }
 
 // Guests join mount points and names with extra slashes (e.g. "/addcont0//file").
-static std::string NormalizeGuestPath(const std::string& mounted_name) {
+static std::string NormalizeGuestPath(std::string_view mounted_name) {
 	std::string normalized = Common::FixFilenameSlash(mounted_name);
 	normalized.erase(std::unique(normalized.begin(), normalized.end(),
 	                             [](char a, char b) { return a == '/' && b == '/'; }),

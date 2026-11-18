@@ -9537,6 +9537,21 @@ public:
                     return texture_cache.IsMetaCleared(base + metadata_b, slice);
                   }),
               "registration reset consumed slices or full clear failed to rearm them");
+      constexpr vk::ImageAspectFlags depth_and_stencil =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      Require(name, "per-aspect HTile clear taken per slice",
+              texture_cache.TakeMetaClear(base + metadata_b, 86,
+                                          vk::ImageAspectFlagBits::eStencil) ==
+                      vk::ImageAspectFlagBits::eStencil &&
+                  texture_cache.TakeMetaClear(base + metadata_b, 86, depth_and_stencil) ==
+                      vk::ImageAspectFlagBits::eDepth &&
+                  !texture_cache.TakeMetaClear(base + metadata_b, 86, depth_and_stencil) &&
+                  texture_cache.TakeMetaClear(base + metadata_b, 64, depth_and_stencil) ==
+                      depth_and_stencil &&
+                  !texture_cache.TakeMetaClear(base + metadata_b, 8192, depth_and_stencil) &&
+                  texture_cache.IsMetaCleared(base + metadata_b, 0) &&
+                  texture_cache.ClearMeta(base + metadata_b),
+              "an HTile clear was taken from the wrong slice or aspect, or taken twice");
       resources.GetBufferCache().FillBuffer(base + metadata_b, sizeof(uint32_t),
                                             0, false);
       Require(

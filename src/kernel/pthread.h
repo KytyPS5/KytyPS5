@@ -114,7 +114,7 @@ void                  PthreadWakeForSignal(Pthread thread);
 bool                  PthreadBeginSignalDispatch(Pthread thread);
 void                  PthreadEndSignalDispatch(Pthread thread);
 bool                  PthreadIsDispatchingSignal(Pthread thread);
-void                  PthreadQueuePendingSignal(Pthread thread, int signum);
+bool                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadHasAnyPendingSignal(Pthread thread);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);

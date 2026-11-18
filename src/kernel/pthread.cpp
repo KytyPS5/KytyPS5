@@ -3115,13 +3115,18 @@ bool PthreadIsDispatchingSignal(Pthread thread) {
 	return thread != nullptr && thread->signal_dispatching.load(std::memory_order_acquire);
 }
 
-void PthreadQueuePendingSignal(Pthread thread, int signum) {
+bool PthreadQueuePendingSignal(Pthread thread, int signum) {
 	if (thread == nullptr || signum < 0 || signum >= 64) {
-		return;
+		return false;
 	}
 
-	thread->pending_signal_mask.fetch_or(1ull << static_cast<uint32_t>(signum),
-	                                     std::memory_order_release);
+	const auto mask = 1ull << static_cast<uint32_t>(signum);
+	thread->pending_signal_mask.fetch_or(mask);
+	if (thread->almost_done || thread->free) {
+		thread->pending_signal_mask.fetch_and(~mask);
+		return false;
+	}
+	return true;
 }
 
 bool PthreadHasPendingSignal(Pthread thread, int signum) {
@@ -3202,8 +3207,8 @@ static void CleanupThread(void* arg) {
 	DestructPthreadSpecific();
 
 	// Guest signal handlers stop here: they would run on freed TLS.
-	thread->pending_signal_mask.store(0, std::memory_order_release);
 	thread->almost_done = true;
+	thread->pending_signal_mask.store(0);
 	Loader::RuntimeLinker::DeleteThreadTls();
 }
 
@@ -3380,8 +3385,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		FreeGuestStack(thread->attr);
 
 		thread->pending_signal_mask.store(0, std::memory_order_relaxed);
-		thread->almost_done = false;
-		thread->free        = true;
+		thread->free = true;
 	}
 
 	switch (result) {

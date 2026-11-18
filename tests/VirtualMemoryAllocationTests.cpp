@@ -6124,6 +6124,28 @@ void TestRaisedSignalWaitsForItsHandler() {
 	Check(test, delivered, "the signal raised during its handler was not delivered after it");
 }
 
+void* KYTY_SYSV_ABI ReturnAtOnce(void* arg) {
+	static_cast<SignalTarget*>(arg)->progress = 1;
+	return nullptr;
+}
+
+void TestRaisedSignalSkipsExitedTarget() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalSkipsExitedTarget";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(false);
+	g_raised_signal_release = true;
+	StartSignalTarget(test, target, ReturnAtOnce);
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	const int  result  = raise_exception(target.thread, 30);
+	const bool pending = PthreadHasAnyPendingSignal(target.thread);
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, !pending, "a raise to an exited thread left its signal pending");
+	Check(test, result == KERNEL_ERROR_ESRCH, "a raise to an exited thread did not fail with ESRCH");
+	Check(test, g_raised_signal_entries.load() == 0, "a handler ran for an exited thread");
+}
+
 int RunTrinityTests();
 
 int main(int argc, char** argv) {
@@ -6331,6 +6353,7 @@ int main(int argc, char** argv) {
 	RunTest(TestRaisedSignalInterruptsGuestCode);
 	RunTest(TestRaisedSignalWaitsForItsHandler);
 	RunTest(TestRaisedSignalReachesCancellingThread);
+	RunTest(TestRaisedSignalSkipsExitedTarget);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

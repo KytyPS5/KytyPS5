@@ -1043,7 +1043,7 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 static void SignalApcHandler(void* arg1, void* /*arg2*/, void* /*arg3*/, PCONTEXT context) {
 	auto* thread = static_cast<Pthread>(arg1);
 	PthreadClearSignalApcQueued(thread);
-	if (!Loader::IsGuestCodeAddress(context->Rip)) {
+	if (PthreadSelfOrNull() != thread || !Loader::IsGuestCodeAddress(context->Rip)) {
 		return;
 	}
 	DispatchPendingSignals(thread, [context](exception_handler_func_t handler, int signum) {
@@ -1168,12 +1168,15 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 	return OK;
 }
 
-static void RaiseOnCurrentThread(Pthread thread, int signum, uint64_t return_address) {
-	PthreadQueuePendingSignal(thread, signum);
+static int RaiseOnCurrentThread(Pthread thread, int signum, uint64_t return_address) {
+	if (!PthreadQueuePendingSignal(thread, signum)) {
+		return KERNEL_ERROR_ESRCH;
+	}
 	DispatchPendingSignals(thread, [return_address](exception_handler_func_t handler, int pending) {
 		auto ctx = CreateCurrentGuestCallSignalUcontext(return_address);
 		handler(pending, &ctx);
 	});
+	return OK;
 }
 
 static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
@@ -1191,12 +1194,13 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
-			RaiseOnCurrentThread(thread, signum,
-			                     reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			return OK;
+			return RaiseOnCurrentThread(thread, signum,
+			                            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 		}
 
-		PthreadQueuePendingSignal(thread, signum);
+		if (!PthreadQueuePendingSignal(thread, signum)) {
+			return KERNEL_ERROR_ESRCH;
+		}
 		if (!QueueSignalApc(thread, signum)) {
 			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 "\n", target_thread_id);
@@ -1209,16 +1213,17 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 #elif defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
-			RaiseOnCurrentThread(thread, signum,
-			                     reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			return OK;
+			return RaiseOnCurrentThread(thread, signum,
+			                            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 		}
 
 		if (!EnsureHostSignalDispatchInstalled()) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		PthreadQueuePendingSignal(thread, signum);
+		if (!PthreadQueuePendingSignal(thread, signum)) {
+			return KERNEL_ERROR_ESRCH;
+		}
 		if (!PthreadKillHost(thread, Common::HostException::GuestSignalDispatchSignal())) {
 			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");

@@ -163,6 +163,8 @@ public:
 	Program*        FindProgramByAddr(uint64_t vaddr);
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
+	// Module handles (unique ids) of the loaded programs, in load order.
+	[[nodiscard]] std::vector<int32_t> GetProgramIds();
 
 	// CreateThreadTls runs on each guest thread before its first guest instruction.
 	static void     CreateThreadTls();

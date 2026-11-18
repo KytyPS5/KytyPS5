@@ -1498,6 +1498,16 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 	return nullptr;
 }
 
+std::vector<int32_t> RuntimeLinker::GetProgramIds() {
+	Common::LockGuard    lock(m_mutex);
+	std::vector<int32_t> ids;
+	ids.reserve(m_programs.size());
+	for (const auto* p: m_programs) {
+		ids.push_back(p->unique_id);
+	}
+	return ids;
+}
+
 Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {
 	Common::LockGuard lock(m_mutex);
 

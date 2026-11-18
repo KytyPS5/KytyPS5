@@ -1820,6 +1820,34 @@ LIB_DEFINE(InitLibKernelWriteThrottling) {
 
 } // namespace LibKernelWriteThrottling
 
+namespace LibKernelModuleInfo {
+
+LIB_VERSION("libkernel_module_info", 1, "libkernel", 1, 1);
+
+// The loaded game modules (eboot and its PRX); system libraries are HLE here, not modules.
+static int KYTY_SYSV_ABI KernelGetModuleList2(int32_t* handles, uint64_t capacity,
+                                              uint64_t* out_count) {
+	PRINT_NAME();
+
+	if (handles == nullptr || out_count == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	const auto ids = Common::Singleton<Loader::RuntimeLinker>::Instance()->GetProgramIds();
+	LOGF("\tcapacity = %" PRIu64 ", modules = %zu\n", capacity, ids.size());
+	if (ids.size() > capacity) {
+		return LibKernel::KERNEL_ERROR_ENOMEM;
+	}
+	std::copy(ids.begin(), ids.end(), handles);
+	*out_count = ids.size();
+	return OK;
+}
+
+LIB_DEFINE(InitLibKernelModuleInfo) {
+	LIB_FUNC("ZzzC3ZGVAkc", KernelGetModuleList2);
+}
+
+} // namespace LibKernelModuleInfo
+
 namespace Posix {
 
 LIB_VERSION("Posix", 1, "libkernel", 1, 1);
@@ -3370,6 +3398,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LibKernelApr::InitLibKernel_1_Apr(s);
 	Posix::InitLibKernel_1_Posix(s);
 	LibKernelWriteThrottling::InitLibKernelWriteThrottling(s);
+	LibKernelModuleInfo::InitLibKernelModuleInfo(s);
 
 	LIB_OBJECT("f7uOxY9mM1U", &LibKernel::g_stack_chk_guard);
 	LIB_OBJECT("djxxOmW6-aw", &LibKernel::g_progname);

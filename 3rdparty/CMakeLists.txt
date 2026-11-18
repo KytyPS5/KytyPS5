@@ -111,8 +111,10 @@ FetchContent_Declare(
 	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
 	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
 	GIT_SHALLOW FALSE
-	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
-		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+	PATCH_COMMAND "${CMAKE_COMMAND}"
+		"-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+		"-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/patches/apply-patch.cmake"
 	SOURCE_SUBDIR kyty-library-only
 )
 FetchContent_MakeAvailable(zstd zarchive_source)

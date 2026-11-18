@@ -486,6 +486,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.clear_mask.reset();
+    metadata.stencil_clear_mask.reset();
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
@@ -17969,54 +17970,100 @@ public:
           "inactive stencil state changed a depth-only HTile attachment");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      constexpr uint64_t stencil_only_address = base + 0x2c0000;
-      constexpr uint64_t stencil_only_htile_address = base + 0x2d0000;
-      HW::DepthRenderTarget stencil_only_target{};
-      stencil_only_target.z_info.htile_acceleration = true;
-      stencil_only_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
-      stencil_only_target.stencil_info.texture_compatibility =
-          Prospero::TextureCompatibleStencil::kEnable;
-      stencil_only_target.stencil_info.htile_stencil_disabled = false;
-      stencil_only_target.stencil_read_base_addr = stencil_only_address;
-      stencil_only_target.stencil_write_base_addr = stencil_only_address;
-      stencil_only_target.htile_data_base_addr = stencil_only_htile_address;
-      stencil_only_target.size = {63, 63, true};
-      registers.SetDepthRenderTarget(stencil_only_target);
-      HW::DepthControl stencil_only_control{};
-      stencil_only_control.z_enable = true;
-      stencil_only_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
-      stencil_only_control.stencil_enable = true;
-      stencil_only_control.stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
-      registers.SetDepthControl(stencil_only_control);
-      HW::RenderControl stencil_only_render_control{};
-      stencil_only_render_control.stencil_clear_enable = true;
-      registers.SetRenderControl(stencil_only_render_control);
-      registers.SetStencilControl({});
-      registers.SetStencilMask({});
-      RenderDepthInfo stencil_only{};
-      RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, scheduler.Current(), stencil_only);
-      const auto stencil_only_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-          executor, scheduler.Current(), &no_color, 0, stencil_only);
-      Require(
-          name, "stencil-only HTile target",
-          stencil_only.image_id &&
-              stencil_only.desc.view_info.aspect == vk::ImageAspectFlagBits::eStencil &&
-              stencil_only.desc.info.data.address == stencil_only_address &&
-              stencil_only.desc.info.stencil.Empty() &&
-              stencil_only.desc.info.metadata.kind == ImageMetadataKind::Htile &&
-              stencil_only.desc.info.metadata.range.address == stencil_only_htile_address &&
-              stencil_only.desc.info.metadata.stencil_compressed &&
-              !stencil_only.depth_test_enable && !stencil_only.depth_write_enable &&
-              stencil_only.stencil_test_enable && stencil_only.stencil_clear_enable &&
-              stencil_only.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil &&
-              stencil_only_rendering.depth_stencil_attachment.image_view != nullptr &&
-              !stencil_only_rendering.depth_stencil_attachment.has_depth &&
-              stencil_only_rendering.depth_stencil_attachment.has_stencil &&
-              stencil_only_rendering.depth_stencil_attachment.stencil_clear,
-          "a stencil-only HTile target with an enabled depth test and no Z surface was rejected "
-          "or exposed a depth plane");
-      RenderExecutorTestAccess::ResetBindings(executor);
+      vk::ImageFormatProperties stencil_only_properties{};
+      const bool stencil_only_supported =
+          context.GetGraphics().GetImageFormatProperties(
+              vk::Format::eS8Uint, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+              DepthTargetImageUsage(), vk::ImageCreateFlags{}, &stencil_only_properties) ==
+              vk::Result::eSuccess &&
+          static_cast<bool>(stencil_only_properties.sampleCounts & vk::SampleCountFlagBits::e1);
+      if (stencil_only_supported) {
+        constexpr uint64_t stencil_only_address = base + 0x2c0000;
+        constexpr uint64_t stencil_only_htile_address = base + 0x2d0000;
+        HW::DepthRenderTarget stencil_only_target{};
+        stencil_only_target.z_info.htile_acceleration = true;
+        stencil_only_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+        stencil_only_target.stencil_info.texture_compatibility =
+            Prospero::TextureCompatibleStencil::kEnable;
+        stencil_only_target.stencil_info.htile_stencil_disabled = false;
+        stencil_only_target.stencil_read_base_addr = stencil_only_address;
+        stencil_only_target.stencil_write_base_addr = stencil_only_address;
+        stencil_only_target.z_read_base_addr = base + 0x2f0000;
+        stencil_only_target.htile_data_base_addr = stencil_only_htile_address;
+        stencil_only_target.size = {63, 63, true};
+        registers.SetDepthRenderTarget(stencil_only_target);
+        HW::DepthControl stencil_only_control{};
+        stencil_only_control.z_enable = true;
+        stencil_only_control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+        stencil_only_control.stencil_enable = true;
+        stencil_only_control.stencilfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+        registers.SetDepthControl(stencil_only_control);
+        HW::RenderControl stencil_only_render_control{};
+        stencil_only_render_control.stencil_clear_enable = true;
+        registers.SetRenderControl(stencil_only_render_control);
+        registers.SetStencilControl({});
+        registers.SetStencilMask({});
+        RenderDepthInfo stencil_only{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), stencil_only);
+        const auto stencil_only_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, stencil_only);
+        Require(
+            name, "stencil-only HTile target",
+            stencil_only.image_id &&
+                stencil_only.desc.view_info.aspect == vk::ImageAspectFlagBits::eStencil &&
+                stencil_only.desc.info.data.address == stencil_only_address &&
+                stencil_only.desc.info.stencil.Empty() &&
+                stencil_only.desc.info.metadata.kind == ImageMetadataKind::Htile &&
+                stencil_only.desc.info.metadata.range.address == stencil_only_htile_address &&
+                stencil_only.desc.info.metadata.stencil_compressed &&
+                !stencil_only.depth_test_enable && !stencil_only.depth_write_enable &&
+                stencil_only.stencil_test_enable && stencil_only.stencil_clear_enable &&
+                stencil_only.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil &&
+                stencil_only_rendering.depth_stencil_attachment.image_view != nullptr &&
+                !stencil_only_rendering.depth_stencil_attachment.has_depth &&
+                stencil_only_rendering.depth_stencil_attachment.has_stencil &&
+                stencil_only_rendering.depth_stencil_attachment.stencil_clear,
+            "a stencil-only HTile target with an enabled depth test and no Z surface was rejected "
+            "or exposed a depth plane");
+        RenderExecutorTestAccess::ResetBindings(executor);
+
+        registers.SetRenderControl({});
+        const bool stencil_only_meta_cleared = texture_cache.ClearMeta(stencil_only_htile_address);
+        RenderDepthInfo cleared_stencil_only{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), cleared_stencil_only);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, cleared_stencil_only);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        constexpr uint64_t depth_over_stencil_only_address = base + 0x2e0000;
+        auto depth_over_stencil_only = depth_only_target;
+        depth_over_stencil_only.z_read_base_addr = depth_over_stencil_only_address;
+        depth_over_stencil_only.z_write_base_addr = depth_over_stencil_only_address;
+        depth_over_stencil_only.htile_data_base_addr = stencil_only_htile_address;
+        registers.SetDepthRenderTarget(depth_over_stencil_only);
+        registers.SetDepthControl(depth_only_control);
+        RenderDepthInfo cleared_depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), cleared_depth);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, cleared_depth);
+        Require(name, "stencil-only bind keeps a pending HTile depth clear",
+                stencil_only_meta_cleared &&
+                    cleared_stencil_only.load_clear_aspects == vk::ImageAspectFlagBits::eStencil &&
+                    cleared_depth.load_clear_aspects == vk::ImageAspectFlagBits::eDepth &&
+                    !texture_cache.IsMetaCleared(stencil_only_htile_address, 0),
+                "a stencil-only bind consumed the HTile depth clear that a later depth target "
+                "over the same HTile needs");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        registers.SetDepthRenderTarget(stencil_only_target);
+        registers.SetDepthControl(stencil_only_control);
+        registers.SetRenderControl(stencil_only_render_control);
+      } else {
+        std::printf("[host]    %s: the host has no S8 depth/stencil attachment, "
+                    "stencil-only cases skipped\n",
+                    name);
+      }
 
       const auto sampled_width = depth_only.desc.info.extent.width - 1u;
       const auto sampled_height = depth_only.desc.info.extent.height - 1u;
@@ -53804,8 +53851,9 @@ void CheckDepthTargetFootprints() {
                                Prospero::StencilFormat::k8UInt, true, stencil,
                                htile, depth) &&
               depth.size == 0 && depth.align == 0 &&
-              stencil.size == paired_stencil.size && stencil.align == 0x10000 &&
-              htile.size == paired_htile.size && htile.align == 0x8000,
+              stencil.size == paired_stencil.size && stencil.size == 0x3c0000 &&
+              stencil.align == 0x10000 && htile.size == paired_htile.size &&
+              htile.size == 0x48000 && htile.align == 0x8000,
           "a stencil-only surface did not keep its stencil and HTile footprint");
   struct TargetFormatCase {
     const char *name;

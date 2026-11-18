@@ -185,6 +185,9 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (width > 16384 || height > 16384) {
 		DepthFatal("invalid depth extent");
 	}
+	if (!has_depth && samples != 1) {
+		DepthFatal("unsupported multisampled stencil-only target: %u samples", samples);
+	}
 	const auto* policy = has_depth ? FindDepthFormatPolicy(z.z_info.format) : nullptr;
 	if (has_depth && policy == nullptr) {
 		DepthFatal("unsupported depth/stencil format pair");
@@ -280,9 +283,9 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	if (!depth_active && !stencil_active) {
 		return;
 	}
-	if (rc.copy_stencil_to_color ||
-	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
-	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
+	if (rc.copy_stencil_to_color || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	    (has_depth && !z.depth_view.depth_write_disable &&
+	     z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");

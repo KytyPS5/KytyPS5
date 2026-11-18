@@ -1452,6 +1452,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
+			metadata->second.stencil_clear_mask.set();
 		}
 		metadata->second.owner = id;
 	}
@@ -1970,7 +1971,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	return found->second.clear_mask.test(slice);
+	return found->second.clear_mask.test(slice) || found->second.stencil_clear_mask.test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -1980,6 +1981,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask.set();
+	found->second.stencil_clear_mask.set();
 	return true;
 }
 
@@ -1990,7 +1992,28 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 		return false;
 	}
 	found->second.clear_mask.set(slice, is_clear);
+	found->second.stencil_clear_mask.set(slice, is_clear);
 	return true;
+}
+
+vk::ImageAspectFlags TextureCache::TakeMetaClear(uint64_t address, uint32_t slice,
+                                                 vk::ImageAspectFlags aspects) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
+		return {};
+	}
+	vk::ImageAspectFlags cleared;
+	auto&                meta = found->second;
+	if ((aspects & vk::ImageAspectFlagBits::eDepth) && meta.clear_mask.test(slice)) {
+		meta.clear_mask.reset(slice);
+		cleared |= vk::ImageAspectFlagBits::eDepth;
+	}
+	if ((aspects & vk::ImageAspectFlagBits::eStencil) && meta.stencil_clear_mask.test(slice)) {
+		meta.stencil_clear_mask.reset(slice);
+		cleared |= vk::ImageAspectFlagBits::eStencil;
+	}
+	return cleared;
 }
 
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {

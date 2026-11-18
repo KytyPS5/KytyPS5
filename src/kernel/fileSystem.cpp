@@ -57,8 +57,8 @@ public:
 	void Mount(const std::filesystem::path& folder, const std::string& point, bool read_only);
 	void Umount(const std::string& folder_or_point);
 
-	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name,
-	                                                bool*              read_only = nullptr);
+	[[nodiscard]] std::filesystem::path ResolvePath(std::string_view mounted_name,
+	                                                bool*            read_only = nullptr);
 	[[nodiscard]] bool                  IsMountPoint(const std::string& point);
 
 private:
@@ -374,7 +374,7 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
-std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name, bool* read_only) {
+std::filesystem::path MountPoints::ResolvePath(std::string_view mounted_name, bool* read_only) {
 	Common::LockGuard lock(m_mutex);
 
 	const std::string normalized = NormalizeGuestPath(mounted_name);
@@ -401,7 +401,8 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name, 
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
+			::printf("FileSystem: Windows-incompatible guest filename: %.*s\n",
+			         static_cast<int>(mounted_name.size()), mounted_name.data());
 		}
 		return p.dir / native_rel_path;
 #else
@@ -1424,12 +1425,10 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto from_path = std::string(from);
-	auto to_path   = std::string(to);
 	bool from_read_only = false;
 	bool to_read_only   = false;
-	auto real_from      = g_mount_points->ResolvePath(from_path, &from_read_only);
-	auto real_to        = g_mount_points->ResolvePath(to_path, &to_read_only);
+	auto real_from      = g_mount_points->ResolvePath(from, &from_read_only);
+	auto real_to        = g_mount_points->ResolvePath(to, &to_read_only);
 	if (from_read_only || to_read_only) {
 		return KERNEL_ERROR_EROFS;
 	}
@@ -1514,7 +1513,7 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     path, mode);
 
 	bool read_only = false;
-	auto real_name = g_mount_points->ResolvePath(std::string(path), &read_only);
+	auto real_name = g_mount_points->ResolvePath(path, &read_only);
 	if (real_name.empty()) {
 		return KERNEL_ERROR_ENOENT;
 	}

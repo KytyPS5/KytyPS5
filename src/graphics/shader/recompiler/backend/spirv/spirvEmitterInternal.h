@@ -318,8 +318,8 @@ bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr);
 // A per-sample PS reads barycentrics only through interpolation functions.
 bool PixelShaderIsPerSample(const EmitterState& state);
 
-// PA_SC_AA_MASK leaves some of this pixel shader's quad pixels uncovered.
-inline bool PixelShaderIsMasked(const EmitterState& state) {
+// This pixel shader tests its pixel's bit of the draw's PA_SC_AA_MASK.
+inline bool PixelShaderTestsAaMask(const EmitterState& state) {
 	return state.program.stage == ShaderType::Pixel && state.input_info.pixel->ps_aa_mask;
 }
 

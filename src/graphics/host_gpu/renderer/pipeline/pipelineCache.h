@@ -161,6 +161,8 @@ struct DrawRenderState {
 	bool parameters_linked = false;
 	// Output: the quad pixels PA_SC_AA_MASK covers, bit (y & 1) * 2 + (x & 1).
 	uint32_t aa_quad_mask = 0xf;
+	// Output: the fragment stage reads it from PushData::AaMaskDword.
+	bool aa_mask_read = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};

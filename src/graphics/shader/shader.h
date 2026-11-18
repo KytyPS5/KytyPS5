@@ -218,7 +218,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
 	bool                                           object_primitive_id          = false;
-	// PA_SC_AA_MASK leaves quad pixels uncovered; PushData::AaMaskDword says which.
+	// The shader tests PA_SC_AA_MASK; PushData::AaMaskDword holds the quad pixels it covers.
 	bool ps_aa_mask = false;
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
@@ -227,6 +227,22 @@ struct ShaderPixelInputInfo {
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
+
+// The guest's state lets the depth and stencil tests run before the shader.
+[[nodiscard]] inline bool ShaderPixelWantsEarlyTests(const ShaderPixelInputInfo& info) {
+	return info.ps_early_z && !info.ps_pixel_kill_enable && !info.ps_depth_export_enable &&
+	       !info.ps_sample_mask_export_enable;
+}
+
+// Early tests would write depth before the shader applied the mask, so they alone leave it out.
+[[nodiscard]] inline bool ShaderPixelTestsAaMask(const ShaderPixelInputInfo& info, bool masked) {
+	return masked || !ShaderPixelWantsEarlyTests(info);
+}
+
+// A masked draw gives up the early tests its state asks for.
+[[nodiscard]] inline bool ShaderPixelDelaysTests(const ShaderPixelInputInfo& info, bool masked) {
+	return masked && ShaderPixelWantsEarlyTests(info);
+}
 
 union ShaderStageInputInfo {
 	const ShaderVertexInputInfo*  vertex;

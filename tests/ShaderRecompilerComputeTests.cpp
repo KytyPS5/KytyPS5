@@ -1697,6 +1697,8 @@ struct GraphicsCase {
   std::vector<u32> gds_initial;
   // PA_SC_AA_MASK: bit (y & 1) * 2 + (x & 1) keeps that pixel of a quad.
   u32 aa_quad_mask = 0xf;
+  // The guest asks for the depth and stencil tests before the shader.
+  bool early_tests = false;
 };
 
 struct CompiledShader {
@@ -1704,6 +1706,8 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  // A fragment shader that reads its draw's AA mask from PushData::AaMaskDword.
+  bool aa_mask = false;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -2215,7 +2219,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   pixel_info.object_primitive_id = !test.object_ids.empty();
-  pixel_info.ps_aa_mask = test.aa_quad_mask != 0xf;
+  pixel_info.ps_early_z = test.early_tests;
+  pixel_info.ps_aa_mask = ShaderPixelTestsAaMask(pixel_info, test.aa_quad_mask != 0xf);
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -2263,7 +2268,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   ShaderRecompiler::IR::WriteIndirectMappingOffsets(result.program.bindings, resources,
                                                     packed_user_data);
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(resources), std::move(packed_user_data), pixel_info.ps_aa_mask};
 }
 
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
@@ -25839,8 +25844,15 @@ public:
       }
     };
 
+    const auto modules = [&] {
+      const auto compiled = PipelineCacheTestAccess::Compiled(context.GetPipelineCache());
+      return std::pair{compiled[static_cast<size_t>(ShaderType::Vertex)],
+                       compiled[static_cast<size_t>(ShaderType::Pixel)]};
+    };
+
     // A second draw under each mask writes the pixels the mask keeps and no others; a mask that
     // keeps none draws nothing.
+    const auto late = modules();
     for (u32 quad = 0; quad < 16; quad++) {
       const uint64_t address = base + quad * 0x10000ull;
       set_mask(0xf);
@@ -25856,6 +25868,9 @@ public:
     set_mask(0x6, 0x0001u, 0xfffeu);
     Require(name, "masked draw", draw(base + 0x100000, far_vs, two), "the draw was skipped");
     check("sample 0 of the mask", read_red(base + 0x100000), 0x6, f2, f1);
+    // Neither shader's tests run early: the mask is a value of the one module each has.
+    Require(name, "one module for every mask", modules().second == late.second + 2,
+            "a pixel shader whose tests run late was compiled again for another mask");
 
     // Depth is written where colour is, although the guest asked for early depth tests.
     HW::DepthRenderTarget z{};
@@ -25874,6 +25889,7 @@ public:
     registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
                                .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
     registers.SetDepthShaderControl({.shader_z_behavior = 1});
+    const auto early = modules();
     z.z_read_base_addr = z.z_write_base_addr = base + 0x200000;
     registers.SetDepthRenderTarget(z);
     set_mask(0x9);
@@ -25886,6 +25902,22 @@ public:
     set_mask(0xf);
     Require(name, "depth-tested draw", draw(base + 0x110000, near_vs, one), "the draw was skipped");
     check("depth test after the mask", read_red(base + 0x110000), 0x9, f2, f1);
+    // Early tests would write depth before the shader applied the mask, so each of the two
+    // shaders has a module for its masked draws and another for the rest.
+    registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                               .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+    z.z_read_base_addr = z.z_write_base_addr = base + 0x350000;
+    registers.SetDepthRenderTarget(z);
+    Require(name, "unmasked early draw", draw(base + 0x1b0000, far_vs, two),
+            "the draw was skipped");
+    set_mask(0x6);
+    Require(name, "masked early draw", draw(base + 0x1b0000, near_vs, one), "the draw was skipped");
+    check("colour of both early forms", read_red(base + 0x1b0000), 0x6, f1, f2);
+    check("depth of both early forms", read_depth(base + 0x350000), 0x6, literal(0.25f),
+          literal(0.5f));
+    Require(name, "two modules for early tests", modules().second == early.second + 4,
+            "a pixel shader whose tests run early does not have a module for its masked draws "
+            "and one for the rest");
     registers.SetDepthShaderControl({});
 
     // A draw without a pixel shader takes the mask through the host's fragment shader.
@@ -25924,27 +25956,32 @@ public:
       }
       registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
                                  .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
-      const auto modules = [&] {
-        const auto compiled = PipelineCacheTestAccess::Compiled(context.GetPipelineCache());
-        return std::pair{compiled[static_cast<size_t>(ShaderType::Vertex)],
-                         compiled[static_cast<size_t>(ShaderType::Pixel)]};
-      };
-      const auto before = modules();
-      for (const u32 quad : {0xfu, 0x9u, 0x6u, 0xfu}) {
-        const uint64_t address = base + 0x310000 + (quad & 3u) * 0x10000ull;
-        const uint64_t color_address = base + 0x150000 + (quad & 3u) * 0x10000ull;
-        z.z_read_base_addr = z.z_write_base_addr = address;
-        registers.SetDepthRenderTarget(z);
-        set_mask(quad);
-        Require(name, "full push block draw", draw(color_address, user_vs, user_ps),
-                "the draw was skipped");
-        check("stage data beside the mask dword", read_depth(address), quad, literal(0.75f), 0);
-        check("colour beside the mask dword", read_red(color_address), quad, f2, 0);
+      // Tests that run late read the mask in every draw. Early ones read it in a masked draw
+      // alone, and the stages of their other draws keep the whole block.
+      for (const bool early_tests : {false, true}) {
+        if (early_tests) {
+          registers.SetDepthShaderControl({.shader_z_behavior = 1});
+        }
+        const auto before = modules();
+        for (const u32 quad : {0xfu, 0x9u, 0x6u, 0xfu}) {
+          const uint64_t slot = (quad & 3u) * 0x10000ull;
+          const uint64_t address = base + (early_tests ? 0x390000 : 0x310000) + slot;
+          const uint64_t color_address = base + (early_tests ? 0x1b0000 : 0x150000) + slot;
+          z.z_read_base_addr = z.z_write_base_addr = address;
+          registers.SetDepthRenderTarget(z);
+          set_mask(quad);
+          Require(name, "full push block draw", draw(color_address, user_vs, user_ps),
+                  "the draw was skipped");
+          check("stage data beside the mask dword", read_depth(address), quad, literal(0.75f), 0);
+          check("colour beside the mask dword", read_red(color_address), quad, f2, 0);
+        }
+        // Late: each stage once, its data clear of the mask's dword. Early: the pixel stage once
+        // for each kind of draw, and the vertex stage once more with the whole block.
+        Require(name, "modules beside the mask dword",
+                modules() == std::pair{before.first + 1, before.second + (early_tests ? 2 : 1)},
+                "the stages were not compiled once for each way their draws lay out the block");
       }
-      // Both stages once without a mask, and once with their data clear of its dword.
-      Require(name, "modules beside the mask dword",
-              modules() == std::pair{before.first + 2, before.second + 2},
-              "the stages of the masked draws were not compiled once each");
+      registers.SetDepthShaderControl({});
       shaders.SetGsShaderResource2({});
       shaders.SetPsShaderResource2({});
       registers.SetDepthRenderTarget({});
@@ -26249,6 +26286,12 @@ public:
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
+      if (fragment.aa_mask) {
+        const u32 every_pixel = 0xf;
+        cmd.pushConstants(selected.pipeline_layout, selected.push_stages,
+                          ShaderRecompiler::IR::PushData::AaMaskDword * sizeof(u32), sizeof(u32),
+                          &every_pixel);
+      }
       const vk::Viewport viewport{0, 0, static_cast<float>(extent),
                                   static_cast<float>(extent), 0, 1};
       const vk::Rect2D scissor{{0, 0}, {extent, extent}};
@@ -27854,7 +27897,6 @@ public:
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const bool object_id = !test.object_ids.empty();
-    const bool masked = test.aa_quad_mask != 0xf;
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
@@ -27907,7 +27949,7 @@ public:
                   fragment_bind.ShaderDataDwords() * sizeof(u32),
               "fragment push constant data size does not match reflection");
     }
-    if (fragment_bind.UsesPushData() || object_id || masked) {
+    if (fragment_bind.UsesPushData() || object_id || fragment.aa_mask) {
       push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
       push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
     }
@@ -28115,7 +28157,7 @@ public:
           std::copy(test.push_constants.begin(), test.push_constants.end(),
                     push_data.dwords.begin() + fragment_bind.push_data_start_dword);
         }
-        if (masked) {
+        if (fragment.aa_mask) {
           push_data.dwords[ShaderRecompiler::IR::PushData::AaMaskDword] = test.aa_quad_mask;
         }
         cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
@@ -55857,6 +55899,15 @@ GraphicsCase GraphicsAaMaskSkipsHelperLanes(bool consume) {
   return test;
 }
 
+// A shader whose tests run early takes no mask in an unmasked draw: the built-in tells its
+// helper lanes.
+GraphicsCase GraphicsEarlyTestsSkipHelperLanes(bool consume) {
+  auto test = GraphicsDsAppendSkipsHelperLanes(consume);
+  test.name = consume ? "GraphicsEarlyTestsSkipConsume" : "GraphicsEarlyTestsSkipAppend";
+  test.early_tests = true;
+  return test;
+}
+
 GraphicsCase GraphicsObjectPrimitiveId(bool discard) {
   auto test = discard ? GraphicsNullVmExportDiscardsInactiveExec()
                       : GraphicsDirectSgprPushConstantExport();
@@ -56642,6 +56693,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsAaMaskKeepsQuadPixels(0xc),
       GraphicsAaMaskSkipsHelperLanes(false),
       GraphicsAaMaskSkipsHelperLanes(true),
+      GraphicsEarlyTestsSkipHelperLanes(false),
+      GraphicsEarlyTestsSkipHelperLanes(true),
   });
   return cases;
 }
@@ -65001,6 +65054,8 @@ int main(int argc, char **argv) {
     }
     RunGraphicsCase(&vulkan, GraphicsAaMaskSkipsHelperLanes(false));
     RunGraphicsCase(&vulkan, GraphicsAaMaskSkipsHelperLanes(true));
+    RunGraphicsCase(&vulkan, GraphicsEarlyTestsSkipHelperLanes(false));
+    RunGraphicsCase(&vulkan, GraphicsEarlyTestsSkipHelperLanes(true));
     vulkan.CheckAaMask();
     CheckVulkan13FeatureRequirements();
     return 0;

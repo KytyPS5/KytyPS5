@@ -776,7 +776,7 @@ void EmitProgram(EmitterState& state) {
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryBindings(state);
-	if (PixelShaderIsMasked(state)) {
+	if (PixelShaderTestsAaMask(state)) {
 		EmitAaMask(state);
 	}
 	if (program.blocks.empty()) {

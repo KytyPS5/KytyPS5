@@ -10776,6 +10776,32 @@ void TestAaMaskPixelShader() {
   Check(!SpirvContainsExecutionMode(masked.spirv, ExecutionModeEarlyFragmentTests),
         "the depth test of a masked shader writes depth before the mask is applied");
   CheckSpirvBinaryValidates(masked.spirv);
+
+  // A draw's mask picks the module of a shader whose tests run early, and of no other.
+  ShaderPixelInputInfo early;
+  early.ps_early_z = true;
+  Check(!ShaderPixelTestsAaMask(early, false) && ShaderPixelTestsAaMask(early, true),
+        "a shader whose tests run early does not test the mask of its masked draws alone");
+  Check(!ShaderPixelDelaysTests(early, false) && ShaderPixelDelaysTests(early, true),
+        "a mask does not delay the early tests of its masked draws alone");
+  auto kills = early;
+  kills.ps_pixel_kill_enable = true;
+  auto exports_depth = early;
+  exports_depth.ps_depth_export_enable = true;
+  auto exports_coverage = early;
+  exports_coverage.ps_sample_mask_export_enable = true;
+  for (auto late : {ShaderPixelInputInfo{}, kills, exports_depth, exports_coverage}) {
+    Check(ShaderPixelTestsAaMask(late, false) && ShaderPixelTestsAaMask(late, true),
+          "a shader whose tests run late has a module for unmasked draws alone");
+    Check(!ShaderPixelDelaysTests(late, false) && !ShaderPixelDelaysTests(late, true),
+          "a mask delays tests that run late whatever the draw");
+    options.input_info.pixel = &late;
+    options.push_data_end = PushData::DwordCount;
+    Check(!SpirvContainsExecutionMode(RecompileForTest(shader, options).spirv,
+                                      ExecutionModeEarlyFragmentTests),
+          "a shader whose tests run late asks for early ones");
+  }
+  options.input_info.pixel = &pixel;
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   options.push_data_end = PushData::DwordCount;
   ExpectFatal([&] { (void)RecompileForTest(shader, options); },

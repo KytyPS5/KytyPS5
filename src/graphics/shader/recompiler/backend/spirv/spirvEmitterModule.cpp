@@ -345,7 +345,7 @@ void DefineDescriptors(EmitterState& state) {
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
 	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0 ||
-	    PixelShaderIsMasked(state)) {
+	    PixelShaderTestsAaMask(state)) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -565,7 +565,7 @@ void DefineInputs(EmitterState& state) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
 	}
-	if (PixelShaderIsMasked(state)) {
+	if (PixelShaderTestsAaMask(state)) {
 		add_builtin(IR::StageInputKind::FragCoord, 4, "gl_FragCoord");
 	}
 	for (auto& input: state.inputs) {
@@ -660,7 +660,7 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
-	if (state.program.info.helper_invocation && !PixelShaderIsMasked(state)) {
+	if (state.program.info.helper_invocation && !PixelShaderTestsAaMask(state)) {
 		const auto variable = DefineInterfaceVariable(state, TypeBool(state), spv::StorageClassInput,
 		                                              "gl_HelperInvocation");
 		state.helper_invocation_variable = variable;
@@ -921,7 +921,7 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (PixelShaderIsMasked(state)) {
+	if (PixelShaderTestsAaMask(state)) {
 		state.builder.RequireCapability(spv::CapabilityDemoteToHelperInvocationEXT);
 		state.builder.RequireExtension("SPV_EXT_demote_to_helper_invocation");
 	}
@@ -999,10 +999,7 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
-		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
-		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable &&
-		    !state.input_info.pixel->ps_aa_mask) {
+		if (ShaderPixelWantsEarlyTests(*state.input_info.pixel) && !PixelShaderTestsAaMask(state)) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 	}

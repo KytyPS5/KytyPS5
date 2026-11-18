@@ -867,7 +867,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
-		pixel_info.ps_aa_mask          = state.aa_quad_mask != 0xf;
+		pixel_info.ps_aa_mask = ShaderPixelTestsAaMask(pixel_info, state.aa_quad_mask != 0xf);
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
 			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
@@ -964,9 +964,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
-	const auto push_data_end = state.aa_quad_mask != 0xf
-	                               ? ShaderRecompiler::IR::PushData::AaMaskDword
-	                               : ShaderRecompiler::IR::PushData::DwordCount;
+	state.aa_mask_read       = pixel_active ? pixel_info.ps_aa_mask : state.aa_quad_mask != 0xf;
+	const auto push_data_end = state.aa_mask_read ? ShaderRecompiler::IR::PushData::AaMaskDword
+	                                              : ShaderRecompiler::IR::PushData::DwordCount;
 	if (pixel_active) {
 		// Pixel inputs reach the fragment shader straight from the vertex stage's exports.
 		state.parameters_linked = !tess_active && !mesh_active &&

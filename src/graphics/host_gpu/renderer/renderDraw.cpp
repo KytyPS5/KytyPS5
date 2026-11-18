@@ -976,8 +976,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	// The shader applies the mask after the early depth test its memory writes rely on.
-	EXIT_NOT_IMPLEMENTED(state.ps_active && state.ps_input_info.ps_aa_mask &&
-	                     state.ps_input_info.ps_early_z &&
+	EXIT_NOT_IMPLEMENTED(state.ps_active &&
+	                     ShaderPixelDelaysTests(state.ps_input_info, state.aa_quad_mask != 0xf) &&
 	                     PixelStageWritesMemory(state.ps_input_info.stage));
 	auto& targets       = m_targets;
 	targets.color_count = 0;
@@ -1331,7 +1331,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());
 	}
-	if (state.aa_quad_mask != 0xf) {
+	if (state.aa_mask_read) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_stages,
 		                        PushData::AaMaskDword * sizeof(uint32_t), sizeof(uint32_t),
 		                        &state.aa_quad_mask);

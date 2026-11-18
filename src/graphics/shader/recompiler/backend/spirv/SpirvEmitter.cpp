@@ -32,8 +32,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, profile);
 	state.push_data_end = push_data_end_dword;
-	// A masked pixel shader reads the dword its draw keeps free.
-	EXIT_IF(PixelShaderIsMasked(state) && push_data_end_dword > IR::PushData::AaMaskDword);
+	// A pixel shader that tests the AA mask reads the dword its draw keeps free.
+	EXIT_IF(PixelShaderTestsAaMask(state) && push_data_end_dword > IR::PushData::AaMaskDword);
 	if (emit_debug_info) {
 		char name[64];
 		std::snprintf(name, sizeof(name), "rdna2-%016" PRIx64 "-block-byte-pc-plus-one",

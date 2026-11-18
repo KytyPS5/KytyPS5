@@ -212,13 +212,13 @@ static int32_t KYTY_SYSV_ABI Hmd2Initialize(const SceHmd2InitializeParam* param)
 
 static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* info) {
 	PRINT_NAME();
-	if (!g_initialized.load()) {
-		return ERROR_NOT_INITIALIZED;
-	}
 	if (info == nullptr) {
 		return ERROR_PARAMETER_NULL;
 	}
 	*info = {};
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INITIALIZED;
+	}
 	if (Config::VrEnabled()) {
 		// Virtual headset defaults: READY, MOUNT, 63 mm lens separation.
 		info->hmuMount               = 1;
@@ -234,6 +234,12 @@ static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* 
 	     info->deviceInfo.panelResolution.width, info->deviceInfo.panelResolution.height,
 	     info->hmuMount);
 	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformationByHandle(int32_t                   handle,
+                                                              SceHmd2DeviceInformation* info) {
+	PRINT_NAME();
+	return handle == HMD_HANDLE ? Hmd2GetDeviceInformation(info) : ERROR_HANDLE_INVALID;
 }
 
 static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView* fov) {
@@ -462,6 +468,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("c812oYs7Vsc", Hmd2::Hmd2Initialize);
 	LIB_FUNC("bIi4YUfSRys", Hmd2::Hmd2GetDeviceInformation);
+	LIB_FUNC("4BlE4IPXP0Q", Hmd2::Hmd2GetDeviceInformationByHandle);
 	LIB_FUNC("gF8+lvc7GuQ", Hmd2::Hmd2GetFieldOfViewWithoutHandle);
 	LIB_FUNC("U-CnbmeyYaA", Hmd2::Hmd2ReprojectionQueryBufferSizeAlign);
 	LIB_FUNC("-C2nkoEYOnU", Hmd2::Hmd2ReprojectionQueryDisplayBufferSizeAlign);

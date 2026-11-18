@@ -56114,10 +56114,11 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// No reprojection pass runs on the host, so every status field is zero once
-// reprojection is initialized.
-void CheckHmd2Reprojection() {
-  constexpr const char *name = "Hmd2Reprojection";
+// Device information by handle checks the handle, then clears the output
+// before it checks that the library is initialized. No reprojection pass runs
+// on the host, so every status field is zero once reprojection is initialized.
+void CheckHmd2() {
+  constexpr const char *name = "Hmd2";
   Loader::SymbolDatabase hmd2;
   Libs::InitHmd2_1(&hmd2);
   const auto func = [&](const char *nid) {
@@ -56128,6 +56129,18 @@ void CheckHmd2Reprojection() {
   const auto initialize =
       reinterpret_cast<int(KYTY_SYSV_ABI *)(const void *, void *)>(
           func("C0rPwER-yxg"));
+  const auto device_info =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, void *)>(
+          func("4BlE4IPXP0Q"));
+  std::array<uint8_t, 28> info;
+  info.fill(0xff);
+  const auto filled = info;
+  Require(name, "device information by handle",
+          device_info(0x0f000002, info.data()) == -1972240381 && // 0x8a720003
+              info == filled &&
+              device_info(0x0f000001, info.data()) == -1972240382 && // 0x8a720002
+              info == std::array<uint8_t, 28>{},
+          "the handle or the output was checked out of order");
   static Hmd2::ReprojectionState work;
   // Work and display buffers, and no see-through buffer.
   const std::array<void *, 9> param{&work, &work};
@@ -57409,7 +57422,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--hmd2-only") == 0) {
-    CheckHmd2Reprojection();
+    CheckHmd2();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {

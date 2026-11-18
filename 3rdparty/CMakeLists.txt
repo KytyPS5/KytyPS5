@@ -104,13 +104,13 @@ FetchContent_Declare(
 )
 option(KYTY_ZARCHIVE_UPDATE_DISCONNECTED
 	"Skip ZArchive update steps during reconfiguration" ON)
+set(FETCHCONTENT_UPDATES_DISCONNECTED_ZARCHIVE_SOURCE "${KYTY_ZARCHIVE_UPDATE_DISCONNECTED}")
 
 FetchContent_Declare(
 	zarchive_source
 	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
 	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
 	GIT_SHALLOW FALSE
-	UPDATE_DISCONNECTED ${KYTY_ZARCHIVE_UPDATE_DISCONNECTED}
 	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
 		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
 	SOURCE_SUBDIR kyty-library-only

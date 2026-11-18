@@ -5884,6 +5884,17 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--tcb-slot-after-host-tls-only") == 0) {
+		constexpr DWORD TEB_TLS_SLOTS = 64;
+		while (TlsAlloc() < TEB_TLS_SLOTS) {
+		}
+		InitSubsystems();
+		RunTest(TestGuestTlsReadsUseThreadTcb);
+		RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);

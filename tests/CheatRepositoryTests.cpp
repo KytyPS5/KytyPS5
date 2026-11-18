@@ -862,10 +862,31 @@ void TestConvertTrainer() {
 	QByteArray missing_attr_xml = R"(<Trainer Version="1.00"><Cheat Text="A"><Offset>0x10</Offset><ValueOn>90</ValueOn><ValueOff>00</ValueOff></Cheat></Trainer>)";
 	Check(!Cheats::ConvertTrainer(&missing_attr_xml, false).isEmpty(), "trainer without Title ID attribute should report error");
 
-	QByteArray incomplete_write_xml = R"(<Trainer Ppsa="PPSA11111" Version="1.00" Process="eboot.bin">
-		<Cheat Text="Incomplete"><Write><Offset>0x1000</Offset><ValueOn>9090</ValueOn></Write></Cheat>
+	// Incomplete write with preceding complete write (nested form)
+	const QByteArray original_nested_incomplete = R"(<Trainer Ppsa="PPSA11111" Version="1.00" Process="eboot.bin">
+		<Cheat Text="NestedPartial">
+			<Write><Offset>0x1000</Offset><ValueOn>1122</ValueOn><ValueOff>0000</ValueOff></Write>
+			<Write><Offset>0x2000</Offset><ValueOn>9090</ValueOn></Write>
+		</Cheat>
 	</Trainer>)";
-	Check(!Cheats::ConvertTrainer(&incomplete_write_xml, false).isEmpty(), "incomplete trainer write should report error");
+	QByteArray test_nested_incomplete = original_nested_incomplete;
+	Check(!Cheats::ConvertTrainer(&test_nested_incomplete, false).isEmpty(),
+	      "nested incomplete trainer write should report error even with preceding complete write");
+	Check(test_nested_incomplete == original_nested_incomplete,
+	      "data should remain unchanged on nested conversion error");
+
+	// Incomplete write with preceding complete write (flat form)
+	const QByteArray original_flat_incomplete = R"(<Trainer Ppsa="PPSA11111" Version="1.00" Process="eboot.bin">
+		<Cheat Text="FlatPartial">
+			<Offset>0x1000</Offset><ValueOn>1122</ValueOn><ValueOff>0000</ValueOff>
+			<Offset>0x2000</Offset><ValueOn>9090</ValueOn>
+		</Cheat>
+	</Trainer>)";
+	QByteArray test_flat_incomplete = original_flat_incomplete;
+	Check(!Cheats::ConvertTrainer(&test_flat_incomplete, false).isEmpty(),
+	      "flat incomplete trainer write should report error even with preceding complete write");
+	Check(test_flat_incomplete == original_flat_incomplete,
+	      "data should remain unchanged on flat conversion error");
 
 	// 5. Positive and Negative AES-256-CBC Encrypted MC4 Decryption (DEFECT-06)
 	QByteArray corrupt_mc4 = "CorruptedBase64==";

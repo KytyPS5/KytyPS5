@@ -222,13 +222,11 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 			std::string_view sv = off_str;
 			while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) sv.remove_prefix(1);
 			while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back()))) sv.remove_suffix(1);
-			int base = 10;
 			if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X')) {
 				sv.remove_prefix(2);
-				base = 16;
 			}
 			uint64_t addr = 0;
-			auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), addr, base);
+			auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), addr, 16);
 			if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
 				return Fail(error, "invalid mod memory offset");
 			}

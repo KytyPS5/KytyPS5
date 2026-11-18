@@ -274,7 +274,11 @@ QString ConvertTrainer(QByteArray* data, bool encrypted) {
 				if (!maybe_flush_for_field(QStringLiteral("offset"))) {
 					return Tr("Trainer contains an incomplete cheat write entry.");
 				}
-				flat_write.insert(QStringLiteral("offset"), xml.readElementText().trimmed());
+				auto offset_str = xml.readElementText().trimmed();
+				if (!offset_str.startsWith(QLatin1String("0x"), Qt::CaseInsensitive)) {
+					offset_str.prepend(QLatin1String("0x"));
+				}
+				flat_write.insert(QStringLiteral("offset"), offset_str);
 			} else if (tag.compare(QLatin1String("ValueOn"), Qt::CaseInsensitive) == 0) {
 				if (!maybe_flush_for_field(QStringLiteral("on"))) {
 					return Tr("Trainer contains an incomplete cheat write entry.");
@@ -319,6 +323,9 @@ QString ConvertTrainer(QByteArray* data, bool encrypted) {
 					    field.compare(QLatin1String("Absolute"), Qt::CaseInsensitive) == 0) {
 						auto value = xml.readElementText().trimmed();
 						if (field.compare(QLatin1String("Offset"), Qt::CaseInsensitive) == 0) {
+							if (!value.startsWith(QLatin1String("0x"), Qt::CaseInsensitive)) {
+								value.prepend(QLatin1String("0x"));
+							}
 							write.insert(QStringLiteral("offset"), value);
 						} else if (field.compare(QLatin1String("ValueOn"), Qt::CaseInsensitive) == 0) {
 							write.insert(QStringLiteral("on"), clean_bytes(value));
@@ -1015,8 +1022,12 @@ static bool SanitizeModEntry(const QJsonObject& in_mod, const QString& fallback_
 		    off_val.size() != on_val.size()) {
 			return false;
 		}
+		QString normalized_offset = off_str;
+		if (!normalized_offset.startsWith(QLatin1String("0x"), Qt::CaseInsensitive)) {
+			normalized_offset.prepend(QLatin1String("0x"));
+		}
 		QJsonObject clean_entry {
-			{QStringLiteral("offset"), off_str},
+			{QStringLiteral("offset"), normalized_offset},
 			{QStringLiteral("off"), off_val},
 			{QStringLiteral("on"), on_val}
 		};

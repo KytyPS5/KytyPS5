@@ -56089,6 +56089,120 @@ void CheckPm4Flip() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckPresentArrayLayer() {
+  namespace EventQueue = LibKernel::EventQueue;
+  constexpr const char *name = "PresentArrayLayer";
+  struct BufferAttribute {
+    uint32_t reserved0;
+    uint32_t tiling_mode;
+    uint32_t aspect_ratio;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch_in_pixel;
+    uint64_t option;
+    uint64_t pixel_format;
+    uint64_t dcc_cb_register_clear_color;
+    uint32_t dcc_control;
+    uint32_t pad0;
+    uint64_t reserved1[3];
+  };
+  struct Buffers {
+    const void *data;
+    const void *metadata;
+    const void *reserved[2];
+  };
+  constexpr uint32_t extent = 128;
+  constexpr uint32_t layers = 2;
+  constexpr uint64_t r8g8b8a8_srgb = 0x8000000022000000ull;
+  constexpr uint64_t surface_size = 0x40000;
+  Config::Load({.printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO),
+          "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = extent;
+  window.graphic_ctx.screen_height = extent;
+  window.window = SDL_CreateWindow(name, extent, extent,
+                                   SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr,
+          "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(extent, extent, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+
+  int64_t surface_offset = -1;
+  void *surface = nullptr;
+  Require(name, "surface memory",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, LibKernel::Memory::KernelGetDirectMemorySize(), surface_size,
+              0x10000, 0, &surface_offset) == 0 &&
+              LibKernel::Memory::KernelMapDirectMemory(
+                  &surface, surface_size, 0x3, 0, surface_offset, 0x10000) == 0,
+          "the surface mapping failed");
+  const auto surface_base = reinterpret_cast<uint64_t>(surface);
+  renderer.MapMemory(surface_base, surface_size);
+  auto desc = VulkanHarness::MakeLinearDesc(
+      surface_base, 0, vk::Format::eR8G8B8A8Srgb,
+      Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
+      {extent, extent, 1}, layers, 4, 1);
+  desc.info.tile_mode = Prospero::TileMode::kRenderTarget;
+  desc.info.pitch = 0;
+  desc.info.UpdateSize();
+  desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+  desc.type = TextureCache::BindingType::RenderTarget;
+  const uint64_t layer_size = desc.info.data.size / layers;
+  Require(name, "layer size",
+          desc.info.data.size <= surface_size && layer_size % 0x10000 == 0,
+          "a layer of the array image does not start on a video-out boundary");
+
+  const int handle = VideoOut::VideoOutOpen(255, 0, 0, nullptr);
+  EventQueue::KernelEqueue flips = EventQueue::KERNEL_EQUEUE_INVALID;
+  BufferAttribute attribute{};
+  attribute.width = extent;
+  attribute.height = extent;
+  attribute.pixel_format = r8g8b8a8_srgb;
+  const std::array<Buffers, layers> buffers{
+      Buffers{surface, nullptr, {nullptr, nullptr}},
+      Buffers{reinterpret_cast<const void *>(surface_base + layer_size), nullptr,
+              {nullptr, nullptr}}};
+  Require(name, "setup",
+          handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
+              VideoOut::VideoOutAddFlipEvent(flips, handle, nullptr) == 0 &&
+              VideoOut::VideoOutRegisterBuffers2(
+                  handle, 0, 0, reinterpret_cast<const VideoOut::VideoOutBuffers *>(buffers.data()), layers,
+                  reinterpret_cast<const VideoOut::VideoOutBufferAttribute2 *>(&attribute), 0,
+                  nullptr) == 0,
+          "video-out setup failed");
+
+  bool cached = false;
+  renderer.GetGpu().SendCommandSync([&] {
+    auto &texture_cache = renderer.GetTextureCache();
+    const auto image = texture_cache.FindImage(desc);
+    cached = image && texture_cache.GetImage(image).info.resources.layers == layers;
+  });
+  Require(name, "array image", cached,
+          "the two-layer image at the video-out address was not cached");
+
+  for (int buffer = 0; buffer < static_cast<int>(layers); ++buffer) {
+    EventQueue::KernelEvent event{};
+    int count = 0;
+    LibKernel::KernelUseconds timeout = 2'000'000;
+    Require(name, buffer == 0 ? "flip of layer 0" : "flip of layer 1",
+            VideoOut::VideoOutSubmitFlip(handle, buffer, 1, 0) == 0 &&
+                EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
+                count == 1,
+            "the flip of a buffer on a layer of an array image did not complete");
+  }
+
+  renderer.GetGpu().WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0,
+          "video-out close failed");
+  EventQueue::KernelDeleteEqueue(flips);
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // A flip rate is the shortest flip interval, counted from the last flip.
 void CheckFlipRate() {
   namespace EventQueue = LibKernel::EventQueue;
@@ -57352,6 +57466,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
     CheckFlipRate();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--present-array-layer-only") == 0) {
+    CheckPresentArrayLayer();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {

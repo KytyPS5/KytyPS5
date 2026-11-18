@@ -606,6 +606,15 @@ add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
 target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
 target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
 
+add_executable(font_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FontTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libFont.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(font_tests common SDL3::SDL3-static FFmpeg::ffmpeg kyty_test_gtest)
+target_include_directories(font_tests PRIVATE ${inc_headers})
+target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"

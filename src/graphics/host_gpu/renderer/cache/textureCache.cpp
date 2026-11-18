@@ -1971,7 +1971,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	return found->second.clear_mask.test(slice) || found->second.stencil_clear_mask.test(slice);
+	return found->second.clear_mask.test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {

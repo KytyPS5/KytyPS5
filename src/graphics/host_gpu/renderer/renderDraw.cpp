@@ -480,14 +480,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
 		const auto  attachment_aspects = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
-		const auto  stencil_only       = attachment_aspects == vk::ImageAspectFlagBits::eStencil;
-		const auto  all_aspects =
-		    vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-		const auto meta_aspects = stencil_only ? attachment_aspects : all_aspects;
-		const auto meta_clear =
+		const auto  meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile
 		        ? cache.TakeMetaClear(metadata.range.address, depth.desc.view_info.base_layer,
-		                              meta_aspects)
+		                              attachment_aspects)
 		        : vk::ImageAspectFlags {};
 		depth.load_clear_aspects = {};
 		if (depth.depth_clear_enable || (meta_clear & vk::ImageAspectFlagBits::eDepth))

@@ -18056,6 +18056,72 @@ public:
                 "a stencil-only bind consumed the HTile depth clear that a later depth target "
                 "over the same HTile needs");
         RenderExecutorTestAccess::ResetBindings(executor);
+        const bool depth_first_meta_cleared = texture_cache.ClearMeta(stencil_only_htile_address);
+        RenderDepthInfo depth_before_stencil{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), depth_before_stencil);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, depth_before_stencil);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        registers.SetDepthRenderTarget(stencil_only_target);
+        registers.SetDepthControl(stencil_only_control);
+        RenderDepthInfo stencil_after_depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), stencil_after_depth);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, stencil_after_depth);
+        Require(name, "depth-only bind keeps a pending HTile stencil clear",
+                depth_first_meta_cleared &&
+                    depth_before_stencil.load_clear_aspects == vk::ImageAspectFlagBits::eDepth &&
+                    stencil_after_depth.load_clear_aspects == vk::ImageAspectFlagBits::eStencil &&
+                    !texture_cache.IsMetaCleared(stencil_only_htile_address, 0),
+                "a depth-only bind consumed the HTile stencil clear that a later stencil target "
+                "over the same HTile needs");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        constexpr uint64_t combined_depth_address = base + 0x600000;
+        constexpr uint64_t combined_stencil_address = base + 0x620000;
+        constexpr uint64_t combined_htile_address = base + 0x640000;
+        auto combined_target = phased_depth_target;
+        combined_target.z_info.partially_resident = false;
+        combined_target.stencil_info.partially_resident = false;
+        combined_target.stencil_info.htile_stencil_disabled = true;
+        combined_target.z_read_base_addr = combined_depth_address;
+        combined_target.z_write_base_addr = combined_depth_address;
+        combined_target.stencil_read_base_addr = combined_stencil_address;
+        combined_target.stencil_write_base_addr = combined_stencil_address;
+        combined_target.htile_data_base_addr = combined_htile_address;
+        combined_target.size = {63, 63, true};
+        registers.SetDepthRenderTarget(combined_target);
+        registers.SetDepthControl(depth_only_control);
+        RenderDepthInfo primed_combined{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), primed_combined);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, primed_combined);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const bool combined_meta_cleared = texture_cache.ClearMeta(combined_htile_address);
+        RenderDepthInfo uncompressed_stencil{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), uncompressed_stencil);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, uncompressed_stencil);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        combined_target.stencil_info.htile_stencil_disabled = false;
+        registers.SetDepthRenderTarget(combined_target);
+        RenderDepthInfo compressed_stencil{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), compressed_stencil);
+        (void)RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, compressed_stencil);
+        Require(name, "uncompressed stencil bind drops the pending HTile stencil clear",
+                combined_meta_cleared &&
+                    !uncompressed_stencil.desc.info.metadata.stencil_compressed &&
+                    compressed_stencil.desc.info.metadata.stencil_compressed &&
+                    uncompressed_stencil.load_clear_aspects == vk::ImageAspectFlagBits::eDepth &&
+                    !compressed_stencil.load_clear_aspects,
+                "an HTile stencil clear survived a bind with an uncompressed stencil plane and "
+                "cleared the stencil of a later compressed bind");
+        RenderExecutorTestAccess::ResetBindings(executor);
         registers.SetDepthRenderTarget(stencil_only_target);
         registers.SetDepthControl(stencil_only_control);
         registers.SetRenderControl(stencil_only_render_control);

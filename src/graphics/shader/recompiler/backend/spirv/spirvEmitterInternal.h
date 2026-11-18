@@ -75,6 +75,21 @@ struct ImageDefinition {
 	uint32_t sampled_type = 0;
 };
 
+// Scalar loads of one pointer that follow each other share the page lookup of the first.
+struct BdaRun {
+	const IR::Inst* first    = nullptr;
+	uint32_t        distance = 0;
+	uint32_t        length   = 0;
+};
+
+// What the first load of a run looked up, in the mapping of its page and of the run's last.
+struct BdaRunPointers {
+	uint32_t first_page  = 0;
+	uint32_t last_page   = 0;
+	uint32_t page_offset = 0;
+	uint32_t label       = 0;
+};
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -120,7 +135,12 @@ struct EmitterState {
 	std::vector<uint32_t>                           memory_byte_sizes;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
-	uint32_t                                         bda_pointer_function    = 0;
+	// BVH programs keep bda_pointer_function, zero for a missing page; the others read zeros.
+	uint32_t                                            bda_pointer_function = 0;
+	uint32_t                                            bda_dword_function   = 0;
+	uint32_t                                            bda_run_function     = 0;
+	std::unordered_map<const IR::Inst*, BdaRun>         bda_runs;
+	std::unordered_map<const IR::Inst*, BdaRunPointers> bda_run_pointers;
 	uint32_t                                           indirect_search_function          = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;

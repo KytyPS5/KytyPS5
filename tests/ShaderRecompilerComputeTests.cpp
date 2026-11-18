@@ -234,6 +234,8 @@ struct BufferCacheTestAccess {
     return cache.m_slot_buffers.is_allocated(id);
   }
 
+  static Buffer &ZeroPage(BufferCache &cache) { return cache.m_bda_zero_page; }
+
   static size_t BoundTablePages(const BufferCache &cache) {
     return static_cast<size_t>(std::ranges::count_if(
         cache.m_table_pages, [](const auto &page) { return page.allocation != nullptr; }));
@@ -6387,6 +6389,7 @@ public:
 
         // The entries of the pages take pages of the BDA page table, which stay.
         const auto before = AllocatedBytes();
+        const auto table_before = BufferCacheTestAccess::BoundTablePages(cache);
         const auto [first, first_offset] = cache.ObtainBuffer(clean, clean_size, false);
         const auto &window = *first;
         const auto [written, written_offset] = cache.ObtainBuffer(dirty, 0x1000, true);
@@ -6397,7 +6400,8 @@ public:
             (Common::AlignUp(clean + clean_size, page) - Common::AlignDown(clean, page)) / page;
         const auto pages = BufferCacheTestAccess::WindowPages(cache);
         const auto full = AllocatedBytes();
-        const auto empty = before + BufferCacheTestAccess::BoundTablePages(cache) * page;
+        const auto empty =
+            before + (BufferCacheTestAccess::BoundTablePages(cache) - table_before) * page;
         Require(name, "pages", full == empty + pages * page && pages == clean_pages + 1 + 2,
                 "the ranges did not take exactly their pages");
 
@@ -6691,8 +6695,9 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  // A sparse BDA page table takes memory only where an entry was written. A page is zero when
-  // shaders first see it: the work recorded before it was bound finished on the unbound entries.
+  // A sparse BDA page table takes memory only where an entry was written: from the start for
+  // the entry of the page of zeros, after the last page's. A page is zero when shaders first see
+  // it: the work recorded before it was bound finished on the unbound entries.
   void CheckSparsePageTable() {
     constexpr const char *name = "SparsePageTable";
     constexpr uint64_t base = 0x0000000260000000ull;
@@ -6701,6 +6706,19 @@ public:
     using Libs::Graphics::SparsePage;
     EnsureRuntimeContext();
     auto &graphics = m_runtime_context;
+    {
+      // The page of zeros of the next cache takes memory that held other bytes, where the
+      // allocator hands the same memory out again.
+      RenderContext context(graphics);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      auto &zeros = BufferCacheTestAccess::ZeroPage(context.GetBufferCache());
+      zeros.Fill(0, zeros.Size(), 0xa5a5a5a5u);
+      scheduler.Finish();
+    }
     {
       RenderContext context(graphics);
       auto &scheduler = context.GetCommandScheduler();
@@ -6717,8 +6735,8 @@ public:
       auto &sparse = *graphics.sparse_binding;
       // The guest addresses one page of the table holds the entries of.
       const auto span = sparse.PageSize() / sizeof(vk::DeviceAddress) * page;
-      Require(name, "empty table", BufferCacheTestAccess::BoundTablePages(cache) == 0,
-              "the table took memory before an entry was written");
+      Require(name, "empty table", BufferCacheTestAccess::BoundTablePages(cache) == 1,
+              "the table took memory for more than the entry of its page of zeros");
       {
         // The memory the table takes next holds other bytes.
         std::array<SparsePage, 4> dirty{};
@@ -6738,7 +6756,7 @@ public:
         scheduler.Finish();
         sparse.Collect();
       }
-      auto readback = CreateHostBuffer(name, 6 * sizeof(uint64_t),
+      auto readback = CreateHostBuffer(name, 7 * sizeof(uint64_t) + page,
                                        vk::BufferUsageFlagBits::eTransferDst, {});
       const auto snapshot = [&](uint64_t address, u32 index) {
         const vk::BufferCopy copy{BufferCache::PageIndex(address) * sizeof(uint64_t),
@@ -6751,19 +6769,26 @@ public:
       const auto &buffer = cache.GetBuffer(cache.FindBuffer(base, page));
       Require(name, "bind order", scheduler.CurrentTick() > tick,
               "work recorded before a table page was bound did not finish first");
-      Require(name, "first page", BufferCacheTestAccess::BoundTablePages(cache) == 1,
+      Require(name, "first page", BufferCacheTestAccess::BoundTablePages(cache) == 2,
               "one entry did not take exactly one table page");
       snapshot(base, 1);
       snapshot(base + 16 * page, 2);
       snapshot(base + span - page, 3);
       snapshot(base + span, 4);
       (void)cache.FindBuffer(base + span / 2, page);
-      Require(name, "shared page", BufferCacheTestAccess::BoundTablePages(cache) == 1,
+      Require(name, "shared page", BufferCacheTestAccess::BoundTablePages(cache) == 2,
               "entries of one table page took a second one");
       snapshot(base, 5);
       (void)cache.FindBuffer(base + span, page);
-      Require(name, "second page", BufferCacheTestAccess::BoundTablePages(cache) == 2,
+      Require(name, "second page", BufferCacheTestAccess::BoundTablePages(cache) == 3,
               "an entry outside the bound table page took no page");
+      // The entry after the last page's, and the page it names.
+      const auto &zeros = BufferCacheTestAccess::ZeroPage(cache);
+      const vk::BufferCopy zero_entry{BufferCache::BDA_ZERO_ENTRY * sizeof(uint64_t),
+                                      6 * sizeof(uint64_t), sizeof(uint64_t)};
+      scheduler.Current().Handle().copyBuffer(table.Handle(), readback.buffer, 1, &zero_entry);
+      const vk::BufferCopy zero_page{0, 7 * sizeof(uint64_t), page};
+      scheduler.Current().Handle().copyBuffer(zeros.Handle(), readback.buffer, 1, &zero_page);
       vk::BufferMemoryBarrier barrier{};
       barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
       barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
@@ -6775,10 +6800,14 @@ public:
           vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
           1, &barrier, 0, nullptr);
       scheduler.Finish();
-      const auto words = ReadBuffer(name, readback, 12);
+      const auto words = ReadBuffer(name, readback, 14 + page / sizeof(u32));
       const auto entry = [&](size_t index) {
         return uint64_t{words[index * 2]} | (uint64_t{words[index * 2 + 1]} << 32);
       };
+      Require(name, "page of zeros",
+              zeros.Size() == page && entry(6) == zeros.BufferDeviceAddress() &&
+                  std::all_of(words.begin() + 14, words.end(), [](u32 word) { return word == 0; }),
+              "the entry after the last page's does not name a page of zeros");
       Require(name, "earlier read", entry(0) == 0,
               "work recorded before a table page was bound saw the page");
       Require(name, "written entry",
@@ -24730,6 +24759,10 @@ public:
           address += BufferCache::CACHING_PAGESIZE;
         }
       }
+      // A page without a buffer reads the page of zeros the entry after the last page's names.
+      cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                       BufferCache::BDA_ZERO_ENTRY * sizeof(vk::DeviceAddress),
+                       sizeof(vk::DeviceAddress), &m_bda_zero_page.device_address);
       barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eComputeShader, {}, 0,
@@ -30021,6 +30054,7 @@ private:
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       DestroyBuffer(&m_fault_buffer);
       DestroyBuffer(&m_bda_pagetable_buffer);
+      DestroyBuffer(&m_bda_zero_page);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
         delete m_runtime_context.sparse_binding;
@@ -30249,6 +30283,8 @@ private:
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
         shader_name, BufferCache::FAULT_BUFFER_SIZE, usage | vk::BufferUsageFlagBits::eTransferSrc);
+    m_bda_zero_page = CreateStorageBuffer(shader_name, {},
+                                          BufferCache::CACHING_PAGESIZE / sizeof(u32), true);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -30326,6 +30362,7 @@ private:
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
+  Buffer m_bda_zero_page;
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
@@ -42797,14 +42834,15 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
           ++profile.uses;
         }
       std::map<u32, std::string> functions;
-      u32 function = 0, bda = 0, inline_reads = 0;
+      std::set<u32> bda;
+      u32 function = 0, inline_reads = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpName) {
           const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
           if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
-          if (name == "get_bda_pointer") bda = words[1];
+          if (name.starts_with("get_bda_")) bda.insert(words[1]);
         }
         if (opcode == spv::OpFunction) {
           function = words[2];
@@ -42812,7 +42850,7 @@ void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
         }
         if (opcode == spv::OpFunctionCall) {
           if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
-          if (words[3] == bda) {
+          if (bda.contains(words[3])) {
             if (functions.contains(function)) ++profiles[functions.at(function)].reads;
             else ++inline_reads;
           }
@@ -44829,7 +44867,7 @@ TestCase FlatStoreSlcCaptured() {
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.decoded_counts = {{"slc=1", 2}};
-  test.forbidden_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"get_bda_"};
   return test;
 }
 
@@ -45236,7 +45274,7 @@ TestCase ScalarLoadAlignsDynamicBase() {
     test.expected[group * 2 + 1] = test.initial[19];
   }
   test.bda_mappings = {{GuestBase, 64}};
-  test.required_spirv = {"get_bda_pointer"};
+  test.required_spirv = {"get_bda_"};
   test.forbidden_spirv = {"flattened_srt"};
   test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX2, O::V_MOV_B32,
                   O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -45310,7 +45348,7 @@ TestCase ScalarBufferFromLoopReadlane(u32 wave_size) {
                    0x44444444u, 0x55555555u, 0x66666666u, 0x77777777u,
                    0, 0, 0, 0};
   test.bda_mappings = {{GuestBase, 512}};
-  test.required_spirv = {"get_bda_pointer", "OpLoopMerge", "OpGroupNonUniformShuffle"};
+  test.required_spirv = {"get_bda_", "OpLoopMerge", "OpGroupNonUniformShuffle"};
   test.forbidden_spirv = {"flattened_srt"};
   test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B32,
                   O::S_MOV_B64, O::S_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX4,
@@ -45388,6 +45426,183 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   test.bda_mappings = {{GuestBase, 8}};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// The four DWORDs of one scalar load share a page lookup. `first` DWORDs of them lie before
+// `boundary`, the start of a page; the buffer's pages are mapped as `mappings` say.
+struct ScalarRun {
+  const char *name;
+  uint64_t boundary;
+  u32 first;
+  u32 pages;
+  std::vector<BdaMapping> mappings;
+  // The buffer's DWORDs the load reads; UINT32_MAX for one it reads from no buffer.
+  std::array<u32, 4> sources;
+  // Another load reads the DWORD this many bytes from the run's first one before the run does,
+  // which tells the host of its page; zero for none. Its source is in the buffer.
+  int32_t reads_first = 0;
+  u32 first_source = 0;
+};
+
+TestCase ScalarLoadRun(const ScalarRun &run) {
+  using O = ShaderOpcode;
+  constexpr u32 output = 16;
+  const auto address = run.boundary - run.first * sizeof(u32);
+
+  // The pointer is 64 bytes before the run, so that the other load's offset is not negative.
+  constexpr u32 lead = 64;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, static_cast<u32>(address - lead));
+  AppendSMovLiteral(&code, 9, static_cast<u32>((address - lead) >> 32u));
+  // The group ID, zero here, keeps the pointer a value of the dispatch.
+  code.push_back(EncodeSop2(0x00, 8, 8, 4));
+  AppendSMovLiteral(&code, 10, 0);
+  if (run.reads_first != 0) {
+    code.push_back(EncodeSmem0(0x00, 16, 4)); // s_load_dword s16, s[8:9], s10
+    code.push_back(EncodeSmem1(static_cast<u32>(static_cast<int32_t>(lead) + run.reads_first), 10));
+  }
+  code.push_back(EncodeSmem0(0x02, 12, 4)); // s_load_dwordx4 s[12:15], s[8:9], s10
+  code.push_back(EncodeSmem1(lead, 10));
+  for (u32 dword = 0; dword < 4; ++dword) {
+    AppendStoreSgpr(&code, 12 + dword, output + dword);
+  }
+  if (run.reads_first != 0) {
+    AppendStoreSgpr(&code, 16, output + 4);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = run.name;
+  test.code = std::move(code);
+  // Every DWORD of the buffer differs, so a load through the wrong mapping shows.
+  test.initial.resize(run.pages * BufferCache::CACHING_PAGESIZE / sizeof(u32));
+  for (u32 index = 0; index < test.initial.size(); ++index) {
+    test.initial[index] = 0xa0000000u + index;
+  }
+  test.expected = test.initial;
+  for (u32 dword = 0; dword < 4; ++dword) {
+    test.expected[output + dword] =
+        run.sources[dword] == UINT32_MAX ? 0u : test.initial[run.sources[dword]];
+  }
+  test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX4, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (run.reads_first != 0) {
+    test.expected[output + 4] = test.initial[run.first_source];
+    test.opcodes.insert(test.opcodes.begin() + 2, O::S_LOAD_DWORD);
+  }
+  test.bda_mappings = run.mappings;
+  test.required_spirv = {"get_bda_run"};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
+constexpr uint64_t ScalarRunBase = 0x0000000110000000ull;
+constexpr u32 ScalarRunPage = BufferCache::CACHING_PAGESIZE / sizeof(u32);
+
+// Both pages have a buffer, and the second page's is not behind the first's.
+TestCase ScalarLoadRunCrossesPages() {
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunCrossesPages",
+                             .boundary = ScalarRunBase + BufferCache::CACHING_PAGESIZE,
+                             .first = 2,
+                             .pages = 3,
+                             .mappings = {{ScalarRunBase, BufferCache::CACHING_PAGESIZE},
+                                          {ScalarRunBase + BufferCache::CACHING_PAGESIZE, 0}},
+                             .sources = {2 * ScalarRunPage - 2, 2 * ScalarRunPage - 1, 0, 1}});
+  test.bda_used_addresses = std::vector<uint64_t>{ScalarRunBase};
+  return test;
+}
+
+// The page the run ends in has no buffer: its DWORDs read zero, and the page is recorded.
+TestCase ScalarLoadRunEndsInUnbackedPage() {
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunEndsInUnbackedPage",
+                             .boundary = ScalarRunBase + BufferCache::CACHING_PAGESIZE,
+                             .first = 2,
+                             .pages = 1,
+                             .mappings = {{ScalarRunBase, 0}},
+                             .sources = {ScalarRunPage - 2, ScalarRunPage - 1, UINT32_MAX,
+                                         UINT32_MAX}});
+  test.fault_address = ScalarRunBase + BufferCache::CACHING_PAGESIZE;
+  return test;
+}
+
+// The host is told of the page the run ends in although it knows of the first already.
+TestCase ScalarLoadRunTellsOfItsSecondPage() {
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunTellsOfItsSecondPage",
+                             .boundary = ScalarRunBase + BufferCache::CACHING_PAGESIZE,
+                             .first = 2,
+                             .pages = 1,
+                             .mappings = {{ScalarRunBase, 0}},
+                             .sources = {ScalarRunPage - 2, ScalarRunPage - 1, UINT32_MAX,
+                                         UINT32_MAX},
+                             .reads_first = -16,
+                             .first_source = ScalarRunPage - 6});
+  test.fault_address = ScalarRunBase + BufferCache::CACHING_PAGESIZE;
+  return test;
+}
+
+// And of the page it starts in although it knows of the one it ends in.
+TestCase ScalarLoadRunTellsOfItsFirstPage() {
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunTellsOfItsFirstPage",
+                             .boundary = ScalarRunBase + BufferCache::CACHING_PAGESIZE,
+                             .first = 2,
+                             .pages = 1,
+                             .mappings = {{ScalarRunBase + BufferCache::CACHING_PAGESIZE, 0}},
+                             .sources = {UINT32_MAX, UINT32_MAX, 0, 1},
+                             .reads_first = 32,
+                             .first_source = 6});
+  test.fault_address = ScalarRunBase;
+  return test;
+}
+
+// The page the run starts in has no buffer.
+TestCase ScalarLoadRunStartsInUnbackedPage() {
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunStartsInUnbackedPage",
+                             .boundary = ScalarRunBase + BufferCache::CACHING_PAGESIZE,
+                             .first = 2,
+                             .pages = 1,
+                             .mappings = {{ScalarRunBase + BufferCache::CACHING_PAGESIZE, 0}},
+                             .sources = {UINT32_MAX, UINT32_MAX, 0, 1}});
+  test.fault_address = ScalarRunBase;
+  return test;
+}
+
+// A run that ends at the end of its page does not look the next page up: nothing is recorded
+// for a page the guest did not read.
+TestCase ScalarLoadRunLeavesNextPageAlone() {
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunLeavesNextPageAlone",
+                             .boundary = ScalarRunBase + BufferCache::CACHING_PAGESIZE,
+                             .first = 4,
+                             .pages = 1,
+                             .mappings = {{ScalarRunBase, 0}},
+                             .sources = {ScalarRunPage - 4, ScalarRunPage - 3, ScalarRunPage - 2,
+                                         ScalarRunPage - 1}});
+  test.fault_free_address = ScalarRunBase + BufferCache::CACHING_PAGESIZE;
+  test.bda_used_addresses = std::vector<uint64_t>{ScalarRunBase};
+  return test;
+}
+
+// The page table's entries for extended memory follow those of the lower 2^40 bytes, so the
+// page a run ends in is not always the next entry: here the run starts below extended memory,
+// outside the guest's GPU space.
+TestCase ScalarLoadRunCrossesIntoExtendedMemory() {
+  constexpr uint64_t extended = Libs::LibKernel::Memory::kExtendedMemoryBase;
+  auto test = ScalarLoadRun({.name = "ScalarLoadRunCrossesIntoExtendedMemory",
+                             .boundary = extended,
+                             .first = 2,
+                             .pages = 1,
+                             .mappings = {{extended, 0}},
+                             .sources = {UINT32_MAX, UINT32_MAX, 0, 1}});
+  test.bda_used_addresses = std::vector<uint64_t>{extended};
+  // An address outside the guest's space tells the host of no page: not of the one its low
+  // bits would name either.
+  test.fault_free_address = 0;
   return test;
 }
 
@@ -49798,7 +50013,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   test.compute_info.dispatch_thread_dimensions = true;
   test.compute_info.dispatch_threads_num[0] = 2;
   test.compute_info.dispatch_threads_num[1] = test.compute_info.dispatch_threads_num[2] = 1;
-  test.forbidden_spirv = {"get_bda_pointer", "flattened_srt", "OpFDiv", "OpUMulExtended"};
+  test.forbidden_spirv = {"get_bda_", "flattened_srt", "OpFDiv", "OpUMulExtended"};
   const auto compiled = CompileCase(test, vulkan.SubgroupSize());
   Require(test.name, "runtime record count",
           compiled.program.info.buffers.size() == 3 &&
@@ -49948,7 +50163,8 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
       if (count == 8u) {
         std::set<u32> nonuniform;
         std::vector<u32> stores;
-        u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
+        std::set<u32> bda_functions;
+        u32 conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
         u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
         bool geometry_pure = true;
@@ -49963,7 +50179,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
           if (opcode == spv::OpName) {
             const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
-            if (name == "get_bda_pointer") bda_function = words[1];
+            if (name.starts_with("get_bda_")) bda_functions.insert(words[1]);
             if (name == "convert_indirect_buffer_format") conversion_function = words[1];
             if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
             if (name == "indirect_buffer_formats") table = words[1];
@@ -49999,7 +50215,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                                                     static_cast<u32>((words.size() - 3u) / 2u));
           }
           if (opcode == spv::OpFunctionCall) {
-            if (words[3] == bda_function) ++bda_calls;
+            if (bda_functions.contains(words[3])) ++bda_calls;
             if (words[3] == conversion_function) ++conversion_calls;
             if (words[3] == geometry_function) ++geometry_calls;
           }
@@ -50274,16 +50490,17 @@ void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
         test.forbidden_spirv = {"convert_indirect_buffer_format", "load_indirect_buffer_",
                                "indirect_buffer_format_geometry"};
       else
-        test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+        test.required_spirv = {"get_bda_", "convert_indirect_buffer_format"};
       CheckSpirvEmission(test, compiled.spirv);
-      u32 bda_function = 0, bda_calls = 0;
+      std::set<u32> bda_functions;
+      u32 bda_calls = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpName &&
-            std::string_view(reinterpret_cast<const char *>(words.data() + 2)) == "get_bda_pointer")
-          bda_function = words[1];
-        if (opcode == spv::OpFunctionCall && words[3] == bda_function) ++bda_calls;
+            std::string_view(reinterpret_cast<const char *>(words.data() + 2)).starts_with("get_bda_"))
+          bda_functions.insert(words[1]);
+        if (opcode == spv::OpFunctionCall && bda_functions.contains(words[3])) ++bda_calls;
         offset += words.size();
       }
       Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u),
@@ -50448,7 +50665,7 @@ void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
     if (outer_loop) test.decoded_counts.insert(test.decoded_counts.end(),
         {{"V_CMPX_EQ_U32", 2u}, {"S_CBRANCH_SCC1", 2u}});
     // The load decodes the record's descriptor in the shader.
-    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "get_bda_pointer",
+    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "get_bda_",
                            "convert_indirect_buffer_format"};
     test.bda_mappings = {{0u, 0u}};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -50583,7 +50800,7 @@ void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
     AppendEnd(&code);
     test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
         {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
-    test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+    test.required_spirv = {"get_bda_", "convert_indirect_buffer_format"};
     if (!wide) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
     test.forbidden_spirv = {"OpAtomicCompareExchange"};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
@@ -56546,6 +56763,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(GlobalLoadRecordsUnbackedPage);
+  AddCase(ScalarLoadRunCrossesPages);
+  AddCase(ScalarLoadRunEndsInUnbackedPage);
+  AddCase(ScalarLoadRunTellsOfItsSecondPage);
+  AddCase(ScalarLoadRunTellsOfItsFirstPage);
+  AddCase(ScalarLoadRunStartsInUnbackedPage);
+  AddCase(ScalarLoadRunLeavesNextPageAlone);
+  AddCase(ScalarLoadRunCrossesIntoExtendedMemory);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
@@ -65232,6 +65456,22 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
     CheckDepthTargetFootprints();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-run-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarLoadAlignsDynamicBase());
+    RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    RunCase(&vulkan, GlobalLoadRecordsUnbackedPage());
+    RunCase(&vulkan, ScalarLoadRunCrossesPages());
+    RunCase(&vulkan, ScalarLoadRunEndsInUnbackedPage());
+    RunCase(&vulkan, ScalarLoadRunTellsOfItsSecondPage());
+    RunCase(&vulkan, ScalarLoadRunTellsOfItsFirstPage());
+    RunCase(&vulkan, ScalarLoadRunStartsInUnbackedPage());
+    RunCase(&vulkan, ScalarLoadRunLeavesNextPageAlone());
+    RunCase(&vulkan, ScalarLoadRunCrossesIntoExtendedMemory());
+    vulkan.CheckSparsePageTable();
+    vulkan.CheckBdaUseKeepsBuffers();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {

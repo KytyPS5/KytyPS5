@@ -182,8 +182,46 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
+constexpr auto BdaPageBytes = static_cast<uint32_t>(BufferCache::CACHING_PAGESIZE);
+
+uint32_t LoadHostDword(EmitterState& state, uint32_t bda, bool coherent) {
+	auto pointer = state.builder.AllocateId();
+	if (coherent) {
+		const auto block =
+		    state.builder.DecoratedType(spv::OpTypeStruct,
+		                                {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                                 {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+		                                 {spv::OpDecorate, {spv::DecorationBlock}}},
+		                                TypeU32(state));
+		state.builder.AddFunction(spv::OpConvertUToPtr,
+		                          TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+		                          pointer, bda);
+		const auto base = pointer;
+		pointer         = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer, base,
+		                          ConstantU32(state, 0));
+	} else {
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          bda);
+	}
+	const auto         value     = state.builder.AllocateId();
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(
+	    spv::OpLoad, TypeU32(state), value, pointer,
+	    spv::MemoryAccessAlignedMask |
+	        (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
+	    alignment);
+	return value;
+}
+
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
-	auto&      state   = ctx.state;
+	auto& state = ctx.state;
+	if (state.bda_pointer_function == 0) {
+		const auto bda = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), bda,
+		                          state.bda_dword_function, address);
+		return LoadHostDword(state, bda, coherent);
+	}
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
@@ -191,32 +229,63 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
 	// on negative links and would advance over zero entries forever.
 	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
-	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
-		auto pointer = state.builder.AllocateId();
-		if (coherent) {
-			const auto block = state.builder.DecoratedType(
-			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
-			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
-			state.builder.AddFunction(
-			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
-			    pointer, bda);
-			const auto base = pointer;
-			pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
-			                          base, ConstantU32(state, 0));
+	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing,
+	                                     [&]() { return LoadHostDword(state, bda, coherent); });
+}
+
+uint32_t TypeU64Pair(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVector, TypeU64(state), 2);
+}
+
+// The first load of a run looks up its page and the run's last; the others are in one of them.
+uint32_t LoadScalarAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto& state = ctx.state;
+	if (state.bda_pointer_function != 0) {
+		return LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+	}
+	const auto found = state.bda_runs.find(&inst);
+	if (found == state.bda_runs.end()) {
+		ctx.Fail(inst, "is a scalar load outside every run");
+	}
+	const auto& run = found->second;
+	if (run.first == &inst) {
+		const auto     address = GuestAddress(ctx, inst, mem);
+		BdaRunPointers pointers {.label = state.current_label};
+		if (run.length == sizeof(uint32_t)) {
+			pointers.first_page = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), pointers.first_page,
+			                          state.bda_dword_function, address);
 		} else {
-			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-			                          bda);
+			const auto pair = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionCall, TypeU64Pair(state), pair,
+			                          state.bda_run_function, address,
+			                          ConstantU32(state, run.length));
+			pointers.first_page = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU64(state), pointers.first_page,
+			                          pair, 0u);
+			pointers.last_page = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU64(state), pointers.last_page,
+			                          pair, 1u);
+			pointers.page_offset = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+			                              Unary(state, spv::OpUConvert, TypeU32(state), address),
+			                              ConstantU32(state, BdaPageBytes - 1));
 		}
-		const auto         value     = state.builder.AllocateId();
-		constexpr uint32_t alignment = sizeof(uint32_t);
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask |
-		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
-		                          alignment);
-		return value;
-	});
+		state.bda_run_pointers.insert_or_assign(&inst, pointers);
+		return LoadHostDword(state, pointers.first_page, false);
+	}
+	const auto& pointers = state.bda_run_pointers.at(run.first);
+	// No load of a run opens a block, so the first one's lookup is still in scope.
+	EXIT_IF(pointers.label != state.current_label);
+	const auto in_first_page =
+	    Binary(state, spv::OpULessThan, TypeBool(state),
+	           Binary(state, spv::OpIAdd, TypeU32(state), pointers.page_offset,
+	                  ConstantU32(state, run.distance)),
+	           ConstantU32(state, BdaPageBytes));
+	const auto base =
+	    Select(state, TypeU64(state), in_first_page, pointers.first_page, pointers.last_page);
+	return LoadHostDword(
+	    state, Binary(state, spv::OpIAdd, TypeU64(state), base, ConstantU64(state, run.distance)),
+	    false);
 }
 
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
@@ -1485,8 +1554,204 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	}
 }
 
+namespace {
+
+struct BdaPage {
+	uint32_t index    = 0;
+	uint32_t in_space = 0;
+};
+
+BdaPage BdaPageOf(EmitterState& state, uint32_t address) {
+	const auto type     = TypeU64(state);
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed   = Select(
+	    state, type, extended,
+	    Binary(state, spv::OpISub, type, address,
+	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	    address);
+	const auto page = Binary(state, spv::OpShiftRightLogical, type, packed,
+	                         ConstantU32(state, BufferCache::CACHING_PAGEBITS));
+	return {Unary(state, spv::OpUConvert, TypeU32(state), page),
+	        Binary(state, spv::OpULessThan, TypeBool(state), page,
+	               ConstantU64(state, BufferCache::CACHING_NUMPAGES))};
+}
+
+uint32_t LoadPageEntry(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
+	                          pointer, state.bda_pagetable_variable, ConstantU32(state, 0), index);
+	const auto entry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU64(state), entry, pointer);
+	return entry;
+}
+
+// Where a page reads from, and the bit that tells the host: its fault bit or its region's use bit.
+struct BdaMapping {
+	uint32_t host    = 0;
+	uint32_t pointer = 0;
+	uint32_t bit     = 0;
+	uint32_t untold  = 0;
+};
+
+BdaMapping MapBdaPage(EmitterState& state, BdaPage page, uint32_t zeros) {
+	const auto u32 = TypeU32(state);
+	const auto entry =
+	    LoadPageEntry(state, Select(state, u32, page.in_space, page.index,
+	                                ConstantU32(state, BufferCache::BDA_ZERO_ENTRY)));
+	const auto backed =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), entry, ConstantU64(state, 0));
+	const auto region =
+	    Binary(state, spv::OpShiftRightLogical, u32, page.index,
+	           ConstantU32(state, BufferCache::BDA_USE_REGIONBITS - BufferCache::CACHING_PAGEBITS));
+	const auto unit = Select(state, u32, backed, region, page.index);
+	const auto word =
+	    Binary(state, spv::OpIAdd, u32,
+	           Binary(state, spv::OpShiftRightLogical, u32, unit, ConstantU32(state, 5)),
+	           Select(state, u32, backed,
+	                  ConstantU32(state, BufferCache::FAULT_BITMAP_SIZE / sizeof(uint32_t)),
+	                  ConstantU32(state, 0)));
+	BdaMapping mapping;
+	mapping.host = Select(state, TypeU64(state), backed, entry, zeros);
+	mapping.pointer =
+	    FaultElementPointer(state, Select(state, u32, page.in_space, word, ConstantU32(state, 0)));
+	mapping.bit =
+	    Select(state, u32, page.in_space,
+	           Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1),
+	                  Binary(state, spv::OpBitwiseAnd, u32, unit, ConstantU32(state, 31))),
+	           ConstantU32(state, 0));
+	const auto told = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u32, told, mapping.pointer);
+	mapping.untold = AndCondition(state, page.in_space,
+	                              Binary(state, spv::OpIEqual, TypeBool(state),
+	                                     Binary(state, spv::OpBitwiseAnd, u32, told, mapping.bit),
+	                                     ConstantU32(state, 0)));
+	return mapping;
+}
+
+void TellHost(EmitterState& state, const BdaMapping& mapping) {
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+	                          mapping.pointer, ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), mapping.bit);
+}
+
+uint32_t PageOffset64(EmitterState& state, uint32_t address) {
+	return Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+	              ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
+}
+
+// The host address of a guest DWORD.
+void DefineBdaDword(EmitterState& state) {
+	const auto type          = TypeU64(state);
+	state.bda_dword_function = state.builder.AllocateId();
+	const auto address       = state.builder.AllocateId();
+	state.builder.AddName(state.bda_dword_function, "get_bda_dword");
+	state.builder.AddFunction(spv::OpFunction, type, state.bda_dword_function,
+	                          spv::FunctionControlMaskNone,
+	                          state.builder.Type(spv::OpTypeFunction, type, type));
+	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto mapping =
+	    MapBdaPage(state, BdaPageOf(state, address),
+	               LoadPageEntry(state, ConstantU32(state, BufferCache::BDA_ZERO_ENTRY)));
+	EmitIfCondition(state, mapping.untold, [&]() { TellHost(state, mapping); });
+	state.builder.AddFunction(spv::OpReturnValue, Binary(state, spv::OpIAdd, type, mapping.host,
+	                                                     PageOffset64(state, address)));
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+// The host addresses of a run's first DWORD in the mapping of its page and of its last DWORD's.
+void DefineBdaRun(EmitterState& state) {
+	const auto type        = TypeU64(state);
+	const auto u32         = TypeU32(state);
+	const auto pair        = TypeU64Pair(state);
+	state.bda_run_function = state.builder.AllocateId();
+	const auto address     = state.builder.AllocateId();
+	const auto length      = state.builder.AllocateId();
+	state.builder.AddName(state.bda_run_function, "get_bda_run");
+	state.builder.AddFunction(spv::OpFunction, pair, state.bda_run_function,
+	                          spv::FunctionControlMaskNone,
+	                          state.builder.Type(spv::OpTypeFunction, pair, type, u32));
+	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
+	state.builder.AddFunction(spv::OpFunctionParameter, u32, length);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto last = Binary(
+	    state, spv::OpIAdd, type, address,
+	    Unary(state, spv::OpUConvert, type,
+	          Binary(state, spv::OpISub, u32, length, ConstantU32(state, sizeof(uint32_t)))));
+	const auto zeros  = LoadPageEntry(state, ConstantU32(state, BufferCache::BDA_ZERO_ENTRY));
+	const auto first  = MapBdaPage(state, BdaPageOf(state, address), zeros);
+	const auto second = MapBdaPage(state, BdaPageOf(state, last), zeros);
+	EmitIfCondition(state,
+	                Binary(state, spv::OpLogicalOr, TypeBool(state), first.untold, second.untold),
+	                [&]() {
+		                TellHost(state, first);
+		                TellHost(state, second);
+	                });
+	const auto offset = PageOffset64(state, address);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, pair, result,
+	                          Binary(state, spv::OpIAdd, type, first.host, offset),
+	                          Binary(state, spv::OpISub, type,
+	                                 Binary(state, spv::OpIAdd, type, second.host, offset),
+	                                 ConstantU64(state, BufferCache::CACHING_PAGESIZE)));
+	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+// A run: scalar loads that follow each other from one pointer and offset value, within 64 bytes.
+void PlanBdaRuns(EmitterState& state) {
+	constexpr int64_t run_bytes = 64;
+	for (const auto* block: state.program.blocks) {
+		const IR::Inst* first  = nullptr;
+		int64_t         origin = 0;
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::LoadAddressU32) {
+				first = nullptr;
+				continue;
+			}
+			const auto& mem = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if (mem.kind != IR::ResourceKind::ScalarAddress) {
+				first = nullptr;
+				continue;
+			}
+			if (mem.planning_only) {
+				continue;
+			}
+			const auto offset = int64_t {static_cast<int32_t>(mem.offset & ~3u)};
+			const bool joins  = first != nullptr && !mem.address_is_full && offset >= origin &&
+			                    offset - origin <= run_bytes - 4 &&
+			                    inst.Arg(0).Resolve() == first->Arg(0).Resolve() &&
+			                    inst.Arg(1).Resolve() == first->Arg(1).Resolve();
+			if (!joins) {
+				// A full address names no pointer another load could share.
+				first  = mem.address_is_full ? nullptr : &inst;
+				origin = offset;
+				state.bda_runs.insert_or_assign(&inst, BdaRun {&inst, 0, sizeof(uint32_t)});
+				continue;
+			}
+			const auto distance = static_cast<uint32_t>(offset - origin);
+			state.bda_runs.insert_or_assign(&inst, BdaRun {first, distance, 0});
+			auto& length = state.bda_runs.at(first).length;
+			length       = std::max<uint32_t>(length, distance + sizeof(uint32_t));
+		}
+	}
+}
+
+} // namespace
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
+		return;
+	}
+	if (!state.program.info.bvh && !state.program.info.bvh8) {
+		PlanBdaRuns(state);
+		DefineBdaDword(state);
+		if (std::ranges::any_of(state.bda_runs, [](const auto& run) {
+			    return run.second.length > sizeof(uint32_t);
+		    })) {
+			DefineBdaRun(state);
+		}
 		return;
 	}
 	const auto type            = TypeU64(state);
@@ -1832,7 +2097,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
-		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+		value = LoadScalarAddress(ctx, inst, mem);
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),

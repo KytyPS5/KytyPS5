@@ -3637,11 +3637,114 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 2u,
         "raw scalar load did not remain a live typed address operation");
-  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 2u,
-        "aligned scalar DWORDs must each use one BDA lookup");
+  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 1u,
+        "the DWORDs of a scalar load must share one page lookup");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
   CheckSpirvBinaryValidates(raw.spirv);
+
+  // The live DWORDs of a scalar load follow each other from one pointer: they are a run with one
+  // lookup, which a page of zeros keeps free of guards. The only conditionals are the helpers'
+  // one each. Loads of other pointers have lookups of their own.
+  constexpr uint32_t OpFunction = 54;
+  constexpr uint32_t OpFunctionCall = 57;
+  constexpr uint32_t OpSelectionMerge = 247;
+  struct Run {
+    std::vector<uint32_t> loads;
+    uint32_t calls;
+    bool run_helper;
+  };
+  // s_load_dwordxN s[destination..], s[2 * base..], s0 offset
+  const auto load = [](uint32_t opcode, uint32_t destination, uint32_t offset, uint32_t base = 4) {
+    return std::vector<uint32_t>{EncodeSmem0(opcode, destination, base), offset};
+  };
+  const auto both = [](std::vector<uint32_t> first, const std::vector<uint32_t> &second) {
+    first.insert(first.end(), second.begin(), second.end());
+    return first;
+  };
+  const Run runs[] = {
+      {load(0x00, 12, 0), 1, false},
+      {load(0x03, 12, 0), 1, true},
+      {load(0x04, 12, 4), 1, true},
+      {both(load(0x00, 12, 0), load(0x00, 16, 0, 5)), 2, false},
+  };
+  for (const auto &run : runs) {
+    // The shader exports s12 and s16: the first DWORD of the load and, of a wider one, the fifth.
+    auto shader = run.loads;
+    shader.insert(shader.end(), {EncodeVop1(0x01, 0, 12), EncodeVop1(0x01, 1, 16),
+                                 EncodeExp0(0x00, 0x3), EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01)});
+    const auto compiled = RecompileForTest(shader, raw_options);
+    Check(SpirvInstructionOpcodeCount(compiled.spirv, OpFunctionCall) == run.calls,
+          "scalar loads did not take one page lookup for each run");
+    Check(SpirvInstructionOpcodeCount(compiled.spirv, OpFunction) == (run.run_helper ? 3u : 2u) &&
+              SpirvInstructionOpcodeCount(compiled.spirv, OpSelectionMerge) ==
+                  (run.run_helper ? 2u : 1u),
+          "a scalar load is guarded, or a lookup helper is missing or unused");
+    CheckSpirvBinaryValidates(compiled.spirv);
+  }
+
+  // A run is loads of one pointer and one offset value. Here the second DWORD of a two-DWORD
+  // load is given another offset value, the pointer of the load before it, or a full address:
+  // it then has a lookup of its own.
+  using ScalarLoads = std::vector<ShaderRecompiler::IR::Inst *>;
+  const auto lookups = [&](const std::function<void(ShaderRecompiler::IR::Program &,
+                                                    const ScalarLoads &)> &edit) {
+    auto shader = both(load(0x00, 16, 0, 5), load(0x01, 12, 0));
+    shader.insert(shader.end(), {EncodeVop1(0x01, 0, 12), EncodeVop1(0x01, 1, 13),
+                                 EncodeVop1(0x01, 2, 16), EncodeExp0(0x00, 0x7),
+                                 EncodeExp1(0, 1, 2, 0), EncodeSopp(0x01)});
+    auto translated = ShaderRecompiler::TranslateProgram(shader, raw_options);
+    ScalarLoads loads;
+    for (auto *block : translated.program.blocks) {
+      for (auto &inst : *block) {
+        if (inst.GetOpcode() != ShaderRecompiler::IR::ValueOpcode::LoadAddressU32) continue;
+        const auto &memory = translated.program.memory_info.at(
+            inst.Flags<ShaderRecompiler::IR::MemoryFlags>().index);
+        if (memory.kind == ShaderRecompiler::IR::ResourceKind::ScalarAddress &&
+            !memory.planning_only) {
+          loads.push_back(&inst);
+        }
+      }
+    }
+    Check(loads.size() == 3u, "the scalar loads of the run test were not translated one for one");
+    edit(translated.program, loads);
+    const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    ShaderRecompiler::IR::ResourceSnapshot resources;
+    ShaderRecompiler::IR::ResourceSpecialization specialization;
+    const ShaderRecompiler::IR::SrtRuntime runtime{
+        .user_data = raw_options.user_data,
+        .shader_base = reinterpret_cast<uint64_t>(shader.data()),
+        .read_specialization_memory = ReadHostTestMemory};
+    Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization),
+          "the run test's resources did not materialize");
+    const auto compiled =
+        ShaderRecompiler::CompileProgram(std::move(translated), raw_options, specialization);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    return SpirvInstructionOpcodeCount(compiled.spirv, OpFunctionCall);
+  };
+  Check(lookups([](auto &, const auto &) {}) == 2u,
+        "the two DWORDs of a scalar load did not share a lookup beside another pointer's load");
+  Check(lookups([](auto &, const auto &loads) {
+          loads[2]->SetArg(1, ShaderRecompiler::IR::Value(0u));
+        }) == 3u,
+        "a load with another offset value joined a run");
+  Check(lookups([](auto &, const auto &loads) { loads[2]->SetArg(0, loads[0]->Arg(0)); }) == 3u,
+        "a load of another pointer joined a run");
+  Check(lookups([](auto &program, const auto &loads) {
+          program.memory_info
+              .at(loads[2]->template Flags<ShaderRecompiler::IR::MemoryFlags>().index)
+              .address_is_full = true;
+        }) == 3u,
+        "a load of a full address joined a run");
+  const auto moved = [&](uint32_t offset) {
+    return lookups([offset](auto &program, const auto &loads) {
+      program.memory_info
+          .at(loads[2]->template Flags<ShaderRecompiler::IR::MemoryFlags>().index)
+          .offset = offset;
+    });
+  };
+  Check(moved(60) == 2u && moved(64) == 3u && moved(static_cast<uint32_t>(-4)) == 3u,
+        "a run did not end 64 bytes after its first load, or took a load before it");
 
   const uint32_t buffer_shader[] = {
       EncodeSmem0(0x08, 12, 4),

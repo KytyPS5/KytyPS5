@@ -35,8 +35,12 @@ public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	// The entry after the last page's names a page of zeros: what a page without a buffer reads.
+	static constexpr uint32_t BDA_ZERO_ENTRY     = static_cast<uint32_t>(CACHING_NUMPAGES);
+	static constexpr uint64_t BDA_PAGETABLE_TAIL = 64 * 1024;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress) + BDA_PAGETABLE_TAIL;
+	static_assert(BDA_ZERO_ENTRY == CACHING_NUMPAGES);
 	// Shaders mark the regions they reach through device addresses, after the fault bitmap.
 	static constexpr uint32_t BDA_USE_REGIONBITS = 21;
 	static constexpr uint64_t BDA_USE_REGIONSIZE = uint64_t {1} << BDA_USE_REGIONBITS;
@@ -139,7 +143,8 @@ private:
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	// A sparse table takes the pages its written entries need.
 	void WritePageTable(uint64_t offset, std::span<const vk::DeviceAddress> entries);
-	void BindPageTable(uint64_t offset, uint64_t size);
+	// `read` is false while no recorded work can read the table.
+	void BindPageTable(uint64_t offset, uint64_t size, bool read = true);
 	// Points the page table at the whole BDA pages of [begin, end), which `buffer` holds.
 	void WritePageEntries(const Buffer& buffer, uint64_t begin, uint64_t end);
 	void TouchBuffer(const Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -235,6 +240,7 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	Buffer                                            m_bda_zero_page;
 	// The pages of a sparse table by position; empty for a table with memory of its own.
 	std::vector<SparsePage>                           m_table_pages;
 	Common::SlotVector<Buffer>                        m_slot_buffers;

@@ -102,7 +102,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	}
 }
 
-void BufferCache::BindPageTable(uint64_t offset, uint64_t size) {
+void BufferCache::BindPageTable(uint64_t offset, uint64_t size, bool read) {
 	if (m_table_pages.empty() || size == 0) {
 		return;
 	}
@@ -125,7 +125,9 @@ void BufferCache::BindPageTable(uint64_t offset, uint64_t size) {
 	}
 	// A bind takes effect ahead of the recording it is queued in: the work recorded so far, which
 	// reads these entries as zero, finishes before memory not yet zeroed takes their place.
-	m_scheduler.Wait(m_scheduler.CurrentTick());
+	if (read) {
+		m_scheduler.Wait(m_scheduler.CurrentTick());
+	}
 	sparse.BindBuffer(m_bda_pagetable_buffer.Handle(), binds);
 	for (const auto& bind: binds) {
 		m_bda_pagetable_buffer.Fill(bind.resourceOffset, bind.size, 0);
@@ -625,6 +627,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(
           graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, BDA_PAGETABLE_SIZE,
           SparsePageTable(graphics) ? Buffer::Sparse::Residency : Buffer::Sparse::None),
+      m_bda_zero_page(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, CACHING_PAGESIZE),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -641,12 +645,20 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_table_pages.resize(BDA_PAGETABLE_SIZE / page);
 	}
 	m_scheduler.BeginCommand();
-	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+	for (auto* buffer:
+	     {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer(), &m_bda_zero_page}) {
 		// A sparse table has no pages yet; each is zeroed as it is bound.
 		if (!buffer->IsSparse()) {
 			buffer->Fill(0, buffer->Size(), 0);
 		}
 	}
+	// Nothing recorded reads the table yet, and the entry takes no staging memory.
+	const auto zeros = m_bda_zero_page.BufferDeviceAddress();
+	const auto entry = BDA_ZERO_ENTRY * sizeof(zeros);
+	BindPageTable(entry, sizeof(zeros), false);
+	m_bda_pagetable_buffer.Fill(entry, sizeof(uint32_t), static_cast<uint32_t>(zeros));
+	m_bda_pagetable_buffer.Fill(entry + sizeof(uint32_t), sizeof(uint32_t),
+	                            static_cast<uint32_t>(zeros >> 32u));
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);

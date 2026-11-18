@@ -294,28 +294,34 @@ void TextureCache::ReleaseDepthFeedbackCopy(ImageId depth_id) {
 
 ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
                                            vk::ImageAspectFlags aspects) {
-	if (const auto found = m_depth_feedback_copies.find(depth_id);
-	    found != m_depth_feedback_copies.end()) {
-		const auto& depth = m_slot_images[depth_id].backing;
-		const auto& copy  = m_slot_images[found->second].backing;
-		if (copy.format != depth.format || copy.extent != depth.extent ||
-		    copy.mip_levels != depth.mip_levels || copy.layers != depth.layers ||
-		    copy.samples != depth.samples) {
-			ReleaseDepthFeedbackCopy(depth_id);
+	ImageId copy_id {};
+	{
+		// Slot insertion and erasure race with InvalidateMemory's reads, as in FindImage.
+		std::scoped_lock lock {m_lock};
+		if (const auto found = m_depth_feedback_copies.find(depth_id);
+		    found != m_depth_feedback_copies.end()) {
+			const auto& depth = m_slot_images[depth_id].backing;
+			const auto& copy  = m_slot_images[found->second].backing;
+			if (copy.format != depth.format || copy.extent != depth.extent ||
+			    copy.mip_levels != depth.mip_levels || copy.layers != depth.layers ||
+			    copy.samples != depth.samples) {
+				ReleaseDepthFeedbackCopy(depth_id);
+			}
 		}
-	}
-	auto [entry, inserted] = m_depth_feedback_copies.try_emplace(depth_id);
-	if (inserted) {
-		// Same layout as the depth image, without guest memory: never registered or tracked.
-		auto info     = m_slot_images[depth_id].info;
-		info.data     = {};
-		info.stencil  = {};
-		info.metadata = {};
-		entry->second = m_slot_images.insert(m_graphics, m_scheduler, info);
+		auto [entry, inserted] = m_depth_feedback_copies.try_emplace(depth_id);
+		if (inserted) {
+			// Same layout as the depth image, without guest memory: never registered or tracked.
+			auto info     = m_slot_images[depth_id].info;
+			info.data     = {};
+			info.stencil  = {};
+			info.metadata = {};
+			entry->second = m_slot_images.insert(m_graphics, m_scheduler, info);
+		}
+		copy_id = entry->second;
 	}
 	// References after the insertion: it may move the images.
 	auto& depth = m_slot_images[depth_id];
-	auto& copy  = m_slot_images[entry->second];
+	auto& copy  = m_slot_images[copy_id];
 	EXIT_IF(range.base_level + range.level_count > depth.backing.mip_levels ||
 	        range.base_layer + range.layer_count > depth.backing.layers);
 	m_scheduler.EndRendering();
@@ -344,7 +350,7 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 		                  copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                  static_cast<uint32_t>(copies.size()), copies.data());
 	}
-	return entry->second;
+	return copy_id;
 }
 
 void TextureCache::FreeImage(ImageId id) {

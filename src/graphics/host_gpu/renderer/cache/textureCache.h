@@ -216,7 +216,7 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
-	// Releases the depth feedback copy of a depth image, if it has one.
+	// Releases the depth feedback copy of a depth image, if it has one. Caller holds m_lock.
 	void                      ReleaseDepthFeedbackCopy(ImageId depth_id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);

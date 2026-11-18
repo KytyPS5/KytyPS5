@@ -54960,6 +54960,22 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
           packet32[8] == patched_label32 && execute(packet32.data(), 14),
       "32-bit native wait patch did not update metadata and hardware packet");
 
+  // 0xfc patches FUNCTION to NOT_EQUAL, so the satisfied wait now blocks; the
+  // cache policy bits stay.
+  const auto patch_compare = [&](auto &packet, uint32_t size_dw) {
+    packet[5] |= 0x06000000u;
+    auto expected = packet;
+    expected[5] = 0x06000014u;
+    Pm4Execution execution;
+    return Gen5::AgcWaitRegMemPatchCompareFunction(packet.data(), 0xfc) == 0 &&
+           packet == expected &&
+           processor.Process(execution, {packet.data(), size_dw}) ==
+               Pm4ProcessResult::Blocked;
+  };
+  Require("Pm4WaitPackets", "32-bit compare function patch",
+          patch_compare(packet32, 14),
+          "32-bit compare function patch did not rewrite FUNCTION alone");
+
   alignas(8) uint64_t label64 = 0x1122334455667788ull;
   std::array<uint32_t, 16> packet64{};
   CommandBufferLayout dcb64{packet64.data(),
@@ -55017,6 +55033,9 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
           execute(packet64.data(), packet64.size()),
       "64-bit native wait patch did not preserve the native high reference "
       "DWORD");
+  Require("Pm4WaitPackets", "64-bit compare function patch",
+          patch_compare(packet64, packet64.size()),
+          "64-bit compare function patch did not rewrite FUNCTION alone");
 
   std::array<uint32_t, 16> invalid{};
   const uint32_t short_payload = 0x342u;
@@ -55026,6 +55045,9 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
               packet_mismatch &&
           Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
               packet_mismatch &&
+          Gen5::AgcWaitRegMemPatchCompareFunction(invalid.data(), 4) ==
+              packet_mismatch &&
+          invalid == std::array<uint32_t, 16>{} &&
           !Gen5::AgcIsInternalDataPacket(
               KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
       "wait patch accepted a packet without the metadata prefix");

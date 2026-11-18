@@ -11533,6 +11533,38 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckUnmappedTexture() {
+    constexpr const char *name = "UnmappedTexture";
+    constexpr uint64_t address = 0x600;
+    constexpr uint64_t size = 0x10000;
+    constexpr std::array<u32, 8> words{0x00000006u, 0xcaf00000u, 0x001fc01fu, 0xd0970324u,
+                                       0x00000000u, 0x00700070u, 0x00000000u, 0x00000000u};
+    EnsureRuntimeContext();
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy(words.begin(), words.end(), value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(
+          context.GetRenderExecutor(), resource, value);
+      Require(name, "unmapped texture",
+              !binding.image_id && !context.GetTextureCache().IsRegionRegistered(address, size),
+              "a texture with no mapped byte was resolved");
+      scheduler.Finish();
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A sampled sRGB texture views as sRGB, or as UNorm when a paired sampler skips degamma; an
   // 8 sRGB texture views as sRGB only where the device filters R8_SRGB.
   void CheckSampledSrgbViews() {
@@ -19331,6 +19363,15 @@ public:
               scheduler.Current(), 1, 1, 1, 0x41u),
           "an aliased scalar load was consumed as a uniform image clear");
       stencil_source = clean_source;
+      auto &stencil_image = stencil_snapshot.images[0];
+      const auto mapped_image = stencil_image;
+      stencil_image.dwords[0] = 0x6u;
+      stencil_image.dwords[1] &= 0xffffff00u;
+      Require(name, "stencil fill unmapped image",
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
+              scheduler.Current(), 1, 1, 1, 0x41u),
+          "a texture with no mapped byte was consumed as a uniform image clear");
+      stencil_image = mapped_image;
       Require(name, "stencil IMAGE_STORE clear",
           RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 1, 1, 1, 0x41u),
@@ -57049,6 +57090,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSampledSrgbViews();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--unmapped-texture-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckUnmappedTexture();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckMsaaStorageClear();
@@ -58076,6 +58122,7 @@ int main(int argc, char **argv) {
     vulkan.CheckSampledDccClear();
     vulkan.CheckDepthBitsCopy();
     vulkan.CheckSampledSrgbViews();
+    vulkan.CheckUnmappedTexture();
     vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();

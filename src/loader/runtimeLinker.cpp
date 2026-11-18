@@ -911,10 +911,12 @@ struct Tcb {
 };
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Taken before main: the host libraries that load later use up the slots at a fixed TEB offset.
+static const DWORD g_tcb_slot = TlsAlloc();
+
 static DWORD TcbSlot() {
-	static const DWORD slot = TlsAlloc();
-	EXIT_IF(slot >= 64); // later slots are not at a fixed TEB offset
-	return slot;
+	EXIT_IF(g_tcb_slot >= 64); // later slots are not at a fixed TEB offset
+	return g_tcb_slot;
 }
 
 static uint32_t TcbGsOffset() {

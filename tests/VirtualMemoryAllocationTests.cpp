@@ -2519,6 +2519,7 @@ void TestAccessDuringMappingReplacement() {
 	const auto direct = reinterpret_cast<uint64_t>(direct_addr);
 
 	std::atomic<bool>     stop {false};
+	std::atomic<bool>     started {false};
 	std::atomic<uint64_t> mismatches {0};
 	std::atomic<uint64_t> accesses {0};
 	std::thread           worker([&] {
@@ -2531,9 +2532,16 @@ void TestAccessDuringMappingReplacement() {
 			if (kept[i % 512] != i || replaced[i % 512] != i) {
 				mismatches.fetch_add(1, std::memory_order_relaxed);
 			}
+			if (i == 0) {
+				started.store(true, std::memory_order_release);
+			}
 		}
 		accesses = i;
 	});
+	// Replace only while the worker is already using both mappings.
+	while (!started.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
 
 	// Each unmap is a partial unmap of the view that holds the worker's page.
 	for (int page = Pages - 1; page >= 1; page--) {
@@ -2555,6 +2563,7 @@ void TestAccessDuringMappingReplacement() {
 	worker.join();
 	RemoveVectoredExceptionHandler(handler);
 
+	Check(test, accesses > 0, "the worker made no accesses during the replacements");
 	Check(test, mismatches == 0, "memory changed while its mapping was replaced");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(flexible, SceKernelPageSize),
 	        "KernelMunmap(flexible cleanup)");

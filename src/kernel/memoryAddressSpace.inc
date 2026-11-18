@@ -37,6 +37,7 @@ struct TransientUnmapWindow {
 	std::atomic<uint64_t> start {0};
 	std::atomic<uint64_t> end {0};
 	std::atomic<int64_t>  closed_ns {0}; // 0 while the range is being remapped
+	std::atomic<bool>     owned {false}; // an open Scope holds this entry
 };
 
 class TransientUnmapWindows {
@@ -46,7 +47,10 @@ public:
 	class Scope {
 	public:
 		Scope(uint64_t start, uint64_t end) noexcept: m_window(Open(start, end)) {}
-		~Scope() { m_window->closed_ns.store(Now(), std::memory_order_release); }
+		~Scope() {
+			m_window->closed_ns.store(Now(), std::memory_order_release);
+			m_window->owned.store(false, std::memory_order_release);
+		}
 		KYTY_CLASS_NO_COPY(Scope);
 
 	private:
@@ -85,8 +89,25 @@ public:
 	}
 
 private:
+	// Claims an entry no open Scope holds, so an open range is never overwritten. Scopes only
+	// span one remap, so when every entry is open one frees up shortly.
+	static Window* Claim() noexcept {
+		for (;;) {
+			for (size_t i = 0; i < s_windows.size(); i++) {
+				auto& window =
+				    s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
+				bool expected = false;
+				if (window.owned.compare_exchange_strong(expected, true,
+				                                         std::memory_order_acquire)) {
+					return &window;
+				}
+			}
+			std::this_thread::yield();
+		}
+	}
+
 	static Window* Open(uint64_t start, uint64_t end) noexcept {
-		auto& window = s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
+		auto& window = *Claim();
 		window.closed_ns.store(0, std::memory_order_relaxed);
 		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
 		                std::memory_order_relaxed);
@@ -101,7 +122,7 @@ private:
 		    .count();
 	}
 
-	inline static std::array<Window, 16> s_windows {};
+	inline static std::array<Window, 64> s_windows {};
 	inline static std::atomic<uint32_t>  s_next {0};
 	inline static std::atomic<uint64_t>  s_opened {0};
 };

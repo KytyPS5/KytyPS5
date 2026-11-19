@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
 #include <QXmlStreamReader>
 
 extern "C" {
@@ -148,9 +149,9 @@ QString ValidateImport(const QJsonDocument& document, const QString& title_id,
 	if (version.isEmpty() || root.value(QStringLiteral("version")).toString() != version) {
 		return Tr("The cheat file does not match this game's version (%1).").arg(version);
 	}
-	if (process.isEmpty() ||
-	    root.value(QStringLiteral("process")).toString().compare(process, Qt::CaseInsensitive) !=
-	        0) {
+	const auto doc_process = root.value(QStringLiteral("process"));
+	if (process.isEmpty() || (!doc_process.isUndefined() &&
+	                          doc_process.toString().compare(process, Qt::CaseInsensitive) != 0)) {
 		return Tr("The cheat file does not match this game's executable (%1).").arg(process);
 	}
 	static const QRegularExpression offset_pattern(
@@ -215,6 +216,32 @@ QJsonDocument WithSelection(const QJsonDocument& document, const QList<bool>& en
 		mods[index] = mod;
 	}
 	root.insert(QStringLiteral("mods"), mods);
+	return QJsonDocument(root);
+}
+
+QJsonDocument Merge(const QJsonDocument& local, const QJsonDocument& imported,
+                    const QString& process) {
+	auto          root = imported.object();
+	QJsonArray    mods;
+	QSet<QString> names;
+	for (const auto& value: root.value(QStringLiteral("mods")).toArray()) {
+		auto mod = value.toObject();
+		names.insert(mod.value(QStringLiteral("name")).toString());
+		mod.insert(QStringLiteral("enabled"), false);
+		mods.append(mod);
+	}
+	qsizetype kept = 0;
+	if (ValidateImport(local, root.value(QStringLiteral("id")).toString(),
+	                   root.value(QStringLiteral("version")).toString(), process)
+	        .isEmpty()) {
+		for (const auto& mod: local.object().value(QStringLiteral("mods")).toArray()) {
+			if (!names.contains(mod.toObject().value(QStringLiteral("name")).toString())) {
+				mods.insert(kept++, mod);
+			}
+		}
+	}
+	root.insert(QStringLiteral("mods"), mods);
+	root.insert(QStringLiteral("process"), process);
 	return QJsonDocument(root);
 }
 

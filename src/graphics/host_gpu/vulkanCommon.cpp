@@ -76,7 +76,9 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k8Srgb, vk::Format::eR8Unorm},
     {Prospero::BufferFormat::k8_8Srgb, vk::Format::eR8G8Unorm},
     {Prospero::BufferFormat::k8_8_8_8Srgb, vk::Format::eR8G8B8A8Srgb},
-    {Prospero::BufferFormat::k9_9_9_5Float, vk::Format::eE5B9G9R9UfloatPack32},
+    // RGB9E5 is not renderable on NVIDIA; B10G11R11 is a renderable 32-bit HDR stand-in.
+    // Guest-uploaded RGB9E5 texel data will decode wrong; add a shader-side pack if colors break.
+    {Prospero::BufferFormat::k9_9_9_5Float, vk::Format::eB10G11R11UfloatPack32},
     {Prospero::BufferFormat::k5_6_5UNorm, vk::Format::eB5G6R5UnormPack16},
     {Prospero::BufferFormat::k5_5_5_1UNorm, vk::Format::eA1R5G5B5UnormPack16},
     {Prospero::BufferFormat::k1_5_5_5UNorm, vk::Format::eR5G5B5A1UnormPack16},

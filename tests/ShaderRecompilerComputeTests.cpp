@@ -7724,6 +7724,52 @@ public:
         }
       }
       {
+        constexpr uint64_t offset = 0x4b10000;
+        constexpr uint32_t requested_layers = 8;
+        std::memset(memory + offset, 0x6b, 0x80000);
+        auto cached = MakeLinearDesc(
+            base + offset, 0, vk::Format::eR8Uint,
+            Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
+            {256, 256, 1}, 1, 1, 1);
+        cached.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        cached.info.resources = {9, 1};
+        cached.view_info.level_count = 9;
+        cached.info.UpdateSize();
+        auto requested = cached;
+        requested.info.data.size = 0;
+        requested.info.resources = {1, requested_layers};
+        requested.view_info.level_count = 1;
+        requested.view_info.layer_count = requested_layers;
+        requested.view_info.type = vk::ImageViewType::e2DArray;
+        requested.info.UpdateSize();
+        Require(name, "array footprints",
+                requested.info.data.size == 0x80000 &&
+                    requested.info.data.size > cached.info.data.size,
+                "unexpected tiled array fixture layout");
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        vk::ClearValue clear{};
+        clear.color.uint32.fill(0x21u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), before,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "array growth with one level",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "insufficient backing was retained");
+        (void)texture_cache.FindTexture(after, requested);
+        Require(name, "array growth contents",
+                ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 0) ==
+                        std::vector<u32>{0x21212121u} &&
+                    ReadCachedTexel(name, context, after, {}, {4, 1, 1},
+                                    requested_layers - 1) ==
+                        std::vector<u32>{0x6b6b6b6bu},
+                "lost GPU contents or failed to initialize the added layers");
+      }
+      {
         constexpr uint64_t offset = 0x4b00000;
         const std::array<uint32_t, 4> values{
             0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
@@ -7733,9 +7779,8 @@ public:
             Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
             {2, 1, 1}, 1, 4, 1);
         cached.info.resources = {2, 1};
-        cached.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
-        cached.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
-        cached.info.linear_slice_stride = 0;
+        cached.info.mip_layout[0] = {0, 8, 2, 1};
+        cached.info.mip_layout[1] = {8, 4, 1, 1};
         cached.view_info.level_count = 2;
         auto requested = MakeLinearDesc(
             base + offset, sizeof(values), vk::Format::eR32Uint,

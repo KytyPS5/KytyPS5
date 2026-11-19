@@ -3155,6 +3155,7 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("n1-v6FgU7MQ", Memory::KernelConfiguredFlexibleMemorySize);
 	LIB_FUNC("vSMAm3cxYTY", Memory::KernelMprotect);
 	LIB_FUNC("9bfdLIyuwCY", Memory::KernelMtypeprotect);
+	LIB_FUNC("RPAHEYSOt1s", Memory::KernelWriteRemapIntoPrtCommand);
 	LIB_FUNC("2SKEx6bSq-4", Memory::KernelBatchMap);
 	LIB_FUNC("kBJzF8x4SyE", Memory::KernelBatchMap2);
 	LIB_FUNC("pU-QydtGcGY", Memory::KernelMemoryPoolReserve);

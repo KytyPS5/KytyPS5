@@ -3785,6 +3785,52 @@ void TestAutomaticMemoryReuseAndAliases() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// An AMM command buffer driven through the library's exports.
+struct AmmCommandBuffer {
+	struct Result {
+		int32_t  result;
+		uint32_t error_offset;
+	};
+	const char*              test;
+	Loader::SymbolDatabase   symbols;
+	std::array<uint64_t, 3>  header {};
+	std::array<uint32_t, 16> data {};
+
+	explicit AmmCommandBuffer(const char* name): test(name) {
+		Libs::LibAmpr::InitAmpr_1(&symbols);
+		Find<int(KYTY_SYSV_ABI*)(void*)>("8aI7R7WaOlc")(header.data());
+		CheckOk(test,
+		        Find<int(KYTY_SYSV_ABI*)(void*, void*, uint32_t)>("N-FSPA4S3nI")(
+		            header.data(), data.data(), sizeof(data)),
+		        "set AMM command buffer");
+	}
+	template <class Function>
+	Function Find(const char* nid) {
+		const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+		Check(test, symbol != nullptr, "AMM export does not resolve");
+		return reinterpret_cast<Function>(symbol->vaddr);
+	}
+	uint32_t Offset() {
+		return static_cast<uint32_t>(
+		    Find<uint64_t(KYTY_SYSV_ABI*)(void*)>("GnxKOHEawhk")(header.data()));
+	}
+	// Runs every appended command and reports each GPU range change.
+	Result Submit() {
+		Result   result {1234, 5678};
+		uint32_t submission = 0;
+		g_gpu_range_events.clear();
+		Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
+		CheckOk(test,
+		        Find<int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*)>(
+		            "OJf3vCckPAM")(data.data(), Offset(), 0, &result, &submission),
+		        "submit AMM commands");
+		CheckOk(test, Find<int(KYTY_SYSV_ABI*)(uint32_t)>("HXymib4T8gc")(submission),
+		        "wait AMM commands");
+		Libs::LibKernel::Memory::TestSetGpuRangeCallback(nullptr);
+		return result;
+	}
+};
+
 void TestAmmMapAsPrt() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test     = "AmmMapAsPrt";
@@ -3792,31 +3838,9 @@ void TestAmmMapAsPrt() {
 	constexpr uint64_t base     = kExtendedMemoryBase + 0x24000000;
 	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
 	int64_t            physical = -1;
-	Loader::SymbolDatabase symbols;
-	Libs::LibAmpr::InitAmpr_1(&symbols);
-	const auto find = [&](const char* nid) {
-		const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
-		Check(test, symbol != nullptr, "AMM export does not resolve");
-		return symbol->vaddr;
-	};
-	struct Result {
-		int32_t  result;
-		uint32_t error_offset;
-	};
-	using Unary     = int(KYTY_SYSV_ABI*)(void*);
-	using SetBuffer = int(KYTY_SYSV_ABI*)(void*, void*, uint32_t);
-	using Offset    = uint64_t(KYTY_SYSV_ABI*)(void*);
-	using MapAsPrt  = int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t);
-	using Submit    = int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*);
-	using Wait      = int(KYTY_SYSV_ABI*)(uint32_t);
-	const auto map_as_prt = reinterpret_cast<MapAsPrt>(find("ZJCgt+aPHAU"));
-	std::array<uint64_t, 3>  header {};
-	std::array<uint32_t, 16> data {};
-	reinterpret_cast<Unary>(find("8aI7R7WaOlc"))(header.data());
-	CheckOk(test,
-	        reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"))(header.data(), data.data(),
-	                                                         sizeof(data)),
-	        "set AMM command buffer");
+	AmmCommandBuffer   commands(test);
+	const auto         map_as_prt =
+	    commands.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t)>("ZJCgt+aPHAU");
 	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
 	        "allocate automatic backing");
 	CheckOk(test, MapAutomaticMemory(base + block, block, SceKernelMtypeC, SceKernelProtCpuRw),
@@ -3824,7 +3848,8 @@ void TestAmmMapAsPrt() {
 	for (const auto [address, size] :
 	     {std::pair<uint64_t, uint64_t> {base + 1, block}, {base, 0}, {0, block}})
 		Check(test,
-		      map_as_prt(header.data(), address, size) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      map_as_prt(commands.header.data(), address, size) ==
+		          Libs::LibKernel::KERNEL_ERROR_EINVAL,
 		      "mapAsPrt accepted an invalid range");
 	void* outside = nullptr;
 	CheckOk(test, KernelReserveVirtualRange(&outside, block, 0, 0), "reserve outside the AMM range");
@@ -3833,19 +3858,9 @@ void TestAmmMapAsPrt() {
 	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
 	      "PRT map accepted a range outside the AMM range");
 	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(outside), block), "release reservation");
-	CheckOk(test, map_as_prt(header.data(), base, block * 4), "append mapAsPrt");
-	const auto bytes = reinterpret_cast<Offset>(find("GnxKOHEawhk"))(header.data());
-	Check(test, bytes == 12, "mapAsPrt record is not three dwords");
-	Result   result {1234, 5678};
-	uint32_t submission = 0;
-	g_gpu_range_events.clear();
-	TestSetGpuRangeCallback(ObserveGpuRange);
-	CheckOk(test,
-	        reinterpret_cast<Submit>(find("OJf3vCckPAM"))(data.data(), static_cast<uint32_t>(bytes),
-	                                                      0, &result, &submission),
-	        "submit mapAsPrt");
-	CheckOk(test, reinterpret_cast<Wait>(find("HXymib4T8gc"))(submission), "wait mapAsPrt");
-	TestSetGpuRangeCallback(nullptr);
+	CheckOk(test, map_as_prt(commands.header.data(), base, block * 4), "append mapAsPrt");
+	Check(test, commands.Offset() == 12, "mapAsPrt record is not three dwords");
+	const auto result = commands.Submit();
 	Check(test, result.result == OK && result.error_offset == 0, "mapAsPrt execution failed");
 	ExpectRange(test, Query(test, base), base, base + block * 4, 0, 0, 0, 0, 0, "anon");
 	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base + block, block}},
@@ -3858,6 +3873,115 @@ void TestAmmMapAsPrt() {
 	            "anon");
 	CheckOk(test, UnmapAmmMemory(base, block * 4), "AMM unmap PRT range");
 	ExpectUnmapped(test, base);
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
+	        "KernelCheckedReleaseDirectMemory(donation)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAmmRemapIntoPrt() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AmmRemapIntoPrt";
+	constexpr uint64_t block    = 0x200000;
+	constexpr uint64_t page     = SceKernelPageSize;
+	constexpr uint64_t prt      = kExtendedMemoryBase + 0x26000000;
+	constexpr uint64_t old      = kExtendedMemoryBase + 0x28000000;
+	constexpr uint64_t target   = prt + block;
+	constexpr int      all      = 0x3f3;
+	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
+	int64_t            physical = -1;
+	AmmCommandBuffer   commands(test);
+	const auto         remap    = commands.Find<int(KYTY_SYSV_ABI*)(
+	    void*, uint64_t, uint64_t, uint64_t, int32_t, int32_t)>("0Xo9g4goDXU");
+	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
+	        "allocate automatic backing");
+	CheckOk(test, MapPrtMemory(prt, block * 4), "MapPrtMemory");
+	CheckOk(test, MapAutomaticMemory(old, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory");
+	*reinterpret_cast<uint64_t*>(old + page * 3) = 0x0123456789abcdefull;
+
+	std::array<uint32_t, 4> record {};
+	uint64_t                record_size = 0;
+	CheckOk(test,
+	        KernelWriteRemapIntoPrtCommand(nullptr, target, old, block, SceKernelProtCpuRead, all,
+	                                       &record_size),
+	        "measure remapIntoPrt");
+	CheckOk(test,
+	        KernelWriteRemapIntoPrtCommand(record.data(), target, old, block, SceKernelProtCpuRead,
+	                                       all, nullptr),
+	        "encode remapIntoPrt");
+	Check(test,
+	      record_size == 16 &&
+	          record == std::array<uint32_t, 4> {0x8327u | SceKernelProtCpuRead << 12,
+	                                             static_cast<uint32_t>(target >> 14),
+	                                             static_cast<uint32_t>(old >> 14),
+	                                             static_cast<uint32_t>(block >> 14 << 5)},
+	      "unexpected remapIntoPrt record");
+	for (const auto [address, source, size, prot, mask] :
+	     {std::tuple<uint64_t, uint64_t, uint64_t, int, int> {target + 1, old, block, 1, all},
+	      {target, old + 1, block, 1, all},
+	      {target, old, 0, 1, all},
+	      {target, old, block, 8, all},
+	      {target, old, block, 1, 0x3f1}})
+		Check(test,
+		      KernelWriteRemapIntoPrtCommand(record.data(), address, source, size, prot, mask,
+		                                     nullptr) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "remapIntoPrt encoder accepted invalid arguments");
+
+	void* outside = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&outside, block, SceKernelProtCpuRw, 0, physical, block),
+	        "KernelMapDirectMemory(outside the AMM range)");
+	const auto alias = reinterpret_cast<uint64_t>(outside);
+	Check(test,
+	      RemapIntoPrtMemory(alias, old, block, SceKernelProtCpuRead) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          RemapIntoPrtMemory(target, alias, block, SceKernelProtCpuRead) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "remap accepted a range outside the AMM range");
+	CheckOk(test, KernelMunmap(alias, block), "KernelMunmap(alias)");
+	Check(test,
+	      RemapIntoPrtMemory(old, old, block, SceKernelProtCpuRead) ==
+	          Libs::LibKernel::KERNEL_ERROR_EACCES,
+	      "remap accepted a target that is not PRT");
+	Check(test,
+	      RemapIntoPrtMemory(target, prt, block, SceKernelProtCpuRead) ==
+	          AMM_ERROR_REGION_NOT_FULLY_MAPPED,
+	      "remap accepted an unmapped source");
+
+	Check(test,
+	      remap(commands.header.data(), target, old, block, SceKernelProtCpuRead, 0x3f1) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          remap(commands.header.data(), target, old, block, SceKernelProtCpuExec, all) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "remapIntoPrt accepted invalid arguments");
+	CheckOk(test, remap(commands.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append remapIntoPrt");
+	Check(test,
+	      commands.Offset() == 16 && std::equal(record.begin(), record.end(), commands.data.begin()),
+	      "remapIntoPrt did not append its four dword record");
+	CheckOk(test, remap(commands.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append repeated remapIntoPrt");
+	const auto result = commands.Submit();
+	Check(test,
+	      result.result == Libs::LibKernel::KERNEL_ERROR_EACCES && result.error_offset == 16,
+	      "remapIntoPrt moved a range onto mapped addresses");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {
+	              {false, target, block}, {true, target, block}, {false, old, block}},
+	      "remapIntoPrt did not replace the new range and unmap the old one on the GPU");
+	ExpectUnmapped(test, old);
+	ExpectRange(test, Query(test, target), target, target + block, SceKernelProtCpuRead, 0, 1, 0, 1,
+	            nullptr, physical);
+	Check(test, Query(test, target).memory_type == SceKernelMtypeC,
+	      "remapIntoPrt changed the memory type");
+	Check(test, *reinterpret_cast<uint64_t*>(target + page * 3) == 0x0123456789abcdefull,
+	      "remapIntoPrt lost the range contents");
+	ExpectRange(test, Query(test, prt), prt, target, 0, 0, 0, 0, 0, "anon");
+	Check(test,
+	      MapAutomaticMemory(old, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
+	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
+	      "remapIntoPrt released the moved pages to the automatic allocator");
+	CheckOk(test, UnmapAmmMemory(prt, block * 4), "AMM unmap PRT range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
 	        "KernelCheckedReleaseDirectMemory(donation)");
 	std::printf("[host]    %-48s ok\n", test);
@@ -5983,6 +6107,7 @@ int main(int argc, char** argv) {
 		RunTest(TestDirectMappingNamesTypesAndValidation);
 		RunTest(TestAutomaticMemoryReuseAndAliases);
 		RunTest(TestAmmMapAsPrt);
+		RunTest(TestAmmRemapIntoPrt);
 		RunTest(TestAutomaticMemoryFragmentedMap);
 		RunTest(TestFragmentedMemoryPoolBacking);
 		RunTest(TestMemoryPoolMiddleDecommitAndReuse);
@@ -6147,6 +6272,7 @@ int main(int argc, char** argv) {
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAmmMapAsPrt);
+	RunTest(TestAmmRemapIntoPrt);
 	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);

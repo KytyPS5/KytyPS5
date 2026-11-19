@@ -550,6 +550,7 @@ constexpr uint64_t APR_MAP_END_RECORD_SIZE       = 0x04;
 constexpr uint64_t AMM_MAP_RECORD_SIZE           = 0x20;
 constexpr uint64_t AMM_MAP_DIRECT_RECORD_SIZE    = 0x30;
 constexpr uint64_t AMM_UNMAP_RECORD_SIZE         = 0x20;
+constexpr uint64_t AMM_MAP_AS_PRT_RECORD_SIZE    = 0x0c;
 constexpr uint64_t AMM_PAGE_SIZE                 = 0x4000;
 constexpr int      AMM_MAP_FIXED                 = 0x10;
 constexpr int      AMM_USAGE_DIRECT              = 0;
@@ -573,6 +574,7 @@ constexpr uint32_t APR_TYPE_MAP_ACTIVE           = 0x00020000;
 enum class AmmCommandKind : uint32_t {
 	MapAuto,
 	MapDirect,
+	MapAsPrt,
 	Unmap,
 };
 
@@ -1085,6 +1087,9 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 	if (command.kind == AmmCommandKind::MapAuto) {
 		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
 		                                             NormalizeAmmProtection(command.prot));
+	}
+	if (command.kind == AmmCommandKind::MapAsPrt) {
+		return LibKernel::Memory::MapPrtMemory(command.va, command.size);
 	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
@@ -2261,6 +2266,25 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapDirectWithGpuMaskId(void* command_bu
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
+static int KYTY_SYSV_ABI AmmCommandBufferMapAsPrt(void* command_buffer, uint64_t va,
+                                                  uint64_t size) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAsPrt;
+	command.va   = va;
+	command.size = size;
+
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                           AMM_MAP_AS_PRT_RECORD_SIZE)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
 static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va, uint64_t size) {
 	PRINT_NAME();
 
@@ -2461,6 +2485,7 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("ojBkmG7+CgE", Ampr::AmmCommandBufferMapWithGpuMaskId);
 	LIB_FUNC("8TBE+9XCZbI", Ampr::AmmCommandBufferMapDirect);
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
+	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);
 	LIB_FUNC("lwS-7y3jcBI", Ampr::AmmSubmitCommandBuffer);
 	LIB_FUNC("NnKhlMJtIsI", Ampr::AmmSubmitCommandBufferAndGetId);

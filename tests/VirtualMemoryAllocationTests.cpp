@@ -10,6 +10,7 @@
 #include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/runtimeLinker.h"
+#include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -86,6 +87,10 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
+}
+
+namespace Libs::LibAmpr {
+void InitAmpr_1(Loader::SymbolDatabase* symbols);
 }
 
 namespace {
@@ -3780,6 +3785,84 @@ void TestAutomaticMemoryReuseAndAliases() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestAmmMapAsPrt() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "AmmMapAsPrt";
+	constexpr uint64_t block    = 0x200000;
+	constexpr uint64_t base     = kExtendedMemoryBase + 0x24000000;
+	const auto         end      = static_cast<int64_t>(KernelGetDirectMemorySize());
+	int64_t            physical = -1;
+	Loader::SymbolDatabase symbols;
+	Libs::LibAmpr::InitAmpr_1(&symbols);
+	const auto find = [&](const char* nid) {
+		const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+		Check(test, symbol != nullptr, "AMM export does not resolve");
+		return symbol->vaddr;
+	};
+	struct Result {
+		int32_t  result;
+		uint32_t error_offset;
+	};
+	using Unary     = int(KYTY_SYSV_ABI*)(void*);
+	using SetBuffer = int(KYTY_SYSV_ABI*)(void*, void*, uint32_t);
+	using Offset    = uint64_t(KYTY_SYSV_ABI*)(void*);
+	using MapAsPrt  = int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t);
+	using Submit    = int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*);
+	using Wait      = int(KYTY_SYSV_ABI*)(uint32_t);
+	const auto map_as_prt = reinterpret_cast<MapAsPrt>(find("ZJCgt+aPHAU"));
+	std::array<uint64_t, 3>  header {};
+	std::array<uint32_t, 16> data {};
+	reinterpret_cast<Unary>(find("8aI7R7WaOlc"))(header.data());
+	CheckOk(test,
+	        reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"))(header.data(), data.data(),
+	                                                         sizeof(data)),
+	        "set AMM command buffer");
+	CheckOk(test, AllocateDirectMemory(0, end, block, block, 0, &physical, true),
+	        "allocate automatic backing");
+	CheckOk(test, MapAutomaticMemory(base + block, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "MapAutomaticMemory");
+	for (const auto [address, size] :
+	     {std::pair<uint64_t, uint64_t> {base + 1, block}, {base, 0}, {0, block}})
+		Check(test,
+		      map_as_prt(header.data(), address, size) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
+		      "mapAsPrt accepted an invalid range");
+	void* outside = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&outside, block, 0, 0), "reserve outside the AMM range");
+	Check(test,
+	      MapPrtMemory(reinterpret_cast<uint64_t>(outside), block) ==
+	          Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "PRT map accepted a range outside the AMM range");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(outside), block), "release reservation");
+	CheckOk(test, map_as_prt(header.data(), base, block * 4), "append mapAsPrt");
+	const auto bytes = reinterpret_cast<Offset>(find("GnxKOHEawhk"))(header.data());
+	Check(test, bytes == 12, "mapAsPrt record is not three dwords");
+	Result   result {1234, 5678};
+	uint32_t submission = 0;
+	g_gpu_range_events.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	CheckOk(test,
+	        reinterpret_cast<Submit>(find("OJf3vCckPAM"))(data.data(), static_cast<uint32_t>(bytes),
+	                                                      0, &result, &submission),
+	        "submit mapAsPrt");
+	CheckOk(test, reinterpret_cast<Wait>(find("HXymib4T8gc"))(submission), "wait mapAsPrt");
+	TestSetGpuRangeCallback(nullptr);
+	Check(test, result.result == OK && result.error_offset == 0, "mapAsPrt execution failed");
+	ExpectRange(test, Query(test, base), base, base + block * 4, 0, 0, 0, 0, 0, "anon");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, base + block, block}},
+	      "mapAsPrt did not unmap the replaced mapping from the GPU");
+	CheckOk(test, MapAutomaticMemory(base, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "mapAsPrt did not return the replaced pages to the automatic allocator");
+	Check(test, Query(test, base).offset == static_cast<uint64_t>(physical),
+	      "automatic allocation did not reuse the replaced pages");
+	ExpectRange(test, Query(test, base + block), base + block, base + block * 4, 0, 0, 0, 0, 0,
+	            "anon");
+	CheckOk(test, UnmapAmmMemory(base, block * 4), "AMM unmap PRT range");
+	ExpectUnmapped(test, base);
+	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
+	        "KernelCheckedReleaseDirectMemory(donation)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestAutomaticMemoryFragmentedMap() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test   = "AutomaticMemoryFragmentedMap";
@@ -5899,6 +5982,7 @@ int main(int argc, char** argv) {
 		RunTest(TestDirectTrimmedAliasRelease);
 		RunTest(TestDirectMappingNamesTypesAndValidation);
 		RunTest(TestAutomaticMemoryReuseAndAliases);
+		RunTest(TestAmmMapAsPrt);
 		RunTest(TestAutomaticMemoryFragmentedMap);
 		RunTest(TestFragmentedMemoryPoolBacking);
 		RunTest(TestMemoryPoolMiddleDecommitAndReuse);
@@ -6062,6 +6146,7 @@ int main(int argc, char** argv) {
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
+	RunTest(TestAmmMapAsPrt);
 	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);

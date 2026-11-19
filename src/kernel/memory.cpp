@@ -1878,6 +1878,13 @@ static bool IsAmmMemoryRange(uint64_t vaddr, size_t size) {
 	       size <= kExtendedMemoryBase + kExtendedMemorySize - vaddr;
 }
 
+// A PRT range holds its addresses without physical memory; CPU access faults.
+int MapPrtMemory(uint64_t vaddr, size_t size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+	return ReplaceFixedRangeWithReserved(vaddr, size);
+}
+
 int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;

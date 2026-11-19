@@ -650,6 +650,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
+	if (RetireThroughGuestMemory(replacement_id, cached_id)) {
+		return replacement_id;
+	}
+	if (!cached.info.resources.Contains(info.resources)) {
+		InitializeImage(replacement_id);
+	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
 		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
@@ -860,11 +866,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
-	if (info.type == source.info.type && !info.resources.Contains(source.info.resources) &&
-	    info.samples == 1 && info.metadata.compression == VideoOutCompression::Uncompressed &&
-	    source.SafeToDownload() && BcAlias::Publish(*this, source)) {
-		InitializeImage(expanded_id);
-		FreeImage(source_id);
+	if (RetireThroughGuestMemory(expanded_id, source_id)) {
 		return expanded_id;
 	}
 	InitializeImage(expanded_id);
@@ -878,6 +880,20 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	}
 	FreeImage(source_id);
 	return expanded_id;
+}
+
+bool TextureCache::RetireThroughGuestMemory(ImageId replacement_id, ImageId retired_id) {
+	const auto& replacement = m_slot_images[replacement_id].info;
+	auto&       retired     = m_slot_images[retired_id];
+	if (replacement.type != retired.info.type ||
+	    replacement.resources.Contains(retired.info.resources) || replacement.samples != 1 ||
+	    replacement.metadata.compression != VideoOutCompression::Uncompressed ||
+	    !retired.SafeToDownload() || !BcAlias::Publish(*this, retired)) {
+		return false;
+	}
+	InitializeImage(replacement_id);
+	FreeImage(retired_id);
+	return true;
 }
 
 bool TextureCache::CanDownload(const Image& image) const {

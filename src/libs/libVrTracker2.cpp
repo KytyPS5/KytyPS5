@@ -31,6 +31,7 @@ constexpr int32_t  DEVICE_TYPE_VR_CONTROLLER_LEFT = 2;
 constexpr uint32_t STATUS_TRACKING                = 1;
 constexpr uint32_t QUALITY_FULL                   = 9;
 constexpr uint8_t  MOTION_SENSOR_DATA_VALID       = 3; // Velocity and acceleration.
+constexpr uint32_t COORDINATE_SYSTEM_COUNT        = 3; // Local floor, local and stage.
 
 struct SceFQuaternion {
 	float x;
@@ -224,6 +225,16 @@ static int32_t KYTY_SYSV_ABI GetResult(const SceVrTracker2GetResultParam* param,
 	return OK;
 }
 
+// Every coordinate system shares the tracking origin, so the choice leaves each pose unchanged.
+static int32_t KYTY_SYSV_ABI SetCoordinateSystem(int32_t type) {
+	PRINT_NAME();
+	LOGF("\t type = %d\n", type);
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INIT;
+	}
+	return static_cast<uint32_t>(type) < COORDINATE_SYSTEM_COUNT ? OK : ERROR_ARGUMENT_INVALID;
+}
+
 // There is no room-scale play area, and a stationary one has no boundary geometry.
 static int32_t KYTY_SYSV_ABI
 GetPlayAreaBoundaryGeometry(SceVrTracker2PlayAreaBoundaryGeometryData* geometry) {
@@ -245,6 +256,7 @@ LIB_DEFINE(InitVrTracker2_1) {
 	LIB_FUNC("6Jy73SRfG-o", VrTracker2::Initialize);
 	LIB_FUNC("Dog+g25QYjw", VrTracker2::RegisterDevice);
 	LIB_FUNC("J4Vh3VVX0iU", VrTracker2::GetResult);
+	LIB_FUNC("UVCMLmS-Eas", VrTracker2::SetCoordinateSystem);
 	LIB_FUNC("SCph4ZbkqzU", VrTracker2::GetPlayAreaBoundaryGeometry);
 }
 

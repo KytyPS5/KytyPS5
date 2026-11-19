@@ -40,21 +40,30 @@ struct BoundaryGeometry {
 };
 static_assert(sizeof(BoundaryGeometry) == 0xc08);
 
-TEST(VrTracker2, PlayAreaBoundaryGeometryIsUnavailableWithoutARoomScalePlayArea) {
+TEST(VrTracker2, ThreeCoordinateSystemsExistButNoBoundaryGeometryWithoutARoomScalePlayArea) {
 	Loader::SymbolDatabase symbols;
 	Libs::InitVrTracker2_1(&symbols);
 	const auto find = [&](const char* nid) {
 		return symbols.FindByNid(nid, Loader::SymbolType::Func)->vaddr;
 	};
 	const auto initialize = reinterpret_cast<int(KYTY_SYSV_ABI*)(const void*)>(find("6Jy73SRfG-o"));
+	const auto set_coordinate_system =
+	    reinterpret_cast<int(KYTY_SYSV_ABI*)(int)>(find("UVCMLmS-Eas"));
 	const auto get_geometry =
 	    reinterpret_cast<int(KYTY_SYSV_ABI*)(BoundaryGeometry*)>(find("SCph4ZbkqzU"));
 
 	BoundaryGeometry geometry {sizeof(geometry)};
 	EXPECT_EQ(get_geometry(&geometry), ERROR_NOT_INIT);
+	EXPECT_EQ(set_coordinate_system(3), ERROR_NOT_INIT);
 	std::array<uint64_t, 9> param {}; // The memory pointer is at 0x20.
 	param[4] = reinterpret_cast<uint64_t>(&param);
 	ASSERT_EQ(initialize(param.data()), 0);
+	// Local floor, local and stage; the reserved systems start at 1000.
+	EXPECT_EQ(set_coordinate_system(-1), ERROR_ARGUMENT_INVALID);
+	EXPECT_EQ(set_coordinate_system(3), ERROR_ARGUMENT_INVALID);
+	EXPECT_EQ(set_coordinate_system(1000), ERROR_ARGUMENT_INVALID);
+	EXPECT_EQ(set_coordinate_system(0), 0);
+	EXPECT_EQ(set_coordinate_system(2), 0);
 	EXPECT_EQ(get_geometry(nullptr), ERROR_ARGUMENT_INVALID);
 	geometry.size = 0;
 	EXPECT_EQ(get_geometry(&geometry), ERROR_ARGUMENT_INVALID);

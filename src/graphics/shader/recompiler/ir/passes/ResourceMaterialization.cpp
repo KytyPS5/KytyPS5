@@ -266,7 +266,7 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	const auto* table = Source(program, indirect.table_source);
 	return indirect.sources.empty() && (!indirect.selector || indirect.table_scalar) &&
 	       (indirect.key_count.IsEmpty() || indirect.table_maximum) && indirect.workgroup_axis == UINT32_MAX &&
-	       table != nullptr && table->dword_count == 4u;
+	       table != nullptr && (table->dword_count == 4u || indirect.table_scalar);
 }
 
 bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offset) {
@@ -615,6 +615,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		if (table_value.dword_count == 2u) {
 			table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
+			// A bounded address table's heap spans the slots of keys 0 through its maximum.
+			if (byte_keys) {
+				table_base += uint64_t {indirect.table_offset} + (indirect.table_immediate & ~3u);
+				table_size = (uint64_t {*indirect.table_maximum} + 1u) * indirect.table_stride;
+			}
 		} else if (DecodeBufferDescriptor(table_value, table)) {
 			table_base = table.Base48();
 			table_size = table.GetSize();
@@ -678,9 +683,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    : indirect.table_maximum ? indirect.table_stride
 			    : affine ? std::max(uint64_t {1} << std::countr_zero(indirect.table_stride), uint64_t {4})
 			             : 4u;
-			const uint64_t first = ((indirect.table_maximum ? indirect.table_offset
-			    : indirect.table_offset % step) & ~uint64_t {3}) +
-			                       (indirect.table_immediate & ~3u);
+			uint64_t first = 0u;
+			if (table_value.dword_count != 2u)
+				first = ((indirect.table_maximum ? indirect.table_offset : indirect.table_offset % step) &
+				         ~uint64_t {3}) + (indirect.table_immediate & ~3u);
 			if (!indirect.table_maximum) domain /= step;
 			const auto count = table_size >= first + 4u
 			    ? std::min((table_size - first - 4u) / step + 1u, domain)
@@ -1728,7 +1734,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
+				        // A sample of a T# whose channels all select 0 reads 0 at any address.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				            (image.sample_access_only && !image.depth_compare &&
+				             DescriptorImageSwizzle(value) == 0u) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;

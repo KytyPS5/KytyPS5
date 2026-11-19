@@ -3,6 +3,7 @@
 #include "additionalContentDialog.h"
 #include "cheatFile.h"
 #include "common/archive.h"
+#include "common/trophies.h"
 #include "compatibilityDatabase.h"
 #include "configuration.h"
 #include "configurationEditDialog.h"
@@ -31,6 +32,7 @@
 #include <QHeaderView>
 #include <QIcon>
 #include <QInputDialog>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -65,6 +67,7 @@
 #include <QDBusPendingCallWatcher>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <vector>
@@ -484,7 +487,8 @@ struct GameMetadata {
 	QString title_id;
 	QString gameVersion;
 	QString firmwareVer;
-	bool    pro_supported = false;
+	bool    pro_supported   = false;
+	bool    activity_intent = false;
 };
 
 static QString GetJsonString(const QJsonObject& obj, const QString& key) {
@@ -581,6 +585,11 @@ static GameMetadata GetGameMetadata(const QByteArray& param_data, const QString&
 	ret.firmwareVer   = GetFirmwareVersion(root);
 	ret.pro_supported = (root.value(QStringLiteral("attribute3")).toInteger() & (1 << 22)) != 0;
 
+	const auto intents  = root.value("gameIntent").toObject().value("permittedIntents").toArray();
+	ret.activity_intent = std::any_of(intents.begin(), intents.end(), [](const QJsonValue& intent) {
+		return intent.toObject().value("intentType").toString() == "launchActivity";
+	});
+
 	return ret;
 }
 
@@ -599,6 +608,7 @@ static void SetGameFiles(Configuration& info, const QString& game_dir, const QSt
 	if (info.name.isEmpty()) {
 		info.name = archive ? game.completeBaseName() : QDir(game_dir).dirName();
 	}
+	info.activity_intent = metadata.activity_intent;
 }
 
 static Configuration* FindCustomInfo(QMap<QString, Configuration*>* custom_infos,
@@ -1272,6 +1282,28 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
 	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	if (item != nullptr && item->GetInfo().activity_intent) {
+		auto* action_activity = menu.addAction(
+		    tr("Launch activity..."), this, [this, base = item->GetInfo().basedir]() {
+			    QStringList activities;
+			    for (const auto& id: Common::Trophies::LoadActivityIds(GameContent::Resolve(
+			             base, GameContent::FromPath(Common::Trophies::UdsPackagePath(0))))) {
+				    activities.append(QString::fromStdString(id));
+			    }
+			    if (activities.isEmpty()) {
+				    QMessageBox::information(this, tr("Launch activity"),
+					                         tr("The game lists no activities."));
+				    return;
+			    }
+			    bool       ok       = false;
+			    const auto activity = QInputDialog::getItem(
+			        this, tr("Launch activity"), tr("Activity:"), activities, 0, false, &ok);
+			    if (ok) {
+				    emit Run(activity);
+			    }
+		    });
+		action_activity->setDisabled(item->IsRunning() || !m_run_enabled);
+	}
 	QAction* action_open_folder =
 	    menu.addAction(style()->standardIcon(QStyle::SP_DirOpenIcon), tr("Open game folder"), this,
 	                   SLOT(open_game_folder()));

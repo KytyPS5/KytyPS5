@@ -155,6 +155,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("u2T2DiA5hRI", Gen5::AgcDcbStallCommandBufferParser);
 	LIB_FUNC("3KDcnM3lrcU", Gen5::AgcWaitRegMemPatchAddress);
 	LIB_FUNC("7nOoijNPvEU", Gen5::AgcWaitRegMemPatchReference);
+	LIB_FUNC("n485EBnIWmk", Gen5::AgcWaitRegMemPatchCompareFunction);
 	LIB_FUNC("0fWWK5uG9rQ", Gen5::AgcQueueEndOfPipeActionPatchAddress);
 	LIB_FUNC("MlEw1feXcjg", Gen5::AgcQueueEndOfPipeActionPatchData);
 	LIB_FUNC("ORWsxIbk4TE", Gen5::AgcCondExecPatchSetEnd);
@@ -164,6 +165,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("ziVA3whp3p4", Gen5::AgcRewindPatchSetRewindState);
 	LIB_FUNC("eWaWyFegzgQ", Gen5::AgcRewindPatchSetRewindState);      // sceAgcAsyncRewindPatchSetRewindState
 	LIB_FUNC("YUeqkyT7mEQ", Gen5::AgcDcbSetFlip);
+	LIB_FUNC("ebixW91gpPw", Gen5::AgcAcbSetFlip);
 }
 
 } // namespace LibGen5

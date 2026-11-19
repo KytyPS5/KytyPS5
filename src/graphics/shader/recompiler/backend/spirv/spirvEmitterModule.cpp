@@ -737,8 +737,12 @@ void DefineModule(EmitterState& state) {
 		state.mesh_guest_func = state.builder.AllocateId();
 		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
 		state.builder.RequireExtension("SPV_EXT_mesh_shader");
-		state.builder.AddExecutionMode(state.main_func,
-		                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
+		constexpr spv::ExecutionMode output_modes[] = {spv::ExecutionModeOutputPoints,
+		                                               spv::ExecutionModeOutputLinesEXT,
+		                                               spv::ExecutionModeOutputTrianglesEXT};
+		state.builder.AddExecutionMode(
+		    state.main_func,
+		    output_modes[state.input_info.vertex->mesh.output_primitive_size - 1u]);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,

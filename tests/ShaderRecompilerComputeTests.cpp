@@ -45,6 +45,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -64,6 +65,7 @@
 #include "libs/agc.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
@@ -126,6 +128,7 @@
 
 namespace Libs {
 void InitAgcDriver_1(Loader::SymbolDatabase *symbols);
+void InitHmd2_1(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::Graphics {
@@ -314,7 +317,12 @@ struct ImageHeapTestAccess {
     return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
   }
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
-    return Element(heap, entry).binding.image_id;
+    return Element(heap, entry).image;
+  }
+  static size_t IndexCount(const ImageHeap &heap) { return heap.m_index.size(); }
+  static size_t HeldCount(const ImageHeap &heap) { return heap.m_held.size(); }
+  static const auto &Slots(const ImageHeap &heap, size_t memory) {
+    return heap.m_memories.at(memory)->views.at(0)->slots;
   }
   // Whether the newest table no longer watches its last page.
   static bool TailPageDirty(const ImageHeap &heap) {
@@ -758,6 +766,14 @@ using BindingType = TextureCache::BindingType;
 using ImageDesc = TextureCache::ImageDesc;
 using ShaderOpcode = ShaderRecompiler::Decoder::Opcode;
 
+// Compares the level counts and the records of those levels.
+bool SameMipLayout(const ImageInfo &left, const ImageInfo &right) {
+  return left.resources.levels == right.resources.levels &&
+         std::equal(left.mip_layout.begin(),
+                    left.mip_layout.begin() + left.resources.levels,
+                    right.mip_layout.begin());
+}
+
 ImageInfo MakeTilingImage(Prospero::BufferFormat format, uint32_t width,
                           uint32_t height, uint32_t levels, uint32_t depth,
                           Prospero::TileMode tile, uint64_t guest_size,
@@ -1143,6 +1159,13 @@ std::string Hex(u32 value) {
 
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
+
+// A host that renders 4_4_4_4 targets natively.
+const GraphicContext &NativeRenderTargetHost() {
+  static GraphicContext graphics;
+  graphics.r4g4b4a4_render_targets = true;
+  return graphics;
+}
 
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
@@ -2467,8 +2490,8 @@ public:
       return true;
     };
 
-    // Black, 100-nit and 250-nit gray, then a color; every source alpha is zero. Flags: PQ
-    // source (4), linear source (8), opaque main bus (16).
+    // Black, 100-nit and 250-nit gray, then a color; every source alpha is zero. Flags:
+    // premultiplied (1), HDR target (2), PQ source (4), linear source (8), opaque main bus (16).
     const auto pq = [](u32 r, u32 g, u32 b) { return r | (g << 10u) | (b << 20u); };
     auto pq_source = CreateImage2D(
         name, 4, 1, vk::Format::eA2B10G10R10UnormPack32, vk::ImageUsageFlagBits::eSampled,
@@ -2487,7 +2510,36 @@ public:
             pixelsMatch(render(nit_source, 4u | 8u | 16u),
                         {0xff000000u, 0xffaaaaaau, 0xfff0f0f0u, 0xff669ce4u}),
             "linear-nit pixels were not converted to opaque sRGB");
+    Require(name, "linear-nit HDR target",
+            pixelsMatch(render(nit_source, 2u | 4u | 8u | 16u),
+                        {0xff000000u, 0xff828282u, 0xff9a9a9au, 0xff6b7f8cu}),
+            "linear-nit pixels were not converted to opaque HDR10 PQ");
 
+    // Linear SDR with alpha 0x80.
+    auto sdr_source = CreateImage2D(
+        name, 4, 1, vk::Format::eR8G8B8A8Unorm, vk::ImageUsageFlagBits::eSampled,
+        {0x80000000u, 0x80808080u, 0x80ffffffu, 0x804080c0u}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "SDR linear source",
+            pixelsMatch(render(sdr_source, 8u | 16u),
+                        {0xff000000u, 0xffbcbcbcu, 0xffffffffu, 0xff89bce1u}),
+            "SDR linear pixels were not converted to opaque sRGB");
+    Require(name, "premultiplied SDR linear source",
+            pixelsMatch(render(sdr_source, 1u | 8u),
+                        {0x80000000u, 0x80808080u, 0x80808080u, 0x805e8080u}),
+            "premultiplied linear pixels were not converted to premultiplied sRGB");
+    // PQ with alpha 1/3 and color up to three times the alpha.
+    auto bright_pq_source = CreateImage2D(
+        name, 4, 1, vk::Format::eA2B10G10R10UnormPack32, vk::ImageUsageFlagBits::eSampled,
+        {1u << 30u, pq(341, 341, 341) | 1u << 30u, pq(716, 716, 716) | 1u << 30u,
+         pq(1023, 1023, 1023) | 1u << 30u}, 1, vk::ImageLayout::eShaderReadOnlyOptimal);
+    Require(name, "premultiplied PQ above alpha",
+            pixelsMatch(render(bright_pq_source, 1u | 4u),
+                        {0x55000000u, 0x55555555u, 0x55555555u, 0x55555555u}),
+            "premultiplied PQ pixels above alpha did not saturate to SDR white");
+
+    DestroyImage(&bright_pq_source);
+    DestroyImage(&sdr_source);
     DestroyImage(&nit_source);
     DestroyImage(&pq_source);
     DestroyImage(&target);
@@ -6005,11 +6057,8 @@ public:
               filtered.slots[0] != 0u && filtered.slots[8] == filtered.slots[0] &&
                   filtered.slots[40] != 0u && filtered.slots[40] != filtered.slots[0] &&
                   filtered.slots[1] == 0u && filtered.slots.back() == 0u &&
-                  ImageHeapTestAccess::ElementCount(heap) == 3u &&
-                  ImageHeapTestAccess::Element(heap, 0u).binding.layout ==
-                      vk::ImageLayout::eShaderReadOnlyOptimal,
-              "probes did not share equal descriptors, left a non-null gap or wrote the null "
-              "element without a sampled layout");
+                  ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "probes did not share equal descriptors or left a non-null gap");
       Require(name, "second view",
               acquire(unfiltered) && views.size() == 2u &&
                   ImageHeapTestAccess::ElementCount(heap) == 5u,
@@ -6020,6 +6069,17 @@ public:
       Require(name, "resident images",
               resident && textures.GetImage(resident).heap_refs.load() == 2u,
               "resolved elements did not pin their image");
+      // A CPU write to a resident image reaches the next draw without rediscovering it.
+      const uint32_t texel = 0xff00ff00u;
+      Libs::LibKernel::Memory::WriteBacking(base + 0x10000u, &texel, sizeof(texel));
+      Require(name, "image write",
+              context.InvalidateMemory(base + 0x10000u, sizeof(texel)) &&
+                  textures.GetImage(resident).IsCpuDirty(),
+              "a CPU write did not dirty the resident image");
+      Require(name, "written image", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "refreshed image", !textures.GetImage(resident).IsCpuDirty(),
+              "a draw sampled a resident image without its CPU write");
 
       // Only acquired views take table changes; the idle one must not allocate.
       const auto idle_slot = idle.slots[40];
@@ -6058,21 +6118,37 @@ public:
               "a view probed descriptors past the guest table bound");
       draw();
 
-      // Only leaving the read state invalidates resident images.
+      // Only leaving the read state queues a change of a resident image.
       auto &image = textures.GetImage(resident);
-      const auto epoch = Libs::Graphics::Image::heap_epoch.load();
+      const auto queued = [&] {
+        std::scoped_lock lock{Libs::Graphics::Image::heap_mutex};
+        return std::ranges::count(Libs::Graphics::Image::heap_changes, image.serial,
+                                  &Libs::Graphics::Image::HeapChange::serial);
+      };
+      const auto before = queued();
       for (uint32_t pass = 0; pass < 2u; ++pass) {
         image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
                       scheduler.Current().Handle());
       }
-      Require(name, "write epoch", Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
-              "repeated writes after leaving the read state bumped the heap epoch again");
+      Require(name, "write change", queued() == before + 1,
+              "repeated writes after leaving the read state queued the image again");
       Require(name, "read again", acquire(sampled), "the view was declined");
       draw();
       Require(name, "read layout",
               image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
-                  Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
+                  queued() == 0,
               "commit did not return a resident image to its read layout");
+      // One that leaves it after discovery, as for a download, returns at commit too.
+      Require(name, "late transit", acquire(sampled), "the view was declined");
+      heap.Rebind(executor);
+      image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
+                    scheduler.Current().Handle());
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "late read layout",
+              image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit missed a resident image that left the read layout after discovery");
+      scheduler.Finish();
+      heap.BeginDraw();
 
       // An image freed during a draw's discovery lives until the tick ends, and the draw's
       // slots still select it.
@@ -6087,6 +6163,26 @@ public:
                   textures.GetImage(freed).backing.state.layout ==
                       vk::ImageLayout::eShaderReadOnlyOptimal,
               "commit skipped the read transition of a freed but sampled image");
+      scheduler.Finish();
+      heap.BeginDraw();
+      // So does an earlier one that leaves the read layout and is freed after discovery.
+      write(10, descriptor(14, Format::k8_8_8_8UNorm));
+      Require(name, "earlier image", acquire(sampled), "the view was declined");
+      draw();
+      const auto earlier = ImageHeapTestAccess::ImageOf(heap, filtered.slots[80]);
+      Require(name, "freed after discovery", earlier && acquire(sampled),
+              "the view was declined or its image was not resolved");
+      heap.Rebind(executor);
+      textures.GetImage(earlier).Transit(vk::ImageLayout::eGeneral,
+                                         vk::AccessFlagBits2::eShaderWrite, {},
+                                         scheduler.Current().Handle());
+      textures.UnmapMemory(base + 0x10000u + 14u * 0x1000u, 0x1000u);
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "freed earlier image layout",
+              !textures.GetImage(earlier).registered &&
+                  textures.GetImage(earlier).backing.state.layout ==
+                      vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit skipped the read transition of an image freed after it left the read layout");
       scheduler.Finish();
       heap.BeginDraw();
 
@@ -6106,7 +6202,7 @@ public:
       draw();
       Require(name, "stale rescan",
               filtered.kinds.size() == 2u &&
-                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).value.dwords ==
+                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).key.value.dwords ==
                       descriptor(3, Format::k8_8_8_8UNorm),
               "a stale element's rescan took a kind its view's programs lack");
 
@@ -6157,9 +6253,14 @@ public:
       draw();
       Require(name, "dead after a skipped draw", filtered.slots[160] == 0u,
               "the rescan of a view left acquired resolved a dead descriptor");
-      // A new descriptor over unmapped memory is never resolved.
+      // A new descriptor over unmapped memory is never resolved, even one whose address breaks
+      // its tiling's alignment.
+      auto unmapped = descriptor(23, Format::k8_8_8_8UNorm);
+      unmapped[0] += 1u;
+      unmapped[2] = 255u | (255u << 14u);
+      unmapped[3] |= static_cast<uint32_t>(Prospero::TileMode::kStandard4KB) << 20u;
       context.UnmapMemory(texture(23), 0x1000u);
-      write(23, descriptor(23, Format::k8_8_8_8UNorm));
+      write(23, unmapped);
       Require(name, "unmapped texture", acquire(sampled), "the view was declined");
       draw();
       Require(name, "unmapped descriptor", !textures.IsRegionRegistered(texture(23), 0x1000u),
@@ -6226,8 +6327,10 @@ public:
       draw();
       Require(name, "retry", acquire(sampled), "the view was declined");
       draw();
-      Require(name, "reused held element", held != 0u && filtered.slots[424] == held,
-              "a reused element was retried as the held element it replaced");
+      Require(name, "reused held element",
+              held != 0u && filtered.slots[424] == held &&
+                  ImageHeapTestAccess::HeldCount(heap) == 0u,
+              "a reused element was retried or kept as the held element it replaced");
       // A 2D view of a heap-pinned volume is another image type, not another extent.
       auto plane_root = sampled;
       plane_root.heap = true;
@@ -6279,13 +6382,57 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "unmapping the table kept its images pinned");
-      // A smaller table enters once a second draw acquires it and leaves at the suspend point
-      // after a frame that did not acquire it. Larger tables stay.
+      // One element serves a descriptor in every table. A table the guest republishes at a new
+      // base takes over the copy that idled a frame, with its views and slots.
+      constexpr uint64_t copy_table = base + 0x1c0000;
+      constexpr uint64_t republished = base + 0x1e0000;
+      std::memcpy(reinterpret_cast<void *>(copy_table), reinterpret_cast<void *>(table), table_size);
+      std::memcpy(reinterpret_cast<void *>(republished), reinterpret_cast<void *>(table), table_size);
+      Require(name, "original table", acquire(sampled), "the table was declined");
+      const auto indexed = ImageHeapTestAccess::IndexCount(heap);
+      Require(name, "shared elements",
+              acquire(sampled, copy_table) && ImageHeapTestAccess::IndexCount(heap) == indexed &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 2u &&
+                  ImageHeapTestAccess::Slots(heap, 1u) == ImageHeapTestAccess::Slots(heap, 0u),
+              "a second table with the same descriptors interned them again");
+      const auto copy_slots = view.slots;
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "original only", acquire(sampled), "the table was declined");
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "republished table",
+              acquire(sampled, republished) && view.slots == copy_slots &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 2u &&
+                  ImageHeapTestAccess::IndexCount(heap) == indexed,
+              "a republished table did not take over its idle copy");
+      draw();
+      // A copy that buried a word is not taken over: a new table resolves the word.
+      context.UnmapMemory(texture(31), 0x1000u);
+      context.MapMemory(texture(31), 0x1000u);
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "original again", acquire(sampled), "the table was declined");
+      draw();
+      heap.RunGarbageCollector();
+      heap.BeginDraw();
+      Require(name, "buried copy", acquire(sampled, copy_table), "the table was declined");
+      draw();
+      Require(name, "fresh table",
+              ImageHeapTestAccess::MemoryCount(heap) == 3u &&
+                  ImageHeapTestAccess::ImageOf(heap, ImageHeapTestAccess::Slots(heap, 2u)[248]),
+              "a table took over a copy that buried a word");
+      heap.UnmapMemory(table, table_size);
+      heap.UnmapMemory(republished, table_size);
+      heap.UnmapMemory(copy_table, table_size);
+      // A smaller table leaves at the suspend point after a frame that did not acquire it, a
+      // larger one after 32 such frames.
       const IR::ImageHeapRequest small_request{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
-      Require(name, "first small draw",
-              acquire(sampled, idle_table) && !heap.Acquire(small_request, view) &&
-                  !heap.Acquire(small_request, view),
-              "a smaller table entered on its first draw");
+      Require(name, "small table",
+              acquire(sampled, idle_table) && heap.Acquire(small_request, view),
+              "a smaller table was declined");
       draw();
       Require(name, "second small draw", heap.Acquire(small_request, view),
               "a smaller table was declined on its second draw");
@@ -6298,6 +6445,12 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 1u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "a suspend point kept an idle smaller table pinned or dropped a larger one");
+      for (uint32_t frame = 2; frame < 32u; ++frame) heap.RunGarbageCollector();
+      Require(name, "idle larger table", ImageHeapTestAccess::MemoryCount(heap) == 1u,
+              "a larger table left before 32 idle frames");
+      heap.RunGarbageCollector();
+      Require(name, "aged larger table", ImageHeapTestAccess::MemoryCount(heap) == 0u,
+              "a larger table stayed resident after 32 idle frames");
       // The idle table stays watched; destroying the heap must unwatch it before the page
       // manager fails on live watches.
       Require(name, "idle table",
@@ -7168,9 +7321,8 @@ public:
       underspecified.info.extent = {2, 1, 1};
       underspecified.info.resources = {1, 1};
       underspecified.info.pitch = 2;
-      underspecified.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
-      underspecified.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
-      underspecified.info.linear_slice_stride = 0;
+      underspecified.info.mip_layout[0] = {0, 8, 2, 1};
+      underspecified.info.mip_layout[1] = {8, 4, 1, 1};
       underspecified.view_info.format = underspecified.info.pixel_format;
       underspecified.view_info.level_count = 1;
       const auto underspecified_id = texture_cache.FindImage(underspecified);
@@ -7343,11 +7495,12 @@ public:
         std::memcpy(memory + mip_layout_offset, mip_guest.data(),
                     mip_guest.size() * sizeof(u32));
         TileSurfaceLayout surface{};
+        TileMipLayout mips[16];
         Require(name, "mip-tail layout",
                 TileGetTiledTextureLayout(
                     {.format = Prospero::BufferFormat::kBc3Srgb,
                      .tile_mode = Prospero::TileMode::kStandard4KB,
-                     .width = width, .height = 64, .levels = 7}, surface) &&
+                     .width = width, .height = 64, .levels = 7}, surface, mips) &&
                     surface.first_tail_level == (width == 32 ? 0u : 1u) &&
                     surface.total_size == (width == 32 ? 0x1000u : 0x2000u),
                 "BC3 width change did not move mip zero into or out of the tail");
@@ -7369,18 +7522,17 @@ public:
         std::vector<vk::BufferImageCopy> copies;
         std::vector<u32> expected;
         for (uint32_t level = 0; level < 7; level++) {
-          const auto &layout = surface.mips[level];
-          desc.info.mip_layout[level] = {
-              layout.offset, layout.size, layout.padded_width,
-              layout.padded_height};
+          const auto &layout = mips[level];
+          desc.info.mip_layout[level] = {layout.offset, layout.size,
+                                         layout.pitch, layout.height};
           vk::BufferImageCopy copy{};
           copy.bufferOffset = expected.size() * sizeof(u32);
           copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1};
           copy.imageExtent = {std::max(width >> level, 1u),
                               std::max(64u >> level, 1u), 1};
           copies.push_back(copy);
-          for (uint32_t y = 0; y < layout.height; y++) {
-            for (uint32_t x = 0; x < layout.width; x++) {
+          for (uint32_t y = 0; y < (copy.imageExtent.height + 3u) / 4u; y++) {
+            for (uint32_t x = 0; x < (copy.imageExtent.width + 3u) / 4u; x++) {
               uint32_t offset = 0;
               Require(name, "mip-tail CPU address",
                       TileGetBlockOffset(
@@ -7423,11 +7575,13 @@ public:
       // chain. Equal block extents do not make their guest tiling compatible.
       constexpr uint64_t bc5_alias_offset = 0x1800000;
       TileSurfaceLayout bc5_surface{};
+      TileMipLayout bc5_mips[16];
       Require(name, "BC5 alias layout",
               TileGetTiledTextureLayout(
                   {.format = Prospero::BufferFormat::kBc5UNorm,
                    .tile_mode = Prospero::TileMode::kStandard64KB,
-                   .width = 1024, .height = 1024, .levels = 11}, bc5_surface) &&
+                   .width = 1024, .height = 1024, .levels = 11}, bc5_surface,
+                  bc5_mips) &&
                   bc5_surface.total_size == 0x160000,
               "captured BC5 allocation no longer has its 0x160000-byte footprint");
       std::memset(memory + bc5_alias_offset, 0, bc5_surface.total_size);
@@ -7464,9 +7618,9 @@ public:
       std::vector<vk::BufferImageCopy> bc5_probes;
       std::vector<u32> bc5_expected;
       for (u32 level = 0; level < 11; ++level) {
-        const auto &layout = bc5_surface.mips[level];
-        bc5_alias.info.mip_layout[level] = {
-            layout.offset, layout.size, layout.padded_width, layout.padded_height};
+        const auto &layout = bc5_mips[level];
+        bc5_alias.info.mip_layout[level] = {layout.offset, layout.size,
+                                            layout.pitch, layout.height};
         u32 offset = 0;
         Require(name, "BC5 alias block address",
                 TileGetBlockOffset(bc5_surface.texture.block, layout.tail_x,
@@ -7510,13 +7664,14 @@ public:
         constexpr uint64_t tiled_array_offset = 0x2c00000;
         constexpr uint32_t tiled_levels = 5, tiled_layers = 6;
         TileSurfaceLayout surface{};
+        TileMipLayout mips[16];
         Require(name, "tiled array alias layout",
                 TileGetTiledTextureLayout(
                     {Prospero::BufferFormat::k32UInt, Prospero::TileMode::kStandard64KB,
                      TileSurfaceDimension::Dim2D, 256, 256, 1, tiled_levels, tiled_layers},
-                    surface) && surface.total_size == 0x240000 &&
+                    surface, mips) && surface.total_size == 0x240000 &&
                     surface.block_slice_size == 0x60000 &&
-                    surface.mips[0].offset + surface.mips[0].size * tiled_layers == 0x1a0000,
+                    mips[0].offset + mips[0].size * tiled_layers == 0x1a0000,
                 "fixture lost the gap between an array mip span and its full backing");
         auto tiled_array = MakeLinearDesc(
             base + tiled_array_offset, surface.total_size, vk::Format::eR32Uint,
@@ -7526,9 +7681,9 @@ public:
         tiled_array.info.resources.levels = tiled_levels;
         tiled_array.view_info.level_count = tiled_levels;
         for (uint32_t level = 0; level < tiled_levels; ++level) {
-          const auto &mip = surface.mips[level];
-          tiled_array.info.mip_layout[level] = {
-              mip.offset, mip.size * tiled_layers, mip.padded_width, mip.padded_height};
+          const auto &mip = mips[level];
+          tiled_array.info.mip_layout[level] = {mip.offset, mip.size * tiled_layers,
+                                                mip.pitch, mip.height};
         }
         tiled_array.info.UpdateSize();
         std::memset(memory + tiled_array_offset, 0, surface.total_size);
@@ -7562,7 +7717,7 @@ public:
                                         vk::BufferUsageFlagBits::eTransferDst, {0, 0});
         TransferReadBarrier(full_array.Handle(), surface.total_size);
         for (uint32_t probe = 0; probe < 2; ++probe) {
-          const auto &mip = surface.mips[probe == 0 ? 0 : tiled_levels - 1];
+          const auto &mip = mips[probe == 0 ? 0 : tiled_levels - 1];
           uint32_t within_block = 0;
           Require(name, "tiled array probe address",
                   TileGetBlockOffset(surface.texture.block, mip.tail_x, mip.tail_y,
@@ -7780,11 +7935,8 @@ public:
           Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(float), 1);
       depth_containment.type = BindingType::DepthTarget;
       depth_containment.info.resources.levels = 2;
-      depth_containment.info.mip_layout[0] = {
-          0, 2 * sizeof(float), 2, 1, 0, 2 * sizeof(float), 2};
-      depth_containment.info.mip_layout[1] = {
-          2 * sizeof(float), sizeof(float), 1, 1, 2 * sizeof(float), sizeof(float), 1};
-      depth_containment.info.linear_slice_stride = 0;
+      depth_containment.info.mip_layout[0] = {0, 2 * sizeof(float), 2, 1};
+      depth_containment.info.mip_layout[1] = {2 * sizeof(float), sizeof(float), 1, 1};
       depth_containment.view_info.format = vk::Format::eD32Sfloat;
       depth_containment.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       depth_containment.view_info.usage =
@@ -8060,7 +8212,7 @@ public:
                     (!htile_storage_image || id == htile_storage_image) &&
                     owner.info.data == htile_depth.info.data &&
                     owner.info.resources == htile_depth.info.resources &&
-                    owner.info.mip_layout == htile_depth.info.mip_layout &&
+                    SameMipLayout(owner.info, htile_depth.info) &&
                     owner.backing.layers == htile_layers &&
                     !owner.info.HasMetadata(),
                 "partial storage conversion separated array layers from their guest layout");
@@ -8844,9 +8996,8 @@ public:
           {13, 11, 1}, 2, 4, 1);
       stencil_clear_desc.info.stencil = {base + 0x27e2000, 0x1000};
       stencil_clear_desc.info.resources.levels = 2;
-      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11, 0, 0x400, 13};
-      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5, 0x800, 0x400, 6};
-      stencil_clear_desc.info.linear_slice_stride = 0x400;
+      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11};
+      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5};
       stencil_clear_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       const auto stencil_clear_id = texture_cache.FindImage(stencil_clear_desc);
@@ -9590,7 +9741,7 @@ public:
               layered_native.backing.layers == 4 &&
               layered_native.backing.mip_levels == 1 &&
               layered_native.info.resources == layered_depth.info.resources &&
-              layered_native.info.mip_layout == layered_depth.info.mip_layout &&
+              SameMipLayout(layered_native.info, layered_depth.info) &&
               layered_native.IsGpuModified(),
           "depth/color conversion mixed the source mip count with the "
           "requested layout");
@@ -10701,18 +10852,11 @@ public:
               TileGetBlockLayout(TileBlockFamily::Depth64KB, sizeof(uint32_t),
                                  depth_block),
               "failed to describe the tiled depth test surface");
-      auto tiled_depth_info =
-          MakeTilingImage(Prospero::BufferFormat::k32Float, tiled_depth_width,
-                          tiled_depth_height, 1, tiled_depth_layers,
-                          Prospero::TileMode::kDepth, tiled_depth_size, false);
-      tiled_depth_info.linear_slice_stride = tiled_depth_slice;
-      tiled_depth_info.mip_layout[0].linear_size = tiled_depth_slice;
-      tiled_depth_info.mip_layout[0].linear_pitch = tiled_depth_pitch;
       auto tiled_depth_input =
           CreateHostBuffer(name, tiled_depth_size, AllFlags, tiled_depth_after);
       auto tiled_depth_linear =
           TextureCacheTestAccess::Tiler(texture_cache)
-              .Detile(tiled_depth_input.buffer, 0, tiled_depth_info);
+              .Detile(tiled_depth_input.buffer, 0, tiled_depth_desc.info);
       auto tiled_depth_output =
           CreateHostBuffer(name, tiled_depth_size, AllFlags,
                            std::vector<uint32_t>(tiled_depth_guest.size(), 0));
@@ -10813,18 +10957,11 @@ public:
               TileGetBlockLayout(TileBlockFamily::Depth64KB, sizeof(uint16_t),
                                  depth_block),
               "failed to describe the tiled D16 test surface");
-      auto tiled_d16_info =
-          MakeTilingImage(Prospero::BufferFormat::k16UNorm, tiled_depth_width,
-                          tiled_depth_height, 1, tiled_depth_layers,
-                          Prospero::TileMode::kDepth, tiled_depth_size, false);
-      tiled_d16_info.linear_slice_stride = tiled_depth_slice;
-      tiled_d16_info.mip_layout[0].linear_size = tiled_depth_slice;
-      tiled_d16_info.mip_layout[0].linear_pitch = tiled_depth_pitch;
       auto tiled_d16_input =
           CreateHostBuffer(name, tiled_depth_size, AllFlags, tiled_d16_words);
       auto tiled_d16_linear =
           TextureCacheTestAccess::Tiler(texture_cache)
-              .Detile(tiled_d16_input.buffer, 0, tiled_d16_info);
+              .Detile(tiled_d16_input.buffer, 0, tiled_d16_desc.info);
       auto tiled_d16_output =
           CreateHostBuffer(name, tiled_depth_size, AllFlags,
                            std::vector<uint32_t>(tiled_d16_words.size(), 0));
@@ -11639,7 +11776,7 @@ public:
                 sampled.image_id == color.image_id &&
                     sampled.desc.info.pitch == target.pitch &&
                     sampled.desc.info.data.size == target.size &&
-                    sampled.desc.info.mip_layout == color.desc.info.mip_layout &&
+                    SameMipLayout(sampled.desc.info, color.desc.info) &&
                     texture_cache.FindTexture(sampled.image_id, sampled.desc) != nullptr,
                 "sampling the target changed its padded layout or created a second image");
         const auto expected = target.float16
@@ -12271,16 +12408,12 @@ public:
     desc.info.tiling.texel_width = desc.info.IsBlock() ? 4u : 1u;
     desc.info.tiling.texel_height = desc.info.IsBlock() ? 4u : 1u;
     desc.info.tiling.block.bytes_per_element = bytes_per_block;
-    desc.info.linear_slice_stride =
-        size / (type == Prospero::ImageType::kColor3D ? extent.depth : layers);
     desc.info.mip_layout[0].pitch =
         (extent.width + desc.info.tiling.texel_width - 1u) /
         desc.info.tiling.texel_width;
     desc.info.mip_layout[0].height =
         (extent.height + desc.info.tiling.texel_height - 1u) /
         desc.info.tiling.texel_height;
-    desc.info.mip_layout[0].linear_pitch = desc.info.mip_layout[0].pitch;
-    desc.info.mip_layout[0].linear_size = desc.info.linear_slice_stride;
     desc.view_info.format = format;
     desc.view_info.type = type == Prospero::ImageType::kColor3D
                               ? vk::ImageViewType::e3D
@@ -13888,8 +14021,10 @@ public:
     for (const auto &fill_case : cases) {
       const auto layout = fill_case.layout;
       const auto type = fill_case.type;
-      const auto bytes_per_pixel = TextureGetRenderTargetFormat(
-          layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
+      const auto bytes_per_pixel =
+          TextureGetRenderTargetFormat(NativeRenderTargetHost(), layout, type,
+                                       Prospero::ChannelOrder::kStandard)
+              .bytes_per_element;
       const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
       const uint32_t selected_layer =
           fill_case.cmask || fill_case.eliminate_fast_clear || fill_case.dcc_mips ? 1 : 0;
@@ -14823,13 +14958,14 @@ public:
                 vk::ComponentSwizzle::eZero},
             "cyclic host mapping reordered output slots or descriptor constants");
     const auto target = TextureGetRenderTargetFormat(
-        Prospero::ChannelLayout::k1_5_5_5, Prospero::ChannelType::kUNorm,
-        Prospero::ChannelOrder::kStandard);
+        NativeRenderTargetHost(), Prospero::ChannelLayout::k1_5_5_5,
+        Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard);
     Require(name, "1555 render target",
             target.format == vk::Format::eR5G5B5A1UnormPack16 &&
                 target.export_mapping == Prospero::ColorMappingAbgr,
             "shared format resolution changed the existing 1555 render target");
     for (const auto native : {target, TextureGetRenderTargetFormat(
+                                          NativeRenderTargetHost(),
                                           Prospero::ChannelLayout::k8,
                                           Prospero::ChannelType::kSNorm,
                                           Prospero::ChannelOrder::kStandard)}) {
@@ -14839,7 +14975,7 @@ public:
       Require(
           name, "render-target guest upload layout",
           upload.pitch * native.bytes_per_element == 256 &&
-              upload.mip_layout[0].linear_size == 256,
+              upload.LinearLayout().mips[0].size == 256,
           "retaining the render-target format lost its physical byte width");
     }
     EnsureRuntimeContext();
@@ -14965,7 +15101,8 @@ public:
     for (const auto &format : transfers) {
       for (const auto tile : {Prospero::TileMode::kLinear, Prospero::TileMode::kRenderTarget}) {
         const auto target = TextureGetRenderTargetFormat(
-            format.layout, format.type, Prospero::ChannelOrder::kReversed);
+            NativeRenderTargetHost(), format.layout, format.type,
+            Prospero::ChannelOrder::kReversed);
         Require(name, "reversed packed render target",
                 target.format == format.native_format && target.guest_format == format.format &&
                     target.export_mapping == Prospero::ColorMappingRgba,
@@ -16640,10 +16777,8 @@ public:
         desc.info.bytes_per_block = 4;
         desc.info.samples = 1;
         desc.info.tile_mode = linear;
-        desc.info.mip_layout[0] = {
-            0, size, extent.width, extent.height, 0, size, extent.width};
+        desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
         desc.info.tiling.block.bytes_per_element = 4;
-        desc.info.linear_slice_stride = size;
         desc.view_info.format = desc.info.pixel_format;
         desc.view_info.type = vk::ImageViewType::e2D;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -17410,8 +17545,8 @@ public:
       split_desc.info.bytes_per_block = 4;
       split_desc.info.samples = 1;
       split_desc.info.tile_mode = linear;
-      split_desc.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
-      split_desc.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
+      split_desc.info.mip_layout[0] = {0, 8, 2, 1};
+      split_desc.info.mip_layout[1] = {8, 4, 1, 1};
       split_desc.info.tiling.block.bytes_per_element = 4;
       split_desc.view_info.format = split_desc.info.pixel_format;
       split_desc.view_info.type = vk::ImageViewType::e2D;
@@ -18482,10 +18617,8 @@ public:
       video_parent.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
       video_parent.info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
       video_parent.info.resources.levels = 2;
-      video_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2,
-                                         0, target_mip_size, 2};
-      video_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1, 1,
-                                         target_mip_size, target_mip_size, 1};
+      video_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2};
+      video_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1, 1};
       video_parent.view_info.format = video_parent.info.pixel_format;
       video_parent.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto video_parent_id = texture_cache.FindImage(video_parent);
@@ -20379,10 +20512,8 @@ public:
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
     color.desc.info.data = {depth_address + 0x10000, extent * extent * 16};
-    color.desc.info.mip_layout[0] = {
-        0, color.desc.info.data.size, extent, extent, 0, color.desc.info.data.size, extent};
+    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent};
     color.desc.info.tiling.block.bytes_per_element = 16;
-    color.desc.info.linear_slice_stride = color.desc.info.data.size;
     color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
     color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
     color.desc.info.extent = {extent, extent, 1};
@@ -22678,6 +22809,7 @@ public:
                                  const ImageInfo &info, uint32_t level = 0) {
       const auto &block = info.tiling.block;
       const auto &mip = info.mip_layout[level];
+      const auto staged = info.LinearLayout().mips[level];
       const auto active = info.MipExtent(level);
       const uint32_t width = (active.width + info.tiling.texel_width - 1u) /
                              info.tiling.texel_width;
@@ -22685,9 +22817,6 @@ public:
                               info.tiling.texel_height;
       const uint64_t columns =
           (mip.pitch + block.block_width - 1u) / block.block_width;
-      const uint64_t slice = info.linear_slice_stride != 0
-                                 ? info.linear_slice_stride
-                                 : mip.linear_size;
       const bool tail = level >= info.first_tail_level;
       for (u32 z = 0; z < active.depth; ++z) {
         for (u32 y = 0; y < height; ++y) {
@@ -22701,15 +22830,14 @@ public:
             u32 local = 0, block_xor = 0;
             Require(name, "reference offset",
                     TileGetBlockOffset(block, lx, ly, lz, local) &&
-                        TileGetBlockXor(block, bx, by, mip.surface_z + bz,
-                                        block_xor),
+                        TileGetBlockXor(block, bx, by, bz, block_xor),
                     "CPU reference address lookup failed");
             const uint64_t tiled =
                 mip.offset + uint64_t{bz} * info.tiled_slice_stride +
                 (by * columns + bx) * block.block_size + (local ^ block_xor);
             const uint64_t linear =
-                mip.linear_offset + uint64_t{z} * slice +
-                (uint64_t{y} * mip.linear_pitch + x) * block.bytes_per_element;
+                staged.offset + uint64_t{z} * staged.size +
+                (uint64_t{y} * staged.pitch + x) * block.bytes_per_element;
             const uint64_t dst_offset = to_tiled ? tiled : linear;
             const uint64_t src_offset = to_tiled ? linear : tiled;
             Require(name, "reference range",
@@ -22766,6 +22894,7 @@ public:
       info.resources = {1, block.block_depth > 1 ? 1u : depth};
       info.tile_mode = Prospero::TileMode::kStandard4KB;
       info.bytes_per_block = block.bytes_per_element;
+      info.pitch = pitch;
       info.tiling = {block, 1, 1};
       info.data.size = guest_size;
       info.first_tail_level = 16;
@@ -22777,9 +22906,6 @@ public:
       info.mip_layout[0] = {
           0, info.IsVolume() ? info.tiled_slice_stride : guest_size, pitch,
           static_cast<uint32_t>(rows * block.block_height)};
-      info.mip_layout[0].linear_pitch = pitch;
-      info.mip_layout[0].linear_size =
-          uint64_t{pitch} * height * block.bytes_per_element;
       return info;
     };
     struct FamilyCase {
@@ -22890,7 +23016,7 @@ public:
       check_round_trip("large array", info.data.size, info);
     }
     {
-      // Adjacent subword mips share output dwords and a guest tail block.
+      // Sixteen subword mips share a guest tail block.
       TileBlockLayout block{};
       Require(name, "packed mip block",
               TileGetBlockLayout(TileBlockFamily::Standard4KB, 1, block),
@@ -22900,9 +23026,6 @@ public:
       info.first_tail_level = 0;
       for (u32 mip = 0; mip < info.resources.levels; ++mip) {
         info.mip_layout[mip] = {0, 4096, block.block_width, block.block_height};
-        info.mip_layout[mip].linear_offset = mip;
-        info.mip_layout[mip].linear_size = 1;
-        info.mip_layout[mip].linear_pitch = 1;
         info.mip_layout[mip].tail_x = mip;
       }
       check_round_trip("16 packed subword mip records", 4096, info);
@@ -22957,7 +23080,7 @@ public:
       Require(name, "partial mip array addresses",
               prefix.size() == 2 && prefix[0].bufferOffset == 256 &&
                   prefix[1].bufferOffset ==
-                      info.mip_layout[1].linear_offset + 256 &&
+                      info.LinearLayout().mips[1].offset + 256 &&
                   info.mip_layout[0].offset == 0x1a00 &&
                   info.mip_layout[1].offset == 0xb00,
               "partial mip transfer recomputed the full-chain guest stride");
@@ -23007,11 +23130,6 @@ public:
 
         auto info =
             block_image(block, width, height, depth, pitch, storage_size);
-        info.mip_layout[0].surface_z =
-            family.family == TileBlockFamily::RenderTarget64KB ||
-                    family.family == TileBlockFamily::Depth64KB
-                ? 3
-                : 0;
         convert_reference(false, &cpu, tiled, info);
         gpu_detile(tiled, &gpu, storage_size, storage_size, info);
         const auto family_label = [&](const char *operation) {
@@ -23080,6 +23198,7 @@ public:
     }
     {
       TileSurfaceLayout invalid{};
+      TileMipLayout invalid_mips[16];
       const TileSurfaceDescription description{
           Prospero::BufferFormat::k32Float,
           Prospero::TileMode::kStandard256B,
@@ -23091,7 +23210,7 @@ public:
           1,
       };
       Require(name, "3D tile policy",
-              !TileGetTiledTextureLayout(description, invalid),
+              !TileGetTiledTextureLayout(description, invalid, invalid_mips),
               "Standard256B volume silently fell back to a 2D array layout");
     }
     Require(
@@ -23180,7 +23299,8 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, 1, levels, tile, false,
                               total);
-      const bool built = TileGetTiledTextureLayout(description, surface);
+      TileMipLayout mips[16];
+      const bool built = TileGetTiledTextureLayout(description, surface, mips);
       const auto surface_format = TextureGetSurfaceFormatInfo(format);
       constexpr u32 tail_xy[7][2] = {{64, 0}, {0, 64}, {32, 0}, {0, 32},
                                      {16, 0}, {8, 16}, {0, 24}};
@@ -23197,12 +23317,12 @@ public:
                    surface.texture.block.block_height == 128 &&
                    surface.texture.block.block_depth == 1 &&
                    surface.first_tail_level == 1 &&
-                   surface.mips[0].offset == 0x10000 && total.size == 0x20000 &&
+                   mips[0].offset == 0x10000 && total.size == 0x20000 &&
                    total.align == 0x10000;
       for (u32 level = 1; level < levels && valid; level++) {
-        valid &= surface.mips[level].offset == 0 &&
-                 surface.mips[level].tail_x == tail_xy[level - 1][0] &&
-                 surface.mips[level].tail_y == tail_xy[level - 1][1];
+        valid &= mips[level].offset == 0 &&
+                 mips[level].tail_x == tail_xy[level - 1][0] &&
+                 mips[level].tail_y == tail_xy[level - 1][1];
       }
       Require(name, "11_11_10 uint layout", valid,
               "PS5 packed integer texture metadata or Standard64KB mip tail "
@@ -23262,11 +23382,10 @@ public:
       Require(name, "array infos",
               layout.resources.levels == 1 &&
                   layout.MipExtent(0).depth == layers &&
-                  layout.mip_layout[0].surface_z == 0 &&
                   layout.tiled_slice_stride == total.size / layers &&
                   regions.size() == 1 &&
                   regions[0].imageSubresource.layerCount == layers,
-              "array mip lost its layer count or absolute surface Z origin");
+              "array mip lost its layer count or guest layer stride");
       check_round_trip("array", total.size, layout);
     }
 
@@ -23287,7 +23406,7 @@ public:
       Require(name, "odd mip infos",
               layout.resources.levels == 2 &&
                   layout.mip_layout[1].pitch >=
-                      layout.mip_layout[1].linear_pitch &&
+                      layout.LinearLayout().mips[1].pitch &&
                   layout.mip_layout[1].height >=
                       ((layout.MipExtent(1).height +
                         layout.tiling.texel_height - 1u) /
@@ -23394,7 +23513,7 @@ public:
               layout.mip_layout[0].offset + 2 * layout.tiled_slice_stride ==
                   0xed000 &&
               layout.mip_layout[1].offset == 0 &&
-              layout.mip_layout[1].linear_pitch == 32 &&
+              layout.LinearLayout().mips[1].pitch == 32 &&
               ((layout.MipExtent(1).height + layout.tiling.texel_height - 1u) /
                layout.tiling.texel_height) == 64 &&
               layout.mip_layout[1].pitch == 40 &&
@@ -23421,7 +23540,7 @@ public:
           layout.resources.levels == levels &&
               layout.MipExtent(0).depth == depth &&
               layout.MipExtent(1).depth == (depth >> 1u) &&
-              layout.mip_layout[1].linear_pitch == 8 &&
+              layout.LinearLayout().mips[1].pitch == 8 &&
               ((layout.MipExtent(1).height + layout.tiling.texel_height - 1u) /
                layout.tiling.texel_height) == 16 &&
               layout.mip_layout[1].pitch == 16 &&
@@ -23489,9 +23608,8 @@ public:
                   layout.tiling.block.family == test.family &&
                   layout.resources.levels == levels &&
                   layout.MipExtent(0).depth == depth &&
-                  (!uses_z || (layout.mip_layout[0].surface_z == 0 &&
-                               layout.tiled_slice_stride != 0)),
-              "volume mode selected the wrong family or lost its surface Z");
+                  (!uses_z || layout.tiled_slice_stride != 0),
+              "volume mode selected the wrong family or lost its slice stride");
       check_round_trip("volume family", total.size, layout);
     }
 
@@ -23582,11 +23700,6 @@ public:
         info.first_tail_level = 0;
         info.mip_layout[0].tail_x = x;
         info.mip_layout[0].tail_y = y;
-        info.mip_layout[0].surface_z =
-            family == TileBlockFamily::RenderTarget64KB ||
-                    family == TileBlockFamily::Depth64KB
-                ? 2
-                : 0;
         convert_reference(false, &cpu, tiled, info);
         gpu_detile(tiled, &gpu, block.block_size, linear_size, info);
         compare("tail bytes", cpu, gpu);
@@ -29484,6 +29597,30 @@ TestCase VectorBfeI32SignExtendsField() {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_BFE_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpBitFieldSExtract"};
+  return test;
+}
+
+TestCase VectorMsadU8SkipsZeroReferenceBytes() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 vgpr = 0; vgpr < 3; vgpr++) {
+    AppendVMovU32(&code, 30, vgpr * sizeof(u32));
+    AppendBufferLoadDword(&code, vgpr, 30);
+  }
+  AppendVop3(&code, 0x171, 10, Vgpr(0), Vgpr(1), Vgpr(2));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorMsadU8SkipsZeroReferenceBytes";
+  test.code = std::move(code);
+  // Byte differences 0x10, 0xfe and 0xdf in both directions; byte 0 has a zero
+  // reference and is skipped. The accumulation wraps at 32 bits.
+  test.initial = {0x10ff2080u, 0x2001ff00u, 0xfffffff0u};
+  test.expected = {0x1ddu};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MSAD_U8,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -45219,7 +45356,7 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
         O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
     Require(test.name, "bounded image candidates",
-            packed ? compiled.resources.images.size() == 32u
+            packed ? compiled.resources.images.size() == 33u // The null root and every slot.
                    : compiled.resources.images.size() == std::max(count, 1u),
             "descriptor planning escaped its selector domain");
     std::vector<VulkanHarness::Image> images;
@@ -48161,75 +48298,118 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   return test;
 }
 
-// Reduces v13 into v0 with V_MIN_U32/S_MIN_U32 or, for bitwise_or, V_OR_B32/S_OR_B32.
-void AppendWave64Reduction(std::vector<u32> &code, bool bitwise_or) {
-  const u32 vector_op = bitwise_or ? 0x1cu : 0x13u;
+// A whole-wave reduction: the SPIR-V reduction it becomes, its VOP2 and SOP2 opcodes and the
+// identity lanes outside EXEC contribute. Only idempotent operations have a sparse graphics case.
+struct WaveReduction {
+  const char *compute_name, *graphics_name, *spirv;
+  ShaderOpcode vector, scalar;
+  u32 vector_op, scalar_op, identity;
+};
+
+constexpr WaveReduction kWaveMinimum{"ComputeWave64Minimum", "GraphicsSparseWaveMinimum",
+    "OpGroupNonUniformUMin", ShaderOpcode::V_MIN_U32, ShaderOpcode::S_MIN_U32, 0x13u, 0x07u,
+    UINT32_MAX};
+constexpr std::array kWaveReductions{kWaveMinimum,
+    WaveReduction{"ComputeWave64Or", "GraphicsSparseWaveOr", "OpGroupNonUniformBitwiseOr",
+        ShaderOpcode::V_OR_B32, ShaderOpcode::S_OR_B32, 0x1cu, 0x10u, 0u},
+    WaveReduction{"ComputeWave64SignedMinimum", "GraphicsSparseWaveSignedMinimum",
+        "OpGroupNonUniformSMin", ShaderOpcode::V_MIN_I32, ShaderOpcode::S_MIN_I32, 0x11u, 0x06u,
+        0x7fffffffu},
+    WaveReduction{"ComputeWave64SignedMaximum", "GraphicsSparseWaveSignedMaximum",
+        "OpGroupNonUniformSMax", ShaderOpcode::V_MAX_I32, ShaderOpcode::S_MAX_I32, 0x12u, 0x08u,
+        0x80000000u},
+    WaveReduction{"ComputeWave64And", "GraphicsSparseWaveAnd", "OpGroupNonUniformBitwiseAnd",
+        ShaderOpcode::V_AND_B32, ShaderOpcode::S_AND_B32, 0x1bu, 0x0eu, UINT32_MAX},
+    WaveReduction{"ComputeWave64Add", nullptr, "OpGroupNonUniformIAdd",
+        ShaderOpcode::V_ADD_NC_U32, ShaderOpcode::S_ADD_U32, 0x25u, 0x00u, 0u},
+    WaveReduction{"ComputeWave64Xor", nullptr, "OpGroupNonUniformBitwiseXor",
+        ShaderOpcode::V_XOR_B32, ShaderOpcode::S_XOR_B32, 0x1du, 0x12u, 0u}};
+
+// Reduces v13 into v0.
+void AppendWave64Reduction(std::vector<u32> &code, const WaveReduction &op) {
   code.insert(code.end(), {EncodeSop1(0x04, 24, 126), // Save contributing lanes.
                           EncodeSop1(0x28, 106, 126)});
-  // Inactive lanes contribute the identity: 0 for OR, UINT_MAX for the minimum.
-  AppendVop3(&code, 0x101, 13, bitwise_or ? 128u : 193u, Vgpr(13), 24);
+  AppendSMovLiteral(&code, 26, op.identity);
+  AppendVop3(&code, 0x101, 13, 26, Vgpr(13), 24);
   for (u32 shift : {1u, 2u, 4u, 8u}) {
-    code.push_back(EncodeVop2(vector_op, 13, 250, 13));
+    code.push_back(EncodeVop2(op.vector_op, 13, 250, 13));
     code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
   }
   // RDNA2 wave64 reduction from PS 964747887d898821, PCs 0x224..0x244.
   code.insert(code.end(), {0xd778100cu, 0x0305830du,
-      EncodeVop2(vector_op, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
+      EncodeVop2(op.vector_op, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
       0xd7600006u, 0x00013f0du, 0xd7600007u, 0x00017f0du,
-      EncodeSop2(bitwise_or ? 0x10u : 0x07u, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+      EncodeSop2(op.scalar_op, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
 }
 
-std::vector<ShaderOpcode> Wave64ReductionOpcodes(bool bitwise_or) {
-  using O = ShaderOpcode;
-  return {bitwise_or ? O::V_OR_B32 : O::V_MIN_U32, O::V_PERMLANEX16_B32,
-          O::V_READLANE_B32, bitwise_or ? O::S_OR_B32 : O::S_MIN_U32};
+std::vector<ShaderOpcode> Wave64ReductionOpcodes(const WaveReduction &op) {
+  return {op.vector, ShaderOpcode::V_PERMLANEX16_B32, ShaderOpcode::V_READLANE_B32, op.scalar};
 }
 
-GraphicsCase GraphicsSparseWaveReduction(bool bitwise_or) {
+GraphicsCase GraphicsSparseWaveReduction(const WaveReduction &op) {
   GraphicsCase test;
-  test.name = bitwise_or ? "GraphicsSparseWaveOr" : "GraphicsSparseWaveMinimum";
+  test.name = op.graphics_name;
   auto &code = test.fragment_code;
   code = {EncodeVintrp(0x02, 13, 0, 0, 2)};
-  AppendWave64Reduction(code, bitwise_or);
+  AppendWave64Reduction(code, op);
   code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
   AppendEnd(&code);
   test.pixel_interpolator_settings = {0x00000400u};
   test.expected_pixel = {0x3e800000u, 0x3e800000u, 0x3e800000u, 0x3e800000u};
-  test.opcodes = Wave64ReductionOpcodes(bitwise_or);
+  test.opcodes = Wave64ReductionOpcodes(op);
   return test;
 }
 
-TestCase ComputeWave64Reduction(bool masked, bool bitwise_or) {
+TestCase ComputeWave64Reduction(const WaveReduction &op, bool masked = false) {
+  using O = ShaderOpcode;
   TestCase test;
+  test.name = masked ? "ComputeWave64MinimumMasked" : op.compute_name;
   auto &code = test.code;
   code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
-  if (bitwise_or) {
-    // Lane i contributes bit i / 4, so each half supplies its own byte of 0xffff.
-    test.name = "ComputeWave64Or";
-    test.expected.assign(64, 0xffffu);
-    code.push_back(EncodeVop2(0x16, 13, InlineU32(2), 0));
-    AppendVop3(&code, 0x11a, 13, Vgpr(13), InlineU32(1));
-  } else {
-    test.name = masked ? "ComputeWave64MinimumMasked" : "ComputeWave64Minimum";
-    test.expected.assign(64, masked ? 38u : 37u);
-    AppendVMovU32(&code, 13, 100);
-    code.push_back(EncodeVop2(0x26, 13, Vgpr(13), 0)); // 100 - lane: minimum is in the upper half.
+  u32 expected = 0;
+  switch (op.vector) {
+    case O::V_MIN_U32:
+      AppendVMovU32(&code, 13, 100);
+      code.push_back(EncodeVop2(0x26, 13, Vgpr(13), 0)); // 100 - lane: minimum is in the upper half.
+      expected = masked ? 38u : 37u;
+      break;
+    case O::V_OR_B32:
+    case O::V_AND_B32:
+      // Lane i sets bit i / 4 (clears it for AND), so each half covers its own byte of 0xffff.
+      code.push_back(EncodeVop2(0x16, 13, InlineU32(2), 0));
+      AppendVop3(&code, 0x11a, 13, Vgpr(13), InlineU32(1));
+      if (op.vector == O::V_AND_B32) code.push_back(EncodeVop1(0x37, 13, Vgpr(13)));
+      expected = op.vector == O::V_OR_B32 ? 0xffffu : 0xffff0000u;
+      break;
+    case O::V_ADD_NC_U32:
+    case O::V_XOR_B32:
+      // lane + 1: the halves sum to 528 and 1552 and XOR to 32 and 96.
+      code.push_back(EncodeVop2(0x25, 13, InlineU32(1), 0));
+      expected = op.vector == O::V_ADD_NC_U32 ? 2080u : 64u;
+      break;
+    default:
+      // lane - 32: the signed minimum is -32, the maximum 31.
+      code.push_back(EncodeVop2(0x27, 13, InlineU32(32), 0));
+      expected = op.vector == O::V_MAX_I32 ? 31u : 0xffffffe0u;
+      break;
   }
   if (masked) {
     AppendSMovLiteral(&code, 126, 0xfffffffeu);
     AppendSMovLiteral(&code, 127, 0x7fffffffu);
   }
-  AppendWave64Reduction(code, bitwise_or);
+  AppendWave64Reduction(code, op);
   AppendBufferStoreDword(&code, 0, 20);
   AppendEnd(&code);
   test.initial.assign(64, 0xa5a5a5a5u);
+  test.expected.assign(64, expected);
   if (masked) test.expected.front() = test.expected.back() = 0xa5a5a5a5u;
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.wave_size = 64;
   test.has_compute_info = true;
-  test.opcodes = Wave64ReductionOpcodes(bitwise_or);
+  test.opcodes = Wave64ReductionOpcodes(op);
+  test.required_spirv = {op.spirv};
   return test;
 }
 
@@ -49053,6 +49233,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
+  AddCase(VectorMsadU8SkipsZeroReferenceBytes);
   AddCase(VectorBfmDropsMaskBitsPastBit31);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorPermSelectsBytesSignsAndFills);
@@ -49113,9 +49294,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorDppMirrorAndRotate(64));
   cases.push_back(VectorReadFirstLaneExecMasks(32));
   cases.push_back(VectorReadFirstLaneExecMasks(64));
-  cases.push_back(ComputeWave64Reduction(false, false));
-  cases.push_back(ComputeWave64Reduction(true, false));
-  cases.push_back(ComputeWave64Reduction(false, true));
+  for (const auto &op : kWaveReductions) cases.push_back(ComputeWave64Reduction(op));
+  cases.push_back(ComputeWave64Reduction(kWaveMinimum, true));
   AddCase(VectorDppBankMaskPreservesDestination);
   for (const bool row_shift : {false, true})
     for (const bool bound_ctrl : {false, true})
@@ -49572,9 +49752,10 @@ std::vector<TestCase> MakeCases() {
 }
 
 std::vector<GraphicsCase> MakeGraphicsCases() {
-  return {
-      GraphicsSparseWaveReduction(false),
-      GraphicsSparseWaveReduction(true),
+  std::vector<GraphicsCase> cases;
+  for (const auto &op : kWaveReductions)
+    if (op.graphics_name != nullptr) cases.push_back(GraphicsSparseWaveReduction(op));
+  cases.insert(cases.end(), {
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
@@ -49607,7 +49788,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
       GraphicsObjectPrimitiveId(false),
       GraphicsObjectPrimitiveId(true),
-  };
+  });
+  return cases;
 }
 
 void CheckComputeLdsLimit(VulkanHarness &vulkan) {
@@ -49721,13 +49903,6 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
     Require(name, "TES vertex gates", full_wave_gates == 2,
             "GS_TG_INFO or the merged wave info did not count one full TES wave");
   }
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  context.SetShaderStages(0x0260212du);
-  ExpectFatal("TessellationGsAmplification", [&] {
-    std::array<ShaderVertexInputInfo, 3> info;
-    (void)PrepareTessellationPrograms(regs, context, info);
-  });
-#endif
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -50867,7 +51042,8 @@ void CheckEmbeddedFetchVertexOffset() {
 }
 
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
-  (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
+  (void)TextureGetRenderTargetFormat(NativeRenderTargetHost(),
+                                     Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
                                      Prospero::ChannelOrder::kStandard);
   std::_Exit(0x7f);
@@ -50876,8 +51052,8 @@ void CheckEmbeddedFetchVertexOffset() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
   const auto r8_uint = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
-      Prospero::ChannelOrder::kStandard);
+      NativeRenderTargetHost(), Prospero::ChannelLayout::k8,
+      Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "R8 uint",
           r8_uint.format == vk::Format::eR8Uint &&
               r8_uint.bytes_per_element == 1u &&
@@ -50885,8 +51061,8 @@ void CheckRenderTargetFormatContract() {
           "R8 uint render-target tuple was rejected");
 
   const auto rgb565 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k5_6_5, Prospero::ChannelType::kUNorm,
-      Prospero::ChannelOrder::kStandard);
+      NativeRenderTargetHost(), Prospero::ChannelLayout::k5_6_5,
+      Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGB565 UNorm",
           rgb565.format == vk::Format::eB5G6R5UnormPack16 &&
               rgb565.bytes_per_element == 2u &&
@@ -50894,8 +51070,8 @@ void CheckRenderTargetFormatContract() {
           "RGB565 UNorm render-target tuple was rejected");
 
   const auto uint_format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUInt,
-      Prospero::ChannelOrder::kStandard);
+      NativeRenderTargetHost(), Prospero::ChannelLayout::k16_16_16_16,
+      Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard);
   Require("RenderTargetFormat", "RGBA16 uint",
           uint_format.format == vk::Format::eR16G16B16A16Uint &&
               uint_format.bytes_per_element == 8u &&
@@ -50903,8 +51079,8 @@ void CheckRenderTargetFormatContract() {
           "RGBA16 uint render-target tuple was rejected");
 
   const auto format = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-      Prospero::ChannelOrder::kReversed);
+      NativeRenderTargetHost(), Prospero::ChannelLayout::k16_16_16_16,
+      Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kReversed);
   Require("ReverseRenderTarget", "exact format",
           format.format == vk::Format::eR16G16B16A16Sfloat &&
               format.bytes_per_element == 8u &&
@@ -50919,8 +51095,8 @@ void CheckRenderTargetFormatContract() {
           "reverse RGBA16F component mask was not mapped exactly once");
 
   const auto rg32 = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
-      Prospero::ChannelOrder::kReversed);
+      NativeRenderTargetHost(), Prospero::ChannelLayout::k32_32,
+      Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kReversed);
   Require(
       "ReverseRenderTarget", "GR32 float",
       rg32.format == vk::Format::eR32G32Sfloat &&
@@ -50933,8 +51109,8 @@ void CheckRenderTargetFormatContract() {
       "reverse GR32F render-target export or write-mask mapping is incorrect");
 
   const auto argb = TextureGetRenderTargetFormat(
-      Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
-      Prospero::ChannelOrder::kAltReversed);
+      NativeRenderTargetHost(), Prospero::ChannelLayout::k16_16_16_16,
+      Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kAltReversed);
   Require(
       "ReverseRenderTarget", "ARGB float",
       argb.format == vk::Format::eR16G16B16A16Sfloat &&
@@ -52564,7 +52740,7 @@ void CheckStorageTextureLinearUploadLayout() {
   Require("StorageTextureLinearUpload", "layout",
           pitch == width && total.size == 0x1fa4000 && total.align == 256 &&
               layout.tile_mode == tile && layout.pitch == width &&
-              layout.linear_slice_stride == total.size && regions.size() == 1 &&
+              layout.LinearLayout().slice_stride == total.size && regions.size() == 1 &&
               regions[0].bufferOffset == 0 &&
               regions[0].imageExtent.width == width &&
               regions[0].imageExtent.height == height &&
@@ -52596,9 +52772,9 @@ void CheckStorageTextureDepthTileUploadLayout() {
               total.size == slice.size && total.align == slice.align &&
               layout.tile_mode == tile &&
               layout.tiling.block.family == TileBlockFamily::Depth64KB &&
-              layout.pitch == pitch && layout.linear_slice_stride == 0 &&
+              layout.pitch == pitch && layout.LinearLayout().slice_stride == 0 &&
               layout.tiled_slice_stride == total.size &&
-              layout.mip_layout[0].linear_size == pitch &&
+              layout.LinearLayout().mips[0].size == pitch &&
               layout.mip_layout[0].size == total.size && regions.size() == 1 &&
               regions[0].bufferOffset == 0 &&
               regions[0].imageExtent.width == width &&
@@ -53091,11 +53267,12 @@ void CheckStorageTextureVolumeUploadLayout() {
       MakeTilingImage(format, width, height, 1, depth,
                       Prospero::TileMode::kRenderTarget, total.size, true);
   const auto regions = layout.BufferCopies();
+  const auto linear = layout.LinearLayout();
   Require("StorageTextureVolumeUpload", "layout",
           pitch == 128 && total.size == 0x210000 &&
-              layout.linear_slice_stride == 0 &&
+              linear.slice_stride == 0 &&
               layout.tiled_slice_stride == 0x10000 &&
-              layout.mip_layout[0].linear_size == 0x2208 &&
+              linear.mips[0].size == 0x2208 &&
               layout.mip_layout[0].size == 0x10000 && regions.size() == 1 &&
               regions[0].imageExtent.depth == depth,
           "3D render-target upload did not preserve its compact linear layout");
@@ -53105,12 +53282,13 @@ void CheckStorageTextureVolumeUploadLayout() {
           "3D render-target canonical mip record lost its depth");
   for (const uint32_t z : {0u, 1u, depth - 1u}) {
     const auto &mip = layout.mip_layout[0];
+    const auto &staged = linear.mips[0];
     Require("StorageTextureVolumeUpload", "slice offsets",
-            mip.linear_offset + z * mip.linear_size == uint64_t{z} * 0x2208 &&
+            staged.offset + z * staged.size == uint64_t{z} * 0x2208 &&
                 mip.offset + z * layout.tiled_slice_stride ==
                     uint64_t{z} * 0x10000 &&
-                mip.surface_z + z == z && mip.linear_pitch == width,
-            "volume slice lost its linear stride, block slice, or Z swizzle");
+                staged.pitch == width,
+            "volume slice lost its linear stride or block slice");
   }
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeUpload");
 }
@@ -53128,28 +53306,29 @@ void CheckStorageTextureVolumeMipRegions() {
   const auto layout = MakeTilingImage(format, width, height, levels, depth,
                                       tile, total.size, true);
   const auto copies = layout.BufferCopies();
+  const auto linear = layout.LinearLayout();
 
   bool valid = copies.size() == levels;
   for (uint32_t level = 0; level < levels && valid; ++level) {
     const auto &copy = copies[level];
-    const auto &mip = layout.mip_layout[level];
+    const auto &mip = linear.mips[level];
     const auto active = layout.MipExtent(level);
     valid &= copy.imageSubresource.mipLevel == level &&
              copy.imageOffset.z == 0 &&
              copy.imageExtent.width == active.width &&
              copy.imageExtent.height == active.height &&
              copy.imageExtent.depth == active.depth &&
-             copy.bufferOffset == mip.linear_offset &&
-             copy.bufferRowLength == mip.linear_pitch &&
+             copy.bufferOffset == mip.offset &&
+             copy.bufferRowLength == mip.pitch &&
              uint64_t{copy.bufferRowLength} * copy.bufferImageHeight *
                      sizeof(uint32_t) ==
-                 layout.linear_slice_stride;
+                 linear.slice_stride;
   }
   const auto saved_mips = layout.mip_layout;
   const auto prefix = layout.BufferCopies(1024, 1);
   const auto again = layout.BufferCopies();
   valid &= prefix.size() == 1 &&
-           prefix[0].bufferOffset == 1024 + layout.mip_layout[0].linear_offset &&
+           prefix[0].bufferOffset == 1024 + linear.mips[0].offset &&
            copies[0].bufferOffset == 768 && copies[1].bufferOffset == 256 &&
            copies[2].bufferOffset == 0 && again == copies &&
            layout.mip_layout == saved_mips;
@@ -54781,6 +54960,22 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
           packet32[8] == patched_label32 && execute(packet32.data(), 14),
       "32-bit native wait patch did not update metadata and hardware packet");
 
+  // 0xfc patches FUNCTION to NOT_EQUAL, so the satisfied wait now blocks; the
+  // cache policy bits stay.
+  const auto patch_compare = [&](auto &packet, uint32_t size_dw) {
+    packet[5] |= 0x06000000u;
+    auto expected = packet;
+    expected[5] = 0x06000014u;
+    Pm4Execution execution;
+    return Gen5::AgcWaitRegMemPatchCompareFunction(packet.data(), 0xfc) == 0 &&
+           packet == expected &&
+           processor.Process(execution, {packet.data(), size_dw}) ==
+               Pm4ProcessResult::Blocked;
+  };
+  Require("Pm4WaitPackets", "32-bit compare function patch",
+          patch_compare(packet32, 14),
+          "32-bit compare function patch did not rewrite FUNCTION alone");
+
   alignas(8) uint64_t label64 = 0x1122334455667788ull;
   std::array<uint32_t, 16> packet64{};
   CommandBufferLayout dcb64{packet64.data(),
@@ -54838,6 +55033,9 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
           execute(packet64.data(), packet64.size()),
       "64-bit native wait patch did not preserve the native high reference "
       "DWORD");
+  Require("Pm4WaitPackets", "64-bit compare function patch",
+          patch_compare(packet64, packet64.size()),
+          "64-bit compare function patch did not rewrite FUNCTION alone");
 
   std::array<uint32_t, 16> invalid{};
   const uint32_t short_payload = 0x342u;
@@ -54847,6 +55045,9 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
               packet_mismatch &&
           Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
               packet_mismatch &&
+          Gen5::AgcWaitRegMemPatchCompareFunction(invalid.data(), 4) ==
+              packet_mismatch &&
+          invalid == std::array<uint32_t, 16>{} &&
           !Gen5::AgcIsInternalDataPacket(
               KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
       "wait patch accepted a packet without the metadata prefix");
@@ -55607,6 +55808,48 @@ void CheckDeviceCreation() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+// A compute shader that takes derivatives over 2x2 quads, as one that queries an image's LOD
+// does, passes validation on the emulator's device; a validation error exits.
+void CheckComputeDerivativesDevice() {
+  constexpr const char *name = "ComputeDerivativesDevice";
+  Config::Load({.vulkan_validation_enabled = true,
+                .printf_direction = Config::LogDirection::Silent});
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window = SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  const auto &graphics = window.graphic_ctx;
+  Require(name, "validation", static_cast<bool>(graphics.debug_messenger),
+          "the validation layer is not active");
+  // OpCapability ComputeDerivativeGroupQuadsKHR, LocalSize 2 2 1, DerivativeGroupQuadsKHR.
+  static constexpr uint32_t code[] = {
+      0x07230203, 0x00010600, 0x00070000, 0x00000005, 0x00000000, 0x00020011, 0x00000001,
+      0x00020011, 0x000014a8, 0x000a000a, 0x5f565053, 0x5f52484b, 0x706d6f63, 0x5f657475,
+      0x64616873, 0x645f7265, 0x76697265, 0x76697461, 0x00007365, 0x0003000e, 0x00000000,
+      0x00000001, 0x0005000f, 0x00000005, 0x00000001, 0x6e69616d, 0x00000000, 0x00060010,
+      0x00000001, 0x00000011, 0x00000002, 0x00000002, 0x00000001, 0x00030010, 0x00000001,
+      0x000014a9, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00050036,
+      0x00000002, 0x00000001, 0x00000000, 0x00000003, 0x000200f8, 0x00000004, 0x000100fd,
+      0x00010038};
+  const auto module =
+      graphics.device.createShaderModule({.codeSize = sizeof(code), .pCode = code}).value;
+  const auto layout = graphics.device.createPipelineLayout({}).value;
+  const auto pipeline = graphics.device.createComputePipeline(
+      nullptr, {.stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = layout});
+  Require(name, "pipeline", pipeline.result == vk::Result::eSuccess,
+          "the derivative compute pipeline was not created");
+  graphics.device.destroyPipeline(pipeline.value);
+  graphics.device.destroyPipelineLayout(layout);
+  graphics.device.destroyShaderModule(module);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // A flip block copies GPU-written storage images back, publishes the dumped
 // occlusion counters, then flips; a wait for a shown buffer names it by its
 // label and returns once its flip is presented, and a blank one waits for
@@ -55641,8 +55884,9 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
 
-  // A GPU-written storage image the flip's GL2 writeback copies back.
-  constexpr uint64_t image_size = 0x10000;
+  // A GPU-written storage image the flip's GL2 writeback copies back, and at
+  // 0x20000 a two-layer eye array.
+  constexpr uint64_t image_size = 0x40000;
   int64_t image_offset = -1;
   void *image_memory = nullptr;
   Require(name, "image memory",
@@ -55778,6 +56022,41 @@ void CheckPm4Flip() {
               flipped_arg == flip_arg,
           "the flip block did not publish the occlusion counters or flip");
 
+  // A compute queue's flip clears R and releases at the end of the shader.
+  constexpr int64_t compute_arg = flip_arg + 1;
+  std::array<uint32_t, 64> acb{};
+  CommandBufferLayout acb_layout{acb.data(), acb.data() + acb.size(),
+                                 acb.data(), acb.data() + acb.size(),
+                                 nullptr,    nullptr,
+                                 0};
+  auto compute_flip = flip;
+  compute_flip[0] = 0xc0027900u;
+  compute_flip[4] = 0xc0043700u;
+  compute_flip[8] = static_cast<uint32_t>(compute_arg);
+  compute_flip[11] = 0x0620062fu;
+  const bool compute_emitted =
+      Gen5::AgcAcbSetFlip(reinterpret_cast<Gen5::CommandBuffer *>(&acb_layout),
+                          handle, -1, 1, compute_arg) == acb.data() &&
+      std::equal(compute_flip.begin(), compute_flip.end(), acb.begin());
+  bool compute_complete = false;
+  gpu.SendCommandSync([&] {
+    CommandProcessor processor(renderer, 0x20);
+    processor.BufferInit();
+    Pm4Execution execution;
+    compute_complete =
+        processor.Process(execution, acb) == Pm4ProcessResult::Complete;
+    processor.BufferFlush();
+  });
+  timeout = 2'000'000;
+  Require(name, "compute flip",
+          compute_emitted && compute_complete &&
+              EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
+                                           &timeout) == 0 &&
+              count == 1 &&
+              VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
+              flipped_arg == compute_arg,
+          "the compute flip packet is not the native one or did not flip");
+
   // Vblanks while the event is undelivered count in that one event.
   Require(name, "vblank event",
           VideoOut::VideoOutAddVblankEvent(flips, handle, nullptr) == 0,
@@ -55825,6 +56104,27 @@ void CheckPm4Flip() {
   Require(name, "wait for a shown buffer", shown_complete && shown_pending == 0,
           "the wait returned before its buffer's flip was presented");
 
+  // A flipped surface can be the first layer of a cached array, as a headset
+  // eye of a stereo render target is; the frame copies only that layer.
+  gpu.SendCommandSync([&] {
+    auto eyes = VulkanHarness::MakeLinearDesc(
+        image_base + 0x20000, 0, vk::Format::eR8G8B8A8Srgb,
+        Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
+        {64, 64, 1}, 2, 4, 1);
+    eyes.info.tile_mode = Prospero::TileMode::kRenderTarget;
+    eyes.info.pitch = 0;
+    eyes.info.UpdateSize();
+    (void)renderer.GetTextureCache().FindImage(eyes);
+    eyes.info.data.size = 0;
+    eyes.info.resources.layers = 1;
+    eyes.info.UpdateSize();
+    auto &scheduler = renderer.GetCommandScheduler();
+    auto &frame = window.presenter->PrepareFrame(
+        scheduler.Current(), eyes.info, 0x8000000022000000ull, false);
+    scheduler.Finish();
+    window.presenter->Discard(frame);
+  });
+
   gpu.WaitForIdle();
   Require(name, "close",
           VideoOut::VideoOutClose(headset) == 0 &&
@@ -55833,6 +56133,65 @@ void CheckPm4Flip() {
   EventQueue::KernelDeleteEqueue(flips);
   renderer.ShutdownGpu();
   VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Device information by handle checks the handle, then clears the output
+// before it checks that the library is initialized. No reprojection pass runs
+// on the host, so every status field is zero once reprojection is initialized.
+// Vibration checks the handle, then the frequency only while a headset is
+// connected.
+void CheckHmd2() {
+  constexpr const char *name = "Hmd2";
+  Loader::SymbolDatabase hmd2;
+  Libs::InitHmd2_1(&hmd2);
+  const auto func = [&](const char *nid) {
+    return hmd2.FindByNid(nid, Loader::SymbolType::Func)->vaddr;
+  };
+  const auto get_status =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(void *)>(func("8GkaY2B7opM"));
+  const auto initialize =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(const void *, void *)>(
+          func("C0rPwER-yxg"));
+  const auto device_info =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, void *)>(
+          func("4BlE4IPXP0Q"));
+  std::array<uint8_t, 28> info;
+  info.fill(0xff);
+  const auto filled = info;
+  Require(name, "device information by handle",
+          device_info(0x0f000002, info.data()) == -1972240381 && // 0x8a720003
+              info == filled &&
+              device_info(0x0f000001, info.data()) == -1972240382 && // 0x8a720002
+              info == std::array<uint8_t, 28>{},
+          "the handle or the output was checked out of order");
+  const auto set_vibration =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, int32_t)>(
+          func("Al4qjNREVQQ"));
+  const auto vibration_checked = [&](bool connected) {
+    Config::Load({.vr_enabled = connected});
+    const int out_of_range = connected ? -1972240375 : 0; // 0x8a720009
+    return set_vibration(0x0f000002, 26) == -1972240381 && // 0x8a720003
+           set_vibration(0x0f000001, 0) == 0 &&
+           set_vibration(0x0f000001, 25) == 0 &&
+           set_vibration(0x0f000001, 26) == out_of_range &&
+           set_vibration(0x0f000001, -1) == out_of_range;
+  };
+  Require(name, "vibration",
+          vibration_checked(false) && vibration_checked(true),
+          "the handle or the frequency was checked wrongly");
+  static Hmd2::ReprojectionState work;
+  // Work and display buffers, and no see-through buffer.
+  const std::array<void *, 9> param{&work, &work};
+  std::array<uint8_t, 0x68> status;
+  status.fill(0xff);
+  Require(name, "status",
+          get_status(status.data()) ==
+                  Hmd2::ERROR_REPROJECTION_NOT_INITIALIZED &&
+              initialize(param.data(), nullptr) == 0 &&
+              get_status(status.data()) == 0 &&
+              status == std::array<uint8_t, 0x68>{},
+          "the reprojection status is not that of none completed");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -56470,11 +56829,11 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
-    RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(false));
-    RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(true));
-    RunCase(&vulkan, ComputeWave64Reduction(false, false));
-    RunCase(&vulkan, ComputeWave64Reduction(true, false));
-    RunCase(&vulkan, ComputeWave64Reduction(false, true));
+    for (const auto &op : kWaveReductions) {
+      if (op.graphics_name != nullptr) RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(op));
+      RunCase(&vulkan, ComputeWave64Reduction(op));
+    }
+    RunCase(&vulkan, ComputeWave64Reduction(kWaveMinimum, true));
     RunCase(&vulkan, VectorDpp8Captured(false));
     for (const u32 wave_size : {32u, 64u})
       for (const bool fi : {false, true})
@@ -57101,8 +57460,16 @@ int main(int argc, char **argv) {
     CheckFlipRate();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--hmd2-only") == 0) {
+    CheckHmd2();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {
     CheckDeviceCreation();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-derivatives-only") == 0) {
+    CheckComputeDerivativesDevice();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--video-out-only") == 0) {
@@ -57149,6 +57516,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
     RunCase(&vulkan, VectorVop3IntegerOps());
+    RunCase(&vulkan, VectorMsadU8SkipsZeroReferenceBytes());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {

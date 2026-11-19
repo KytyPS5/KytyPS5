@@ -1036,9 +1036,11 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
 		if (!guest_context) {
 			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx]() mutable {
+			std::thread([thread, signum, handler, ctx,
+			             tcb = Loader::RuntimeLinker::GetThreadTcb()]() mutable {
 				SignalDispatchScope helper_scope;
-				auto*               previous_self = PthreadSwapSelfForSignal(thread);
+				Loader::RuntimeLinker::SetThreadTcb(tcb);
+				auto* previous_self = PthreadSwapSelfForSignal(thread);
 				handler(signum, &ctx);
 				PthreadSwapSelfForSignal(previous_self);
 			}).detach();
@@ -3153,6 +3155,7 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("n1-v6FgU7MQ", Memory::KernelConfiguredFlexibleMemorySize);
 	LIB_FUNC("vSMAm3cxYTY", Memory::KernelMprotect);
 	LIB_FUNC("9bfdLIyuwCY", Memory::KernelMtypeprotect);
+	LIB_FUNC("RPAHEYSOt1s", Memory::KernelWriteRemapIntoPrtCommand);
 	LIB_FUNC("2SKEx6bSq-4", Memory::KernelBatchMap);
 	LIB_FUNC("kBJzF8x4SyE", Memory::KernelBatchMap2);
 	LIB_FUNC("pU-QydtGcGY", Memory::KernelMemoryPoolReserve);

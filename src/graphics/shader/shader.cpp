@@ -441,9 +441,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& mesh = info.mesh;
 		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		                       mesh.output_primitive_size, mesh.primitives_per_group,
+		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
+		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -554,9 +554,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
 	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
-	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 	mesh.scratch_size_dwords = data.scratch_size_dwords;
+	// VGT_GS_OUT_PRIM_TYPE 0, 1 and 2 output points, lines and triangles.
+	mesh.output_primitive_size = sh.m_vgtGsOutPrimType + 1u;
+	mesh.provoking_vertex =
+	    context.GetModeControl().provoking_vtx_last ? mesh.output_primitive_size - 1u : 0u;
 	const auto fast_launch = (context.GetShaderStages() >> 19u) & 3u;
 	EXIT_NOT_IMPLEMENTED(fast_launch > 1u);
 	mesh.fast_launch = fast_launch != 0;
@@ -591,7 +594,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
+	    sh.m_vgtGsOutPrimType > 2u ||
+	    (!native_ngg && sh.m_vgtGsMaxVertOut < mesh.output_primitive_size) ||
 	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
 	    mesh.max_vertices == 0u) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
@@ -624,7 +628,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
 	const auto stages = context.GetShaderStages();
-	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0 || (stages & 0x20u) != 0);
+	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);

@@ -1886,6 +1886,13 @@ static bool IsAmmMemoryRange(uint64_t vaddr, size_t size) {
 	       size <= kExtendedMemoryBase + kExtendedMemorySize - vaddr;
 }
 
+// A PRT range holds its addresses without physical memory; CPU access faults.
+int MapPrtMemory(uint64_t vaddr, size_t size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+	return ReplaceFixedRangeWithReserved(vaddr, size);
+}
+
 int UnmapAmmMemory(uint64_t vaddr, size_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
@@ -2383,6 +2390,53 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
 		EXIT_IF(MapDirectMemory(&address, length, prot, 0x10, static_cast<int64_t>(offset),
 		                        page_size, "", type) != OK);
 		mapped += length;
+	}
+	return OK;
+}
+
+// Moves a mapped range onto PRT addresses; the pages keep their memory type.
+int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(prt_vaddr, size) || !IsAmmMemoryRange(old_vaddr, size)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (!IsReservedSpan(prt_vaddr, size)) {
+		return KERNEL_ERROR_EACCES;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(old_vaddr, size, &ranges) ||
+	    std::any_of(ranges.begin(), ranges.end(),
+	                [](const auto& range) { return range.type != VirtualRangeType::Direct; })) {
+		return AMM_ERROR_REGION_NOT_FULLY_MAPPED;
+	}
+	// The new mapping references the pages before the old one releases them.
+	for (const auto& range: ranges) {
+		void* address = reinterpret_cast<void*>(prt_vaddr + (range.start - old_vaddr));
+		EXIT_IF(MapDirectMemory(&address, range.size, prot, 0x10,
+		                        static_cast<int64_t>(range.offset), PRT_PAGE_SIZE, "",
+		                        range.memory_type) != OK);
+	}
+	UnmapMemoryOwners(ranges, [] {});
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelWriteRemapIntoPrtCommand(uint32_t* record, uint64_t prt_vaddr,
+                                                 uint64_t old_vaddr, uint64_t size, int prot,
+                                                 int prot_mask, uint64_t* record_size) {
+	PRINT_NAME();
+	if (!IsAmmMemoryRange(prt_vaddr, size) || !IsAmmMemoryRange(old_vaddr, size) ||
+	    (prot & ~0x3f7) != 0 || prot_mask != 0x3f3) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (record != nullptr) {
+		record[0] = 0x8327u | static_cast<uint32_t>(prot) << 12;
+		record[1] = static_cast<uint32_t>(prt_vaddr >> 14);
+		record[2] = static_cast<uint32_t>(old_vaddr >> 14);
+		record[3] = static_cast<uint32_t>(size >> 14 << 5 | (old_vaddr >> 46 & 3) << 2 |
+		                                  (prt_vaddr >> 46 & 3));
+	}
+	if (record_size != nullptr) {
+		*record_size = 16;
 	}
 	return OK;
 }

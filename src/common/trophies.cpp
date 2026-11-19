@@ -59,6 +59,15 @@ std::optional<uint64_t> ReadUnsigned(const Json& value) {
 	           : std::nullopt;
 }
 
+// Empty when the package is missing or too large.
+std::vector<std::byte> ReadPackage(const std::filesystem::path& path) {
+	File file(path, File::Mode::Read);
+	if (file.IsInvalid() || file.Size() > MaxPackageSize) {
+		return {};
+	}
+	return file.ReadWholeBuffer();
+}
+
 Json ReadJson(const Files& files, std::string_view name) {
 	const auto entry = files.find(name);
 	if (entry == files.end()) {
@@ -222,11 +231,7 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 } // namespace
 
 Package LoadPackage(const std::filesystem::path& path, int console_language) {
-	File file(path, File::Mode::Read);
-	if (file.IsInvalid() || file.Size() > MaxPackageSize) {
-		return {};
-	}
-	return ParsePackage(file.ReadWholeBuffer(), console_language);
+	return ParsePackage(ReadPackage(path), console_language);
 }
 
 std::filesystem::path PackagePath(uint32_t service_label) {
@@ -335,11 +340,7 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 }
 
 UdsRules LoadUdsRules(const std::filesystem::path& path) {
-	File file(path, File::Mode::Read);
-	if (file.IsInvalid() || file.Size() > MaxPackageSize) {
-		return {};
-	}
-	const auto bytes = file.ReadWholeBuffer();
+	const auto bytes = ReadPackage(path);
 	Files      files;
 	uint64_t   size = 0;
 	if (!ReadFiles(bytes, files, size)) {
@@ -412,6 +413,33 @@ UdsRules LoadUdsRules(const std::filesystem::path& path) {
 		events[condition["eventName"].get<std::string>()].push_back(std::move(parsed));
 	}
 	return events;
+}
+
+std::set<std::string> LoadActivityIds(const std::filesystem::path& path) {
+	const auto bytes = ReadPackage(path);
+	Files      files;
+	uint64_t   size = 0;
+	if (!ReadFiles(bytes, files, size)) {
+		return {};
+	}
+	const auto enums = ReadJson(files, "enum_definition.json");
+	if (!enums.contains("enumArray") || !enums["enumArray"].is_array()) {
+		return {};
+	}
+	std::set<std::string> ids;
+	for (const auto& group: enums["enumArray"]) {
+		if (!group.contains("sourceId") || !group["sourceId"].is_string() ||
+		    !group["sourceId"].get_ref<const std::string&>().starts_with("activity") ||
+		    !group.contains("enumValueArray") || !group["enumValueArray"].is_array()) {
+			continue;
+		}
+		for (const auto& value: group["enumValueArray"]) {
+			if (value.contains("name") && value["name"].is_string()) {
+				ids.insert(value["name"].get<std::string>());
+			}
+		}
+	}
+	return ids;
 }
 
 std::filesystem::path UdsPackagePath(uint32_t service_label) {

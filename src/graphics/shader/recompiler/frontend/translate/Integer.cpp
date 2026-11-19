@@ -296,6 +296,26 @@ void Translator::V_SAD_U32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
+void Translator::V_MSAD_U8(const Decoder::Instruction& inst) {
+	const auto lhs    = ReadU32(inst.src0);
+	const auto rhs    = ReadU32(inst.src1);
+	auto       result = ReadU32(inst.src2);
+	for (uint32_t offset = 0; offset < 32u; offset += 8u) {
+		const auto byte = [&](IR::U32 value) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract,
+			                       {value, IR::Value(offset), IR::Value(8u)}));
+		};
+		const auto reference = byte(rhs);
+		const auto difference =
+		    IR::U32(ir.Emit(IR::ValueOpcode::IAbs32, {ir.ISub(byte(lhs), reference)}));
+		// Bytes whose reference in src1 is zero do not contribute.
+		const auto masked = ir.Select(ir.INotEqual(reference, IR::U32(IR::Value(0u))), difference,
+		                              IR::U32(IR::Value(0u)));
+		result = ir.IAdd(result, masked);
+	}
+	WriteOperand(DestinationOperand(inst), result);
+}
+
 void Translator::S_BITSET_B32(const Decoder::Instruction& inst, bool set) {
 	const auto offset = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(31u)));
 	const auto bit    = ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), offset);

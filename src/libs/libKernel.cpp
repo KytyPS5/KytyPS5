@@ -1820,6 +1820,81 @@ LIB_DEFINE(InitLibKernelWriteThrottling) {
 
 } // namespace LibKernelWriteThrottling
 
+namespace LibKernelModuleInfo {
+
+LIB_VERSION("libkernel_module_info", 1, "libkernel", 1, 1);
+
+struct ModuleInfo2 {
+	uint64_t st_size;
+	char     name[256];
+	struct {
+		uint64_t address;
+		uint32_t size;
+		int32_t  prot;
+	} segments[4];
+	uint32_t segment_count;
+	uint8_t  fingerprint[20];
+};
+static_assert(sizeof(ModuleInfo2) == 0x160);
+
+// The loaded game modules, executable first; system libraries are HLE, not modules.
+static int KYTY_SYSV_ABI KernelGetModuleList2(int32_t* handles, uint64_t num, uint64_t* count) {
+	PRINT_NAME();
+
+	if (handles == nullptr || count == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	const auto ids = Common::Singleton<Loader::RuntimeLinker>::Instance()->GetProgramIds();
+	if (ids.size() > num) {
+		return LibKernel::KERNEL_ERROR_ENOMEM;
+	}
+	std::copy(ids.begin(), ids.end(), handles);
+	*count = ids.size();
+	return OK;
+}
+
+static int KYTY_SYSV_ABI KernelGetModuleInfo2(int32_t handle, ModuleInfo2* info) {
+	PRINT_NAME();
+
+	if (info == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (info->st_size != sizeof(ModuleInfo2)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	const auto* program =
+	    Common::Singleton<Loader::RuntimeLinker>::Instance()->FindProgramById(handle);
+	if (program == nullptr) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	*info = {sizeof(ModuleInfo2)};
+	std::snprintf(info->name, sizeof(info->name), "%s",
+	              Common::PathToString(program->file_name.filename()).c_str());
+	const auto* phdr = program->elf->GetPhdr();
+	for (Loader::Elf64_Half i = 0;
+	     i < program->elf->GetEhdr()->e_phnum && info->segment_count < std::size(info->segments);
+	     i++) {
+		const auto& p = phdr[i];
+		if (p.p_memsz != 0 && (p.p_type == Loader::PT_LOAD || p.p_type == Loader::PT_OS_RELRO)) {
+			// PF_R, PF_W, PF_X are bits 2, 1, 0; read, write, execute are bits 0, 1, 2.
+			const int32_t prot = static_cast<int32_t>(((p.p_flags & Loader::PF_R) >> 2u) |
+			                                          (p.p_flags & Loader::PF_W) |
+			                                          ((p.p_flags & Loader::PF_X) << 2u));
+			info->segments[info->segment_count++] = {program->base_vaddr + p.p_vaddr,
+			                                         static_cast<uint32_t>(p.p_memsz), prot};
+		}
+	}
+	return OK;
+}
+
+LIB_DEFINE(InitLibKernelModuleInfo) {
+	LIB_FUNC("ZzzC3ZGVAkc", KernelGetModuleList2);
+	LIB_FUNC("QgsKEUfkqMA", KernelGetModuleInfo2);
+}
+
+} // namespace LibKernelModuleInfo
+
 namespace Posix {
 
 LIB_VERSION("Posix", 1, "libkernel", 1, 1);
@@ -3371,6 +3446,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LibKernelApr::InitLibKernel_1_Apr(s);
 	Posix::InitLibKernel_1_Posix(s);
 	LibKernelWriteThrottling::InitLibKernelWriteThrottling(s);
+	LibKernelModuleInfo::InitLibKernelModuleInfo(s);
 
 	LIB_OBJECT("f7uOxY9mM1U", &LibKernel::g_stack_chk_guard);
 	LIB_OBJECT("djxxOmW6-aw", &LibKernel::g_progname);

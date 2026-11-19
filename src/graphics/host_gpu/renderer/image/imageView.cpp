@@ -329,12 +329,15 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
 	}
+#if !defined(__APPLE__)
+	// MoltenVK lacks VK_EXT_image_view_min_lod; sampling clamps at the base level instead (#1068).
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;
 	}
+#endif
 	vk::ImageViewCreateInfo create {};
 	create.pNext                           = &usage;
 	create.image                           = image.image;

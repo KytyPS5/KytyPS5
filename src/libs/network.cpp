@@ -2324,7 +2324,9 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
+	// SO_ONESBCAST: Linux and Winsock have no equivalent and reject the raw ID. Black Ops II's
+	// local lobby sets it on its UDP socket after SO_BROADCAST and drops the socket on failure.
 	if (level == 0xffff && optname == 0x10000) {
 		if (optlen != sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);

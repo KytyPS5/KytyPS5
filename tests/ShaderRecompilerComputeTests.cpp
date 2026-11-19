@@ -11562,6 +11562,51 @@ public:
               "a texture with no mapped byte was resolved");
       scheduler.Finish();
     }
+    constexpr uintptr_t partly_mapped_base = 0x0000000205020000ull;
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000, 0,
+                &direct_offset) == 0,
+            "texture allocation failed");
+    void *mapped = reinterpret_cast<void *>(partly_mapped_base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                          direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(partly_mapped_base),
+            "texture mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(partly_mapped_base, size / 2);
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy(words.begin(), words.end(), value.dwords.begin());
+      value.dwords[0] = static_cast<u32>(partly_mapped_base >> 8u);
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      auto &executor = context.GetRenderExecutor();
+      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "partly mapped texture",
+              binding.image_id && context.GetTextureCache().FindTexture(binding.image_id, binding.desc),
+              "a texture with a mapped byte was bound as null");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(partly_mapped_base, size / 2);
+      scheduler.Finish();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(partly_mapped_base, size) == 0,
+            "texture mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "texture allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

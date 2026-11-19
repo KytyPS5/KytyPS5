@@ -29,6 +29,9 @@ void InitNet_1_NpEntitlementAccess(Loader::SymbolDatabase* s);
 namespace LibNpEntitlementAccessPft {
 void InitNet_1_NpEntitlementAccessPft(Loader::SymbolDatabase* s);
 }
+namespace LibNpPartner {
+void InitNet_1_NpPartner(Loader::SymbolDatabase* s);
+}
 namespace LibNpTrophy2 {
 void InitNet_1_NpTrophy2(Loader::SymbolDatabase* s);
 }
@@ -1734,6 +1737,56 @@ LIB_DEFINE(InitNet_1_NpManager) {
 
 } // namespace LibNpManager
 
+namespace LibNpPartner {
+
+LIB_VERSION("libSceNpPartner001", 1, "libSceNpPartner001", 1, 1);
+
+namespace {
+bool g_np_partner_initialized = false;
+}
+
+// sceNpEAAccessInitialize/Terminate are no-arg on PS5 (AnyPS5 research, docs/dev/debt/
+// libSceNpPartner001.md). UFC 6 (PPSA23566) imports both and calls Initialize at startup.
+static int KYTY_SYSV_ABI NpEAAccessInitialize() {
+	PRINT_NAME();
+
+	g_np_partner_initialized = true;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpEAAccessTerminate() {
+	PRINT_NAME();
+
+	g_np_partner_initialized = false;
+	return OK;
+}
+
+// From AnyPS5's PPSA34015 disassembly: (int userId, bool* result); EA Access has no
+// server here, so report no subscription.
+static int KYTY_SYSV_ABI NpHasEAAccessSubscription(int /*user_id*/, bool* has_subscription) {
+	PRINT_NAME();
+
+	if (has_subscription == nullptr) {
+		return OK;
+	}
+	*has_subscription = false;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpHasEAAccessSubscriptionAbortRequest() {
+	PRINT_NAME();
+	return OK;
+}
+
+LIB_DEFINE(InitNet_1_NpPartner) {
+	LIB_FUNC("pMxXhNozUX8", NpEAAccessTerminate);
+	LIB_FUNC("pQfYTZHznMc", NpHasEAAccessSubscriptionAbortRequest);
+	LIB_FUNC("7CxI50-xlCk", NpEAAccessInitialize);
+	LIB_FUNC("+OnbUs1CV0M", NpHasEAAccessSubscription);
+}
+
+} // namespace LibNpPartner
+
 namespace LibNpSessionSignaling {
 
 LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
@@ -2992,6 +3045,7 @@ LIB_DEFINE(InitNet_1) {
 	LibNetCtl::InitNet_1_NetCtl(s);
 	LibNpCommerce::InitNet_1_NpCommerce(s);
 	LibNpManager::InitNet_1_NpManager(s);
+	LibNpPartner::InitNet_1_NpPartner(s);
 	LibNpSessionSignaling::InitNet_1_NpSessionSignaling(s);
 	LibNpEntitlementAccess::InitNet_1_NpEntitlementAccess(s);
 	LibNpEntitlementAccessPft::InitNet_1_NpEntitlementAccessPft(s);

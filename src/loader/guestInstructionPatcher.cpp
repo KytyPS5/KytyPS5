@@ -114,6 +114,7 @@ struct DecodedCodeInstruction {
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
 	std::set<uintptr_t>                         branch_targets;
+	std::set<uintptr_t>                         callees;
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
@@ -187,9 +188,9 @@ uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
 
 DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 	DecodedCodeInstruction decoded {.address = address};
-	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address),
-	                                           end - address, &decoded.instruction,
-	                                           decoded.operands.data());
+	const auto             status =
+	    ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address), end - address,
+	                           &decoded.instruction, decoded.operands.data());
 	if (!ZYAN_SUCCESS(status)) {
 		decoded.instruction.length = 0;
 		return decoded;
@@ -469,8 +470,17 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 
 	std::optional<std::vector<uintptr_t>> resolved_targets;
 	for (const uintptr_t table_address: table_candidates) {
-		if (table_address < segment_start || table_address > segment_end ||
-		    *table_size > (segment_end - table_address) / sizeof(s32)) {
+		// Compilers usually place jump tables in .rodata, outside the executable segment, so
+		// accept any table inside the loaded module image; the targets are validated below.
+		uintptr_t table_limit = segment_end;
+		if (table_address < segment_start || table_address >= segment_end) {
+			const auto* module = GetContainingModule(reinterpret_cast<const void*>(table_address));
+			if (module == nullptr) {
+				continue;
+			}
+			table_limit = reinterpret_cast<uintptr_t>(module->end);
+		}
+		if (*table_size > (table_limit - table_address) / sizeof(s32)) {
 			continue;
 		}
 
@@ -531,6 +541,18 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 
 				const uintptr_t next_address  = address + decoded.instruction.length;
 				const uintptr_t branch_target = GetRelativeTarget(decoded);
+				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL) {
+					// A direct call always enters a function, even one that lies inside the
+					// caller's range because .eh_frame did not list it. Tail jumps are left
+					// out: they can target the middle of a function, and splitting it there
+					// would truncate the red-zone liveness of its first half. A call to the next
+					// instruction reads its own address with a following pop and stays in the
+					// same function, so it is not a function entry.
+					if (branch_target != next_address && branch_target >= segment_start &&
+					    branch_target < segment_end) {
+						function.callees.insert(branch_target);
+					}
+				}
 				if (branch_target >= function_start && branch_target < function_end) {
 					function.branch_targets.insert(branch_target);
 				}
@@ -579,6 +601,140 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
 	return function;
+}
+
+// Adds the direct-call targets reachable from the known function starts, and the functions that
+// follow their decoded code after alignment padding, to a fixpoint.
+void AddDecodedCallees(uintptr_t segment_start, uintptr_t segment_end,
+                       std::vector<uintptr_t>* starts) {
+	std::set<uintptr_t>    known(starts->begin(), starts->end());
+	std::vector<uintptr_t> pending(starts->begin(), starts->end());
+	while (!pending.empty()) {
+		const uintptr_t start = pending.back();
+		pending.pop_back();
+		const auto      following = known.upper_bound(start);
+		const uintptr_t end       = following != known.end() ? *following : segment_end;
+		const auto      function  = DecodeFunction(start, end, segment_start, segment_end);
+		for (const uintptr_t callee: function.callees) {
+			if (known.insert(callee).second) {
+				pending.push_back(callee);
+			}
+		}
+		// Functions reached only through pointers (lambdas, virtual functions) are neither called
+		// directly nor always listed in .eh_frame. Clang pads between functions with int3 up to
+		// the 16-byte function alignment, so the aligned address after the padding that ends a
+		// function starts another one.
+		if (function.instructions.empty()) {
+			continue;
+		}
+		const auto& [last_address, last] = *function.instructions.rbegin();
+		uintptr_t  next                  = last_address + last.instruction.length;
+		const bool complete =
+		    !function.has_indirect_branch && IsControlFlowTerminator(last.instruction);
+		if (!complete) {
+			// Blocks reached only through an unresolved jump table still belong to this
+			// function: step over them linearly up to the int3 padding that ends it.
+			while (next < end && *reinterpret_cast<const u8*>(next) != 0xcc) {
+				const auto decoded = DecodeCodeInstruction(next, end);
+				if (decoded.instruction.length == 0) {
+					break;
+				}
+				next += decoded.instruction.length;
+			}
+		}
+		const uintptr_t padding_start = next;
+		while (next < end && *reinterpret_cast<const u8*>(next) == 0xcc) {
+			++next;
+		}
+		if (next < end && (next & 15u) == 0 && (complete || next != padding_start) &&
+		    known.insert(next).second) {
+			pending.push_back(next);
+		}
+	}
+	starts->assign(known.begin(), known.end());
+}
+
+// Frame-pointer functions can reach their red zone through RBP instead of RSP: after
+// `push rbp; mov rbp, rsp; push ...; sub rsp, imm` RSP sits `frame` bytes below RBP, so
+// [rbp - d] with d > frame lies below RSP. Clang emits this for leaf functions that keep locals
+// in the red zone. Such accesses are not RSP-relative, so the per-instruction model cannot
+// see them; protect the whole function conservatively when one is found.
+void DetectFramePointerRedZone(DecodedFunction& function, uintptr_t function_start) {
+	if (function.uses_red_zone && function.requires_conservative_red_zone_tracking) {
+		return;
+	}
+
+	auto it = function.instructions.find(function_start);
+	if (it == function.instructions.end()) {
+		return;
+	}
+	const auto is_reg = [](const ZydisDecodedOperand& operand, ZydisRegister reg) {
+		return operand.type == ZYDIS_OPERAND_TYPE_REGISTER && operand.reg.value == reg;
+	};
+	const auto next = [&function](const auto& current) {
+		return function.instructions.find(current->first + current->second.instruction.length);
+	};
+
+	// push rbp
+	if (it->second.instruction.mnemonic != ZYDIS_MNEMONIC_PUSH ||
+	    !is_reg(it->second.operands[0], ZYDIS_REGISTER_RBP)) {
+		return;
+	}
+	// mov rbp, rsp
+	it = next(it);
+	if (it == function.instructions.end() ||
+	    it->second.instruction.mnemonic != ZYDIS_MNEMONIC_MOV ||
+	    !is_reg(it->second.operands[0], ZYDIS_REGISTER_RBP) ||
+	    !is_reg(it->second.operands[1], ZYDIS_REGISTER_RSP)) {
+		return;
+	}
+	const uintptr_t frame_setup = it->first;
+
+	// Callee-saved pushes and a fixed stack allocation define RSP relative to RBP.
+	s64 frame = 0;
+	for (it = next(it); it != function.instructions.end(); it = next(it)) {
+		const auto& decoded = it->second;
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+			frame += static_cast<s64>(sizeof(u64));
+		} else if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_SUB &&
+		           is_reg(decoded.operands[0], ZYDIS_REGISTER_RSP) &&
+		           decoded.stack_pointer_delta.has_value() && *decoded.stack_pointer_delta < 0) {
+			frame -= *decoded.stack_pointer_delta;
+		} else {
+			break;
+		}
+	}
+
+	bool uses_red_zone = false;
+	for (const auto& [address, decoded]: function.instructions) {
+		if (address <= frame_setup) {
+			continue;
+		}
+		// RBP must keep the frame address for the offsets below to mean anything.
+		if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_POP &&
+		    decoded.instruction.mnemonic != ZYDIS_MNEMONIC_LEAVE &&
+		    WritesRegister(decoded, ZYDIS_REGISTER_RBP)) {
+			return;
+		}
+		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+			    operand.mem.base != ZYDIS_REGISTER_RBP ||
+			    operand.mem.index != ZYDIS_REGISTER_NONE || operand.mem.disp.size == 0) {
+				continue;
+			}
+			const s64 access_start = operand.mem.disp.value;
+			const s64 access_size  = std::max<s64>(operand.size / 8, 1);
+			if (access_start < -frame &&
+			    access_start + access_size > -frame - static_cast<s64>(GuestRedZoneSize)) {
+				uses_red_zone = true;
+			}
+		}
+	}
+	if (uses_red_zone) {
+		function.uses_red_zone                           = true;
+		function.requires_conservative_red_zone_tracking = true;
+	}
 }
 
 std::optional<RedZoneMask> TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
@@ -1307,7 +1463,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		constexpr s64 ShortJumpMin = std::numeric_limits<s8>::min();
 		constexpr s64 ShortJumpMax = std::numeric_limits<s8>::max();
-		const auto    relay_slot = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
+		const auto    relay_slot   = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
 			const s64 displacement =
 			    static_cast<s64>(address) - static_cast<s64>(site + ShortJumpSize);
 			return displacement >= ShortJumpMin && displacement <= ShortJumpMax;
@@ -1370,15 +1526,14 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 					}
 				}
 				if (span.instructions.empty() ||
-				    !(span.continuation <= site ||
-				      span.patch_start >= site_span.continuation) ||
+				    !(span.continuation <= site || span.patch_start >= site_span.continuation) ||
 				    overlaps_patched_span(span.patch_start, span.continuation)) {
 					continue;
 				}
 
 				const uintptr_t relay_address = span.patch_start + NearJumpSize;
-				const s64 displacement = static_cast<s64>(relay_address) -
-				                         static_cast<s64>(short_jump_address + ShortJumpSize);
+				const s64       displacement = static_cast<s64>(relay_address) -
+				                               static_cast<s64>(short_jump_address + ShortJumpSize);
 				if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
 					continue;
 				}
@@ -1400,8 +1555,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		std::map<uintptr_t, uintptr_t> relay_parent {{site, site}};
 		std::vector<uintptr_t>         relay_queue {site};
 		for (size_t queue_index = 0;
-		     !host_span && !final_relay_slot && queue_index < relay_queue.size();
-		     ++queue_index) {
+		     !host_span && !final_relay_slot && queue_index < relay_queue.size(); ++queue_index) {
 			const uintptr_t current = relay_queue[queue_index];
 			if (current != site) {
 				if (std::ranges::find(relay_slots, current) != relay_slots.end()) {
@@ -1411,8 +1565,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				}
 				const auto near_slot =
 				    std::ranges::find_if(relay_slots, [current](uintptr_t address) {
-					    const s64 displacement = static_cast<s64>(address) -
-					                             static_cast<s64>(current + ShortJumpSize);
+					    const s64 displacement =
+					        static_cast<s64>(address) - static_cast<s64>(current + ShortJumpSize);
 					    return address != current && displacement >= ShortJumpMin &&
 					           displacement <= ShortJumpMax;
 				    });
@@ -1451,10 +1605,9 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			continue;
 		}
 
-		const auto* site_trampoline =
-		    module->trampoline_gen.getCode() + *site_trampoline_offset;
-		auto&     patch_gen = module->patch_gen;
-		uintptr_t relay_address {};
+		const auto* site_trampoline = module->trampoline_gen.getCode() + *site_trampoline_offset;
+		auto&       patch_gen       = module->patch_gen;
+		uintptr_t   relay_address {};
 		if (final_relay_slot) {
 			relay_address = *final_relay_slot;
 			patch_gen.reset();
@@ -1481,8 +1634,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		uintptr_t jump_target = relay_address;
 		while (final_short_jump != site) {
 			patch_gen.reset();
-			patch_gen.setSize(final_short_jump -
-			                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.setSize(final_short_jump - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
 			patch_gen.jmp(reinterpret_cast<void*>(jump_target),
 			              Xbyak::CodeGenerator::LabelType::T_SHORT);
 			EXIT_IF(Xbyak::GetError() != 0);
@@ -1543,7 +1695,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	if (tsc_only && tsc_multiplier == 0) {
 		return result;
 	}
-	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+	auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
 		return result;
 	}
@@ -1559,10 +1711,15 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	std::ranges::sort(starts);
 	const auto unique_end = std::ranges::unique(starts).begin();
 	starts.erase(unique_end, starts.end());
+	if (protect_memory) {
+		// .eh_frame omits some functions (leaf functions among them), which then decode as the
+		// tail of whichever function precedes them and are never analyzed for red-zone use.
+		AddDecodedCallees(segment_addr, segment_end, &starts);
+	}
 
 	std::unique_lock lock {module->mutex};
 	const size_t     trampoline_begin = module->trampoline_gen.getSize();
-	bool analyze_red_zone = protect_memory;
+	bool             analyze_red_zone = protect_memory;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif
@@ -1578,6 +1735,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		++result.function_count;
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
 		if (analyze_red_zone) {
+			DetectFramePointerRedZone(function, function_start);
 			AnalyzeRedZoneLiveness(function);
 		}
 		result.instruction_count += function.instructions.size();

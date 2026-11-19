@@ -56139,6 +56139,8 @@ void CheckPm4Flip() {
 // Device information by handle checks the handle, then clears the output
 // before it checks that the library is initialized. No reprojection pass runs
 // on the host, so every status field is zero once reprojection is initialized.
+// Vibration checks the handle, then the frequency only while a headset is
+// connected.
 void CheckHmd2() {
   constexpr const char *name = "Hmd2";
   Loader::SymbolDatabase hmd2;
@@ -56163,6 +56165,21 @@ void CheckHmd2() {
               device_info(0x0f000001, info.data()) == -1972240382 && // 0x8a720002
               info == std::array<uint8_t, 28>{},
           "the handle or the output was checked out of order");
+  const auto set_vibration =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, int32_t)>(
+          func("Al4qjNREVQQ"));
+  const auto vibration_checked = [&](bool connected) {
+    Config::Load({.vr_enabled = connected});
+    const int out_of_range = connected ? -1972240375 : 0; // 0x8a720009
+    return set_vibration(0x0f000002, 26) == -1972240381 && // 0x8a720003
+           set_vibration(0x0f000001, 0) == 0 &&
+           set_vibration(0x0f000001, 25) == 0 &&
+           set_vibration(0x0f000001, 26) == out_of_range &&
+           set_vibration(0x0f000001, -1) == out_of_range;
+  };
+  Require(name, "vibration",
+          vibration_checked(false) && vibration_checked(true),
+          "the handle or the frequency was checked wrongly");
   static Hmd2::ReprojectionState work;
   // Work and display buffers, and no see-through buffer.
   const std::array<void *, 9> param{&work, &work};

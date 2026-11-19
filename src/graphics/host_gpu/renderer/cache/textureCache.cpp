@@ -860,6 +860,13 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
+	if (info.type == source.info.type && !info.resources.Contains(source.info.resources) &&
+	    info.samples == 1 && info.metadata.compression == VideoOutCompression::Uncompressed &&
+	    source.SafeToDownload() && BcAlias::Publish(*this, source)) {
+		InitializeImage(expanded_id);
+		FreeImage(source_id);
+		return expanded_id;
+	}
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
@@ -1301,6 +1308,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
+				if (CanDownload(resolved)) {
+					RefreshImage(result);
+					if (resolved.SafeToDownload()) {
+						(void)BcAlias::Publish(*this, resolved);
+					}
+				}
 				FreeImage(result);
 				result = {};
 			}

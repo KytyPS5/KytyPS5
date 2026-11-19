@@ -7183,7 +7183,7 @@ public:
                 "unexpected tiled fixture layout");
         const auto before = texture_cache.FindImage(cached);
         (void)texture_cache.FindTexture(before, cached);
-        for (uint32_t mip = 0; mip < 9; ++mip) {
+        for (uint32_t mip = 0; mip < cached.info.resources.levels; ++mip) {
           vk::ClearValue clear{};
           clear.color.uint32.fill(0x10u + mip);
           TextureCacheTestAccess::ClearImage(
@@ -7206,6 +7206,12 @@ public:
                           std::vector<u32>{0x5a5a5a5au},
                   "lost GPU contents or failed to initialize the added layer");
         }
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(restored, cached);
+        Require(name, "mixed resource round trip",
+                ReadCachedTexel(name, context, restored, {}, {2, 2, 1}, 0, 9) ==
+                    std::vector<u32>{0x19191919u},
+                "retiring the mip chain lost a GPU-only tail mip");
       }
       {
         constexpr uint64_t offset = 0x4b10000;
@@ -7226,9 +7232,14 @@ public:
         requested.view_info.layer_count = requested_layers;
         requested.view_info.type = vk::ImageViewType::e2DArray;
         requested.info.UpdateSize();
+        const uint64_t layer_size = requested.info.data.size / requested_layers;
+        const uint32_t mip0_layer =
+            static_cast<uint32_t>(cached.info.mip_layout[0].offset / layer_size);
         Require(name, "array footprints",
                 requested.info.data.size == 0x80000 &&
-                    requested.info.data.size > cached.info.data.size,
+                    requested.info.data.size > cached.info.data.size &&
+                    cached.info.mip_layout[0].offset % layer_size == 0 &&
+                    mip0_layer + 1 < requested_layers,
                 "unexpected tiled array fixture layout");
         const auto before = texture_cache.FindImage(cached);
         (void)texture_cache.FindTexture(before, cached);
@@ -7237,6 +7248,10 @@ public:
         TextureCacheTestAccess::ClearImage(
             texture_cache, scheduler.Current(), before,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        clear.color.uint32.fill(0x37u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), before,
+            {vk::ImageAspectFlagBits::eColor, 1, 1, 0, 1}, clear);
         const auto after = texture_cache.FindImage(requested);
         Require(name, "array growth with one level",
                 after != before &&
@@ -7246,12 +7261,18 @@ public:
                 "insufficient backing was retained");
         (void)texture_cache.FindTexture(after, requested);
         Require(name, "array growth contents",
-                ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 0) ==
+                ReadCachedTexel(name, context, after, {}, {4, 1, 1}, mip0_layer) ==
                         std::vector<u32>{0x21212121u} &&
                     ReadCachedTexel(name, context, after, {}, {4, 1, 1},
                                     requested_layers - 1) ==
                         std::vector<u32>{0x6b6b6b6bu},
                 "lost GPU contents or failed to initialize the added layers");
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(restored, cached);
+        Require(name, "array resource round trip",
+                ReadCachedTexel(name, context, restored, {}, {4, 1, 1}, 0, 1) ==
+                    std::vector<u32>{0x37373737u},
+                "retiring the mip chain lost a GPU-only mip");
       }
       {
         constexpr uint64_t offset = 0x4b00000;
@@ -7274,6 +7295,11 @@ public:
         requested.view_info.layer_count = 1;
         const auto before = texture_cache.FindImage(cached);
         (void)texture_cache.FindTexture(before, cached);
+        vk::ClearValue clear{};
+        clear.color.uint32.fill(0xabcdef01u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), before,
+            {vk::ImageAspectFlagBits::eColor, 1, 1, 0, 1}, clear);
         const auto after = texture_cache.FindImage(requested);
         Require(name, "missing-layer fallback replacement",
                 after != before &&
@@ -7284,8 +7310,18 @@ public:
         Require(name, "missing-layer texture acquisition",
                 texture_cache.FindTexture(after, requested) != nullptr &&
                     ReadCachedTexel(name, context, after, {}, {1, 1, 1}, 1) ==
-                        std::vector<u32>{values[2]},
-                "the requested layer was not usable");
+                        std::vector<u32>{0xabcdef01u},
+                "the requested layer lost GPU-written guest bytes");
+        clear.color.uint32.fill(0x55667788u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), after,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1}, clear);
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(restored, cached);
+        Require(name, "missing-layer round trip",
+                ReadCachedTexel(name, context, restored, {}, {1, 1, 1}, 0, 1) ==
+                    std::vector<u32>{0x55667788u},
+                "retiring the array lost GPU-written guest bytes");
       }
 
       auto sampled =

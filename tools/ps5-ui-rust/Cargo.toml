@@ -1,0 +1,21 @@
+[package]
+name = "ps5-ui-rust"
+version = "0.1.0"
+edition = "2021"
+description = "PlayStation 5 style Dashboard & KytyPS5 Launcher written in pure Rust"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+rfd = "0.15"
+gilrs = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

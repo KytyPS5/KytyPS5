@@ -7334,6 +7334,96 @@ public:
                     std::vector<u32>{0x55667788u},
                 "retiring the array lost GPU-written guest bytes");
       }
+      const auto linear_d32 = [](uint64_t address, uint64_t size,
+                                 uint32_t levels, uint32_t layers) {
+        auto desc = MakeLinearDesc(address, size, vk::Format::eD32Sfloat,
+                                   Prospero::BufferFormat::k32Float,
+                                   Prospero::ImageType::kColor2D, {2, 1, 1},
+                                   layers, sizeof(float), 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.resources.levels = levels;
+        desc.view_info.format = vk::Format::eD32Sfloat;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        desc.view_info.level_count = levels;
+        desc.view_info.layer_count = layers;
+        desc.view_info.type = layers > 1 ? vk::ImageViewType::e2DArray
+                                         : vk::ImageViewType::e2D;
+        return desc;
+      };
+      const auto depth_texels = [](float first, float second) {
+        return std::vector<u32>{std::bit_cast<u32>(first),
+                                std::bit_cast<u32>(second)};
+      };
+      constexpr uint32_t depth_array_layers = 4;
+      constexpr std::array<float, 2 * depth_array_layers> depth_guest{
+          0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f, 1.0f};
+      {
+        constexpr uint64_t offset = 0x4ba0000;
+        constexpr std::array<float, 2> mip_clears{0.0625f, 0.9375f};
+        constexpr float layer_clear = 0.3125f;
+        std::memcpy(memory + offset, depth_guest.data(), sizeof(depth_guest));
+        auto cached = linear_d32(base + offset, 3 * sizeof(float), 2, 1);
+        cached.info.mip_layout[0] = {0, 2 * sizeof(float), 2, 1};
+        cached.info.mip_layout[1] = {2 * sizeof(float), sizeof(float), 1, 1};
+        auto requested =
+            linear_d32(base + offset, sizeof(depth_guest), 1, depth_array_layers);
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(before, cached);
+        for (uint32_t mip = 0; mip < mip_clears.size(); ++mip) {
+          vk::ClearValue clear{};
+          clear.depthStencil.depth = mip_clears[mip];
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), before,
+              {vk::ImageAspectFlagBits::eDepth, mip, 1, 0, 1}, clear);
+        }
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "depth layer growth",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "insufficient depth backing was retained");
+        (void)texture_cache.FindDepthTarget(after, requested);
+        Require(name, "depth layer growth contents",
+                ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 0) ==
+                        depth_texels(mip_clears[0], mip_clears[0]) &&
+                    ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 1) ==
+                        depth_texels(mip_clears[1], depth_guest[3]) &&
+                    ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 3) ==
+                        depth_texels(depth_guest[6], depth_guest[7]),
+                "lost a GPU-only depth mip or failed to initialize the added layers");
+        vk::ClearValue clear{};
+        clear.depthStencil.depth = layer_clear;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), after,
+            {vk::ImageAspectFlagBits::eDepth, 0, 1, 1, 1}, clear);
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(restored, cached);
+        Require(name, "depth mip round trip",
+                ReadCachedTexel(name, context, restored, {}, {1, 1, 1}, 0, 1) ==
+                    std::vector<u32>{std::bit_cast<u32>(layer_clear)},
+                "retiring the depth array lost GPU-written guest bytes");
+      }
+      {
+        constexpr uint64_t offset = 0x4bb0000;
+        std::memcpy(memory + offset, depth_guest.data(), sizeof(depth_guest));
+        auto cached = linear_d32(base + offset, 2 * sizeof(float), 1, 1);
+        auto requested =
+            linear_d32(base + offset, sizeof(depth_guest), 1, depth_array_layers);
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(before, cached);
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "guest-only depth layer growth",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before),
+                "insufficient depth backing was retained");
+        (void)texture_cache.FindDepthTarget(after, requested);
+        Require(name, "guest-only depth layer contents",
+                ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 3) ==
+                    depth_texels(depth_guest[6], depth_guest[7]),
+                "the added depth layers were never initialized from guest memory");
+      }
 
       auto sampled =
           MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,

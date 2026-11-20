@@ -870,12 +870,31 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	    })) {
 		const auto raster =
 		    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+		// Resolving marked every target; a dropped one is no attachment of this pass, so it must
+		// not stay marked, or a stage sampling it expects an attachment layout that is never set.
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX + 1> unmarked {};
+		size_t                                                unmarked_count = 0;
+		for (const auto& color: colors) {
+			if (color.desc.info.samples != raster) unmarked[unmarked_count++] = color.image_id;
+		}
 		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
 			return color.desc.info.samples != raster;
 		});
 		targets.color_count -= static_cast<uint32_t>(dropped.size());
 		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
-			targets.depth = {};
+			unmarked[unmarked_count++] = targets.depth.image_id;
+			targets.depth              = {};
+		}
+		auto&      cache = m_context.GetTextureCache();
+		const auto kept  = std::span {targets.colors, targets.color_count};
+		for (size_t i = 0; i < unmarked_count; i++) {
+			const auto id = unmarked[i];
+			if (targets.depth.image_id == id ||
+			    std::ranges::any_of(kept,
+			                        [&](const RenderColorInfo& c) { return c.image_id == id; })) {
+				continue;
+			}
+			cache.GetImage(id).binding.is_target = false;
 		}
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {

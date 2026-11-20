@@ -73,6 +73,11 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
 		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
+	if (program.info.ray_query) {
+		descriptor_bindings.push_back(
+		    {ShaderRecompiler::IR::UnusedAccelerationStructureBinding,
+		     vk::DescriptorType::eAccelerationStructureKHR, 1, stage, nullptr});
+	}
 }
 
 // Creates the descriptor set layout and the pipeline layout that uses it.

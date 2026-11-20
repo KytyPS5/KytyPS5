@@ -52,6 +52,8 @@ enum class Counter {
 	PresentNs, // Includes image acquire and overlay preparation.
 	PresentAcquireNs,
 	OverlayNs,
+	AudioHolds,  // GPU stalls that held guest audio, once per stall however many threads waited.
+	AudioHoldNs, // Time from the first held submit of a stall to its end.
 	Count
 };
 

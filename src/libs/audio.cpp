@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -404,7 +405,9 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
 		if (queued < static_cast<int>(prepared_size)) {
-			if (port->queue_primed) {
+			// A hold for a long pipeline compile drains the host queue on purpose, so the first
+			// submit after it re-primes without counting an underrun.
+			if (port->queue_primed && !Common::GpuStall::ResumedFromHold()) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
 			}
 			port->queue_primed = false;
@@ -989,6 +992,10 @@ int KYTY_SYSV_ABI AudioOutSetVolume(int handle, uint32_t flag, int* vol) {
 }
 
 int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
+	// Waits out a long pipeline compile before anything else, so a game that paces its scenes
+	// by audio does not run ahead of its frozen frames. Holding first also means a port closed
+	// during the wait is seen as invalid below.
+	Common::GpuStall::WaitWhileStalled();
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(param == nullptr);
@@ -1013,6 +1020,8 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 }
 
 int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr) {
+	// Held first for the same reason as AudioOutOutputs.
+	Common::GpuStall::WaitWhileStalled();
 	// EXIT_NOT_IMPLEMENTED(ptr == nullptr);
 
 	Audio::OutputParam params[1];

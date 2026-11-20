@@ -14417,6 +14417,42 @@ public:
         }
       }
       host_lds_limit = saved_lds_limit;
+
+      constexpr u32 group_threads = 16 * 16 * 6;
+      std::vector<u32> group_shader;
+      AppendVop3(&group_shader, 0x346, 3, Vgpr(2), InlineU32(4), Vgpr(1));
+      AppendVop3(&group_shader, 0x346, 3, Vgpr(3), InlineU32(4), Vgpr(0));
+      group_shader.insert(group_shader.end(), {
+          EncodeVop2(0x1a, 4, InlineU32(2), 3), EncodeVop2(0x25, 5, InlineU32(1), 3),
+          EncodeDs0(0x0d), EncodeDs1(0, 5, 4), EncodeSopp(0x0a, 0),
+          EncodeVop2(0x26, 6, 255, 3), group_threads - 1u,
+          EncodeVop2(0x1a, 6, InlineU32(2), 6),
+          EncodeDs0(0x36), EncodeDs1(7, 0, 6), EncodeSopp(0x0c, 0)});
+      AppendVop3(&group_shader, 0x360, 8, Vgpr(3), InlineU32(63));
+      AppendVop3(&group_shader, 0x346, 7, 8, InlineU32(16), Vgpr(7));
+      group_shader.insert(group_shader.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(7, 0, 4)});
+      AppendEnd(&group_shader);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(group_shader.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(group_shader.size() * sizeof(u32))});
+      cache.FillBuffer(lds_output, group_threads * sizeof(u32), sentinel, false);
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(group_shader.data()),
+                           .num_thread_x = 16, .num_thread_y = 16, .num_thread_z = 6,
+                           .wave_size = 64, .user_sgpr = 4, .tidig_comp_cnt = 2,
+                           .lds_size = group_threads * sizeof(u32) / 512u});
+      set_buffer(0, lds_output, group_threads * sizeof(u32));
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      cache.ReadMemory(lds_output, group_threads * sizeof(u32));
+      std::vector<u32> group_actual(group_threads);
+      Require(name, "oversized workgroup readback",
+              LibKernel::Memory::TryReadBacking(lds_output, group_actual.data(),
+                                                group_actual.size() * sizeof(u32)),
+              "oversized workgroup result could not be read back");
+      for (u32 thread = 0; thread < group_threads; thread++) {
+        Require(name, "1536-thread wave64 workgroup barrier, LDS exchange and lane read",
+                group_actual[thread] == group_threads - thread + ((thread | 63u) << 16u),
+                "thread " + std::to_string(thread) + " read " + std::to_string(group_actual[thread]));
+      }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     });
@@ -24671,6 +24707,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_subgroup_size_control = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -24689,10 +24726,18 @@ private:
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
     m_runtime_context.device = m_device;
+    vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_control{};
+    subgroup_control.pNext = &m_runtime_context.mesh_shader_properties;
     vk::PhysicalDeviceProperties2 properties{};
-    properties.pNext = &m_runtime_context.mesh_shader_properties;
+    properties.pNext = &subgroup_control;
     m_physical_device.getProperties2(&properties);
     m_runtime_context.physical_device_properties = properties.properties;
+    m_runtime_context.min_subgroup_size = subgroup_control.minSubgroupSize;
+    m_runtime_context.max_subgroup_size = subgroup_control.maxSubgroupSize;
+    m_runtime_context.compute_subgroup_size_control_enabled =
+        m_subgroup_size_control &&
+        (subgroup_control.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute) &&
+        subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
@@ -24981,6 +25026,8 @@ private:
     device_features13.pNext = &barycentric;
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
+    device_features13.subgroupSizeControl = available_features13.subgroupSizeControl;
+    m_subgroup_size_control = available_features13.subgroupSizeControl == true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;

@@ -144,6 +144,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .stage              = stage,
 	    .shader_hash        = shader_hash,
 	    .wave_size          = wave_size,
+	    .subgroup_size      = wave_size,
 	    .user_data_base     = user_data_base,
 	    .has_address_writes = has_address_writes,
 	    .info               = std::move(info),

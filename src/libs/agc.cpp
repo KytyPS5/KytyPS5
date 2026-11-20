@@ -3085,6 +3085,37 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	                        poll_cycles);
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address,
+                                        uint32_t size_in_bytes) {
+	PRINT_NAME();
+
+	return AgcDcbPrimeUtcl2(buf, address, size_in_bytes);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address,
+                                        uint32_t size_in_bytes) {
+	PRINT_NAME();
+
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(5);
+
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	const auto address_value = reinterpret_cast<uint64_t>(address);
+	cmd[0] = KYTY_PM4(5, Pm4::IT_NOP, 0u);
+	cmd[1] = 0u;
+	cmd[2] = static_cast<uint32_t>(address_value);
+	cmd[3] = static_cast<uint32_t>(address_value >> 32u);
+	cmd[4] = size_in_bytes;
+
+	return cmd;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
                                            uint8_t mailbox, uint8_t signal_type, uint8_t op) {
 	return AgcAcbMemSemaphore(buf, address, mailbox, signal_type, op);

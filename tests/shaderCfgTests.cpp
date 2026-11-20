@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/meshSlices.h"
@@ -4456,6 +4457,84 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
             result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer)] != 0,
         "unbased FLAT did not compile through BDA");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // A guest page past the BDA table is a missing page: get_bda_pointer compares the 64-bit page
+  // with the table size before it indexes the table or records a fault.
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto begin  = source.find("%get_bda_pointer = OpFunction");
+  const auto end    = source.find("OpFunctionEnd", begin);
+  const auto body   = begin == std::string::npos ? std::string {} : source.substr(begin, end - begin);
+  const auto pages  = std::to_string(Libs::Graphics::BufferCache::CACHING_NUMPAGES);
+  std::string pages_id;
+  for (size_t line = 0; line < source.size();) {
+    const auto next = std::min(source.find('\n', line), source.size());
+    const auto text = source.substr(line, next - line);
+    if (text.find("OpConstant %ulong " + pages) != std::string::npos ||
+        text.find("OpConstant %uint64 " + pages) != std::string::npos) {
+      pages_id = text.substr(text.find('%'), text.find(' ', text.find('%')) - text.find('%'));
+    }
+    line = next + 1;
+  }
+  Check(!pages_id.empty(), "BDA page lookup has no page table size constant");
+
+  // Follow the comparison: it must pick the table index and guard the fault record.
+  std::vector<std::vector<std::string>> instructions;
+  {
+    std::istringstream lines(body);
+    for (std::string line; std::getline(lines, line);) {
+      std::istringstream words(line);
+      std::vector<std::string> tokens;
+      for (std::string word; words >> word;) {
+        tokens.push_back(word);
+      }
+      instructions.push_back(std::move(tokens));
+    }
+  }
+  // Empty pattern entries match any operand.
+  const auto find = [&](std::initializer_list<std::string> pattern) -> std::string {
+    for (const auto &tokens: instructions) {
+      if (tokens.size() == pattern.size() &&
+          std::equal(pattern.begin(), pattern.end(), tokens.begin(),
+                     [](const std::string &p, const std::string &t) { return p.empty() || p == t; })) {
+        return tokens[0];
+      }
+    }
+    return {};
+  };
+  const auto in_range = find({"", "=", "OpULessThan", "%bool", "", pages_id});
+  const auto index    = find({"", "=", "OpSelect", "%uint", in_range, "", "%uint_0"});
+  const auto missing  = find({"", "=", "OpLogicalNot", "%bool", in_range});
+  auto       unbacked = find({"", "=", "OpLogicalOr", "%bool", "", missing});
+  if (unbacked.empty()) {
+    unbacked = find({"", "=", "OpLogicalOr", "%bool", missing, ""});
+  }
+  Check(!in_range.empty() && !index.empty() && !missing.empty() && !unbacked.empty() &&
+            !find({"", "=", "OpAccessChain", "", "%bda_pagetable", "%uint_0", index}).empty() &&
+            !find({"OpBranchConditional", unbacked, "", ""}).empty(),
+        "BDA page lookup did not select the table index with the bounds check");
+
+  // The fault bitmap is only touched in the block the bounds check branches into.
+  std::string record_label;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 4 && tokens[0] == "OpBranchConditional" && tokens[1] == in_range) {
+      record_label = tokens[2];
+    }
+  }
+  bool     in_record    = false;
+  bool     record_index = false;
+  uint32_t record_uses  = 0;
+  uint32_t total_uses   = 0;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 3 && tokens[1] == "=" && tokens[2] == "OpLabel") {
+      in_record = !record_label.empty() && tokens[0] == record_label;
+    }
+    const auto uses = static_cast<uint32_t>(std::count(tokens.begin(), tokens.end(), "%fault_buffer"));
+    total_uses += uses;
+    record_uses += in_record ? uses : 0;
+    record_index |= in_record && std::find(tokens.begin(), tokens.end(), index) != tokens.end();
+  }
+  Check(!record_label.empty() && record_uses != 0 && record_uses == total_uses && record_index,
+        "BDA fault record is not guarded by the page bounds check");
 }
 
 void TestNewShaderRecompilerDsReadWrite2Translation() {

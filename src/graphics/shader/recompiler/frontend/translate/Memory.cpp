@@ -617,8 +617,8 @@ void Translator::IMAGE_GET_RESINFO(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageQueryDimensions, {resource, address},
-	                              AddMemoryInfo(memory, inst.pc));
+	const auto result = ir.Emit(IR::ValueOpcode::ImageQueryDimensions,
+	                            {resource, address, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
 	WriteImageComponents(inst.dst, result, memory, 4u);
 }
 
@@ -627,8 +627,9 @@ void Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageQueryLod, {resource, sampler, address},
-	                              AddMemoryInfo(memory, inst.pc));
+	const auto result =
+	    ir.Emit(IR::ValueOpcode::ImageQueryLod, {resource, sampler, address, ir.GetExec()},
+	            AddMemoryInfo(memory, inst.pc));
 	WriteImageComponents(inst.dst, result, memory, 2u);
 }
 

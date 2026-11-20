@@ -667,9 +667,19 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
-			return vaddr >= range.first && vaddr + size <= range.first + range.second;
-		});
+		const auto end = vaddr + size;
+		auto covered = vaddr;
+		while (covered < end) {
+			auto next = covered;
+			for (const auto& [start, length]: m_owned) {
+				if (start <= covered && length <= UINT64_MAX - start) {
+					next = std::max(next, start + length);
+				}
+			}
+			if (next == covered) return false;
+			covered = next;
+		}
+		return true;
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1074,25 +1084,10 @@ private:
 		}
 #else
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-		std::vector<std::pair<uint64_t, uint64_t>> occupied;
-		FILE*                                      maps = fopen("/proc/self/maps", "r");
-		EXIT_IF(maps == nullptr);
-
-		char line[512];
-		while (fgets(line, sizeof(line), maps) != nullptr) {
-			unsigned long long mapping_start = 0;
-			unsigned long long mapping_end   = 0;
-			if (sscanf(line, "%llx-%llx", &mapping_start, &mapping_end) == 2) {
-				occupied.emplace_back(static_cast<uint64_t>(mapping_start),
-				                      static_cast<uint64_t>(mapping_end));
-			}
-		}
-		fclose(maps);
-
 		uint64_t reserved_bytes = 0;
-		auto reserve_range = [this, &reserved_bytes](uint64_t start, uint64_t end) {
+		auto reserve_range = [this, &reserved_bytes](uint64_t start, uint64_t end) -> bool {
 			if (end <= start) {
-				return;
+				return true;
 			}
 
 			const auto size  = end - start;
@@ -1106,7 +1101,7 @@ private:
 				if (ptr != MAP_FAILED) {
 					munmap(ptr, size);
 				}
-				return;
+				return false;
 			}
 
 			reserved_bytes += size;
@@ -1117,14 +1112,41 @@ private:
 			} else {
 				m_owned.emplace_back(start, size);
 			}
+			return true;
 		};
 
 		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
 			const auto [region_start, region_end] = regions[i];
 			const auto before = reserved_bytes;
-			for (const auto& [start, end]:
-			     AlignedFreeRangesInRegion(region_start, region_end, occupied, PageSize())) {
-				reserve_range(start, end);
+			constexpr unsigned MaxReservationAttempts = 4;
+			for (unsigned attempt = 0; attempt < MaxReservationAttempts; ++attempt) {
+				std::vector<std::pair<uint64_t, uint64_t>> occupied;
+				FILE* maps = fopen("/proc/self/maps", "r");
+				EXIT_IF(maps == nullptr);
+				char line[512];
+				while (fgets(line, sizeof(line), maps) != nullptr) {
+					unsigned long long mapping_start = 0;
+					unsigned long long mapping_end = 0;
+					if (sscanf(line, "%llx-%llx", &mapping_start, &mapping_end) == 2) {
+						occupied.emplace_back(static_cast<uint64_t>(mapping_start),
+						                      static_cast<uint64_t>(mapping_end));
+					}
+				}
+				fclose(maps);
+				bool retry = false;
+				for (const auto& [start, end]:
+				     AlignedFreeRangesInRegion(region_start, region_end, occupied, PageSize())) {
+					if (!reserve_range(start, end)) {
+						retry = true;
+						break;
+					}
+				}
+				if (!retry) break;
+				if (attempt + 1 == MaxReservationAttempts) {
+					EXIT("failed to reserve guest address space region [0x%016" PRIx64
+					     ", 0x%016" PRIx64 ") after %u attempts\n",
+					     region_start, region_end, MaxReservationAttempts);
+				}
 			}
 			if (reserved_bytes == before) {
 				// Every guest region is needed for fixed-address guest mappings. Continuing

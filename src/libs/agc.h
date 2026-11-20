@@ -233,6 +233,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 uint64_t KYTY_SYSV_ABI  AgcAcbWaitOnAddressGetSize(uint8_t size);
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
                                            uint8_t mailbox, uint8_t signal_type, uint8_t op);
+uint32_t* KYTY_SYSV_ABI AgcAcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address,
+                                        uint32_t size_in_bytes);
+uint32_t* KYTY_SYSV_ABI AgcDcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address,
+                                        uint32_t size_in_bytes);
 uint32_t* KYTY_SYSV_ABI AgcDcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
                                            uint8_t mailbox, uint8_t signal_type, uint8_t op);
 uint32_t KYTY_SYSV_ABI  AgcAcbAtomicMemGetSize();

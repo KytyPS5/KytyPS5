@@ -2046,6 +2046,17 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	return cmd;
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
+                                                 const uint32_t* workload_ids,
+                                                 uint32_t        workload_count) {
+	return AgcDcbSetWorkloadsActive(buf, stream_id, workload_ids, workload_count);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
+                                                  uint32_t workload_id) {
+	return AgcDcbSetWorkloadComplete(buf, stream_id, workload_id);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count) {
@@ -3072,6 +3083,41 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
 	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
 	                        poll_cycles);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
+	return AgcAcbMemSemaphore(buf, address, mailbox, signal_type, op);
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicMemGetSize() {
+	PRINT_NAME();
+
+	return 9u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicGdsGetSize() {
+	PRINT_NAME();
+
+	return 11u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbPrimeUtcl2GetSize() {
+	PRINT_NAME();
+
+	return 5u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicMemGetSize() {
+	PRINT_NAME();
+
+	return 9u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicGdsGetSize() {
+	PRINT_NAME();
+
+	return 11u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,

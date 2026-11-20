@@ -37,10 +37,8 @@ constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
-[[nodiscard]] bool SameMipPlacement(const ImageMipInfo& left, const ImageMipInfo& right) {
-	return left.offset == right.offset && left.size == right.size && left.pitch == right.pitch &&
-	       left.height == right.height && left.tail_x == right.tail_x &&
-	       left.tail_y == right.tail_y && left.surface_z == right.surface_z;
+[[nodiscard]] bool SameMipPlacement(const TileMipLayout& left, const TileMipLayout& right) {
+	return left == right;
 }
 
 // Guest mip chains run backwards, so a texture with fewer levels keeps its base level at a
@@ -286,13 +284,12 @@ void TextureCache::DeleteImage(ImageId id) {
 		// non-depth replacement still drops it. Entries another surface rebound are its own.
 		const auto surface  = image.info.data.address;
 		bool       retained = false;
-		for (const auto other: FindImagesInRegion(surface, image.info.data.size, false)) {
-			const auto* owner = m_slot_images.try_get(other);
-			retained |= other != id && owner != nullptr && owner->registered && !owner->depth_id &&
-			            owner->info.IsDepth() &&
-			            owner->info.metadata.kind == ImageMetadataKind::Htile &&
-			            owner->info.data.address == surface;
-		}
+		ForEachImageInRegion(surface, image.info.data.size, [&](ImageId other, Image& owner) {
+			retained |= other != id && owner.registered && !owner.depth_id &&
+			            owner.info.IsDepth() &&
+			            owner.info.metadata.kind == ImageMetadataKind::Htile &&
+			            owner.info.data.address == surface;
+		});
 		if (!retained) {
 			std::erase_if(m_surface_metas, [&](const auto& metadata) {
 				return metadata.second.depth_address == surface;

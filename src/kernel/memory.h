@@ -187,6 +187,8 @@ int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int
 int KYTY_SYSV_ABI KernelWriteRemapIntoPrtCommand(uint32_t* record, uint64_t prt_vaddr,
                                                  uint64_t old_vaddr, uint64_t size, int prot,
                                                  int prot_mask, uint64_t* record_size);
+int KYTY_SYSV_ABI KernelWriteUnmapToPrtCommand(uint32_t* record, uint64_t vaddr, uint64_t size,
+                                               uint64_t* record_size);
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out);
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,

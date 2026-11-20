@@ -2441,6 +2441,23 @@ int KYTY_SYSV_ABI KernelWriteRemapIntoPrtCommand(uint32_t* record, uint64_t prt_
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelWriteUnmapToPrtCommand(uint32_t* record, uint64_t vaddr, uint64_t size,
+                                               uint64_t* record_size) {
+	PRINT_NAME();
+	if (!IsAmmMemoryRange(vaddr, size)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (record != nullptr) {
+		record[0] = 0x228u;
+		record[1] = static_cast<uint32_t>(vaddr >> 14);
+		record[2] = static_cast<uint32_t>(size >> 14 << 5 | (vaddr >> 46 & 3));
+	}
+	if (record_size != nullptr) {
+		*record_size = 12;
+	}
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
                                              int64_t direct_memory_start, size_t alignment,
                                              const char* name) {

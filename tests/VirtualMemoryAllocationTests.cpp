@@ -3983,6 +3983,40 @@ void TestAmmRemapIntoPrt() {
 	      MapAutomaticMemory(old, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
 	      "remapIntoPrt released the moved pages to the automatic allocator");
+
+	std::array<uint32_t, 3> unmap_record {};
+	CheckOk(test, KernelWriteUnmapToPrtCommand(unmap_record.data(), target, block, &record_size),
+	        "encode unmapToPrt");
+	Check(test,
+	      record_size == 12 &&
+	          unmap_record == std::array<uint32_t, 3> {0x228u, static_cast<uint32_t>(target >> 14),
+	                                                   static_cast<uint32_t>(block >> 14 << 5)},
+	      "unexpected unmapToPrt record");
+	AmmCommandBuffer unmap(test);
+	const auto       unmap_to_prt =
+	    unmap.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t)>("3A2X6OCHtnA");
+	Check(test,
+	      unmap_to_prt(unmap.header.data(), target + page / 2, block) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          unmap_to_prt(unmap.header.data(), target, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          unmap_to_prt(unmap.header.data(), kExtendedMemoryBase - block, block) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "unmapToPrt accepted invalid arguments");
+	CheckOk(test, unmap_to_prt(unmap.header.data(), target, block), "append unmapToPrt");
+	Check(test,
+	      unmap.Offset() == 12 &&
+	          std::equal(unmap_record.begin(), unmap_record.end(), unmap.data.begin()),
+	      "unmapToPrt did not append its three dword record");
+	CheckOk(test, unmap.Submit().result, "submit unmapToPrt");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, target, block}},
+	      "unmapToPrt did not unmap the range on the GPU");
+	ExpectRange(test, Query(test, prt), prt, prt + block * 4, 0, 0, 0, 0, 0, "anon");
+	CheckOk(test, MapAutomaticMemory(old, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "unmapToPrt kept the pages it unmapped");
+	AmmCommandBuffer again(test);
+	CheckOk(test, remap(again.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append remapIntoPrt after unmapToPrt");
+	CheckOk(test, again.Submit().result, "remapIntoPrt into a range unmapped to PRT");
 	CheckOk(test, UnmapAmmMemory(prt, block * 4), "AMM unmap PRT range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
 	        "KernelCheckedReleaseDirectMemory(donation)");

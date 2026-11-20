@@ -1089,23 +1089,25 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 	    static_cast<int64_t>(command.dmem_offset), AMM_PAGE_SIZE);
 }
 
-static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::CommandData command,
-                                uint64_t record_size) {
+// Returns the zeroed record in the guest buffer, or null when it was not appended.
+static uint32_t* AppendCommandRecord(uint64_t                        command_buffer,
+                                     CommandBufferState::CommandData command,
+                                     uint64_t                        record_size) {
 	std::scoped_lock      lock(g_command_buffer_mutex);
 	CommandBufferIterator it;
 	if (!GetOrCreateCommandBufferStateLocked(command_buffer, &it)) {
-		return false;
+		return nullptr;
 	}
 
 	auto& state = it->second;
 	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
-		return false;
+		return nullptr;
 	}
 
-	auto* record_addr    = reinterpret_cast<void*>(state.buffer + state.write_offset);
+	auto* record_addr = reinterpret_cast<uint32_t*>(state.buffer + state.write_offset);
 	std::memset(record_addr, 0, static_cast<size_t>(record_size));
 	state.commands.push_back({state.write_offset, std::move(command)});
-	return CommitCommandBufferRecord(command_buffer, &state, record_size);
+	return CommitCommandBufferRecord(command_buffer, &state, record_size) ? record_addr : nullptr;
 }
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
@@ -2294,16 +2296,36 @@ static int KYTY_SYSV_ABI AmmCommandBufferRemapIntoPrt(void* command_buffer, uint
 	command.size   = size;
 	command.prot   = prot;
 
-	const auto header = reinterpret_cast<uint64_t>(command_buffer);
-	uint64_t   buffer = 0;
-	uint32_t   offset = 0;
-	AprShared::ReadGuest(header + COMMAND_BUFFER_DATA_OFFSET, &buffer);
-	AprShared::ReadGuest(header + COMMAND_BUFFER_OFFSET_OFFSET, &offset);
-	if (!AppendCommandRecord(header, command, AMM_REMAP_RECORD_SIZE)) {
+	auto* record = AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                                   AMM_REMAP_RECORD_SIZE);
+	if (record == nullptr) {
 		return LibKernel::KERNEL_ERROR_EBUSY;
 	}
-	return LibKernel::Memory::KernelWriteRemapIntoPrtCommand(
-	    reinterpret_cast<uint32_t*>(buffer + offset), va, old_va, size, prot, prot_mask, nullptr);
+	return LibKernel::Memory::KernelWriteRemapIntoPrtCommand(record, va, old_va, size, prot,
+	                                                         prot_mask, nullptr);
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferUnmapToPrt(void* command_buffer, uint64_t va,
+                                                    uint64_t size) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr ||
+	    LibKernel::Memory::KernelWriteUnmapToPrtCommand(nullptr, va, size, nullptr) != OK) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	// The range ends in the state MapAsPrt leaves it in.
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAsPrt;
+	command.va   = va;
+	command.size = size;
+
+	auto* record = AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                                   AMM_MAP_AS_PRT_RECORD_SIZE);
+	if (record == nullptr) {
+		return LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	return LibKernel::Memory::KernelWriteUnmapToPrtCommand(record, va, size, nullptr);
 }
 
 static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va, uint64_t size) {
@@ -2508,6 +2530,7 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
 	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
 	LIB_FUNC("0Xo9g4goDXU", Ampr::AmmCommandBufferRemapIntoPrt);
+	LIB_FUNC("3A2X6OCHtnA", Ampr::AmmCommandBufferUnmapToPrt);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);
 	LIB_FUNC("lwS-7y3jcBI", Ampr::AmmSubmitCommandBuffer);
 	LIB_FUNC("NnKhlMJtIsI", Ampr::AmmSubmitCommandBufferAndGetId);

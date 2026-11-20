@@ -1309,7 +1309,7 @@ static uint32_t CpWaitFlipDone(CommandProcessor& cp, const uint32_t* block, uint
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	// Driver user data has R = 1; a compute queue's flip has R = 0.
+	// Driver user data has R = 1 in a DCB and R = 0 on a compute queue.
 	if ((KYTY_PM4_R(cmd_id) == 1u || cp.IsAsyncComputeQueue()) &&
 	    buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		switch (buffer[1] & 0xff000000u) {

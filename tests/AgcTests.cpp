@@ -131,6 +131,24 @@ TEST(Agc, JumpPatchSetTargetKeepsLowBitsAndWritesHighDword) {
 	EXPECT_EQ(jump, (std::array<uint32_t, 4> {0xc0023f00u, 0x56789abfu, 0x1234u, 0x12300010u}));
 }
 
+TEST(Agc, AcbUserDataHasNoR) {
+	uint64_t   label = 0;
+	Packet<16> dcb;
+	Packet<16> acb;
+	Gen5::AgcDcbWaitRegMem(dcb.Buf(), 1, 3, 0, 0, &label, 1, ~0ull, 400);
+	Gen5::AgcAcbWaitRegMem(acb.Buf(), 1, 3, 0, &label, 1, ~0ull, 400);
+	EXPECT_EQ((std::array {dcb.dw[0], dcb.dw[13], acb.dw[0], acb.dw[13]}),
+	          (std::array {0xc0027904u, 0xc0017904u, 0xc0027900u, 0xc0017900u}));
+	dcb.dw[0] = acb.dw[0];
+	dcb.dw[13] = acb.dw[13];
+	EXPECT_EQ(acb.dw, dcb.dw);
+	EXPECT_EQ(Gen5::AgcWaitRegMemPatchReference(acb.dw.data(), 2), 0);
+
+	Packet<11> semaphore;
+	Gen5::AgcAcbMemSemaphore(semaphore.Buf(), &label, 0, 0, 7);
+	EXPECT_EQ((std::array {semaphore.dw[0], semaphore.dw[8]}), (std::array {0xc0027900u, 0xc0017900u}));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

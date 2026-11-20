@@ -56648,9 +56648,9 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
 
   Require(name, "wait stream",
           emit(0, 7) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
+              packet == decltype(packet){0xc0027900u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
                                          0xc0023900u, low & ~0x7u, high, 0xe0010000u,
-                                         0xc0017904u, 0x342u, 0xc9000000u} &&
+                                         0xc0017900u, 0x342u, 0xc9000000u} &&
               Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
               Gen5::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
           "semaphore wait differs from the native stream");
@@ -56664,7 +56664,7 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
 
   Require(name, "increment stream",
           emit(0, 6) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
+              packet == decltype(packet){0xc0027900u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
                                          0xc0011000u, poison, poison,
                                          0xc0023900u, low & ~0x7u, high, 0xc0010000u} &&
               Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&

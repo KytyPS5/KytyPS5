@@ -2424,8 +2424,9 @@ static constexpr uint32_t AGC_MEM_SEMAPHORE_END_TAG             = 0xc9000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW           = 4u;
 static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
-static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
-	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+// Driver user data has R = 1 in a DCB and R = 0 in an ACB.
+static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag, uint32_t r = 1u) {
+	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, r);
 	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = tag;
 }
@@ -3009,13 +3010,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, 
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
-                                         uint8_t cache_policy, const volatile void* address,
-                                         uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
-	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
-	                        poll_cycles);
-}
-
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
                                            uint8_t mailbox, uint8_t signal_type, uint8_t op) {
 	EXIT_NOT_IMPLEMENTED(op != 6u && op != 7u);
@@ -3028,7 +3022,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 
 	const auto address_value = reinterpret_cast<uint64_t>(address);
 	const bool signal        = (op == 6u);
-	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 0u);
 	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
@@ -3046,7 +3040,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	semaphore[3] = (static_cast<uint32_t>(op) << 29u) | ((signal_type & 0x1u) << 20u) |
 	               ((mailbox & 0x1u) << 16u);
 	if (!signal) {
-		write_agc_internal_data_packet(semaphore + 4, AGC_MEM_SEMAPHORE_END_TAG);
+		write_agc_internal_data_packet(semaphore + 4, AGC_MEM_SEMAPHORE_END_TAG, 0u);
 	}
 
 	return cmd;
@@ -3825,7 +3819,7 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 
 bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	    payload[0] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		return false;
 	}
 
@@ -3843,12 +3837,9 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG || payload[1] == AGC_DRAW_END_TAG);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
-                                         uint8_t op, uint8_t cache_policy,
-                                         const volatile void* address, uint64_t reference,
-                                         uint64_t mask, uint32_t poll_cycles) {
-	PRINT_NAME();
-
+static uint32_t* wait_reg_mem(CommandBuffer* buf, uint8_t size, uint8_t compare_function, uint8_t op,
+                              uint8_t cache_policy, const volatile void* address, uint64_t reference,
+                              uint64_t mask, uint32_t poll_cycles, uint32_t r) {
 	AgcTrace("\t size             = 0x%02" PRIx8 "\n"
 	         "\t compare_function = 0x%02" PRIx8 "\n"
 	         "\t op               = 0x%02" PRIx8 "\n"
@@ -3886,7 +3877,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 		return nullptr;
 	}
 
-	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, r);
 	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = (wait32 ? AGC_WAIT_USER_DATA_BEGIN_32_TAG : AGC_WAIT_USER_DATA_BEGIN_64_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
@@ -3894,7 +3885,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 
 	auto* wait = cmd + AGC_WAIT_USER_DATA_BEGIN_DW;
 	auto* end  = wait + wait_dw;
-	write_agc_internal_data_packet(end, AGC_WAIT_USER_DATA_END_TAG);
+	write_agc_internal_data_packet(end, AGC_WAIT_USER_DATA_END_TAG, r);
 
 	if (wait32) {
 		wait[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0u);
@@ -3919,6 +3910,25 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	wait[8] = poll;
 
 	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
+                                         uint8_t op, uint8_t cache_policy,
+                                         const volatile void* address, uint64_t reference,
+                                         uint64_t mask, uint32_t poll_cycles) {
+	PRINT_NAME();
+
+	return wait_reg_mem(buf, size, compare_function, op, cache_policy, address, reference, mask,
+	                    poll_cycles, 1u);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
+                                         uint8_t cache_policy, const volatile void* address,
+                                         uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
+	PRINT_NAME();
+
+	return wait_reg_mem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
+	                    poll_cycles, 0u);
 }
 
 uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {

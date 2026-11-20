@@ -201,8 +201,10 @@ void CheckStateEvents() {
 	struct Case {
 		bool auto_start;
 		bool close_on_ready;
+		bool stop;
 	};
-	for (const auto test: {Case {false, false}, Case {true, false}, Case {true, true}}) {
+	for (const auto test: {Case {false, false, false}, Case {true, false, false}, Case {true, true, false},
+	                       Case {true, false, true}}) {
 		VideoMemory                memory;
 		EventLog                   log;
 		const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
@@ -212,7 +214,7 @@ void CheckStateEvents() {
 		std::unique_lock lock(log.mutex);
 		log.add_source_returned = true;
 		log.condition.notify_all();
-		const auto expected = test.auto_start && !test.close_on_ready
+		auto expected = test.auto_start && !test.close_on_ready
 		                          ? std::vector {AVPLAYER_EVENT_STATE_READY, AVPLAYER_EVENT_STATE_PLAY}
 		                          : std::vector {AVPLAYER_EVENT_STATE_READY};
 		Check(log.condition.wait_for(lock, std::chrono::seconds(5),
@@ -220,6 +222,15 @@ void CheckStateEvents() {
 		      "deliver the state events");
 		Check(log.ready_waited_for_caller && log.thread != std::this_thread::get_id(),
 		      "AddSource returns while the READY handler runs on the player's event thread");
+		if (test.stop) {
+			lock.unlock();
+			Check(AvPlayerStop(player) == 0, "stop the playing player");
+			lock.lock();
+			expected.push_back(AVPLAYER_EVENT_STATE_STOP);
+			Check(log.condition.wait_for(lock, std::chrono::seconds(5),
+			                             [&] { return log.ids.size() == expected.size(); }),
+			      "deliver STOP after PLAY");
+		}
 		lock.unlock();
 		if (test.close_on_ready) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));

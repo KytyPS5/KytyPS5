@@ -146,6 +146,8 @@ public:
 			m_thread = nullptr;
 			return false;
 		}
+		std::lock_guard lock(m_state->mutex);
+		m_state->started = true;
 		return true;
 	}
 	void Shutdown() {
@@ -169,10 +171,10 @@ public:
 		Post(std::span(&event, 1));
 	}
 	void Post(std::span<const Event> events) {
-		if (m_thread == nullptr || events.empty()) {
+		std::lock_guard lock(m_state->mutex);
+		if (!m_state->started || m_state->quit || events.empty()) {
 			return;
 		}
-		std::lock_guard lock(m_state->mutex);
 		m_state->events.insert(m_state->events.end(), events.begin(), events.end());
 		m_state->condition.notify_one();
 	}
@@ -185,7 +187,8 @@ private:
 		std::condition_variable      condition;
 		std::deque<Event>            events;
 		std::atomic<std::thread::id> thread;
-		bool                         quit = false;
+		bool                         started = false;
+		bool                         quit    = false;
 	};
 	static KYTY_SYSV_ABI void* Run(void* arg) {
 		const auto state = std::move(*static_cast<std::shared_ptr<State>*>(arg));

@@ -1808,8 +1808,13 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
 	cmd[6]  = static_cast<uint32_t>(reference & 0xffffffffu);
 	cmd[7]  = static_cast<uint32_t>((reference >> 32u) & 0xffffffffu);
 	std::fill(cmd + 8, cmd + BranchPacketSizeDw, 0u);
-	write_branch_target(cmd + 8, then_vaddr, cache_policy1, size_in_dwords1);
-	write_branch_target(cmd + 11, else_vaddr, cache_policy2, size_in_dwords2);
+	// A null target leaves its slot zero.
+	if (then_vaddr != 0u) {
+		write_branch_target(cmd + 8, then_vaddr, cache_policy1, size_in_dwords1);
+	}
+	if (else_vaddr != 0u) {
+		write_branch_target(cmd + 11, else_vaddr, cache_policy2, size_in_dwords2);
+	}
 
 	return cmd;
 }

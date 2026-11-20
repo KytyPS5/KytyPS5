@@ -63,6 +63,14 @@ TEST(Agc, CondExecWritesAnyArguments) {
 	EXPECT_EQ(unaligned.dw, (std::array<uint32_t, 5> {0xc0032200u, 0x34561000u, 0x12u, 0u, 7u}));
 }
 
+TEST(Agc, BranchLeavesNullTargetSlotsZero) {
+	const auto* then_target = reinterpret_cast<const volatile uint32_t*>(0x1234567898ull);
+	Packet<14> dcb;
+	Gen5::AgcCbBranch(dcb.Buf(), 1, 3, nullptr, 0, 0, 1, then_target, 0x10u, 2, nullptr, 0x20u);
+	EXPECT_EQ(dcb.dw, (std::array<uint32_t, 14> {0xc00c3f00u, 0x301u, 0u, 0u, 0u, 0u, 0u, 0u,
+	                                             0x34567898u, 0x12u, 0x10000010u, 0u, 0u, 0u}));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

@@ -35,6 +35,17 @@ TEST(Agc, AcquireMemWritesBackInvalidatedGl2) {
 	}
 }
 
+TEST(Agc, AcquireMemDbFlushIsGlobal) {
+	const auto* base = reinterpret_cast<const volatile void*>(0x12345600);
+	for (const auto [gcr, expected]: {std::pair {0x910au, 0x8101u}, std::pair {0x500bu, 0xc001u},
+	                                  std::pair {0x1108u, 0x0100u}}) {
+		Packet<8> dcb;
+		Gen5::AgcDcbAcquireMem(dcb.Buf(), 1, 0x04000040u, gcr, base, 0x100, 400);
+		EXPECT_EQ(dcb.dw, (std::array<uint32_t, 8> {0xc0065800u, 0x84004040u, 0xfffffffeu, 0xffu, 1u,
+		                                            0u, 0x19u, expected}));
+	}
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

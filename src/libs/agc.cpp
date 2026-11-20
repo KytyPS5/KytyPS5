@@ -2884,7 +2884,15 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	}
 
 	constexpr uint64_t address_mask = 0xffffffffffffull;
-	const auto vaddr = reinterpret_cast<uint64_t>(base);
+	auto               vaddr        = reinterpret_cast<uint64_t>(base);
+	// A DB flush (DB_ACTION_ENA) is global: DB_DEST_BASE_ENA over the whole address range,
+	// GL1_RANGE and GL2_RANGE drop their range bit, and a ranged GLI_INV invalidates all.
+	if ((cb_db_op & 0x04000000u) != 0u) {
+		cb_db_op |= 0x4000u;
+		vaddr      = 0x100u;
+		size_bytes = address_mask;
+		gcr_cntl   = (gcr_cntl & ~0x100bu) | std::min(gcr_cntl & 3u, 1u);
+	}
 	// Cover the byte range in 256-byte units, bounded by the 48-bit address space.
 	const auto size = std::min((((vaddr & 0xffu) + size_bytes) & address_mask) + 0xffu,
 	                           (address_mask & ~uint64_t {0xff}) - vaddr) >> 8u;

@@ -7,7 +7,8 @@
 
 // Sets a host file's write time to `unix_ns` nanoseconds since the Unix epoch.
 inline void SetUnixWriteTime(const std::filesystem::path& path, int64_t unix_ns) {
-	const std::chrono::sys_time<std::chrono::nanoseconds> time {std::chrono::nanoseconds(unix_ns)};
+	const auto time = std::chrono::time_point_cast<std::filesystem::file_time_type::duration>(
+	    std::chrono::sys_time<std::chrono::nanoseconds> {std::chrono::nanoseconds(unix_ns)});
 #ifdef _MSVC_STL_VERSION // no file_clock::from_sys
 	const auto file_time = std::chrono::clock_cast<std::chrono::file_clock>(time);
 #else

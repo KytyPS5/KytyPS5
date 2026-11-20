@@ -191,6 +191,7 @@ bool SkipNoticeScreen();
 const std::string& GetLaunchActivity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
+void EnableRedZoneProtection();
 #endif
 
 const Keymap& GetKeymap();

@@ -372,6 +372,17 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 	    Throughput(Rate(shown, upload)) + " up / " + Throughput(Rate(shown, download)) + " down");
 }
 
+/// Shows the recent GPU writes that --batch-hot-readbacks downloads in another readback's wait.
+/// It is shown even at zero while the flag is on, so a feature that never fires stays visible.
+void CoDownloadRow(const Snapshot& shown) {
+	if (!Config::BatchHotReadbacksEnabled()) {
+		return;
+	}
+	Row("Co-downloaded GPU writes",
+	    Fmt("%.0f ranges/s  (", Rate(shown, Counter::BufferCoDownloads)) +
+	        Throughput(Rate(shown, Counter::BufferCoDownloadBytes)) + ")");
+}
+
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
@@ -638,6 +649,7 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		Row("Queue submits", Fmt("%.0f/s", Rate(shown, Counter::QueueSubmits)));
 		const auto faults = Rate(shown, Counter::GpuFaults);
 		Row("Write-tracking faults", Fmt("%.0f/s", faults), LevelColor(faults, 20000, 100000));
+		CoDownloadRow(shown);
 		CompilationRows(shown);
 		ImGui::EndTable();
 	}

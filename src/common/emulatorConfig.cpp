@@ -246,6 +246,10 @@ uint32_t GetFlushDraws() {
 	return g_config->flush_draws;
 }
 
+bool BatchHotReadbacksEnabled() {
+	return g_config->batch_hot_readbacks;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }

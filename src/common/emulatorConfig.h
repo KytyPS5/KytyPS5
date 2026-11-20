@@ -97,6 +97,7 @@ struct ConfigOptions {
 	bool                  readback_tiled_images           = false;
 	bool                  readback_storage_images         = false;
 	bool                  sync_raw_image_buffers          = false;
+	bool                  batch_hot_readbacks             = false;
 	bool                  partial_buffer_refresh_enabled  = false;
 	bool                  skip_redundant_unmap_drains     = false;
 	// Experimental. Keeps GPU buffer caches when direct memory is released and mapped back
@@ -199,7 +200,10 @@ bool     RelaxedShaderFloatEnabled();
 bool     NativeRtEnabled();
 bool     LodStatsEnabled();
 bool     AudioCompileHoldEnabled();
-bool     TrophyEnabled();
+// Makes a fault readback that waits for the GPU also read back GPU-written bytes of buffers that
+// recently faulted.
+bool BatchHotReadbacksEnabled();
+bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool     PlayGoHackEnabled();
 bool     SkipNoticeScreen();

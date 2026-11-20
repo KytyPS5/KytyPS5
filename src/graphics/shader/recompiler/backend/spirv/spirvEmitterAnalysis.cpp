@@ -6,6 +6,29 @@
 
 #include <cstdlib>
 
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+uint32_t PixelRawParameterMask(const ShaderPixelInputInfo&     info,
+                               std::span<const IR::StageInput> inputs) {
+	// Rectangle lists forward parameters through generated stages.
+	if (info.parameter_mode == ShaderPixelParameterMode::Rectangle) {
+		return 0;
+	}
+	// A location stays a float varying if any alias of it is interpolated.
+	uint32_t raw    = 0;
+	uint32_t cooked = 0;
+	for (const auto& input: inputs) {
+		if (input.kind != IR::StageInputKind::Parameter) continue;
+		const auto location = ShaderPixelParameterMappedLocation(info, input.location);
+		if (location >= 32u) continue;
+		const bool is_raw = input.per_vertex || ShaderPixelParameterIsFlat(info, input.location);
+		(is_raw ? raw : cooked) |= 1u << location;
+	}
+	return raw & ~cooked;
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {

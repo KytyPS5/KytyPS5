@@ -28,11 +28,14 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 struct InputBinding : IR::StageInput {
 	uint32_t variable_id = 0;
+	// A raw parameter: an integer varying holding the guest's 32-bit words.
+	bool raw = false;
 };
 
 struct OutputBinding : IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
+	bool     raw                = false;
 };
 
 using ImageDimension = Decoder::ImageDimension;
@@ -169,6 +172,11 @@ struct EmitterState {
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
 };
+
+// The last pre-rasterization stage writes this parameter location as an integer varying.
+[[nodiscard]] inline bool IsRawParameterOutput(const EmitterState& state, uint32_t location) {
+	return location < 32u && (state.input_info.vertex->raw_parameter_mask & (1u << location)) != 0u;
+}
 
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);

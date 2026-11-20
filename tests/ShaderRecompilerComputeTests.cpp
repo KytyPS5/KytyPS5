@@ -55256,8 +55256,8 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
           emitted = indexed ? Gen5::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
                             : Gen5::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
         }
-        const uint32_t begin = multi && !indexed ? 3 : 0;
-        const uint32_t words = multi ? (indexed ? 10 : 16) : 5;
+        const uint32_t begin = multi ? 3 : 0;
+        const uint32_t words = multi ? 16 : 5;
         const uint32_t opcode = multi ? (indexed ? 0xc0083800u : 0xc0082c00u)
                                       : (indexed ? 0xc0032500u : 0xc0032400u);
         const uint32_t initiator = (indexed ? 0 : 2) |

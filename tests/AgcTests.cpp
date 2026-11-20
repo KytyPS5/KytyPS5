@@ -105,6 +105,24 @@ TEST(Agc, RegisterWorkloadStreamChecksRegistrationFirst) {
 	EXPECT_EQ(Gen5::AgcDriverRegisterWorkloadStream(6, nullptr), static_cast<int>(0x8a6c0035u));
 }
 
+TEST(Agc, IndexedMultiDrawsAreTagged) {
+	Packet<15> instanced;
+	EXPECT_EQ(Gen5::AgcDcbDrawIndexMultiInstanced(instanced.Buf(), 2, reinterpret_cast<const volatile void*>(0x1000),
+	                                              reinterpret_cast<const volatile void*>(0x2000), 0, 0),
+	          instanced.dw.data());
+	EXPECT_EQ(instanced.dw, (std::array<uint32_t, 15> {0xc0017904u, 0x342u, 0xc6000006u, 0xc0073a00u, 2u, 0x1000u, 0u,
+	                                                   1u, 0x2000u, 0u, 0u, 0x80u, 0xc0017904u, 0x342u, 0xc6000000u}));
+	EXPECT_EQ(Gen5::AgcDcbDrawIndexMultiInstancedGetSize(), 60u);
+	EXPECT_TRUE(Gen5::AgcIsInternalDataPacket(instanced.dw[0], &instanced.dw[1]));
+
+	Packet<16> indirect;
+	EXPECT_EQ(Gen5::AgcDcbDrawIndexIndirectMulti(indirect.Buf(), 0x10u, 1, 2, nullptr, 0x20u, 0), indirect.dw.data());
+	const auto& dw = indirect.dw;
+	EXPECT_EQ((std::array {dw[0], dw[1], dw[2], dw[3], dw[13], dw[14], dw[15]}),
+	          (std::array<uint32_t, 7> {0xc0017904u, 0x342u, 0xc6000005u, 0xc0083800u, 0xc0017904u, 0x342u, 0xc6000000u}));
+	EXPECT_TRUE(Gen5::AgcIsInternalDataPacket(dw[0], &dw[1]));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

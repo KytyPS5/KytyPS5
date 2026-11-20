@@ -2411,8 +2411,10 @@ static uint32_t decode_draw_index_initiator(uint64_t modifier) {
 	return (static_cast<uint32_t>(modifier) >> 3u) & 0x20u;
 }
 
+static constexpr uint32_t AGC_DRAW_INDEX_IND_MULTI_BEGIN_TAG    = 0xc6000005u;
+static constexpr uint32_t AGC_DRAW_INDEX_MULTI_INST_BEGIN_TAG   = 0xc6000006u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG     = 0xc6000008u;
-static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
+static constexpr uint32_t AGC_DRAW_END_TAG                      = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG       = 0xc8020000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG            = 0xc8000000u;
@@ -2426,6 +2428,18 @@ static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
 	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
 	cmd[2] = tag;
+}
+
+// Brackets a draw packet between a begin tag naming the draw and an end tag. Returns the begin tag;
+// the draw packet follows it.
+static uint32_t* allocate_tagged_draw(CommandBuffer* buf, uint32_t begin_tag, uint32_t draw_dw) {
+	auto* cmd = buf->AllocateDW(draw_dw + 2u * AGC_INTERNAL_DATA_PACKET_SIZE_DW);
+	if (cmd != nullptr) {
+		write_agc_internal_data_packet(cmd, begin_tag);
+		write_agc_internal_data_packet(cmd + AGC_INTERNAL_DATA_PACKET_SIZE_DW + draw_dw,
+		                               AGC_DRAW_END_TAG);
+	}
+	return cmd;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
@@ -2477,27 +2491,24 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	         instance_count, reinterpret_cast<uint64_t>(object_ids),
 	         reinterpret_cast<uint64_t>(index_addr), index_count, modifier);
 
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
-	EXIT_NOT_IMPLEMENTED(object_ids == nullptr);
-	EXIT_NOT_IMPLEMENTED((reinterpret_cast<uint64_t>(index_addr) & 1u) != 0);
-
-	auto* cmd = buf->AllocateDW(9);
-
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	auto* cmd = allocate_tagged_draw(buf, AGC_DRAW_INDEX_MULTI_INST_BEGIN_TAG, 9u);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	auto* draw = cmd + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
 
 	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
 	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 
-	cmd[0] = KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0u);
-	cmd[1] = instance_count;
-	cmd[2] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
-	cmd[3] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
-	cmd[4] = (index_count == 0 ? 1u : index_count);
-	cmd[5] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
-	cmd[6] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
-	cmd[7] = index_count;
-	cmd[8] = decode_draw_index_initiator(modifier) | 0x80u;
+	draw[0] = KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0u);
+	draw[1] = instance_count;
+	draw[2] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
+	draw[3] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
+	draw[4] = std::max(index_count, 1u);
+	draw[5] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
+	draw[6] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
+	draw[7] = index_count;
+	draw[8] = decode_draw_index_initiator(modifier) | 0x80u;
 
 	return cmd;
 }
@@ -2505,7 +2516,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
 	PRINT_NAME();
 
-	return 9u * 4u;
+	return (9u + 2u * AGC_INTERNAL_DATA_PACKET_SIZE_DW) * 4u;
 }
 
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
@@ -2694,18 +2705,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	}
 
 	constexpr uint32_t draw_packet_size_dw = 10u;
-	constexpr uint32_t total_size_dw =
-	    AGC_INTERNAL_DATA_PACKET_SIZE_DW + draw_packet_size_dw +
-	    AGC_INTERNAL_DATA_PACKET_SIZE_DW;
-	auto* cmd = buf->AllocateDW(total_size_dw);
+	auto* cmd = allocate_tagged_draw(buf, AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG, draw_packet_size_dw);
 	if (cmd == nullptr) {
 		return nullptr;
 	}
-
-	write_agc_internal_data_packet(cmd, AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG);
 	auto* draw = cmd + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
-	auto* end  = draw + draw_packet_size_dw;
-	write_agc_internal_data_packet(end, AGC_DRAW_INDIRECT_MULTI_END_TAG);
 
 	const auto low           = static_cast<uint32_t>(modifier);
 	const auto sgpr_base     = indirect_modifier_sgpr_base(low);
@@ -2750,13 +2754,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	         data_offset_in_bytes, count_indirect, max_count_or_count,
 	         reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
 
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	EXIT_NOT_IMPLEMENTED((count_indirect & ~1u) != 0);
+	auto* cmd = allocate_tagged_draw(buf, AGC_DRAW_INDEX_IND_MULTI_BEGIN_TAG, 10u);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
 
-	auto* cmd = buf->AllocateDW(10);
-
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
+	auto*      draw          = cmd + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
 	const auto low           = static_cast<uint32_t>(modifier);
 	const auto sgpr_base     = indirect_modifier_sgpr_base(low);
 	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
@@ -2771,16 +2774,16 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	                          ((low & 0x2u) << 27u) | ((count_indirect & 0x1u) << 30u) |
 	                          ((low & 0x8u) << 28u);
 
-	cmd[0] = KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u);
-	cmd[1] = data_offset_in_bytes;
-	cmd[2] = static_cast<uint32_t>(patch_offsets);
-	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
-	cmd[4] = draw_control;
-	cmd[5] = max_count_or_count;
-	cmd[6] = static_cast<uint32_t>(count_vaddr) & ~0x3u;
-	cmd[7] = static_cast<uint32_t>(count_vaddr >> 32u);
-	cmd[8] = stride_in_bytes;
-	cmd[9] = decode_draw_index_initiator(modifier);
+	draw[0] = KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u);
+	draw[1] = data_offset_in_bytes;
+	draw[2] = static_cast<uint32_t>(patch_offsets);
+	draw[3] = static_cast<uint32_t>(patch_offsets >> 32u);
+	draw[4] = draw_control;
+	draw[5] = max_count_or_count;
+	draw[6] = static_cast<uint32_t>(count_vaddr) & ~0x3u;
+	draw[7] = static_cast<uint32_t>(count_vaddr >> 32u);
+	draw[8] = stride_in_bytes;
+	draw[9] = decode_draw_index_initiator(modifier);
 
 	return cmd;
 }
@@ -3835,8 +3838,9 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 
 	return size_dw == AGC_INTERNAL_DATA_PACKET_SIZE_DW &&
 	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG || payload[1] == AGC_MEM_SEMAPHORE_END_TAG ||
-	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
-	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
+	        payload[1] == AGC_DRAW_INDEX_IND_MULTI_BEGIN_TAG ||
+	        payload[1] == AGC_DRAW_INDEX_MULTI_INST_BEGIN_TAG ||
+	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG || payload[1] == AGC_DRAW_END_TAG);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,

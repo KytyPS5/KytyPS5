@@ -7406,6 +7406,50 @@ public:
                 "retiring the depth array lost GPU-written guest bytes");
       }
       {
+        constexpr uint64_t offset = 0x4bc0000;
+        constexpr uint64_t htile_address = base + offset + 0x800;
+        constexpr std::array<float, 2> mip_clears{0.0625f, 0.9375f};
+        std::memcpy(memory + offset, depth_guest.data(), sizeof(depth_guest));
+        auto cached = linear_d32(base + offset, 3 * sizeof(float), 2, 1);
+        cached.info.mip_layout[0] = {0, 2 * sizeof(float), 2, 1};
+        cached.info.mip_layout[1] = {2 * sizeof(float), sizeof(float), 1, 1};
+        cached.info.metadata.kind = ImageMetadataKind::Htile;
+        cached.info.metadata.range = {htile_address, 0x200};
+        cached.info.htile_initial_clear = true;
+        auto sampled = MakeLinearDesc(
+            base + offset, sizeof(depth_guest), vk::Format::eR32Sfloat,
+            Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+            {2, 1, 1}, depth_array_layers, sizeof(float), 1);
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(before, cached);
+        for (uint32_t mip = 0; mip < mip_clears.size(); ++mip) {
+          vk::ClearValue clear{};
+          clear.depthStencil.depth = mip_clears[mip];
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), before,
+              {vk::ImageAspectFlagBits::eDepth, mip, 1, 0, 1}, clear);
+        }
+        const auto grown = texture_cache.FindImage(sampled);
+        Require(name, "sampled depth growth over a dropped mip",
+                grown != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(grown).backing.format ==
+                        vk::Format::eD32Sfloat &&
+                    texture_cache.GetImage(grown).info.resources ==
+                        sampled.info.resources &&
+                    texture_cache.IsMetaCleared(htile_address, 0),
+                "the grown depth array lost its pending HTile clears");
+        Require(name, "sampled depth growth contents",
+                texture_cache.FindTexture(grown, sampled) != nullptr &&
+                    ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 0) ==
+                        depth_texels(mip_clears[0], mip_clears[0]) &&
+                    ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 1) ==
+                        depth_texels(mip_clears[1], depth_guest[3]) &&
+                    ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 3) ==
+                        depth_texels(depth_guest[6], depth_guest[7]),
+                "the grown depth array lost a GPU-only mip or skipped guest memory");
+      }
+      {
         constexpr uint64_t offset = 0x4bb0000;
         std::memcpy(memory + offset, depth_guest.data(), sizeof(depth_guest));
         auto cached = linear_d32(base + offset, 2 * sizeof(float), 1, 1);

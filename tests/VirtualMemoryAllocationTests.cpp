@@ -3795,13 +3795,15 @@ struct AmmCommandBuffer {
 	Loader::SymbolDatabase   symbols;
 	std::array<uint64_t, 3>  header {};
 	std::array<uint32_t, 16> data {};
+	uint32_t*                buffer;
 
-	explicit AmmCommandBuffer(const char* name): test(name) {
+	explicit AmmCommandBuffer(const char* name, uint32_t* storage = nullptr)
+	    : test(name), buffer(storage != nullptr ? storage : data.data()) {
 		Libs::LibAmpr::InitAmpr_1(&symbols);
 		Find<int(KYTY_SYSV_ABI*)(void*)>("8aI7R7WaOlc")(header.data());
 		CheckOk(test,
 		        Find<int(KYTY_SYSV_ABI*)(void*, void*, uint32_t)>("N-FSPA4S3nI")(
-		            header.data(), data.data(), sizeof(data)),
+		            header.data(), buffer, sizeof(data)),
 		        "set AMM command buffer");
 	}
 	template <class Function>
@@ -3822,7 +3824,7 @@ struct AmmCommandBuffer {
 		Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
 		CheckOk(test,
 		        Find<int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*)>(
-		            "OJf3vCckPAM")(data.data(), Offset(), 0, &result, &submission),
+		            "OJf3vCckPAM")(buffer, Offset(), 0, &result, &submission),
 		        "submit AMM commands");
 		CheckOk(test, Find<int(KYTY_SYSV_ABI*)(uint32_t)>("HXymib4T8gc")(submission),
 		        "wait AMM commands");
@@ -3984,6 +3986,26 @@ void TestAmmRemapIntoPrt() {
 	CheckOk(test, UnmapAmmMemory(prt, block * 4), "AMM unmap PRT range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
 	        "KernelCheckedReleaseDirectMemory(donation)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// A submission runs the command buffer that owns the submitted buffer, even when that buffer
+// occupies the header storage of a command buffer that was never destroyed.
+void TestAmmSubmitReusedHeaderStorage() {
+	const char*      test  = "AmmSubmitReusedHeaderStorage";
+	uint64_t         value = 0;
+	AmmCommandBuffer abandoned(test);
+	const auto       write =
+	    abandoned.Find<int(KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint64_t, uint32_t)>(
+	        "j0+3uJMxYJY");
+	CheckOk(test, write(abandoned.header.data(), &value, 1, 0), "append abandoned writeAddress");
+
+	AmmCommandBuffer commands(test, reinterpret_cast<uint32_t*>(abandoned.header.data()));
+	CheckOk(test, write(commands.header.data(), &value, 2, 0), "append writeAddress");
+	CheckOk(test, write(commands.header.data(), &value, 3, 0), "append second writeAddress");
+	const auto result = commands.Submit();
+	Check(test, result.result == OK && result.error_offset == 0 && value == 3,
+	      "submission did not run the command buffer that owns the buffer");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6273,6 +6295,7 @@ int main(int argc, char** argv) {
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAmmMapAsPrt);
 	RunTest(TestAmmRemapIntoPrt);
+	RunTest(TestAmmSubmitReusedHeaderStorage);
 	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);

@@ -840,24 +840,6 @@ static bool UpdateCommandBufferTypeFlags(uint64_t command_buffer, uint32_t set_b
 	return true;
 }
 
-static std::unordered_map<uint64_t, CommandBufferState>::iterator
-ResolveCommandBufferStateLocked(uint64_t command_buffer) {
-	auto it = g_command_buffers.find(command_buffer);
-	if (it != g_command_buffers.end() && !it->second.commands.empty()) {
-		return it;
-	}
-
-	const auto alias = g_command_buffer_aliases.find(command_buffer);
-	if (alias != g_command_buffer_aliases.end()) {
-		const auto alias_it = g_command_buffers.find(alias->second);
-		if (alias_it != g_command_buffers.end()) {
-			return alias_it;
-		}
-	}
-
-	return it;
-}
-
 static bool WriteVisibleCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
                                               uint64_t size) {
 	if (size > std::numeric_limits<uint32_t>::max() ||
@@ -908,7 +890,9 @@ static bool TryGetCommandBufferState(uint64_t command_buffer, CommandBufferState
 
 	{
 		std::scoped_lock lock(g_command_buffer_mutex);
-		const auto       it = ResolveCommandBufferStateLocked(command_buffer);
+		const auto       alias = g_command_buffer_aliases.find(command_buffer);
+		const auto       it    = g_command_buffers.find(
+		    alias != g_command_buffer_aliases.end() ? alias->second : command_buffer);
 		if (it != g_command_buffers.end()) {
 			*out = it->second;
 			return true;

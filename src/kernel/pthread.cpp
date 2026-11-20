@@ -337,15 +337,15 @@ struct PthreadMutexPrivate {
 		Waiter*                 previous = nullptr;
 		Waiter*                 next     = nullptr;
 	};
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	Pthread                 owner     = nullptr;
-	uint32_t                count     = 0;
-	int                     type      = 1;
-	int                     pprotocol = PTHREAD_PRIO_NONE;
-	Waiter*                 first_waiter = nullptr;
-	Waiter*                 last_waiter  = nullptr;
+	uint8_t     reserved[256];
+	std::string name;
+	std::mutex  m;
+	Pthread     owner        = nullptr;
+	uint32_t    count        = 0;
+	int         type         = 1;
+	int         pprotocol    = PTHREAD_PRIO_NONE;
+	Waiter*     first_waiter = nullptr;
+	Waiter*     last_waiter  = nullptr;
 };
 
 struct PthreadMutexattrPrivate {
@@ -356,20 +356,20 @@ struct PthreadMutexattrPrivate {
 };
 
 struct PthreadAttrPrivate {
-	uint8_t        reserved[64];
-	KernelCpumask  affinity;
-	size_t         guard_size;
-	void*          stack_addr;
-	size_t         stack_size;
-	bool           stack_user;
-	uint64_t       stack_map_addr;
-	size_t         stack_map_size;
-	int            policy;
-	int            guest_priority;
-	int            inherit_sched;
-	int            solosched;
-	bool           detached;
-	pthread_attr_t p;
+	uint8_t          reserved[64];
+	KernelCpumask    affinity;
+	size_t           guard_size;
+	void*            stack_addr;
+	size_t           stack_size;
+	bool             stack_user;
+	uint64_t         stack_map_addr;
+	size_t           stack_map_size;
+	int              policy;
+	std::atomic<int> guest_priority;
+	int              inherit_sched;
+	int              solosched;
+	bool             detached;
+	pthread_attr_t   p;
 };
 
 struct PthreadGuestData {
@@ -380,23 +380,23 @@ struct PthreadGuestData {
 static_assert(sizeof(PthreadGuestData) == 4096);
 
 struct PthreadPrivate {
-	PthreadGuestData      guest;
-	std::string           name;
-	pthread_t             p;
-	PthreadAttr           attr;
-	pthread_entry_func_t  entry;
-	void*                 arg;
-	int                   unique_id;
-	std::atomic_bool      detached;
-	std::atomic_bool      almost_done;
-	std::atomic_bool      free;
-	uint64_t              host_thread_id;
-	uintptr_t             guest_host_rbx;
-	uintptr_t             guest_host_rsp;
-	uintptr_t             guest_host_rbp;
-	uint64_t              cond_sequence = 0;
+	PthreadGuestData        guest;
+	std::string             name;
+	pthread_t               p;
+	PthreadAttr             attr;
+	pthread_entry_func_t    entry;
+	void*                   arg;
+	int                     unique_id;
+	std::atomic_bool        detached;
+	std::atomic_bool        almost_done;
+	std::atomic_bool        free;
+	uint64_t                host_thread_id;
+	uintptr_t               guest_host_rbx;
+	uintptr_t               guest_host_rsp;
+	uintptr_t               guest_host_rbp;
+	uint64_t                cond_sequence = 0;
 	std::condition_variable cond_cv;
-	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic<uint64_t>   pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -447,11 +447,11 @@ struct PthreadCondattrPrivate {
 };
 
 struct PthreadCondPrivate {
-	uint8_t                 reserved[256];
-	std::string             name;
-	std::mutex              m;
-	KernelClockid           clock_id = KERNEL_CLOCK_REALTIME;
-	std::vector<Pthread>    waiters;
+	uint8_t              reserved[256];
+	std::string          name;
+	std::mutex           m;
+	KernelClockid        clock_id = KERNEL_CLOCK_REALTIME;
+	std::vector<Pthread> waiters;
 };
 
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -1236,8 +1236,8 @@ static int PthreadRwlockInitNamed(PthreadRwlock* rwlock, const PthreadRwlockattr
                                   const char* name);
 static int PthreadCondInitNamed(PthreadCond* cond, const PthreadCondattr* attr, const char* name);
 
-static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
-                                     PthreadMutexPrivate::Waiter* waiter) {
+static void NativeMutexRemoveWaiter(PthreadMutexPrivate*         mutex,
+                                    PthreadMutexPrivate::Waiter* waiter) {
 	if (waiter->previous != nullptr) {
 		waiter->previous->next = waiter->next;
 	} else {
@@ -1289,12 +1289,11 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	} else {
 		mutex->first_waiter = &waiter;
 	}
-	mutex->last_waiter = &waiter;
-	const auto deadline = timeout_us != nullptr
-	                          ? std::chrono::steady_clock::now() +
-	                                std::chrono::microseconds(*timeout_us)
-	                          : std::chrono::steady_clock::time_point::max();
-	int result = OK;
+	mutex->last_waiter  = &waiter;
+	const auto deadline = timeout_us != nullptr ? std::chrono::steady_clock::now() +
+	                                                  std::chrono::microseconds(*timeout_us)
+	                                            : std::chrono::steady_clock::time_point::max();
+	int        result   = OK;
 	while (mutex->owner != self) {
 		const auto now = std::chrono::steady_clock::now();
 		if (now >= deadline) {
@@ -1302,8 +1301,8 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 			result = ETIMEDOUT;
 			break;
 		}
-		waiter.cv.wait_until(lock, std::min(deadline, now +
-		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		waiter.cv.wait_until(
+		    lock, std::min(deadline, now + std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		if (mutex->owner != self) {
 			lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
@@ -2152,7 +2151,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
+	if (param->sched_priority <= 460) {
 		pparam.sched_priority = +2;
 	} else if (param->sched_priority >= 733) {
 		pparam.sched_priority = -2;
@@ -3151,6 +3150,17 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 		return 700;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (thread->attr == nullptr) {
+		return 700;
+	}
+	if (thread->attr->guest_priority >= 733) {
+		return 767;
+	}
+	if (thread->attr->guest_priority <= 478) {
+		return 256;
+	}
+#else
 	sched_param param {};
 	int         pol = 0;
 
@@ -3164,6 +3174,7 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 	if (param.sched_priority >= +2) {
 		return 256;
 	}
+#endif
 	return 700;
 }
 
@@ -3516,7 +3527,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
+	if (prio <= 460) {
 		param.sched_priority = +2;
 	} else if (prio >= 733) {
 		param.sched_priority = -2;

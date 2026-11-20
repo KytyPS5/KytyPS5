@@ -25,6 +25,7 @@ struct MemoryRange {
 
 void Initialize();
 void Shutdown();
+void EmergencyShutdown();
 
 // Guest GPU progress for libraries that hand the guest buffers its GPU work may read (AvPlayer):
 // the work submitted so far, and a wait until the command processor has completed it
@@ -33,9 +34,10 @@ void Shutdown();
 [[nodiscard]] bool     WaitForGpuWork(uint64_t marker, const std::atomic_bool& cancel);
 
 struct Lifecycle {
-	static constexpr const char* name       = "Graphics";
-	static constexpr auto        initialize = Libs::Graphics::Initialize;
-	static constexpr auto        shutdown   = Libs::Graphics::Shutdown;
+	static constexpr const char* name               = "Graphics";
+	static constexpr auto        initialize         = Libs::Graphics::Initialize;
+	static constexpr auto        shutdown           = Libs::Graphics::Shutdown;
+	static constexpr auto        emergency_shutdown = Libs::Graphics::EmergencyShutdown;
 };
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);

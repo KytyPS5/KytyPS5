@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <mutex>
@@ -50,6 +51,13 @@ struct Frame {
 constexpr uint32_t SHADER_CACHE_COMPATIBILITY_VERSION = 1;
 
 uint64_t CacheCompatibilityStamp() {
+	// KYTY_SHADER_CACHE_STAMP=N keeps the shader cache across rebuilds.
+	if (const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP"); env != nullptr && env[0] != 0) {
+		const auto value = std::strtoull(env, nullptr, 10);
+		if (value != 0) {
+			return value;
+		}
+	}
 	// Magic "KPS5" (0x4B505335) in high 32 bits, explicit compatibility version in low 32 bits.
 	return (0x4B505335ULL << 32) | static_cast<uint64_t>(SHADER_CACHE_COMPATIBILITY_VERSION);
 }
@@ -234,7 +242,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 
 	const uint32_t total_items =
 	    static_cast<uint32_t>(pending_modules.size() + m_graphics_pipelines.size() + compute_count);
-	const uint32_t        num_threads = GetOptimalShaderWorkerThreads();
+	// Several threads compiling pipelines at once trips a crash inside NVIDIA's
+	// libnvidia-glvkspirv, so that driver warms up serially; elsewhere the work stays spread
+	// over the pool.
+	const bool            is_nvidia = m_graphics.GetPhysicalDeviceProperties().vendorID == 0x10DEu;
+	const uint32_t        num_threads = is_nvidia ? 1u : GetOptimalShaderWorkerThreads();
 	std::atomic<uint32_t> completed   = 0;
 
 	if (total_items > 0) {
@@ -253,7 +265,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			ReportShaderProgress(done, total_items, m_graphics.window);
 		});
 
-		// Step 2: Create all graphics and compute pipelines in parallel
+		// Step 2: Create all graphics and compute pipelines
 		const auto                                modules = MapModules();
 		std::vector<Common::UniqueFunction<void>> jobs;
 		jobs.reserve(m_graphics_pipelines.size() + compute_count);
@@ -275,7 +287,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 				});
 			}
 		}
-		Common::ParallelFor(jobs.size(), num_threads, [&](size_t i) { jobs[i](); });
+		if (is_nvidia) {
+			for (auto& job: jobs) {
+				job();
+			}
+		} else {
+			Common::ParallelFor(jobs.size(), num_threads, [&](size_t i) { jobs[i](); });
+		}
 
 		::printf("\r%-65s\n", fmt::format("Preparando shaders: {} de {} (100.0%) - Completado",
 		                                  total_items, total_items)

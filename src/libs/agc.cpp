@@ -94,6 +94,23 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
+void EmergencyShutdown() {
+	if (g_renderer == nullptr) {
+		return;
+	}
+	auto& mutex = g_renderer->GetMutex();
+	if (mutex.IsHeldByCurrentThread()) {
+		// The crashing thread already owns this lock, so Save() would run with partially
+		// updated renderer/Vulkan state and do blocking file I/O from inside a crash handler;
+		// skip the save rather than risk corrupting the cache or hanging here.
+		return;
+	}
+	if (mutex.TryLock()) {
+		g_renderer->GetPipelineCache().Save();
+		mutex.Unlock();
+	}
+}
+
 uint64_t SubmittedGpuWork() {
 	return g_renderer != nullptr ? g_renderer->GetGpu().SubmittedWork() : 0;
 }

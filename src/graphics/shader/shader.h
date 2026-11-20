@@ -53,7 +53,7 @@ inline uint8_t GetDstSel(uint32_t swizzle, uint32_t channel) {
 }
 
 [[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
-                                             uint32_t component_count = 4) noexcept {
+                                              uint32_t component_count = 4) noexcept {
 	if ((swizzle & ~0xfffu) != 0) {
 		return false;
 	}
@@ -88,6 +88,10 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives        = 0;
 	uint32_t provoking_vertex      = 0;
 	bool     fast_launch           = false;
+	// Push dword holding the 8-layer chunk a layered draw renders, or UINT32_MAX. AMD's Windows
+	// driver keeps only the low 3 bits of a mesh shader's per-primitive Layer, so such draws run
+	// once per chunk of 8 layers and the shader culls the other chunks' primitives.
+	uint32_t layer_chunk_dword = UINT32_MAX;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -108,7 +112,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 		return vertices < size ? 0u : (vertices - size) / InputPrimitiveStep() + 1u;
 	}
 	[[nodiscard]] constexpr uint32_t InputVertexCount(uint32_t primitives) const {
-		return primitives == 0u ? 0u : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
+		return primitives == 0u ? 0u
+		                        : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
 	}
 };
 
@@ -142,7 +147,7 @@ struct ShaderVertexInputInfo {
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
-	ShaderType                  logical_stage        = ShaderType::Vertex;
+	ShaderType              logical_stage       = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
@@ -150,18 +155,18 @@ struct ShaderVertexInputInfo {
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
-	uint32_t                lds_size_dwords     = 0;
-	uint32_t                pa_cl_vs_out_cntl    = 0;
+	uint32_t lds_size_dwords   = 0;
+	uint32_t pa_cl_vs_out_cntl = 0;
 	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
-	uint32_t                user_clip_planes     = 0;
-	ShaderClipSpaceTransform clip_space;
-	ShaderMeshInputInfo      mesh;
+	uint32_t                    user_clip_planes = 0;
+	ShaderClipSpaceTransform    clip_space;
+	ShaderMeshInputInfo         mesh;
 	ShaderTessellationInputInfo tess;
-	ShaderIndirectOffsets   indirect_offsets;
+	ShaderIndirectOffsets       indirect_offsets;
 	// GPU-read records add Vulkan bases even when the packet patches no user SGPRs.
-	bool                    indirect_draw       = false;
+	bool indirect_draw = false;
 	// Attribute-table metadata enables dynamic fetch detection; loads are matched later.
-	bool                    has_dynamic_vertex_fetch = false;
+	bool has_dynamic_vertex_fetch = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -169,7 +174,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           workgroup_counts[3]        = {0, 0, 0};
-	uint64_t           indirect_args_address       = 0;
+	uint64_t           indirect_args_address      = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
@@ -183,6 +188,9 @@ enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne,
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {
+	// Push dword of a layered mesh draw's 8-layer chunk (ShaderMeshInputInfo::layer_chunk_dword):
+	// gl_Layer then reads the layer within the chunk, so the chunk's base is added back.
+	uint32_t                                       layer_chunk_dword            = UINT32_MAX;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;
@@ -194,34 +202,34 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
-	uint8_t                                        target_packed_unorm_mask      = 0;
+	uint8_t                                        target_packed_unorm_mask     = 0;
 	// Exports to UINT and SINT targets, which take integer outputs of the same signedness.
-	uint8_t                                        target_uint_mask             = 0;
-	uint8_t                                        target_sint_mask             = 0;
+	uint8_t target_uint_mask = 0;
+	uint8_t target_sint_mask = 0;
 	// CB round mode per converted export: zero adds half an LSB, one truncates.
-	uint8_t                                        target_round_mode            = 0;
-	uint32_t                                       scratch_size_dwords          = 0;
+	uint8_t  target_round_mode   = 0;
+	uint32_t scratch_size_dwords = 0;
 	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
-	uint32_t                                       lds_size_dwords              = 0;
-	bool                                           ps_pos_x                     = false;
-	bool                                           ps_pos_y                     = false;
-	bool                                           ps_pos_z                     = false;
-	bool                                           ps_pos_w                     = false;
-	bool                                           ps_front_face                = false;
-	bool                                           ps_front_face_all_bits       = false;
-	bool                                           ps_ancillary                 = false;
-	bool                                           ps_no_perspective            = false;
-	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
-	bool                                           ps_pixel_kill_enable         = false;
-	bool                                           ps_depth_export_enable       = false;
-	bool                                           ps_sample_mask_export_enable = false;
-	bool                                           ps_sample_shading            = false;
-	bool                                           dual_source_blending         = false;
-	bool                                           object_primitive_id          = false;
+	uint32_t                 lds_size_dwords              = 0;
+	bool                     ps_pos_x                     = false;
+	bool                     ps_pos_y                     = false;
+	bool                     ps_pos_z                     = false;
+	bool                     ps_pos_w                     = false;
+	bool                     ps_front_face                = false;
+	bool                     ps_front_face_all_bits       = false;
+	bool                     ps_ancillary                 = false;
+	bool                     ps_no_perspective            = false;
+	ShaderPixelParameterMode parameter_mode               = ShaderPixelParameterMode::FirstVertex;
+	bool                     ps_pixel_kill_enable         = false;
+	bool                     ps_depth_export_enable       = false;
+	bool                     ps_sample_mask_export_enable = false;
+	bool                     ps_sample_shading            = false;
+	bool                     dual_source_blending         = false;
+	bool                     object_primitive_id          = false;
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
-	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
-	bool                                           ps_early_z                   = false;
-	ShaderStageRuntime                             stage;
+	ShaderAlphaBlendSource alpha_blend_source = ShaderAlphaBlendSource::None;
+	bool                   ps_early_z         = false;
+	ShaderStageRuntime     stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
@@ -334,20 +342,20 @@ struct Shader {
 
 struct ShaderMappedData {
 	Prospero::ShaderBinaryType type {};
-	ShaderUserData* user_data           = nullptr;
-	ShaderSemantic* input_semantics     = nullptr;
-	uint32_t        num_input_semantics = 0;
-	uint32_t        code_size_bytes     = 0;
-	uint32_t        scratch_size_dwords = 0;
+	ShaderUserData*            user_data           = nullptr;
+	ShaderSemantic*            input_semantics     = nullptr;
+	uint32_t                   num_input_semantics = 0;
+	uint32_t                   code_size_bytes     = 0;
+	uint32_t                   scratch_size_dwords = 0;
 };
 
-void ShaderInit();
-void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+void     ShaderInit();
+void     ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
-void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
-void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
-void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
+void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
+void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
+void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
 
 } // namespace Libs::Graphics
 

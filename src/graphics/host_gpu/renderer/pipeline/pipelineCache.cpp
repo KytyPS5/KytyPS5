@@ -2928,27 +2928,34 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		const auto& rt = ctx.GetRenderTarget(slot);
+		auto blend = ctx.GetBlendControl(slot);
 		auto alpha_source = ShaderAlphaBlendSource::None;
 		if (slot == 0 && ps_active) {
 			alpha_source = ps_input_info.alpha_blend_source;
 		}
-		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
-		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
-			static_params.blend_enable[slot] = false;
-			static std::atomic_bool warned = false;
-			if (!warned.exchange(true, std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "Warning: blending disabled for unsupported color mapping "
-				    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
-				    slot, colors[i].export_mapping.packed, bc.color_srcblend, bc.color_destblend,
-				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
+		static_params.blend_enable[slot] = blend.enable && !rt.info.blend_bypass;
+		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None) {
+			const auto& mapping = colors[i].export_mapping;
+			const auto support = ClassifyBlendMapping(blend, mapping);
+			if (support == BlendMappingSupport::AttenuateDestinationAlpha) {
+				// Logical alpha is already in the source color lane selected by this write mask.
+				static_params.color_mask[slot] &= mapping.ApplyMask(8u);
+				blend.color_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrcColor);
+				blend.separate_alpha_blend = false;
+			} else if (support != BlendMappingSupport::Direct) {
+				static_params.blend_enable[slot] = false;
+				static std::atomic_bool warned = false;
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: blending disabled for unsupported color mapping "
+					    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
+					    slot, mapping.packed, blend.color_srcblend, blend.color_destblend,
+					    blend.alpha_srcblend, blend.alpha_destblend, blend.separate_alpha_blend ? 1 : 0));
+				}
 			}
 		}
 		if (static_params.blend_enable[slot]) {
-			auto blend = bc;
 			switch (alpha_source) {
 				case ShaderAlphaBlendSource::SourceAlpha:
 					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);

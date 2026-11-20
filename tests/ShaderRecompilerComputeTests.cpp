@@ -22384,6 +22384,57 @@ public:
                   "reversed blending changed logical RGB or the separate alpha equation");
         }
       }
+      // Preserve destination RGB and attenuate only logical alpha, stored in physical red.
+      alpha_blend.color_srcblend = alpha_blend.alpha_srcblend =
+          static_cast<uint8_t>(Prospero::BlendFactor::kZero);
+      alpha_blend.color_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+      alpha_blend.separate_alpha_blend = true;
+      registers.SetBlendControl(0, alpha_blend);
+      const auto rgba_target = color;
+      for (const auto channels : {4u, 1u}) {
+        if (channels == 1u) {
+          blend_target_info.format = Prospero::ChannelLayout::k8;
+          blend_target_info.channel_type = Prospero::ChannelType::kUNorm;
+          blend_target_info.channel_order = Prospero::ChannelOrder::kAltReversed;
+          registers.SetColorInfo(0, blend_target_info);
+          color.desc.info.data = {depth_address + 0x20000, extent * extent};
+          registers.SetColorBase(0, {.addr = depth_address + 0x20000});
+          color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent};
+          color.desc.info.tiling.block.bytes_per_element = color.desc.info.bytes_per_block = 1;
+          color.desc.view_info.format = color.desc.info.pixel_format = vk::Format::eR8Unorm;
+          color.desc.info.guest_format = Prospero::BufferFormat::k8UNorm;
+          color.export_mapping = Prospero::ColorMappingAgba;
+          color.image_id = cache.FindImage(color.desc);
+        }
+        for (const auto mask : {0xfu, 0x7u}) {
+          registers.SetRenderTargetMask(mask);
+          native_programs();
+          Require(name, "alpha export mapping", pixel.target_export_mapping[0] == color.export_mapping,
+                  "the pixel shader and physical target disagree about the alpha lane");
+          constexpr std::array<float, 4> destination{128.0f / 255.0f, 0.7f, 0.1f, 0.2f};
+          draw(pipeline(true, 2, 2), 3, std::bit_cast<std::array<u32, 4>>(destination));
+          auto expected = destination;
+          if (mask & 8u) expected[0] *= 0.5f;
+          const auto pixels = read_color();
+          if (channels == 1u) {
+            const auto bytes = std::as_bytes(std::span(pixels));
+            const auto alpha = static_cast<std::byte>(mask & 8u ? 64 : 128);
+            Require(name, "R8 alpha attenuation",
+                    bytes.size() == extent * extent && std::ranges::all_of(bytes, [alpha](auto v) { return v == alpha; }),
+                    "the alpha-only target contains the wrong UNorm value");
+          } else {
+            Require(name, "RGBA target size", pixels.size() == extent * extent * channels,
+                    "readback did not cover the full target");
+            for (size_t i = 0; i < pixels.size(); ++i) {
+              Require(name, "destination alpha attenuation",
+                      std::abs(std::bit_cast<float>(pixels[i]) - expected[i % channels]) < 0.00001f,
+                      "target lost preserved colors or updated a masked logical alpha");
+            }
+          }
+        }
+      }
+      color = rgba_target;
+      registers.SetRenderTargetMask(0xf);
       shaders.SetPsShaderBase(pixel_address);
       color.export_mapping = {};
       registers.SetBlendControl(0, saved_blend);

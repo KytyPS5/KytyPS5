@@ -674,6 +674,9 @@ target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
 target_link_libraries(net_resolver_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(agc_tests "${KYTY_TESTS_DIR}/AgcTests.cpp")
+target_link_libraries(agc_tests kyty_test_gtest)
+
 add_executable(dlss_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DlssTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/dlss.cpp")

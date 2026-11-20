@@ -2895,6 +2895,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	cmd[4] = static_cast<uint32_t>(vaddr >> 8u);
 	cmd[5] = static_cast<uint32_t>(vaddr >> 40u);
 	cmd[6] = std::min(poll_cycles >> 4u, 0xffffu);
+	// GL2 is never invalidated without being written back (GL2_INV adds GL2_WB).
+	gcr_cntl |= (gcr_cntl & 0x4000u) << 1u;
 	cmd[7] = gcr_cntl & 0x7ffffu;
 
 	return cmd;

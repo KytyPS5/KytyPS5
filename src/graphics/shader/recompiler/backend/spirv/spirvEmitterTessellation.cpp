@@ -29,11 +29,13 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
 		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
+		// The factor ring holds the outer factors, then the inner ones: tri 3 + 1, quad 4 + 2,
+		// isoline 2 + 0.
 		const auto index       = inst.Arg(1).U32() / 4u;
-		const bool quad        = tess.domain == 2u;
-		const auto outer_count = quad ? 4u : 3u;
-		const bool outer       = index < outer_count;
-		EXIT_NOT_IMPLEMENTED(index >= (quad ? 6u : 4u));
+		const auto outer_count = tess.domain == 2u ? 4u : tess.domain == 1u ? 3u : 2u;
+		const auto inner_count = tess.domain == 2u ? 2u : tess.domain == 1u ? 1u : 0u;
+		const auto outer       = index < outer_count;
+		EXIT_NOT_IMPLEMENTED(index >= outer_count + inner_count);
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
 		                          ConstantU32(state, outer ? index : index - outer_count));
@@ -125,8 +127,9 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, state.tess_inner_variable,
 			                            spv::DecorationPatch);
 		} else {
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation,
-			                            patch ? (tess.hs_stride + 15u) / 16u : 0u);
+			state.builder.AddAnnotation(
+			    spv::OpDecorate, variable, spv::DecorationLocation,
+			    patch ? (tess.hs_stride + 15u) / 16u : 0u);
 		}
 		if (kind == Attribute::Factor || patch) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);
@@ -136,25 +139,34 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	// Triangle or quad domain, integer or fractional partitioning, triangle output.
-	EXIT_NOT_IMPLEMENTED((tess.domain != 1u && tess.domain != 2u) ||
-	                     (tess.partitioning != 0u && tess.partitioning != 2u && tess.partitioning != 3u) ||
-	                     (tess.output_topology != 2u && tess.output_topology != 3u));
+	// VGT_TF_PARAM: TYPE 0 isoline, 1 tri, 2 quad; PARTITIONING 0 integer, 1 pow2,
+	// 2 fractional odd, 3 fractional even; TOPOLOGY 0 point, 1 line, 2 tri CW, 3 tri CCW.
+	// Wolverine's terrain is a quad domain with fractional-even spacing.
+	EXIT_NOT_IMPLEMENTED(tess.domain > 2u || tess.partitioning > 3u || tess.output_topology > 3u);
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
 	} else {
-		state.builder.AddExecutionMode(state.main_func, tess.domain == 1u
-		                                                   ? spv::ExecutionModeTriangles
-		                                                   : spv::ExecutionModeQuads);
-		state.builder.AddExecutionMode(
-		    state.main_func, tess.partitioning == 0u ? spv::ExecutionModeSpacingEqual
-		                     : tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd
-		                                                : spv::ExecutionModeSpacingFractionalEven);
-		state.builder.AddExecutionMode(state.main_func, tess.output_topology == 2u
-		                                                   ? spv::ExecutionModeVertexOrderCw
-		                                                   : spv::ExecutionModeVertexOrderCcw);
+		state.builder.AddExecutionMode(state.main_func,
+		                               tess.domain == 2u   ? spv::ExecutionModeQuads
+		                               : tess.domain == 1u ? spv::ExecutionModeTriangles
+		                                                   : spv::ExecutionModeIsolines);
+		state.builder.AddExecutionMode(state.main_func,
+		                               tess.partitioning == 2u   ? spv::ExecutionModeSpacingFractionalOdd
+		                               : tess.partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven
+		                                                         : spv::ExecutionModeSpacingEqual);
+		// Power-of-two partitioning is equal spacing over factors rounded up to a power of two
+		// (EmitSetTessellationAttribute). A line output is what an isoline domain produces; the
+		// host cannot draw a triangle or quad domain as lines.
+		EXIT_NOT_IMPLEMENTED(tess.output_topology == 1u && tess.domain != 0u);
+		if (tess.output_topology == 0u) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePointMode);
+		} else if (tess.output_topology >= 2u) {
+			state.builder.AddExecutionMode(state.main_func, tess.output_topology == 2u
+			                                                    ? spv::ExecutionModeVertexOrderCw
+			                                                    : spv::ExecutionModeVertexOrderCcw);
+		}
 	}
 }
 
@@ -174,6 +186,13 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto floating = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
 			value = floating;
+			if (ctx.state.input_info.vertex->tess.partitioning == 1u) {
+				// Power-of-two partitioning: exp2(ceil(log2(f))). A factor of zero, a negative one
+				// or NaN stays zero or NaN, and still culls the patch.
+				const auto log = EmitGlsl<GLSLstd450Log2, IR::Type::F32>(ctx.state, value);
+				const auto up  = EmitGlsl<GLSLstd450Ceil, IR::Type::F32>(ctx.state, log);
+				value          = EmitGlsl<GLSLstd450Exp2, IR::Type::F32>(ctx.state, up);
+			}
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});

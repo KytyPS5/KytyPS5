@@ -4,7 +4,9 @@
 #include "common/common.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <atomic>
 #include <memory>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -17,6 +19,32 @@ public:
 	~PageManager();
 
 	KYTY_CLASS_NO_COPY(PageManager);
+
+	// A hint only: callers must still check exact GPU ownership before reading a backing alias. Whether a page of the
+	// range has read watchers (its access taken away: a read of it faults).
+	[[nodiscard]] bool HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept;
+	// HasReadWatchers' filter, for callers that test it inline: bit g of word g / 64 is clear when no page of the
+	// 64 KiB granule g (of the tracker's address space) has read watchers.
+	static constexpr uint64_t                   READ_GRANULE_BITS = 16;
+	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept;
+	// Whether cache tracking currently restricts access to the page holding vaddr.
+	[[nodiscard]] bool IsWatched(uint64_t vaddr) const;
+	// Whether any page of [vaddr, vaddr + size) is watched; then the first watched page and the end of the last one.
+	[[nodiscard]] bool WatchedSpan(uint64_t vaddr, uint64_t size, uint64_t* first, uint64_t* end) const noexcept;
+	// The watchers' protections carry no execute permission: puts it back on the page holding
+	// vaddr, with their access. False while read watchers keep the page inaccessible.
+	[[nodiscard]] bool AllowExecute(uint64_t vaddr);
+
+	// KYTY_ASYNC_REPROTECT: while a sink is set on this thread, adding write watchers updates the pages' state but
+	// records the address ranges instead of changing the host protection; ReapplyProtection() of those ranges applies
+	// the pages' state then.
+	struct DeferredRange {
+		uint64_t address = 0, size = 0;
+	};
+	static void SetDeferredWriteProtectSink(std::vector<DeferredRange>* sink) noexcept;
+	// The host protection of the watched pages of [vaddr, vaddr + size) set to their state now (unwatched pages keep
+	// theirs).
+	void ReapplyProtection(uint64_t vaddr, uint64_t size);
 
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

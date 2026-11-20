@@ -549,6 +549,41 @@ void TestReadWriteWatcherInteractions() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestSharedReadWatchers() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto page = [&](size_t index) {
+    return reinterpret_cast<void *>(address + page_size * index);
+  };
+
+  // Two owners hold the first two pages; one of them also holds the next one.
+  manager.UpdatePageWatchers<true, true>(address, page_size * 2);
+  manager.UpdatePageWatchers<true, true>(address + page_size, page_size * 2);
+  Check(Protection(page(0)) == PAGE_NOACCESS &&
+            Protection(page(1)) == PAGE_NOACCESS &&
+            Protection(page(2)) == PAGE_NOACCESS &&
+            IsWritable(page(3)),
+        "access watchers did not deny the watched pages");
+  Check(manager.IsWatched(address) && !manager.IsWatched(address + page_size * 3),
+        "IsWatched ignored the access watchers");
+
+  manager.UpdatePageWatchers<false, true>(address, page_size * 2);
+  Check(IsWritable(page(0)) && Protection(page(1)) == PAGE_NOACCESS &&
+            Protection(page(2)) == PAGE_NOACCESS,
+        "one owner's unwatch released pages the other still holds");
+
+  manager.UpdatePageWatchers<true>(address + page_size * 2, page_size);
+  manager.UpdatePageWatchers<false, true>(address + page_size, page_size * 2);
+  Check(IsWritable(page(1)) && Protection(page(2)) == PAGE_READONLY,
+        "access unwatch did not fall back to the write watcher");
+  manager.UpdatePageWatchers<false>(address + page_size * 2, page_size);
+  Check(IsWritable(page(2)), "write unwatch did not restore access");
+
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestConcurrentSharedWatchers() {
   constexpr size_t worker_count = 8;
   PageManager manager;
@@ -700,6 +735,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestSharedReadWatchers();
   TestConcurrentSharedWatchers();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");

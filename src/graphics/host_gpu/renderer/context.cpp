@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -14,14 +15,28 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <utility>
 namespace Libs::Graphics {
 
-CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+CommandBuffer::CommandBuffer(CommandScheduler& scheduler, CommandStream* stream)
+    : m_scheduler(scheduler), m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
+      m_stream(stream) {}
+
+void CommandBuffer::InvalidateDynamicState() const {
+	m_scheduler.GetDynamicState().Invalidate();
+}
+
+CommandRecorder CommandBuffer::Handle() const {
+	return m_stream != nullptr ? CommandRecorder(m_stream) : CommandRecorder(m_buffer);
+}
 
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	EXIT_IF(m_rendering || m_pending_shader_writes || IsInvalid());
+	if (m_stream != nullptr) {
+		// The recording thread begins its Vulkan command buffer when it replays commands.
+		return;
+	}
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -33,7 +48,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	auto buffer = Handle();
+	if (m_stream != nullptr) {
+		return;
+	}
+	auto buffer = m_buffer;
 
 	auto result = buffer.end();
 
@@ -79,20 +97,26 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	const auto recorder = Handle();
+	recorder.beginRendering(rendering);
 	m_render_state = state;
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
+	m_context.GetOcclusionQueries().OnBeginRendering(recorder);
 }
 
 void CommandBuffer::EndRendering() const {
-	if (!m_rendering) {
-		return;
+	if (m_rendering) {
+		const auto recorder = Handle();
+		m_context.GetOcclusionQueries().OnEndRendering(recorder);
+		recorder.endRendering();
+		m_rendering = false;
 	}
-	Handle().endRendering();
-	m_rendering = false;
+	if (m_pending_shader_writes) {
+		ShaderWriteBarrier(Handle(), std::exchange(m_pending_shader_writes, {}));
+	}
 }
 
 } // namespace Libs::Graphics

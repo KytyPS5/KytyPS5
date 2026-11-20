@@ -24,16 +24,28 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// A wave64 program run as halves orders its LDS accesses with a subgroup barrier (KYTY76_LDS_SYNC=0: off).
+	bool lds_lane_sync = true;
 };
 
 inline constexpr Profile DefaultProfile {};
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
+// mip_stats_records=false emits the plain variant of a pixel shader instrumented for GET_LOD_STATS
+// (UsesMipStats): the same bindings and code without the per-sample recording, whose storage
+// buffer atomics make the driver run the depth and stencil tests after a shader that can discard.
+// ray_stats: instrument the native ray tracing sites to count host queries and fallback rays
+// (CompileOptions::ray_stats).
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+                                  bool           emit_debug_info       = false,
+                                  bool           mip_stats_records     = true,
+                                  bool           ray_stats             = false);
 
+// A pixel shader that samples an image through a T# the draw supplies records GET_LOD_STATS
+// mip statistics for it (see LodStatsCounter).
+[[nodiscard]] bool UsesMipStats(const IR::Program& program);
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVEMITTER_H_ */

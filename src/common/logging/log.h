@@ -25,8 +25,11 @@ inline constexpr const char* RelaunchedVariable = "KYTY_RELAUNCHED";
 
 bool IsSilent();
 void Write(fmt::text_style style, std::string_view text);
-// Also shown on the console when the log goes to a file or nowhere.
+// Also shown on the console when the log goes to a file or nowhere, and kept in the session log.
 void WriteToConsoleAndLog(std::string_view text);
+// The session log (--session-log): the console messages above and the reports of a fatal error,
+// whatever the log direction and without the printf log. Buffered: Flush() writes it out.
+void WriteToSessionLog(std::string_view text);
 
 namespace Color {
 

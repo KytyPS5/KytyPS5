@@ -87,6 +87,14 @@ bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t& r
 	return HostMemoryQueryRange(addr, requested_size, HostMemoryAccess::Read, readable_size);
 }
 
+bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
+	if (addr == 0 || size == 0 || UINT64_MAX - addr < size) {
+		return false;
+	}
+	uint64_t readable_size = 0;
+	return HostMemoryQueryReadable(addr, size, readable_size) && readable_size >= size;
+}
+
 bool HostMemoryIsReadable(uint64_t addr) {
 	uint64_t readable_size = 0;
 	return HostMemoryQueryReadable(addr, 1, readable_size);

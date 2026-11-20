@@ -44,6 +44,11 @@ public:
 
 	// Consume scratch results before the next acquisition, or pass their buffer as input.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info);
+	// Detiles `count` array layers from `first` on of a layered image (ImageInfo::LayersTransferable())
+	// whose tiled data holds only those layers, from `tiled_offset` on. The result is packed as
+	// ImageInfo::LayerRunLinearLayout() says, for ImageInfo::BufferCopiesLayers().
+	[[nodiscard]] Result DetileLayers(vk::Buffer tiled, uint64_t tiled_offset, const ImageInfo& info,
+	                                  uint32_t first, uint32_t count);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
 	          uint64_t tiled_offset, uint64_t tiled_capacity, const ImageInfo& info,
 	          uint32_t levels = 0);
@@ -54,10 +59,11 @@ public:
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
-	// Color-clear keys are multiples of 0x20, so key >> 5 selects one of these slots.
-	static constexpr uint32_t ColorClearSlots = 8;
+	// Color-clear keys are multiples of 0x10 (0x10 is the PS5 register clear), so key >> 4
+	// selects one of these slots.
+	static constexpr uint32_t ColorClearSlots = 16;
 	// metadata spans `slices` equal runs `stride` bytes apart. Returns the buffer whose dword
-	// slice * ColorClearSlots + (key >> 5) is set when every byte of that run equals a key whose
+	// slice * ColorClearSlots + (key >> 4) is set when every byte of that run equals a key whose
 	// bit `keys` selects; a hit expands to 0xff when `expand` is set.
 	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
 	                                         uint32_t keys, bool expand);
@@ -80,6 +86,9 @@ private:
 		uint32_t slice_bytes;
 		uint32_t tiled_slice_bytes;
 		uint32_t blocks_per_row;
+		// First array layer of a layer run (see DetileLayers()): the z swizzle of depth and render
+		// target blocks depends on the slice index.
+		uint32_t surface_z;
 		uint32_t tail_x;
 		uint32_t tail_y;
 		uint32_t num_texels;
@@ -87,7 +96,8 @@ private:
 	struct TilingParams {
 		uint32_t                      num_texels      = 0;
 		uint32_t                      color_transform = 0;
-		std::array<uint32_t, 2>        padding {};
+		uint32_t                       packed_r8 = 0;
+		uint32_t                       padding = 0;
 		std::array<Mip, MaxMipLevels> mips;
 	};
 	struct Tiling {
@@ -116,9 +126,13 @@ private:
 	                                             uint64_t active, uint32_t remaining,
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
+	struct LayerRun {
+		uint32_t first = 0;
+		uint32_t count = 0;
+	};
 	[[nodiscard]] Tiling Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	                             const ImageInfo& info, uint32_t levels, uint64_t source_offset,
-	                             uint64_t target_offset);
+	                             uint64_t target_offset, const LayerRun* run = nullptr);
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling);

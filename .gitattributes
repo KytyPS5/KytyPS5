@@ -1,0 +1,2 @@
+# Pipeline manifests are text whose bytes do not depend on the platform.
+assets/pipelines/*.kpm text eol=lf

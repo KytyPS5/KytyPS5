@@ -1,0 +1,49 @@
+# kyty pipeline manifest v1
+M 205b21fad085 vs code=0368d78a708b20dd ud=12 cur=4 fa=8 fb=6 dyn attr=440000.102941.4dfac.9.4.0.0.0,440000.102941.4dfac.13.4.1.0.0,440000.102941.4022c.17.2.2.0.0,440000.102941.4dfac.19.4.3.0.0,440000.102941.4a3ac.23.3.4.0.0 vbuf=68.102941.0
+M 427b4b86e350 ps code=0410b92189841491 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,2 si=n:Float/d:2D ss=-
+M 9131d94f3e5b ps code=05a5318c13c0f384 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M 020a56d6f95a vs code=1d9fedb75c885471 ud=12 cur=1 fa=8 fb=6 dyn attr=340000.7692.4dfac.9.4.0.0.0,340000.7692.4dfac.13.4.1.0.0,340000.7692.4022c.17.2.2.0.0,340000.7692.4a3ac.19.3.3.0.0 vbuf=52.7692.0
+M b17e5460582c ps code=204d3bdde77ed52a ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D,n:Float/d:3D ss=-
+M 1a02968fa515 vs code=355a378dd716abff ud=12 cur=2 fa=8 fb=6 dyn attr=340000.7692.4dfac.9.4.0.0.0,340000.7692.4dfac.13.4.1.0.0,340000.7692.4022c.17.2.2.0.0,340000.7692.4a3ac.19.3.3.0.0 vbuf=52.7692.0
+M 77a15a4c7f23 ps code=3ea017adfa2934df ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D ss=-
+M d28f0a81c7fb ps code=474470cb2dd506e4 ud=4 sysbase=2 center=0 smask=f omode=4 faceall early in=0
+M 8139af880806 vs code=49ba1912fea0d438 ud=12 cur=1 fa=8 fb=6 dyn attr=240000.194444.4dfac.9.4.0.0.0,240000.194444.4a3ac.13.3.1.0.0,240000.194444.4022c.16.2.2.0.0 vbuf=36.194444.0
+M 484e286ab10e ps code=4b2a18523f0cb8ba ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D ss=-
+M ce84b1ae2511 cs code=6dc17afc0445255d ud=10 t=64,1,1 tid=1 wgr=10 gx sb=st:4/f:32UInt/sw:4
+M 1ff5f90a5592 ps code=71058c24a2fd6824 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D ss=-
+M 705f398e1072 ps code=717ddb59689bd869 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D ss=-
+M fcda92c95f80 vs code=76449df0a26c8273 ud=12 cur=1 fa=8 fb=6 dyn attr=440000.102941.4dfac.9.4.0.0.0,440000.102941.4dfac.13.4.1.0.0,440000.102941.4dfac.17.4.2.0.0,440000.102941.4a3ac.21.3.3.0.0,440000.102941.4022c.24.2.4.0.0 vbuf=68.102941.0
+M f68eb4fb8193 ps code=7f9f6cc4942eba72 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M a1ed84b1e059 ps code=8ad03be976a940be ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 0efcc532fc7d ps code=9aa7b45a3a71f211 ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D,n:Float/d:1D ss=-
+M 20af028c71c0 vs code=9c03b301be04456a ud=12 cur=1 fa=8 fb=6 dyn attr=440000.102941.4dfac.9.4.0.0.0,440000.102941.4dfac.13.4.1.0.0,440000.102941.4dfac.17.4.2.0.0,440000.102941.4a3ac.21.3.3.0.0,440000.102941.4022c.24.2.4.0.0 vbuf=68.102941.0
+M 69d2c9073856 vs code=a491996a9a315589 ud=10 fa=6 fb=4 dyn attr=340000.7692.4dfac.9.4.0.0.0,340000.7692.4dfac.13.4.1.0.0,340000.7692.4022c.17.2.2.0.0,340000.7692.4a3ac.19.3.3.0.0 vbuf=52.7692.0
+M 3e1548e884ed ps code=ad94bb69b791f15f ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D ss=-
+M e207bf8ae460 ps code=b80957c0ce29b6de ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D ss=-
+M ecfc3c3be7da vs code=cc12fd5db637713e ud=12 cur=1 fa=8 fb=6 dyn attr=440000.102941.4dfac.9.4.0.0.0,440000.102941.4dfac.13.4.1.0.0,440000.102941.4022c.17.2.2.0.0,440000.102941.4dfac.19.4.3.0.0,440000.102941.4a3ac.23.3.4.0.0 vbuf=68.102941.0
+M e15d64c57ac5 vs code=d39250761bab9932 ud=12 cur=2 fa=8 fb=6 dyn attr=340000.7692.4dfac.9.4.0.0.0,340000.7692.4dfac.13.4.1.0.0,340000.7692.4022c.17.2.2.0.0,340000.7692.4a3ac.19.3.3.0.0 vbuf=52.7692.0
+M 6b5a8b9610f6 ps code=d669d731db68f519 ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D ss=-
+M 8f46de9c2a9a vs code=dc85b71b45c59858 ud=12 cur=1 fa=8 fb=6 dyn attr=340000.7692.4dfac.9.4.0.0.0,340000.7692.4dfac.13.4.1.0.0,340000.7692.4022c.17.2.2.0.0,340000.7692.4a3ac.19.3.3.0.0 vbuf=52.7692.0
+M ce4bfa979117 ps code=e167bca39608688c ud=6 sysbase=2 center=0 smask=f omode=4 faceall kill in=0 si=n:Float/d:2D ss=-
+M 181329652fbc ps code=ecb09486deb3ccc1 ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 0d52efb4e523 cs code=eeb821b44ca6111d ud=9 t=8,8,1 tid=2 wgr=9 gx gy sb=st:1/f:8UInt/sw:204,st:2/f:8_8UInt/sw:22c
+M 1423f9fd1fc0 ps code=f305bf734dcd0767 ud=6 sysbase=2 center=0 smask=f omode=4 faceall early in=1 si=n:Float/d:2D,n:Float/d:2D ss=-
+P v=020a56d6f95a p=9131d94f3e5b plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5 topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=020a56d6f95a p=f68eb4fb8193 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.8.0.2 topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=1a02968fa515 p=1423f9fd1fc0 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=1a02968fa515 p=181329652fbc plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=1a02968fa515 p=b17e5460582c plain cc=1 c0=R8G8B8A8Unorm m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=205b21fad085 p=a1ed84b1e059 plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,40.0,56.0
+P v=20af028c71c0 p=1ff5f90a5592 plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,48.0,60.0
+P v=69d2c9073856 p=d28f0a81c7fb cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=69d2c9073856 p=d28f0a81c7fb cc=1 c0=R8G8B8A8Unorm m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=8139af880806 p=ce4bfa979117 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5 topo=TriangleList vb=36.0 va=0.0,16.0,28.0
+P v=8f46de9c2a9a p=6b5a8b9610f6 plain cc=1 c0=R8G8B8A8Srgb m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=8f46de9c2a9a p=77a15a4c7f23 plain cc=1 c0=R8G8B8A8Unorm m0=f topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=e15d64c57ac5 p=0efcc532fc7d plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.8.0.2 topo=TriangleList vb=52.0 va=0.0,16.0,32.0,40.0
+P v=ecfc3c3be7da p=427b4b86e350 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.1 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,40.0,56.0
+P v=ecfc3c3be7da p=427b4b86e350 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,40.0,56.0
+P v=ecfc3c3be7da p=705f398e1072 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,40.0,56.0
+P v=ecfc3c3be7da p=e207bf8ae460 plain cc=1 c0=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,40.0,56.0
+P v=ecfc3c3be7da p=e207bf8ae460 plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,40.0,56.0
+P v=fcda92c95f80 p=3e1548e884ed plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5 topo=TriangleList vb=68.0 va=0.0,16.0,32.0,48.0,60.0

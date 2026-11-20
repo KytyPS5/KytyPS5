@@ -136,6 +136,10 @@ std::array<IR::U32, 2> Translator::VectorMask(IR::U1 value) {
 IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 	switch (operand.kind) {
 		case Decoder::OperandKind::LiteralConstant:
+			if (runtime_word) {
+				return IR::U32(ir.Emit(IR::ValueOpcode::ReadCallWord, {IR::Value(*runtime_word)}));
+			}
+			return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
@@ -455,6 +459,9 @@ void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
 void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
 	value           = ApplyF32ResultModifiers(operand, value);
 	const auto half = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
+	if (NativeF16Enabled() && WriteF16Lane(operand, half)) {
+		return;
+	}
 	const auto bits = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,
 	                                  {IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}))}));
 	Write16Bits(operand, bits);
@@ -501,6 +508,26 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 }
 
 IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane) {
+	if (operand.kind != Decoder::OperandKind::FloatInlineConstant && operand.sdwa_sel >= 4u) {
+		// Convert the selected half in place; the sign modifiers apply exactly in F32.
+		auto raw_operand      = operand;
+		raw_operand.sdwa_sel  = 6;
+		raw_operand.sdwa_sext = false;
+		const auto bits = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
+		bool       high = high_lane ? operand.op_sel_hi : operand.op_sel;
+		if (operand.sdwa_sel != 6u) {
+			high = operand.sdwa_sel == 5u;
+		}
+		auto value = IR::F32(
+		    ir.Emit(IR::ValueOpcode::ConvertF32F16Lane, {bits, IR::Value(high ? 1u : 0u)}));
+		if (operand.absolute) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
+		}
+		if (high_lane ? operand.negate_hi : operand.negate) {
+			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
+		}
+		return value;
+	}
 	const auto bits     = Read16LaneBits(operand, high_lane);
 	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}));
 	const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16, {half_u16}));
@@ -619,7 +646,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	if (operand.kind == Decoder::OperandKind::LiteralConstant ||
 	    operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
 	    operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		return ThreadBit(ReadU32Pair(operand));
+		// Wave32 lane masks are 32-bit operands, which keep the single-precision encoding.
+		return ThreadBit(program.wave_size == 64u
+		                     ? ReadU32Pair(operand)
+		                     : std::array {ReadRawU32(operand), IR::U32(IR::Value(0u))});
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {
@@ -999,6 +1029,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u) {
+		// (Only a host with 32-wide subgroups runs two lanes per invocation otherwise.)
+		const auto* group = ShaderWorkgroupInput(options.stage, options.input_info);
+		result.lane_local = group != nullptr && group->host_subgroup_size == 32u && IsWaveLaneLocal(decoded);
+	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1137,7 +1172,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
-			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u && !result.lane_local &&
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
@@ -1257,7 +1292,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto& offsets  = options.input_info.vertex->indirect_offsets;
 			for (const auto [slot, parameter]:
 			     {std::pair {offsets.vertex, 1u},
-			      std::pair {offsets.instance, IR::PushData::MeshDrawDwordCount}}) {
+			      std::pair {offsets.instance, IR::PushData::MeshTaskPayloadDwordCount - 1u}}) {
 				if (indirect && 8u + slot < options.user_data_count) {
 					entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(8u + slot), draw(parameter));
 				}
@@ -1265,11 +1300,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto vertex_index = [&](IR::U32 index) {
 				return indirect ? index : entry_ir.IAdd(draw(1), index);
 			};
+			// The workgroup row is the instance within the host draw; a direct draw split in several adds
+			// its first instance (draw(5)). Indirect records pass theirs as the start instance above.
+			const auto instance_index = [&](IR::U32 row) {
+				return indirect ? row : entry_ir.IAdd(draw(5), row);
+			};
 			if (mesh.fast_launch) {
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), vertex_index(group));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				                      instance_index(builtin(IR::StageInputKind::WorkgroupId, 1)));
 			} else {
 				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 				// center in every subgroup; strip winding follows the global primitive.
@@ -1315,7 +1355,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      vertex_index(entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-				                      builtin(IR::StageInputKind::WorkgroupId, 1));
+				                      instance_index(builtin(IR::StageInputKind::WorkgroupId, 1)));
 			}
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), active_lane_count());
@@ -1454,8 +1494,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  options.input_info.vertex->resources[resource]);
 				continue;
 			}
+			const auto literal = std::ranges::lower_bound(decoded.runtime_literals, instruction.pc, {},
+			                                              &Decoder::RuntimeLiteral::pc);
+			translator.runtime_word.reset();
+			if (literal != decoded.runtime_literals.end() && literal->pc == instruction.pc) {
+				translator.runtime_word = literal->word;
+			}
 			translator.TranslateInstruction(instruction);
 		}
+		translator.runtime_word.reset();
 		translator.AddBranchCondition(cfg, cfg_block, *block);
 	}
 	return result;

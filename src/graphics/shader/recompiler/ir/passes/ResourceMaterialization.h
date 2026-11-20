@@ -30,6 +30,10 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
+		uint32_t                      table                      = ImageResource::NoImageTable;
+		uint32_t                      table_capacity             = 0;
+		uint32_t                      table_mapping_offset       = 0;
+		uint32_t                      table_entry_mask           = 0;
 		bool                          cube                       = false;
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
@@ -60,12 +64,39 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
+// Makes indirect descriptor layouts stable: mappings reserve room for a power of two of keys
+// (compute shaders at least `keys`, other stages at least 8) and indirect image roots bind a power
+// of two of images (compute shaders at least `images`), so that the guest data they select from
+// changes the shader permutation less often. Until it is called, layouts keep exact counts.
+void SetComputeIndirectFloors(size_t keys, size_t images);
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// Whether a module of `program` whose strides are read at run time (SrtRuntime::runtime_stride)
+// reads that of buffer `index`, whose specialization without it is `buffer`.
+bool ReadsStrideAtRunTime(const ResourcePlan& program, uint32_t index,
+                          const ResourceSpecialization::Buffer& buffer);
+// A specialization with the strides compiled in, as MaterializeResources() gives it for a program
+// that reads them at run time.
+void ReadStridesAtRunTime(const ResourcePlan& program, ResourceSpecialization& specialization);
+// The specialization of resources whose descriptors the caller evaluated itself (table mode, chenxiao07's
+// KytyPS5 fork): snapshot.buffers, images and samplers hold one descriptor per resource of the plan. False for
+// a plan with indirect descriptors, or descriptors no specialization takes.
+bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                               ResourceSpecialization& specialization);
+
+// Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
+bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
+
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+
+// Whether specialization has an element for each of program's resources and its added elements
+// name resources that exist: a pipeline manifest record written by another build may hold a
+// specialization for another list of resources, which ApplyResourceSpecialization rejects.
+bool ResourceSpecializationFits(const Program& program, const ResourceSpecialization& specialization);
 
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
 // null. Entries of one kind specialize identically.

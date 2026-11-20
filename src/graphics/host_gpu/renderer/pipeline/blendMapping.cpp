@@ -30,6 +30,15 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 	if (mapping.Map(3) == 3u) {
 		return BlendMappingSupport::Direct;
 	}
+	using Factor = Prospero::BlendFactor;
+	if (blend.separate_alpha_blend && blend.color_comb_fcn == static_cast<uint8_t>(Prospero::BlendOp::kAdd) &&
+	    blend.alpha_comb_fcn == blend.color_comb_fcn &&
+	    blend.color_srcblend == static_cast<uint8_t>(Factor::kZero) &&
+	    blend.color_destblend == static_cast<uint8_t>(Factor::kOne) &&
+	    blend.alpha_srcblend == static_cast<uint8_t>(Factor::kZero) &&
+	    blend.alpha_destblend == static_cast<uint8_t>(Factor::kOneMinusSrcAlpha)) {
+		return BlendMappingSupport::AttenuateDestinationAlpha;
+	}
 	if (blend.separate_alpha_blend &&
 	    blend.color_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha) &&
 	    blend.color_destblend == static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrcAlpha) &&

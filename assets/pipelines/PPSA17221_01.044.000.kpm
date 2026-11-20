@@ -1,0 +1,9 @@
+# kyty pipeline manifest v1
+M 1fd692604785 ps code=391de17bbb920072 ud=4 sysbase=2 center=0 smask=f omode=4 faceall early sb=-
+M 3c861086eb00 cs code=7f2f2408d305b8d4 ud=12 t=64,1,1 tid=1 wgr=12 gx sb=-,st:4,st:4
+M 367038889b36 vs code=877fe1b55a29974c ud=4 cur=1 fa=2 dyn attr=1c0000.149784.4dfac.9.3.0.0.0,1c0000.149784.4a3ac.12.2.1.0.0 vbuf=28.149784.0
+M 1fa836c06b35 vs code=b0d412b617468c1b ud=4 fa=2 dyn attr=c0000.4.4a3ac.9.3.0.0.0 vbuf=12.4.0
+M 4d0709e84c64 ps code=c4564a0879a838ff ud=12 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+P v=1fa836c06b35 depth=D32SfloatS8Uint stencil neg topo=TriangleStrip vb=12.0 va=0.0
+P v=1fa836c06b35 p=1fd692604785 cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=f neg topo=TriangleStrip vb=12.0 va=0.0
+P v=367038889b36 p=4d0709e84c64 plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5.1.1.0.5 neg topo=TriangleList vb=28.0 va=0.0,16.0

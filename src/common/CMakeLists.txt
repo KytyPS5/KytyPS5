@@ -9,6 +9,12 @@ file(GLOB_RECURSE common_headers CONFIGURE_DEPENDS "*.h")
 if(KYTY_CLANG_CL)
 	set_source_files_properties(${common_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack")
 endif()
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	# The fault and resume labels of kyty_guarded_copy are defined in the asm of a naked function, which the symbol
+	# table of an LTO module does not list: with KYTY_THINLTO or CMAKE_INTERPROCEDURAL_OPTIMIZATION the code that
+	# reads their addresses would not link. Compile it natively (without LTO the option changes nothing).
+	set_source_files_properties(guardedCopy.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 

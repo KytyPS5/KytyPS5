@@ -14,7 +14,7 @@ layout(push_constant, std430) uniform Check {
 	uint expand;
 } params;
 
-const uint Slots = 8u; // TileManager::ColorClearSlots
+const uint Slots = 16u; // TileManager::ColorClearSlots
 
 shared uint key;
 shared uint mismatch;
@@ -37,8 +37,8 @@ void main() {
 		atomicOr(mismatch, 1u);
 	}
 	barrier();
-	const uint slot = key >> 5u;
-	const bool hit  = mismatch == 0u && (key & 0x1fu) == 0u && (params.keys & (1u << slot)) != 0u;
+	const uint slot = key >> 4u;
+	const bool hit  = mismatch == 0u && (key & 0xfu) == 0u && (params.keys & (1u << slot)) != 0u;
 	if (gl_LocalInvocationIndex < Slots) {
 		predicates.data[slice * Slots + gl_LocalInvocationIndex] =
 		    uint(hit && slot == gl_LocalInvocationIndex);

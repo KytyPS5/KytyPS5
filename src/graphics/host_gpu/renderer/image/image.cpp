@@ -120,10 +120,36 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+// A depth-stencil image goes from attachment use to attachment use with shader reads, or back, in
+// a layout that keeps every aspect shaders can read there read-only (depth read-only with a
+// stencil attachment, or the reverse): the shader reads and the attachment writes are of different
+// aspects, so the draws need no barrier between them, nor the render pass break it takes. The
+// image keeps both accesses. Demon's Souls' deferred decals alternate a stencil mark with a decal
+// that samples depth, ~750 times a frame at Boletaria.
+static bool AttachmentKeepsShaderRead(vk::ImageLayout layout, vk::AccessFlags2 access,
+                                      vk::ImageLayout destination_layout,
+                                      vk::AccessFlags2 destination_access) {
+	constexpr auto attachment = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+	                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+	return layout == destination_layout &&
+	       (layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+	        layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal) &&
+	       (access & attachment) == attachment && (destination_access & attachment) == attachment &&
+	       (access ^ destination_access) == vk::AccessFlagBits2::eShaderRead;
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	constexpr vk::AccessFlags2 WriteAccess =
+	    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+	    vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
+	    vk::AccessFlagBits2::eHostWrite | vk::AccessFlagBits2::eMemoryWrite;
+	if (destination_access & WriteAccess) {
+		write_count++;
+	}
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -157,6 +183,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
+				if (AttachmentKeepsShaderRead(subresource_state.layout, subresource_state.access_mask,
+				                              destination_layout, destination_access)) {
+					subresource_state.access_mask |= destination_access;
+					subresource_state.pl_stage |= destination_stage;
+					continue;
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -192,6 +224,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		    !repeated_write) {
 			return {};
 		}
+		if (AttachmentKeepsShaderRead(state.layout, state.access_mask, destination_layout,
+		                              destination_access)) {
+			state.access_mask |= destination_access;
+			state.pl_stage |= destination_stage;
+			return {};
+		}
 
 		vk::ImageMemoryBarrier2 barrier {};
 		barrier.srcStageMask                    = state.pl_stage;
@@ -217,13 +255,20 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
 	    })) {
 		HeapChanged();
+	} else if (state.layout != destination_layout || state.access_mask != destination_access ||
+	           std::ranges::any_of(barriers, [](const vk::ImageMemoryBarrier2& barrier) {
+		           return barrier.oldLayout != barrier.newLayout ||
+		                  barrier.srcAccessMask != barrier.dstAccessMask;
+	           })) {
+		// A layout or access change (repeated writes keep both).
+		StateChanged();
 	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};

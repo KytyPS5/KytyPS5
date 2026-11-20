@@ -35,6 +35,11 @@ enum class ShaderType {
 
 struct ShaderModule;
 
+// Names what the fields of the stage input structures below mean for the files that keep them
+// across sessions and builds (the shader program and pipeline stores). Change it whenever a field
+// is added, removed or reinterpreted, even when no structure changes size.
+inline constexpr std::string_view ShaderInputLayoutTag = "3";
+
 struct ShaderStageRuntime {
 	const ShaderModule*                           module    = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
@@ -173,6 +178,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
+	// An indirect thread-dimension dispatch: the thread limit is written by the GPU, so the
+	// shader data lives in a storage buffer instead of push constants.
+	bool               dispatch_indirect_threads  = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
@@ -343,7 +351,30 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Moves whenever a shader is mapped, and the code hash of the shader mapped at `addr` (0: none).
+[[nodiscard]] uint64_t ShaderMapGeneration();
+[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
+// The binary of the shader mapped at `addr` as the game gave it (code, metadata and the footer
+// that ends it), or an empty span when no shader is mapped there.
+std::span<const uint32_t> ShaderMappedBinary(uint64_t addr);
+// Names the driver resource registration gives guest memory (sceAgcDriverRegisterResource): the
+// libraries that register their shaders name each one by its code address. `name` null forgets
+// the name of `addr`.
+void ShaderSetRegisteredName(uint64_t addr, const char* name);
+// The registered name of the resource starting at `addr` (a shader's code address), or null. The
+// string stays valid for the life of the process.
+const char* ShaderRegisteredName(uint64_t addr);
+// Whether a resource was ever registered under `name` (a library's resources tell its version).
+bool ShaderNameRegistered(const char* name);
+
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
+
+// Told about each mapped shader on the thread that maps it, with its hash and the code the hash
+// covers, which is only valid during the call.
+using ShaderMapListener = void (*)(void* userdata, uint64_t hash, std::span<const uint32_t> code);
+// Installs the listener (a null one removes it) and tells it at once about the shaders mapped
+// before. No call is in progress once it returns.
+void ShaderSetMapListener(ShaderMapListener listener, void* userdata);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

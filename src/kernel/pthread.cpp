@@ -584,6 +584,7 @@ public:
 	Pthread Create();
 
 	void FreeDetachedThreads();
+	void HostThreadIds(std::vector<uint64_t>& ids);
 
 private:
 	std::vector<Pthread> m_threads;
@@ -713,6 +714,46 @@ static int CreateGuestStack(PthreadAttr attr) {
 	std::memset(attr->stack_addr, 0, stack_size);
 
 	return OK;
+}
+
+uint64_t AllocateEmulatorGuestStack(size_t size, size_t* allocated) {
+	const auto map_size = RoundStackSize(size);
+	uint64_t   address  = 0;
+	{
+		Common::LockGuard lock(g_guest_stack_mutex);
+		auto              cached = std::find_if(g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
+		                                        [map_size](const auto& stack) {
+                                       return stack.map_size == map_size && stack.guard_size == 0;
+		                                        });
+		if (cached != g_guest_stack_cache.end()) {
+			address = cached->address;
+			g_guest_stack_cache.erase(cached);
+		} else {
+			if (g_guest_stack_last == 0) {
+				g_guest_stack_last = PTHREAD_STACK_TOP - PTHREAD_STACK_INITIAL - PTHREAD_STACK_PAGE;
+			}
+			if (map_size > g_guest_stack_last - PTHREAD_STACK_BOTTOM) {
+				return 0;
+			}
+			address = g_guest_stack_last - map_size;
+			g_guest_stack_last -= map_size;
+			address = Memory::AllocateGuestStackMemory(address, map_size, Common::VirtualMemory::Mode::ReadWrite,
+			                                           "fiber stack");
+			if (address == 0) {
+				return 0;
+			}
+		}
+	}
+	*allocated = map_size;
+	return address;
+}
+
+void FreeEmulatorGuestStack(uint64_t address, size_t size) {
+	if (address == 0) {
+		return;
+	}
+	Common::LockGuard lock(g_guest_stack_mutex);
+	g_guest_stack_cache.push_back({address, size, 0});
 }
 
 static void FreeGuestStack(PthreadAttr attr) {
@@ -1536,6 +1577,18 @@ void PthreadPool::FreeDetachedThreads() {
 	for (auto* p: m_threads) {
 		if (p->detached && p->almost_done && !p->free) {
 			PthreadJoin(p, nullptr);
+		}
+	}
+}
+
+void PthreadPool::HostThreadIds(std::vector<uint64_t>& ids) {
+	Common::LockGuard lock(m_mutex);
+
+	for (const auto* p: m_threads) {
+		// A thread that has not started yet has no unique id and may keep the host id of the
+		// thread that used the entry before.
+		if (!p->free && !p->almost_done && p->unique_id != -1 && p->host_thread_id != 0) {
+			ids.push_back(p->host_thread_id);
 		}
 	}
 }
@@ -3085,6 +3138,17 @@ Pthread PthreadSwapSelfForSignal(Pthread thread) {
 
 uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
+}
+
+std::vector<uint64_t> PthreadGuestHostThreadIds() {
+	std::vector<uint64_t> ids;
+	if (g_pthread_main != nullptr && g_pthread_main->host_thread_id != 0) {
+		ids.push_back(g_pthread_main->host_thread_id);
+	}
+	if (g_pthread_context != nullptr) {
+		g_pthread_context->GetPthreadPool()->HostThreadIds(ids);
+	}
+	return ids;
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

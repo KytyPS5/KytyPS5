@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -9,6 +10,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+// ShaderInfo::ray_query_header_slots before the first RayQueryInit.
+constexpr uint32_t UnsetRayQuerySlot = 0xfffffffeu;
 
 [[noreturn]] void Fail(std::string_view message) {
 	EXIT("shader info collection failed: %s", std::string(message).c_str());
@@ -268,6 +272,8 @@ struct InputUsage {
 	std::array<StageInputKind, static_cast<size_t>(StageInputKind::Parameter)> builtins {};
 	uint32_t builtin_mask = 0;
 	uint32_t builtin_count = 0;
+	// Buffers read other than by an in-range constant ReadConstBuffer.
+	std::vector<bool> not_constant;
 
 	void AddBuiltin(StageInputKind kind) {
 		const auto bit = 1u << static_cast<uint32_t>(kind);
@@ -286,6 +292,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
+	info.float16 |= op == ValueOpcode::PackedFPAdd16x2 || op == ValueOpcode::PackedFPMul16x2 ||
+	                op == ValueOpcode::PackedFPFma16x2 || op == ValueOpcode::PackedFPMin16x2 ||
+	                op == ValueOpcode::PackedFPMax16x2 || inst.GetType() == Type::F16;
+	for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+		info.float16 |= inst.Arg(arg).GetType() == Type::F16;
+	}
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||
@@ -306,11 +318,21 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					return Fail("buffer operation has invalid resource metadata");
 				}
 				info.buffers[memory.resource].live = true;
+				const auto offset = op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer
+				                        ? inst.Arg(1).Resolve() : Value {};
+				const bool constant =
+				    offset.IsImmediate() && offset.GetType() == Type::U32 &&
+				    (static_cast<uint64_t>(offset.U32() & ~3u) + memory.offset + sizeof(uint32_t) <=
+				     UniformBufferBytes - UniformBufferBaseSlack);
+				if (!constant) {
+					inputs.not_constant[memory.resource] = true;
+				}
 				for (const auto child: info.buffers[memory.resource].indirect_resources) {
 					if (child >= info.buffers.size()) {
 						return Fail("indirect buffer operation has invalid resource metadata");
 					}
 					info.buffers[child].live = true;
+					inputs.not_constant[child] = true;
 				}
 			}
 		}
@@ -336,7 +358,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
-				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
+				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op) || memory.IsCoherentBufferPairStore(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -352,7 +374,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					collect_element(child);
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 					if (program.stage != ShaderType::Compute) {
-						return Fail("buffer ADD_TID is only valid for compute shaders");
+						return Fail(fmt::format(
+						    "buffer ADD_TID is only valid for compute shaders: hash=0x{:016x} "
+						    "stage={} resource={}",
+						    program.shader_hash, static_cast<unsigned>(program.stage),
+						    memory.resource));
 					}
 					info.subgroup_local_invocation_id = true;
 				}
@@ -513,17 +539,47 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::GetDispatchThreadExtent:
 			info.uses_dispatch_threads |= inst.HasUses();
 			break;
-		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
+		case ValueOpcode::ReadConst:
+		case ValueOpcode::ReadCallWord: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = info.uses_dma = true; break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
-		case ValueOpcode::RayQueryInitialize: info.ray_query = true; break;
+		case ValueOpcode::RayQueryInitialize: info.ray_query = info.ray_query_mirror = true; break;
 		case ValueOpcode::LoadDeviceAddressU32: info.uses_device_address = true; break;
+		case ValueOpcode::RayQueryInit: {
+			// The native ray tracing context, by device address.
+			info.uses_dma = true;
+			// Where its TLAS header address comes from: the flattened SRT dwords, when the guest
+			// loads it from its user data. Every site must read the same ones.
+			auto& slots = info.ray_query_header_slots;
+			for (uint32_t word = 0; word < 2; word++) {
+				const auto* read = inst.Arg(8 + word).Resolve().TryInstruction();
+				const auto  slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+				                          read->NumArgs() == 2 && read->Arg(1).Resolve().IsImmediate()
+				                       ? read->Arg(1).Resolve().U32()
+				                       : ShaderInfo::NoRayQuerySlot;
+				slots[word] = slots[word] == UnsetRayQuerySlot || slots[word] == slot
+				                  ? slot
+				                  : ShaderInfo::NoRayQuerySlot;
+			}
+			info.ray_query = true;
+			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
+			break;
+		}
+		case ValueOpcode::RayQueryNext:
+		case ValueOpcode::RayQueryMatch:
+		case ValueOpcode::RayQuerySelectedLeaf:
+		case ValueOpcode::RayQueryResult:
+		case ValueOpcode::RayQueryMark:
+		case ValueOpcode::RayQueryAlpha:
+			info.ray_query = true;
+			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
+			break;
 		case ValueOpcode::ConditionRef:
-			info.subgroup_vote |=
+			info.subgroup_ballot |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
@@ -583,16 +639,22 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
+	info.ray_query_mirror = false;
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
 	        false;
-	info.bvh = info.ray_query = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	info.ray_query              = false;
+	info.ray_query_sites        = 0;
+	info.ray_query_header_slots = {UnsetRayQuerySlot, UnsetRayQuerySlot};
+	info.bvh = info.subgroup_ballot = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
-	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 =
+	    info.float16 = false;
 	InputUsage inputs;
+	inputs.not_constant.assign(info.buffers.size(), false);
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
@@ -601,12 +663,25 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
 	}
+	for (auto& slot: info.ray_query_header_slots) {
+		if (slot == UnsetRayQuerySlot) slot = ShaderInfo::NoRayQuerySlot;
+	}
+	for (uint32_t index = 0; index < info.buffers.size(); index++) {
+		auto& buffer         = info.buffers[index];
+		buffer.constant_only = buffer.live && !inputs.not_constant[index] &&
+		                       !buffer.written && !buffer.atomic && !buffer.formatted &&
+		                       buffer.indirect_root == BufferResource::NoIndirectBuffer &&
+		                       buffer.indirect_resources.empty() && !buffer.indirect_write_table;
+	}
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
 	                           std::ranges::any_of(info.images, uses_mapping) ||
-	                           std::ranges::any_of(info.samplers, uses_mapping);
+	                           std::ranges::any_of(info.samplers, uses_mapping) ||
+	                           std::ranges::any_of(info.images, [](const ImageResource& image) {
+		                           return image.table_capacity != 0u;
+	                           });
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
 	switch (program.stage) {
 		case ShaderType::Vertex:

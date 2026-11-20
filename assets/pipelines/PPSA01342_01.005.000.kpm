@@ -1,0 +1,1090 @@
+# kyty pipeline manifest v1
+M c0a1563c2e3a cs code=003985e04af63f5f ud=2 t=64,1,1 lds=384 tid=1 wgr=2 dims gx si=n:Float/d:2D,n:Uint/d:2D
+M 0fbd58be2d49 cs code=00b0a3974bcee09a ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 18b6193a0c46 ps code=00cf5beb84143a74 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 sb=st:160 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 621440a725f9 ps code=00d5964cd01b8e7e ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420,400 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 692c82af0345 cs code=0105c11ff30cb5dd ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 000c43dab1db cs code=01b4656b668365de ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:44,st:220,st:12,st:4,st:4,st:4,st:68,-,st:8,st:120,st:60
+M aa210b58dd45 cs code=022b52aeb62d6dbc ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M f5be4e299d0e cs code=022b52aeb62d6dbc ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 6a2535241076 ps code=025fa5b584e71758 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420,400 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2edea103e954 cs code=02c9bc6c14d9bec6 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:308,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:48
+M 302cc878e7e6 cs code=02e9d8554147f519 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M d06cb8d7838e ps code=033c8d4337a8337f ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 258ca5428c71 cs code=039bd2879fb2e168 ud=4 t=64,1,1 lds=640 tid=1 wgr=4 gx gy sb=st:2/f:16SInt/sw:4,st:4/f:32SInt/sw:4,st:2/f:16SInt/sw:4 si=n:Uint/d:2D
+M 92acdca1b066 vs code=040005dfeb57ad7b ud=3 cur=9 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 27381a16da45 cs code=040108e395e90e6d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,-,st:120,st:64 si=n:Float/d:2D ss=-
+M f31130d49659 cs code=048c4231dd2a7a8e ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 5f5fadd6f87f cs code=04b68c53552cbc1b ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:64,st:4/f:32Float/sw:204,st:4,st:4/f:32UInt/sw:4 si=n:Float/d:2D
+M 1b1b21f9d8b8 ps code=04f2c1f7567588bd ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 75f14f5d2f41 cs code=0516546bcafb43b1 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e9e18e006472 cs code=0516546bcafb43b1 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 43c466797e73 cs code=059dde7fe1596b53 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64
+M 294d590e0dfb cs code=05a05a0ac5bb0782 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:224,st:12,st:4,st:12
+M f1cb92ea78e6 cs code=064feec383589203 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M 57140b1b2349 vs code=0693f6c6df34aec2 ud=3 cur=2 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 5c85893000e8 cs code=06bff19511606b78 ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 76289e5088ba cs code=06bff19511606b78 ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c660247c9ead cs code=06cb5813cdec8b9f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:112,st:4,st:104 si=n:Float/d:2D ss=-
+M 3668063b81ad cs code=06eff681ae765650 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 40946d016c37 cs code=070cec8604244193 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:64,st:8
+M 9479b72e1c15 cs code=0724581ef1889aff ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:76 si=n:Float/d:3D,n:Float/d:3D ss=-
+M c859b819c15f cs code=07acdce97d7c3df3 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Uint/d:2D,n:Uint/d:2D
+M 4ad2c6fd766d cs code=07b9acf76618ea00 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:308,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:48
+M 0b2983985351 cs code=07fba23ecbd828ba ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:304,st:12,st:4,st:12
+M 5383df974a45 cs code=08f7c97f2a870e66 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:252,st:12,st:4,st:12
+M 4f99369e8506 vs code=09c6fc3b6f45b2a6 ud=2 sb=st:12/f:32_32_32Float/sw:3ac,-
+M 6bbfacbb1074 cs code=0a4534e20ef3d4d7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:36 si=n:Float/d:2D ss=-
+M ed1dc2f12d9e cs code=0a4534e20ef3d4d7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:36,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:36 si=n:Float/d:2D ss=-
+M 1db494c5868b cs code=0ac1b773ae9f7af0 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M 2d1c9fe2987c cs code=0afe4fd033704f8a ud=2 t=8,8,1 lds=128 tid=2 wgr=2 gx gy sb=st:224 si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2DArray/t:0/tc:256/tm:136/te:7ffffff,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8c8e9fd9f0d9 cs code=0afe4fd033704f8a ud=2 t=8,8,1 lds=128 tid=2 wgr=2 gx gy sb=st:224 si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2DArray/t:0/tc:256/tm:136/te:7ffffff/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M dac3c5cde927 cs code=0b40fc6dcea1dfb0 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=- si=n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 21568392e48f cs code=0bc73e00eff88663 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Uint/d:2D,n:Float/d:2D
+M 1dbff8893a34 ps code=0d16f17c76ed9ca1 ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 90b89a5b5e90 cs code=0d321c7f6e58d043 ud=6 t=512,1,1 lds=2048 tid=1 wgr=6 gx sb=st:1
+M 00171f31d8d9 cs code=0d9545ded3973e1b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4,st:32,st:4,st:4/f:32UInt/sw:4
+M b48f0adaa670 cs code=0da2ef9addad7857 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:36,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:36
+M d63c929ef679 cs code=0da2ef9addad7857 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:36
+M 30a637a98c25 vs code=0e77618f15b4a5a0 ud=3 cur=5 sb=st:4/f:8_8_8_8UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c
+M 27a43b69d601 ps code=0e77dd0be1882042 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 0af158ce59b6 cs code=0f9ccffe5ebafe34 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:68,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:56 si=n:Float/d:2D ss=-
+M 981dd28ab860 cs code=0fc1ec506b9e1c47 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M b8c70157a9a7 cs code=0fc1ec506b9e1c47 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M 317f8b29f449 ps code=0fff53ff3aa08491 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420,400 sb=st:4,st:112 si=n:Float/d:2D ss=-
+M 25fcb0942499 cs code=102f0d4c553811c9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,-,-,-,st:8/f:16_16_16_16UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm
+M 35a0867ade53 cs code=102f0d4c553811c9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,-,-,-,st:4/f:8_8_8_8UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm
+M ce225951d384 cs code=102f0d4c553811c9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,-,st:8,st:1,st:8/f:16_16_16_16UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm
+M 8cc4e51b4dac cs code=10506a2d64084700 ud=12 t=1024,1,1 lds=128 tid=1 wgr=12 async gx sb=-,st:4,st:8
+M d0b04a2a59f1 cs code=10bd9b73351f9c69 ud=2 t=4,4,4 tid=3 wgr=2 gx gy gz sb=-,st:8/f:32_32UInt/sw:2c,st:16 si=n:Uint/d:3D
+M 1bb64bee9ec8 cs code=110c7850fcdbc180 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:48 si=n:Float/d:2D ss=-
+M f1d67b86b702 cs code=110c7850fcdbc180 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:48 si=n:Float/d:2D ss=-
+M 649ab014fddd cs code=11871b814ee9dd82 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:64
+M ae1cf5ece201 cs code=11871b814ee9dd82 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:64
+M 077f48cc2fc8 vs code=130aa8790f6e726a ud=2 sb=st:12/f:32_32_32Float/sw:3ac,-
+M 391f36102b2d vs code=130aa8790f6e726a ud=2 cur=7 sb=st:12/f:32_32_32Float/sw:3ac,-
+M 422effb780c1 vs code=130aa8790f6e726a ud=2 cur=8 sb=st:12/f:32_32_32Float/sw:3ac,-
+M e114f15c1c16 vs code=130aa8790f6e726a ud=2 cur=6 sb=st:12/f:32_32_32Float/sw:3ac,-
+M df5ec8d2223e cs code=15300ab48bba5a1e ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:16,st:1/f:8UInt/sw:4
+M 5e7b8da490bc cs code=1539bc8765a3ff98 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 6797b026476b ps code=15444b499b45b7b8 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy posw faceall early in=0,1,2,403,404,406 si=n:Float/d:2DArray/ir:0/im:96/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0 ss=-,-
+M a65c47683899 ps code=15444b499b45b7b8 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy posw faceall early in=0,1,2,403,404,406 si=n:Float/d:2DArray/ir:0/im:96/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0 ss=-,-
+M 389d5dcb4014 cs code=157a5a79685b88e0 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:236,st:12,st:4,st:12
+M 25d3b5d2abd5 cs code=15c7707af0a2ad18 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:72,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:72
+M 468ae67e5b03 cs code=15c7707af0a2ad18 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:72
+M 38d6592f8dd8 cs code=16af22544b651a0a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:112,st:4,st:104
+M 82974eaabb05 cs code=16af22544b651a0a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:104,st:220,st:12,st:4,st:4,-,st:4,st:112,st:4,st:104
+M 0c46adf8422f cs code=16b0e816bd4828ef ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:48,st:308,st:16,st:4,st:4,-,st:4,st:8,st:120,st:72 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 48f2fe4c221b cs code=171d5d27c14ece1e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:68,st:220,st:12,st:4,st:4,st:4,st:68,st:8,-,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D ss=-
+M c33f76b86ced cs code=171d5d27c14ece1e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,-,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 81123e14b219 cs code=173802555ebe2be1 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M ae32574396a9 cs code=173802555ebe2be1 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M b5b7f0f08cb3 ps code=175347256f1d67b7 ud=2 sysbase=2 custom=2 center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy face faceall early in=0,421 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 52917ba75327 cs code=1802e846823d7114 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:60
+M d24233074a72 vs code=184e03a821f43207 ud=3 ii=2 idraw sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M e544fc18d82b cs code=18aa2cd1f70dce7a ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:52,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 8bb6b0be2ed5 cs code=18ad5f19dd870b25 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,st:4,st:8,st:120,st:52
+M ae49475f3edf cs code=18ad5f19dd870b25 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:52,st:336,st:12,st:4,st:4,st:4,st:8,st:120,st:52
+M 3c146a463622 cs code=18f56c2bf2b6ac38 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5e471dc75625 cs code=18f56c2bf2b6ac38 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1dafa49ed504 ps code=18fd00339a28ab57 ud=2 sysbase=2 custom=d center=0 smask=0 face faceall kill in=420,400,421,422 sb=st:160 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 04c5973b40f1 cs code=197d209a026b6d90 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44 si=n:Float/d:2D ss=-
+M d2a6bb614c1a cs code=197d209a026b6d90 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44 si=n:Float/d:2D ss=-
+M 4b0e576396d8 ps code=19cb19f02614ca57 ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 65f7913f6391 ps code=1a641c8d33cdca23 ud=2 sysbase=2 center=0 smask=3f omode=4,4 posx posy faceall early in=0,1 si=n:Float/d:2D,n:Float/d:2D ss=-
+M b2294688bdf2 cs code=1aa9893d0db5cc3d ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:292,st:12,st:4,st:12
+M bd96bee697c0 ps code=1b78c18c283edf88 ud=2 sysbase=2 center=0 omode=4,4,4,4,4,4,4,4 posw faceall kill in=0,1,403,405,406 si=n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray ss=-
+M a4f71de6c1b2 cs code=1cb7de463e98c8d1 ud=8 t=1,1,1 tid=1 wgr=8 sb=st:4,st:4
+M 853f7f6feab4 ps code=1d69048de840bf59 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a4388a2bd7cf cs code=1d8d227fdf1938f9 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M cfb068ddf481 cs code=1d8d227fdf1938f9 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8202dd542726 cs code=1f1dc79245559fde ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8457710712c1 cs code=1f5265b60e296d77 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:8,st:8
+M 14b41ed26b15 cs code=1f78b8f44ce8e515 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M d5c9c5370a94 cs code=1f78b8f44ce8e515 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M 095cda89b38d vs code=209bef28d5daa0d6 ud=3 cur=5 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 714200538a53 vs code=209bef28d5daa0d6 ud=3 cur=3 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 83abdd42dba2 cs code=20f6724b981b882b ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:240,st:12,st:4,st:12
+M 522bcb1a45c1 cs code=2105c784e57d9b0d ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7a74c8e4311b cs code=2105c784e57d9b0d ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e21fedea17d2 cs code=213dfa1959e9cd04 ud=12 t=8,8,1 tid=2 wgr=12 async gx gy gz sb=- si=n:Float/d:3D
+M d0a0b430c81e cs code=21e948902d9838ae ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M a949d0a40078 cs code=21ead362172fa067 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:72
+M c3b1ba73a086 ps code=21fab0b2c2cf48de ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 1a238be6db93 cs code=221934ccafc767e4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40 si=n:Float/d:2D ss=-
+M 66250c034863 cs code=221934ccafc767e4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40 si=n:Float/d:2D ss=-
+M 9667349ff345 cs code=2239054d59702a6f ud=14 t=64,1,1 tid=1 wgr=14 gx sb=-,st:64,-,st:32,st:8
+M ed9c51fc57ba cs code=226abfdbf55853f0 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy sb=- si=n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D ss=-
+M e901e4f7f5f5 cs code=226e1fa8a8b5bb10 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fbbe5c869759 cs code=226e1fa8a8b5bb10 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 60e9c743cc78 ps code=23d2580fe517cb9a ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=- si=n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:2DArray ss=-,-
+M a04445221442 cs code=23da90105cfcc172 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4,st:8/f:32_32UInt/sw:2c,st:8/f:32_32UInt/sw:2c si=n:Uint/d:3D,n:Uint/d:3D
+M 4ef5dfd4e71d ps code=23e8aa3adbc6c26d ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 365bd7bd386f ps code=24083813b4f1bb07 ud=2 sysbase=2 custom=a center=0 smask=f omode=4 posw face faceall kill in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 08f2d4a13b96 cs code=24711e91dcb84d18 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 71a81d9f9831 cs code=24d6eb8c62c6982d ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 82947d37e398 cs code=250bc8dde0edb810 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 9ec8dae3bd1e cs code=250bc8dde0edb810 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M a790e3988429 cs code=258b070fb2f258ab ud=2 t=8,8,1 lds=128 tid=2 wgr=2 async gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M 65e6c6cdcbaa cs code=2592746eb6c70642 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M b8f40d245f74 vs code=25c3f0092a157c68 ud=2 cur=1 sb=f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac,-,st:4/f:16_16Float/sw:22c
+M f9213bf956c3 cs code=25f0c775e7bf511b ud=2 t=1,1,1 tid=1 wgr=2 async gx sb=st:24 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 84df5f59892f cs code=26999627aaaf175a ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:56,st:4/f:32UInt/sw:4,st:16,st:4,st:16
+M 5856972793ac ps code=26d9511b25fa2a1e ud=2 sysbase=2 center=0 smask=ff omode=4,4 posx posy faceall early in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 09061d154e59 vs code=270a2731b509129a ud=3 cur=1 sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 46fafa91b24b vs code=270a2731b509129a ud=3 cur=1 sb=oob,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M f865cb54cec6 vs code=270a2731b509129a ud=3 cur=2 sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 5286ac85355d cs code=277c05c86f79054e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64
+M 78ef9356cec9 cs code=277c05c86f79054e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64
+M 16e55c31f4b2 cs code=27bf77ccb8cb8e4f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:60
+M 6e144582f082 cs code=27bf77ccb8cb8e4f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:60
+M 0301780cda4a ps code=281cd0f060829b9e ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M be2fe752c518 cs code=282a83abe798bdf1 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=-,st:4,st:4 si=n:Uint/d:3D
+M 916f836be836 ps code=2868bd03800325d6 ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M eae396617fb5 cs code=286a3fc2bc8e70d3 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=-,- si=n:Float/d:2D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray ss=-
+M 698a496b41c1 cs code=28c0b0fb7291ae55 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8c3723996559 cs code=28c0b0fb7291ae55 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b73dd9ca2c45 vs code=29299a7b149cf109 ud=3 ii=2 idraw sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 9bc69044b798 cs code=296f15c47c55604e ud=2 t=2,2,2 tid=3 wgr=2 gx gy gz sb=-,st:8/f:32_32UInt/sw:2c,st:16 si=n:Uint/d:3D
+M ca4cf6ec4479 cs code=2977ca716dde6406 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M da676ec8a064 cs code=29905715f72bae53 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:244,st:12,st:4,st:4,st:4,st:8,st:120,st:36
+M 92e502032f5e cs code=299534658f7b451a ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M b3dc23a78cc2 vs code=29df538699f7d522 ud=3 cur=7 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M d547637590c8 vs code=29df538699f7d522 ud=3 cur=8 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 6245d5750a82 cs code=2a3206e916dea7b7 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:56,st:2/f:16UInt/sw:4,-,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:32UInt/sw:4,st:12 si=n:Float/d:2D ss=-
+M fa83d4ae2cf1 cs code=2a7fd07be617354d ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:16,st:56,st:4,st:4/f:32UInt/sw:4,st:4
+M a91fce578013 cs code=2a83f61829176339 ud=2 t=8,8,1 lds=128 tid=2 wgr=2 async gx gy sb=-,st:176,st:16,st:4,st:4,st:8/f:16_16_16_16Float si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 96f48a559852 cs code=2b38c5fa084c33ca ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D/m:4 ss=-
+M fc29bd9582b0 cs code=2b38c5fa084c33ca ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D/m:4 ss=-
+M 8a1670fe6df1 cs code=2b80e818d4a2443b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,st:8,-,st:120,st:60
+M e9ece82ba872 cs code=2b80e818d4a2443b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:228,st:12,st:4,st:4,st:4,st:8,-,st:120,st:60
+M ae084265cded cs code=2bcf76a472623970 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 1b42fe360665 cs code=2c2243c9e3e3b5fc ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a4ff6c60dbd7 cs code=2c2243c9e3e3b5fc ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 936cf2b4d6de ps code=2ce13ce75f854e23 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1
+M 25059ef9cb7c cs code=2d45ffd3ea15096a ud=8 t=64,1,1 tid=1 wgr=8 gx sb=-,st:4/f:32UInt/sw:4
+M 01510ce484da cs code=2d5f2c6cc8028117 ud=2 t=4,4,4 tid=3 wgr=2 gx gy gz sb=-,st:8/f:32_32UInt/sw:2c,st:16 si=n:Uint/d:3D
+M 22576be0e112 cs code=2d7c87eaca98bb5f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M f7e1a0ef0cc7 cs code=2e10aa934a2f34fa ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M e200ed164ad9 cs code=2eaa952d027ef338 ud=2 t=1,1,1 tid=1 wgr=2 async sb=-,-,st:4/f:32UInt/sw:4
+M 0c19df7e3d14 ps code=2fc5c9c5b0f7e454 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M e0fd9161b0ae cs code=2fd8689761ba689a ud=2 t=4,4,4 tid=3 wgr=2 gx gy gz si=n:Float/d:3D,n:Float/d:3D
+M 9e258e9a0225 cs code=301cc87ec998d48e ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:236,st:12,st:4,st:12
+M f290ba2aec2b cs code=3062dab70bb7d5f2 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 7e195bec4863 ps code=30ab4cc4d440e3e2 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420,400 sb=st:160,st:32 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0ade1a887a3e vs code=30dfc377d3ab5bf1 ud=3 cur=10 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 2e6a300ade46 vs code=30dfc377d3ab5bf1 ud=3 cur=6 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 54e8cc3c4eb1 vs code=30dfc377d3ab5bf1 ud=3 cur=9 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 9bb72bb78357 vs code=30dfc377d3ab5bf1 ud=3 cur=8 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M f9fd57595e4d vs code=30dfc377d3ab5bf1 ud=3 cur=7 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 71c6bdb68378 cs code=31090d8f4fc447c1 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:56,st:220,st:12,st:4,st:4,st:4,st:8,-,st:120,st:56
+M 72e1f5704e72 cs code=31090d8f4fc447c1 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,-,st:120,st:56
+M 7b8c1ba5a456 ps code=3123e902860665fe ud=2 sysbase=2 center=0 smask=7 omode=4 faceall early in=0 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d62e76a892c5 cs code=3145302589ae0fe6 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:56,st:2/f:16UInt/sw:4,-,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:32UInt/sw:4,st:12
+M 05f81eeff107 cs code=3173266c17bf64db ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:232,st:12,st:4,st:4,st:4,st:8,st:120,-,st:48 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 22c6be38a2d4 cs code=3173266c17bf64db ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:232,st:12,st:4,st:4,st:4,st:8,st:120,-,st:48 si=n:Float/d:3D,n:Float/d:3D ss=-
+M b197762caf19 cs code=32248745b7de4060 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:304,st:12,st:4,st:4,st:4,st:8,st:120,st:48 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M d5de731e0d5b cs code=32248745b7de4060 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:304,st:12,st:4,st:4,st:4,st:8,st:120,st:48 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M c11a95184c94 cs code=33793023ea04f48a ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,f:8_8_8_8UNorm,st:4,st:56 si=n:Float/d:2D ss=-
+M cc553f3b4aa7 cs code=33793023ea04f48a ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:4/f:32UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,f:8_8_8_8UNorm,st:4,st:56 si=n:Float/d:2D ss=-
+M eac61ef02641 cs code=338063ee71716dba ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4
+M 3340774edc5d cs code=3385888f3da9ed6e ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Uint/d:2D
+M 1c1f125f9a40 vs code=34e9b14d92def6fe ud=2 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a16ae29bb132 cs code=35282c3b3f3bae09 ud=2 t=8,8,1 lds=128 tid=2 wgr=2 gx gy sb=st:224 si=n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray/t:0/tc:256/tm:184/te:7ffffff/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 65d3c8863fb3 ps code=35fcfef86c7ce53e ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 400ac82140f2 cs code=36005932b0f05758 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fcab092936aa cs code=36005932b0f05758 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 15fe91bea2de cs code=3629f84fc622938c ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 36dbf7a56953 cs code=3629f84fc622938c ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 18f5ec72a6f5 vs code=3720645199c20be3 ud=3 cur=4 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 249959bb5937 vs code=3720645199c20be3 ud=3 cur=2 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M c05a89202c5e vs code=3720645199c20be3 ud=3 cur=3 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 5d140dd3adb2 cs code=3759e0a55f4bf077 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:36 si=n:Float/d:2D,n:Float/d:2D ss=-
+M c56e92e8e4bd vs code=378b98029f785f05 ud=3 cur=2 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 9696a2b914bf cs code=37efeac172a7259d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:100 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M 74ed2f95582d ps code=3a145fd49574dba6 ud=2 sysbase=2 custom=14 center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy posw face faceall early in=0,1,422,402,423 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 5a16780379c4 ps code=3a425b9cbe6cc71b ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2a01b0ae1341 cs code=3a7d1f0899513fa9 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,-,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,st:20,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 8efbc9fecdcd cs code=3abb589d293253ac ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:52
+M 7073f4cfc18f cs code=3b4d2bdcacacee1a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:228,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M a8dfc962f796 cs code=3b4d2bdcacacee1a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M e3ec0d3a5282 cs code=3ba0a1ab3e328e9b ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M f0d131f094e6 cs code=3ba0a1ab3e328e9b ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 90013d6d108a ps code=3c420deafde6aadb ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 4afc0de337e9 vs code=3ccd9b43f2a7bb21 ud=3 cur=4 sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M abf85e592dbb vs code=3ccfc1cb6ffb1b4d ud=3 cur=11 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 179aa15474e4 cs code=3d8a177eead782bd ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:2/f:16UInt/sw:4,st:4/f:10_10_10_2UNorm,st:4,st:8,st:1,st:8/f:16_16_16_16UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,-
+M 5e232c5ae2a2 cs code=3d8a177eead782bd ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:2/f:16UInt/sw:4,st:4/f:10_10_10_2UNorm,st:4,st:8,st:1,st:4/f:8_8_8_8UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,-
+M c463b2fb453f cs code=3e0bd08580239175 ud=4 t=64,1,1 lds=640 tid=1 wgr=4 gx gy sb=st:2/f:16SInt/sw:4,st:4/f:32SInt/sw:4,st:2/f:16SInt/sw:4 si=n:Uint/d:2D
+M 9846405335b9 ps code=3e1f1afcfc1305fd ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5ab5811d05d9 cs code=3e2095af40c90e79 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:60
+M b284f2d0cba4 ps code=3ea2336f5f45a59c ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D ss=-
+M a0bdba5e112a ps code=3ed1e76f037e33c4 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 7523caed427d cs code=3f00f7379e518f67 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2847ab4965a6 ps code=3f9d0bf24a2f405d ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M fb6b1eb3b613 vs code=3fcb41f2aac0314b ud=3 cur=5 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 0e237f52e1ac cs code=401cf59dc3dfd07c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:240,st:12,st:4,st:4,st:4,-,st:8,st:120,st:116
+M 43979df16386 cs code=4031503b2686da6f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:112,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M 53d735bcabec cs code=40b31260df68c240 ud=2 t=32,32,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M e37a0c198b0d cs code=40bb9e81e7bf8ef9 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 86ff14d28c5c cs code=40e98b867582e380 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:92 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M 01af4a8de832 cs code=420fc07b6d039a97 ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5332699aa01e cs code=420fc07b6d039a97 ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 3ab54494f9c4 ps code=424785f8e38c37b0 ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M e6eba3e39c17 cs code=42fbee7b5c76dd5a ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:4/f:32UInt/sw:4,st:64,st:4/f:32Float/sw:204,st:4,st:4/f:32UInt/sw:4 si=n:Float/d:2D
+M 50c688b8af4c cs code=43db6bd4ac92f710 ud=2 t=32,1,1 tid=1 wgr=2 gx sb=st:80,st:160,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M dc1cfb725d0e vs code=43f8161030691814 ud=2 cur=3 sb=st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,-
+M 55ba31f5b068 cs code=441bf202e32724a1 ud=2 t=8,8,1 tid=2 wgr=2 async gz sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,-,st:384,st:4/f:32UInt/sw:4
+M ea258c5ffb51 cs code=441bf202e32724a1 ud=2 t=8,8,1 tid=2 wgr=2 async gz sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,-,oob,st:4/f:32UInt/sw:4
+M 0ceca3cc5eb4 cs code=444dcb1ad39517da ud=8 t=64,1,1 tid=1 wgr=8 gx sb=st:256/f:32_32UInt/sw:2c
+M 4b3f69204b19 cs code=444dcb1ad39517da ud=8 t=64,1,1 tid=1 wgr=8 dims gx sb=st:16/f:32_32_32_32UInt
+M 5d08778b6743 cs code=44b03b0ae1a6e42f ud=8 t=64,1,1 lds=128 tid=1 wgr=8 gx gy sb=st:2/f:16SInt/sw:4,st:4/f:16_16SInt/sw:2c si=n:Uint/d:2D,n:Uint/d:2D
+M 4bcb1532001b cs code=44f76d5f176e3b88 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64
+M edbe64ca7402 cs code=44f76d5f176e3b88 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64
+M a9ecdef71e5f ps code=457a49f0e22ec37a ud=2 sysbase=2 center=0 smask=3f omode=4,4 posx posy faceall early in=0,1 si=n:Float/d:2D ss=-
+M 0a2f0135f4c4 ps code=458192a762f14d49 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2b0a24924a66 cs code=46f0fd9b375feafb ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6188d46a9cb4 cs code=46f0fd9b375feafb ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7b55ef36e459 cs code=476944d2ecfea633 ud=2 t=8,8,1 lds=128 tid=2 wgr=2 async gx gy sb=-,st:176,st:16,st:4,st:4,st:8/f:16_16_16_16Float si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 89df35576f49 cs code=476944d2ecfea633 ud=2 t=8,8,1 lds=128 tid=2 wgr=2 async gx gy sb=-,st:176,st:16,st:4,st:4,st:8/f:16_16_16_16Float si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c716f56c0e85 vs code=47e27367af3b3b13 ud=3 cur=2 ii=2 idraw sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c
+M 42b7e6751520 vs code=4823f453113b551a ud=3 cur=10 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M baf475cfdf13 ps code=48d62cc001da6700 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420,400 sb=st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 1286f9058e58 ps code=4976c67988e82346 ud=2 lds=512 sysbase=2 center=0 smask=f11ff uint=c omode=4,4,1,1,4 posx posy posw faceall kill in=0,1,2,3 sb=st:16,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4,-,oob,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-,-
+M 2f484abbb0d5 ps code=4976c67988e82346 ud=2 lds=512 sysbase=2 center=0 smask=f11ff uint=c omode=4,4,1,1,4 posx posy posw faceall kill in=0,1,2,3 sb=st:16,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-,-
+M e6d8b2cd5bd0 cs code=49cac800706292de ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M f2eb66732b2d cs code=49cac800706292de ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 4e369db7b034 cs code=4a195e4af234849b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64
+M bf4970b13bfe cs code=4a9d45915df56925 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:236,st:12,st:4,st:12
+M 03f3dbbaf95e cs code=4ad9163a6bd19e88 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 025983d5ed90 cs code=4b0edcbeb52f6163 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 30711e90d2a6 cs code=4b4aa67bfdff10f7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 668b23fa6571 cs code=4b4aa67bfdff10f7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:56,st:228,st:12,st:4,st:4,st:4,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 8848f6bc57f9 cs code=4b6292816a74d3e9 ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a269fa05e4b9 cs code=4b6292816a74d3e9 ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M bfd3b1f5e4f7 cs code=4b7bd789bd6a5d4d ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:56,-,st:4/f:32UInt/sw:4,st:4
+M 2010df59c933 cs code=4bc3b95462f18f9d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40
+M 045141a06203 cs code=4bcaae88506729ba ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:44 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 429782877019 cs code=4bcaae88506729ba ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:44 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 8dd20c15e4d5 ps code=4c4948c5054f32b0 ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M f7250fc70231 cs code=4c50cccc00ea6dae ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:16,st:4,st:1/f:8UInt/sw:4,st:4,st:4,st:56,st:4/f:32UInt/sw:4
+M de63f6c47f37 cs code=4c998991f557862f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:112,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:112 si=n:Float/d:2D ss=-
+M ed5fa19d1f56 cs code=4c998991f557862f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:112 si=n:Float/d:2D ss=-
+M 68bb5e239812 cs code=4cad8a51f852a753 ud=2 t=32,1,1 tid=1 wgr=2 async gx sb=st:384,st:4 si=n:Float/d:2D ss=-
+M 4b8dfb3f9de3 ps code=4cef4551645f4da1 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M 7a891d7f1b13 cs code=4d3451b8b4d0d2e5 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d997d992c05c cs code=4d3451b8b4d0d2e5 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fe151e4f14a6 cs code=4ddaf59deb0328e3 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:64,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1d49f526ef28 cs code=4e55f7b119787aa4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,oob,oob,oob,sw:0/oob,-,oob,sw:0/oob si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7b4f6e0ac8e0 cs code=4e55f7b119787aa4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,st:68,st:16,st:4,st:4/f:8_8_8_8UNorm,-,oob,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a7ae103182d9 cs code=4ed738199c4cea8a ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 577300f48f4c cs code=4f02801bcb496c2a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:16,st:4,st:4,-,st:4,st:68,st:8,st:120,st:64 si=n:Float/d:2D,n:Float/d:2D ss=-
+M a977568c7d83 cs code=4f02801bcb496c2a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:16,st:4,st:4,-,st:4,st:68,st:8,st:120,st:64 si=n:Float/d:2D,n:Float/d:2D ss=-
+M dcf690620db8 vs code=4f9e5872dd994c7f ud=3 cur=6 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 0af6f354ae48 cs code=50a7f9f7f4608cfb ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M 81884696b0ba cs code=50a7f9f7f4608cfb ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M 48e79c53fb41 cs code=50ebe05d584e4947 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:336,st:12,st:4,st:12
+M e3242a121cd7 cs code=50fb0d6970ecd975 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,-,st:8,st:120,st:64
+M 317a76be7b9d cs code=51aec2a13f056e7c ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b7ec67323bcc cs code=51aec2a13f056e7c ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d73255cdab92 cs code=5203808acba41f3a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:308,st:16,st:4,st:4,-,st:4,st:8,st:120,st:72 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 47bbb6643f31 cs code=52619a702f5ff7e9 ud=2 t=1,1,1 tid=1 wgr=2 async sb=st:16,- si=n:Float/d:2DArray ss=-
+M a7437bd94b3f cs code=52f2d0a783cea454 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:56,st:12
+M 0b4634ab7852 cs code=52f38168277a4c8d ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b273a8d47f27 cs code=52f38168277a4c8d ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 14ddbf7598da cs code=53a1385c06cf47d0 ud=2 t=64,1,1 tid=1 wgr=2 sb=st:4/f:32Float/sw:204,st:4,sw:0/oob,st:80,st:4/f:32Float/sw:204,st:4/f:32Float/sw:204
+M 86db131ef541 cs code=53b92905731cb0e7 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 95bc95416e22 ps code=53c41bf274787e6b ud=2 sysbase=2 custom=4 center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,1,421 si=n:Float/d:2D ss=-
+M beb1e33f6d56 cs code=544967cea0f96561 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M c54f102bd034 cs code=544967cea0f96561 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 4c248f0fa049 cs code=549003e3c5b6d954 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 4e639ed3b720 vs code=54badf06bd4db5b9 ud=3 cur=6 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 85b91bea093d ps code=54cea765c5c321ee ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M d5701bc98d43 cs code=54f54af90a56b698 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:76 si=n:Float/d:3D,n:Float/d:3D ss=-
+M b043f15d7c16 ps code=5524f016e34c8a45 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 0d1d187e8130 vs code=55541227622c588e ud=3 cur=4 sb=st:4/f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:160,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 54f6c69895f3 ps code=563916c5ac02f04c ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 698d32ef028b ps code=56b7db46431a29fb ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 3ca43a0a53cc vs code=572e492a5e437e36 ud=3 cur=6 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c
+M 767fa0674ef0 ps code=5751c7c99df4cfee ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2665a65d7547 cs code=5846c06093d6feb5 ud=2 t=1,1,1 tid=1 wgr=2 async sb=st:64,-,st:4/f:32UInt/sw:4
+M d4abc6873baa ps code=585bdba1c4015f42 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1
+M b35a7422abe1 cs code=58850e86f988fca0 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:10_10_10_2UNorm,st:4/f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac,-,st:8,st:1,st:4/f:8_8_8_8UNorm,st:8/f:16_16_16_16UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm
+M 97a80a438286 vs code=58c9fbc7cbb70399 ud=2 cur=29 sb=st:12,st:2/f:16UInt/sw:4,st:4/f:10_10_10_2UNorm,st:8/f:16_16_16_16Float,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,-,st:1/f:8UNorm/sw:204
+M c721d6597c7c vs code=58c9fbc7cbb70399 ud=2 cur=30 idraw sb=st:12,st:2/f:16UInt/sw:4,st:4/f:10_10_10_2UNorm,st:8/f:16_16_16_16Float,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,-,st:1/f:8UNorm/sw:204
+M 54398e559ba7 ps code=593b5d63ac8d5d8b ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M 3ebd253bc7dd vs code=59744857701bfb85 ud=2
+M 6d370a8ccf41 cs code=59843dab103077de ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 7bcc7be67e71 cs code=599f634f7cc33cfd ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:64
+M 39b081303480 vs code=59cf2b08eb641067 ud=3 cur=2 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M dc181652a422 cs code=59d1cc697a082321 ud=4 t=1,1,1 tid=1 wgr=4 async sb=st:4
+M 17804864cf5f cs code=5c5d24b9c1d2fd98 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M 4ee6ba3228fd cs code=5c5d24b9c1d2fd98 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M 5df3c1c58fc4 cs code=5c5dfda8292dd3f0 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6e8ca6a1d528 cs code=5c5dfda8292dd3f0 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0dfc4941d046 cs code=5db92bf5ef32d8f0 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:48 si=n:Float/d:2D,n:Float/d:2D ss=-
+M cab071c1a516 cs code=5e80f907dcc94c88 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 2cc4ff021cf7 cs code=5e9cbd03956cd8e9 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M df3d0bde98cf cs code=5e9cbd03956cd8e9 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 9d6db9470991 vs code=5ead94286a3adf69 ud=2 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:32_32Float/sw:22c,st:4/f:8_8_8_8UNorm
+M 76f9ec960b4b cs code=5ef89f13d228bfca ud=2 t=8,8,1 lds=256 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 4fc9cfbe7dbd cs code=5fc0632301cb03b6 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:60
+M d0e24996ffb3 cs code=60787486917f46cd ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 44e9542b62ee cs code=61131bb20aea8d4a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:60 si=n:Float/d:2D ss=-
+M 85d94a0ac9e3 cs code=61131bb20aea8d4a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:60 si=n:Float/d:2D ss=-
+M 32ee6a2769f9 cs code=61b31b690997c68d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40
+M 5b6944b366de cs code=61b31b690997c68d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:228,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40
+M 55b5b31849e0 cs code=6241a990111cf058 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 714e03d0e5c1 cs code=6241a990111cf058 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e16e0eebf756 vs code=6260342b7c01d0fa vsout=1240000
+M e581f4ae3d7f vs code=62848c7625a87107 ud=3 cur=5 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c
+M 19310fcf0f8e vs code=6299c2f7dacb97f3 ud=2 cur=1 sb=f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac,-,st:4/f:16_16Float/sw:22c
+M cb7479382673 ps code=630501bf18d2eb3e ud=2 lds=128 sysbase=2 center=0 smask=f11ff uint=c omode=4,4,1,1,4 posx posy posw faceall kill in=0,1,2,3 sb=st:16,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4,-,oob,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube ss=-,-,-,-,-
+M e4b916a6602e cs code=6315fb0c2c4c512a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,st:8,st:120,-,st:48
+M eeab927c64d7 cs code=6341ff001f0914aa ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:72,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:72
+M f05f2dc48248 cs code=6341ff001f0914aa ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:72
+M 6ab76c844538 cs code=6353bb91d3b95619 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:16,st:4,st:8/f:32_32UInt/sw:2c si=n:Uint/d:3D
+M 1192850c6535 cs code=63d94ba1a47db8da ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D
+M 2a796982bfa3 cs code=6431cfa6abe86893 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M 6e3d284d301c cs code=6431cfa6abe86893 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 446fa09db9d5 cs code=64358915516ead34 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M dea6c4aad4b2 ps code=651f53f5932d8794 sysbase=2 center=0 smask=f omode=4 faceall early
+M 8f9719925729 cs code=6587866abe154b57 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M 10bd205bba39 ps code=668d523af5f206c3 ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 8d1425d14b54 cs code=66ea8adac6382d44 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:308,st:12,st:4,st:12
+M 10755aac40d6 cs code=6851b132eb97f5cc ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:240,st:12,st:4,st:12
+M 865878fca70c ps code=685ee5600896fc29 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2DArray/cube ss=-
+M 61cd5371b630 cs code=68660eee424711f8 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M 2c3aa43d7d26 cs code=68be0752e25374af ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,-,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,st:20,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 86a1a0d60d37 vs code=68bf7fde086bf5c1 cur=7
+M 107e39f5cdbb vs code=690b072d09577bc3 ud=3 cur=7 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 15cd794ccdab cs code=690c7f8eba3ffec7 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 30e94490417a vs code=69dbd61b2644bd26 ud=3 ii=2 idraw sb=st:160,st:12/f:32_32_32Float/sw:3ac
+M 56fadffee199 vs code=69dbd61b2644bd26 ud=3 sb=st:160,st:12/f:32_32_32Float/sw:3ac
+M 177a5e88a45c cs code=6af5bf185413eb1d ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 3e472dfa1989 cs code=6b0a16f9e7b1ba0f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,oob,oob,oob,sw:0/oob,-,oob,sw:0/oob si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a0e8de6cdde5 cs code=6b0a16f9e7b1ba0f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,st:68,st:16,st:4,st:4/f:8_8_8_8UNorm,-,oob,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M cd0cf3aae66b cs code=6b802d9783aa4796 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D/m:3 ss=-
+M d322de8ff5b5 ps code=6c05f99715dafc7b ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 814143f43be0 cs code=6c48886d2bec7730 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,st:8,-,st:120,st:60
+M 7cf4f12461f5 ps code=6c570a41a7780bdb ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2698591d550b cs code=6c588846502a46e3 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 61ab0c71794f cs code=6c588846502a46e3 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M bec8c9899dd4 cs code=6cbede672a5beb79 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 9146c7b53049 cs code=6df20149471e31a2 ud=2 t=256,1,1 tid=1 wgr=2 async gx gy sb=-,-,st:12,st:4,st:12
+M 40308a30d6b5 ps code=6e8aa00faf7531f5 sysbase=2 center=0 smask=f omode=4 faceall early
+M f04c87c819cc vs code=6f2d9f5488adbcc1 ud=3 cur=6 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 54bc9b348a96 cs code=6f9eed6093956d91 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:52 si=n:Float/d:2D ss=-
+M 03ed3530b841 ps code=703b4cf10cb9eedd ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M 3034c72ec04d ps code=70524632d88544e9 ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D ss=-
+M bda62d8db13f cs code=7084152be5befe71 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 6d327687c18d cs code=70ec964573a14b96 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:60
+M fbd28d075583 cs code=70ec964573a14b96 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:60
+M 406b37ceb1b1 ps code=711fa1b35f18f6c8 ud=2 sysbase=2 custom=1 center=0 smask=0 posx posy face faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M ed514c0406b9 cs code=71ed91b67882ad32 ud=2 t=4,4,4 tid=3 wgr=2 gx gy gz sb=-,st:8/f:32_32UInt/sw:2c,st:16 si=n:Uint/d:3D
+M 57fa2116e571 cs code=721f492aa11322db ud=8 t=8,8,1 tid=2 wgr=8 gx gy si=n:Float/d:2DArray,n:Float/d:2DArray
+M f6b3196024b4 cs code=72831f3297debf3f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:304,st:12,st:4,st:4,st:4,st:8,st:120,st:48 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M b0a66d120855 cs code=72cd4fe27ad27a03 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M ed7cc7f53208 cs code=72cd4fe27ad27a03 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 00f9715616b4 cs code=73238131ba5a0996 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:64,st:64,st:4/f:32Float/sw:204,st:4,st:4/f:32UInt/sw:4
+M 88de6f7224cc cs code=732e725eade055d7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:304,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:72 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 57a5890fdf4e ps code=734b5f1e99389155 ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 6618deb36f26 cs code=73c773ed53b3b62c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,st:4,st:8,st:120,-,st:48 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 2e9a92db32f8 cs code=73d059772ee72296 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M b19e217bbcf9 cs code=74b97b88581a6760 ud=14 t=64,1,1 lds=2176 tid=1 wgr=14 async gx sb=st:4/f:32UInt/sw:4,st:8,st:120,-,st:4,st:8
+M 242d7508c486 vs code=750c1064acf6abce ud=3 cur=3 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 41f668caf393 vs code=753657dafe4ac0b5 ud=3 cur=2 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 35d661fe90d8 cs code=75469d4758985a35 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 6fa10aa55111 ps code=7561e805a8ecf0a2 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 7ad73559b577 ps code=7561e805a8ecf0a2 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall noop in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 4c2d08f51bb7 vs code=7578e64b7c1ef693 ud=3 cur=2 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 86a3e15ea290 cs code=75873930bdfa6a99 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:4,st:12,st:4,st:4,st:8,st:120,st:44 si=n:Float/d:2D ss=-
+M bda23fba353c cs code=7590452c24407d4a ud=2 t=8,8,1 tid=2 wgr=2 async gx gy sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D ss=-
+M a0f2260b7624 cs code=75f0ba1a6705fc99 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M 318f7c097766 cs code=7646d5a733270f14 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=oob,-,sw:0/oob
+M aaeaaae20fe7 cs code=7667de05e0a0afca ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 0272381b36ec vs code=76cfe422ff8f443e ud=3 cur=4 sb=st:4/f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:160,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 4bb8044e9f2f cs code=7721dc9947082a83 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M 7e15c2c93c41 cs code=7721dc9947082a83 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 977dbca88736 cs code=7721dc9947082a83 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:224,st:12,st:4,st:12
+M 2d78c91013b8 vs code=77cdf4dfa1393092 ud=3 ii=2 idraw sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac
+M c8ffc951c27c vs code=77cdf4dfa1393092 ud=3 sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac
+M 06c27502b799 cs code=7865921319dc24a9 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=- si=n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 40ebfaea6468 cs code=78e31c29d0f96113 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:252,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:60 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 48f222ca4163 cs code=78eb47b731e4f373 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:16,st:4,st:12
+M 2425c38e8b98 cs code=793dabbd5a793622 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 56e4cc8d6ac5 cs code=793dabbd5a793622 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6cfd92243e83 cs code=79c2920f29743f45 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 7d1b2f64dc2b cs code=79c2920f29743f45 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M c30f3922c077 cs code=79c4731a9ff07ee6 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:8,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:8,st:1/f:8UInt/sw:4,st:4,st:4/f:32UInt/sw:4,st:4,st:16,st:4/f:32UInt/sw:4
+M ed599be89bb3 cs code=79e0166691d552c9 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:304,st:12,st:4,st:12 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 901b53120f9d cs code=79e87a1db294b953 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:336,st:12,st:4,st:12
+M 110db53b3956 vs code=7a2a4d9b0c4f393d ud=3 cur=1 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 1eb420ccbe70 ps code=7a92550fc6c9f52a ud=16 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 sb=- si=n:Float/d:2D ss=-
+M b87c8c9932fd cs code=7ab33aecaaef1524 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e06d3adb9f86 cs code=7ab33aecaaef1524 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c42161b646d9 cs code=7ad925089c0f7970 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 411c9f7bf6b5 cs code=7b91e6be51a64aa9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M e3690c10b8c0 cs code=7b91e6be51a64aa9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 849cbb3ef995 ps code=7bb202f2704cf2d7 ud=2 sysbase=2 custom=2 center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421
+M f19c32bb014e cs code=7c00092557a18b53 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:112 si=n:Float/d:2D ss=-
+M b5e6bfa47d7c cs code=7d3486ad73c37113 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:56,st:2/f:16UInt/sw:4,-,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:32UInt/sw:4,st:12 si=n:Float/d:2D ss=-
+M 30f83895e7a3 ps code=7d888c21bd1aec6e ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 si=n:Float/d:2D ss=-
+M 22ab96c9844b vs code=7db30bb5002949d3 ud=3 cur=1 ii=2 idraw sb=st:8/f:16_16_16_16Float,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 974f9d2ae3dd cs code=7e41148f4da106f3 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4
+M 42085c9e6849 cs code=7f778680ecc935ae ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,f:8_8_8_8UNorm,st:4,st:56 si=n:Float/d:2D ss=-
+M e2b562667213 cs code=803b44dffe9aff47 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:100 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M 6891c1ff6d25 cs code=8059aed91308e454 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:56,st:4/f:32UInt/sw:4,st:16,st:4,st:16
+M 7ff0883199f4 vs code=80c1af545b3887c9 ud=2 cur=1 sb=st:12/f:32_32_32Float/sw:3ac,f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c,-
+M 395e72f10063 cs code=82b81fabab3d978f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M f3793c789ac3 cs code=82b81fabab3d978f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1850ea2e4f1a cs code=82d6d4d869716b90 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,st:8,st:120,-,st:48
+M c4f90ec264c6 cs code=82e9140ea3b164ef ud=2 t=8,8,1 lds=256 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 524545036ad2 cs code=83092103b1912a22 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:52 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 457970816079 cs code=830e292ceb517047 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:36 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 839c995864ac cs code=837e69dc19ea1ebb ud=2 t=64,1,1 lds=128 tid=1 wgr=2 gx sb=-,st:12 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 239a47ce435b vs code=83dda350b95beafb ud=3 cur=27 ii=2 idraw sb=st:8,st:120,st:80 si=n:Float/d:2D ss=-
+M 844dfc4c3adb cs code=83f3acd27e0206f5 ud=2 t=1,1,1 tid=1 wgr=2 sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M c9960002e2dd cs code=83fe87caa4a4bde3 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,st:68,-,st:8,st:120,st:52
+M 928f8db58511 cs code=842cc0c02ca42619 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,-,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,st:20,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 20befcbd86d8 cs code=84d1dd88e421afe8 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:112,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M 8a3a9f48dd54 ps code=858b58169b393d1a ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420,400 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 9d2be93cf560 ps code=8617d579c52c454b ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 73ae1fdff978 cs code=86767a4381d2ab5f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:308,st:16,st:4,st:4,-,st:4,st:68,st:8,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 39460ed0ff66 cs code=8689f29dfa452d1f ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 9692353821da ps code=873ee89e22ce3f70 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=- si=n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D ss=-
+M 6f8cb6d79447 cs code=87b2e82484372e8f ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:56,st:4/f:32UInt/sw:4
+M 1aa564416391 cs code=87d1ab222f6038c3 ud=2 t=8,8,1 tid=2 wgr=2 gx gy gz sb=st:4 si=n:Uint/d:3D
+M 5ba219e8d011 cs code=8837068925f983f3 ud=2 t=1,1,1 tid=1 wgr=2 async sb=st:64,st:4/f:32UInt/sw:4
+M 4509875445a1 cs code=8897f7c2806dd956 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:32 si=n:Float/d:2D,n:Float/d:3D ss=-
+M cbdc33e07e99 cs code=8897f7c2806dd956 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:32 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 766e6aa33f92 cs code=895980fe45f90eaa ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:60
+M d81080e9217f cs code=895980fe45f90eaa ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:60
+M 60e701bdfea7 cs code=8a8838ff479502c7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:56,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:56
+M 6c0466d2f906 cs code=8a8838ff479502c7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:56
+M 8800d0eb6b55 vs code=8ad1a82941b2f359 ud=3 cur=1 ii=2 idraw sb=st:12,st:2/f:16UInt/sw:4,st:160,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:1/f:8UNorm/sw:204
+M fa34e6270b16 cs code=8b30ab43ca011a94 ud=14 t=32,1,1 tid=1 wgr=14 gx sb=-,st:64,st:32,st:8,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 1b7b607ae2e6 cs code=8d19d4613fdeba9d ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 950544c53af8 ps code=8d6579005ca8539a ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1187e65269d5 cs code=8d864c0d67e48c25 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:48
+M f3a5029ae3ec cs code=8d9fdea361dc6d65 ud=2 t=16,16,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M 7fad9fdabd2a vs code=8e66b0ced087a970 ud=3 cur=17 ii=2 idraw sb=st:12,st:4/f:32UInt/sw:4,st:160,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,f:8_8_8_8UNorm
+M 69ab3bd86afa ps code=8e768bb67df8e1aa ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:3D ss=-,-
+M 15f724004351 ps code=8e849717a2b5f389 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 673924e1cad1 cs code=8ee491b9c970a8c6 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:44 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 72037db03009 cs code=8ee491b9c970a8c6 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:44 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1bba8f09786a vs code=901284a9a96efe59 ud=3 cur=5 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 3e17e3e0826e vs code=901284a9a96efe59 ud=3 cur=2 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 0c2cfd360ceb cs code=9114c82dd204a8e8 ud=12 t=64,1,1 tid=1 wgr=12 sb=-,st:4/f:32UInt/sw:4,st:4
+M e8349151e261 ps code=91173389c7c3fac4 ud=2 sysbase=2 custom=2 center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421
+M c4f60d4e92a3 ps code=917f8944cc2e1736 ud=2 sysbase=2 custom=d center=0 smask=0 face faceall kill in=420,400,421,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 837484045427 cs code=91da99b8516c646e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:232,st:12,st:4,st:4,st:4,st:8,st:120,-,st:48 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 15ddffe13816 ps code=923daf09a612facd ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d6d331823f09 vs code=929d9d79e6a6a6fd ud=12 cur=3 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:32_32Float/sw:22c,st:4/f:8_8_8_8UNorm
+M 8a435d592612 ps code=92a4de477be68636 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 8ff60a01e1f8 cs code=92a6ed3e95757110 ud=2 t=8,8,1 lds=128 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 7de22012e312 cs code=92aa3241e64cd3c4 t=64,1,1 tid=1
+M c59d64a52ad1 cs code=92d0c7fd00c040a1 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:76 si=n:Float/d:2D ss=-
+M f7872bffd759 cs code=92d0c7fd00c040a1 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:76,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:76 si=n:Float/d:2D ss=-
+M 527d3142fefd cs code=92f2d38738880013 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44 si=n:Float/d:2D ss=-
+M dd85d9f8c239 cs code=92f2d38738880013 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44 si=n:Float/d:2D ss=-
+M ee640df17c1d cs code=92fcd4206a15e121 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M d8f0fedf7fbd cs code=9307a1b81ec86abc ud=8 t=1,1,1 tid=1 wgr=8 async sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M 60ca1b7d3510 cs code=939a072a82234033 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:32,st:16,st:4,st:4,st:8 si=n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D ss=-
+M c3cec3bb0f1d cs code=939a072a82234033 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:32,st:16,st:4,st:4,st:8 si=n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray ss=-
+M 61f11d4f2270 cs code=94972e84525bd545 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 82084a69a718 cs code=94a9d800d41c9125 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M 54f78f8db7cb cs code=953f09a35651afb0 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 8247cfd01714 cs code=955d517ebc8ec7ee ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:52 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 3f30b93f5c35 cs code=95a285fed36578a5 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M 9c96c52df7bc cs code=95a285fed36578a5 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M 88dfce2c4b1f cs code=95aad97469a8dead ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:36
+M 5dfe32b29610 cs code=964c243472acabb6 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 08956b8d181d ps code=965be671ca626959 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 si=n:Float/d:2DArray ss=-
+M 1395fa65052a ps code=965be671ca626959 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 si=n:Float/d:2D ss=-
+M c10b5117f6b2 ps code=965e38bc268a1332 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a0ee89fad892 cs code=97ba66cc91f7d857 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M e29ad0f08b6e ps code=985309ccddd9d16a ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M 4c137767d3aa cs code=987038f55df82389 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:240,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 8a145b53ebed ps code=9887f5ad20f0cc20 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420,400 sb=st:160,st:32 si=n:Float/d:2D ss=-
+M 1830c9af62df cs code=989cbc8a5745e071 ud=14 t=32,1,1 tid=1 wgr=14 gx sb=-,st:64,st:64,st:32,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M b73561318bb0 cs code=98af8cb19b3b7ea2 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 5cd17b7fd4bd cs code=98d1bc119e8ebbb8 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M ad451b0a18bd cs code=98d1bc119e8ebbb8 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1934ff9b3219 cs code=9956c093be958809 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M a31099fbb472 cs code=9984aa013cdfac04 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:56,st:4/f:32UInt/sw:4,-,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:32UInt/sw:4,st:12 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 4176f0e34b3f cs code=9a36b60bbc6b67bf ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,-,st:120,st:68 si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D ss=-
+M 7dc5f09ab2b5 cs code=9ac7a20243c5ad41 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=-,-,-,st:4 si=n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray
+M fa18b374cc2e cs code=9ac7a20243c5ad41 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=-,-,-,st:4 si=n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D
+M ee598d7577ac ps code=9b7019cc9e11260d ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M a14b8ed7cbec cs code=9b9011abbd56fa6e ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:4/f:32UInt/sw:4,-,st:8/f:16_16_16_16Float si=n:Float/d:2DArray
+M ee2c05413275 cs code=9b9011abbd56fa6e ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:4/f:32UInt/sw:4,-,st:8/f:16_16_16_16Float si=n:Float/d:2D
+M a2dc1955e8c2 cs code=9bb458479ce48d7b ud=12 t=8,8,1 tid=2 wgr=12 gx gy sb=- si=n:Float/d:2D,n:Float/d:2D
+M 24c4ac4b4064 cs code=9bf16c2498a4fca4 ud=2 t=512,1,1 lds=2048 tid=1 wgr=2 async gx sb=st:8,-
+M c8a4a11df924 cs code=9c7929d7892874e4 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4/f:32UInt/sw:4,st:4,st:4
+M db5f2c8614c3 cs code=9c8a4af26e48cc2a ud=2 t=8,8,1 lds=128 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M d556cc2972d5 ps code=9ca45924a094a7e7 ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a0803939e8f9 cs code=9ce25a46f8f3a3dd ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:48
+M dc409f58c5b5 cs code=9d6d30d08a8e68c0 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:308,st:16,st:4,st:12
+M 98e58ebf1f0c ps code=9d99e3089312b1e6 ud=2 sysbase=2 center=0 smask=ff omode=4,4 posx posy faceall kill in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M b2261edd38d3 cs code=9e0c973d1472e945 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Uint/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M a92550bf11af ps code=9e4cc5e004f11fd3 ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M a73143359b9a cs code=9e5439a3e880c869 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 185f8ad7e31e ps code=9eddb4c27bc15fe1 ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 13e505711d70 cs code=9f554f3bf66ccd06 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 36eda7d2e3c0 cs code=9f5aad76eefa0ccc ud=14 t=64,1,1 tid=1 wgr=14 gx sb=-,st:64,-,st:32,st:8
+M 05713c11e9a3 cs code=9f8232165e81c304 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,oob,oob,oob,sw:0/oob,-,oob,sw:0/oob si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fbdc1aded482 cs code=9f8232165e81c304 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,st:68,st:16,st:4,st:4/f:8_8_8_8UNorm,-,oob,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 27352b161028 ps code=9fc1df8c24123d49 ud=2 sysbase=2 custom=5 center=0 smask=0 posx posy faceall kill in=420,400,421 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 4a3c7b6e5dc5 cs code=9fc4d7f7aecee809 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M c214a59b7443 cs code=9fc4f4b304fa72dc ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M ea21dc60bf8e cs code=a07b7f60d584f9bf ud=2 t=512,1,1 lds=1024 tid=1 wgr=2 gx sb=st:4,-
+M 3c379b633566 cs code=a0be4f622b47af58 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,st:176,st:4,st:176 si=n:Float/d:2D ss=-
+M a34aa3daf7ab cs code=a0dd928ad025faf0 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2DArray/cube,n:Float/d:2D ss=-
+M 72a5097eeb01 vs code=a0ff94ab7bc3cc0b ud=3 cur=4 ii=2 idraw sb=st:4,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:112
+M 5d25a6c4f799 ps code=a10229efbc4d569d ud=4 sysbase=2 center=0 smask=f omode=4 faceall early in=0 sb=-
+M 626b06c84e02 vs code=a15ffdf654d65a40 ud=3 ii=2 idraw sb=st:12,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,st:160
+M 9e9175a7e2cd vs code=a200e758c4f423c4 ud=2 cur=11
+M 058e06a08dec cs code=a280680d1372480c ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:56,st:4/f:32UInt/sw:4,st:16,st:1/f:8UInt/sw:4,st:4/f:32UInt/sw:4,st:16
+M 18d26273cfd8 vs code=a339375d48bb72e4 ud=3 cur=9 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c
+M 6822af3bcfce ps code=a354bc1357e34d47 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6e3c775231bf cs code=a3b4a4dfcf27c0be ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:224,st:12,st:4,st:12
+M 08a12a5bc188 cs code=a3b668fd535e7414 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Uint/d:2D
+M 560f9a9bbd94 cs code=a3b7921948963e9c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:72,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:72
+M cfd564fc9157 cs code=a3b7921948963e9c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,-,st:72
+M bb277dfbe435 cs code=a3c8baa54c27f68b ud=2 t=32,32,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M ebff92fb06f4 ps code=a3f0c2478b750719 ud=2 sysbase=2 center=0 smask=7 omode=4 posx posy faceall early in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 0f20c28e7cbd cs code=a42eb5b74659c8a1 ud=2 t=8,8,1 tid=2 wgr=2 gx gy gz sb=st:4/f:32UInt/sw:4,st:4/f:16_16Float/sw:22c si=n:Float/d:2DArray
+M 6e69ff4bbf69 cs code=a42eb5b74659c8a1 ud=2 t=8,8,1 tid=2 wgr=2 gx gy gz sb=st:4/f:32UInt/sw:4,st:4/f:16_16Float/sw:22c si=n:Float/d:2D
+M 3b7548cf4e9b cs code=a466038b2538a17d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:44 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7db6f2bcc1dc ps code=a4aa3eb46c65c360 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 74e255411018 cs code=a4af1173c109ef84 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D/m:3 ss=-
+M 7f1eb234c6db cs code=a4b810ef9a064b31 ud=2 t=64,1,1 tid=1 wgr=2 sb=st:4/f:32Float/sw:204,st:4,sw:0/oob,st:80,st:4/f:32Float/sw:204,st:4/f:32Float/sw:204
+M bd86bdac377e cs code=a4ca4a4c6027ccda ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:8/f:32_32UInt/sw:2c,st:8/f:32_32UInt/sw:2c
+M 20cc3bb440c7 cs code=a4fa1aaf743d65e4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:72,st:304,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:72 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 31c5e41919ba cs code=a4fa1aaf743d65e4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:304,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:72 si=n:Float/d:3D,n:Float/d:3D ss=-
+M d73faaa50713 cs code=a544cafa3a6fdfe3 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:8/f:32_32UInt/sw:2c,st:16/f:32_32_32_32Float,st:32
+M a46f0d3d05ec cs code=a6180d357e14e2e4 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray
+M b4a6deed5a44 cs code=a6180d357e14e2e4 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M 3c3eeabba783 ps code=a69948cd55fe9181 ud=2 sysbase=2 center=0 smask=7 omode=4 faceall early in=0 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 049a9ed8e5d5 ps code=a6af6a5b4d220a93 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M d7b9b50382bb ps code=a715d055bb8c71de ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=- si=n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D ss=-,-
+M d506599e126c ps code=a773ea73869689ba ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 5fddd0efd316 cs code=a7958c5686c7530a ud=2 t=8,8,1 tid=2 wgr=2 gx gy gz sb=oob si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D
+M ce43559a6e94 cs code=a7958c5686c7530a ud=2 t=8,8,1 tid=2 wgr=2 gx gy gz sb=st:32 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D
+M 78bf9e740985 cs code=a83ba2ba6e2de97c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:4,st:12,st:4,st:4,st:8,st:120,st:44 si=n:Float/d:2D ss=-
+M ddb358b50b43 cs code=a8427d7e28b2ceeb ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:4/f:32Float/sw:204,st:12,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,-,st:4,st:4,-,st:4,st:8,st:120,st:44
+M 9151b2c2bba8 ps code=a899c0fa4ca84041 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 7d4a0065a4f9 cs code=a8a4b45528a2e096 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M b115f19efbc6 cs code=a8a4b45528a2e096 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M a4ecb54487b8 cs code=a9b01e3d87abf61a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:304,st:12,st:4,st:4,st:4,-,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 50d7a66fd4a1 ps code=a9e3c34cf18884df ud=2 sysbase=2 custom=c center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,400,421,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6735e4d74014 cs code=aa2f0c7266b8e52b ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M 0fabe8f3a619 cs code=ab71174d2a7d36aa ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32Float/sw:204 si=n:Float/d:2D ss=-
+M 1bfcdb16b11a cs code=abfe77f8ee3caa6f ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Uint/d:2D
+M 4488dd927df6 cs code=ac9172b5284fd235 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,st:4,st:68,-,st:8,st:120,st:52 si=n:Float/d:2D ss=-
+M 46e13908c430 ps code=ad13b6acfbef9fe5 ud=2 sysbase=2 center=0 smask=1 omode=4 posz faceall kill in=0,1,403,406 si=n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray ss=-
+M 81319ad7a393 cs code=adc7a260d641f14a ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e810f61b4b59 cs code=adc7a260d641f14a ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c27d49bf6b8a cs code=ae10ea74a0a17150 ud=2 t=256,1,1 tid=1 wgr=2 async gx gy sb=-,-,st:12,st:4,st:12
+M 45767eedff23 cs code=ae11df0f77c49516 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M f7f03ba771e7 ps code=ae475e4ed176b71e ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M df02b6a97fe1 cs code=ae5e342ec7a9e74d ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=-,-,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M 4de1e7767ba5 cs code=aeb73ac479c8ffa9 ud=12 t=32,1,1 lds=128 tid=1 wgr=12 async gx sb=st:4,-,st:4/f:32UInt/sw:4
+M 3edfc2035072 vs code=aeeb059f09a978d4 ud=3 cur=7 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 65afb6fdd183 vs code=aeeb059f09a978d4 ud=3 cur=3 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M bb4d141b9ed7 vs code=aeeb059f09a978d4 ud=3 cur=8 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 8d0a2939dad5 cs code=af5de5c5549569b0 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M 637d47c9965a cs code=afa17e80b1a94cb4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:64,st:8,st:4/f:32UInt/sw:4,st:4/f:32Float/sw:204
+M a989baaf1883 cs code=afa17e80b1a94cb4 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:64,st:8,sw:0/oob,sw:0/oob
+M 2e22884e466b vs code=b012df74afa7d6e5 ud=3 cur=7 ii=2 idraw sb=st:12,st:4/f:32UInt/sw:4,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:160
+M ababa4689f21 cs code=b05483b246ade031 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:244,st:12,st:4,st:12
+M c42c60fbb98f cs code=b05483b246ade031 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:224,st:12,st:4,st:12
+M 359ad67a86d9 cs code=b0d4eda3907099d1 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:8_8_8_8UInt,st:4/f:8_8_8_8UNorm,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm
+M 5e8e5601a766 cs code=b16b574d3066a4d1 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7837c550f1cd cs code=b16b574d3066a4d1 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fe2a0286877b cs code=b3a426dca385b022 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 784c9cd95110 vs code=b3af908e9dfe39eb ud=8 cur=2 sb=st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm
+M c496ffe9a846 cs code=b3cc0d54c6932436 ud=2 t=64,1,1 tid=1 wgr=2 dims gx sb=-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Uint/d:2D
+M 87f806846664 ps code=b44818dd27f73922 ud=16 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 sb=- si=n:Float/d:2DArray ss=-
+M 94deb16ecf2b cs code=b46d6874171ddb6e ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fcb748b51fdf cs code=b46d6874171ddb6e ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c0610f5ecc69 cs code=b4709e84d4fc7d56 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:4/f:32Float/sw:204,st:64,st:64,st:4,st:4/f:32UInt/sw:4
+M a46e85f3807b cs code=b4b3dfbbef7677a8 ud=8 t=8,8,1 tid=2 wgr=8 gx gy si=n:Float/d:2D
+M 7ba3f25e2ab3 cs code=b5ef02ff69fd0196 ud=14 t=64,1,1 lds=384 tid=1 wgr=14 async gx sb=st:4/f:32UInt/sw:4,st:8,st:120,st:80,-
+M 7de43a64cabd cs code=b714f41b7687a43c ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:336,st:12,st:4,st:12
+M 7e87e36c304a cs code=b81aa3ab5caa4452 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4
+M 9cbb29b11522 cs code=b81aa3ab5caa4452 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4
+M e52c489944be cs code=b895be7061ae2dd5 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,st:8/f:32_32UInt/sw:2c,-,st:4/f:32UInt/sw:4,-,- si=n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 1b2d3bb97094 cs code=b89d2eb8c63e40fe ud=2 t=64,1,1 lds=128 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:116,st:240,st:12,st:4,st:4,st:4,st:8,st:120,-,st:116
+M c6c60f5157d3 cs code=b89d2eb8c63e40fe ud=2 t=64,1,1 lds=128 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:240,st:12,st:4,st:4,st:4,st:8,st:120,-,st:116
+M 6fa87e1897aa vs code=b9438752deb9eca0 ud=3 cur=8 ii=2 idraw sb=st:8,st:120,st:80
+M 06de45f30541 cs code=b9a96adade5fe4fd ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,st:68,st:16,st:4,st:4/f:8_8_8_8UNorm,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 50f2acef7062 cs code=b9a96adade5fe4fd ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=-,oob,oob,oob,sw:0/oob,-,oob,sw:0/oob si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e4504179625d ps code=ba17a780d8d61dd7 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420,400 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 910abe5fcdd7 cs code=ba7a736e4f30cfe5 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:36,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:36 si=n:Float/d:2D ss=-
+M da58abb34fbd cs code=ba7a736e4f30cfe5 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:36 si=n:Float/d:2D ss=-
+M 81e9c7ba8d46 vs code=ba9b941b4443bf6f ud=3 cur=2 ii=2 idraw sb=st:160,st:1/f:8UNorm/sw:204,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c
+M 3b95e865313b cs code=baaea04ccd5af2fa ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M 6d7e7246749f cs code=bc3bd352cf1cae02 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:64,st:220,st:12,st:4,st:4,st:4,st:68,-,st:8,st:120,st:64
+M f0191713074f cs code=bc3bd352cf1cae02 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,-,st:8,st:120,st:64
+M 2aa5422a1bc0 cs code=bca71ed47cf3d733 ud=2 t=8,8,1 lds=512 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M e4563029d162 ps code=bd8253f9a6611dc8 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=- si=n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:2DArray ss=-,-
+M 86589c9da248 ps code=be88fd2747063b2f ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 27595fa3c529 cs code=beeadd4cb5e5fd0e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:92 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M 99784715e326 cs code=bef6a5c14ddd3c28 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:60 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M ef4faf96e910 cs code=bef93d5cdf18d7ff ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,st:8/f:32_32UInt/sw:2c,-,st:4/f:32UInt/sw:4,-,st:16,st:4,- si=n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M f64b73d5f3dc cs code=bef93d5cdf18d7ff ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,st:8/f:32_32UInt/sw:2c,-,st:4/f:32UInt/sw:4,-,st:16,st:4,- si=n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M bd8d24dc9670 cs code=bf0e83bcdeadcabe ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,-,st:8,st:120,st:64
+M 355bef4c04d7 cs code=bf180be7296aee56 ud=8 t=64,1,1 lds=128 tid=1 wgr=8 gx gy sb=st:2/f:16SInt/sw:4,st:4/f:16_16SInt/sw:2c si=n:Uint/d:2D,n:Uint/d:2D
+M 4dfd878c3811 cs code=bfe8e538a63e0de5 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M d5a4b8b52cd0 cs code=c0242c98b043124b ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D/m:4 ss=-
+M baf4239befaa cs code=c0d514745c7c1ba9 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4,st:4 si=n:Uint/d:2D
+M a6e80cb495a5 cs code=c1903be3ae364b37 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M ba881b894307 cs code=c1bc819b0e2b73db ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,st:16/f:32_32_32_32Float
+M ec895c17e3d3 cs code=c1bc819b0e2b73db ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:8_8_8_8UNorm,st:4/f:8_8_8_8UNorm
+M aae92dbf4c75 cs code=c1d603a1a4157103 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e9498ced7878 cs code=c1d603a1a4157103 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 00472a915ad0 cs code=c206b0b95c65eff0 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=-,-,st:4,st:12 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Uint/d:2D
+M 1cf897cc0d2c cs code=c206b0b95c65eff0 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=-,-,oob,oob si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D
+M 9cf71283fe7b cs code=c2edb7721845958f ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e85177df06ed cs code=c2edb7721845958f ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 25edca46bfcf cs code=c3106f4ef930a195 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:60 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 8bbe0ed87485 cs code=c3106f4ef930a195 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:60 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-
+M 0c621fdfd8a2 cs code=c33c973a3ca2ab54 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:44 si=n:Float/d:3D,n:Float/d:3D ss=-
+M f7fe059d1848 cs code=c4a8ce0394443be5 ud=4 t=64,1,1 lds=896 tid=1 wgr=4 gx gy sb=st:2/f:16SInt/sw:4,st:4/f:16_16SInt/sw:2c,st:4/f:32SInt/sw:4,st:2/f:16SInt/sw:4,st:2/f:16SInt/sw:4 si=n:Uint/d:2D,n:Uint/d:2D
+M 0273fb159a01 ps code=c4dbbb153cff98c5 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall in=0,1,2,3 si=n:Float/d:2D,n:Float/d:2D
+M 456142be43d6 vs code=c4dbcc324be11b19 ud=3 cur=5 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 1eb5008f6274 ps code=c4e74b4c90059dae ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 15ce36680817 cs code=c545cfd635e9639b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:240,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 30e27b7abe21 cs code=c545cfd635e9639b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:240,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 6a6c2338cea0 cs code=c56a64833c5492b8 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D
+M 03feb315d852 cs code=c64a074df17359ef ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M 180d25c8f97d cs code=c7674de348afcd0b ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 55d198ea3458 cs code=c79fea3f62e3f55d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:244,st:12,st:4,st:4,st:4,st:8,st:120,st:36
+M cc863e7116f2 cs code=c79fea3f62e3f55d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:36,st:244,st:12,st:4,st:4,st:4,st:8,st:120,st:36
+M 964a2374dd28 cs code=c8b4e180ad9cce94 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 07281e11c8ea cs code=c973027cffc250bd ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:96
+M 0869f99973c7 cs code=c99c626e549db26e ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 4d1b2cc945ba cs code=c9f37445d6bfdea5 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 23a4547aeba2 cs code=ca52670c37ca2cb8 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:60
+M 52ba80be7e16 cs code=ca52670c37ca2cb8 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:60,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:60
+M 1ad95f65b60f cs code=ca6a8e5163a3f76f ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,-,st:4/f:32UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,st:20,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 5189083519a4 cs code=ca6a8e5163a3f76f ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,-,st:2/f:16UInt/sw:4,st:12/f:32_32_32Float/sw:3ac,st:20,st:4/f:32UInt/sw:4 si=n:Float/d:2D ss=-
+M 23ddaf496f95 vs code=cacaa0cf7087fee9 ud=3 cur=27 ii=2 idraw sb=st:8,st:120,st:80
+M 41ac33cc1407 vs code=cacaa0cf7087fee9 ud=3 cur=25 ii=2 idraw sb=st:8,st:120,st:80
+M 78e886d1f010 vs code=cacaa0cf7087fee9 ud=3 cur=8 ii=2 idraw sb=st:8,st:120,st:80
+M b17a649dd2c7 vs code=cacaa0cf7087fee9 ud=3 cur=24 ii=2 idraw sb=st:8,st:120,st:80
+M b58819b8e2e8 cs code=cb57d8e7d40462c9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40 si=n:Float/d:2D ss=-
+M dcce0e511fea cs code=cb57d8e7d40462c9 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:40 si=n:Float/d:2D ss=-
+M 33d8eed48ed1 cs code=cbfdd6ccb8421081 ud=12 t=64,1,1 tid=1 wgr=12 async gx sb=-,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M f601e941caad cs code=cbfdd6ccb8421081 ud=12 t=64,1,1 tid=1 wgr=12 gx sb=-,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M e783e6eb74be ps code=cd0eefb6d0781148 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 3068b2b1521a cs code=cd2c1e98c18e3308 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 9387273989a5 cs code=cd2c1e98c18e3308 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 15a6b4254866 cs code=cd627ee5a3b7fd07 ud=8 t=1,1,1 tid=1 wgr=8 sb=st:4,st:4
+M c13ffec598dd ps code=cd85910a6095e482 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420,400 sb=st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 8be156e653dd vs code=cdee10cc94c8f484 ud=3 cur=3 sb=st:4/f:8_8_8_8UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c
+M 8d1620f4fc5a vs code=ceb148eca692b282 ud=3 cur=10 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 1a9188779487 cs code=cf07394dc43004ba ud=2 t=8,8,1 lds=128 tid=2 wgr=2 async gx gy gz sb=st:16,st:4,st:4/f:8_8_8_8UNorm,st:8/f:16_16_16_16Float,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:3D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube ss=-,-,-
+M 912e7ea148e1 cs code=cf07394dc43004ba ud=2 t=8,8,1 lds=128 tid=2 wgr=2 async gx gy gz sb=st:16,st:4,st:4/f:8_8_8_8UNorm,st:8/f:16_16_16_16Float,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:3D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube ss=-,-,-
+M 3b07aae454a2 cs code=cf3372a035384ea9 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 2ade97d83fda cs code=cf6a00f5150a7861 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 8397d5f206f1 cs code=cf854d86e7f365a0 ud=2 t=4,4,4 tid=3 wgr=2 gx gy gz sb=- si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-
+M 686a1aa9c6cf vs code=cfe21fee01076afd ud=12 cur=5 sb=st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm
+M 82fce3d1e949 vs code=cfe21fee01076afd ud=12 cur=3 sb=st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm
+M f6d2636508d0 cs code=cffc9831474796fe ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M c75514655a7f cs code=d061cd4e2ea11a21 ud=4 t=64,1,1 lds=1152 tid=1 wgr=4 gx gy sb=st:2/f:16SInt/sw:4,st:4/f:16_16SInt/sw:2c,st:4/f:32SInt/sw:4,st:2/f:16SInt/sw:4,st:2/f:16SInt/sw:4 si=n:Uint/d:2D,n:Uint/d:2D ss=-
+M 0ca5dee244d8 vs code=d0aef521b249af39 ud=3 cur=9 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 24f13afd0b59 vs code=d0aef521b249af39 ud=3 cur=10 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M f97c802aa998 vs code=d0aef521b249af39 ud=3 cur=8 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M de56653cedf8 cs code=d0eb60bdf6e9504c ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 926b18eac484 ps code=d152895098c27fbf ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 4987c0642e35 cs code=d1c5167ed4bd22ed ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:76,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:76 si=n:Float/d:2D ss=-
+M d7c814d3f762 cs code=d1c5167ed4bd22ed ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:76 si=n:Float/d:2D ss=-
+M 48c2a7acb226 cs code=d1f6b5a9080cf540 ud=2 t=64,1,1 lds=128 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:16/f:32_32_32_32Float,-,st:4/f:32Float/sw:204,st:64,st:8
+M 21f4817fe552 cs code=d23c41a7c2764a4e ud=2 t=8,8,1 tid=2 wgr=2 async gx gy sb=-,- si=n:Float/d:2D,n:Float/d:2DArray,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 3960f01cd857 cs code=d2700bcddfc92166 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 6709cc8e9a93 cs code=d29c6a487470b987 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=-,st:56,-,st:4/f:32UInt/sw:4,st:4
+M 4a7006e02d11 vs code=d2dc04c1944930b6 ud=3 cur=3 ii=2 idraw sb=st:4/f:10_10_10_2UNorm,st:4,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:112
+M 0dbbd5ca643a cs code=d37a5d45538f1c37 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:68,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a661f2bf2ad3 cs code=d37a5d45538f1c37 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c959f4a67d13 cs code=d3bae6c67db1f95f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M db6a96c33a21 vs code=d3bbe50a18bd722f ud=3 cur=5 sb=st:4/f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 49553aaa2758 cs code=d42d38510742199f ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 219b6230723b vs code=d4b8b3337d984869 ud=3 cur=17 ii=2 idraw sb=st:12,st:4/f:32UInt/sw:4,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:160,f:8_8_8_8UNorm
+M 3cbbbfa000e4 ps code=d52ccdf8802b975d ud=2 sysbase=2 custom=d center=0 smask=0 face faceall kill in=420,400,421,422 sb=st:160 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8bd035743bf4 cs code=d5598005e5cbf276 ud=8 t=1,1,1 tid=1 wgr=8 sb=st:4,st:4/f:32UInt/sw:4
+M 0380cbd17010 cs code=d6e1f22a98db34ed ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,-,st:120,st:40 si=n:Float/d:2D ss=-
+M 4a4366bf3b96 cs code=d6e1f22a98db34ed ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:220,st:12,st:4,st:4,st:4,st:8,-,st:120,st:40 si=n:Float/d:2D ss=-
+M 012fbef6ebd6 ps code=d7484be4374791e2 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 sb=-,-
+M d7afecbbed64 vs code=d7c690389f3a90bc ud=3 cur=1 ii=2 idraw sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c
+M 82dd8fa4b1ae cs code=d96e3a6701739b86 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy sb=- si=n:Float/d:2D,n:Float/d:2D ss=-
+M c71bca6e152a ps code=d99b9326e55eeebb ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 3a1e2e21d2a8 cs code=d9a45dc7d396d52c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:252,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:60 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 17fbe56cce52 cs code=d9f404a9c5b1aa20 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:16,st:4,st:4,-,st:4,st:68,st:8,st:120,st:64 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 82fdec1cea43 vs code=db76a105c97d9d2c ud=3 cur=3 sb=st:4/f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 8b56348982c7 cs code=db78addb107578a0 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,-,st:4,st:8,st:120,st:64 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 9e147f98a01b cs code=dbecbbe2051b41ba ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M d1e93e2a0dd3 cs code=dc0c6905de02c436 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:56
+M e340d1ad086b cs code=dc51070ae4f75d53 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:220,st:12,st:4,st:12
+M 355dc28df2f4 cs code=dc520f53638901c8 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:336,st:12,st:4,st:12
+M ac91dd40889d cs code=dc74e2c9f552a4c5 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M 142ab9542e4a cs code=dc8690d76390fa0f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:56,st:304,st:12,st:4,st:4,st:4,-,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M ac29fcf10ed3 cs code=dc8690d76390fa0f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:304,st:12,st:4,st:4,st:4,-,st:8,st:120,st:56 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 89baeb30c629 ps code=dcecde4dac3c0158 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 posx posy faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D ss=-
+M b819a635005f cs code=dcedc414141f7b1c ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:112,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M 9aa90b7410ff ps code=dd22bfadb8ca8cac ud=2 sysbase=2 custom=a center=0 smask=f31111 uint=f omode=1,1,1,1,4,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6925216450f6 cs code=dd7d31c844a7a548 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M d64d209910f9 ps code=ddcc592d4b0465ec ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M ce1a1d5fb4d9 cs code=de40d73723123f4a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:224,st:12,st:4,st:4,st:4,st:8,-,st:120,st:48 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 526fa4026918 cs code=de4eb0d8a25ff6a3 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:112,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:76 si=n:Float/d:2D ss=-
+M 10ff53ccbcc5 ps code=deb51269cf0d9065 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7ea3f5d80196 cs code=deb888afaec980df ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D/m:2 ss=-
+M 5c1f92bde66f vs code=debf1e056b871b6b ud=2 cur=2 sb=f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac,-,st:4/f:16_16Float/sw:22c
+M 8e1a8e077dad ps code=df1f4c828cf7cb28 ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5eaa1d480a2a cs code=df1f8d29dea5dce8 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:336,st:12,st:4,st:12
+M 917f7318e6b2 cs code=dfef2fa193db47cf ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 0d81000870d5 vs code=e054447cc86e5a89 ud=3 cur=9 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 985cf2492d6b vs code=e054447cc86e5a89 ud=3 cur=8 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M daccaa60007b vs code=e054447cc86e5a89 ud=3 cur=10 sb=st:160,f:8_8_8_8UNorm,st:4/f:10_10_10_2UNorm,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 5d0897eecc2d cs code=e0cd037f4814be24 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e4872453f74a cs code=e0cd037f4814be24 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M cae62dc946f4 vs code=e0ebf70bc2dfbd32 ud=3 cur=9 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 2bb65185082a ps code=e141904ceaa2da93 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall in=1,3 si=n:Float/d:2D,n:Float/d:2D
+M 268822896a15 cs code=e1655b7780378cf8 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M 5d29ef5a7803 cs code=e1655b7780378cf8 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M 768a751f4a7b cs code=e1aff7cc5dccef57 ud=2 t=64,1,1 lds=128 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:292,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:136 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 7bd8e63779d7 cs code=e1d80dda613a882d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:96
+M ab67f77f7208 cs code=e1f998ea76b28192 ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 54543240ccf7 cs code=e1f9c68dde3c4817 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:232,st:12,st:4,st:12
+M fd23b0bb2b92 cs code=e21845e93cf27159 ud=2 t=4,4,4 tid=3 wgr=2 gx gy gz sb=-,st:8/f:32_32UInt/sw:2c,st:16 si=n:Uint/d:3D
+M a5e9b723927d cs code=e27ef9b74df7257d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:72
+M 19ba36d3c1bc cs code=e2e002629079222f ud=2 t=8,8,1 tid=2 wgr=2 gx gy gz si=n:Float/d:3D,n:Float/d:3D
+M 6990904bf494 cs code=e4606fd932374497 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d2f1bf9fe53c cs code=e4606fd932374497 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 29cee4d82990 ps code=e4f44fb9e779a29c ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 3c47fd54b392 cs code=e556644f448a5130 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M 455b834bc94b cs code=e57969b41b703d8f ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4/f:10_10_10_2UNorm,st:4/f:10_10_10_2UNorm,st:4/f:10_10_10_2UNorm,st:4/f:10_10_10_2UNorm
+M 1b34bd5d319c cs code=e581fafc4e88dd66 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M b993308487f1 cs code=e5b60117e2e44376 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:44,st:224,st:12,st:4,st:4,-,st:4,st:8,st:120,st:60 si=n:Float/d:2D ss=-
+M 1ca4d2de4458 vs code=e5ef201dd577cab8 ud=3 cur=1 sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 68564caf8316 vs code=e5ef201dd577cab8 ud=3 cur=2 sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 6f8b39376442 vs code=e5ef201dd577cab8 ud=3 cur=1 sb=oob,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 56b651ca41d7 cs code=e689aec208730429 ud=2 t=8,8,1 lds=384 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 608b32d206ae ps code=e7f75f8bfb8d90fb ud=2 sysbase=2 custom=1 center=0 smask=f omode=4 faceall kill in=420 si=n:Float/d:2D ss=-
+M 41d12c87f31c cs code=e854073f8119b7bf ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:224,st:12,st:4,st:12
+M 8492dcce3362 ps code=e88d48a3eb25bc0f ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy face faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 7294b064af99 cs code=e968134a402e8f62 ud=8 t=1,1,1 tid=1 wgr=8 sb=-,st:4/f:32UInt/sw:4
+M 7e1a15697a26 ps code=e9878cff8ce567a5 ud=2 sysbase=2 center=0 smask=f omode=4 faceall kill in=0 si=n:Float/d:2D ss=-
+M e1093b0a88fe cs code=e98caf03c9314a8f ud=2 t=8,8,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 338c04c8d84b ps code=e98e850e957f7e1d ud=2 sysbase=2 custom=d center=0 smask=0 posx posy face faceall kill in=420,400,421,422 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 16a51cd0f399 cs code=eac3d2aa82ab3275 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:48,st:308,st:16,st:4,st:4,-,st:4,st:68,st:8,st:120,st:68 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 72dd8f2c0713 cs code=ead4a6991103e5ed ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44
+M 884a661c0aae cs code=ead4a6991103e5ed ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:228,st:12,st:4,st:4,-,st:4,st:8,st:120,st:44
+M ae80eb664155 vs code=eaf9c5f4734f1fd2 ud=2 cur=1 sb=st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:8_8_8_8UNorm
+M 4f83a9f643b1 cs code=ec60beb54f48aa6f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:112,st:236,st:12,st:4,st:4,-,st:4,st:8,st:120,st:76 si=n:Float/d:2D ss=-
+M a11a20a7a8e0 ps code=ec7044a124f6d300 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M d3ab1ec5217f ps code=ec7044a124f6d300 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall noop in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 5ea2ad9f5bc3 cs code=ed336cce8e352e6a ud=2 t=8,8,1 lds=384 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 9eb27d32bf9d cs code=ed336cce8e352e6a ud=2 t=8,8,1 lds=384 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2f9c5a09e349 ps code=ed97872bb666c52c ud=2 sysbase=2 center=0 smask=7 omode=4 posx posy faceall early in=0 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 34d97f219cd0 cs code=edc7a4062d2a6456 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6b673ef9c43b cs code=edc7a4062d2a6456 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 97b275c18ef2 cs code=edc7fdac4bff827f ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 6bec99970683 ps code=ee1fe8daf918cd85 ud=2 sysbase=2 custom=2 center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401 sb=st:4,st:112
+M 543892a3ffc1 cs code=ee495e624b475ee8 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M f302410fa4bd cs code=ee495e624b475ee8 ud=2 t=8,8,1 tid=2 wgr=2 gx sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:16,st:4,st:4,st:8/f:16_16_16_16Float,st:1/f:8UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 83073e43d001 vs code=eeea5189e44a7567 ud=2 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:32_32Float/sw:22c,st:4/f:8_8_8_8UNorm
+M 1a3994b6ee93 cs code=effc32634f56c78e ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:228,st:12,st:4,st:12
+M e36a4535b008 ps code=f01a99e27af77421 ud=2 sysbase=2 custom=5 center=0 smask=0 faceall kill in=420,400,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b0192fa17f4b cs code=f059b355b6ccfcf7 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 7fa0ed6285b9 cs code=f0aad57f9f6a87e8 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:40,st:228,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M e3113eb43214 cs code=f0aad57f9f6a87e8 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:228,st:12,st:4,st:4,st:4,st:8,st:120,st:40
+M 57f46aa5e20a cs code=f0dcc431f5a3dfe7 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:8,-,st:120,st:40 si=n:Float/d:2D ss=-
+M 2afd6531b31e cs code=f195850a29c9809f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5a8a579a2ce2 cs code=f195850a29c9809f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 218c64f1c9b2 vs code=f1f791d9910791cf ud=2 cur=27 idraw sb=st:12,st:2/f:16UInt/sw:4,st:4/f:10_10_10_2UNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,st:1/f:8UNorm/sw:204
+M 99fb8ef49157 cs code=f23b432f400df0e8 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M f7efc311c576 cs code=f23b432f400df0e8 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray
+M 3e80d362e37c cs code=f24f10e07e132fcd ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8e112077b054 cs code=f24f10e07e132fcd ud=2 t=8,8,1 lds=256 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,-,st:4/f:32UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 65bfc6f5a85d cs code=f26df8485049f576 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:80,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 63a1510b1f03 vs code=f2fd7c42a255c7d3 ud=3 cur=27 ii=2 idraw sb=st:8,st:120,st:80 si=n:Float/d:2D ss=-
+M 669f0083f298 ps code=f38c6d5244ec1a9b ud=2 sysbase=2 custom=d center=0 smask=0 posx posy faceall kill in=420,400,421,422 sb=st:160,st:32,st:4/f:32Float/sw:204 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 69f560be13ed cs code=f3b92c7cda773bc2 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:220,st:12,st:4,st:4,st:4,st:68,st:8,-,st:120,st:72
+M cf53354befe4 cs code=f3d46ef7e21d1f41 ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M d630e7e934bd ps code=f464ea2d9b98c6b3 ud=28 sysbase=2 center=0 smask=f omode=4 posx posy faceall early in=0,1 sb=-,st:16/f:32_32_32_32Float si=n:Float/d:2DArray,n:Float/d:2DArray ss=-
+M a9292904a481 cs code=f4d1fbaeadc84c3f ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4,st:4
+M fe936ac2408f cs code=f4fc24cfe81639a8 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy gz sb=st:16,st:4,st:4/f:8_8_8_8UNorm,st:8/f:16_16_16_16Float,- si=n:Float/d:2D,n:Float/d:3D,n:Float/d:2DArray,n:Float/d:3D,n:Uint/d:3D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray ss=-,-,-
+M 4e5ec1a84b54 vs code=f57af68889047e4c ud=3 cur=5 sb=st:160,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 3230801dcb67 vs code=f609b6c5af86be41 ud=3 cur=5 sb=st:4/f:10_10_10_2UNorm,st:160,st:12/f:32_32_32Float/sw:3ac,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 92044132ecbe cs code=f6313452137f830d ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:336,st:12,st:4,st:4,st:4,st:8,st:120,st:52
+M 4a5469be34bd cs code=f635652ea9383db4 ud=2 t=16,16,1 tid=2 wgr=2 gx gy si=n:Float/d:2D,n:Float/d:2D ss=-
+M fe905898840c cs code=f6aa3d058098c8bd ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4
+M 1dd572d57077 cs code=f6ed6a916e6527fa ud=2 t=8,8,1 tid=2 wgr=2 gx gy sb=st:4/f:32UInt/sw:4,st:4/f:32UInt/sw:4,-,st:4/f:32UInt/sw:4 si=n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-
+M 3acb7a7583f0 cs code=f722c9277c94e605 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M dfe3478db4f9 cs code=f722c9277c94e605 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:236,st:12,st:4,st:4,st:4,-,st:8,st:120,st:8,st:48 si=n:Float/d:2D ss=-
+M 234e144d3d80 ps code=f7598f10b1190eac ud=2 sysbase=2 center=0 smask=ff omode=4,4 posx posy posw faceall kill in=0,1,2,403,404,405,406 si=n:Float/d:2DArray/ir:0/im:125/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:3D,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0 ss=-,-,-,-
+M f7f7978c95fb ps code=f7598f10b1190eac ud=2 sysbase=2 center=0 smask=ff omode=4,4 posx posy posw faceall kill in=0,1,2,403,404,405,406 si=n:Float/d:2DArray/ir:0/im:125/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:3D,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0 ss=-,-,-,-
+M 0cf1c2f72112 ps code=f7f627e9aaa9c71e ud=16 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 sb=- si=n:Float/d:2D ss=-
+M f3c7060f21c2 cs code=f931d245933ce711 ud=14 t=1,1,1 tid=1 wgr=14 sb=-,st:4,st:4,st:4,st:16
+M fb843b232551 ps code=f9608198ca99aeda ud=2 sysbase=2 center=0 smask=f omode=4 posx posy posw faceall kill in=0,1,2,403,404,406 si=n:Float/d:2DArray/ir:0/im:116/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0 ss=-,-,-
+M ffb1b6cd15a8 ps code=f9608198ca99aeda ud=2 sysbase=2 center=0 smask=f omode=4 posx posy posw faceall kill in=0,1,2,403,404,406 si=n:Float/d:2DArray/ir:0/im:116/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0 ss=-,-,-
+M 801577fd1107 cs code=f99bf1ba2bc5ea4b ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:292,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:136 si=n:Float/d:3D,n:Float/d:3D ss=-
+M 0df0a56ef199 cs code=fad7f97be20a5ea1 ud=2 t=16,4,1 tid=2 wgr=2 async gx gy sb=st:4,st:308,st:16,st:4,st:12
+M 3da377266556 cs code=fc931304db96d8bb ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:12,st:228,st:12,st:4,st:4,-,st:4,st:68,st:8,st:120,st:48
+M 4df3b0087f9b cs code=fd447a883bdf0e10 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 631bbcd270f0 cs code=fd447a883bdf0e10 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:44,st:220,st:12,st:4,st:4,st:4,st:8,st:120,st:44
+M 273918d2e985 ps code=fddf1a3edf2a4165 ud=2 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2,403,404,406 si=n:Float/d:2DArray/ir:0/im:70/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0,n:Float/d:2D/ir:0 ss=-
+M d22c587c3db6 ps code=fddf1a3edf2a4165 ud=2 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2,403,404,406 si=n:Float/d:2DArray/ir:0/im:70/is:6,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0 ss=-
+M d2d83d9eb0de cs code=fe02856b43155b63 ud=2 t=8,8,1 tid=2 wgr=2 async gx gy si=n:Uint/d:2D,n:Uint/d:2D
+M 0a1770b2af53 vs code=fe290c4735fd342a ud=2 cur=4
+M f6f69be6181b cs code=fe4ed49d0605f532 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4,st:56,st:4/f:32UInt/sw:4,st:16,st:1/f:8UInt/sw:4,st:4,st:4
+M 12de5a19f9f3 cs code=ff142f4da9f5e63e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,st:48,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:48
+M 1476fa19808b cs code=ff142f4da9f5e63e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:4/f:32UInt/sw:4,-,st:220,st:12,st:4,st:4,st:4,st:68,st:8,st:120,st:48
+M f21b1f0f6c07 ps code=ff43610190875e78 ud=2 sysbase=2 custom=a center=0 smask=31111 uint=f omode=1,1,1,1,4 posx posy faceall early in=0,421,401,422 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0ab44ffbc0e9 ps code=ff85a09d1087d647 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early noop si=n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5392aa423c34 ps code=ff85a09d1087d647 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Uint/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+P v=0272381b36ec p=767fa0674ef0 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0272381b36ec p=767fa0674ef0 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=077f48cc2fc8 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=09061d154e59 p=049a9ed8e5d5 plain depth=D32Sfloat noclip topo=TriangleList
+P v=09061d154e59 p=2847ab4965a6 plain depth=D32Sfloat noclip topo=TriangleList
+P v=09061d154e59 p=d64d209910f9 plain depth=D32Sfloat noclip topo=TriangleList
+P v=095cda89b38d p=853f7f6feab4 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=095cda89b38d p=853f7f6feab4 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=095cda89b38d p=c10b5117f6b2 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=095cda89b38d p=c10b5117f6b2 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=0a1770b2af53 p=0c19df7e3d14 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=0ade1a887a3e p=338c04c8d84b depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=0ade1a887a3e p=338c04c8d84b plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=0ca5dee244d8 p=0301780cda4a cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0ca5dee244d8 p=0301780cda4a plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0ca5dee244d8 p=57a5890fdf4e cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0ca5dee244d8 p=57a5890fdf4e plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0ca5dee244d8 p=a92550bf11af cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0ca5dee244d8 p=a92550bf11af plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0d81000870d5 p=0301780cda4a cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0d81000870d5 p=0301780cda4a plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0d81000870d5 p=57a5890fdf4e cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=0d81000870d5 p=57a5890fdf4e plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=107e39f5cdbb p=18b6193a0c46 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=107e39f5cdbb p=18b6193a0c46 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=110db53b3956 p=608b32d206ae plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=18d26273cfd8 p=1dbff8893a34 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=18d26273cfd8 p=1dbff8893a34 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=18f5ec72a6f5 p=8dd20c15e4d5 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=18f5ec72a6f5 p=8dd20c15e4d5 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=18f5ec72a6f5 p=c71bca6e152a depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=18f5ec72a6f5 p=c71bca6e152a plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=19310fcf0f8e p=a9ecdef71e5f cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f noclip topo=TriangleList
+P v=19310fcf0f8e p=a9ecdef71e5f cc=2 c0=R16G16B16A16Sfloat c1=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f noclip topo=TriangleList
+P v=19310fcf0f8e p=a9ecdef71e5f plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f noclip topo=TriangleList
+P v=19310fcf0f8e p=a9ecdef71e5f plain cc=2 c0=R16G16B16A16Sfloat c1=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f noclip topo=TriangleList
+P v=1bba8f09786a p=185f8ad7e31e depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=185f8ad7e31e plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=1eb5008f6274 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=1eb5008f6274 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=65d3c8863fb3 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=65d3c8863fb3 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=916f836be836 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=916f836be836 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=d556cc2972d5 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=d556cc2972d5 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=f7f03ba771e7 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1bba8f09786a p=f7f03ba771e7 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=1c1f125f9a40 p=0273fb159a01 noclip topo=TriangleStrip
+P v=1ca4d2de4458 p=2847ab4965a6 plain depth=D32Sfloat noclip topo=TriangleList
+P v=1ca4d2de4458 p=d64d209910f9 plain depth=D32Sfloat noclip topo=TriangleList
+P v=1ca4d2de4458 p=e29ad0f08b6e plain depth=D32Sfloat noclip topo=TriangleList
+P v=218c64f1c9b2 p=cb7479382673 cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=218c64f1c9b2 p=cb7479382673 plain cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=239a47ce435b p=234e144d3d80 plain cc=2 c0=R16G16B16A16Sfloat c1=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5.1.1.0.5 m1=f b1=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=239a47ce435b p=234e144d3d80 plain cc=2 c0=R16G16B16A16Sfloat c1=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 m1=f b1=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=239a47ce435b p=f7f7978c95fb plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=239a47ce435b p=f7f7978c95fb plain cc=2 c0=R16G16B16A16Sfloat c1=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 m1=f b1=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=23ddaf496f95 p=fb843b232551 plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=23ddaf496f95 p=ffb1b6cd15a8 plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=249959bb5937 p=d322de8ff5b5 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=249959bb5937 p=d322de8ff5b5 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=2d78c91013b8 p=e8349151e261 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=2e22884e466b p=365bd7bd386f depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=2e22884e466b p=365bd7bd386f plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=2e6a300ade46 p=c4f60d4e92a3 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=2e6a300ade46 p=c4f60d4e92a3 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=30a637a98c25 p=3ab54494f9c4 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=30e94490417a p=dea6c4aad4b2 depth=D32Sfloat noclip topo=TriangleList
+P v=30e94490417a p=dea6c4aad4b2 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=3230801dcb67 p=9aa90b7410ff cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=3230801dcb67 p=9aa90b7410ff plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=391f36102b2d p=d7b9b50382bb depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=391f36102b2d p=d7b9b50382bb plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=3ca43a0a53cc p=e36a4535b008 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=3ca43a0a53cc p=e36a4535b008 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=3e17e3e0826e p=3034c72ec04d depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=3e17e3e0826e p=3034c72ec04d plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=3ebd253bc7dd p=2bb65185082a noclip topo=TriangleStrip
+P v=3edfc2035072 p=1b1b21f9d8b8 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=3edfc2035072 p=1b1b21f9d8b8 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=41ac33cc1407 p=6797b026476b plain cc=1 c0=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=41ac33cc1407 p=a65c47683899 plain cc=1 c0=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=422effb780c1 p=9692353821da depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=422effb780c1 p=9692353821da plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=42b7e6751520 p=10bd205bba39 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=42b7e6751520 p=85b91bea093d cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=42b7e6751520 p=90013d6d108a cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=42b7e6751520 p=90013d6d108a plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=456142be43d6 p=9aa90b7410ff cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=4a7006e02d11 p=6bec99970683 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=4afc0de337e9 p=8a145b53ebed plain depth=D32Sfloat noclip topo=TriangleList
+P v=4e5ec1a84b54 p=7e195bec4863 depth=D32Sfloat noclip topo=TriangleList
+P v=4e5ec1a84b54 p=7e195bec4863 plain depth=D32Sfloat noclip topo=TriangleList
+P v=4e639ed3b720 p=27352b161028 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=4e639ed3b720 p=27352b161028 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=4f99369e8506 p=dea6c4aad4b2 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=56fadffee199 p=dea6c4aad4b2 depth=D32Sfloat noclip topo=TriangleList
+P v=56fadffee199 p=dea6c4aad4b2 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=5c1f92bde66f p=65f7913f6391 cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f noclip topo=TriangleList
+P v=5c1f92bde66f p=65f7913f6391 cc=2 c0=R16G16B16A16Sfloat c1=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f noclip topo=TriangleList
+P v=5c1f92bde66f p=65f7913f6391 plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f noclip topo=TriangleList
+P v=5c1f92bde66f p=65f7913f6391 plain cc=2 c0=R16G16B16A16Sfloat c1=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f noclip topo=TriangleList
+P v=626b06c84e02 p=dea6c4aad4b2 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=63a1510b1f03 p=234e144d3d80 plain cc=2 c0=R16G16B16A16Sfloat c1=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5.1.1.0.5 m1=f b1=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=63a1510b1f03 p=f7f7978c95fb plain cc=2 c0=R16G16B16A16Sfloat c1=R8G8B8A8Unorm depth=D32Sfloat m0=f b0=1.1.0.5.1.1.0.5 m1=f b1=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=65afb6fdd183 p=15ddffe13816 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=65afb6fdd183 p=15ddffe13816 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=65afb6fdd183 p=926b18eac484 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=65afb6fdd183 p=926b18eac484 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=65afb6fdd183 p=d06cb8d7838e cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=65afb6fdd183 p=d06cb8d7838e plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=68564caf8316 p=15f724004351 depth=D32Sfloat noclip topo=TriangleList
+P v=68564caf8316 p=15f724004351 plain depth=D32Sfloat noclip topo=TriangleList
+P v=68564caf8316 p=8e1a8e077dad depth=D32Sfloat noclip topo=TriangleList
+P v=68564caf8316 p=8e1a8e077dad plain depth=D32Sfloat noclip topo=TriangleList
+P v=686a1aa9c6cf p=d630e7e934bd plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=6fa87e1897aa p=bd96bee697c0 plain cc=8 c0=R16G16B16A16Sfloat c1=R16G16B16A16Sfloat c2=R16G16B16A16Sfloat c3=R16G16B16A16Sfloat c4=R16G16B16A16Sfloat c5=R16G16B16A16Sfloat c6=R16G16B16A16Sfloat c7=R16G16B16A16Sfloat m0=f b0=1.1.0.1.1.1.0.1 m1=f b1=1.1.0.1.1.1.0.1 m2=f b2=1.1.0.1.1.1.0.1 m3=f b3=1.1.0.1.1.1.0.1 m4=f b4=1.1.0.1.1.1.0.1 m5=f b5=1.1.0.1.1.1.0.1 m6=f b6=1.1.0.1.1.1.0.1 m7=f b7=1.1.0.1.1.1.0.1 topo=TriangleStrip
+P v=714200538a53 p=0a2f0135f4c4 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=0a2f0135f4c4 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=10ff53ccbcc5 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=10ff53ccbcc5 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=9d2be93cf560 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=9d2be93cf560 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=f21b1f0f6c07 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=714200538a53 p=f21b1f0f6c07 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=72a5097eeb01 p=317f8b29f449 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=784c9cd95110 p=5d25a6c4f799 cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=784c9cd95110 p=5d25a6c4f799 cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=784c9cd95110 p=5d25a6c4f799 cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleList
+P v=78e886d1f010 p=46e13908c430 plain cc=1 c0=R8Unorm m0=7 b0=1.1.3.1.1.1.3.1 noclip topo=TriangleStrip
+P v=7fad9fdabd2a p=74ed2f95582d cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=7fad9fdabd2a p=74ed2f95582d plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=7ff0883199f4 p=7e1a15697a26 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=7ff0883199f4 p=7e1a15697a26 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=81e9c7ba8d46 p=b5b7f0f08cb3 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=81e9c7ba8d46 p=b5b7f0f08cb3 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=82fce3d1e949 p=87f806846664 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=82fce3d1e949 p=87f806846664 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=82fce3d1e949 p=87f806846664 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.3.1.1.1.3.1 noclip topo=TriangleList
+P v=82fdec1cea43 p=406b37ceb1b1 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=83073e43d001 p=936cf2b4d6de cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=86a1a0d60d37 p=0ab44ffbc0e9 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=27a43b69d601 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=2f9c5a09e349 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=3c3eeabba783 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=40308a30d6b5 cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=8 noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=4b8dfb3f9de3 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=5392aa423c34 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=5856972793ac plain cc=2 c0=R16G16B16A16Sfloat c1=R8G8B8A8Unorm m0=f b0=1.1.0.5.1.1.0.5 m1=f b1=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=5a16780379c4 plain cc=1 c0=A2B10G10R10UnormPack32 m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=69ab3bd86afa plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=6fa10aa55111 noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=6fa10aa55111 plain noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=7ad73559b577 plain noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=7b8c1ba5a456 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=7cf4f12461f5 plain cc=1 c0=A2B10G10R10UnormPack32 m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=865878fca70c plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=8a435d592612 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=98e58ebf1f0c cc=2 c0=R16G16B16A16Sfloat c1=R16G16B16A16Sfloat m0=f m1=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=a0bdba5e112a plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=a0bdba5e112a plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=b043f15d7c16 plain cc=1 c0=A2B10G10R10UnormPack32 m0=f noclip topo=TriangleStrip
+P v=86a1a0d60d37 p=ebff92fb06f4 plain cc=1 c0=R16G16B16A16Sfloat m0=f noclip topo=TriangleStrip
+P v=8800d0eb6b55 p=95bc95416e22 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=8800d0eb6b55 p=95bc95416e22 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=8be156e653dd p=950544c53af8 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=8be156e653dd p=950544c53af8 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=8d1620f4fc5a p=10bd205bba39 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=8d1620f4fc5a p=10bd205bba39 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=8d1620f4fc5a p=85b91bea093d cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=8d1620f4fc5a p=85b91bea093d plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=8d1620f4fc5a p=90013d6d108a cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=8d1620f4fc5a p=90013d6d108a plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=92acdca1b066 p=c3b1ba73a086 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=92acdca1b066 p=c3b1ba73a086 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=97a80a438286 p=1286f9058e58 plain cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=985cf2492d6b p=86589c9da248 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=985cf2492d6b p=86589c9da248 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=9bb72bb78357 p=3cbbbfa000e4 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=9bb72bb78357 p=3cbbbfa000e4 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=9d6db9470991 p=d4abc6873baa cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=9e9175a7e2cd p=a11a20a7a8e0 noclip topo=TriangleStrip
+P v=9e9175a7e2cd p=a11a20a7a8e0 plain noclip topo=TriangleStrip
+P v=9e9175a7e2cd p=d3ab1ec5217f noclip topo=TriangleStrip
+P v=9e9175a7e2cd p=d3ab1ec5217f plain noclip topo=TriangleStrip
+P v=abf85e592dbb p=50d7a66fd4a1 cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=abf85e592dbb p=50d7a66fd4a1 plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=ae80eb664155 p=1395fa65052a plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=ae80eb664155 p=30f83895e7a3 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=b17a649dd2c7 p=273918d2e985 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=b17a649dd2c7 p=d22c587c3db6 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleStrip
+P v=b3dc23a78cc2 p=1b1b21f9d8b8 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=b3dc23a78cc2 p=1b1b21f9d8b8 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=b73dd9ca2c45 p=dea6c4aad4b2 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=b8f40d245f74 p=4ef5dfd4e71d cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.4.1.1.0.4 noclip topo=TriangleList
+P v=b8f40d245f74 p=4ef5dfd4e71d plain cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.4.1.1.0.4 noclip topo=TriangleList
+P v=bb4d141b9ed7 p=4b0e576396d8 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=bb4d141b9ed7 p=4b0e576396d8 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=bb4d141b9ed7 p=ee598d7577ac cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=bb4d141b9ed7 p=ee598d7577ac plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=c05a89202c5e p=d506599e126c depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=c05a89202c5e p=d506599e126c plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=c716f56c0e85 p=9151b2c2bba8 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=c716f56c0e85 p=9151b2c2bba8 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=c721d6597c7c p=1286f9058e58 cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=c721d6597c7c p=1286f9058e58 plain cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=c721d6597c7c p=2f484abbb0d5 cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=c721d6597c7c p=2f484abbb0d5 plain cc=5 c0=R16G16B16A16Sfloat c1=R16G16Sfloat c2=R32Uint c3=R32Uint c4=R8Unorm depth=D32SfloatS8Uint stencil m0=f b0=1.4.0.5.1.4.0.5 m1=f b1=1.4.0.5.1.4.0.5 m2=f m3=f m4=f b4=1.4.0.5.1.4.0.5 noclip topo=TriangleList
+P v=c8ffc951c27c p=849cbb3ef995 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=cae62dc946f4 p=1dbff8893a34 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=d24233074a72 p=dea6c4aad4b2 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=d547637590c8 p=4b0e576396d8 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=d547637590c8 p=4b0e576396d8 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=d547637590c8 p=ee598d7577ac cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=d547637590c8 p=ee598d7577ac plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=d6d331823f09 p=0cf1c2f72112 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=d6d331823f09 p=1eb420ccbe70 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.5.1.1.0.5 noclip topo=TriangleList
+P v=d7afecbbed64 p=54398e559ba7 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=d7afecbbed64 p=54398e559ba7 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=daccaa60007b p=54f6c69895f3 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=daccaa60007b p=54f6c69895f3 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=daccaa60007b p=698d32ef028b cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=daccaa60007b p=698d32ef028b plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=db6a96c33a21 p=3ab54494f9c4 cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=db6a96c33a21 p=3ab54494f9c4 plain cc=6 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat c5=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f m5=f noclip topo=TriangleList
+P v=dc1cfb725d0e p=012fbef6ebd6 cc=1 c0=R16G16B16A16Sfloat depth=D32SfloatS8Uint stencil m0=f noclip topo=TriangleList
+P v=dcf690620db8 p=8a3a9f48dd54 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=dcf690620db8 p=e4504179625d plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=e114f15c1c16 p=60e9c743cc78 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=e114f15c1c16 p=60e9c743cc78 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=e114f15c1c16 p=e4563029d162 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=e114f15c1c16 p=e4563029d162 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=e16e0eebf756 depth=D32Sfloat neg topo=PatchList pcp=3
+P v=e16e0eebf756 depth=D32Sfloat noclip topo=PatchList pcp=3
+P v=e16e0eebf756 depth=D32SfloatS8Uint stencil neg topo=PatchList pcp=3
+P v=e581f4ae3d7f p=6822af3bcfce cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=e581f4ae3d7f p=6822af3bcfce plain cc=5 c0=R32Uint c1=R32Uint c2=R32Uint c3=R32Uint c4=R16G16Sfloat depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f m4=f noclip topo=TriangleList
+P v=f865cb54cec6 p=9846405335b9 depth=D32Sfloat noclip topo=TriangleList
+P v=f865cb54cec6 p=9846405335b9 plain depth=D32Sfloat noclip topo=TriangleList
+P v=f9fd57595e4d p=1dafa49ed504 depth=D32SfloatS8Uint stencil noclip topo=TriangleList
+P v=f9fd57595e4d p=1dafa49ed504 plain depth=D32SfloatS8Uint stencil noclip topo=TriangleList

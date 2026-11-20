@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -347,7 +348,7 @@ void DefineBvhIntersect(EmitterState& s) {
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
-	const auto node_words = inst.Flags<uint32_t>();
+	const auto node_words = inst.Flags<uint32_t>() & ~IR::BvhIntersectNative;
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
 	    ray->NumArgs() < node_words + 10u || s.bvh_intersect_function == 0)
 		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");

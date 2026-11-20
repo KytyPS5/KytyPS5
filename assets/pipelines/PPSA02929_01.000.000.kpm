@@ -1,0 +1,17 @@
+# kyty pipeline manifest v1
+M d179d0ff8a4a ps code=0a8799efb5f8569c ud=16 sysbase=2 center=0 smask=f omode=4 faceall early in=0 sb=- si=n:Float/d:2D ss=-
+M 1fd692604785 ps code=391de17bbb920072 ud=4 sysbase=2 center=0 smask=f omode=4 faceall early sb=-
+M 85086ce694a7 vs code=6b1606010b4bd4c7 ud=8 cur=1 fa=6 fb=4 dyn attr=180000.43690.4a3ac.9.3.0.0.0,180000.43690.16204.12.1.1.0.0,180000.43690.4022c.13.2.2.0.0 vbuf=24.43690.0 sb=-
+M 993f436e1080 vs code=6b1606010b4bd4c7 ud=8 cur=2 fa=6 fb=4 dyn attr=180000.43690.4a3ac.9.3.0.0.0,180000.43690.16204.12.1.1.0.0,180000.43690.4022c.13.2.2.0.0 vbuf=24.43690.0 sb=-
+M cd35ba13f01b vs code=6b1606010b4bd4c7 ud=8 cur=3 fa=6 fb=4 dyn attr=180000.43690.4a3ac.9.3.0.0.0,180000.43690.16204.12.1.1.0.0,180000.43690.4022c.13.2.2.0.0 vbuf=24.43690.0 sb=-
+M 4a7461dcdafb vs code=9883d6b62781801f ud=4 cur=3 fa=2 dyn attr=100000.4.4022c.9.2.0.0.0,100000.4.4022c.11.2.1.0.0 vbuf=16.4.0
+M c100d6f3cf63 vs code=b373280d936a95ee cur=4
+M 39e3652c8647 ps code=e7058001d51ff739 ud=16 sysbase=2 center=0 smask=f omode=4 faceall early in=0 sb=- si=n:Float/d:2D ss=-
+M 1f2147b46d90 ps code=eb77913cddeb8687 ud=12 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 si=n:Float/d:2D ss=-
+M a56275222994 ps code=f5eba2e9e45b53d4 ud=4 sysbase=2 center=0 smask=f omode=4 faceall param=Rectangle early
+P v=4a7461dcdafb p=d179d0ff8a4a plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.4.0.5.1.4.0.5 neg topo=TriangleList vb=16.0 va=0.0,8.0
+P v=4a7461dcdafb p=d179d0ff8a4a plain cc=1 c0=R8G8B8A8Unorm m0=f neg topo=TriangleStrip vb=16.0 va=0.0,8.0
+P v=85086ce694a7 p=1f2147b46d90 plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5.1.1.0.5 neg topo=TriangleList vb=24.0 va=0.0,12.0,16.0
+P v=993f436e1080 p=1fd692604785 cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.0.1.1 neg topo=TriangleList vb=24.0 va=0.0,12.0,16.0
+P v=c100d6f3cf63 p=a56275222994 cc=1 c0=R8G8B8A8Unorm m0=f neg topo=PatchList pcp=3
+P v=cd35ba13f01b p=39e3652c8647 plain cc=1 c0=R8G8B8A8Unorm m0=f b0=1.1.0.5.1.1.0.5 neg topo=TriangleList vb=24.0 va=0.0,12.0,16.0

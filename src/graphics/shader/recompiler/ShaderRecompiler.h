@@ -6,10 +6,12 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
 #include <bitset>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -24,9 +26,17 @@ struct CompileOptions {
 	bool                        dump_ir                    = true;
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;
+	// Replace known guest BVH traversal loops with host ray queries (see
+	// IR::TraceNativeTraversals).
+	bool                        native_ray_tracing         = false;
+	// With native ray tracing, count initialized Vulkan queries and fallback rays in the fault buffer.
+	bool                        ray_stats                  = false;
+	bool                        table_mode                 = false; // IR::EnterTableMode
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Also emit CompileResult::spirv_plain for a pixel shader instrumented for GET_LOD_STATS.
+	bool                        plain_mip_stats_variant    = false;
 };
 
 struct TranslateResult {
@@ -36,7 +46,11 @@ struct TranslateResult {
 };
 
 struct CompileResult {
-	std::vector<uint32_t>  spirv;
+	std::vector<uint32_t>  spirv; // empty when table mode was asked for and refused (table_refusal)
+	std::string            table_refusal;
+	// The same program without the GET_LOD_STATS recording (Spirv::UsesMipStats): for draws in
+	// which no image has a mip-statistics counter. Empty unless requested and instrumented.
+	std::vector<uint32_t>  spirv_plain;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;
@@ -62,11 +76,40 @@ struct ShaderSource {
 	IR::ResourcePlan call_targets;
 	std::vector<Call> calls;
 	uint32_t unsupported_call_pc = UINT32_MAX;
+	// Calls whose targets the call queries cannot evaluate (a function each lane picks from a
+	// table, or a target written differently on different paths) are expanded from the guest's
+	// call tables when the source is refreshed: `linked` then holds the expanded program, and
+	// `refresh_failed` reports a refresh whose expansion is not possible (with its reason).
+	bool expand_calls = false;
 	uint32_t wave_size = 64;
+	std::shared_ptr<Decoder::ShaderFunctionExpander> expander;
+	bool refresh_failed = false;
+	std::string refresh_failure;
 	std::optional<Linked> linked;
+	// The addresses the expanded program reads at run time (Decoder::RuntimeLiteral), current
+	// after each refresh: they change without changing the program.
+	std::vector<uint32_t> call_words;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
+
+	[[nodiscard]] bool HasCalls() const { return !calls.empty() || expand_calls; }
 };
+
+// The programs with a guest BVH walk compiled with native ray tracing, by distinct shader hash (see
+// the "[RT]" summary of RayTracing): those whose walks trace natively (IR::TraceNativeTraversals),
+// those whose walk no form recognizes, and those with a native site that always takes the guest
+// walk (its alpha tested triangles have no per lane alpha test, see EmitRayQueryInit); the last
+// hash of the latter two.
+enum class RayTracingProgramKind : uint32_t { Native, Unrecognized, AlwaysGuest };
+struct RayTracingPrograms {
+	uint64_t native            = 0;
+	uint64_t unrecognized      = 0;
+	uint64_t always_guest      = 0;
+	uint64_t last_unrecognized = 0;
+	uint64_t last_always_guest = 0;
+};
+void                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
+[[nodiscard]] RayTracingPrograms GetRayTracingPrograms();
 
 [[nodiscard]] const char* StageName(ShaderType stage);
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,

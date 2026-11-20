@@ -1,0 +1,891 @@
+# kyty pipeline manifest v1
+M 9703a8a8ebf6 vs code=00f8c3b1ab088ded ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.5366.4a3ac.9.3.0.0.0 vbuf=12.5366.0 sb=-
+M ed8f2b097939 ps code=017ae168e0d397d8 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 44dd1d8b02ec cs code=01ceaf222b5d3a86 ud=4 t=64,1,1 tid=1 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 4eb3d7edc6c3 ps code=01f96a110887b8c5 ud=2 sysbase=2 center=0 smask=ffffff omode=4,4,4,4,4,4 posx posy faceall early si=n:Float/d:2DArray/cube ss=-
+M f8af7abf43f8 cs code=02a4ce25e059a202 ud=4 t=1024,1,1 lds=1024 tid=1 wgr=4 gx sb=st:4,st:4
+M 0e18218fa89b ps code=02c717d2a2fbe790 ud=5 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a2444ccc99c2 vs code=037c09258347e52f ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.4838.4a3ac.9.3.0.0.0,80000.3628.39fac.12.4.1.0.1 vbuf=12.4838.0,8.3628.0 sb=-
+M a058e1d41019 vs code=038e872a44afde1e ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.344806.4a3ac.9.3.0.0.0,80000.376152.39fac.12.4.1.0.1,40000.564228.1d22c.16.2.3.0.2,100000.94038.3cfac.18.4.4.0.3,100000.94038.38fac.22.4.5.0.3 vbuf=12.344806.0,8.376152.0,4.564228.0,16.94038.0 sb=-,st:48
+M 53013671bea2 ps code=048d0dbd6f3ee210 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=3f omode=4,4 posx posy posz faceall sshade early in=0,421,422 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-,-
+M 86eb4f2e5b57 ps code=048d0dbd6f3ee210 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=3f omode=4,4 posx posy posz faceall sshade early in=0,421,422 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-,-,-,-,-
+M 03b82ba0296c hs code=057af7a3fa7b70c9 ud=12 cur=3 ticp=1 tocp=1 tls=40 ths=32 tpb=32672 tps=84 tdom=2 tpart=2 ttopo=3
+M 03d1ce16dafd cs code=07359f0383ca0961 ud=10 t=64,1,1 tid=1 wgr=10 async gx sb=st:44,empty,sw:0/oob,oob,oob,oob,st:4,st:8
+M 2cfe1233a436 cs code=07359f0383ca0961 ud=10 t=64,1,1 tid=1 wgr=10 async gx sb=st:44,-,st:12/f:32_32_32Float/sw:3ac,st:64,st:4,oob,st:4,st:8
+M c6d3906e2f1a cs code=07de49c064e477f5 ud=5 t=256,1,1 tid=1 wgr=5 async sb=st:32,st:16
+M d3869928278f cs code=083b533c86e6e77f ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D
+M dbc8bf69e1f9 ps code=08434baee689a723 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 0eb88c6f28db cs code=08b8e68842b8fe8f ud=13 t=64,1,1 lds=128 tid=1 wgr=13 async gx sb=st:4,st:64,st:8,st:4,st:8
+M aa41960bc736 vs code=08d885afb2b31769 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.344806.4a3ac.9.3.0.0.0,40000.564228.1d22c.12.2.3.0.1,100000.94038.3cfac.14.4.4.0.2,100000.94038.38fac.18.4.5.0.2 vbuf=12.344806.0,4.564228.0,16.94038.0 sb=st:4,st:112,st:48
+M c3fb9449ade9 ps code=0937faf7b2fd03cd ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=ffff omode=4,4,4,4 posx posy posw faceall sshade early in=0,421,422 sb=st:4,st:1,-,-,-,- si=n:Float/d:2D/ir:0/im:51/heap,n:Float/d:2D/ir:0/im:51/heap ss=-
+M 188da6c14432 cs code=09f96705bc50062f ud=4 t=32,32,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D
+M 6f44910f120d ls code=0a22d62bbbaec8e8 ud=2 cur=5 ticp=1 tocp=1 tls=4 ths=48 tpb=32672 tps=84 tdom=2 ttopo=2
+M 08e4afb132d3 ps code=0ae3441816f18c91 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2DArray ss=-
+M 00cd84bea11e vs code=0d2eb2b083aa7f59 ud=11 cur=14 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.2296.4a3ac.9.3.0.0.0,80000.1968.39fac.12.4.1.0.1,80000.1968.39fac.16.4.2.0.1,40000.1968.1d22c.20.2.3.0.2,40000.984.1d22c.22.2.4.0.3 vbuf=12.2296.0,8.1968.0,4.1968.0,4.984.0 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D ss=-
+M 24b0a0a7a724 vs code=0d2eb2b083aa7f59 ud=11 cur=14 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.63182.4a3ac.9.3.0.0.0,80000.54157.39fac.12.4.1.0.1,80000.54157.39fac.16.4.2.0.1,40000.54158.1d22c.20.2.3.0.2,40000.27080.1d22c.22.2.4.0.3 vbuf=12.63182.0,8.54157.0,4.54158.0,4.27080.0 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D ss=-
+M 449bf6818cf6 ps code=0e1c97fb0412afa2 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8a76915fa059 cs code=0e40204dd850fbee ud=5 t=256,1,1 tid=1 wgr=5 async sb=st:80,st:16
+M 3c6438e5f099 mesh code=0e59c8ed2ec1e132 ud=19 cur=18 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac
+M 81e9d1e44447 mesh code=0e59c8ed2ec1e132 ud=19 cur=17 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac
+M 5aeee94e6b33 ps code=0fc6e0b98002972c ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d502816b3a7e cs code=0fe35311dd83080b ud=11 t=64,1,1 tid=1 wgr=11 async gx sb=st:32,st:16
+M bf3673557435 vs code=1020edb3d05150b3 ud=8 cur=7 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=c0000.30581.4a3ac.9.3.0.0.0,80000.18349.39fac.12.4.2.0.1,40000.3182488.1d22c.16.2.4.0.2,40000.3182488.1d22c.18.2.5.0.2 vbuf=12.30581.0,8.18349.0,4.3182488.0
+M 2b9e3711ad53 mesh code=10449cda3281aa7a ud=19 cur=28 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M b518743d6147 mesh code=10b0758896cdf982 ud=19 cur=20 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,-,-,-,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M 5d75529cde6b cs code=10fe6362edd2f1de ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,st:1,st:1,st:1,st:1,st:1
+M 115ec772c2ca cs code=1179788c19739a93 ud=4 t=256,1,1 tid=1 wgr=4 gx sb=st:4,st:1,st:1
+M 905048d79f0b ps code=11b2e336790333bd ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 134d45462155 mesh code=11b51c4938180da1 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac
+M 5f2256cb7f99 ps code=11b847ba1fa397db ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M bedc92cc3e8f mesh code=12327bedc0ae5947 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,-,-,- si=n:Float/d:2D ss=-
+M 4e6e17b4af29 vs code=133494bf9c02f080 ud=11 cur=12 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.421388.4a3ac.9.3.0.0.0,80000.459697.39fac.12.4.1.0.1,80000.459697.39fac.16.4.2.0.1,40000.689546.1d22c.20.2.3.0.2,100000.114924.3cfac.22.4.4.0.3,100000.114924.38fac.26.4.5.0.3,40000.574622.1d22c.30.2.7.0.4 vbuf=12.421388.0,8.459697.0,4.689546.0,16.114924.0,4.574622.0 sb=-,-,-,-,st:48 si=n:Float/d:2D ss=-
+M c0746752af8a ps code=13490d949b89ec73 ud=4 sysbase=2 center=0 smask=ffffff omode=4,4,4,4,4,4 posx posy faceall early sb=st:1
+M 37fab6fd69e0 vs code=13f838f4f38162c9 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.2817.4a3ac.9.3.0.0.0,80000.2415.39fac.12.4.1.0.1,80000.2415.39fac.16.4.2.0.1,40000.2417.1d22c.20.2.3.0.2,40000.1210.1d22c.22.2.4.0.3 vbuf=12.2817.0,8.2415.0,4.2417.0,4.1210.0 sb=st:4,st:112
+M 13a7ec7e973d vs code=142bd7e2573e8c9a ud=8 cur=16 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=c0000.48930.4a3ac.9.3.0.0.0,c0000.30581.4a3ac.12.3.1.0.1,80000.18349.39fac.15.4.2.0.2,80000.18349.39fac.19.4.3.0.2,40000.3182488.1d22c.23.2.4.0.3,40000.3182488.1d22c.25.2.5.0.3 vbuf=12.48930.0,12.30581.0,8.18349.0,4.3182488.0
+M 81993bd617c8 ps code=16be60c6e68de5e6 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 97529ddcf5b4 ps code=1838b6baeac642e1 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 64e92c004903 ps code=187c4a8396c51624 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=ffff omode=4,4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M fe7b859b3dde ps code=18ae83d9b647fb39 ud=4 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=st:1,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Uint/d:2D,n:Uint/d:3D,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:2DArray ss=-,-
+M fe5a2e830891 ps code=19934f54648bae6f ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 5e4ea0c136f1 ps code=1a4d482b7931afec ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 9bab7623f835 ps code=1ad812932c0e917c ud=4 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 19e609b11c35 ps code=1b52e1f2c99f496f ud=2 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz faceall sshade early in=420,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-
+M 6a791692731d ps code=1b52e1f2c99f496f ud=2 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz faceall sshade early in=420,421 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 1534e62db7c3 cs code=1b596da3282ad8c9 ud=9 t=256,1,1 lds=2048 tid=1 wgr=9 async gx sb=oob,st:1024,st:16,oob
+M f6786b070e27 cs code=1b596da3282ad8c9 ud=9 t=256,1,1 lds=2048 tid=1 wgr=9 async gx sb=st:4,st:1024,st:16,st:4
+M 6d007f1e205a ps code=1b76fe0478953b97 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e9f565deac00 cs code=1b8b3292221d7ec8 ud=4 t=64,1,1 lds=128 tid=1 wgr=4 async gx sb=st:64,-,st:352,st:176
+M 5d19fd78a521 mesh code=1bc78e2a883edcc4 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:8/f:8_8_8_8SNorm si=n:Float/d:2D,n:Float/d:2D ss=-
+M f390650b13aa ps code=1d09f9b85131cb04 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 505903f83a52 cs code=1d35c575651a4719 ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,-,-,-,-,st:48,st:1 si=n:Float/d:2D ss=-
+M e7e98e31e5e1 mesh code=1d8c0525e36b4f0c ud=19 cur=12 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M b4b3f1141cdb ps code=1e7d678131b2f680 ud=4 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M 3f22b92c7ded mesh code=1f0baf51463c6770 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M cfc3775b3d80 mesh code=1f90c415794220d8 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48 si=n:Float/d:2D ss=-
+M 4a3e2b956ab2 cs code=1fc1fb3c3592e9ad ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D ss=-
+M 5abc2c6e8d58 ps code=1fc52f99b73e16a7 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 4dc3fd904552 cs code=1ff97ad77124443e ud=4 t=256,1,1 tid=1 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 1809e670332f cs code=213dffe426b387dc ud=13 t=64,1,1 tid=1 wgr=13 async gx sb=st:4,st:4,st:64,st:64,st:4,st:4,st:4
+M 486983412ac7 vs code=2186e88e06b1082d ud=6 fa=2 dyn iv=4 ii=5 idraw attr=40000.3595.1d22c.9.2.0.0.0,40000.2996.1d22c.11.2.1.0.1 vbuf=4.3595.0,4.2996.0
+M 90e1632e4ec7 vs code=22b032724342ae55 ud=2 cur=4 iv=0 ii=1 idraw
+M bfc9849e5d8c ps code=2319d64293fbf45f ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=400 sb=st:1
+M 9f04600bad8d ps code=232adfd4669d27f4 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 1f39561c4f63 mesh code=2373a3c5149204ee ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:4,st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,st:1,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:8/f:8_8_8_8SNorm si=n:Float/d:2D/ir:0/im:65/heap,n:Float/d:2D/ir:0/im:65/heap ss=-
+M a01dcee0ad75 ps code=2480990bdd167ac2 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M ae7b909a9933 cs code=252423571d881c6f ud=2 t=16,16,1 tid=2 wgr=2 async gx gy si=n:Uint/d:2D
+M 943afdc18b2a vs code=253555dad42abed7 ud=10 cur=17 fa=6 fb=4 dyn iv=8 ii=9 idraw attr=340000.50412.4a3ac.9.3.0.0.0,340000.50412.38fac.12.4.1.0.0,340000.50412.1d22c.16.2.2.0.0,340000.50412.47fac.18.4.3.0.0,340000.50412.14204.22.1.7.0.0 vbuf=52.50412.0 sb=oob
+M f3c8bb7acb86 cs code=266cfbc2e865565b ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 23c308a55fb6 mesh code=26716e1ac58e47d5 ud=19 cur=21 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:48,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M f74938d6e34a vs code=26afaf88679a5cbd ud=8 cur=1 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=140000.30003.4a3ac.9.3.0.0.0,140000.30003.38fac.12.4.1.0.0,140000.30003.1d22c.16.2.2.0.0 vbuf=20.30003.0
+M f50c661f7f1f ps code=26c6a72607d73f95 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy posz faceall sshade in=0,421,422 sb=st:4,st:1,-,-,st:1,st:1 si=n:Float/d:2D/ir:0/im:47/heap,n:Float/d:2D/ir:0/im:47/heap ss=-,-
+M 6014cf7e95e1 ps code=26ce2a3ed33390be ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 42b31e2f2aab cs code=272dab619c8e690e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:16,st:32,st:4,st:64,st:12,st:128
+M 81257940e061 cs code=272dab619c8e690e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:16,st:24,st:4,st:64,st:12,st:128
+M a728d096dc21 cs code=272dab619c8e690e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:16,oob,st:4,st:64,st:12,oob
+M d1c0fafb0d66 vs code=27c77e55ee700806 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.5278.4a3ac.9.3.0.0.0,80000.4525.39fac.12.4.1.0.1,40000.4526.1d22c.16.2.3.0.2,40000.2264.1d22c.18.2.4.0.3 vbuf=12.5278.0,8.4525.0,4.4526.0,4.2264.0 sb=st:4,st:112,st:4,st:1,st:4,st:112,st:1,-,-
+M c354c11abb6d cs code=283e3dab3daf71e5 ud=4 t=256,1,1 tid=1 wgr=4 async gx gy si=n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D
+M 8b6c1b579574 cs code=285ad763ecf1d7f5 ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,-,st:48,st:1
+M 292f9f2e6e86 cs code=287955d4dc67eef0 ud=4 t=16,16,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Float/d:2D
+M a07160f2970c ps code=289cfd3ee365cd86 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d508546eeee7 ps code=28db12c7f4caefdc ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 5624e3d2d46c cs code=29171d835082a33c ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:4 si=n:Float/d:1DArray
+M 2ad9f80974f7 ps code=295008a24b6d1743 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 894dd66ed094 ps code=29b68a9baf3728c5 ud=5 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz faceall sshade early in=420,421 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-
+M f24ac8eff966 cs code=2b0747f793b42515 ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:352,st:64,st:176
+M 7dc61aea996f vs code=2b09ee300dae598d ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.1122562.4a3ac.9.3.0.0.0,40000.3182488.1d22c.12.2.3.0.1,100000.786362.3cfac.14.4.4.0.2,100000.786362.38fac.18.4.5.0.2,40000.3182488.1d22c.22.2.6.0.1 vbuf=12.1122562.0,4.3182488.0,16.786362.0 sb=-,st:48
+M 2f9043d66858 ps code=2bc9888557527c6e ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=400 sb=st:1
+M 3e0907cb5a73 cs code=2c86d677ff405db0 ud=2 t=64,1,1 tid=1 wgr=2 gx gy si=n:Float/d:2D
+M e4ad5ccd5643 cs code=2d083c60a5527b20 ud=15 t=64,1,1 lds=128 tid=1 wgr=15 async gx sb=st:96,st:32,st:24
+M 4eec61da1fb4 cs code=2d3203f9c6d2dd7a ud=5 t=64,1,1 lds=256 tid=1 wgr=5 async gx gy sb=st:1 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 08f796d0fe42 mesh code=2d43f5d0c95a0fb6 ud=19 cur=12 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M f0d7f8296647 cs code=2d8482f130eb45c7 ud=13 t=64,1,1 tid=1 wgr=13 async gx sb=st:44,st:20
+M 2c212cd2fbe6 mesh code=2df96d0503b5c43f ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=896 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M 7f4eb1ccd6af mesh code=2e0f599050d11e62 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-
+M b395607157d2 cs code=2e9433e4f8d41447 ud=10 t=64,1,1 lds=128 tid=1 wgr=10 async gx sb=-,st:6,st:12/f:32_32_32Float/sw:3ac,st:24
+M e5717774b510 cs code=2ee039d4d19553df ud=3 t=64,1,1 tid=1 wgr=3 gx sb=st:1
+M f79b208c7670 mesh code=2f2e9907995d8c23 ud=19 cur=21 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,-,-,-,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M cc911e416a36 cs code=2f7711f1c1592759 ud=5 t=64,1,1 tid=1 wgr=5 gx sb=st:32,st:1
+M 54f1cc2d0392 ps code=2f85f8dbc92ab5e8 ud=4 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall early in=0,1,2,3,4,5,6,407,9 sb=st:32,- si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M ea57b931172a cs code=2fbc5524c92ac286 ud=4 t=16,16,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M de2a622a8897 mesh code=30373020a1fb2216 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,-,-,- si=n:Float/d:2D ss=-
+M 1194cf29b459 vs code=304714fcbe34af4f ud=11 cur=13 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.14952.4a3ac.9.3.0.0.0,80000.12816.39fac.12.4.1.0.1,80000.12816.39fac.16.4.2.0.1,40000.12816.1d22c.20.2.3.0.2,40000.6408.1d22c.22.2.4.0.3 vbuf=12.14952.0,8.12816.0,4.12816.0,4.6408.0 sb=-
+M 11a7ee75ca89 vs code=304714fcbe34af4f ud=11 cur=12 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.42849.4a3ac.9.3.0.0.0,80000.36728.39fac.12.4.1.0.1,80000.36728.39fac.16.4.2.0.1,40000.36728.1d22c.20.2.3.0.2,40000.18364.1d22c.22.2.4.0.3 vbuf=12.42849.0,8.36728.0,4.36728.0,4.18364.0 sb=-
+M 19431368c0fd vs code=304714fcbe34af4f ud=11 cur=9 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.12141.4a3ac.9.3.0.0.0,80000.10407.39fac.12.4.1.0.1,80000.10407.39fac.16.4.2.0.1,40000.10409.1d22c.20.2.3.0.2,40000.5206.1d22c.22.2.4.0.3 vbuf=12.12141.0,8.10407.0,4.10409.0,4.5206.0 sb=-
+M 576e28f429e9 vs code=304714fcbe34af4f ud=11 cur=14 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.31306.4a3ac.9.3.0.0.0,80000.26834.39fac.12.4.1.0.1,80000.26834.39fac.16.4.2.0.1,40000.26835.1d22c.20.2.3.0.2,40000.13418.1d22c.22.2.4.0.3 vbuf=12.31306.0,8.26834.0,4.26835.0,4.13418.0 sb=-
+M 8b58af483729 vs code=304714fcbe34af4f ud=11 cur=8 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.29104.4a3ac.9.3.0.0.0,80000.24946.39fac.12.4.1.0.1,80000.24946.39fac.16.4.2.0.1,40000.24947.1d22c.20.2.3.0.2,40000.12474.1d22c.22.2.4.0.3 vbuf=12.29104.0,8.24946.0,4.24947.0,4.12474.0 sb=-
+M a4f0a4277ddd vs code=304714fcbe34af4f ud=11 cur=25 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.9808.4a3ac.9.3.0.0.0,80000.8407.39fac.12.4.1.0.1,80000.8407.39fac.16.4.2.0.1,40000.8409.1d22c.20.2.3.0.2,40000.4206.1d22c.22.2.4.0.3 vbuf=12.9808.0,8.8407.0,4.8409.0,4.4206.0 sb=-
+M b47f10b5b732 vs code=304714fcbe34af4f ud=11 cur=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.4838.4a3ac.9.3.0.0.0,80000.3628.39fac.12.4.1.0.1,80000.3628.39fac.16.4.2.0.1,40000.2419.1d22c.20.2.3.0.2,40000.2419.1d22c.22.2.4.0.2 vbuf=12.4838.0,8.3628.0,4.2419.0 sb=-
+M b6a5b9b464ba vs code=304714fcbe34af4f ud=11 cur=16 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.5366.4a3ac.9.3.0.0.0,80000.4600.39fac.12.4.1.0.1,80000.4600.39fac.16.4.2.0.1,40000.4600.1d22c.20.2.3.0.2,40000.2300.1d22c.22.2.4.0.3 vbuf=12.5366.0,8.4600.0,4.4600.0,4.2300.0 sb=-
+M dcdac8122985 vs code=304714fcbe34af4f ud=11 cur=9 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.7705.4a3ac.9.3.0.0.0,80000.6605.39fac.12.4.1.0.1,80000.6605.39fac.16.4.2.0.1,40000.6606.1d22c.20.2.3.0.2,40000.3304.1d22c.22.2.4.0.3 vbuf=12.7705.0,8.6605.0,4.6606.0,4.3304.0 sb=-
+M 955e249ea6bb ps code=30a34f4ca2fecc4e ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2DArray/ir:0/im:27/heap,n:Float/d:2DArray/ir:0/im:27/heap,n:Float/d:2DArray/ir:0/im:27/cube/heap ss=-
+M a041d0ff00e6 ps code=30a34f4ca2fecc4e ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2DArray/ir:0/im:27,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0/cube,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0/cube,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0 ss=-
+M 54b8996f4a6a cs code=30bd70bd53d2885b ud=4 t=256,1,1 tid=1 wgr=4 async gx gy sb=st:1,oob,sw:0/oob,sw:0/oob,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-,-,-
+M 155914a7ce81 cs code=31370adf201bb5b3 ud=2 t=1,1,1 tid=1 wgr=2 async sb=st:256
+M 0c49520fe540 ps code=319db230522739a4 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0ffab2243965 vs code=31e3abe18dbc67aa ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.4480.4a3ac.9.3.0.0.0,80000.3840.39fac.12.4.1.0.1,40000.3840.1d22c.16.2.3.0.2,40000.1920.1d22c.18.2.4.0.3 vbuf=12.4480.0,8.3840.0,4.3840.0,4.1920.0 sb=-,-,st:1,-,-
+M 4e76ee0f6c98 ps code=32a542ed51c6d0de ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early in=0,1 si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-
+M 8274032e730e vs code=32e8be253654a275 ud=11 cur=14 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.34955.4a3ac.9.3.0.0.0,80000.38133.39fac.12.4.1.0.1,80000.38133.39fac.16.4.2.0.1,40000.57201.1d22c.20.2.3.0.2,100000.9533.3cfac.22.4.4.0.3,100000.9533.38fac.26.4.5.0.3,40000.47668.1d22c.30.2.7.0.4 vbuf=12.34955.0,8.38133.0,4.57201.0,16.9533.0,4.47668.0 sb=-,-,-,-,st:48 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 28b9b635ecb3 cs code=330a73cf03958fbf ud=2 t=256,1,1 tid=1 wgr=2 gx sb=st:4,st:4
+M df4da7114469 cs code=330a73cf03958fbf ud=2 t=256,1,1 tid=1 wgr=2 async gx sb=st:4,st:4
+M b3bc91d98619 vs code=3446290fcbebc4d6 ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.6846.4a3ac.9.3.0.0.0,80000.5869.39fac.12.4.1.0.1,40000.5870.1d22c.16.2.3.0.2,40000.2936.1d22c.18.2.4.0.3 vbuf=12.6846.0,8.5869.0,4.5870.0,4.2936.0 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D ss=-
+M da89b52f2b56 cs code=36119b28ef26c3a7 ud=4 t=256,1,1 lds=1408 wave=32 tid=1 wgr=4 async gx gy gz si=n:Uint/d:2D,n:Uint/d:2D
+M f141cc1ca894 ps code=3632d028bd6b5924 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M d79e459c07ce ps code=3635c28c33815b0c ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 7bf35456dde9 cs code=36514fd4b15cfb51 ud=13 t=64,1,1 tid=1 wgr=13 async gx sb=st:4,st:4,st:64,st:64
+M 8d3cbef8f89e mesh code=3664dd97b09c5711 ud=19 cur=17 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 9a423da91d66 mesh code=3664dd97b09c5711 ud=19 cur=14 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M f0783db58f66 mesh code=3664dd97b09c5711 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 80dfddd881b7 cs code=36de43acbbfa7b0a ud=2 t=1,1,1 tid=1 wgr=2 async sb=st:256
+M b9c97432dcfd vs code=36fcb03498dccb32 ud=8 cur=1 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=180000.25002.4a3ac.9.3.0.0.0,180000.25002.38fac.12.4.1.0.0,180000.25002.1d22c.16.2.2.0.0,180000.25002.1d22c.18.2.3.0.0 vbuf=24.25002.0
+M ceadcfa615b6 hs code=38e0f55663246917 ud=10 cur=5 ticp=1 tocp=1 tls=4 ths=48 tpb=32672 tps=84 tdom=2 ttopo=2
+M a9382f6e2e54 mesh code=390de133d95122ba ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 3ff441652de9 ps code=3a480ddef6d77c7a ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 881f1edd9705 mesh code=3b7bba777ef16913 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M d661fde23c01 mesh code=3b7bba777ef16913 ud=19 cur=14 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M d7b25dd28d50 mesh code=3b7bba777ef16913 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 953dcb111353 mesh code=3c7304a535dd1709 ud=19 cur=12 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 88bfefa36cb7 cs code=3d125f6d70d77a88 ud=4 t=64,1,1 wave=32 tid=1 wgr=4 gx sb=st:4,st:4,st:16,st:16,st:48,st:96,st:80,-,- si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D/ir:2/im:215/heap,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D/ir:2/im:215/heap ss=-,-,-
+M 742c88785283 ps code=3e5cae9aa5d34516 ud=4 sysbase=2 center=0 smask=ff omode=4,4 posx posy faceall early sb=st:1,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2DArray,n:Uint/d:3D,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:2DArray ss=-,-
+M 35b344d3d961 cs code=407aff0ae2f39bea ud=4 t=64,1,1 tid=1 wgr=4 gx sb=-,st:1,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,-,-,- si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D
+M 3b8e924a26a5 ps code=40be16bc279d9dab ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2D/ir:0/im:30/heap ss=-,-
+M 1de6b22915ac ps code=42292ae70c75f1c5 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 67b3acc7a70d cs code=4373aef3874b2ca2 ud=2 t=64,1,1 tid=1 wgr=2 async gx gy si=n:Float/d:2D
+M 975fdca361b7 cs code=4373aef3874b2ca2 ud=2 t=64,1,1 tid=1 wgr=2 gx gy si=n:Float/d:2D
+M 789fa7b6c860 cs code=43a419bca9466494 ud=6 cur=4294967295 t=64,1,1 tid=1 wgr=6 async dims ithreads gx sb=st:4,-,st:4
+M 1de14a9bb1ee ps code=45b8ec1d7f2d5c78 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a1a80351184b cs code=463e880c808a9b24 ud=4 t=16,16,1 tid=2 wgr=4 gx gy si=n:Float/d:2DArray/cube,n:Float/d:2DArray ss=-
+M 76c8d3875b0b ps code=46cbf50d082f4654 sysbase=2 center=0 smask=3 omode=9 faceall early in=0
+M d3d08f59998f cs code=4725f9f7de8fb155 ud=7 t=64,1,1 lds=512 tid=1 wgr=7 async gx sb=st:16
+M 27fe7bad809b vs code=47d5812359123398 ud=10 cur=5 fa=6 fb=4 dyn iv=8 ii=9 idraw attr=340000.50412.4a3ac.9.3.0.0.0,340000.50412.38fac.12.4.1.0.0,340000.50412.1d22c.16.2.2.0.0,340000.50412.47fac.18.4.3.0.0,340000.50412.3cfac.22.4.4.0.0,340000.50412.3cfac.26.4.5.0.0,340000.50412.14204.30.1.7.0.0,340000.50412.1b22c.31.2.8.0.0,340000.50412.1d22c.33.2.9.0.0 vbuf=52.50412.0 sb=oob si=n:Float/d:2D
+M 2a9355e658f3 ps code=48876cb57df727c0 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 458babee3e32 ps code=48e7d34c7014d55f ud=4 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall early in=0,1,2,403,4,5,6 sb=- si=n:Float/d:2D,n:Float/d:2D ss=-
+M 2baaf07cefa4 cs code=490da79e71d1ea6e ud=4 t=1024,1,1 lds=1152 tid=1 wgr=4 async gx sb=st:1,st:1,st:1
+M 6870d91f336a cs code=49b020a8457f07ac ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D
+M 4becd58e5087 ps code=4aa6d04a9e4acfb3 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:36/heap,n:Float/d:2DArray/ir:1/im:39/heap,n:Float/d:2D/ir:0/im:36/heap,n:Float/d:2DArray/ir:1/im:39/heap,n:Float/d:2DArray/ir:1/im:39/cube/heap ss=-,-
+M c10d0a873dcf ps code=4ab3a0ef6e722f3e ud=5 cur=6 sysbase=2 custom=1 sample=0 smask=fff omode=4,4,4 faceall sshade early in=420 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e2ac64c56690 ps code=4aff28a5c0cfee9d ud=5 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz faceall sshade early in=420,421 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-,-
+M 28f39e0a2025 ps code=4bf490e09c8ad888 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 4e0b236560ec ps code=4c2c9f77f8e5e3ff ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 8f8effb3ba30 vs code=4c4d43e6908abbca ud=8 cur=1 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=280000.65536.4dfac.9.4.0.0.0,280000.65536.38fac.13.4.1.0.0,280000.65536.1d22c.17.2.2.0.0,280000.65536.47fac.19.4.3.0.0 vbuf=40.65536.0 si=n:Float/d:2D ss=-
+M ee67e2567ef9 vs code=4d068976fe8ccebf ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.28658.4a3ac.9.3.0.0.0,80000.24565.39fac.12.4.1.0.1,80000.24565.39fac.16.4.2.0.1,40000.24566.1d22c.20.2.3.0.2,40000.12284.1d22c.22.2.4.0.3 vbuf=12.28658.0,8.24565.0,4.24566.0,4.12284.0 sb=st:4,st:112,st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:63/heap,n:Float/d:2D/ir:0/im:63/heap ss=-
+M fe6239f5ac28 vs code=4d068976fe8ccebf ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.28432.4a3ac.9.3.0.0.0,80000.24370.39fac.12.4.1.0.1,80000.24370.39fac.16.4.2.0.1,40000.24371.1d22c.20.2.3.0.2,40000.12186.1d22c.22.2.4.0.3 vbuf=12.28432.0,8.24370.0,4.24371.0,4.12186.0 sb=st:4,st:112,st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:63/heap,n:Float/d:2D/ir:0/im:63/heap ss=-
+M 2c2bb0f8d525 cs code=4d6f1e4b9f0f530f ud=4 t=64,1,1 lds=128 tid=1 wgr=4 gx sb=st:1,st:1 si=n:Float/d:2D ss=-
+M 47ce08245e79 mesh code=4e1ea1c7a25430e6 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 799647d8bcaa mesh code=4e1ea1c7a25430e6 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M a141c0cb04ef mesh code=4e1ea1c7a25430e6 ud=19 cur=14 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M b4c5a551fe3d vs code=4e6e782074a407b1 ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.34404.4a3ac.9.3.0.0.0,80000.37532.39fac.12.4.1.0.1,100000.9383.3cfac.16.4.4.0.2,100000.9383.38fac.20.4.5.0.2 vbuf=12.34404.0,8.37532.0,16.9383.0 sb=-,st:48
+M e3f8c979088a ps code=4e8eb64973938c82 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 0399093f01a8 mesh code=4e9522cc7312cc88 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,-,-,- si=n:Float/d:2D ss=-
+M bab4df0cd330 ps code=4eca400d37f1d48c ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=ffff omode=4,4,4,4 posx posy posw faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 2a0a92a811d7 cs code=4eea2fe398d3e35b ud=4 t=8,8,1 lds=128 tid=2 wgr=4 gx gy sb=st:1,st:1 si=n:Uint/d:2D
+M 94e4ff5bda96 mesh code=4f3d8c86478c6ac0 ud=16 cur=6 iv=6 ii=7 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M e06df47599e8 mesh code=50018fe2db60b088 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 775faf272100 cs code=51d4082084c8744e ud=3 t=256,1,1 tid=1 wgr=3 gx sb=-,st:1,st:1
+M c31c996221d1 ps code=51f1796b1eb1a2a4 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 84313c17a2bb cs code=5241c8f803c720b5 ud=3 t=64,1,1 tid=1 wgr=3 gx sb=st:1,st:1,st:16,st:80,st:80
+M 2bafb86b3f7e mesh code=525347ef5288cc9b ud=19 cur=13 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 66062744b3f9 mesh code=525347ef5288cc9b ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 72d678237c5d ps code=52bba5d16beae39a ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8b77be71f4e0 ps code=52bba5d16beae39a ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M da3178bdc90d cs code=533e1759f86b0303 ud=6 t=1,1,1 tid=1 wgr=6 async sb=st:56
+M 165a96f6e27e mesh code=53793145e0d339ed ud=19 cur=14 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 32116a630d55 mesh code=53793145e0d339ed ud=19 cur=17 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 79c93338f28c mesh code=53793145e0d339ed ud=19 cur=20 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 7cd906a5a98c mesh code=53793145e0d339ed ud=19 cur=18 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 8ef3fcfa4268 mesh code=53793145e0d339ed ud=19 cur=30 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M ab9a8b144035 mesh code=53793145e0d339ed ud=19 cur=22 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M b6af98ad6967 mesh code=53793145e0d339ed ud=19 cur=19 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M bb7d9f0ea8c4 mesh code=53793145e0d339ed ud=19 cur=21 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M c07cbcf086e1 mesh code=53793145e0d339ed ud=19 cur=15 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M e30aa69e700a mesh code=53793145e0d339ed ud=19 cur=23 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M e4a981afbd57 mesh code=53793145e0d339ed ud=19 cur=13 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 0eacb4055b9a vs code=541483c3f060ebb9 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.7316.4a3ac.9.3.0.0.0,40000.6273.1d22c.12.2.3.0.1,40000.3138.1d22c.14.2.4.0.2 vbuf=12.7316.0,4.6273.0,4.3138.0 sb=st:4,st:112
+M 242eec710541 vs code=541483c3f060ebb9 ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.7316.4a3ac.9.3.0.0.0,40000.6273.1d22c.12.2.3.0.1,40000.3138.1d22c.14.2.4.0.2 vbuf=12.7316.0,4.6273.0,4.3138.0 sb=st:4,st:112
+M 5d286df71b4e vs code=541483c3f060ebb9 ud=11 cur=6 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.3754.4a3ac.9.3.0.0.0,40000.3219.1d22c.12.2.3.0.1,40000.1610.1d22c.14.2.4.0.2 vbuf=12.3754.0,4.3219.0,4.1610.0 sb=st:4,st:112
+M aaa43071b547 vs code=541483c3f060ebb9 ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.3754.4a3ac.9.3.0.0.0,40000.3219.1d22c.12.2.3.0.1,40000.1610.1d22c.14.2.4.0.2 vbuf=12.3754.0,4.3219.0,4.1610.0 sb=st:4,st:112
+M b06e01358e7d ps code=5431fe957031f8b0 ud=3 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M ce0bb7721a22 ps code=54ed549dbf01fb2e ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0f2189fdc476 ps code=562a220e9d5e29a9 ud=5 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz faceall sshade early in=420,421 sb=-,-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,-,-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-,-,-
+M 0f836633dcd4 ps code=56cf50dac34ef22d ud=3 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M e79a4295be73 ps code=56cf50dac34ef22d ud=3 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M ea9feb1537e6 vs code=56f679daee0dd3b5 ud=11 cur=24 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.5833.4a3ac.9.3.0.0.0,80000.5000.39fac.12.4.1.0.1,80000.5000.39fac.16.4.2.0.1,40000.5000.1d22c.20.2.3.0.2,40000.2500.1d22c.22.2.4.0.3 vbuf=12.5833.0,8.5000.0,4.5000.0,4.2500.0 sb=-
+M 309ff399bc97 mesh code=56f99487c9e32428 ud=16 cur=22 iv=6 ii=7 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M fe8aa3714a57 cs code=585bbe7846febeb3 ud=4 t=256,1,1 wave=32 tid=1 wgr=4 async gx gy si=n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D
+M 4bc84a37ca28 ps code=596539ea29f68dc4 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:23/heap,n:Float/d:2D/ir:0/im:23/heap ss=-
+M 5f2f34c4d224 cs code=59f805dee6ee9d5c ud=3 t=256,1,1 lds=896 tid=1 wgr=3 gx sb=-,st:1,st:1,st:32,st:32
+M 49dd90b36b98 mesh code=5b592f48b6b39d4b ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M d381f0acee44 mesh code=5b592f48b6b39d4b ud=19 cur=12 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 9cdcf5dae1e0 ps code=5c4105fd015f6263 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 038459647901 ps code=5c74cf3d3e6503fb ud=2 sysbase=2 center=0 smask=ffffff omode=4,4,4,4,4,4 posx posy faceall early si=n:Float/d:2D ss=-
+M 6360d8113785 cs code=5cde1346b18ade0c ud=2 t=32,1,1 tid=1 wgr=2 sb=st:1
+M 86a913e60e58 cs code=5ee9344d0c9b85a3 ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M 96c0f2fab88e mesh code=5f09b9f1bf520c62 ud=19 cur=15 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 3e6a88b3944c ps code=5f6156b5659cc56f ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2ceb789cba26 vs code=6005c4e94f970f73 ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.1264.4a3ac.9.3.0.0.0 vbuf=12.1264.0 sb=-
+M 4bac7ae8cf3e vs code=60a8b9c0cbeb4eaf ud=8 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=c0000.48930.4a3ac.9.3.0.0.0,80000.18349.39fac.12.4.2.0.1 vbuf=12.48930.0,8.18349.0
+M 49314b6bb4cb mesh code=60c88b7d334a1d60 ud=19 cur=18 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M b7ed98f2010e mesh code=60c88b7d334a1d60 ud=19 cur=20 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M bc1c9c9785f3 mesh code=60c88b7d334a1d60 ud=19 cur=15 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M bcd1eeb86d20 mesh code=60c88b7d334a1d60 ud=19 cur=14 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M d43cbd3b6bce mesh code=60c88b7d334a1d60 ud=19 cur=17 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M e67e2ca9ad80 mesh code=60c88b7d334a1d60 ud=19 cur=16 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 569f1c1edc45 mesh code=60d497aa800f47fd ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac
+M cb104593c48f cs code=61da896389c8f65f ud=11 t=64,1,1 tid=1 wgr=11 async gx sb=oob,oob,st:8,oob,oob/empty,st:4,st:64,st:12
+M dc0641832e7b cs code=61da896389c8f65f ud=11 t=64,1,1 tid=1 wgr=11 async gx sb=oob,oob,st:8,st:64,st:120,st:4,st:64,st:12
+M aaa36984eab8 ps code=6218c373454d3b6f ud=5 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420,421 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M e40d01ff0cb3 vs code=62b2ce3c980398a3 ud=6 cur=2 iv=4 ii=5 idraw sb=st:1,st:64
+M edb45dc9d68c mesh code=62fd90cfb3ca4245 ud=19 cur=12 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M 78869f8783c2 ps code=6346fd85bdbe2cb5 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:33/heap,n:Float/d:2DArray/ir:1/im:36/heap,n:Float/d:2D/ir:0/im:33/heap,n:Float/d:2DArray/ir:1/im:36/heap,n:Float/d:2DArray/ir:1/im:36/cube/heap ss=-,-
+M cda5c4442ac9 ps code=63ac31b2811575eb ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M a0535b61e3d9 mesh code=651801a411d92571 ud=19 cur=20 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M 7be3de447e44 vs code=6585a002548a1846 ud=10 cur=17 fa=6 fb=4 dyn iv=8 ii=9 idraw attr=340000.50412.4a3ac.9.3.0.0.0,340000.50412.38fac.12.4.1.0.0,340000.50412.47fac.16.4.3.0.0,340000.50412.3cfac.20.4.5.0.0,340000.50412.14204.24.2.7.0.0,340000.50412.1b22c.26.2.9.0.0 vbuf=52.50412.0 sb=st:16,oob
+M fd83f29525a2 vs code=662dc09522a3c8b5 ud=8 cur=2 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=140000.30003.4a3ac.9.3.0.0.0,140000.30003.38fac.12.4.1.0.0,140000.30003.1d22c.16.2.2.0.0 vbuf=20.30003.0
+M 2279514b7e5c ps code=668ae279952e82c2 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M c0a76582c8d4 ps code=668ae279952e82c2 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M cd213278a546 ps code=671c0c97fcc5d2d0 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 7216f6b804f2 ps code=672836c849714cb1 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M a4be50767a12 cs code=67414e1e50856b87 ud=3 t=64,1,1 lds=256 tid=1 wgr=3 gx sb=-,st:1,st:1,st:1
+M 3d2972983396 vs code=679bc9ea2d6389aa ud=8 cur=7 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=c0000.48930.4a3ac.9.3.0.0.0,40000.3182488.1d22c.12.2.4.0.1,40000.3182488.1d22c.14.2.5.0.1 vbuf=12.48930.0,4.3182488.0
+M f760628de73a ps code=67f3aa6cf1d64283 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7f93f4fe5b0d cs code=681ba5f269e55619 ud=2 t=64,1,1 tid=1 wgr=2 gx sb=st:1,st:1
+M f568b873d533 ps code=6887f5babb88955c ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray ss=-,-,-,-
+M 84d7809347a4 mesh code=699bbcdb52f9c725 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm
+M e60fddaa5265 ps code=6a867da7fb10d763 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e9f7420c5910 ps code=6aa24a31ea52d752 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 75edb191103f ps code=6bfdebc5bdda5ccb ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 401681757a33 ps code=6c4de6f2d40f26cf ud=5 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz face faceall sshade early in=420,421 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-,-
+M 813bee071e23 cs code=6ccb5b49802b01d6 ud=4 t=16,16,1 tid=2 wgr=4 gx gy si=n:Float/d:2DArray/cube,n:Float/d:2DArray/cube,n:Float/d:2DArray ss=-
+M 278ebcb320c8 ps code=6dd6a4c620642e67 ud=2 sysbase=2 sample=0 smask=f omode=4 posx posy faceall sshade early in=1 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 12afdfba371b cs code=6df7f14994a66a9c ud=4 t=4,4,4 tid=3 wgr=4 gx gy gz sb=st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,-,st:1,-,- si=n:Float/d:2DArray,n:Uint/d:3D,n:Float/d:1DArray,n:Float/d:3D,n:Float/d:3D ss=-,-,-
+M bf8db3c7de77 cs code=6edf4ef0f954bb57 ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D
+M 509c81061a6a cs code=6f35f7a1d0cd89f7 ud=4 t=64,1,1 tid=1 wgr=4 gx sb=-,st:1 si=n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D
+M 6332dc514664 vs code=70f386d47dea73f1 ud=10 cur=9 fa=6 fb=4 dyn iv=8 ii=9 idraw attr=340000.50412.4a3ac.9.3.0.0.0,340000.50412.38fac.12.4.1.0.0,340000.50412.47fac.16.4.3.0.0,340000.50412.3cfac.20.4.4.0.0,340000.50412.3cfac.24.4.5.0.0,340000.50412.14204.28.2.7.0.0,340000.50412.1b22c.30.2.9.0.0 vbuf=52.50412.0 sb=st:16,oob si=n:Float/d:2D
+M 46391771952a vs code=71b4ae069824effe ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.17033.4a3ac.9.3.0.0.0,80000.14600.39fac.12.4.1.0.1,80000.14600.39fac.16.4.2.0.1,40000.14600.1d22c.20.2.3.0.2,40000.7300.1d22c.22.2.4.0.3 vbuf=12.17033.0,8.14600.0,4.14600.0,4.7300.0 sb=st:4,st:112,st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:63/heap,n:Float/d:2D/ir:0/im:63/heap ss=-
+M 54d9495f1b2c vs code=71b4ae069824effe ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.3440.4a3ac.9.3.0.0.0,80000.2949.39fac.12.4.1.0.1,80000.2949.39fac.16.4.2.0.1,40000.2950.1d22c.20.2.3.0.2,40000.1476.1d22c.22.2.4.0.3 vbuf=12.3440.0,8.2949.0,4.2950.0,4.1476.0 sb=st:4,st:112,st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:63/heap,n:Float/d:2D/ir:0/im:63/heap ss=-
+M a87247d8c22b cs code=726c960fd64967e9 ud=4 t=16,16,1 tid=2 wgr=4 gx gy sb=st:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 7bcf7bfa6020 ps code=72d520e0389c90b0 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 7b60d95cecec ps code=732199c969c02590 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 9bc5f41c3926 cs code=73fffc1bdf3da419 ud=4 t=64,1,1 tid=1 wgr=4 gx sb=-,st:1,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,-,-,- si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D
+M 372eeeed0fd3 vs code=74217ff60d9beae1 ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.31306.4a3ac.9.3.0.0.0,80000.26834.39fac.12.4.1.0.1 vbuf=12.31306.0,8.26834.0 sb=-
+M 9999f673a94a mesh code=7556fe7ae8c00238 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:8/f:8_8_8_8SNorm si=n:Float/d:2D,n:Float/d:2D ss=-
+M 017981c78b50 vs code=7558c07fdd07ee53 ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.7705.4a3ac.9.3.0.0.0,40000.6606.1d22c.12.2.3.0.1,40000.3304.1d22c.14.2.4.0.2 vbuf=12.7705.0,4.6606.0,4.3304.0 sb=-
+M ae327348a964 vs code=7558c07fdd07ee53 ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.6846.4a3ac.9.3.0.0.0,40000.5870.1d22c.12.2.3.0.1,40000.2936.1d22c.14.2.4.0.2 vbuf=12.6846.0,4.5870.0,4.2936.0 sb=-
+M de2cbfccacfb vs code=7558c07fdd07ee53 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.14952.4a3ac.9.3.0.0.0,40000.12816.1d22c.12.2.3.0.1,40000.6408.1d22c.14.2.4.0.2 vbuf=12.14952.0,4.12816.0,4.6408.0 sb=-
+M 379d9397ee68 cs code=758c1113eda79d9f ud=4 t=16,16,1 lds=384 tid=2 wgr=4 async gx gy sb=st:56 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M 5720ce4dab4b ps code=77eceae9f987f44b ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 528f06df9f8b ps code=78d74037aef6d9de ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 0668b09b7561 tes code=78e4ae817ade2b09 ud=4 cur=5 ticp=1 tocp=1 tls=4 ths=48 tpb=32672 tps=84 tdom=2 ttopo=2
+M 6bb20651dda1 vs code=79e5853c97c2290b ud=11 cur=24 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.3490.4a3ac.9.3.0.0.0,80000.3665.39fac.12.4.1.0.1,80000.3665.39fac.16.4.2.0.1,40000.5237.1d22c.20.2.3.0.2,100000.1047.3cfac.22.4.4.0.3,100000.1047.38fac.26.4.5.0.3,40000.5237.1d22c.30.2.7.0.2 vbuf=12.3490.0,8.3665.0,4.5237.0,16.1047.0 sb=-,st:48
+M 03ad455f2274 cs code=7ab3f17de03e03ff ud=11 t=64,1,1 tid=1 wgr=11 async gx sb=st:32,st:16
+M e2fd1c17c414 cs code=7ab3f17de03e03ff ud=11 t=64,1,1 tid=1 wgr=11 async gx sb=st:24,st:16
+M e733c201a55d cs code=7bfa969daeceaa49 ud=4 t=32,32,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D
+M 7ea9ce9126c3 mesh code=7c1ae567e1a17fbe ud=19 cur=13 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M bf7cc9e41c1e mesh code=7c1ae567e1a17fbe ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 90e6e4f6932c cs code=7c6e8bce8ecfbba7 ud=4 t=64,1,1 tid=1 wgr=4 gx sb=st:4,st:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M c1befaa90e1d ps code=7c744aa53998276f ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 2f84ab35ddfe ps code=7e31d21bab77c744 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 6d209e29b99a vs code=7e6a3bec33167f2a ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.1122562.4a3ac.9.3.0.0.0,80000.1628284.39fac.12.4.1.0.1,40000.3182488.1d22c.16.2.3.0.2,100000.786362.3cfac.18.4.4.0.3,100000.786362.38fac.22.4.5.0.3,40000.3182488.1d22c.26.2.6.0.2 vbuf=12.1122562.0,8.1628284.0,4.3182488.0,16.786362.0 sb=-,-,-,-,st:48 si=n:Float/d:2D ss=-
+M 17091e8cb782 cs code=7ebadc94df96916e ud=4 t=256,1,1 tid=1 wgr=4 gx sb=st:4
+M 1bb735415806 ps code=7f5d5b7a03d2e56e ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2D/ir:0/im:30/heap ss=-,-
+M 97ae717f78d9 vs code=7f6fea5bdf77bb4a ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.3668.4a3ac.9.3.0.0.0,40000.3144.1d22c.12.2.3.0.1 vbuf=12.3668.0,4.3144.0 sb=-
+M febc1b224ecb ps code=7fcc860e2808d965 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 12d7e4348a2d ps code=806e75f21d5df9e9 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2D/ir:0/im:30/heap ss=-,-
+M cc7c345a7a79 ps code=80baafb00a96419a ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 445eeb18f0f3 cs code=818678dabd7a3615 ud=4 t=1024,1,1 lds=1024 tid=1 wgr=4 gx sb=st:4,st:4
+M 3eed21a81f37 vs code=81e9ead23df9b96c ud=11 cur=16 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.1122562.4a3ac.9.3.0.0.0,80000.1628284.39fac.12.4.1.0.1,80000.1628284.39fac.16.4.2.0.1,40000.3182488.1d22c.20.2.3.0.2,100000.786362.3cfac.22.4.4.0.3,100000.786362.38fac.26.4.5.0.3,40000.3182488.1d22c.30.2.7.0.2 vbuf=12.1122562.0,8.1628284.0,4.3182488.0,16.786362.0 sb=-,-,-,-,st:48 si=n:Float/d:2D ss=-
+M 6518c968b4c8 ps code=820325a0d99f0b42 ud=5 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8db8e33a22e5 vs code=82a3efe7a2998f73 ud=2 iv=0 ii=1 idraw
+M e5dd44b5c31c ps code=8332549e53404fe2 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M bbb73addce3d vs code=838ac0cdfa0fe24e ud=2 iv=0 ii=1 idraw
+M 2724d0e8844e ps code=83e6a507c87128b5 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:33/heap,n:Float/d:2DArray/ir:1/im:36/heap,n:Float/d:2D/ir:0/im:33/heap,n:Float/d:2DArray/ir:1/im:36/heap,n:Float/d:2DArray/ir:1/im:36/cube/heap ss=-,-
+M c63ef747e06d ps code=844b97fde1f4f27c ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M b7341cc02bbe ps code=84d1ffb0a38cd122 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M f1ca58f7cfa3 ps code=84f603f452a87de6 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2D/ir:0/im:30/heap ss=-,-
+M 5b756d6c38f9 vs code=85d4d0e9bade5969 ud=8 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=40000.470190.1d22c.9.2.0.0.0,80000.94038.39fac.11.3.1.0.1,c0000.156730.4a3ac.14.3.2.0.2 vbuf=4.470190.0,8.94038.0,12.156730.0
+M 8f6ab524390c vs code=861a1349194f9c15 ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.6846.4a3ac.9.3.0.0.0,80000.5869.39fac.12.4.1.0.1,40000.5870.1d22c.16.2.3.0.2,40000.2936.1d22c.18.2.4.0.3 vbuf=12.6846.0,8.5869.0,4.5870.0,4.2936.0 sb=-
+M e89a287e56b9 vs code=861a1349194f9c15 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.5972.4a3ac.9.3.0.0.0,80000.5119.39fac.12.4.1.0.1,40000.5121.1d22c.16.2.3.0.2,40000.2562.1d22c.18.2.4.0.3 vbuf=12.5972.0,8.5119.0,4.5121.0,4.2562.0 sb=-
+M 476a758a5da1 ps code=87b499f3078fe105 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M ec453327a8ad ps code=8a778c27ae25df75 ud=2 sysbase=2 sample=0 smask=ffff omode=4,4,4,4 posx posy faceall sshade early in=0,1,2,3 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b4751507b0e6 cs code=8b72f22dc7548d69 ud=12 t=32,1,1 wave=32 tid=1 wgr=12 async gx sb=st:4,st:32
+M 7bc19fc091c7 cs code=8b946f6934cda6d1 ud=8 t=64,1,1 tid=1 wgr=8 async gx sb=-,-,st:6,st:12/f:32_32_32Float/sw:3ac,st:16
+M 6a253e34c0ba cs code=8bd5cf7f1705fd61 ud=15 t=64,1,1 lds=128 tid=1 wgr=15 async gx sb=st:4,st:4,st:64,st:8,st:8
+M e0068fa058c0 mesh code=8c5b38da22ce9325 ud=19 cur=20 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm si=n:Float/d:2D,n:Float/d:2D ss=-
+M 582ca18f850a ps code=8c761e3bd084c754 ud=3 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=st:4,st:1,-,-,f:8UInt/sw:4 si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M 3fbf9c534f36 ps code=8cc2dd0580300244 ud=5 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2DArray/ir:0/im:26/heap,n:Float/d:2DArray/ir:0/im:26/heap,n:Float/d:2DArray/ir:0/im:26/cube/heap ss=-
+M e86335867b3b ps code=8cc2dd0580300244 ud=5 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2DArray/ir:0/im:26,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0/cube,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0/cube,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0,n:Float/d:2DArray/ir:0 ss=-
+M 4aaa11a257be ps code=8d9665666b3b314c ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 987917bc68c7 ps code=8dc450476a58e541 ud=5 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 398a37fb07b2 ps code=8df6b1f56703902d ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M b1a322f8510a ps code=8e054c60ced9dd89 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 9705f6ca83f2 cs code=8e82c74115ffee42 ud=2 t=1,1,1 tid=1 wgr=2 sb=-,st:1,st:1
+M 859072e60e87 ps code=8e9aa52aa2a6f416 ud=4 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall early in=0,1,2,3,4,5,6,407 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M cb50b9740124 cs code=903480a5479021d1 ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M db1b37b59dd2 cs code=90b6063ec8dc44c4 ud=4 t=64,1,1 tid=1 wgr=4 gx gy si=n:Float/d:3D,n:Float/d:3D ss=-
+M dfc95191d0fe vs code=91583c9ecd7404d4 ud=2 cur=2 iv=0 ii=1 idraw
+M 950290893b60 cs code=921bc4e3d2599841 ud=4 t=64,1,1 tid=1 wgr=4 gx sb=st:64,st:1,st:1,st:1,st:1
+M d83a93045e39 ps code=922dcc9c1aca2252 ud=4 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1,2 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0dcfc40453f0 ps code=926154c5476e430c ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d967d9b175da cs code=927cae1d3ee438c1 ud=4 t=256,1,1 tid=1 wgr=4 gx sb=st:1 si=n:Float/d:2DArray/cube ss=-,-
+M dec0e8114fac mesh code=9283fc56fd47a32d ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm
+M 95739bcf6afd cs code=92aa3241e64cd3c4 ud=8 t=1,1,1 tid=1 wgr=8 async
+M 3c3b39c0a146 cs code=92c32640255af09f ud=2 t=256,1,1 lds=128 tid=1 wgr=2 async gx sb=st:4
+M f434e291ae5e cs code=92c32640255af09f ud=2 t=256,1,1 lds=128 tid=1 wgr=2 async gx sb=oob
+M 933c23baf796 ps code=935f2790f3b2cc34 ud=4 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1,2,3,4,405,6 sb=- si=n:Float/d:2D ss=-,-
+M d132d1f0f793 ps code=93a70745b2a5ef8b ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1 si=n:Float/d:2D ss=-
+M 7e1fa4b1e512 cs code=9488ed153b7a3049 ud=10 t=64,1,1 tid=1 wgr=10 async gx sb=st:4
+M dd49c2a28e87 ps code=9494a30a23aa719f ud=4 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz faceall sshade early in=420,421 sb=st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:32,st:64,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray ss=-,-,-,-
+M 21403577dbc7 ps code=94fe60653ca50117 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:36/heap,n:Float/d:2D/ir:0/im:36/heap ss=-,-
+M 6e2a806ba9a5 vs code=9539286e9800a6ca ud=8 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=40000.2996.1d22c.9.2.0.0.0,c0000.998.4a3ac.11.3.2.0.1 vbuf=4.2996.0,12.998.0
+M d1c80f6c4e2d cs code=9611455cbb174ab5 ud=4 t=8,8,1 tid=2 wgr=4 gx gy sb=- si=n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 1f2e718dd069 ps code=967411b035a08979 ud=3 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M 53df607f42ef cs code=96894200bed955da ud=11 t=64,1,1 tid=1 wgr=11 async gx sb=st:16,st:4,st:4,st:4,st:12,st:4
+M 27a9951c4e8a cs code=9819053540a8571e ud=5 t=64,1,1 tid=1 wgr=5 gx sb=st:32,st:1
+M 682b730180c4 mesh code=988bad72d4e1f693 ud=16 cur=11 iv=6 ii=7 idraw mt=64,1,1 mlds=896 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M d9f420aa5dc0 cs code=98b4d929f815b427 ud=4 t=256,1,1 wave=32 tid=1 wgr=4 async gx gy si=n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M cdf18ef313fb ps code=991795cc7d165f95 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M b6417f9c80da cs code=99456c57b26c6ff0 ud=14 t=64,1,1 tid=1 wgr=14 async gx sb=st:32,st:96,st:96
+M 70de116088bc vs code=99b29ccc62108e1d ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.344806.4a3ac.9.3.0.0.0,80000.376152.39fac.12.4.1.0.1,80000.376152.39fac.16.4.2.0.1,40000.564228.1d22c.20.2.3.0.2,100000.94038.3cfac.22.4.4.0.3,100000.94038.38fac.26.4.5.0.3,40000.470190.1d22c.30.2.7.0.4 vbuf=12.344806.0,8.376152.0,4.564228.0,16.94038.0,4.470190.0 sb=st:4,st:112,st:48
+M 2f5e66f92a74 mesh code=99d707b3b0f47c27 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 3c96a96687eb ps code=99ef8767e9892d94 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 61b6e2bda63c ps code=99ef8767e9892d94 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 5bb59c87822c cs code=9b13d734f671a794 ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D
+M bfa2b2ad1693 mesh code=9b16b6dc5b29b84a ud=16 cur=27 iv=6 ii=7 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M f32f8d78fa76 mesh code=9b16b6dc5b29b84a ud=16 cur=15 iv=6 ii=7 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 5dfed9e76a37 mesh code=9b9d46e83cc88091 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:4,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,st:1,-,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm si=n:Float/d:2D/ir:0/im:63/heap,n:Float/d:2D/ir:0/im:63/heap ss=-
+M 0a509f2ea4bb ps code=9ca5532fdcdf5676 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M f29aa6260b13 ps code=9dbc9b46d33fe3c4 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 8d6384ef57fa cs code=9e206a4e2904fb94 ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,-,-,st:48,st:1
+M 6fa59f419d95 ps code=9e4635b6e8d2b971 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b22ce1fde49e ps code=9f7939d755e71ab4 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M dac934ad2745 cs code=9f95bafde6644f5b ud=5 t=64,1,1 tid=1 wgr=5 async gx gy sb=st:4 si=n:Float/d:2D,n:Float/d:2D
+M 31a2851a7e59 ps code=9fd653d4214feb60 ud=5 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2DArray ss=-
+M 36695d600f9a ps code=a11c91ee4ef08fb5 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6407bc5c27b0 ps code=a1a43124494538bc ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D
+M 8a198ed9d621 vs code=a1d3a32a3f2c4ec1 ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.34404.4a3ac.9.3.0.0.0,80000.37532.39fac.12.4.1.0.1,100000.9383.3cfac.16.4.4.0.2,100000.9383.38fac.20.4.5.0.2 vbuf=12.34404.0,8.37532.0,16.9383.0 sb=-,st:48
+M 0cc57b120748 vs code=a2c066c4ad0d7beb ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.421388.4a3ac.9.3.0.0.0,80000.459697.39fac.12.4.1.0.1,80000.459697.39fac.16.4.2.0.1,40000.689546.1d22c.20.2.3.0.2,100000.114924.3cfac.22.4.4.0.3,100000.114924.38fac.26.4.5.0.3,40000.574622.1d22c.30.2.7.0.4 vbuf=12.421388.0,8.459697.0,4.689546.0,16.114924.0,4.574622.0 sb=-,-,-,-,st:48 si=n:Float/d:2D ss=-
+M 07642780fc29 cs code=a3369be199dec7c6 ud=4 t=64,1,1 wave=32 tid=1 wgr=4 gx sb=st:4,st:4,st:16,st:16,st:48,st:96,st:80,-,- si=n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D/ir:2/im:216/heap,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D/ir:2/im:216/heap ss=-,-,-
+M d971df8d5d12 cs code=a359ff83f9bb8d42 ud=4 t=64,2,1 tid=2 wgr=4 async gx sb=st:176,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:32,st:64,-,- si=n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-,-,-
+M 35f9ad24bc87 cs code=a35f1fa7e0bd589b ud=4 t=64,1,1 tid=1 wgr=4 async gx sb=st:80,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:32,st:64,-,-,st:32 si=n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:3D,n:Float/d:3D ss=-,-,-
+M 4ff9a4a648b6 cs code=a37c48e0ee51507e ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:16,st:12,st:4
+M 6e8eb706eea0 cs code=a39db6748254059a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:16,st:32,st:4,st:128,st:12
+M d73327c8c1a7 cs code=a39db6748254059a ud=2 t=64,1,1 tid=1 wgr=2 async gx sb=st:16,oob,st:4,st:128,st:12
+M b84c16beb15a cs code=a40eb02c680ad1fc ud=15 t=64,1,1 lds=128 tid=1 wgr=15 async gx sb=st:96,st:24,st:24
+M e39f408a5044 ps code=a45e302bb5b12255 ud=5 sysbase=2 custom=6 sample=0 smask=3f omode=4,4 posx posy posz face faceall sshade early in=0,421,422 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-,-
+M dd2c646cf147 ps code=a48423694a0a472f ud=5 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 33744815746c vs code=a57faaea63c584e7 ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.6846.4a3ac.9.3.0.0.0,80000.5869.39fac.12.4.1.0.1,40000.5870.1d22c.16.2.3.0.2,40000.2936.1d22c.18.2.4.0.3 vbuf=12.6846.0,8.5869.0,4.5870.0,4.2936.0 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D ss=-
+M 5ed4f7bff313 ps code=a60219a56982590a ud=3 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M 5516608542a4 mesh code=a6336d1ad6e6230f ud=19 cur=22 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M 70ca1e759555 vs code=a6ac5a147357edbe ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.239532.4a3ac.9.3.0.0.0,80000.261308.39fac.12.4.1.0.1,40000.391963.1d22c.16.2.3.0.2,100000.65327.3cfac.18.4.4.0.3,100000.65327.38fac.22.4.5.0.3,40000.326636.1d22c.26.2.6.0.4 vbuf=12.239532.0,8.261308.0,4.391963.0,16.65327.0,4.326636.0 sb=-,st:48
+M 53fb3104c683 ps code=a6ef5f448922349b ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 20a4e9ea0c3d cs code=a6f9ca5d430d02d3 ud=4 t=64,1,1 lds=128 tid=1 wgr=4 async gx sb=st:64,-,st:352,st:1,st:272,st:1,-,st:1 si=n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-
+M 471c8ebe0c9d mesh code=a771ee0ad0640792 ud=19 cur=13 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M 8501b30b68bf cs code=a8272032b75fb500 ud=4 t=1,256,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M e3cb663728b2 ps code=a8b4c4c3002de9c8 ud=3 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:20/heap,n:Float/d:2D/ir:0/im:20/heap ss=-
+M 49e1c01726fe cs code=a8b61f004820708a ud=5 t=256,1,1 tid=1 wgr=5 async sb=st:96,st:96
+M 3c7aa9892cc2 ps code=a912f98cee0b35ad ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D
+M c1fbda000747 ps code=aad03fba1e635198 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 2bc246c5b31f ps code=ab37e675b015980a ud=2 sysbase=2 center=0 smask=1 omode=1 faceall early in=0 si=n:Float/d:2D
+M 8bc2a500040f mesh code=ab89998b42f9c85e ud=19 cur=20 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 15616db3ae83 cs code=abe8c132ad18ad33 ud=2 t=256,1,1 tid=1 wgr=2 gx sb=st:1
+M c15df2f14fc2 ps code=abf7a96286bff0a9 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 8228f6454b43 cs code=abfa1207ea167732 ud=12 t=64,1,1 tid=1 wgr=12 async gx sb=st:16,st:32,st:32
+M 788779171cc0 cs code=ac2e58e3d71d56cb ud=7 t=64,1,1 tid=1 wgr=7 async gx sb=-,st:20,-,st:12/f:32_32_32Float/sw:3ac,st:64
+M 2bf0b6b7e26f ps code=ac3e6c91e515d3f3 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M e6a1aacd91a3 ps code=ac4330b70687cebe ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M f43be6c987f4 ps code=ac9f6662cc58407d ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 309e520f420b ps code=acc481b28b52a41c ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2D/ir:0/im:30/heap ss=-,-
+M 0111050e17e0 ps code=ad0811731080222d ud=4 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall early in=0,1,2,3,4,405 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 800ce22ec585 ps code=ad61d8baf064a5ac ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 0a9442ad7eaa ps code=ad6c55cb3610c4cc ud=4 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall kill in=0,2,3,4 sb=st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:32,st:64,-,- si=n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray ss=-,-,-,-
+M e6dfb6ee463c ps code=ade912620eafcf8b ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-
+M 47d2c3050726 mesh code=ae8fb517b87f06e0 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48 si=n:Float/d:2D ss=-
+M 587d87ee5eca cs code=ae940cb7274a46de ud=4 t=32,32,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D
+M ab2868c649ea mesh code=ae9a3d5648fbaed8 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=896 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M 06cbd43a7d24 mesh code=aeaaee98e96c0b24 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:4,st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,st:1,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:8/f:8_8_8_8SNorm si=n:Float/d:2D/ir:0/im:65/heap,n:Float/d:2D/ir:0/im:65/heap ss=-
+M 13d66eacf507 ps code=aeb91d80d2aef9bc ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M dc8fd650a603 ps code=aeb91d80d2aef9bc ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M c33621bf4d46 ps code=aed8ff62537a5070 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M a895be69e733 ps code=af1c3a7daf16206a ud=4 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M f6de930cd833 cs code=af3a06c77cbc67e7 ud=13 t=64,1,1 tid=1 wgr=13 async sb=st:4,st:4,st:8,st:4
+M effd3218a102 ps code=af7ba1b51f0f8de5 ud=4 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M 64ddf8fee730 vs code=b002d4a3d6ca663b ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.34955.4a3ac.9.3.0.0.0,80000.38133.39fac.12.4.1.0.1,40000.57201.1d22c.16.2.3.0.2,100000.9533.3cfac.18.4.4.0.3,100000.9533.38fac.22.4.5.0.3,40000.47668.1d22c.26.2.6.0.4 vbuf=12.34955.0,8.38133.0,4.57201.0,16.9533.0,4.47668.0 sb=-,-,-,-,st:48 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 62c65700586c ps code=b0d57a8b6b675931 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M cfe3e80f0029 ps code=b0d57a8b6b675931 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6746cf1ba83f ps code=b136291714a4b2f0 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 545434274e85 ps code=b1faf9e71bf66a47 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Float/d:2D ss=-
+M 1c4345ed04b1 ps code=b20370947b5917c9 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2DArray/ir:1/im:33/heap,n:Float/d:2D/ir:0/im:30/heap,n:Float/d:2DArray/ir:1/im:33/heap,n:Float/d:2DArray/ir:1/im:33/cube/heap ss=-,-
+M 6506cdf4ec5c cs code=b23a5931b4046ae7 ud=12 t=32,1,1 lds=512 wave=32 tid=1 wgr=12 async gx sb=st:32,st:128,st:4
+M 4e3cd11be5b0 ps code=b261528db3d369e4 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 6e441426685e vs code=b2b46566d60813be ud=8 cur=1 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=280000.65536.4dfac.9.4.0.0.0,280000.65536.38fac.13.4.1.0.0,280000.65536.1d22c.17.2.2.0.0,280000.65536.47fac.19.4.3.0.0,280000.65536.47fac.23.4.4.0.0 vbuf=40.65536.0 si=n:Float/d:2D ss=-
+M 06fa76846b50 mesh code=b2df2303cecec7d7 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M 548a1bf2f9cd mesh code=b2df46ffcd5617c8 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M 52593aa07ab1 vs code=b386ac9e385f5c3c ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.421388.4a3ac.9.3.0.0.0,80000.459697.39fac.12.4.1.0.1,40000.689546.1d22c.16.2.3.0.2,100000.114924.3cfac.18.4.4.0.3,100000.114924.38fac.22.4.5.0.3,40000.574622.1d22c.26.2.6.0.4 vbuf=12.421388.0,8.459697.0,4.689546.0,16.114924.0,4.574622.0 sb=-,-,-,-,st:48 si=n:Float/d:2D ss=-
+M 7fa476875664 ps code=b3c688469ea0a092 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D
+M 70ccf808bfa1 vs code=b41543b11da5ddb3 ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.5278.4a3ac.9.3.0.0.0,80000.4525.39fac.12.4.1.0.1,80000.4525.39fac.16.4.2.0.1,40000.4526.1d22c.20.2.3.0.2,40000.2264.1d22c.22.2.4.0.3 vbuf=12.5278.0,8.4525.0,4.4526.0,4.2264.0 sb=st:4,st:112,st:4,st:1,st:4,st:112,st:1,-,-
+M 51ff1d5b757a ps code=b4f72d99eb8441ef sysbase=2 center=0 smask=f omode=9 faceall early in=0
+M 41f966933d2e ps code=b6030efb7223d9e0 ud=2 sysbase=2 sample=0 smask=f omode=4 faceall anc kill sshade in=1,2 si=n:Float/d:2D ss=-
+M 351d82cc2806 mesh code=b62d3d1ca4719491 ud=19 cur=17 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M d001c5eded0c mesh code=b62d3d1ca4719491 ud=19 cur=14 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M da904cc949eb mesh code=b62d3d1ca4719491 ud=19 cur=30 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M b0459859cc96 ps code=b634162ca8414f76 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M bb5b0e8c8d2f cs code=b64f11b802a061ff ud=8 t=1,1,1 tid=1 wgr=8 async sb=-,st:12
+M 542fbb94b596 ps code=b65fc83975ee9663 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy posz faceall sshade in=0,421,422 sb=-,-,-,st:1,st:1 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 4e80393ea1dd ps code=b698b8c31ca7da42 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 3fde89d5f21d cs code=b7510c1520404052 ud=4 t=16,16,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 7c8829cff1c7 cs code=b772fbfbfd29cd36 ud=4 t=18,18,1 lds=384 tid=2 wgr=4 gx gy sb=st:4 si=n:Float/d:2D
+M e3524a312388 cs code=b7e376d9243fa624 ud=2 t=256,1,1 lds=384 tid=1 wgr=2 async gx sb=st:64,st:4,st:4,st:4,st:4
+M abf61e23d709 ps code=b95c9ebf7db15de7 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 4e1ceb1d3c33 mesh code=bb7c84cc84c05242 ud=19 cur=22 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:48,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M 4b5bc9a3bcf2 ps code=bbd09f391df7e8f0 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 8c792bfa594f ps code=bbfd7ee76c2563ad ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M fe4827081a2b cs code=bc107c18247db134 ud=5 t=128,1,1 lds=896 tid=1 wgr=5 async gx gy sb=st:96,st:1,st:1 si=n:Uint/d:3D
+M 1a52766bb398 ps code=bd633cad10e69c2e ud=5 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy posz face faceall sshade early in=420,421 sb=-,-,-,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1,-,-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:3D,n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D,n:Float/d:2D ss=-,-,-,-,-,-,-
+M a63c2d1a1504 cs code=be0b848d2e06ec9b ud=6 t=64,1,1 lds=512 scratch=56 tid=1 wgr=6 gx sb=st:4,st:4,st:4,-,-,- si=n:Float/d:2D,n:Float/d:2D/ir:1/im:72/heap,n:Uint/d:2D,n:Float/d:2D/ir:1/im:72/heap ss=-,-
+M 24917c98638e cs code=be2d49a058dc72e5 ud=4 t=256,1,1 lds=7296 tid=1 wgr=4 gx sb=st:1,st:1,st:1
+M 9aeb5dc29b97 cs code=bf439c2f9197ddc7 ud=2 t=256,1,1 lds=384 tid=1 wgr=2 async gx sb=st:4,st:64,st:4,st:12,st:4
+M ace8bff30a39 cs code=c05442ed57523ca6 ud=4 t=256,1,1 tid=1 wgr=4 async gx sb=st:1,st:48,st:1
+M 5dbba85bf739 cs code=c06f26bcf795f9e7 ud=4 t=64,2,1 tid=2 wgr=4 async gx sb=st:176,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:32,st:64,-,- si=n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:3D,n:Float/d:3D ss=-,-,-
+M ba2d3d09cce3 ps code=c09067947aaf43e8 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Float/d:2D ss=-
+M 72b7afd49638 ps code=c0cf8c01d7613065 ud=5 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2DArray ss=-
+M 3633e3ea6248 cs code=c14fe501b9e61e21 ud=4 t=16,16,1 lds=128 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 578791ccd1ef ps code=c17fded04921a753 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 28a034117063 ps code=c19ea4c9d789f46c ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M b04ba3944741 vs code=c2c2dd1856a3a83b ud=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.34404.4a3ac.9.3.0.0.0,80000.37532.39fac.12.4.1.0.1,100000.9383.3cfac.16.4.2.0.2,100000.9383.38fac.20.4.3.0.2 vbuf=12.34404.0,8.37532.0,16.9383.0 sb=-,st:48
+M a580654b458d ps code=c2d1c7c72e18cfac ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Float/d:2D ss=-
+M e907d267a8ba cs code=c34da9282605cb53 ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c7dec715ec0d mesh code=c419e4507986eccc ud=16 cur=6 iv=6 ii=7 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac
+M 5e274529aa17 vs code=c4f8f794927dfe73 ud=7 cur=2 iv=5 ii=6 idraw sb=st:1,st:32,st:1
+M 18311b55be62 cs code=c587352a2e17d7e2 ud=14 t=64,1,1 tid=1 wgr=14 async gx sb=st:4,st:64,st:4,st:4
+M f1c09daacf8a vs code=c5bed050e4bc306d ud=8 fa=4 fb=2 dyn iv=6 ii=7 idraw attr=c0000.50056.4a3ac.9.3.0.0.0,80000.18771.39fac.12.4.2.0.1,80000.18771.39fac.16.4.3.0.1,40000.3219696.1d22c.20.2.4.0.2,40000.3180750.1d22c.22.2.5.0.3 vbuf=12.50056.0,8.18771.0,4.3219696.0,4.3180750.0
+M eccb80740771 ps code=c60efe2d5f0b255d ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M dd2facedbef0 ps code=c6614f1165972edc ud=4 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=st:152 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D ss=-,-
+M 483e32bc2c48 mesh code=c68acf16c1b1c61a ud=19 cur=22 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 32bbe882d11a cs code=c6934dc52374751f ud=5 t=128,1,1 lds=896 tid=1 wgr=5 async gx gy sb=st:16,st:96,st:1,st:1 si=n:Uint/d:3D
+M 4588cc34cd71 ps code=c7d214389f867a23 ud=4 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=st:152 si=n:Uint/d:2D,n:Float/d:2D ss=-,-
+M 43ddb40ecec6 ps code=c82d75abf6424d51 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M e678f58042b7 mesh code=cacb8289d20c51b9 ud=19 cur=17 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm si=n:Float/d:2D ss=-
+M 20a1aae86073 mesh code=cb079e4714539403 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 288e54b752df mesh code=cb203d3eef3b884e ud=16 cur=28 iv=6 ii=7 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 7a562f445c11 ps code=cbb4fa4f687310c5 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 10f96dfbc178 vs code=cc8a518d8ea2d5fd ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.344806.4a3ac.9.3.0.0.0,40000.564228.1d22c.12.2.3.0.1,100000.94038.3cfac.14.4.4.0.2,100000.94038.38fac.18.4.5.0.2 vbuf=12.344806.0,4.564228.0,16.94038.0 sb=-,st:48
+M adc735d786d7 ps code=ccf2c960726d5b04 ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M c784aef100ab mesh code=ce9c624c57be2d9e ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M d3edd74d6f34 mesh code=ce9c624c57be2d9e ud=19 cur=13 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 2062a5bdc725 ps code=cf400e3f9f088b57 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 5ac6df68dade mesh code=cf5292069cc4a0d5 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm
+M cfb463cdec6a ps code=cfb0972f6e7a839c ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 854563e5c26b cs code=cfc3b7194f3fd933 ud=12 t=64,1,1 tid=1 wgr=12 async gx sb=st:4,st:8
+M 3428d2872626 vs code=d049a41b04b3f13b ud=11 cur=7 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.421388.4a3ac.9.3.0.0.0,80000.459697.39fac.12.4.1.0.1,40000.689546.1d22c.16.2.3.0.2,100000.114924.3cfac.18.4.4.0.3,100000.114924.38fac.22.4.5.0.3,40000.574622.1d22c.26.2.6.0.4 vbuf=12.421388.0,8.459697.0,4.689546.0,16.114924.0,4.574622.0 sb=-,-,-,-,st:48 si=n:Float/d:2D ss=-
+M 2bf9230d11ea mesh code=d09e291ab0a55e5c ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac,st:4,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:1,-,-,st:8/f:8_8_8_8SNorm si=n:Float/d:2D/ir:0/im:65/heap,n:Float/d:2D/ir:0/im:65/heap ss=-
+M ba17f6073243 ps code=d3d4d956c1829f80 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 8e94bcc91a9d cs code=d53049ba2fee9847 ud=4 t=256,1,1 lds=384 tid=1 wgr=4 gx gy sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D
+M f1c47a205add vs code=d578e9ee6e381bac ud=11 cur=8 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.4480.4a3ac.9.3.0.0.0,80000.3840.39fac.12.4.1.0.1,80000.3840.39fac.16.4.2.0.1,40000.3840.1d22c.20.2.3.0.2,40000.1920.1d22c.22.2.4.0.3 vbuf=12.4480.0,8.3840.0,4.3840.0,4.1920.0 sb=-,-,st:1,-,-
+M 3663aa42ae71 cs code=d5b5ba17a56c98c1 ud=9 t=1,1,1 tid=1 wgr=9 async sb=-,st:64
+M 5c36203891fc ls code=d5e86f3030d5dc00 ud=4 cur=3 ticp=1 tocp=1 tls=40 ths=32 tpb=32672 tps=84 tdom=2 tpart=2 ttopo=3
+M 8c510c2d8e4c mesh code=d6c6de732c408ed9 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:4,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,st:1,-,-,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm si=n:Float/d:2D/ir:0/im:63/heap,n:Float/d:2D/ir:0/im:63/heap ss=-
+M 50c733d196c4 ps code=d6dc38b47fd630f1 ud=3 sysbase=2 custom=3 sample=0 smask=f omode=4 faceall anc kill sshade in=420,421 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M f5e838d2ed42 mesh code=d6ed4b01f4d29840 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4,st:112,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c
+M fbede0829e30 cs code=d80b71bc06255947 ud=4 t=64,1,1 tid=1 wgr=4 gx sb=st:4,st:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M 863540e9dbf3 mesh code=d8b39419932af6fa ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,-,st:48,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:12/f:32_32_32Float/sw:3ac
+M 20b07db4e485 ps code=d8bf3946a6ee39b5 ud=2 sysbase=2 center=0 smask=f omode=4 faceall early
+M 5e7c3f75ca2a mesh code=d9b4befc33026b85 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M f46bd7c71f37 mesh code=d9b4befc33026b85 ud=19 cur=13 iv=9 ii=10 idraw mt=64,1,1 mlds=1152 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M fdfb0b3dea9e vs code=d9f7a208138c913e ud=11 cur=5 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.28432.4a3ac.9.3.0.0.0,80000.24370.39fac.12.4.1.0.1,40000.24371.1d22c.16.2.3.0.2,40000.12186.1d22c.18.2.4.0.3 vbuf=12.28432.0,8.24370.0,4.24371.0,4.12186.0 sb=st:4,st:112,st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:53/heap,n:Float/d:2D/ir:0/im:53/heap ss=-
+M b179c79db6c1 mesh code=d9fa5ac2921db121 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:48,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm si=n:Float/d:2D ss=-
+M 14c7ad930e60 mesh code=da1ee0eb3566c4d3 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48,st:12/f:32_32_32Float/sw:3ac
+M b42daccab911 ps code=da3b80aac0a94dfa ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M f12819b06ec9 cs code=dab555dd9e6e9be7 ud=4 t=8,8,1 tid=2 wgr=4 gx gy si=n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Uint/d:2D,n:Uint/d:2D ss=-
+M 711409189290 mesh code=daebbfcf4c79c5c3 ud=16 cur=20 iv=6 ii=7 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M 86b7256d47cc mesh code=daebbfcf4c79c5c3 ud=16 cur=21 iv=6 ii=7 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M af06d56649bc mesh code=daebbfcf4c79c5c3 ud=16 cur=22 iv=6 ii=7 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M f89644493260 mesh code=daebbfcf4c79c5c3 ud=16 cur=25 iv=6 ii=7 idraw mt=64,1,1 mlds=1408 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:8/f:8_8_8_8SNorm,st:12/f:32_32_32Float/sw:3ac,st:4/f:16_16Float/sw:22c,st:4/f:16_16Float/sw:22c
+M a7ecd78d1f52 ps code=db11b0e8bf539944 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2DArray/cube,n:Float/d:2D ss=-,-
+M 2958fe254c21 cs code=dc89322d3aa80ba1 ud=4 t=64,1,1 lds=640 tid=1 wgr=4 gx gy sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 863a5798c95b mesh code=dcbbe5ae12edb452 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=896 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 70ad3bcca6b8 cs code=dd10b7e0fec0fe0e ud=9 t=256,1,1 lds=768 tid=1 wgr=9 async sb=st:4,st:16,st:1024,st:4,st:16
+M 8ac485236372 cs code=dd10b7e0fec0fe0e ud=9 t=256,1,1 lds=768 tid=1 wgr=9 async sb=oob,st:16,st:1024,oob,st:16
+M 0cda8b0da0c0 ps code=dd9f59ac804c4305 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 7ed5e515cc49 tes code=dea35e40203c18ae ud=4 cur=3 ticp=1 tocp=1 tls=40 ths=32 tpb=32672 tps=84 tdom=2 tpart=2 ttopo=3 si=n:Float/d:2D ss=-
+M e2ca9301fc5e vs code=df2fccac94d3ddf9 ud=6 cur=5 iv=4 ii=5 idraw sb=-
+M 09306a84f154 ps code=df8d59d32c9e0867 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=ff0 omode=4,4 faceall sshade early in=420 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M d1c7b40b54f9 ps code=dfab4a5089414b6f ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 9c0cc4b607de mesh code=e0384134ebe7fecf ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48 si=n:Float/d:2D ss=-
+M f7f50fec93b6 ps code=e05a1bcb58a2eeac ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 3803b2019723 cs code=e0659d5873c74129 ud=4 t=16,16,1 lds=1664 tid=2 wgr=4 async gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-,-
+M 6dce877d782f cs code=e0ab94cdd6871546 ud=5 t=256,1,1 tid=1 wgr=5 async gx sb=st:1,-,st:48,st:1
+M fa3580aeb897 ps code=e0dbd7f1cdc9362a sysbase=2 center=0 smask=ff omode=9,4 faceall early in=0,1
+M 9eff28062d79 ps code=e0e4c0f4d9cec20e ud=4 sysbase=2 center=0 smask=f omode=4 posx posy faceall early sb=- si=n:Float/d:2D,n:Float/d:1DArray,n:Float/d:2DArray ss=-,-
+M e7c117144ded ps code=e14573261846044a ud=3 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=st:4,st:1,-,-,f:8UInt/sw:4 si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M f6d081b1759d ps code=e14573261846044a ud=3 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=st:4,st:1,-,-,f:8UInt/sw:4 si=n:Float/d:2D/ir:0/im:16/heap,n:Float/d:2D/ir:0/im:16/heap ss=-
+M 1cc484422386 ps code=e1bea9e3f72abfa3 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=ffff omode=4,4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M dcbed36e9542 ps code=e2dbf08ce75c035b ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=ffff omode=4,4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D ss=-
+M f8ea2cc53e8e cs code=e30bd373c7e38b19 ud=5 t=256,1,1 tid=1 wgr=5 async gx sb=st:1,-,-,-,st:48,st:1
+M 06277f59967d cs code=e3fd4a2884d2f20c ud=4 t=16,16,1 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 97b8000298a9 cs code=e4f10b2ef11083cc ud=4 t=64,1,1 lds=256 tid=1 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 99d782a118c8 vs code=e5cde40e9fe8389e ud=10 cur=9 fa=6 fb=4 dyn iv=8 ii=9 idraw attr=340000.50412.4a3ac.9.3.0.0.0,340000.50412.38fac.12.4.1.0.0,340000.50412.1d22c.16.2.2.0.0,340000.50412.47fac.18.4.3.0.0,340000.50412.3cfac.22.4.4.0.0,340000.50412.14204.26.1.7.0.0,340000.50412.1d22c.27.2.9.0.0 vbuf=52.50412.0 sb=oob si=n:Float/d:2D
+M f032d8833669 vs code=e5cf12a1d8311a0d ud=6 cur=4 iv=4 ii=5 idraw sb=oob,st:176 si=n:Float/d:2D
+M 2f8c8b25e084 vs code=e624369698779185 ud=11 cur=9 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.2163.4a3ac.9.3.0.0.0,80000.2360.39fac.12.4.1.0.1,80000.2360.39fac.16.4.2.0.1,40000.3540.1d22c.20.2.3.0.2,100000.590.3cfac.22.4.4.0.3,100000.590.38fac.26.4.5.0.3,40000.2950.1d22c.30.2.7.0.4 vbuf=12.2163.0,8.2360.0,4.3540.0,16.590.0,4.2950.0 sb=-,st:48
+M 67cfce98afb2 vs code=e624369698779185 ud=11 cur=12 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.344806.4a3ac.9.3.0.0.0,80000.376152.39fac.12.4.1.0.1,80000.376152.39fac.16.4.2.0.1,40000.564228.1d22c.20.2.3.0.2,100000.94038.3cfac.22.4.4.0.3,100000.94038.38fac.26.4.5.0.3,40000.470190.1d22c.30.2.7.0.4 vbuf=12.344806.0,8.376152.0,4.564228.0,16.94038.0,4.470190.0 sb=-,st:48
+M ab4537dcd114 vs code=e624369698779185 ud=11 cur=10 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.1122562.4a3ac.9.3.0.0.0,80000.1628284.39fac.12.4.1.0.1,80000.1628284.39fac.16.4.2.0.1,40000.3182488.1d22c.20.2.3.0.2,100000.786362.3cfac.22.4.4.0.3,100000.786362.38fac.26.4.5.0.3,40000.3182488.1d22c.30.2.7.0.2 vbuf=12.1122562.0,8.1628284.0,4.3182488.0,16.786362.0 sb=-,st:48
+M cf9b0b178d71 vs code=e624369698779185 ud=11 cur=11 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.34404.4a3ac.9.3.0.0.0,80000.37532.39fac.12.4.1.0.1,80000.37532.39fac.16.4.2.0.1,40000.56299.1d22c.20.2.3.0.2,100000.9383.3cfac.22.4.4.0.3,100000.9383.38fac.26.4.5.0.3,40000.46916.1d22c.30.2.7.0.4 vbuf=12.34404.0,8.37532.0,4.56299.0,16.9383.0,4.46916.0 sb=-,st:48
+M df1bf22f778f cs code=e658beac972de2f8 ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,-,st:48,-,-,-,st:1 si=n:Float/d:2D ss=-
+M abf50fc25670 ps code=e7aec135981e0313 ud=5 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 094f6f0b3c46 ps code=e90582ffc9402b1f ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D
+M 9e0fe5f52f80 cs code=e95562d76cd4fb9a ud=4 t=64,1,1 lds=128 tid=1 wgr=4 gx sb=-,st:352,-,-,st:176 si=n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:2DArray ss=-
+M 8141bfd8a112 cs code=e969324875fc542e ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,st:1,st:1,st:1,st:1,st:1
+M bf98f3080347 ps code=e9a92015898d9947 ud=5 cur=6 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 0698e7e91441 ps code=ea65d22b630c6fe8 ud=2 sysbase=2 center=0 smask=f omode=4 posx posy faceall early si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Uint/d:2D,n:Float/d:2D ss=-
+M 690c3b50b7a1 cs code=eaf60ba6984235ab ud=4 t=64,1,1 tid=1 wgr=4 async gx sb=st:80,st:1,st:80,st:1/f:8UInt/sw:4,st:1/f:8UInt/sw:4,st:32,st:64,-,-,st:32 si=n:Float/d:2DArray,n:Float/d:2DArray/cube,n:Float/d:2DArray,n:Float/d:2DArray,n:Float/d:1DArray,n:Float/d:2DArray,n:Float/d:3D,n:Float/d:3D,n:Float/d:3D ss=-,-,-,-
+M e3ef99d55d89 cs code=eb11601015df9f2d ud=4 t=64,1,1 lds=128 tid=1 wgr=4 async gx sb=st:64,-,st:352,st:1,st:1
+M 3431df2a9219 vs code=eb16f0d00d5a072b ud=10 cur=3 fa=6 fb=4 dyn iv=8 ii=9 idraw attr=500000.32768.4a3ac.9.3.0.0.0,500000.32768.38fac.12.4.1.0.0,500000.32768.1d22c.16.2.2.0.0,500000.32768.47fac.18.4.3.0.0,500000.32768.3cfac.22.4.4.0.0,500000.32768.3cfac.26.4.5.0.0,500000.32768.14204.30.1.7.0.0,500000.32768.45fac.31.4.8.0.0,500000.32768.47fac.35.4.9.0.0,500000.32768.39fac.39.4.11.0.0,500000.32768.47fac.43.4.12.0.0 vbuf=80.32768.0 sb=st:1 si=n:Float/d:2D
+M 14ef31ed4122 ps code=eb417049e3a84958 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D ss=-
+M 12889dc53749 ps code=eba14ca87380e346 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 68d4e7478e8c ps code=eba14ca87380e346 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M c4c21af90c0b ps code=ebfa0aa38ed1769a ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 14f40279cd7b ps code=ec97c4758a8b6528 ud=5 cur=6 sysbase=2 custom=1 sample=0 smask=ff0 omode=4,4 posx posy posz faceall sshade early in=420 sb=-,- si=n:Float/d:2D
+M d19da4a55759 mesh code=ed64360d054cfad1 ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm,st:48,st:16/f:8_8_8_8UInt,st:16/f:8_8_8_8UNorm si=n:Float/d:2D ss=-
+M cecb59744ff9 ps code=eeab09c20d0be996 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 0d52efb4e523 cs code=eeb821b44ca6111d ud=9 t=8,8,1 tid=2 wgr=9 gx gy sb=st:1/f:8UInt/sw:204,st:2/f:8_8UInt/sw:22c
+M 8f573983afe7 vs code=f0079c1a5e0400e8 ud=6 cur=4 iv=4 ii=5 idraw sb=-
+M 9771776d7023 ps code=f087a7efd8a8f000 ud=4 sysbase=2 center=0 smask=0 faceall zexp in=0 sb=st:4
+M cb4d84209ee9 ps code=f18b9500cf6eb98f ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2DArray,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 3817c63bddc6 cs code=f1bac35241c314e9 ud=10 t=64,1,1 lds=128 tid=1 wgr=10 async gx sb=-,st:12/f:32_32_32Float/sw:3ac,st:24
+M 4998f9a01497 mesh code=f1d3361ed8d0687a ud=19 cur=6 iv=9 ii=10 idraw mt=64,1,1 mlds=640 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:4/f:16_16Float/sw:22c,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c,st:12/f:32_32_32Float/sw:3ac,-,-,-,-,st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,st:48 si=n:Float/d:2D ss=-
+M 83d56b32e13e cs code=f1fa1ebc05b8e820 ud=3 t=64,1,1 tid=1 wgr=3 gx sb=-,st:4,st:1,st:1,st:1
+M 1ee026299f70 ps code=f224b647a65c534b ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:27/heap,n:Float/d:2D/ir:0/im:27/heap ss=-,-
+M 8d64436298e9 cs code=f25b35bb603d3dae ud=8 t=64,1,1 tid=1 wgr=8 async gx sb=st:128,st:4
+M c894031d88cb cs code=f293dc24962fcd29 ud=5 t=256,1,1 tid=1 wgr=5 gx sb=st:1,-,-,-,-,st:48,st:1 si=n:Float/d:2D ss=-
+M c4d24d81a9a5 ps code=f387df2de1643752 ud=5 sysbase=2 custom=6 sample=0 smask=fff0 omode=4,4,4 posx posy face faceall sshade early in=0,421,422 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 59a301ebf953 ps code=f4382dab4f6c4dfb ud=4 sysbase=2 center=0 smask=f omode=4 posx posy faceall kill in=0,1 si=n:Float/d:2D,n:Float/d:2D ss=-,-
+M eddf1fc0e603 mesh code=f4cccc5aa420513e ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=896 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:16/f:8_8_8_8UNorm,st:16/f:8_8_8_8UInt,-,st:48,st:12/f:32_32_32Float/sw:3ac,st:8/f:8_8_8_8SNorm,st:4/f:16_16Float/sw:22c
+M 9f515e60c5fa cs code=f543712a4e4944dc ud=14 t=32,1,1 lds=128 tid=1 wgr=14 async gx sb=st:56,st:4,st:32,st:96,st:4,st:128
+M b1e787c65134 ps code=f591c3ac7eb2a96b ud=4 sysbase=2 center=0 smask=f omode=4 faceall kill in=0,1 si=n:Float/d:2D ss=-
+M d918a71e0ab6 cs code=f6a89f5b2676f2c2 ud=3 t=64,1,1 tid=1 wgr=3 gx sb=st:12,st:1
+M 72d32db8c020 mesh code=f91ec9791c53c500 ud=19 cur=11 iv=9 ii=10 idraw mt=64,1,1 mlds=896 mprim=4 mppg=21 mvpg=63 mmaxv=64 mmaxp=21 sb=st:12/f:32_32_32Float/sw:3ac,-,st:4/f:16_16Float/sw:22c
+M 961107c3d781 cs code=f969c192323c215b ud=6 t=64,1,1 lds=512 scratch=56 tid=1 wgr=6 gx sb=st:4,st:4,st:4,-,-,- si=n:Float/d:2D,n:Float/d:2D/ir:1/im:72/heap,n:Uint/d:2D,n:Float/d:2D/ir:1/im:72/heap ss=-,-
+M f56ff89b402f cs code=f9a5feb34082e1b1 ud=4 t=1,64,1 lds=256 tid=2 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M a5e9c9c0b8c1 cs code=fa710db2c54f507d ud=5 t=256,1,1 tid=1 wgr=5 async gx sb=st:1,-,-,-,-,st:48,st:1 si=n:Float/d:2D,n:Float/d:2D ss=-
+M 1a94af3940cd ps code=fb9ed1c41b8d3c61 ud=5 sysbase=2 custom=6 sample=0 smask=ffff omode=4,4,4,4 posx posy posw face faceall sshade early in=0,421,422 sb=-,-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 1bbbff99d7e8 ps code=fbc3ac91539c54a9 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 44c2570c8fbf ps code=fbc3ac91539c54a9 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 285bb97e64f0 ps code=fbe612fae73a522e ud=5 cur=6 sysbase=2 custom=2 sample=0 smask=fff0 omode=4,4,4 posx posy faceall sshade early in=0,421 sb=-,-,- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M ca89c6259755 ps code=fca2a2bbf057cdda ud=5 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 posx posy faceall kill sshade in=420 sb=-,-,-,f:8UInt/sw:4
+M 87d6b5b553ae vs code=fcd107c51811ff00 ud=7 cur=2 iv=5 ii=6 idraw sb=st:32
+M 789172e27397 cs code=fcf4204a665f2d36 ud=3 t=64,1,1 tid=1 wgr=3 async gx sb=st:16,oob,oob
+M 884c0cba9bde cs code=fcf4204a665f2d36 ud=3 t=64,1,1 tid=1 wgr=3 async gx sb=st:16,st:96,st:128
+M 8623e87cd07a vs code=fe17f82615686f37 ud=11 cur=6 fa=7 fb=5 dyn iv=9 ii=10 idraw attr=c0000.17033.4a3ac.9.3.0.0.0,80000.14600.39fac.12.4.1.0.1,40000.14600.1d22c.16.2.3.0.2,40000.7300.1d22c.18.2.4.0.3 vbuf=12.17033.0,8.14600.0,4.14600.0,4.7300.0 sb=st:4,st:112,st:4,st:1,-,- si=n:Float/d:2D/ir:0/im:53/heap,n:Float/d:2D/ir:0/im:53/heap ss=-
+M 60e0a3489fe7 ps code=fe43c77ba95dcde4 ud=3 cur=6 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 70c722311d12 ps code=fe43c77ba95dcde4 ud=3 sysbase=2 custom=1 sample=0 smask=f omode=4 faceall anc kill sshade in=420 sb=-,-,- si=n:Float/d:2D ss=-
+M 7385ab5b6900 ps code=feb7c818b0492ff8 ud=5 cur=6 sysbase=2 custom=3 sample=0 smask=f omode=4 posx posy faceall anc kill sshade in=420,421 sb=-,-,-,f:8UInt/sw:4 si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-,-
+M 91851af4b480 cs code=ff53c3eb455a2344 ud=4 t=256,1,1 tid=1 wgr=4 gx gy si=n:Float/d:2D,n:Float/d:2D
+M 2f358212bc55 ps code=ffc555564b7333ca ud=2 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D,n:Float/d:2D ss=-
+P v=00cd84bea11e p=abf50fc25670 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=017981c78b50 p=3c96a96687eb plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,4.0 va=0.0,0.1,0.2
+P v=0399093f01a8 depth=D32Sfloat topo=TriangleList
+P v=06cbd43a7d24 p=c1fbda000747 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=06fa76846b50 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=08f796d0fe42 p=14ef31ed4122 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=0cc57b120748 p=1a52766bb398 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=0eacb4055b9a p=e79a4295be73 depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,4.0 va=0.0,0.1,0.2
+P v=0ffab2243965 p=b42daccab911 plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=10f96dfbc178 p=2f84ab35ddfe plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,16.0 va=0.0,0.1,0.2,8.2
+P v=1194cf29b459 p=c4c21af90c0b plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=11a7ee75ca89 p=28a034117063 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=134d45462155 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=13a7ec7e973d p=ce0bb7721a22 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,12.0,8.0,4.0 va=0.0,0.1,0.2,4.2,0.3,0.3
+P v=13a7ec7e973d p=d1c7b40b54f9 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,12.0,8.0,4.0 va=0.0,0.1,0.2,4.2,0.3,0.3
+P v=14c7ad930e60 depth=D32Sfloat topo=TriangleList
+P v=165a96f6e27e p=5abc2c6e8d58 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=165a96f6e27e p=6fa59f419d95 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=165a96f6e27e p=bab4df0cd330 plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList
+P v=19431368c0fd p=0e18218fa89b plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=19431368c0fd p=97529ddcf5b4 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=19431368c0fd p=e5dd44b5c31c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=19431368c0fd p=e5dd44b5c31c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=1f39561c4f63 p=2724d0e8844e cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=20a1aae86073 p=5ed4f7bff313 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=23c308a55fb6 p=72d678237c5d plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=23c308a55fb6 p=8b77be71f4e0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=24b0a0a7a724 p=abf50fc25670 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=27fe7bad809b p=54f1cc2d0392 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 noclip restart topo=TriangleStrip vb=52.0 va=0.0,12.0,16.0,20.0,28.0,32.0,40.0,44.0,48.0
+P v=288e54b752df p=894dd66ed094 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList
+P v=2b9e3711ad53 p=894dd66ed094 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList
+P v=2bafb86b3f7e p=dc8fd650a603 plain depth=D32Sfloat topo=TriangleList
+P v=2bf9230d11ea p=21403577dbc7 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=2c212cd2fbe6 p=14f40279cd7b cc=3 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 depth=D32SfloatS8Uint stencil m1=7 b1=1.4.0.5.1.1 m2=7 b2=1.4.0.5.1.1 topo=TriangleList
+P v=2ceb789cba26 depth=D32Sfloat topo=TriangleList ms=4 vb=12.0 va=0.0
+P v=2f5e66f92a74 p=955e249ea6bb cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=2f8c8b25e084 p=97529ddcf5b4 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=309ff399bc97 p=0a509f2ea4bb plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=309ff399bc97 p=6746cf1ba83f plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=32116a630d55 p=0c49520fe540 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=32116a630d55 p=62c65700586c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=33744815746c p=4aaa11a257be plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=3428d2872626 p=36695d600f9a plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,0.2,0.3,8.3,0.4
+P v=3431df2a9219 p=933c23baf796 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 noclip restart topo=TriangleStrip vb=80.0 va=0.0,12.0,16.0,20.0,28.0,32.0,40.0,44.0,52.0,68.0,72.0
+P v=351d82cc2806 p=09306a84f154 plain cc=3 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 depth=D32SfloatS8Uint stencil m1=7 b1=1.4.0.5.1.1 m2=7 b2=1.4.0.5.1.1 topo=TriangleList
+P v=372eeeed0fd3 depth=D32Sfloat topo=TriangleList vb=12.0,8.0 va=0.0,0.1
+P v=37fab6fd69e0 p=1ee026299f70 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=37fab6fd69e0 p=4b5bc9a3bcf2 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=37fab6fd69e0 p=528f06df9f8b cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=37fab6fd69e0 p=f43be6c987f4 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=37fab6fd69e0 p=f43be6c987f4 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=3c6438e5f099 p=1cc484422386 plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList
+P v=3d2972983396 p=dd2c646cf147 plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0 va=0.0,0.1,0.1
+P v=3f22b92c7ded depth=D32Sfloat topo=TriangleList
+P v=46391771952a p=6014cf7e95e1 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=471c8ebe0c9d p=0cda8b0da0c0 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=47ce08245e79 p=12d7e4348a2d cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=1bb735415806 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=309e520f420b cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=4becd58e5087 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=4e0b236560ec cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=78869f8783c2 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=cd213278a546 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47ce08245e79 p=e6a1aacd91a3 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=47d2c3050726 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=486983412ac7 p=76c8d3875b0b cc=1 c0=R16G16Sfloat m0=f topo=TriangleList vb=4.0,4.0 va=0.0,0.1
+P v=49314b6bb4cb p=2bf0b6b7e26f plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=49314b6bb4cb p=449bf6818cf6 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=49314b6bb4cb p=542fbb94b596 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=49314b6bb4cb p=9f04600bad8d plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=4998f9a01497 depth=D32Sfloat topo=TriangleList
+P v=49dd90b36b98 p=0f836633dcd4 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=49dd90b36b98 p=5ed4f7bff313 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=4bac7ae8cf3e depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0 va=0.0,0.1
+P v=4e1ceb1d3c33 p=cc7c345a7a79 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=4e6e17b4af29 p=cfb463cdec6a plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=52593aa07ab1 p=cda5c4442ac9 plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,0.2,0.3,8.3,0.4
+P v=548a1bf2f9cd depth=D32Sfloat topo=TriangleList
+P v=54d9495f1b2c p=6014cf7e95e1 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=569f1c1edc45 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=576e28f429e9 p=b22ce1fde49e plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=5ac6df68dade depth=D32Sfloat topo=TriangleList
+P v=5b756d6c38f9 p=fa3580aeb897 cc=2 c0=R32G32B32A32Sfloat c1=A2B10G10R10UnormPack32 m0=f m1=f topo=TriangleList vb=4.0,8.0,12.0 va=0.0,0.1,0.2
+P v=5c36203891fc h=03b82ba0296c d=7ed5e515cc49 p=ec453327a8ad plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.5.1.1 m1=f b1=1.4.0.5.1.19.0.5 m2=f b2=1.4.0.5.1.1.0.5 m3=4 b3=1.2.3.8.1.1 topo=PatchList pcp=1
+P v=5d19fd78a521 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=5d286df71b4e p=f6d081b1759d depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0 va=0.0,0.1,0.1
+P v=5d286df71b4e p=f6d081b1759d depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,4.0 va=0.0,0.1,0.2
+P v=5dfed9e76a37 p=2a9355e658f3 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=5e274529aa17 p=bfc9849e5d8c depth=D32Sfloat topo=TriangleList ms=4
+P v=5e7c3f75ca2a p=12889dc53749 plain depth=D32Sfloat topo=TriangleList
+P v=6332dc514664 p=0111050e17e0 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 noclip restart topo=TriangleStrip vb=52.0 va=0.0,12.0,20.0,28.0,32.0,40.0,48.0
+P v=64ddf8fee730 p=4aaa11a257be plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,0.2,0.3,8.3,0.4
+P v=66062744b3f9 p=12889dc53749 plain depth=D32Sfloat topo=TriangleList
+P v=67cfce98afb2 p=1de6b22915ac plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=682b730180c4 p=14f40279cd7b cc=3 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 depth=D32SfloatS8Uint stencil m1=7 b1=1.4.0.5.1.1 m2=7 b2=1.4.0.5.1.1 topo=TriangleList
+P v=6bb20651dda1 p=401681757a33 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList vb=12.0,8.0,4.0,16.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.2
+P v=6bb20651dda1 p=401681757a33 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=6d209e29b99a depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,16.0 va=0.0,0.1,0.2,0.3,8.3,0.2
+P v=6e2a806ba9a5 p=51ff1d5b757a cc=1 c0=R32G32B32A32Sfloat m0=f topo=TriangleList vb=4.0,12.0 va=0.0,0.1
+P v=6e441426685e p=d132d1f0f793 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.0.0.5 restart topo=TriangleStrip vb=40.0 va=0.0,16.0,20.0,24.0,32.0
+P v=6f44910f120d h=ceadcfa615b6 d=0668b09b7561 p=9eff28062d79 plain cc=1 c0=R16G16B16A16Sfloat m0=f b0=1.1.0.1.1.1.3.1 topo=PatchList pcp=1
+P v=70ca1e759555 p=aaa36984eab8 plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,16.0 va=0.0,0.1,0.2,0.3,8.3,0.2
+P v=70ca1e759555 p=aaa36984eab8 plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,0.2,0.3,8.3,0.4
+P v=70ccf808bfa1 p=476a758a5da1 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=70de116088bc p=f1ca58f7cfa3 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=711409189290 p=d508546eeee7 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=711409189290 p=eccb80740771 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=72d32db8c020 p=1bbbff99d7e8 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=72d32db8c020 p=75edb191103f plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=79c93338f28c p=4e3cd11be5b0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=7be3de447e44 p=0a9442ad7eaa plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.4.0.5.1.4.0.5 noclip restart topo=TriangleStrip vb=52.0 va=0.0,12.0,20.0,32.0,40.0,48.0
+P v=7cd906a5a98c p=2bf0b6b7e26f plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=7cd906a5a98c p=9f04600bad8d plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=7dc61aea996f p=dd2c646cf147 plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,16.0,4.0 va=0.0,0.1,0.2,8.2,0.3
+P v=7ea9ce9126c3 p=61b6e2bda63c plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=7f4eb1ccd6af depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=81e9d1e44447 p=e3f8c979088a plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8274032e730e p=abf50fc25670 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=84d7809347a4 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=8623e87cd07a p=582ca18f850a depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=863540e9dbf3 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=863a5798c95b p=cecb59744ff9 plain depth=D32Sfloat topo=TriangleList
+P v=86b7256d47cc p=72d678237c5d plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=86b7256d47cc p=8b77be71f4e0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=87d6b5b553ae p=2f9043d66858 depth=D32Sfloat topo=TriangleList ms=4
+P v=8a198ed9d621 depth=D32Sfloat topo=TriangleList vb=12.0,8.0,16.0 va=0.0,0.1,0.2,8.2
+P v=8b58af483729 p=1a94af3940cd plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=8b58af483729 p=987917bc68c7 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=8bc2a500040f p=4e80393ea1dd plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8bc2a500040f p=5aeee94e6b33 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8bc2a500040f p=b7341cc02bbe plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8bc2a500040f p=d508546eeee7 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8c510c2d8e4c p=7bcf7bfa6020 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8d3cbef8f89e p=09306a84f154 plain cc=3 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 depth=D32SfloatS8Uint stencil m1=7 b1=1.4.0.5.1.1 m2=7 b2=1.4.0.5.1.1 topo=TriangleList
+P v=8db8e33a22e5 depth=D32Sfloat topo=TriangleList
+P v=8db8e33a22e5 p=20b07db4e485 cc=1 c0=A2R10G10B10UnormPack32 m0=f topo=TriangleList
+P v=8ef3fcfa4268 p=53013671bea2 plain cc=2 c0=B10G11R11UfloatPack32 c1=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f topo=TriangleList
+P v=8ef3fcfa4268 p=6d007f1e205a plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=8f573983afe7 p=278ebcb320c8 plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=8f6ab524390c p=13d66eacf507 plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=8f8effb3ba30 p=d132d1f0f793 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.0.0.5 restart topo=TriangleStrip vb=40.0 va=0.0,16.0,20.0,24.0
+P v=90e1632e4ec7 p=2062a5bdc725 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=28f39e0a2025 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=2bc246c5b31f cc=1 c0=R8Unorm m0=f topo=TriangleList
+P v=90e1632e4ec7 p=2f358212bc55 plain cc=1 c0=A2R10G10B10UnormPack32 m0=f topo=TriangleList
+P v=90e1632e4ec7 p=398a37fb07b2 plain cc=1 c0=R8Unorm m0=f topo=TriangleList
+P v=90e1632e4ec7 p=53fb3104c683 plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=90e1632e4ec7 p=578791ccd1ef plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=5e4ea0c136f1 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=7216f6b804f2 plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=90e1632e4ec7 p=7b60d95cecec plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=800ce22ec585 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=a01dcee0ad75 plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=90e1632e4ec7 p=ba17f6073243 plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=90e1632e4ec7 p=c63ef747e06d plain cc=1 c0=R8Unorm m0=f topo=TriangleList
+P v=90e1632e4ec7 p=cdf18ef313fb plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.0.1 topo=TriangleList
+P v=90e1632e4ec7 p=d79e459c07ce plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList
+P v=90e1632e4ec7 p=e6dfb6ee463c plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.4.1.1 topo=TriangleList
+P v=90e1632e4ec7 p=f29aa6260b13 plain cc=1 c0=A2R10G10B10UnormPack32 m0=f topo=TriangleList
+P v=90e1632e4ec7 p=febc1b224ecb plain cc=1 c0=R8Unorm m0=f topo=TriangleList
+P v=943afdc18b2a p=0a9442ad7eaa plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.4.0.5.1.4.0.5 noclip restart topo=TriangleStrip vb=52.0 va=0.0,12.0,16.0,20.0,40.0
+P v=94e4ff5bda96 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=953dcb111353 p=dcbed36e9542 plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList
+P v=96c0f2fab88e p=64e92c004903 plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList
+P v=96c0f2fab88e p=f568b873d533 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=9703a8a8ebf6 depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0 va=0.0
+P v=97ae717f78d9 p=44c2570c8fbf plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0 va=0.0,0.1
+P v=9999f673a94a depth=D32Sfloat topo=TriangleList
+P v=99d782a118c8 p=859072e60e87 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 noclip restart topo=TriangleStrip vb=52.0 va=0.0,12.0,16.0,20.0,28.0,40.0,48.0
+P v=9a423da91d66 p=c10d0a873dcf plain cc=3 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.5.1.1 m1=7 b1=1.4.0.5.1.1 m2=7 b2=1.4.0.5.1.1 topo=TriangleList
+P v=9c0cc4b607de depth=D32Sfloat topo=TriangleList
+P v=a0535b61e3d9 p=285bb97e64f0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=a058e1d41019 p=5720ce4dab4b plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,16.0 va=0.0,0.1,0.2,0.3,8.3
+P v=a141c0cb04ef p=f50c661f7f1f cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=a2444ccc99c2 depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0 va=0.0,0.1
+P v=a4f0a4277ddd p=e39f408a5044 plain cc=2 c0=B10G11R11UfloatPack32 c1=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=a9382f6e2e54 p=3fbf9c534f36 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=aa41960bc736 p=e3cb663728b2 depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,16.0 va=0.0,0.1,0.2,8.2
+P v=ab2868c649ea p=31a2851a7e59 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=ab4537dcd114 p=ce0bb7721a22 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=ab9a8b144035 p=7a562f445c11 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=ab9a8b144035 p=b0459859cc96 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=ae327348a964 p=3c96a96687eb plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,4.0 va=0.0,0.1,0.2
+P v=af06d56649bc p=cc7c345a7a79 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b04ba3944741 depth=D32Sfloat topo=TriangleList vb=12.0,8.0,16.0 va=0.0,0.1,0.2,8.2
+P v=b179c79db6c1 depth=D32Sfloat topo=TriangleList
+P v=b3bc91d98619 p=43ddb40ecec6 plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=b47f10b5b732 p=1de14a9bb1ee plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=b47f10b5b732 p=1de14a9bb1ee plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=b47f10b5b732 p=cb4d84209ee9 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,4.1,0.2,0.2
+P v=b4c5a551fe3d depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,16.0 va=0.0,0.1,0.2,8.2
+P v=b518743d6147 p=eccb80740771 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b6a5b9b464ba p=6518c968b4c8 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=b6af98ad6967 p=5f2256cb7f99 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=3ff441652de9 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=4e3cd11be5b0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=53013671bea2 plain cc=2 c0=B10G11R11UfloatPack32 c1=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f topo=TriangleList
+P v=b7ed98f2010e p=7a562f445c11 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=b7341cc02bbe plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=c1befaa90e1d plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=d508546eeee7 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b7ed98f2010e p=ed8f2b097939 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=b9c97432dcfd p=41f966933d2e plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=24.0 va=0.0,12.0,16.0,20.0
+P v=bb7d9f0ea8c4 p=bf98f3080347 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=bb7d9f0ea8c4 p=c1befaa90e1d plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=bbb73addce3d p=038459647901 plain cc=6 c0=B10G11R11UfloatPack32 c1=B10G11R11UfloatPack32 c2=B10G11R11UfloatPack32 c3=B10G11R11UfloatPack32 c4=B10G11R11UfloatPack32 c5=B10G11R11UfloatPack32 m0=f m1=f m2=f m3=f m4=f m5=f topo=TriangleList
+P v=bbb73addce3d p=0698e7e91441 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f topo=TriangleList
+P v=bbb73addce3d p=094f6f0b3c46 cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f topo=TriangleList
+P v=bbb73addce3d p=20b07db4e485 cc=1 c0=R8G8B8A8Srgb m0=f topo=TriangleList
+P v=bbb73addce3d p=3c7aa9892cc2 cc=1 c0=R16G16B16A16Sfloat m0=f topo=TriangleList
+P v=bbb73addce3d p=4588cc34cd71 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f topo=TriangleList
+P v=bbb73addce3d p=4eb3d7edc6c3 plain cc=6 c0=B10G11R11UfloatPack32 c1=B10G11R11UfloatPack32 c2=B10G11R11UfloatPack32 c3=B10G11R11UfloatPack32 c4=B10G11R11UfloatPack32 c5=B10G11R11UfloatPack32 m0=f m1=f m2=f m3=f m4=f m5=f topo=TriangleList
+P v=bbb73addce3d p=545434274e85 plain cc=1 c0=R8G8B8A8Srgb m0=f topo=TriangleList
+P v=bbb73addce3d p=6407bc5c27b0 cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.1.1.1.3.1 topo=TriangleList
+P v=bbb73addce3d p=6407bc5c27b0 cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=bbb73addce3d p=742c88785283 plain cc=2 c0=B10G11R11UfloatPack32 c1=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.1.1.1.0.1 m1=f topo=TriangleList
+P v=bbb73addce3d p=7fa476875664 cc=1 c0=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f topo=TriangleList
+P v=bbb73addce3d p=a580654b458d plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f topo=TriangleList
+P v=bbb73addce3d p=ba2d3d09cce3 plain cc=1 c0=R16G16B16A16Sfloat m0=f topo=TriangleList
+P v=bbb73addce3d p=c0746752af8a cc=6 c0=B10G11R11UfloatPack32 c1=B10G11R11UfloatPack32 c2=B10G11R11UfloatPack32 c3=B10G11R11UfloatPack32 c4=B10G11R11UfloatPack32 c5=B10G11R11UfloatPack32 m0=f m1=f m2=f m3=f m4=f m5=f topo=TriangleList
+P v=bbb73addce3d p=dd2facedbef0 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f topo=TriangleList
+P v=bbb73addce3d p=f760628de73a plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=bbb73addce3d p=fe7b859b3dde plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.4.1.1.0.1 topo=TriangleList
+P v=bc1c9c9785f3 p=0dcfc40453f0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=bc1c9c9785f3 p=c15df2f14fc2 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=bc1c9c9785f3 p=f7f50fec93b6 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=bcd1eeb86d20 p=5abc2c6e8d58 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=bcd1eeb86d20 p=bab4df0cd330 plain cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList
+P v=bedc92cc3e8f depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=bf3673557435 p=dd2c646cf147 plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,0.2,0.2
+P v=bf7cc9e41c1e p=60e0a3489fe7 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=bfa2b2ad1693 p=dd49c2a28e87 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.4.0.5.1.4.0.5 topo=TriangleList
+P v=c07cbcf086e1 p=0dcfc40453f0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=c07cbcf086e1 p=adc735d786d7 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=c07cbcf086e1 p=c15df2f14fc2 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=c07cbcf086e1 p=f390650b13aa plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=c07cbcf086e1 p=f7f50fec93b6 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=c784aef100ab p=60e0a3489fe7 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=c784aef100ab p=c0a76582c8d4 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=c7dec715ec0d depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=cf9b0b178d71 p=1de14a9bb1ee plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,16.0,4.0 va=0.0,0.1,4.1,0.2,0.3,8.3,0.4
+P v=cfc3775b3d80 depth=D32Sfloat topo=TriangleList
+P v=d001c5eded0c p=7385ab5b6900 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=d001c5eded0c p=c10d0a873dcf plain cc=3 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.5.1.1 m1=7 b1=1.4.0.5.1.1 m2=7 b2=1.4.0.5.1.1 topo=TriangleList
+P v=d19da4a55759 depth=D32Sfloat topo=TriangleList
+P v=d1c0fafb0d66 p=1f2e718dd069 depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=d381f0acee44 p=e7c117144ded depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=d3edd74d6f34 p=61b6e2bda63c plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=d43cbd3b6bce p=0c49520fe540 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d43cbd3b6bce p=62c65700586c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d43cbd3b6bce p=a7ecd78d1f52 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d43cbd3b6bce p=cfe3e80f0029 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d661fde23c01 p=c3fb9449ade9 cc=4 c0=B10G11R11UfloatPack32 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m0=f m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=1bb735415806 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=1c4345ed04b1 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=2ad9f80974f7 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=3b8e924a26a5 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=4bc84a37ca28 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=4e0b236560ec cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=81993bd617c8 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=b1a322f8510a cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=cd213278a546 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=e6a1aacd91a3 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=e9f7420c5910 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=f141cc1ca894 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=d7b25dd28d50 p=fe5a2e830891 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=da904cc949eb p=e2ac64c56690 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList
+P v=dcdac8122985 p=e5dd44b5c31c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=de2a622a8897 depth=D32Sfloat topo=TriangleList
+P v=de2cbfccacfb p=2279514b7e5c plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,4.0 va=0.0,0.1,0.2
+P v=de2cbfccacfb p=70c722311d12 plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0,4.0 va=0.0,0.1,0.2
+P v=de2cbfccacfb p=8c792bfa594f plain depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,4.0 va=0.0,0.1,0.1
+P v=dec0e8114fac depth=D32Sfloat topo=TriangleList
+P v=dfc95191d0fe p=9771776d7023 depth=D32Sfloat topo=TriangleList
+P v=e0068fa058c0 p=c33621bf4d46 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e06df47599e8 p=08e4afb132d3 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e2ca9301fc5e p=4e76ee0f6c98 plain cc=1 c0=B10G11R11UfloatPack32 m0=f topo=TriangleList
+P v=e30aa69e700a p=3ff441652de9 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e30aa69e700a p=abf61e23d709 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e40d01ff0cb3 p=2f9043d66858 depth=D32Sfloat topo=TriangleList ms=4
+P v=e4a981afbd57 p=e60fddaa5265 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e678f58042b7 p=9cdcf5dae1e0 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e67e2ca9ad80 p=3e6a88b3944c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=e7e98e31e5e1 p=ca89c6259755 depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=e89a287e56b9 p=68d4e7478e8c plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=e89a287e56b9 p=905048d79f0b plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0 va=0.0,0.1,0.2,0.2
+P v=e89a287e56b9 p=dbc8bf69e1f9 plain depth=D32Sfloat topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=ea9feb1537e6 p=401681757a33 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=edb45dc9d68c p=ca89c6259755 depth=D32Sfloat topo=TriangleList
+P v=eddf1fc0e603 p=72b7afd49638 plain depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=ee67e2567ef9 p=c31c996221d1 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=f032d8833669 p=458babee3e32 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleStrip
+P v=f0783db58f66 p=0f2189fdc476 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList
+P v=f1c09daacf8a p=1a52766bb398 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.0.0.5 topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=f1c47a205add p=c4d24d81a9a5 plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3
+P v=f32f8d78fa76 p=19e609b11c35 plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 topo=TriangleList
+P v=f32f8d78fa76 p=6a791692731d plain cc=1 c0=B10G11R11UfloatPack32 depth=D32SfloatS8Uint stencil m0=f b0=1.1.0.5.1.1.0.5 topo=TriangleList
+P v=f46bd7c71f37 p=dc8fd650a603 plain depth=D32Sfloat topo=TriangleList
+P v=f5e838d2ed42 p=b06e01358e7d depth=D32SfloatS8Uint stencil topo=TriangleList
+P v=f74938d6e34a p=59a301ebf953 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=f74938d6e34a p=a895be69e733 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=f74938d6e34a p=b1e787c65134 plain cc=1 c0=R8Unorm m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=f74938d6e34a p=b4b3f1141cdb plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=f74938d6e34a p=effd3218a102 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=f79b208c7670 p=a07160f2970c plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=f89644493260 p=4e80393ea1dd plain cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList
+P v=fd83f29525a2 p=9bab7623f835 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=fd83f29525a2 p=d83a93045e39 plain cc=1 c0=B10G11R11UfloatPack32 m0=f b0=1.1.0.5.1.1.0.1 restart topo=TriangleStrip vb=20.0 va=0.0,12.0,16.0
+P v=fdfb0b3dea9e p=50c733d196c4 depth=D32SfloatS8Uint stencil topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,0.2,0.3
+P v=fe6239f5ac28 p=c31c996221d1 cc=4 c1=R8G8B8A8Srgb c2=A2B10G10R10UnormPack32 c3=R16G16B16A16Snorm depth=D32SfloatS8Uint stencil m1=f m2=f m3=f topo=TriangleList vb=12.0,8.0,4.0,4.0 va=0.0,0.1,4.1,0.2,0.3

@@ -11,6 +11,8 @@ static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+// Where host aliases of guest memory start (see GuestBackingStore).
+static constexpr uint64_t HOST_ALIAS_MIN = 0x10000000000ull;
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -24,6 +26,87 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	                   MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
 #endif
+
+// Ranges whose guest mapping is briefly absent while the emulator replaces it: a guest mmap with
+// MAP_FIXED over an existing mapping (unmapped, then mapped again), and, on Windows, the parts of a
+// file view that stay mapped when part of it is unmapped (Windows splits a view only by unmapping
+// all of it). On the console these replacements are atomic, so guest threads keep using the
+// memory: GTA V's streamer decompresses into buffers whose 64 KiB pages are mapped again or
+// neighbour an unmap. A fault inside such a range waits until the mapping is back and is retried
+// instead of being reported as an access violation.
+struct TransientUnmapWindow {
+	std::atomic<uint64_t> id {0};
+	std::atomic<uint64_t> start {0};
+	std::atomic<uint64_t> end {0};
+	std::atomic<int64_t>  closed_ns {0}; // 0 while the range is being remapped
+};
+
+class TransientUnmapWindows {
+public:
+	using Window = TransientUnmapWindow;
+
+	class Scope {
+	public:
+		Scope(uint64_t start, uint64_t end) noexcept: m_window(Open(start, end)) {}
+		~Scope() { m_window->closed_ns.store(Now(), std::memory_order_release); }
+		KYTY_CLASS_NO_COPY(Scope);
+
+	private:
+		Window* m_window;
+	};
+
+	// The newest range being remapped recently that holds vaddr (0: none). Waits while it still
+	// is being remapped.
+	static uint64_t Wait(uint64_t vaddr) noexcept {
+		constexpr int64_t Second  = 1000000000;
+		uint64_t          matched = 0;
+		for (auto& window: s_windows) {
+			if (vaddr < window.start.load(std::memory_order_acquire) ||
+			    vaddr >= window.end.load(std::memory_order_acquire)) {
+				continue;
+			}
+			const auto begin = Now();
+			for (uint32_t spins = 0; window.closed_ns.load(std::memory_order_acquire) == 0; spins++) {
+				if (Now() - begin > Second * 10) {
+					return 0; // never closed: report the fault
+				}
+				if (spins < 4096) {
+#if defined(_M_X64) || defined(__x86_64__)
+					_mm_pause();
+#endif
+				} else {
+					std::this_thread::yield();
+				}
+			}
+			// The fault may be handled after the mapping is already back.
+			if (Now() - window.closed_ns.load(std::memory_order_acquire) < Second) {
+				matched = std::max(matched, window.id.load(std::memory_order_acquire));
+			}
+		}
+		return matched;
+	}
+
+private:
+	static Window* Open(uint64_t start, uint64_t end) noexcept {
+		auto& window = s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
+		window.closed_ns.store(0, std::memory_order_relaxed);
+		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
+		                std::memory_order_relaxed);
+		window.start.store(start, std::memory_order_relaxed);
+		window.end.store(end, std::memory_order_seq_cst);
+		return &window;
+	}
+
+	static int64_t Now() noexcept {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		           std::chrono::steady_clock::now().time_since_epoch())
+		    .count();
+	}
+
+	inline static std::array<Window, 16> s_windows {};
+	inline static std::atomic<uint32_t>  s_next {0};
+	inline static std::atomic<uint64_t>  s_opened {0};
+};
 
 class GuestBackingStore {
 public:
@@ -46,8 +129,20 @@ public:
 			     "this up front, so the paging file is usually what needs to be larger.\n",
 			     m_size / (1024U * 1024U), static_cast<uint32_t>(GetLastError()));
 		}
-		m_backing_base = static_cast<uint8_t*>(
-		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		// The guest regions take the address space below HOST_USER_MAX, and the alias went to the
+		// lowest free range: the one left below 1 TiB. The NVIDIA driver reserves its CUDA address
+		// space there for VK_NVX_binary_import (DLSS), so the alias goes above it.
+		MEM_ADDRESS_REQUIREMENTS requirements {
+		    .LowestStartingAddress = reinterpret_cast<void*>(HOST_ALIAS_MIN)};
+		MEM_EXTENDED_PARAMETER above {};
+		above.Type    = MemExtendedParameterAddressRequirements;
+		above.Pointer = &requirements;
+		m_backing_base = static_cast<uint8_t*>(MapViewOfFile3(
+		    m_handle, GetCurrentProcess(), nullptr, 0, m_size, 0, PAGE_READWRITE, &above, 1));
+		if (m_backing_base == nullptr) {
+			m_backing_base = static_cast<uint8_t*>(
+			    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		}
 		if (m_backing_base == nullptr) {
 			EXIT("direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",
 			     static_cast<uint32_t>(GetLastError()));
@@ -133,6 +228,23 @@ public:
 		    [](uint64_t, uint64_t) {});
 	}
 
+	// Writes values[i] to vaddr + i * stride, values[0] last. Callers hold the state lock, as for
+	// WriteBacking().
+	void WriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count,
+	                        uint64_t stride) {
+		const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+		if (const auto* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
+			auto* target = const_cast<uint8_t*>(backing);
+			for (uint32_t i = count; i-- > 0;) {
+				*reinterpret_cast<volatile uint64_t*>(target + i * stride) = values[i];
+			}
+			return;
+		}
+		for (uint32_t i = count; i-- > 0;) {
+			WriteBacking(vaddr + i * stride, &values[i], sizeof(uint64_t));
+		}
+	}
+
 	// Needs no lock: page entries are atomic and buckets live as long as the store.
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
@@ -156,6 +268,66 @@ public:
 			std::memset(destination, 0, bytes);
 		});
 		return true;
+	}
+
+	// The backing alias of a range that one run of contiguous backing holds, or null. Needs no
+	// lock, like TryReadBacking. The alias stays mapped for the store's lifetime, so the pointer
+	// can be read later, even after the guest range changed.
+	[[nodiscard]] const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const uint8_t* result = nullptr;
+		bool           split  = false;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t) {
+			    if (start == vaddr) {
+				    result = m_backing_base + offset;
+			    } else {
+				    split = true;
+			    }
+		    },
+		    [&](uint64_t, uint64_t) { split = true; });
+		return split ? nullptr : result;
+	}
+
+	// BackingPieces with the parts not backed as pieces without bytes (null), in order.
+	void SparsePieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
+		pieces.clear();
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t, uint64_t bytes) { pieces.emplace_back(m_backing_base + offset, bytes); },
+		    [&](uint64_t, uint64_t bytes) { pieces.emplace_back(nullptr, bytes); });
+	}
+
+	// The backing bytes of [vaddr, vaddr + size) as one piece per run of contiguous backing, in order (the pieces are
+	// contiguous in the guest range); false if a part is not backed.
+	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
+		pieces.clear();
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		bool complete = true;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t, uint64_t bytes) { pieces.emplace_back(m_backing_base + offset, bytes); },
+		    [&](uint64_t, uint64_t) { complete = false; });
+		return complete && !pieces.empty();
+	}
+
+	// Linux: the pages of [address, address + size) of the backing view freed (a hole punched in the store's memfd: gone
+	// from every view of them, a later read gets zeros). False elsewhere.
+	bool DiscardPages(uint64_t address, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		return address >= base && address - base < m_size && size <= m_size - (address - base) &&
+		       fallocate(m_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(address - base),
+		                 static_cast<off_t>(size)) == 0;
+#else
+		(void)address, (void)size;
+		return false;
+#endif
 	}
 
 	template <typename Gap>
@@ -190,11 +362,13 @@ public:
 		}
 #endif
 		StorePages(vaddr, size, backing_offset);
+		BumpBackingEpoch(vaddr, size);
 		return true;
 	}
 
 	// The caller validated the span; failing here is an emulator fault.
 	void Unmap(uint64_t vaddr, uint64_t size) {
+		BumpBackingEpoch(vaddr, size);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const auto end   = vaddr + size;
 		uint64_t   views = 0;
@@ -362,6 +536,12 @@ private:
 		std::vector<MEMORY_BASIC_INFORMATION> protections;
 		QueryProtections(view.base, left_size, mode, &protections);
 		QueryProtections(right_addr, right_size, mode, &protections);
+		// The parts that stay mapped vanish until they are mapped again with their protections:
+		// faults there wait and are retried meanwhile (see TransientUnmapWindows).
+		std::optional<TransientUnmapWindows::Scope> transient;
+		if (left_size != 0 || right_size != 0) {
+			transient.emplace(view.base, view.base + view.size);
+		}
 
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view.base), view.size));
 		ClearPages(vaddr, size);
@@ -535,6 +715,21 @@ public:
 		return true;
 	}
 
+	// TryWriteBacking() of `count` qwords `stride` bytes apart (8-byte aligned), values[0] last.
+	bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count,
+	                           uint64_t stride) {
+		const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+		if (count == 0 || !Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock state(g_memory_state_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return false;
+		}
+		m_backing->WriteBackingQwords(vaddr, values, count, stride);
+		return true;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
@@ -542,6 +737,36 @@ public:
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		return m_backing->IsBacked(vaddr, size);
 	}
+
+	[[nodiscard]] const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) const {
+		return m_backing->FindBackingPointer(vaddr, size);
+	}
+
+	bool BackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) const {
+		return m_backing->BackingPieces(vaddr, size, pieces);
+	}
+
+	// What CopySparseMemory<false> reads, as pieces: the runs of backing, and the gaps (null) it reads as zeros; false
+	// where it fails.
+	bool SparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		if (m_backing->BackingPieces(vaddr, size, pieces)) {
+			return true;
+		}
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock state(g_memory_state_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return false;
+		}
+		m_backing->SparsePieces(vaddr, size, pieces);
+		return true;
+	}
+
+	bool DiscardBacking(uint64_t address, uint64_t size) { return m_backing->DiscardPages(address, size); }
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
@@ -802,14 +1027,35 @@ private:
 	}
 
 	[[nodiscard]] bool OverlapsPrivateUnlocked(uint64_t vaddr, uint64_t size) const {
+		// Backing-store writes and reads ask this for a few bytes at a time, mostly within the
+		// mapping they asked for last (labels, query results, WRITE_DATA): remember, per thread,
+		// the last shared mapping that held the whole range until the mappings change.
+		struct LastShared {
+			const void* space      = nullptr;
+			uint64_t    generation = 0;
+			uint64_t    begin      = 0;
+			uint64_t    end        = 0;
+		};
+		thread_local LastShared last;
+		const auto generation = m_mapped_generation.load(std::memory_order_relaxed);
+		if (last.space == this && last.generation == generation && vaddr >= last.begin &&
+		    vaddr + size <= last.end) {
+			return false;
+		}
 		auto mapping = m_mapped.upper_bound(vaddr);
 		if (mapping != m_mapped.begin()) {
 			--mapping;
 		}
 		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
 			const auto& region = mapping->second;
-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+			if (region.vaddr + region.size <= vaddr) {
+				continue;
+			}
+			if (region.type == MappingType::Private) {
 				return true;
+			}
+			if (region.vaddr <= vaddr && vaddr + size <= region.vaddr + region.size) {
+				last = {this, generation, region.vaddr, region.vaddr + region.size};
 			}
 		}
 		return false;
@@ -837,6 +1083,7 @@ private:
 	}
 
 	void AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
+		m_mapped_generation.fetch_add(1, std::memory_order_relaxed);
 		m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type});
 	}
 
@@ -849,6 +1096,7 @@ private:
 			const auto original_end = original.vaddr + original.size;
 			const auto part_end     = std::min(end, original_end);
 			m_mapped.erase(it);
+			m_mapped_generation.fetch_add(1, std::memory_order_relaxed);
 			if (original.vaddr < current) {
 				AddMappedUnlocked(original.vaddr, current - original.vaddr, original.type);
 			}
@@ -1140,6 +1388,8 @@ private:
 
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Advances on every change of m_mapped (under the exclusive lock; read under either).
+	std::atomic<uint64_t>                       m_mapped_generation {1};
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;

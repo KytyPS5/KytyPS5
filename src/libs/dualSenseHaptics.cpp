@@ -1,5 +1,6 @@
 #include "libs/dualSenseHaptics.h"
 
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "libs/dualSenseBluetooth.h"
@@ -326,7 +327,10 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	if (frames == 0) {
 		return 0;
 	}
-	if (!stream->speaker &&
+	// Haptic audio is written for voice-coil actuators (a vehicle engine is a quiet continuous
+	// texture there) and makes rumble motors buzz without pause, so non-DualSense pads only rumble
+	// from it when the user asks (--pad-haptic-rumble); otherwise they only get scePadSetVibration.
+	if (!stream->speaker && Config::PadHapticRumbleEnabled() &&
 	    SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5) {
 		CloseDevice(stream);
 		stream->next_check = 0;

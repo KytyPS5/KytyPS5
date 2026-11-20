@@ -5,10 +5,28 @@
 
 #include <algorithm>
 #include <bit>
+#include <tuple>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// 76 (torn meshes on RTX 30/40, Ziva on): a guest wave64 run as halves passes values between lanes through LDS
+// with no barrier (CS_ZivaRBFInterpolate & co. reduce 32/16/8/4/2/1; lockstep on GCN). Between host invocations
+// that is a data race under the Vulkan memory model, which some NVIDIA compilers act on. A subgroup barrier
+// with workgroup-memory acquire/release before every LDS access orders it, like CUDA's __syncwarp. Halves keep
+// control flow subgroup-uniform (branches are votes), so every invocation reaches it. KYTY76_LDS_SYNC=0: off.
+void EmitLdsLaneSync(EmitterState& state, const IR::MemoryInfo& mem) {
+	// A BVH stack keeps each lane to its own LDS slots and must stay barrier-free.
+	if (!state.profile.lds_lane_sync || state.program.stage != ShaderType::Compute || mem.kind != IR::ResourceKind::Lds ||
+	    state.lane_count != 2 ||
+	    state.lds_storage_class != spv::StorageClassWorkgroup || state.program.info.bvh_stack) {
+		return;
+	}
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup), ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+}
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
@@ -77,8 +95,10 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 }
 
 uint32_t BufferLane(EmitterState& state) {
-	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+	// (ADD_TID: the GCN lane. A lane-local wave64 program's subgroup is half a wave: its index in the group.)
+	const auto id = state.lane_count == 1 && state.program.lane_local ? EmitLocalInvocationIndex(state)
+	                                                                  : EmitSubgroupLocalInvocationId(state);
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 63));
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -90,8 +110,21 @@ uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
 	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	// A stride read at run time: the bound buffer's, from the shader data. In table mode an unswizzled buffer's is
+	// its V#'s, from the block (EmitTableMode): the renderer gives a pair's program the V#s of every stride.
+	uint32_t stride_value = 0;
+	if (state.program.table_mode && !swizzle && mem.resource < state.table_strides.size()) {
+		stride_value = state.table_strides[mem.resource];
+	} else if (IR::HasRuntimeStride(packed)) {
+		const auto binding = state.program.info.buffers[mem.resource].descriptor_index;
+		stride_value       = binding < state.memory_strides.size() ? state.memory_strides[binding] : 0u;
+		if (stride_value == 0u) {
+			ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
+			                             "the buffer's run-time stride was not prepared");
+		}
+	}
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              stride_value != 0u ? stride_value : ConstantU32(state, stride),
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;
@@ -167,54 +200,202 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
+// The BufferCache caching page of a guest address: the index of its BDA page table entry and of
+// its bits in the fault buffer.
+uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
+	const auto type     = TypeU64(state);
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed   = Select(state, type, extended,
+	                             Binary(state, spv::OpISub, type, address,
+	                                    ConstantU64(state,
+	                                        LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                             address);
+	const auto page64   = Binary(state, spv::OpShiftRightLogical, type, packed,
+	                             ConstantU64(state, BufferCache::CACHING_PAGEBITS));
+	return Unary(state, spv::OpUConvert, TypeU32(state), page64);
+}
+
+// Sets the page's bit in the fault buffer bitmap at `bitmap_offset`. Most accesses find the bit
+// set already; only the first one to a page since the host last read the bitmap pays the atomic.
+void RecordBdaPageBit(EmitterState& state, uint32_t page, uint64_t bitmap_offset) {
+	const auto word = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
+	    ConstantU32(state, static_cast<uint32_t>(bitmap_offset / sizeof(uint32_t))));
+	const auto bit =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto pointer = FaultElementPointer(state, word);
+	const auto scope   = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	// Shaders that walk BVHs read device addresses in long dependent chains (node after node): the
+	// load of the bitmap word before each access cost them up to a third of their time. They OR
+	// without looking, with no branch. Other shaders keep the check, which saves the atomic traffic
+	// of shaders that read the same pages from many lanes.
+	if (state.program.info.bvh) {
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+		                          pointer, scope, relaxed, bit);
+		return;
+	}
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, scope, relaxed);
+	const auto missing =
+	    Binary(state, spv::OpIEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, bit), ConstantU32(state, 0));
+	EmitIfCondition(state, missing, [&]() {
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+		                          pointer, scope, relaxed, bit);
+	});
+}
+
+// The host learns which pages V#-table stores wrote.
+void RecordBdaWrite(EmitterState& state, uint32_t page) {
+	static_assert(BufferCache::WRITE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
+	              BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
+	RecordBdaPageBit(state, page, BufferCache::WRITE_BITMAP_OFFSET);
+}
+
 void RecordBdaFault(EmitterState& state, uint32_t page) {
 	const auto word =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
-	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	// One atomic OR: lanes faulting on pages of the same bitmap word keep each other's bits.
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+	                          FaultElementPointer(state, word), ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+}
+
+// What a dword of a page that no buffer backs yet reads as: zero, except in BVH traversal shaders:
+// there it reads as all ones, the absent-node link bvh_intersect returns, because guest list walks
+// end on negative links and would advance over zero entries forever.
+uint32_t MissingBdaDword(EmitterState& state) {
+	return ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
+}
+
+// The dword at a pointer of get_bda_pointer that is not zero.
+uint32_t EmitBdaPointerLoad(EmitterState& state, uint32_t bda, bool coherent) {
+	auto pointer = state.builder.AllocateId();
+	if (coherent) {
+		const auto block = state.builder.DecoratedType(
+		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+		                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
+		state.builder.AddFunction(
+		    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+		    pointer, bda);
+		const auto base = pointer;
+		pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
+		                          base, ConstantU32(state, 0));
+	} else {
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          bda);
+	}
+	const auto         value     = state.builder.AllocateId();
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessAlignedMask |
+	                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
+	                          alignment);
+	return value;
+}
+
+// The dword at a pointer of get_bda_pointer, or `missing` without a cached page (`bda` 0).
+uint32_t LoadBdaPointerDword(ValueEmitContext& ctx, uint32_t bda, bool coherent, uint32_t missing) {
+	auto&      state   = ctx.state;
+	const auto present =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
+		return EmitBdaPointerLoad(state, bda, coherent);
+	});
+}
+
+// The dword at `address`, `missing` without a cached page, and zero where `condition` (when there
+// is one) does not hold: a call of bda_load_u32 or bda_load_u32_g (see DefineBdaLoads). Every lane
+// makes the call and the guard is inside it, so no call of a program sits under a lane guard.
+uint32_t LoadBdaDwordIf(ValueEmitContext& ctx, uint32_t condition, uint32_t address, bool coherent = false) {
+	auto& state = ctx.state;
+	if (condition == ConstantBool(state, true)) condition = 0;
+	// The function is defined with the others at the end of the module, when its variants are known.
+	auto [entry, inserted] = state.bda_load_functions.try_emplace(
+	    std::array {uint32_t(coherent), uint32_t(condition != 0)}, 0u);
+	if (inserted) entry->second = state.builder.AllocateId();
+	const auto function = entry->second;
+	const auto result   = state.builder.AllocateId();
+	if (condition != 0) {
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result, function, condition, address);
+	} else {
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result, function, address);
+	}
+	return result;
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
-	auto&      state   = ctx.state;
-	const auto bda     = GetBdaPointer(state, address);
-	const auto present =
-	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
-	// A page that no buffer backs yet reads as zero, except in BVH traversal shaders: there it
-	// reads as all ones, the absent-node link bvh_intersect returns, because guest list walks end
-	// on negative links and would advance over zero entries forever.
-	const auto missing = ConstantU32(state, state.program.info.bvh ? ~0u : 0u);
-	return EmitValueOrDefaultIfCondition(state, present, TypeU32(state), missing, [&]() {
-		auto pointer = state.builder.AllocateId();
-		if (coherent) {
-			const auto block = state.builder.DecoratedType(
-			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
-			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
-			state.builder.AddFunction(
-			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
-			    pointer, bda);
-			const auto base = pointer;
-			pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
-			                          base, ConstantU32(state, 0));
-		} else {
-			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-			                          bda);
-		}
-		const auto         value     = state.builder.AllocateId();
-		constexpr uint32_t alignment = sizeof(uint32_t);
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask |
-		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
-		                          alignment);
-		return value;
-	});
+	return LoadBdaDwordIf(ctx, 0, address, coherent);
+}
+
+// The two dwords of a read that may cross into the next dword, with one get_bda_pointer: NVIDIA's
+// compiler inlines a copy at each call, and the copies for the next dword were half of them in
+// Demon's Souls' compute programs. The next dword is on the first one's page unless the first ends
+// the page; only then a second pass of the loop looks it up. The loads are in the loop, which
+// carries only the first dword into its second pass.
+std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint32_t aligned,
+                                                    uint32_t low, uint32_t crosses, bool coherent) {
+	auto&      state = ctx.state;
+	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
+	static_assert(BufferCache::CACHING_PAGESIZE <= (uint64_t {1} << 32u));
+	const auto last_dword =
+	    ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_PAGESIZE - 1u) & ~3u);
+	const auto next_page = Binary(
+	    state, spv::OpLogicalAnd, boolean, crosses,
+	    Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, low, last_dword),
+	           last_dword));
+	const auto same_page = Binary(state, spv::OpLogicalAnd, boolean, crosses,
+	                              Unary(state, spv::OpLogicalNot, boolean, next_page));
+	const auto preheader = state.current_label;
+	const auto header    = state.builder.AllocateId();
+	const auto body      = state.builder.AllocateId();
+	const auto latch     = state.builder.AllocateId();
+	const auto merge     = state.builder.AllocateId();
+	const auto pass      = state.builder.AllocateId();
+	const auto kept      = state.builder.AllocateId();
+	const auto first     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, header);
+	state.builder.AddFunction(spv::OpPhi, boolean, pass, ConstantBool(state, false), preheader,
+	                          ConstantBool(state, true), latch);
+	state.builder.AddFunction(spv::OpPhi, u32, kept, ConstantU32(state, 0), preheader, first, latch);
+	state.builder.AddFunction(spv::OpLoopMerge, merge, latch, spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranch, body);
+	EmitLabel(state, body);
+	const auto zero    = ConstantU64(state, 0);
+	const auto step    = Select(state, u64, pass, ConstantU64(state, sizeof(uint32_t)), zero);
+	const auto bda     = GetBdaPointer(state, Binary(state, spv::OpIAdd, u64, aligned, step));
+	const auto at      = LoadBdaPointerDword(ctx, bda, coherent, MissingBdaDword(state));
+	const auto next_at = Select(
+	    state, u64,
+	    Binary(state, spv::OpLogicalAnd, boolean, same_page,
+	           Binary(state, spv::OpINotEqual, boolean, bda, zero)),
+	    Binary(state, spv::OpIAdd, u64, bda, ConstantU64(state, sizeof(uint32_t))), zero);
+	// next_at is 0 for a missing page, but also for a read that stays in its dword, whose next
+	// dword must read zero (it is ORed in unshifted when the read is aligned).
+	const auto missing_next =
+	    state.program.info.bvh
+	        ? Select(state, u32, same_page, MissingBdaDword(state), ConstantU32(state, 0))
+	        : ConstantU32(state, 0);
+	const auto following = LoadBdaPointerDword(ctx, next_at, coherent, missing_next);
+	state.builder.AddFunction(spv::OpCopyObject, u32, first, Select(state, u32, pass, kept, at));
+	const auto second = Select(state, u32, pass, at, following);
+	state.builder.AddFunction(spv::OpBranch, latch);
+	EmitLabel(state, latch);
+	const auto again = Binary(state, spv::OpLogicalAnd, boolean, next_page,
+	                          Unary(state, spv::OpLogicalNot, boolean, pass));
+	state.builder.AddFunction(spv::OpBranchConditional, again, header, merge);
+	EmitLabel(state, merge);
+	return {first, second};
 }
 
 uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
@@ -223,18 +404,17 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
 		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned, coherent);
-		const auto byte =
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-		const auto crosses =
-		    bits == 8u ? ConstantBool(state, false)
-		               : Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
-		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))), coherent);
-		});
+		const auto low  = Unary(state, spv::OpUConvert, TypeU32(state), address);
+		const auto byte = Binary(state, spv::OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, 3));
+		uint32_t   first = 0, second = 0;
+		if (bits == 8u) {
+			first  = LoadBdaDword(ctx, aligned, coherent);
+			second = ConstantU32(state, 0);
+		} else {
+			const auto crosses = Binary(state, bits == 16u ? spv::OpUGreaterThan : spv::OpINotEqual,
+			                            TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
+			std::tie(first, second) = LoadBdaCrossingDwords(ctx, aligned, low, crosses, coherent);
+		}
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
 		const auto upper_shift =
@@ -257,7 +437,11 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
                      uint32_t prefix = 0) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
-		if (prefix == 0u) prefix = ctx.state.memory_byte_offsets[resource];
+		// (Table mode addresses each buffer from its V#'s base: EmitTableMode.)
+		if (prefix == 0u) {
+			prefix = ctx.state.program.table_mode ? ConstantU32(ctx.state, 0)
+			                                      : ctx.state.memory_byte_offsets[resource];
+		}
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -388,7 +572,25 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
+inline bool HasPrivateArrays(const EmitterState& state) {
+	return state.scratch_storage_class == spv::StorageClassPrivate || state.lds_storage_class == spv::StorageClassPrivate;
+}
+bool IsPrivateArray(const EmitterState& state, const MemoryResourceAccess& resource);
+uint32_t LoadPrivateArray(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                          uint32_t valid);
+void StorePrivateArray(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                       uint32_t valid, uint32_t data);
+
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
+	if (HasPrivateArrays(ctx.state) && (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Scratch)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (IsPrivateArray(ctx.state, resource)) {
+			const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+			return LoadPrivateArray(ctx, resource, index,
+			                        AndCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1),
+			                                     EmitMemoryElementInBounds(ctx.state, resource, index)));
+		}
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
@@ -408,22 +610,16 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index) {
-	const auto value   = ctx.state.builder.AllocateId();
-	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
-	                              resource.memory_access);
-	return value;
+	return EmitAccessLoad(ctx.state, TypeU32(ctx.state), EmitMemoryElementPointer(ctx.state, resource, index),
+	                      resource);
 }
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits) {
 	uint32_t value;
 	if (resource.element_bits < 32u) {
-		const auto loaded = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad,
-		                              ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, loaded,
-		                              EmitMemoryElementPointer(ctx.state, resource, index),
-		                              resource.memory_access);
+		const auto loaded = EmitAccessLoad(ctx.state, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
+		                                   EmitMemoryElementPointer(ctx.state, resource, index), resource);
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
@@ -520,11 +716,10 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           uint32_t bits, uint32_t data) {
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (resource.element_bits < 32u) {
-		ctx.state.builder.AddFunction(
-		    spv::OpStore, pointer,
-		    Unary(ctx.state, spv::OpUConvert,
-		          ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, data),
-		    resource.memory_access);
+		EmitAccessStore(ctx.state, pointer,
+		                Unary(ctx.state, spv::OpUConvert, ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type,
+		                      data),
+		                resource);
 		return;
 	}
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
@@ -579,9 +774,36 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	EmitAccessStore(ctx.state, EmitMemoryElementPointer(ctx.state, resource, index), data, resource);
+}
+
+// The per invocation arrays of a program with outlined call targets (Private variables) are read
+// at a clamped index and written back unchanged where the lane does not store: an access needs no
+// branch. The NVIDIA compiler gives every divergent branch inside a called function a convergence
+// mask, and Wolverine's hit groups lost the device in them (see DefineGetBdaPointerMasked).
+bool IsPrivateArray(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return (resource.kind == IR::ResourceKind::Scratch && state.scratch_storage_class == spv::StorageClassPrivate) ||
+	       (resource.kind == IR::ResourceKind::Lds && state.lds_storage_class == spv::StorageClassPrivate);
+}
+
+uint32_t PrivateArraySafeIndex(EmitterState& state, const MemoryResourceAccess& resource, uint32_t index) {
+	return EmitUMin32(state, index,
+	                  Binary(state, spv::OpISub, TypeU32(state), resource.length, ConstantU32(state, 1u)));
+}
+
+uint32_t LoadPrivateArray(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                          uint32_t valid) {
+	auto&      state = ctx.state;
+	const auto value = LoadWordInBounds(ctx, resource, PrivateArraySafeIndex(state, resource, index));
+	return Select(state, TypeU32(state), valid, value, ConstantU32(state, 0));
+}
+
+void StorePrivateArray(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                       uint32_t valid, uint32_t data) {
+	auto&      state = ctx.state;
+	const auto safe  = PrivateArraySafeIndex(state, resource, index);
+	const auto old   = LoadWordInBounds(ctx, resource, safe);
+	StoreWordInBounds(ctx, resource, safe, Select(state, TypeU32(state), valid, data, old));
 }
 
 template <typename Fn>
@@ -606,6 +828,20 @@ void ForEachLocalFlatAccess(ValueEmitContext& ctx, const IR::Inst& inst, Fn&& em
 }
 
 uint32_t LoadLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto private_array = [&](IR::ResourceKind kind) {
+		auto mem = ctx.Memory(inst);
+		mem.kind = kind;
+		return IsPrivateArray(ctx.state, PrepareMemoryResourceAccess(ctx.state, mem));
+	};
+	if (HasPrivateArrays(ctx.state) && private_array(IR::ResourceKind::Scratch) && private_array(IR::ResourceKind::Lds)) {
+		const auto exec   = ctx.Arg(inst, inst.NumArgs() - 1);
+		uint32_t   result = 0;
+		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
+			const auto value = LoadPrivateArray(ctx, resource, index, AndCondition(ctx.state, exec, valid));
+			result = result == 0 ? value : Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state), result, value);
+		});
+		return result;
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		uint32_t result = 0;
 		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
@@ -619,6 +855,19 @@ uint32_t LoadLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto private_array = [&](IR::ResourceKind kind) {
+		auto mem = ctx.Memory(inst);
+		mem.kind = kind;
+		return IsPrivateArray(ctx.state, PrepareMemoryResourceAccess(ctx.state, mem));
+	};
+	if (HasPrivateArrays(ctx.state) && private_array(IR::ResourceKind::Scratch) && private_array(IR::ResourceKind::Lds)) {
+		const auto exec = ctx.Arg(inst, inst.NumArgs() - 1);
+		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
+			StorePrivateArray(ctx, resource, index, AndCondition(ctx.state, exec, valid),
+			                  ctx.Arg(inst, inst.NumArgs() - 2));
+		});
+		return;
+	}
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		ForEachLocalFlatAccess(ctx, inst, [&](const auto& resource, uint32_t index, uint32_t valid) {
 			EmitIfCondition(ctx.state, valid, [&]() {
@@ -640,6 +889,17 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
+	if (HasPrivateArrays(ctx.state) && (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Scratch)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		if (IsPrivateArray(ctx.state, resource)) {
+			const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+			StorePrivateArray(ctx, resource, index,
+			                  AndCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1),
+			                               EmitMemoryElementInBounds(ctx.state, resource, index)),
+			                  ctx.Arg(inst, inst.NumArgs() - 2));
+			return;
+		}
+	}
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
 			StoreWordPrepared(ctx, inst, selected, resource, ctx.Arg(inst, inst.NumArgs() - 2));
@@ -885,15 +1145,16 @@ uint32_t LoadIndirectScalarBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                            ConstantU64(state, ctx.Memory(inst).offset & ~3u));
 	const auto  end =
 	    Binary(state, spv::OpIAdd, TypeU64(state), offset, ConstantU64(state, sizeof(uint32_t)));
-	return EmitValueOrZeroIfCondition(
-	    state, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size), [&]() {
-		    const auto base = PackU64(state,
-		                              Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-		                                     ctx.Arg(handle, 0), ConstantU32(state, ~3u)),
-		                              Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1,
-		                                     ConstantU32(state, 0xffffu)));
-		    return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), base, offset));
-	    });
+	const auto scalar_address = [&]() {
+		const auto base = PackU64(state,
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+		                                 ctx.Arg(handle, 0), ConstantU32(state, ~3u)),
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1,
+		                                 ConstantU32(state, 0xffffu)));
+		return Binary(state, spv::OpIAdd, TypeU64(state), base, offset);
+	};
+	return LoadBdaDwordIf(ctx, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size),
+	                      scalar_address());
 }
 
 struct IndirectBufferAccess {
@@ -1007,31 +1268,129 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 		const auto address = component == 0u ? base
 		                                     : Binary(state, spv::OpIAdd, TypeU64(state), base,
 		                                              ConstantU64(state, component * 4u));
-		values[component] = EmitValueOrZeroIfCondition(
-		    state, AndCondition(state, valid_format,
-		                        IndirectBufferInBounds(state, buffer, component * 4u,
-		                                               ConstantU32(state, bits / 8u), false)),
-		    [&]() {
-			    const auto value = LoadBdaDword(ctx, address, coherent);
-			    if (bits == 32u) return value;
-			    const auto byte = Binary(
-			        state, spv::OpBitwiseAnd, TypeU32(state),
-			        Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
-			        ConstantU32(state, bits == 8u ? 3u : 2u));
-			    return EmitBitFieldUExtract(
-			        state, value,
-			        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3u)),
-			        ConstantU32(state, bits));
-		    });
+		const auto condition = AndCondition(state, valid_format,
+		                                    IndirectBufferInBounds(state, buffer, component * 4u,
+		                                                           ConstantU32(state, bits / 8u), false));
+		const auto finish = [&](uint32_t value) {
+			if (bits == 32u) return value;
+			const auto byte = Binary(
+			    state, spv::OpBitwiseAnd, TypeU32(state),
+			    Unary(state, spv::OpUConvert, TypeU32(state), buffer.address),
+			    ConstantU32(state, bits == 8u ? 3u : 2u));
+			return EmitBitFieldUExtract(
+			    state, value,
+			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3u)),
+			    ConstantU32(state, bits));
+		};
+		values[component] = finish(LoadBdaDwordIf(ctx, condition, address, coherent));
 	}
 	return ConstructU32Composite(state, components, values);
 }
 
-uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
 	auto& state = ctx.state;
-	const auto geometry = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
-	                          state.indirect_format_geometry_function, buffer.format);
+	if (state.converged_calls) {
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		const auto bda     = GetBdaPointerMasked(state, aligned, active);
+		const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
+			constexpr uint32_t alignment = sizeof(uint32_t);
+			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask, alignment);
+			RecordBdaWrite(state, BdaPageIndex(state, aligned));
+		});
+		return;
+	}
+	EmitIfCondition(state, active, [&]() {
+		// RDNA2 DWORD accesses ignore the two low address bits.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		const auto bda     = GetBdaPointer(state, aligned);
+		const auto present =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+			constexpr uint32_t alignment = sizeof(uint32_t);
+			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+			                          alignment);
+			RecordBdaWrite(state, BdaPageIndex(state, aligned));
+		});
+	});
+}
+
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	const auto store = [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+		                           ConstantU32(state, 0));
+		if (state.converged_calls) valid_format = AndCondition(state, valid_format, ctx.Arg(inst, inst.NumArgs() - 1));
+		const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                         ConstantU64(state, ~uint64_t {3}));
+		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+		for (uint32_t component = 0; component < components; component++) {
+			auto value = data;
+			if (components != 1u) {
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data,
+				                          component);
+			}
+			const auto address = component == 0u ? base : Binary(
+			    state, spv::OpIAdd, TypeU64(state), base,
+			    ConstantU64(state, component * 4u));
+			StoreBdaDword(ctx, address,
+			              AndCondition(state, valid_format,
+			                           IndirectBufferInBounds(state, buffer, component * 4u,
+			                                                  ConstantU32(state, 4u), false)),
+			              value);
+		}
+	};
+	if (state.converged_calls) store();
+	else EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), store);
+}
+
+// A 32-bit integer atomic through a V# selected at runtime (IR::MemoryInfo::SupportsIndirectBufferAtomic):
+// it runs on the guest memory by device address where StoreIndirectBuffer() writes it. Memory without a
+// cached buffer records a fault and returns zero, as an indirect load reads it.
+uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto exec   = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto atomic = [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+		const auto valid  = AndCondition(
+		    state, Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
+		    IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false));
+		// RDNA2 DWORD accesses ignore the two low address bits.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		const auto run = [&](uint32_t bda) {
+			const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+			return EmitValueOrZeroIfCondition(state, present, [&]() {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda);
+				const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
+				RecordBdaWrite(state, BdaPageIndex(state, aligned));
+				return old;
+			});
+		};
+		if (state.converged_calls)
+			return run(GetBdaPointerMasked(state, aligned, AndCondition(state, valid, exec)));
+		return EmitValueOrZeroIfCondition(state, valid, [&]() { return run(GetBdaPointer(state, aligned)); });
+	};
+	if (state.converged_calls) return atomic();
+	return EmitValueOrZeroIfCondition(state, exec, atomic);
+}
+
+// One component of a formatted load through a V# selected at runtime: `selector` is the
+// component's DST_SEL (0 and 1 are constants, 4..7 the format's X..W).
+uint32_t LoadIndirectFormattedComponent(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                                        uint32_t geometry, uint32_t selector) {
+	auto& state = ctx.state;
 	const auto field = [&](uint32_t index) {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, geometry, index);
@@ -1040,7 +1399,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	const auto bytes = field(0);
 	const auto component = Binary(
 	    state, spv::OpUMod, TypeU32(state),
-	    Binary(state, spv::OpISub, TypeU32(state), buffer.selector, ConstantU32(state, 4)), field(1));
+	    Binary(state, spv::OpISub, TypeU32(state), selector, ConstantU32(state, 4)), field(1));
 	const auto alignment = Unary(state, spv::OpUConvert, TypeU64(state), field(3));
 	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 	                         Unary(state, spv::OpNot, TypeU64(state), alignment));
@@ -1050,27 +1409,52 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAcces
 	          Binary(state, spv::OpIMul, TypeU32(state), component, field(2))));
 	const auto memory = AndCondition(
 	    state, Binary(state, spv::OpINotEqual, TypeBool(state), bytes, ConstantU32(state, 0)),
-	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), buffer.selector,
-	           ConstantU32(state, 4)));
-	const auto raw = EmitValueOrZeroIfCondition(
-	    state, AndCondition(state, memory, IndirectBufferInBounds(state, buffer, 0u, bytes, true)),
-	    [&]() {
-		    // Format alignment and component spacing keep every selected component within one DWORD.
-		    const auto word = LoadBdaDword(
-		        ctx, Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
-		                    ConstantU64(state, ~uint64_t {3})));
-		    const auto byte = Binary(
-		        state, spv::OpBitwiseAnd, TypeU32(state),
-		        Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
-		    return Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
-		                  Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
-		                         ConstantU32(state, 3)));
-	    });
+	    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector, ConstantU32(state, 4)));
+	const auto raw_condition = AndCondition(state, memory, IndirectBufferInBounds(state, buffer, 0u, bytes, true));
+	const auto raw_address   = [&]() {
+		return Binary(state, spv::OpBitwiseAnd, TypeU64(state), address, ConstantU64(state, ~uint64_t {3}));
+	};
+	const auto raw_shifted = [&](uint32_t word) {
+		const auto byte = Binary(
+		    state, spv::OpBitwiseAnd, TypeU32(state),
+		    Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+		return Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+		              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3)));
+	};
+	// Format alignment and component spacing keep every selected component within one DWORD.
+	const auto raw = raw_shifted(LoadBdaDwordIf(ctx, raw_condition, raw_address()));
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFunctionCall, TypeU32(state), result,
-	                          state.indirect_format_function, buffer.format, buffer.selector,
+	                          state.indirect_format_function, buffer.format, selector,
 	                          component, raw);
 	return result;
+}
+
+uint32_t IndirectFormatGeometry(EmitterState& state, const IndirectBufferAccess& buffer) {
+	const auto geometry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
+	                          state.indirect_format_geometry_function, buffer.format);
+	return geometry;
+}
+
+// buffer_load_format_x/xy/xyz/xyzw through a runtime V#: each component takes its own DST_SEL
+// (X from the prepared buffer, the others from the V#'s DWORD 3 in `args`).
+uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
+                               const std::array<uint32_t, 8>& args, uint32_t components) {
+	auto& state = ctx.state;
+	const auto geometry = IndirectFormatGeometry(state, buffer);
+	if (components == 1u) {
+		return LoadIndirectFormattedComponent(ctx, buffer, geometry, buffer.selector);
+	}
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto selector =
+		    component == 0u ? buffer.selector
+		                    : EmitBitFieldUExtract(state, args[3], ConstantU32(state, component * 3u),
+		                                           ConstantU32(state, 3));
+		values[component] = LoadIndirectFormattedComponent(ctx, buffer, geometry, selector);
+	}
+	return ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1130,21 +1514,85 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	return result;
 }
 
+// Table mode: a formatted buffer specialized for no format takes it from its buffer word (IR::TablePlan::runtime_formats).
+bool UsesRuntimeFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return state.program.table_mode && mem.kind == IR::ResourceKind::Buffer && mem.formatted && !mem.typed &&
+	       mem.resource < 32u && ((state.program.table_plan.runtime_formats >> mem.resource) & 1u) != 0 &&
+	       mem.resource < state.table_buffer_words.size() && state.table_buffer_words[mem.resource] != 0u;
+}
+
+// A formatted load whose format and dst_sel are the buffer word's (the V#'s fourth dword, as a load through a V# selected
+// at run time decodes it: LoadIndirectFormattedComponent): the values LoadFormattedPrepared gives for that format, raw
+// dwords for no format.
+uint32_t LoadRuntimeFormatted(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                              const MemoryResourceAccess& resource, uint32_t components) {
+	auto&      state = ctx.state;
+	const auto u32   = TypeU32(state);
+	const auto word  = state.table_buffer_words[mem.resource];
+	const auto bits  = [&](uint32_t value, uint32_t offset, uint32_t count) {
+		return EmitBitFieldUExtract(state, value, ConstantU32(state, offset), ConstantU32(state, count));
+	};
+	const auto format   = bits(word, 12, 7);
+	const auto geometry = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, 4), geometry,
+	                          state.indirect_format_geometry_function, format);
+	const auto field = [&](uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, value, geometry, index);
+		return value;
+	};
+	const auto bytes   = field(0);
+	const auto unknown = Binary(state, spv::OpIEqual, TypeBool(state), bytes, ConstantU32(state, 0));
+	// The whole, unaligned element in bounds, then its aligned address (PrepareFormattedMemory).
+	const auto start = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto end   = Binary(state, spv::OpIAdd, u32, start,
+	                          Binary(state, spv::OpISub, u32,
+	                                 Select(state, u32, unknown, ConstantU32(state, 1), bytes), ConstantU32(state, 1)));
+	const auto in_bounds = BufferIndexInBounds(
+	    ctx, inst, mem, resource,
+	    AndCondition(state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), end, start),
+	                 EmitMemoryElementInBounds(
+	                     state, resource, Binary(state, spv::OpShiftRightLogical, u32, end, ConstantU32(state, 2)))));
+	const auto base = Binary(state, spv::OpBitwiseAnd, u32, start, Unary(state, spv::OpNot, u32, field(3)));
+	std::array<uint32_t, 4> values {};
+	for (uint32_t output = 0; output < components; output++) {
+		const auto selector  = bits(word, output * 3u, 3);
+		const auto component = Binary(state, spv::OpUMod, u32,
+		                              Binary(state, spv::OpISub, u32, selector, ConstantU32(state, 4)), field(1));
+		const auto address   = Binary(state, spv::OpIAdd, u32, base, Binary(state, spv::OpIMul, u32, component, field(2)));
+		const auto memory    = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), selector, ConstantU32(state, 4));
+		const auto dword     = EmitValueOrZeroIfCondition(state, AndCondition(state, memory, in_bounds), [&]() {
+			return LoadWordInBounds(ctx, resource, Binary(state, spv::OpShiftRightLogical, u32, address, ConstantU32(state, 2)));
+		});
+		const auto raw = Binary(state, spv::OpShiftRightLogical, u32, dword,
+		                        Binary(state, spv::OpShiftLeftLogical, u32,
+		                               Binary(state, spv::OpBitwiseAnd, u32, address, ConstantU32(state, 3)),
+		                               ConstantU32(state, 3)));
+		const auto decoded = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, u32, decoded, state.indirect_format_function, format, selector,
+		                          component, raw);
+		const auto plain = LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, output), resource);
+		values[output]   = Select(state, u32, unknown, plain, decoded);
+	}
+	return ConstructU32Composite(state, components, values);
+}
+
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
+		// Every lane calls the loader, which takes whether the lane executes as an argument.
+		const auto function = state.indirect_buffer_load_functions.at(
+		    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+		const auto args   = IndirectBufferArgs(ctx, inst);
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components), result,
+		                          function, args, ctx.Arg(inst, inst.NumArgs() - 1));
+		return result;
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
-		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
-			    const auto function = state.indirect_buffer_load_functions.at(
-			        {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
-			    const auto args = IndirectBufferArgs(ctx, inst);
-			    const auto result = state.builder.AllocateId();
-			    state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components),
-			                              result, function, args);
-			    return result;
-		    }
 		    return EmitBufferAccess(ctx, inst, mem, components, [&](const auto& selected, const auto& resource) {
 			    const auto info = Format::GetFormatInfo(
 			        selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
@@ -1152,9 +1600,67 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 				    return LoadFormattedPrepared(ctx, inst, selected, resource, info, components);
 			    }
 			    if (resource.object_pointer == 0u) return ConstantU32CompositeZero(state, components);
+			    if (UsesRuntimeFormat(state, selected)) {
+				    return LoadRuntimeFormatted(ctx, inst, selected, resource, components);
+			    }
 			    return LoadRawBuffer(ctx, inst, selected, resource, components);
 		    });
 	    });
+}
+
+static uint32_t ExtractU32(EmitterState& state, uint32_t composite, uint32_t component) {
+	const auto data = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite, component);
+	return data;
+}
+
+// A GLC/DLC DWORD pair store is one 64-bit write on the guest GPU: a reader of the pair (a single-pass
+// scan's look-back reads {flag, value} with one coherent load, see LoadRawBuffer()) never sees the new
+// flag with the old value. Two DWORD stores would let it, so an aligned pair inside the buffer is
+// stored at once through the 64-bit alias; anything else keeps the DWORD stores.
+template <typename Scalar>
+static void StoreRawBufferPair(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                               const MemoryResourceAccess& resource, uint32_t composite, Scalar&& scalar) {
+	auto&      state  = ctx.state;
+	const auto first  = ByteAddress(ctx, inst, mem, resource.byte_offset);
+	const auto second = ByteAddress(ctx, inst, RebaseRawComponent(mem, 1), resource.byte_offset);
+	const auto wide   = PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3],
+	                                                       resource.non_uniform ? resource.descriptor_index : 0u);
+	const auto index  = Binary(state, spv::OpShiftRightLogical, TypeU32(state), first, ConstantU32(state, 3));
+	auto       atomic = Binary(state, spv::OpIEqual, TypeBool(state),
+	                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 7)),
+	                           ConstantU32(state, 0));
+	atomic = AndCondition(state, atomic,
+	                      Binary(state, spv::OpIEqual, TypeBool(state), second,
+	                             EmitAddU32(state, first, ConstantU32(state, 4))));
+	atomic = AndCondition(state, atomic, EmitMemoryElementInBounds(state, wide, index));
+	// The DWORD stores check each DWORD against the V#: the pair is stored at once only when both pass.
+	for (uint32_t component = 0; component < 2u; component++) {
+		const auto word  = RebaseRawComponent(mem, component);
+		const auto dword = DwordIndex(ctx, inst, word, resource.byte_offset);
+		atomic = AndCondition(state, atomic,
+		                      BufferIndexInBounds(ctx, inst, word, resource,
+		                                          EmitStorageElementInBounds(state, resource, dword)));
+	}
+	const auto atomic_label = state.builder.AllocateId(), scalar_label = state.builder.AllocateId();
+	const auto merge        = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, atomic, atomic_label, scalar_label);
+	EmitLabel(state, atomic_label);
+	const auto pointer = EmitStorageBufferElementPointer(state, wide, index, TypeStorageBufferElementPointer(state, 64));
+	const auto low     = Unary(state, spv::OpUConvert, TypeU64(state), ExtractU32(state, composite, 0u));
+	const auto high    = Unary(state, spv::OpUConvert, TypeU64(state), ExtractU32(state, composite, 1u));
+	const auto value   = Binary(state, spv::OpBitwiseOr, TypeU64(state), low,
+	                            Binary(state, spv::OpShiftLeftLogical, TypeU64(state), high, ConstantU32(state, 32)));
+	state.builder.AddFunction(spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsReleaseMask |
+	                                                 spv::MemorySemanticsUniformMemoryMask),
+	                          value);
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, scalar_label);
+	scalar();
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, merge);
 }
 
 void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
@@ -1167,6 +1673,15 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 			    selected.formatted ? BufferFormat(ctx, selected) : Prospero::BufferFormat::kInvalid);
 			if (info.type != Format::ComponentType::Unknown) {
 				StoreFormattedPrepared(ctx, inst, selected, resource, info, composite, components);
+				return;
+			}
+			if (selected.IsCoherentBufferPairStore(inst.GetOpcode()) && resource.object_pointer != 0u) {
+				StoreRawBufferPair(ctx, inst, selected, resource, composite, [&]() {
+					for (uint32_t component = 0; component < components; component++) {
+						const auto data = ExtractU32(state, composite, component);
+						StoreWordPrepared(ctx, inst, RebaseRawComponent(selected, component), resource, data);
+					}
+				});
 				return;
 			}
 			for (uint32_t component = 0; component < components; component++) {
@@ -1263,7 +1778,7 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	const auto raw = state.builder.AllocateId();
 	state.builder.AddName(state.indirect_format_function, "convert_indirect_buffer_format");
 	state.builder.AddFunction(spv::OpFunction, type, state.indirect_format_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          SharedHelperControl(state), function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, format);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, selector);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, component);
@@ -1310,6 +1825,27 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 
 void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
+	// Table mode decodes the formats of its runtime format buffers with the same functions (LoadRuntimeFormatted).
+	if (state.program.table_mode && state.indirect_format_function == 0u) {
+		const auto& buffers = state.program.info.buffers;
+		for (size_t i = 0; i < buffers.size() && i < 32; ++i) {
+			if (((state.program.table_plan.runtime_formats >> i) & 1u) != 0 &&
+			    buffers[i].descriptor_format == Prospero::BufferFormat::kInvalid) {
+				DefineIndirectBufferFormats(ctx);
+				break;
+			}
+		}
+	}
+	// The native ray tracing alpha test reads index buffers through runtime V#s.
+	if (state.program.info.ray_query) {
+		for (const auto* block: state.program.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == IR::ValueOpcode::RayQueryAlpha && state.indirect_format_function == 0u) {
+					DefineIndirectBufferFormats(ctx);
+				}
+			}
+		}
+	}
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
 			const auto components = IR::BufferComponentCount(inst.GetOpcode());
@@ -1328,22 +1864,167 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			const auto type = TypeU32(state);
 			const auto result_type = TypeU32Composite(state, components);
 			const auto signature = state.builder.Type(
-			    spv::OpTypeFunction, result_type, type, type, type, type, type, type, type, type);
+			    spv::OpTypeFunction, result_type, type, type, type, type, type, type, type, type,
+			    TypeBool(state));
 			const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "") +
 			                  (memory.formatted ? "_formatted" : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
-			                          spv::FunctionControlMaskNone, signature);
+			                          SharedHelperControl(state), signature);
 			std::array<uint32_t, 8> args;
 			for (auto& arg: args) {
 				arg = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpFunctionParameter, type, arg);
 			}
+			const auto active = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionParameter, TypeBool(state), active);
 			EmitLabel(state, state.builder.AllocateId());
+			// A lane that is not executing loads nothing: its V# has no format.
+			args[3] = Select(state, type, active, args[3],
+			                 Binary(state, spv::OpBitwiseAnd, type, args[3], ConstantU32(state, ~(0x7fu << 12))));
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormattedX(ctx, buffer)
+			const auto result = memory.formatted ? LoadIndirectFormatted(ctx, buffer, args, components)
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
+			std::array<uint32_t, 4> values {};
+			for (uint32_t component = 0; component < components; component++) {
+				values[component] = Select(state, type, active,
+				                           components == 1u ? result : ExtractU32(state, result, component),
+				                           ConstantU32(state, 0));
+			}
+			state.builder.AddFunction(spv::OpReturnValue, ConstructU32Composite(state, components, values));
+			state.builder.AddFunction(spv::OpFunctionEnd);
+		}
+	}
+}
+
+void EmitRayCounts(EmitterState& state, uint32_t guest, uint32_t native) {
+	EXIT_IF(state.fault_buffer_variable == 0);
+	const auto hash  = state.program.shader_hash;
+	const auto first = BufferCache::HACK_MARKS_OFFSET / sizeof(uint32_t) +
+	                   uint64_t {BufferCache::HackMarkEntry(hash)} * BufferCache::HACK_MARK_DWORDS;
+	const auto low   = static_cast<uint32_t>(hash);
+	const auto high  = static_cast<uint32_t>(hash >> 32u);
+	const std::array<std::pair<uint32_t, uint32_t>, 6> updates {{
+	    {0, ConstantU32(state, low)},
+	    {1, ConstantU32(state, high)},
+	    {2, ConstantU32(state, ~low)},
+	    {3, ConstantU32(state, ~high)},
+	    {BufferCache::HACK_MARK_GUEST_RAYS, guest},
+	    {BufferCache::HACK_MARK_NATIVE_RAYS, native},
+	}};
+	const auto pointer_type = TypeStorageBufferElementPointer(state);
+	const auto scope        = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed      = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	for (const auto& [dword, value]: updates) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, state.fault_buffer_variable,
+		                          ConstantU32(state, 0), ConstantU32(state, static_cast<uint32_t>(first + dword)));
+		state.builder.AddFunction(dword < BufferCache::HACK_MARK_COUNTS ? spv::OpAtomicOr : spv::OpAtomicIAdd,
+		                          TypeU32(state), state.builder.AllocateId(), pointer, scope, relaxed, value);
+	}
+}
+
+// get_bda_pointer(address) for a lane that is `active`; the others look up nothing, record nothing and
+// get no pointer. The NVIDIA compiler gives a function that is called from a lane guard (`if (exec)`,
+// the lanes of a call target that execute) a software mask, and Wolverine's 0x1a04c58a9fbc2052
+// (ray tracing hit groups called through a table) lost the device with "Illegal Instruction
+// Parameter" at the reconvergence of a branch inside such a helper, with real data only. Every call
+// of an outlined program's memory accesses is made by all lanes instead and takes the guard as an
+// argument.
+void DefineGetBdaPointerMasked(EmitterState& state) {
+	const auto type          = TypeU64(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type, TypeBool(state));
+	state.bda_masked_function = state.builder.AllocateId();
+	const auto address        = state.builder.AllocateId();
+	const auto active         = state.builder.AllocateId();
+	state.builder.AddName(state.bda_masked_function, "get_bda_pointer_masked");
+	state.builder.AddFunction(spv::OpFunction, type, state.bda_masked_function, SharedHelperControl(state),
+	                          function_type);
+	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
+	state.builder.AddFunction(spv::OpFunctionParameter, TypeBool(state), active);
+	EmitLabel(state, state.builder.AllocateId());
+	const auto lane_address  = Select(state, type, active, address, ConstantU64(state, 0));
+	const auto page          = BdaPageIndex(state, lane_address);
+	const auto entry_pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64), entry_pointer,
+	                          state.bda_pagetable_variable, ConstantU32(state, 0), page);
+	const auto base = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
+	EmitIfCondition(state, AndCondition(state, active, Unary(state, spv::OpLogicalNot, TypeBool(state), missing)),
+	                [&]() { RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET); });
+	EmitIfCondition(state, AndCondition(state, active, missing), [&]() { RecordBdaFault(state, page); });
+	const auto offset = Binary(state, spv::OpBitwiseAnd, type, lane_address,
+	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
+	state.builder.AddFunction(spv::OpReturnValue,
+	                          Select(state, type, missing, ConstantU64(state, 0),
+	                                 Binary(state, spv::OpIAdd, type, base, offset)));
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+// bda_load_u32(address) and bda_load_u32_g(condition, address): the dword at a guest address, as
+// get_bda_pointer and a load from its pointer at every site would read it (the page's use and fault
+// bits, `missing` where no buffer backs the page); the guarded one reads zero where its condition
+// does not hold. A function of its own, rather than a copy of a diamond of three blocks and a Phi
+// at each of the thousands of reads of V#s and tables of a ray tracing program, is what the NVIDIA
+// compiler takes: Wolverine's 0x1a04c58a9fbc2052 takes 232 s and 7.4 GB with the copies. Only the
+// variants the program calls are defined, after its functions (by `coherent`, a volatile load, and
+// by whether there is a guard).
+void DefineBdaLoads(EmitterState& state) {
+	if (state.bda_load_functions.empty()) return;
+	const auto u32 = TypeU32(state), u64 = TypeU64(state), boolean = TypeBool(state);
+	state.current_block = nullptr;
+	for (const auto& [key, function]: state.bda_load_functions) {
+		const auto [coherent, guarded] = key;
+		{
+			const auto function_type = guarded != 0u
+			    ? state.builder.Type(spv::OpTypeFunction, u32, boolean, u64)
+			    : state.builder.Type(spv::OpTypeFunction, u32, u64);
+			const auto name = std::string("bda_load_u32") + (coherent != 0u ? "_coherent" : "") +
+			                  (guarded != 0u ? "_g" : "");
+			state.builder.AddName(function, name.c_str());
+			state.builder.AddFunction(spv::OpFunction, u32, function, SharedHelperControl(state),
+			                          function_type);
+			const auto condition = guarded != 0u ? state.builder.AllocateId() : 0u;
+			const auto address   = state.builder.AllocateId();
+			if (guarded != 0u) state.builder.AddFunction(spv::OpFunctionParameter, boolean, condition);
+			state.builder.AddFunction(spv::OpFunctionParameter, u64, address);
+			EmitLabel(state, state.builder.AllocateId());
+			const auto body = [&]() {
+				const auto page          = BdaPageIndex(state, address);
+				const auto entry_pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
+				                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
+				                          page);
+				const auto base = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, u64, base, entry_pointer);
+				RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET);
+				const auto missing = Binary(state, spv::OpIEqual, boolean, base, ConstantU64(state, 0));
+				const auto fault_label = state.builder.AllocateId();
+				const auto load_label  = state.builder.AllocateId();
+				const auto merge_label = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+				state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, load_label);
+				EmitLabel(state, fault_label);
+				RecordBdaFault(state, page);
+				state.builder.AddFunction(spv::OpBranch, merge_label);
+				EmitLabel(state, load_label);
+				const auto offset = Binary(state, spv::OpBitwiseAnd, u64, address,
+				                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
+				const auto value = EmitBdaPointerLoad(state, Binary(state, spv::OpIAdd, u64, base, offset),
+				                                      coherent != 0u);
+				const auto load_exit = state.current_label;
+				state.builder.AddFunction(spv::OpBranch, merge_label);
+				EmitLabel(state, merge_label);
+				const auto result = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpPhi, u32, result, MissingBdaDword(state), fault_label, value,
+				                          load_exit);
+				return result;
+			};
+			const auto result = guarded != 0u
+			    ? EmitValueOrDefaultIfCondition(state, condition, u32, ConstantU32(state, 0), body)
+			    : body();
 			state.builder.AddFunction(spv::OpReturnValue, result);
 			state.builder.AddFunction(spv::OpFunctionEnd);
 		}
@@ -1361,46 +2042,231 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto entry_label     = state.builder.AllocateId();
 	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
 	state.builder.AddFunction(spv::OpFunction, type, state.bda_pointer_function,
-	                          spv::FunctionControlMaskNone, function_type);
+	                          SharedHelperControl(state), function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
-	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
-	const auto packed   = Select(
-	    state, type, extended,
-	    Binary(state, spv::OpISub, type, address,
-	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
-	    address);
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	const auto page          = BdaPageIndex(state, address);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
-	const auto entry = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, type, entry, entry_pointer);
-	const auto unbacked =
-	    Binary(state, spv::OpIEqual, TypeBool(state), entry, ConstantU64(state, 0));
+	const auto base = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
+	// The host releases cached buffers no access used for a long time: record the access (a page
+	// without a buffer has no owner to keep).
+	static_assert(BufferCache::USE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
+	              BufferCache::USE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
+	RecordBdaPageBit(state, page, BufferCache::USE_BITMAP_OFFSET);
+	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
+	// The NVIDIA compiler inlines this function at every call: the fault path only records the
+	// fault, and the pointer is a select rather than a Phi of two paths.
 	const auto fault_label = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, unbacked, fault_label, merge_label);
+	state.builder.AddFunction(spv::OpBranchConditional, missing, fault_label, merge_label);
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
-	state.builder.AddFunction(spv::OpReturnValue, ConstantU64(state, 0));
+	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
 	const auto offset = Binary(state, spv::OpBitwiseAnd, type, address,
 	                           ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-	state.builder.AddFunction(spv::OpReturnValue, Binary(state, spv::OpIAdd, type, entry, offset));
+	const auto result = Select(state, type, missing, ConstantU64(state, 0),
+	                           Binary(state, spv::OpIAdd, type, base, offset));
+	state.builder.AddFunction(spv::OpReturnValue, result);
 	state.builder.AddFunction(spv::OpFunctionEnd);
+	if (state.converged_calls) {
+		DefineGetBdaPointerMasked(state);
+	}
+}
+
+uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result, state.bda_masked_function, address,
+	                          active);
+	return result;
+}
+
+uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address) {
+	return LoadBdaDword(ctx, Binary(ctx.state, spv::OpBitwiseAnd, TypeU64(ctx.state), address,
+	                                ConstantU64(ctx.state, ~uint64_t {3})));
+}
+
+GuestObject EmitGuestObject(ValueEmitContext& ctx, uint32_t address, uint32_t size) {
+	auto&      state  = ctx.state;
+	const auto wide   = TypeU64(state);
+	const auto inside = Binary(
+	    state, spv::OpULessThanEqual, TypeBool(state),
+	    Binary(state, spv::OpIAdd, wide,
+	           Binary(state, spv::OpBitwiseAnd, wide, address, ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1)),
+	           ConstantU64(state, size)),
+	    ConstantU64(state, BufferCache::CACHING_PAGESIZE));
+	const auto host = EmitValueOrDefaultIfCondition(state, inside, wide, ConstantU64(state, 0),
+	                                                [&]() { return GetBdaPointer(state, address); });
+	return {address, host, inside};
+}
+
+uint32_t EmitGuestObjectDword(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset) {
+	return EmitGuestObjectDwordAt(ctx, object, ConstantU32(ctx.state, offset & ~3u));
+}
+
+uint32_t EmitGuestObjectDwordAt(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset_id) {
+	auto&      state = ctx.state;
+	const auto wide  = TypeU64(state);
+	const auto offset64 = Unary(state, spv::OpUConvert, wide, offset_id);
+	const auto fast  = EmitValueOrZeroIfCondition(
+	    state,
+	    AndCondition(state, object.inside,
+	                 Binary(state, spv::OpINotEqual, TypeBool(state), object.host, ConstantU64(state, 0))),
+	    [&]() {
+		    const auto pointer = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                              Binary(state, spv::OpIAdd, wide, object.host, offset64));
+		    const auto value = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask,
+		                              uint32_t {sizeof(uint32_t)});
+		    return value;
+	    });
+	// An object across pages: each access translates its own address.
+	const auto slow = EmitValueOrZeroIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), object.inside), [&]() {
+		return EmitGuestDwordLoad(ctx, Binary(state, spv::OpIAdd, wide, object.address, offset64));
+	});
+	return Select(state, TypeU32(state), object.inside, fast, slow);
+}
+
+void EmitScalarBufferObject(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp, uint32_t offset,
+                            uint32_t size, ScalarBufferObject& object) {
+	auto&      state  = ctx.state;
+	const auto wide   = TypeU64(state);
+	const auto stride = EmitBitFieldUExtract(state, vsharp[1], ConstantU32(state, 16), ConstantU32(state, 14));
+	object.size = Binary(state, spv::OpIMul, wide,
+	                     Unary(state, spv::OpUConvert, wide, EmitUMax32(state, stride, ConstantU32(state, 1))),
+	                     Unary(state, spv::OpUConvert, wide, vsharp[2]));
+	object.offset = Unary(state, spv::OpUConvert, wide,
+	                      Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u)));
+	const auto base = PackU64(
+	    state, Binary(state, spv::OpBitwiseAnd, TypeU32(state), vsharp[0], ConstantU32(state, ~3u)),
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), vsharp[1], ConstantU32(state, 0xffffu)));
+	object.object = EmitGuestObject(ctx, Binary(state, spv::OpIAdd, wide, base, object.offset), size);
+}
+
+uint32_t EmitScalarBufferObjectDword(ValueEmitContext& ctx, const ScalarBufferObject& object, uint32_t offset) {
+	auto&      state = ctx.state;
+	const auto wide  = TypeU64(state);
+	const auto end   = Binary(state, spv::OpIAdd, wide, object.offset, ConstantU64(state, offset + sizeof(uint32_t)));
+	return EmitValueOrZeroIfCondition(state, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, object.size),
+	                                  [&]() { return EmitGuestObjectDword(ctx, object.object, offset); });
+}
+
+// As LoadIndirectScalarBuffer: the buffer is NUM_RECORDS * max(STRIDE, 1) bytes.
+uint32_t EmitScalarBufferDwordLoad(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                   uint32_t offset) {
+	auto&      state  = ctx.state;
+	const auto wide   = TypeU64(state);
+	const auto stride = EmitBitFieldUExtract(state, vsharp[1], ConstantU32(state, 16), ConstantU32(state, 14));
+	const auto size   = Binary(state, spv::OpIMul, wide,
+	                           Unary(state, spv::OpUConvert, wide, EmitUMax32(state, stride, ConstantU32(state, 1))),
+	                           Unary(state, spv::OpUConvert, wide, vsharp[2]));
+	const auto byte   = Unary(state, spv::OpUConvert, wide,
+	                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u)));
+	const auto end    = Binary(state, spv::OpIAdd, wide, byte, ConstantU64(state, sizeof(uint32_t)));
+	const auto dword_address = [&]() {
+		const auto base = PackU64(
+		    state, Binary(state, spv::OpBitwiseAnd, TypeU32(state), vsharp[0], ConstantU32(state, ~3u)),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), vsharp[1], ConstantU32(state, 0xffffu)));
+		return Binary(state, spv::OpIAdd, wide, base, byte);
+	};
+	return LoadBdaDwordIf(ctx, Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size),
+	                      dword_address());
+}
+
+uint32_t EmitFormattedBufferLoadX(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                  uint32_t index) {
+	auto&      state = ctx.state;
+	const auto zero  = ConstantU32(state, 0);
+	const std::array<uint32_t, 8> args {vsharp[0], vsharp[1], vsharp[2], vsharp[3], index, zero, zero,
+	                                    BufferLane(state)};
+	return LoadIndirectFormatted(ctx, PrepareIndirectBuffer(state, args, true), args, 1u);
+}
+
+// Index buffers of 16 or 32-bit unsigned elements are read through one translation; other V#s
+// take the generic formatted load per element.
+std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                            uint32_t first) {
+	auto&      state = ctx.state;
+	const auto u = TypeU32(state), b = TypeBool(state), wide = TypeU64(state);
+	const auto vector = TypeU32Vector(state, 3);
+	const auto field = [&](uint32_t word, uint32_t offset, uint32_t count) {
+		return EmitBitFieldUExtract(state, word, ConstantU32(state, offset), ConstantU32(state, count));
+	};
+	const auto equal = [&](uint32_t value, uint32_t constant) {
+		return Binary(state, spv::OpIEqual, b, value, ConstantU32(state, constant));
+	};
+	const auto format = field(vsharp[3], 12, 7);
+	const auto stride = field(vsharp[1], 16, 14);
+	const auto narrow = AndCondition(state, equal(format, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt)),
+	                                 equal(stride, 2));
+	const auto dwords = AndCondition(state, equal(format, static_cast<uint32_t>(Prospero::BufferFormat::k32UInt)),
+	                                 equal(stride, 4));
+	// Structured (OOB_SELECT 0), unswizzled, no lane added to the index, X from memory.
+	const auto plain = AndCondition(
+	    state,
+	    AndCondition(state, AndCondition(state, equal(field(vsharp[1], 31, 1), 0), equal(field(vsharp[3], 23, 1), 0)),
+	                 equal(field(vsharp[3], 28, 2), 0)),
+	    equal(field(vsharp[3], 0, 3), 4));
+	const auto fast = AndCondition(state, plain, Binary(state, spv::OpLogicalOr, b, narrow, dwords));
+	const auto zero = ConstantU32CompositeZero(state, 3);
+	const auto compose = [&](const std::array<uint32_t, 3>& values) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, vector, result, values[0], values[1], values[2]);
+		return result;
+	};
+	// 16 bytes from the dword holding the first element cover the three.
+	const auto fast_values = EmitValueOrDefaultIfCondition(state, fast, vector, zero, [&]() {
+		const auto base    = PackU64(state, vsharp[0], field(vsharp[1], 0, 16));
+		const auto start   = Binary(state, spv::OpIAdd, wide, base,
+		                            Unary(state, spv::OpUConvert, wide, Binary(state, spv::OpIMul, u, first, stride)));
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, wide, start, ConstantU64(state, ~uint64_t {3}));
+		const auto object  = EmitGuestObject(ctx, aligned, 16);
+		const auto bias    = Unary(state, spv::OpUConvert, u, Binary(state, spv::OpBitwiseAnd, wide, start, ConstantU64(state, 3)));
+		std::array<uint32_t, 3> values {};
+		for (uint32_t k = 0; k < 3; k++) {
+			const auto byte  = Binary(state, spv::OpIAdd, u, bias, Binary(state, spv::OpIMul, u, ConstantU32(state, k), stride));
+			const auto value = EmitGuestObjectDwordAt(ctx, object, Binary(state, spv::OpBitwiseAnd, u, byte, ConstantU32(state, ~3u)));
+			const auto shift = Binary(state, spv::OpShiftLeftLogical, u,
+			                          Binary(state, spv::OpBitwiseAnd, u, byte, ConstantU32(state, 3)), ConstantU32(state, 3));
+			const auto element =
+			    Select(state, u, narrow,
+			           Binary(state, spv::OpBitwiseAnd, u, Binary(state, spv::OpShiftRightLogical, u, value, shift),
+			                  ConstantU32(state, 0xffffu)),
+			           value);
+			const auto in_bounds =
+			    Binary(state, spv::OpULessThan, b, Binary(state, spv::OpIAdd, u, first, ConstantU32(state, k)), vsharp[2]);
+			values[k] = Select(state, u, in_bounds, element, ConstantU32(state, 0));
+		}
+		return compose(values);
+	});
+	const auto slow_values = EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, b, fast), vector, zero, [&]() {
+		std::array<uint32_t, 3> values {};
+		for (uint32_t k = 0; k < 3; k++) {
+			values[k] = EmitFormattedBufferLoadX(ctx, vsharp, Binary(state, spv::OpIAdd, u, first, ConstantU32(state, k)));
+		}
+		return compose(values);
+	});
+	const auto selected = Select(state, vector, fast, fast_values, slow_values);
+	std::array<uint32_t, 3> result {};
+	for (uint32_t k = 0; k < 3; k++) {
+		result[k] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u, result[k], selected, k);
+	}
+	return result;
 }
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) return AtomicIndirectBuffer(ctx, inst);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
@@ -1569,6 +2435,14 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
+	if (state.program.table_mode) {
+		// A slot the block does not give the shader only addresses planning-only loads (IR::EnterTableMode), which
+		// emit nothing.
+		const auto slot = inst.Arg(1).Resolve().U32();
+		return slot < state.table_slot_values.size() && state.table_slot_values[slot] != 0
+		           ? state.table_slot_values[slot]
+		           : ConstantU32(state, 0);
+	}
 	if (state.flattened_srt_variable == 0) {
 		ctx.Fail(inst, "requires the flattened SRT descriptor");
 	}
@@ -1596,6 +2470,22 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (!offset.IsImmediate() && mem.offset >= 4u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
 	}
+	if (const auto& resource = state.program.info.buffers.at(mem.resource);
+	    resource.uniform_index != UINT32_MAX) {
+		// The uniform view shares the storage view's base, so the same byte offset applies.
+		const auto element = Binary(
+		    state, spv::OpIAdd, TypeU32(state), index,
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		           state.memory_byte_offsets[resource.descriptor_index], ConstantU32(state, 2)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassUniform, TypeU32(state)),
+		                          pointer, state.uniform_buffer_variable,
+		                          ConstantU32(state, resource.uniform_index), ConstantU32(state, 0),
+		                          element);
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer));
+		return;
+	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
 	auto element = Binary(
@@ -1611,8 +2501,8 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto condition = EmitStorageElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           return EmitAccessLoad(state, TypeU32(state), EmitMemoryElementPointer(state, access, element),
+		                                 access);
 	           }));
 }
 
@@ -1642,6 +2532,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
 	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
+	EmitLdsLaneSync(ctx.state, mem);
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
@@ -1675,8 +2566,11 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
+	EmitLdsLaneSync(ctx.state, mem);
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
 	else if (buffer_components > 1u)
 		StoreBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)

@@ -9,6 +9,33 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+// flat_slot: the flattened SRT dword that is the load's only use, else NoFlatSlot.
+using SrtLoadRecorder = void (*)(void* userdata, uint64_t address, uint32_t value,
+                                 uint32_t flat_slot);
+// The loads of a walk at once, in order: pairs of the address and the value | flat_slot << 32.
+// Loads below SrtGuestMemoryStart are included: their bytes read zero on every thread.
+using SrtLoadsRecorder = void (*)(void* userdata, std::span<const uint64_t> loads);
+// Guest memory starts here: nothing is mapped below.
+inline constexpr uint64_t SrtGuestMemoryStart = 0x40000;
+inline constexpr uint32_t NoFlatSlot = UINT32_MAX;
+// A load whose value is only one descriptor word with bits the execution thread may refresh
+// (DescriptorRefreshMask()) reports DescriptorSlot(source, word) instead of a flat slot.
+inline constexpr uint32_t DescriptorSlotFlag = 0x80000000u;
+// A load whose value is only a bound tested for zero (`lane < n` with an unknown lane) reports
+// ZeroTestSlot: the resolution depends only on whether the value is 0.
+inline constexpr uint32_t ZeroTestSlot = UINT32_MAX - 1u;
+constexpr uint32_t DescriptorSlot(uint32_t source, uint32_t word) {
+	return DescriptorSlotFlag | (source << 3u) | word;
+}
+constexpr bool IsDescriptorSlot(uint32_t slot) {
+	return slot != NoFlatSlot && slot != ZeroTestSlot && (slot & DescriptorSlotFlag) != 0;
+}
+constexpr uint32_t DescriptorSlotSource(uint32_t slot) {
+	return (slot & ~DescriptorSlotFlag) >> 3u;
+}
+constexpr uint32_t DescriptorSlotWord(uint32_t slot) {
+	return slot & 7u;
+}
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -28,10 +55,26 @@ struct ImageHeapView {
 	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
 };
 
+// The candidates of a sampled root that selects descriptors through records (tables that
+// GPU-chosen records name, see ResourceMaterialization): the host keeps them resident in device
+// slot words, a leading null slot and then one slot per candidate, as a table view keeps its
+// table's descriptors, so the host can replace an element whose image changed.
+struct ImageHeapList {
+	const void*                      owner    = nullptr; // With resource, names the root's list.
+	uint32_t                         resource = 0;
+	const ImageResource*             root     = nullptr;
+	std::span<const DescriptorValue> values;
+};
+
 class ImageHeapSource {
 public:
 	// False when the host does not keep the table resident.
 	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
+	// Fills view: value i selects slot i + 1, slot 0 and the slots past the values are null. False
+	// when the host does not keep the descriptors resident.
+	virtual bool AcquireList(const ImageHeapList& /*list*/, ImageHeapView& /*view*/) {
+		return false;
+	}
 
 protected:
 	~ImageHeapSource() = default;
@@ -45,6 +88,29 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	// A walk ahead of execution: a guest load that faults fails the walk instead of resolving
+	// the fault (GPU-written bytes cannot be downloaded there), and the walk reports every load
+	// above the null page with the value it read. A load whose value only fills a flattened SRT
+	// dword reports that dword: nothing else the walk resolved depends on its bytes.
+	SrtLoadRecorder           record_load           = nullptr;
+	// Optional with record_load: takes all the loads of a walk in one call instead.
+	SrtLoadsRecorder          record_loads          = nullptr;
+	// A walk ahead of execution: whether the GPU produces the dword at an address (a dispatch
+	// resolved lately writes it). A load whose value only decides control flow is not read there:
+	// a bound tested for zero (`lane < n` with an unknown lane: no lane when n is 0) or a value
+	// that only branch conditions depend on stays unknown, which reaches both sides. Its bytes may
+	// not be written yet.
+	bool (*gpu_produced)(uint64_t address) = nullptr;
+	// A walk ahead of execution: the dword that writes of earlier operations leave at an address
+	// before they execute (false when none covers it). The walk reads it instead of guest memory,
+	// which gets it only when the write executes.
+	bool (*pending_write)(uint64_t address, uint32_t& value) = nullptr;
+	// The runtime words of an expanded program (ShaderSource::call_words): they follow the
+	// walked SRT words in the flattened SRT, where ReadCallWord reads them.
+	std::span<const uint32_t> call_words;
+	// The program's modules read the strides of their buffers at run time (HasRuntimeStride()):
+	// the specialization holds RuntimeBufferStride for the buffers that can.
+	bool runtime_stride = false;
 };
 
 class SrtReadCapture {
@@ -79,9 +145,27 @@ bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
+// How walker loads read a 4 KiB guest page: directly, from bytes the emulator points to, or by
+// asking the emulator for each dword.
+enum class SrtWalkerPage : uint8_t { Direct, Backing, PerLoad };
+// Set by the emulator; without it every load is direct. `ahead` tells a walk ahead of execution.
+struct SrtWalkerGuestMemory {
+	// The page holding `address`: Direct when a direct load reads it right (or faults as it
+	// should), Backing when `backing` points to the bytes every load must read, PerLoad otherwise
+	// (`backing` may then point to page bytes for `read`). The answer holds for the rest of the
+	// walk.
+	SrtWalkerPage (*page)(uint64_t address, bool ahead, const uint8_t*& backing) = nullptr;
+	// Reads the dword at an address of a PerLoad page that a direct load may fault on (a page the
+	// GPU owns), without faulting; false when the walker should load it directly.
+	bool (*read)(uint64_t address, uint32_t& value, bool ahead, const uint8_t* backing) = nullptr;
+};
+void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+// As SrtWalkerLoadLength, for a fault the walker on this thread must not resolve: a walk ahead
+// of execution, which then fails. Loads below guest memory read zero in any walk.
+uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

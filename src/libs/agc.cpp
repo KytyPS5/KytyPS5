@@ -32,6 +32,8 @@
 #include <cstddef>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1631,30 +1633,125 @@ AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes
 	return 0x8a6c9018u;
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterOwner() {
+// Resource registration (the names debugging and capture tools show for guest memory). Libraries
+// register an owner and then each of their resources, typically their shaders by code address;
+// with native ray tracing the names are kept for the emulator (ShaderRegisteredName(): it knows
+// the sce::Psr shaders by them). Without it the calls are left unimplemented, as before.
+struct RegisteredResource {
+	uint32_t owner   = 0;
+	uint64_t address = 0;
+};
+
+static std::mutex                                       g_resource_registration_mutex;
+static uint32_t                                         g_next_registration_handle = 1;
+static std::unordered_map<uint32_t, std::string>        g_registered_owners;
+static std::unordered_map<uint32_t, RegisteredResource> g_registered_resources;
+
+int KYTY_SYSV_ABI AgcDriverRegisterOwner(uint32_t* owner_handle, const char* name) {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
+
+	LOGF("\t name = %s\n", name != nullptr ? name : "(null)");
+
+	if (owner_handle == nullptr || name == nullptr) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
+	}
+
+	std::scoped_lock lock(g_resource_registration_mutex);
+	const auto       handle = g_next_registration_handle++;
+	g_registered_owners.emplace(handle, name);
+	*owner_handle = handle;
+
+	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterResource() {
+int KYTY_SYSV_ABI AgcDriverRegisterResource(uint32_t* resource_handle, uint32_t owner_handle,
+                                            const void* memory, uint64_t size, const char* name,
+                                            uint32_t type, uint64_t user_data) {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
+
+	const auto address = reinterpret_cast<uint64_t>(memory);
+	LOGF("\t owner   = %" PRIu32 "\n"
+	     "\t memory  = 0x%016" PRIx64 "\n"
+	     "\t size    = 0x%08" PRIx32 "\n"
+	     "\t name    = %s\n"
+	     "\t type    = %" PRIu32 "\n"
+	     "\t user    = 0x%016" PRIx64 "\n",
+	     owner_handle, address, static_cast<uint32_t>(size), name != nullptr ? name : "(null)",
+	     type, user_data);
+
+	if (resource_handle == nullptr || name == nullptr) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
+	}
+
+	std::scoped_lock lock(g_resource_registration_mutex);
+	if (!g_registered_owners.contains(owner_handle)) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+	const auto handle = g_next_registration_handle++;
+	g_registered_resources.emplace(handle,
+	                               RegisteredResource {.owner = owner_handle, .address = address});
+	if (address != 0) {
+		ShaderSetRegisteredName(address, name);
+	}
+	*resource_handle = handle;
+
+	return OK;
 }
 
 int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
 	PRINT_NAME();
 
-	(void)owner_handle;
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
 
-	return static_cast<int>(0x8a6c9018u);
+	LOGF("\t owner = %" PRIu32 "\n", owner_handle);
+
+	std::scoped_lock lock(g_resource_registration_mutex);
+	if (g_registered_owners.erase(owner_handle) == 0) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+	std::erase_if(g_registered_resources, [owner_handle](const auto& entry) {
+		if (entry.second.owner != owner_handle) {
+			return false;
+		}
+		if (entry.second.address != 0) {
+			ShaderSetRegisteredName(entry.second.address, nullptr);
+		}
+		return true;
+	});
+
+	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverUnregisterResource() {
+int KYTY_SYSV_ABI AgcDriverUnregisterResource(uint32_t resource_handle) {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	if (!Config::NativeRayTracingEnabled()) {
+		return static_cast<int>(0x8a6c9018u);
+	}
+
+	LOGF("\t resource = %" PRIu32 "\n", resource_handle);
+
+	std::scoped_lock lock(g_resource_registration_mutex);
+	const auto       iter = g_registered_resources.find(resource_handle);
+	if (iter == g_registered_resources.end()) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+	if (iter->second.address != 0) {
+		ShaderSetRegisteredName(iter->second.address, nullptr);
+	}
+	g_registered_resources.erase(iter);
+
+	return OK;
 }
 
 int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {

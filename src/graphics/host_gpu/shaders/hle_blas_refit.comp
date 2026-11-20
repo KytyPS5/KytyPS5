@@ -1,0 +1,470 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// HLE of GTA V's BLAS refits (see CommandProcessor::HleBlasDispatch()): every frame the game
+// updates the BLASes of animated geometry in place: the vertices of their triangle nodes from
+// the geometry's vertex buffer and then, bottom up, the boxes of their box32 nodes. The topology
+// stays.
+//
+// BLAS header: +56.. refit bookkeeping (not needed here), +64 u64 offset of the vertex index
+// table (5 u32 per triangle node), +80 u64 offset of the first triangle node of each geometry
+// (u32 per geometry), +88 node limit, +108 geometry count, +120 triangle node count, +124 first
+// triangle node (64-byte units from the BLAS). Generation Base252 (GTA V 01.005,
+// Push::header_layout 1) has the same fields at other offsets (kHeaderOffsets). Triangle node: 5
+// vertices (3 floats each), word 15 the barycentric remap. Box32 node: 4 child pointers, 4 boxes (lo.xyz hi.xyz), 16 bytes of ones.
+// Leaves: lists of 8-byte entries at BLAS + 8 * (pointer >> 3): a triangle node pointer
+// (type 0-3 = one of its 4 triangles, 7 = an AABB of the geometry entry pointer >> 3) and a
+// primitive word (bit 31: last entry).
+//
+// Generation Base515 (Marvel's Wolverine, Push::header_layout 2) has the fields at the offsets of
+// Base460; its vertices are refit by the game's own passes (they call functions of the game).
+// Before them, MODE_ARGUMENTS writes their indirect dispatch arguments where the game's pass
+// writes them: over the second half of the first box of the box node 4 + geometry and the first
+// half of its second box (16 bytes at +32), with the signs of the four floats it overwrites in its
+// last word; MODE_BOXES makes those floats infinite again with their signs before the refit (the
+// box of an invalid child stays so), and writes the bounds of the BLAS (the root's four boxes) at
+// +152 of its header. Base515 header: +24 flags, +108 geometry count, +80 u64 offset of the first
+// triangle node of each geometry, +120 triangle node count, +252 BVH version (10).
+//
+// MODE_VERTICES: one workgroup per geometry job (a geometry of a BLAS, as dispatched by the
+// game, with its vertex buffer V# and object matrix): rewrites its triangle nodes' vertices.
+// MODE_BOXES: one workgroup per BLAS: lists its box nodes level by level from the root, then
+// recomputes the child boxes of each level from the deepest up (non-finite boxes become empty
+// ones, degenerate triangles are skipped, as the game does).
+
+#include "rt_common.inc"
+
+layout(local_size_x = 512) in;
+
+layout(push_constant, std430) uniform Push {
+	uint64_t jobs;
+	uint64_t pool;
+	uint64_t state;
+	uint     mode;
+	uint     job_count;
+	uint     pool_capacity;
+	// The BLAS header: 0 for generation Base460, 1 for Base252, 2 for Base515.
+	uint     header_layout;
+} pc;
+
+// The offsets of the BLAS header fields the refit reads, by Push::header_layout: the vertex index table,
+// the first triangle node of each geometry, the geometry count, the triangle node count, the
+// first triangle node and the node limit.
+const uint kHeaderOffsets[3][6] = {{64u, 80u, 108u, 120u, 124u, 88u},
+                                   {56u, 72u, 112u, 124u, 128u, 80u},
+                                   {64u, 80u, 108u, 120u, 124u, 88u}};
+
+const uint MODE_VERTICES = 0u;
+const uint MODE_BOXES    = 1u;
+const uint MODE_ARGUMENTS = 2u;
+
+// A geometry job (96 bytes).
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer GeometryJob {
+	uint64_t blas;
+	uint     geometry;
+	uint     pad;
+	uvec4    vsharp;
+	vec4     matrix[4];
+};
+
+// A BLAS job (16 bytes).
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BlasJob {
+	uint64_t blas;
+	uint     pool_offset;
+	uint     pool_size;
+};
+
+// The refit state (cleared before each refit).
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer State {
+	uint pool_cursor;
+};
+
+// Box reads and writes of the bottom-up pass see the writes of the level below (other
+// invocations of the workgroup).
+layout(buffer_reference, std430, buffer_reference_align = 16) coherent buffer CoherentU32x4 { uvec4 v; };
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer CoherentU32 { uint v; };
+
+// The child boxes of a box32 node (host address, 0 when not cached: zero boxes), coherently.
+void LoadBoxes(uint64_t host, out vec3 lo[4], out vec3 hi[4]) {
+	uint words[24];
+	for (uint i = 0; i < 6; i++) {
+		const uvec4 v    = host == 0 ? uvec4(0) : CoherentU32x4(host + 16 + i * 16).v;
+		words[i * 4]     = v.x;
+		words[i * 4 + 1] = v.y;
+		words[i * 4 + 2] = v.z;
+		words[i * 4 + 3] = v.w;
+	}
+	for (uint c = 0; c < 4; c++) {
+		lo[c] = uintBitsToFloat(uvec3(words[c * 6], words[c * 6 + 1], words[c * 6 + 2]));
+		hi[c] = uintBitsToFloat(uvec3(words[c * 6 + 3], words[c * 6 + 4], words[c * 6 + 5]));
+	}
+}
+
+shared uint s_level_begin[65];
+shared uint s_levels;
+shared uint s_tail;
+shared uint s_overflow;
+shared uint s_base;
+shared uint s_size;
+
+// A buffer load with format of three components (BUFFER_LOAD_FORMAT_XYZ): the components of
+// element `index` of the V# (0 out of range). Formats of 8, 16 and 32-bit components.
+vec3 LoadFormatXyz(uvec4 v, uint index) {
+	const uint64_t base  = uint64_t(v.x) | (uint64_t(v.y & 0xffffu) << 32);
+	const uint     stride = (v.y >> 16) & 0x3fffu;
+	const uint     records = v.z;
+	const uint     format  = (v.w >> 12) & 0x7fu;
+	if (index >= records) {
+		return vec3(0.0);
+	}
+	const uint64_t va = base + uint64_t(index) * stride;
+	// Component count, bits and type: 0 unorm, 1 snorm, 2 uscaled, 3 sscaled, 4 uint, 5 sint,
+	// 6 float.
+	uint comps = 0, bits = 0, type = 0;
+	if (format >= 1u && format <= 6u) { comps = 1; bits = 8; type = format - 1u; }
+	else if (format >= 7u && format <= 13u) { comps = 1; bits = 16; type = format - 7u; }
+	else if (format >= 14u && format <= 19u) { comps = 2; bits = 8; type = format - 14u; }
+	else if (format >= 20u && format <= 22u) { comps = 1; bits = 32; type = format - 20u + 4u; }
+	else if (format >= 23u && format <= 29u) { comps = 2; bits = 16; type = format - 23u; }
+	else if (format >= 56u && format <= 61u) { comps = 4; bits = 8; type = format - 56u; }
+	else if (format >= 62u && format <= 64u) { comps = 2; bits = 32; type = format - 62u + 4u; }
+	else if (format >= 65u && format <= 71u) { comps = 4; bits = 16; type = format - 65u; }
+	else if (format >= 72u && format <= 74u) { comps = 3; bits = 32; type = format - 72u + 4u; }
+	else if (format >= 75u && format <= 77u) { comps = 4; bits = 32; type = format - 75u + 4u; }
+	else {
+		return vec3(0.0);
+	}
+	vec3 result = vec3(0.0);
+	for (uint c = 0; c < 3; c++) {
+		if (c >= comps) {
+			break;
+		}
+		const uint byte_offset = c * (bits / 8u);
+		const uint64_t at      = va + byte_offset;
+		const uint     word    = LoadGuestU32(at & ~uint64_t(3));
+		const uint     shift   = uint(at & 3u) * 8u;
+		uint           raw     = bits == 32u ? word : (word >> shift) & ((1u << bits) - 1u);
+		if (bits != 32u && shift + bits > 32u) {
+			raw = 0u; // unaligned element (not expected)
+		}
+		float value = 0.0;
+		const uint sign_bit = 1u << (bits - 1u);
+		const int  sraw     = bits == 32u ? int(raw) : int(raw ^ sign_bit) - int(sign_bit);
+		switch (type) {
+			case 0u: value = bits == 32u ? 0.0 : float(raw) / float((1u << bits) - 1u); break;
+			case 1u: value = bits == 32u ? 0.0 : max(float(sraw) / float(sign_bit - 1u), -1.0); break;
+			case 2u: value = float(raw); break;
+			case 3u: value = float(sraw); break;
+			case 4u: value = uintBitsToFloat(raw); break; // integer formats keep their bits
+			case 5u: value = uintBitsToFloat(raw); break;
+			case 6u:
+				value = bits == 32u ? uintBitsToFloat(raw) : (bits == 16u ? unpackHalf2x16(raw).x : 0.0);
+				break;
+		}
+		result[c] = value;
+	}
+	return result;
+}
+
+void VertexJob(uint job_index) {
+	GeometryJob       job  = GeometryJob(pc.jobs + uint64_t(job_index) * 96);
+	const uint64_t    blas = job.blas;
+	if (blas == 0) {
+		return;
+	}
+	const uint     hl          = min(pc.header_layout, 2u);
+	const uint64_t index_table = blas + LoadGuestU64(blas + kHeaderOffsets[hl][0]);
+	const uint64_t first_table = blas + LoadGuestU64(blas + kHeaderOffsets[hl][1]);
+	const uint     geometries  = LoadGuestU32(blas + kHeaderOffsets[hl][2]);
+	const uint     node_count  = LoadGuestU32(blas + kHeaderOffsets[hl][3]);
+	const uint     node_first  = LoadGuestU32(blas + kHeaderOffsets[hl][4]);
+	const uint     g           = job.geometry;
+	if (g >= geometries) {
+		return;
+	}
+	const uint first = LoadGuestU32(first_table + uint64_t(g) * 4);
+	const uint end   = g + 1u < geometries ? LoadGuestU32(first_table + uint64_t(g + 1u) * 4) : node_count;
+	const uvec4 vsharp = job.vsharp;
+	const mat4  m      = mat4(job.matrix[0], job.matrix[1], job.matrix[2], job.matrix[3]);
+	for (uint n = first + gl_LocalInvocationID.x; n < end && n < node_count; n += gl_WorkGroupSize.x) {
+		const uint64_t ids  = index_table + uint64_t(n) * 20;
+		const uint64_t node = blas + (uint64_t(node_first + n) << 6);
+		float          out_v[15];
+		for (uint k = 0; k < 5; k++) {
+			const vec3 p = LoadFormatXyz(vsharp, LoadGuestU32(ids + k * 4));
+			vec3 q = vec3(m[0][0] * p.x + m[1][0] * p.y + m[2][0] * p.z + m[3][0],
+			              m[0][1] * p.x + m[1][1] * p.y + m[2][1] * p.z + m[3][1],
+			              m[0][2] * p.x + m[1][2] * p.y + m[2][2] * p.z + m[3][2]);
+			if (any(isnan(q))) {
+				q = vec3(uintBitsToFloat(0x7f7fffffu));
+			}
+			out_v[k * 3]     = q.x;
+			out_v[k * 3 + 1] = q.y;
+			out_v[k * 3 + 2] = q.z;
+		}
+		// A 64-byte node never crosses a caching page.
+		const uint64_t host = HostAddress(node);
+		if (host != 0) {
+			for (uint w = 0; w < 12; w += 4) {
+				U32x4Ref(host + w * 4).v =
+				    floatBitsToUint(vec4(out_v[w], out_v[w + 1], out_v[w + 2], out_v[w + 3]));
+			}
+			U32Ref(host + 48).v = floatBitsToUint(out_v[12]);
+			U32Ref(host + 52).v = floatBitsToUint(out_v[13]);
+			U32Ref(host + 56).v = floatBitsToUint(out_v[14]);
+		}
+	}
+}
+
+// The bounds of a leaf list: its triangles (degenerate ones skipped) and AABBs.
+void LeafBounds(uint64_t blas, uint leaf, inout vec3 lo, inout vec3 hi) {
+	const uint first = leaf >> 3;
+	for (uint k = 0; k < kMaxLeafEntries; k++) {
+		const uvec2    pair  = LoadGuestU32x2(blas + (uint64_t(first + k) << 3));
+		const uint     tri   = pair.x;
+		const uint     word  = pair.y;
+		if (NodeType(tri) == 7u) {
+			// AABB primitives: not refit here (no dynamic BLAS seen with them); keep bounds open
+			// so the box stays conservative.
+			lo = vec3(-uintBitsToFloat(0x7f7fffffu));
+			hi = vec3(uintBitsToFloat(0x7f7fffffu));
+		} else if (NodeType(tri) < 4u) {
+			const uint64_t node = blas + (uint64_t(tri >> 3) << 6);
+			vec3 p[3];
+			LoadTriangle(node, NodeType(tri), p);
+			const vec3 a = p[0];
+			const vec3 b = p[1];
+			const vec3 c = p[2];
+			if (!(all(equal(a, b)) || all(equal(a, c)) || all(equal(b, c)))) {
+				lo = min(lo, min(a, min(b, c)));
+				hi = max(hi, max(a, max(b, c)));
+			}
+		}
+		if ((word & 0x80000000u) != 0) {
+			break;
+		}
+	}
+}
+
+bool Finite(vec3 v) {
+	return !any(isnan(v)) && !any(isinf(v));
+}
+
+// Generation Base515: whether the BLAS has the header its refit passes expect (else the game's
+// pass would stop the GPU, and the replacement leaves the BLAS as it is).
+bool Base515Header(uint64_t blas) {
+	const uint flags = LoadGuestU32(blas + 24);
+	return blas != 0 && LoadGuestU32(blas + 252) == 10u && (flags & 0x10u) != 0 && (flags & 0x40000u) == 0 &&
+	       (flags & 0x20000000u) == 0;
+}
+
+// Generation Base515: the 16 bytes where the arguments of the vertex pass of geometry `g` go.
+uint64_t ArgumentSlot(uint64_t blas, uint g) {
+	return blas + 0x120u + uint64_t(g) * 64u;
+}
+
+// Generation Base515: the indirect arguments of the game's vertex passes of a BLAS, one per
+// geometry (its triangle node count, 1, 1 and the signs of the floats they overwrite).
+void ArgumentsJob(uint job_index) {
+	BlasJob        job  = BlasJob(pc.jobs + uint64_t(job_index) * 16);
+	const uint64_t blas = job.blas;
+	if (!Base515Header(blas)) {
+		return;
+	}
+	const uint     geometries  = min(LoadGuestU32(blas + kHeaderOffsets[2][2]), 1u << 16);
+	const uint64_t first_table = blas + LoadGuestU64(blas + kHeaderOffsets[2][1]);
+	const uint     node_count  = LoadGuestU32(blas + kHeaderOffsets[2][3]);
+	for (uint g = gl_LocalInvocationID.x; g < geometries; g += gl_WorkGroupSize.x) {
+		const uint     first = LoadGuestU32(first_table + uint64_t(g) * 4);
+		const uint     end   = g + 1u < geometries ? LoadGuestU32(first_table + uint64_t(g + 1u) * 4) : node_count;
+		const uint64_t host  = HostAddress(ArgumentSlot(blas, g));
+		if (host != 0) {
+			const uvec4 old   = U32x4Ref(host).v;
+			const uint  signs = (old.x >> 31) | ((old.y >> 31) << 1) | ((old.z >> 31) << 2) | ((old.w >> 31) << 3);
+			U32x4Ref(host).v  = uvec4(end - first, 1u, 1u, signs);
+		}
+	}
+}
+
+void BoxJob(uint job_index) {
+	const uint     lid  = gl_LocalInvocationID.x;
+	BlasJob        job   = BlasJob(pc.jobs + uint64_t(job_index) * 16);
+	const uint64_t blas  = job.blas;
+	State          state = State(pc.state);
+	const bool     base515 = pc.header_layout == 2u;
+	if (base515) {
+		if (!Base515Header(blas)) {
+			return;
+		}
+		// The floats under the arguments are infinite again, with their signs.
+		const uint geometries = min(LoadGuestU32(blas + kHeaderOffsets[2][2]), 1u << 16);
+		for (uint g = lid; g < geometries; g += gl_WorkGroupSize.x) {
+			const uint64_t host = HostAddress(ArgumentSlot(blas, g));
+			if (host != 0) {
+				const uint signs     = CoherentU32(host + 12).v;
+				CoherentU32x4(host).v = uvec4(0x7f800000u) | (uvec4(signs, signs >> 1, signs >> 2, signs >> 3) << 31);
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
+	if (lid == 0) {
+		s_levels   = 0;
+		s_overflow = 0;
+		s_tail     = 0;
+		// Box nodes never outnumber the node limit of the BLAS.
+		s_size = min(LoadGuestU32(blas + kHeaderOffsets[min(pc.header_layout, 2u)][5]) + 1u, 1u << 20);
+		s_base = atomicAdd(state.pool_cursor, s_size);
+		if (blas == 0 || s_base + s_size > pc.pool_capacity || s_base + s_size < s_base) {
+			s_overflow = 1;
+		} else {
+			U32Ref(pc.pool + uint64_t(s_base) * 4).v = 0x25u;
+			s_tail           = 1;
+			s_level_begin[0] = 0;
+		}
+	}
+	barrier();
+	if (s_overflow != 0) {
+		return;
+	}
+	const uint64_t queue = pc.pool + uint64_t(s_base) * 4;
+	// Top down: level l holds the queue entries [s_level_begin[l], s_level_begin[l + 1]).
+	uint head = 0;
+	for (uint level = 0; level < 64; level++) {
+		const uint tail = s_tail;
+		if (head == tail) {
+			break;
+		}
+		for (uint i = head + lid; i < tail; i += gl_WorkGroupSize.x) {
+			const uint     node    = U32Ref(queue + uint64_t(i) * 4).v;
+			const uint64_t address = blas + (uint64_t(node >> 3) << 6);
+			const uvec4    children = LoadGuestU32x4(address);
+			for (uint c = 0; c < 4; c++) {
+				const uint child = children[c];
+				if (child != kInvalidNode && NodeType(child) == 5u) {
+					const uint slot = atomicAdd(s_tail, 1u);
+					if (slot < s_size) {
+						U32Ref(queue + uint64_t(slot) * 4).v = child;
+					} else {
+						s_overflow = 1;
+					}
+				} else if (child != kInvalidNode && NodeType(child) == 4u) {
+					// Refit BLASes have box32 nodes only: leave this one to its last boxes.
+					s_overflow = 1;
+				}
+			}
+		}
+		barrier();
+		if (lid == 0) {
+			s_level_begin[level + 1] = min(s_tail, s_size);
+			s_levels                 = level + 1;
+			if (level == 63 && s_tail != tail) {
+				s_overflow = 1;
+			}
+		}
+		head = tail;
+		barrier();
+		if (s_overflow != 0) {
+			break;
+		}
+	}
+	barrier();
+	if (s_overflow != 0) {
+		return;
+	}
+	// Bottom up. A 64-byte node never crosses a caching page: one translation per node. The new
+	// boxes of the four children are stored after all their reads, which can then overlap.
+	for (int level = int(s_levels) - 1; level >= 0; level--) {
+		const uint begin = s_level_begin[level];
+		const uint end   = s_level_begin[level + 1];
+		for (uint i = begin + lid; i < end; i += gl_WorkGroupSize.x) {
+			const uint     node     = U32Ref(queue + uint64_t(i) * 4).v;
+			const uint64_t host     = HostAddress(blas + (uint64_t(node >> 3) << 6));
+			if (host == 0) {
+				continue;
+			}
+			const uvec4 children = U32x4Ref(host).v;
+			vec3        lo[4], hi[4];
+			for (uint c = 0; c < 4; c++) {
+				lo[c]            = vec3(uintBitsToFloat(0x7f800000u));
+				hi[c]            = vec3(uintBitsToFloat(0xff800000u));
+				const uint child = children[c];
+				// Invalid children and padding (0x1e) keep their box.
+				if (child == kInvalidNode || child == 0x1eu || NodeType(child) == 4u ||
+				    NodeType(child) == 6u) {
+					continue;
+				}
+				if (NodeType(child) == 5u) {
+					const uint64_t child_host = HostAddress(blas + (uint64_t(child >> 3) << 6));
+					const uvec4    grand      = child_host == 0 ? uvec4(0) : U32x4Ref(child_host).v;
+					vec3           box_lo[4], box_hi[4];
+					LoadBoxes(child_host, box_lo, box_hi);
+					for (uint g = 0; g < 4; g++) {
+						if (grand[g] != kInvalidNode && grand[g] != 0x1eu) {
+							lo[c] = min(lo[c], box_lo[g]);
+							hi[c] = max(hi[c], box_hi[g]);
+						}
+					}
+				} else {
+					LeafBounds(blas, child, lo[c], hi[c]);
+				}
+				if (!Finite(lo[c]) || !Finite(hi[c])) {
+					lo[c] = vec3(uintBitsToFloat(0x7f800000u));
+					hi[c] = vec3(uintBitsToFloat(0xff800000u));
+				} else if (base515 && node == 0x25u) {
+					// The root's boxes (and the bounds of the BLAS, their union) grow by 1/256 of
+					// their size: in animated BLASes they were seen up to 1e-3 of it behind their
+					// children, and no ray may miss the geometry at their edges.
+					const vec3 margin = (hi[c] - lo[c]) * (1.0 / 256.0) + vec3(1e-6);
+					lo[c] -= margin;
+					hi[c] += margin;
+				}
+			}
+			for (uint c = 0; c < 4; c++) {
+				const uint child = children[c];
+				if (child == kInvalidNode || child == 0x1eu || NodeType(child) == 4u ||
+				    NodeType(child) == 6u) {
+					continue;
+				}
+				// 24 bytes at 8-byte alignment.
+				const uint64_t at = host + 16 + c * 24;
+				CoherentU32(at).v      = floatBitsToUint(lo[c].x);
+				CoherentU32(at + 4).v  = floatBitsToUint(lo[c].y);
+				CoherentU32(at + 8).v  = floatBitsToUint(lo[c].z);
+				CoherentU32(at + 12).v = floatBitsToUint(hi[c].x);
+				CoherentU32(at + 16).v = floatBitsToUint(hi[c].y);
+				CoherentU32(at + 20).v = floatBitsToUint(hi[c].z);
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
+	// Generation Base515: the bounds of the BLAS, the root's four boxes.
+	if (base515 && lid == 0) {
+		vec3 lo[4], hi[4];
+		LoadBoxes(HostAddress(blas + (uint64_t(0x25u >> 3) << 6)), lo, hi);
+		const vec3     box_lo = min(min(lo[0], lo[1]), min(lo[2], lo[3]));
+		const vec3     box_hi = max(max(hi[0], hi[1]), max(hi[2], hi[3]));
+		const uint64_t header = HostAddress(blas + 152);
+		if (header != 0) {
+			CoherentU32(header).v      = floatBitsToUint(box_lo.x);
+			CoherentU32(header + 4).v  = floatBitsToUint(box_lo.y);
+			CoherentU32(header + 8).v  = floatBitsToUint(box_lo.z);
+			CoherentU32(header + 12).v = floatBitsToUint(box_hi.x);
+			CoherentU32(header + 16).v = floatBitsToUint(box_hi.y);
+			CoherentU32(header + 20).v = floatBitsToUint(box_hi.z);
+		}
+	}
+}
+
+void main() {
+	if (gl_WorkGroupID.x >= pc.job_count) {
+		return;
+	}
+	if (pc.mode == MODE_VERTICES) {
+		VertexJob(gl_WorkGroupID.x);
+	} else if (pc.mode == MODE_ARGUMENTS) {
+		ArgumentsJob(gl_WorkGroupID.x);
+	} else {
+		BoxJob(gl_WorkGroupID.x);
+	}
+}

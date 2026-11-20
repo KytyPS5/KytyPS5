@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <cstdint>
+#include <vector>
+
 // IWYU pragma: no_include <pthread.h>
 
 extern "C" {
@@ -91,6 +94,10 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
+// A guest stack of at least `size` bytes the emulator gives code whose own stack is too small
+// (see Fiber::FiberStartOnGuestStack); its size in `allocated`, 0 when there is no room.
+uint64_t              AllocateEmulatorGuestStack(size_t size, size_t* allocated);
+void                  FreeEmulatorGuestStack(uint64_t address, size_t size);
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
@@ -111,6 +118,8 @@ void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
+// The host thread ids of the guest's live threads, its main thread included.
+std::vector<uint64_t>  PthreadGuestHostThreadIds();
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);

@@ -5,9 +5,11 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/TableMode.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -23,7 +25,9 @@
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -479,6 +483,37 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
+namespace {
+
+std::mutex                                  g_ray_tracing_programs_mutex;
+std::array<std::unordered_set<uint64_t>, 3> g_ray_tracing_programs;
+RayTracingPrograms                          g_ray_tracing_counts;
+
+} // namespace
+
+void NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash) {
+	const std::lock_guard lock(g_ray_tracing_programs_mutex);
+	if (!g_ray_tracing_programs[static_cast<size_t>(kind)].insert(shader_hash).second) {
+		return;
+	}
+	switch (kind) {
+		case RayTracingProgramKind::Native: g_ray_tracing_counts.native++; break;
+		case RayTracingProgramKind::Unrecognized:
+			g_ray_tracing_counts.unrecognized++;
+			g_ray_tracing_counts.last_unrecognized = shader_hash;
+			break;
+		case RayTracingProgramKind::AlwaysGuest:
+			g_ray_tracing_counts.always_guest++;
+			g_ray_tracing_counts.last_always_guest = shader_hash;
+			break;
+	}
+}
+
+RayTracingPrograms GetRayTracingPrograms() {
+	const std::lock_guard lock(g_ray_tracing_programs_mutex);
+	return g_ray_tracing_counts;
+}
+
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
@@ -496,6 +531,9 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		PrepareCallTargets(source, options);
 		source.code.assign(code.begin(), code.end());
 		source.decoded.code = source.code;
+	}
+	if (options.stage == ShaderType::Compute) {
+		(void)Decoder::DeriveRecordReach(source.decoded, options.wave_size, source.decoded.record_reach);
 	}
 	return source;
 }
@@ -586,10 +624,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
 	     options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	for (const auto& body: decoded.call_bodies)
+		ir.inlined_call_entries.push_back(body.begin);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	const auto undefined_spills = IR::MarkUndefinedLaneSpills(ir);
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
@@ -598,6 +639,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	};
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
+	IR::ReleaseUndefinedLaneSpills(undefined_spills);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
 		LOGF("ShaderRecompiler %s read-lane elimination: reads=%" PRIu32
 		     " reductions=%" PRIu32 "\n",
@@ -611,14 +653,69 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			for (const auto& inst: *block)
 				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
 	}
-	LowerTessellationMemory(ir, options);
+	if (!LowerTessellationMemory(ir, options)) {
+		EXIT("ShaderRecompiler %s failed hash=0x%016" PRIx64
+		     ": unsupported tessellation memory shape\n",
+		     stage, options.shader_hash);
+	}
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
 		LOGF("ShaderRecompiler %s native IR before resource tracking:\n%s", stage,
 		     MakeIrDump(cfg_dump, ir).c_str());
 	}
-	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	// The traversals of the native ray tracing forms, recognized on the IR: their TLAS source (also
+	// for the guest's own traversal, see RenderContext::CacheTlasMemory()) and, when they trace
+	// natively, the guest code that stays in the BVH, which resource tracking takes from the decoded
+	// program (Decoder::Program::ray_tracing_reach; only when the walks cover every node test).
+	const auto*      tracked = &decoded;
+	Decoder::Program traced_source;
+	if (options.stage == ShaderType::Compute) {
+		const auto traced = IR::TraceNativeTraversals(
+		    ir, {.wave_size = options.wave_size, .rewrite = options.native_ray_tracing, .decoded = &decoded});
+		const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+			return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+		});
+		if (traced.source_valid) {
+			// (See RayTracing::FindTlasSource().)
+			ir.info.ray_query_user_sgpr      = traced.user_sgpr;
+			ir.info.ray_query_header_offset  = traced.header_offset;
+			ir.info.ray_query_header_vsharp  = traced.header_vsharp;
+			ir.info.ray_query_root           = traced.root;
+			ir.info.ray_query_layout         = traced.layout;
+			traced_source                    = decoded;
+			traced_source.ray_tracing_source = {.user_sgpr     = traced.user_sgpr,
+			                                    .header_offset = traced.header_offset,
+			                                    .header_vsharp = traced.header_vsharp,
+			                                    .root          = traced.root,
+			                                    .layout        = traced.layout,
+			                                    .valid         = true};
+			if (traced.sites != 0 && !traced.reach.empty()) {
+				auto& reach = traced_source.ray_tracing_reach;
+				for (const auto& inst: decoded.instructions) {
+					if (std::ranges::any_of(traced.reach, [&](const auto& range) {
+						    return inst.pc >= range.first && inst.pc < range.second;
+					    })) {
+						reach.push_back(inst.pc);
+					}
+				}
+				std::ranges::sort(reach);
+				reach.erase(std::unique(reach.begin(), reach.end()), reach.end());
+			}
+			tracked = &traced_source;
+		}
+		if (traced.sites != 0) {
+			LOGF("%s native ray tracing traversals: hash=0x%016" PRIx64 " sites=%u\n", stage,
+			     options.shader_hash, traced.sites);
+			NoteRayTracingProgram(RayTracingProgramKind::Native, options.shader_hash);
+		} else if (options.native_ray_tracing && bvh && !decoded.has_swap_pc && decoded.call_bodies.empty()) {
+			// It walks a guest BVH no form recognizes: on the guest side.
+			LOGF("%s native ray tracing: hash=0x%016" PRIx64 " wave%u walks a guest BVH no form recognizes\n",
+			     stage, options.shader_hash, options.wave_size);
+			NoteRayTracingProgram(RayTracingProgramKind::Unrecognized, options.shader_hash);
+		}
+	}
+	IR::TrackResources(ir, *tracked, native_cfg, options.input_info);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
@@ -635,6 +732,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
 	IR::ApplyResourceSpecialization(ir, specialization);
+	// Table mode plans from the descriptor sources and SRT reads, which the clean-up below drops.
+	if (options.table_mode) {
+		CompileResult refused;
+		if (!IR::EnterTableMode(ir, refused.table_refusal)) {
+			return refused;
+		}
+	}
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
@@ -659,7 +763,8 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&
-				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
+				                (ir.info.images[resource].indirect_root == resource ||
+				                 ir.info.images[resource].table_capacity != 0u) ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.samplers.size() &&
@@ -675,12 +780,19 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	// The walks of the native ray tracing sites (RayQueryInit) keep the guest's loop for when the
+	// host has no structures for their TLAS: the ray query pass leaves those walks as they are.
 	if (options.profile->ray_query) {
 		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
 			     stage, ir.shader_hash, traced);
 		}
 	}
+	if (const auto selects = IR::EliminateMaskedSelects(ir.blocks); selects != 0) {
+		LOGF("ShaderRecompiler %s masked select elimination: selects=%" PRIu32 "\n", stage, selects);
+	}
+	IR::RemoveIdentities(ir);
+	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
@@ -692,7 +804,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
+	                                options.emit_debug_info, true, options.ray_stats);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
 	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,
@@ -700,6 +812,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	                               std::chrono::steady_clock::now() - emit_begin)
 	                               .count()));
 	CompileResult result;
+	if (options.plain_mip_stats_variant && Spirv::UsesMipStats(ir)) {
+		result.spirv_plain =
+		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+		                       options.emit_debug_info, false, options.ray_stats);
+	}
 	result.spirv   = std::move(spirv);
 	result.program = std::move(ir);
 	if (options.dump_ir) {

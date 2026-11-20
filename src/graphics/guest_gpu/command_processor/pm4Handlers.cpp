@@ -435,6 +435,7 @@ KYTY_HW_SH_PARSER(HwShIgnoreUserAccumulator) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
+	cp.NoteAcquireMem();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
 	// GCR_CNTL GL2_WB (bit 15) over the whole GL2 (GL2_RANGE, bits 11-12, zero) makes GPU writes
@@ -483,26 +484,11 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0038e00);
 
 	const auto buffer_size = buffer[0];
-	auto* dst = reinterpret_cast<volatile uint32_t*>((buffer[1] & 0xffffffc0u) |
+	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
-	if (Config::LodStatsEnabled()) {
-		// Bit 18 or 19 resets the counters after the report.
-		cp.GetLodStats(dst, buffer_size, (buffer[3] & 0xc0000u) != 0);
-		return 4;
-	}
-
-	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
-	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
-	// samples. A non-zero dword 0 then marks the report complete.
-	if (dst != nullptr && buffer_size >= 64) {
-		const auto slots = std::min((buffer_size - 64) / 8, 256u);
-		for (uint32_t slot = 0; slot < slots; slot++) {
-			dst[16 + slot * 2]     = slot << 24u;
-			dst[16 + slot * 2 + 1] = 15u << 24u;
-		}
-		dst[0] = 1;
-	}
+	// A packet without a buffer resets or probes the counters.
+	cp.WriteLodStats(dst, buffer_size, buffer[3]);
 
 	return 4;
 }
@@ -521,6 +507,8 @@ KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0004200);
+
+	cp.SyncFetchWithExecution();
 
 	return 1;
 }
@@ -581,7 +569,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -611,10 +599,13 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	if (TestWaitRegMemValue(*compare_addr, reference, mask, function)) {
+	if (TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr), reference, mask,
+	                        function)) {
+		cp.PrepareCommandFetch({then_buffer, then_num_dw});
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
+		cp.PrepareCommandFetch({else_buffer, else_num_dw});
 		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
 	}
 
@@ -764,21 +755,52 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP, Pm4::SH_NOP};
 
-	// Following packets with the same other words, each drawing the record after the previous one,
-	// draw the records of a multi-draw without a draw index.
+	// Following packets with the same other words whose data offsets step a constant stride (the
+	// next record, or every second or third record) draw the records of a multi-draw without a draw
+	// index.
 	constexpr uint32_t packet_dw = 5;
 	const uint32_t     record_size =
 	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
-	uint32_t count = 1;
-	for (uint32_t at = 4; at + packet_dw < dw; at += packet_dw, count++) {
+	uint32_t count  = 1;
+	uint32_t stride = record_size;
+	for (uint32_t at = 4; at + packet_dw < dw; at += packet_dw) {
 		const auto* next = buffer + at;
-		if (next[0] != cmd_id || next[1] != uint64_t {next[-4]} + record_size ||
-		    next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) {
+		if (next[0] != cmd_id || next[2] != buffer[1] || next[3] != buffer[2] ||
+		    next[4] != buffer[3] || next[1] <= next[-4]) {
 			break;
 		}
+		const uint32_t step = next[1] - next[-4];
+		if (count == 1) {
+			if (step < record_size || (step & 3u) != 0) {
+				break;
+			}
+			stride = step;
+		} else if (step != stride) {
+			break;
+		}
+		count++;
 	}
-	cp.DrawIndirectMulti(data_offset, count, nullptr, record_size, registers, draw_initiator,
-	                     indexed);
+	// chenxiao07's native XPR runs: following packets with the same other words draw the same object whatever their
+	// data offsets (nothing written between them). A shader pair whose draws its table programs take draws such a run
+	// in one operation: one table evaluation, the records grouped into multi-draws where they follow one another.
+	// (Demon's Souls, Boletaria: ~6,600 such packets a frame, ~3,460 operations by the constant stride, ~2,700 by
+	// runs.) Other pairs keep the constant stride, whose draws the normal path takes in one operation.
+	if (indexed && cp.TakesDrawRuns()) {
+		constexpr uint32_t MaxRun = 64;
+		uint32_t           run    = count;
+		for (uint32_t at = 4 + packet_dw * (count - 1); run < MaxRun && at + packet_dw < dw; at += packet_dw) {
+			const auto* next = buffer + at;
+			if (next[0] != cmd_id || next[2] != buffer[1] || next[3] != buffer[2] || next[4] != buffer[3]) {
+				break;
+			}
+			run++;
+		}
+		if (run > count) {
+			cp.DrawIndirectRun(buffer, run, registers, draw_initiator);
+			return 4 + packet_dw * (run - 1);
+		}
+	}
+	cp.DrawIndirectMulti(data_offset, count, nullptr, stride, registers, draw_initiator, indexed);
 
 	return 4 + packet_dw * (count - 1);
 }
@@ -975,6 +997,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 		     ", control = 0x%08" PRIx32 "\n",
 		     indirect_num_dw, buffer[2]);
 	}
+
+	cp.PrepareCommandFetch({indirect_buffer, indirect_num_dw});
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
@@ -1210,6 +1234,10 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu,
 	    (buffer[0] & (1u << 21u)) != 0);
+	if (((buffer[1] >> 24u) & 0x7u) == 0 || ((buffer[1] >> 24u) & 0x7u) == 3) {
+		// A label-only release keeps batching; long batches still start the GPU early.
+		cp.BufferFlushIfBatchReady();
+	}
 
 	return 7;
 }

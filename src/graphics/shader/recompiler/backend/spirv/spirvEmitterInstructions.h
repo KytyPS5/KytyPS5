@@ -11,10 +11,10 @@ uint32_t EmitIdentity(ValueEmitContext& ctx, uint32_t value);
 // (IR::Value), and instructions whose metadata or operand loads must stay lazy.
 #define EMIT_NATIVE(name, opcode, type, ...)                                                       \
 	inline constexpr auto Emit##name = EmitNative<spv::opcode, IR::Type::type, __VA_ARGS__>;
-inline constexpr auto EmitBitCastU16F16 = EmitIdentity;
-inline constexpr auto EmitBitCastF16U16 = EmitBitCastU16F16;
-inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
-inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
+uint32_t              EmitBitCastU16F16(EmitterState& state, uint32_t arg0);
+uint32_t              EmitBitCastF16U16(EmitterState& state, uint32_t arg0);
+inline constexpr auto EmitConvertU32U16 = EmitIdentity;
+inline constexpr auto EmitConvertU32U8  = EmitIdentity;
 EMIT_NATIVE(BitCastU32F32, OpBitcast, U32, uint32_t)
 EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
 EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
@@ -22,7 +22,9 @@ EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
 uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU8U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
-inline constexpr auto EmitConvertF32F16 = EmitF16BitsToF32;
+uint32_t              EmitF32ToF16Bits(EmitterState& state, uint32_t arg0);
+uint32_t              EmitConvertF32F16(EmitterState& state, uint32_t arg0);
+uint32_t              EmitConvertF32F16Lane(EmitterState& state, uint32_t bits, IR::Value lane);
 uint32_t              EmitConvertS32F32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU32F32(EmitterState& state, uint32_t arg0);
 EMIT_NATIVE(ConvertF32S32, OpConvertSToF, F32, uint32_t)
@@ -181,6 +183,21 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t
 uint32_t EmitFPMad32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPAdd16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPMul16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPFma16x2(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitPackedFPMin16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitPackedFPMax16x2(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitExtractF16Lane(EmitterState& state, uint32_t bits, IR::Value lane);
+uint32_t EmitInsertF16Lane(EmitterState& state, uint32_t bits, uint32_t value, IR::Value lane);
+uint32_t EmitFPAdd16(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPSub16(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPMul16(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPFma16(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
+uint32_t EmitFPMin16(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPMax16(EmitterState& state, uint32_t arg0, uint32_t arg1);
+uint32_t EmitFPAbs16(EmitterState& state, uint32_t arg0);
+uint32_t EmitFPNeg16(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2);
@@ -242,6 +259,7 @@ uint32_t              EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst&
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
+uint32_t              EmitReadCallWord(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadRealtimeClock(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
@@ -348,6 +366,13 @@ uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Ins
 uint32_t              EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryCandidateFrontFace(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryMatch(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQuerySelectedLeaf(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryResult(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryMark(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitRayQueryAlpha(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;

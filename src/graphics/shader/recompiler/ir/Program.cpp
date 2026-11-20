@@ -141,11 +141,14 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
+	    .bda_read_plan      = BuildBdaReadPlan(*this),
 	    .stage              = stage,
 	    .shader_hash        = shader_hash,
 	    .wave_size          = wave_size,
 	    .user_data_base     = user_data_base,
 	    .has_address_writes = has_address_writes,
+	    .table_mode         = table_mode,
+	    .table_plan         = std::move(table_plan),
 	    .info               = std::move(info),
 	    .bindings           = std::move(bindings),
 	};
@@ -480,9 +483,9 @@ void ValidateProgram(const Program& program) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
+				    !memory.SupportsIndirectBufferAccess(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, "
-					            "or formatted X load");
+					            "or 32-bit formatted load, a raw DWORD store or a raw 32-bit integer atomic");
 				}
 				const auto access = BufferAccessOf(inst.GetOpcode());
 				const bool packed_formatted =

@@ -80,10 +80,12 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 }
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
-	// The handle comes from the SPIR-V; stored programs have no function code.
+	// The handle and the SPIR-V size come from the SPIR-V; stored programs have no function code.
+	// The plain variant is stored as its SPIR-V.
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	       mesh_task, spirv_words, plain, guest_traversal, plan] = stage;
+	(void)plan;
+	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task, guest_traversal);
 }
 
 } // namespace
@@ -138,6 +140,18 @@ void ShaderStoreWriter::Post(Common::UniqueFunction<void>&& job) {
 	m_ready.notify_one();
 }
 
+struct PipelineCache::StoreRecord {
+	Record                             type = Record::Module;
+	// A module: its program's key and resource plan (false when it does not load).
+	ProgramKey                         key;
+	ShaderRecompiler::IR::ResourcePlan plan;
+	bool                               plan_loaded = false;
+	ShaderModule                       module;
+	GraphicsPipelineKey                pipeline {};
+	uint64_t                           layout_key = 0;
+	ShaderTessellationInputInfo        layout;
+};
+
 void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (path.empty()) {
 		return;
@@ -164,7 +178,32 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (reusable) {
 		records = records.subspan(header.size());
-		while (LoadRecord(records)) {
+		// Reading the records (their zstd frames, their resource plans and their Vulkan modules) is
+		// most of the time a large store takes, and each is read by itself: on every thread. They
+		// are then added in the store's order.
+		std::vector<std::span<const uint8_t>> frames;
+		for (auto rest = records; rest.size() >= sizeof(Frame);) {
+			Frame frame;
+			std::memcpy(&frame, rest.data(), sizeof(frame));
+			if (rest.size() - sizeof(frame) < frame.compressed_size) {
+				break;
+			}
+			frames.push_back(rest.first(sizeof(frame) + frame.compressed_size));
+			rest = rest.subspan(frames.back().size());
+		}
+		std::vector<StoreRecord> loaded(frames.size());
+		std::vector<uint8_t>     read(frames.size());
+		Common::ParallelFor(frames.size(), [&](size_t i) { read[i] = ReadRecord(frames[i], loaded[i]) ? 1 : 0; });
+		size_t kept = 0;
+		while (kept < frames.size() && read[kept] != 0 && AddRecord(loaded[kept])) {
+			records = records.subspan(frames[kept].size());
+			kept++;
+		}
+		// The records after a damaged one are not kept.
+		for (size_t i = kept + 1; i < frames.size(); i++) {
+			if (read[i] != 0 && loaded[i].type == Record::Module) {
+				DestroyModule(loaded[i].module);
+			}
 		}
 	}
 	// A damaged record ends the store; the records before it stay.
@@ -202,16 +241,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	        .count()));
 }
 
-bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
+bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord& record) const {
 	Frame frame;
-	if (records.size() < sizeof(frame)) {
-		return false;
-	}
-	std::memcpy(&frame, records.data(), sizeof(frame));
-	if (records.size() - sizeof(frame) < frame.compressed_size) {
-		return false;
-	}
-	const auto compressed = records.subspan(sizeof(frame), frame.compressed_size);
+	std::memcpy(&frame, frame_bytes.data(), sizeof(frame));
+	const auto compressed = frame_bytes.subspan(sizeof(frame), frame.compressed_size);
 	if (XXH3_64bits(compressed.data(), compressed.size()) != frame.checksum ||
 	    ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != frame.raw_size) {
 		return false;
@@ -221,61 +254,79 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 		return false;
 	}
 	Reader     reader {raw};
-	auto       type     = Record::Module;
 	const auto complete = [&] { return reader.ok && reader.bytes.empty(); };
-	IoAll(reader, type);
-	switch (type) {
+	IoAll(reader, record.type);
+	switch (record.type) {
 		case Record::Module: {
-			ProgramKey            key;
 			std::vector<uint8_t>  plan;
-			ShaderModule          module;
+			auto&                 module = record.module;
 			std::vector<uint32_t> spirv;
-			IoKey(reader, key);
+			std::vector<uint32_t> plain_spirv;
+			IoKey(reader, record.key);
 			IoAll(reader, plan);
 			IoModule(reader, module);
-			IoAll(reader, spirv);
+			IoAll(reader, spirv, plain_spirv);
 			if (!complete()) {
 				return false;
 			}
-			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
-			if (inserted &&
-			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
-				m_program_cache.erase(program);
-				return false;
+			record.plan_loaded = ShaderRecompiler::IR::LoadResourcePlan(plan, record.plan);
+			module.module      = CompileSPV(spirv, m_graphics.device);
+			module.spirv_words = static_cast<uint32_t>(spirv.size());
+			if (!plain_spirv.empty()) {
+				module.plain = MakePlainModule(module, plain_spirv, m_graphics.device);
+				if (module.plain == nullptr) {
+					m_graphics.device.destroyShaderModule(module.module, nullptr);
+					return false;
+				}
 			}
-			module.module = CompileSPV(spirv, m_graphics.device);
-			program->second.modules.push_back(std::move(module));
-			break;
+			return true;
 		}
 		case Record::GraphicsPipeline: {
-			GraphicsPipelineKey key;
-			reader.Raw(&key, sizeof(key));
-			if (!complete()) {
-				return false;
-			}
-			// WarmUp creates the pipeline once every record is loaded.
-			m_graphics_pipelines.try_emplace(key);
-			break;
+			reader.Raw(&record.pipeline, sizeof(record.pipeline));
+			return complete();
 		}
 		case Record::TessellationLayout: {
-			uint64_t                    key = 0;
-			ShaderTessellationInputInfo layout;
-			IoAll(reader, key, layout);
-			if (!complete()) {
-				return false;
-			}
-			m_tess_layouts.try_emplace(key, layout);
-			break;
+			IoAll(reader, record.layout_key, record.layout);
+			return complete();
 		}
 		default: return false;
 	}
-	records = records.subspan(sizeof(frame) + compressed.size());
+}
+
+bool PipelineCache::AddRecord(StoreRecord& record) {
+	switch (record.type) {
+		case Record::Module: {
+			const auto [program, inserted] = m_program_cache.try_emplace(std::move(record.key));
+			if (inserted) {
+				// The plan of the program's first record.
+				if (!record.plan_loaded) {
+					m_program_cache.erase(program);
+					DestroyModule(record.module);
+					return false;
+				}
+				program->second.resource_plan = std::move(record.plan);
+			}
+			program->second.modules.push_back(std::move(record.module));
+			program->second.modules.back().plan = &program->second.resource_plan;
+			break;
+		}
+		case Record::GraphicsPipeline: {
+			// WarmUp creates the pipeline once every record is loaded.
+			m_graphics_pipelines.try_emplace(record.pipeline);
+			break;
+		}
+		case Record::TessellationLayout: {
+			m_tess_layouts.try_emplace(record.layout_key, record.layout);
+			break;
+		}
+	}
 	return true;
 }
 
 // Records are encoded here, since programs and modules change later.
 void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
-                                const ShaderModule& module, const std::vector<uint32_t>& spirv) {
+                                const ShaderModule& module, const std::vector<uint32_t>& spirv,
+                                const std::vector<uint32_t>& plain_spirv) {
 	if (!m_store) {
 		return;
 	}
@@ -284,11 +335,12 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 	IoKey(record, key);
 	IoAll(record, ShaderRecompiler::IR::SaveResourcePlan(program.resource_plan));
 	IoModule(record, module);
-	IoAll(record, spirv);
+	IoAll(record, spirv, plain_spirv);
 	m_store.Append(std::move(record.bytes));
 }
 
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
+	RecordPipeline(key);
 	if (!m_store) {
 		return;
 	}
@@ -299,6 +351,7 @@ void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
 }
 
 void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout) {
+	RecordLayout(key, layout);
 	if (!m_store) {
 		return;
 	}
@@ -307,11 +360,30 @@ void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo&
 	m_store.Append(std::move(record.bytes));
 }
 
+std::vector<uint8_t> EncodeComputeModule(const ShaderModule& module, const std::vector<uint32_t>& spirv) {
+	Writer record;
+	IoModule(record, module);
+	IoAll(record, spirv);
+	return std::move(record.bytes);
+}
+
+bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
+                         std::vector<uint32_t>& spirv) {
+	Reader reader {bytes};
+	IoModule(reader, module);
+	IoAll(reader, spirv);
+	module.spirv_words = static_cast<uint32_t>(spirv.size());
+	return reader.ok && reader.bytes.empty() && module.info.stage == ShaderType::Compute;
+}
+
 PipelineCache::ModuleMap PipelineCache::MapModules() const {
 	ModuleMap modules {{0, nullptr}};
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			modules.emplace(module.id, &module);
+			if (module.plain != nullptr) {
+				modules.emplace(module.plain->id, module.plain.get());
+			}
 		}
 	}
 	return modules;

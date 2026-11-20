@@ -20,6 +20,8 @@ struct RunOptions {
 
 void Run(const RunOptions& options);
 int LoadExec(const char* path, const char* const argv[]);
+// In a process LoadExec started: waits until the process that started it has exited.
+void WaitForLoadExecParent();
 
 } // namespace Emulator
 

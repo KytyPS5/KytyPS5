@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -70,6 +71,14 @@ uint32_t TypeF32(EmitterState& state) {
 		state.f32_type = state.builder.Type(spv::OpTypeFloat, 32);
 	}
 	return state.f32_type;
+}
+
+uint32_t TypeF16(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 16);
+}
+
+uint32_t TypeF16x2(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVector, TypeF16(state), 2);
 }
 
 uint32_t TypeF64(EmitterState& state) {
@@ -155,6 +164,13 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 	return buffer->element_pointer_type;
 }
 
+// Table mode: a pointer to a buffer of `bits`-bit elements at a device address.
+uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits) {
+	const uint32_t alias = bits == 8u ? 0u : bits == 16u ? 1u : bits == 64u ? 3u : 2u;
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer,
+	                   StorageBufferType(state, state.storage_buffers[alias], bits));
+}
+
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
@@ -180,6 +196,15 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 }
 
 namespace {
+
+// KYTY_UNIFORM_BUFFERS=0 reads constant buffers through their storage buffer descriptors.
+bool UniformBuffersEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_UNIFORM_BUFFERS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 uint32_t PushConstantArrayType(EmitterState& state) {
 	const auto count = ConstantU32(state, IR::PushData::DwordCount);
@@ -228,8 +253,18 @@ void DefineDescriptors(EmitterState& state) {
 	auto& bindings = state.program.bindings;
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
+	// Table mode reads its buffers through their device addresses (EmitTableMode): no buffer descriptors.
+	const bool table = state.program.table_mode;
 	for (auto& buffer: info.buffers) {
-		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+		buffer.descriptor_index = buffer.live && !table ? buffer_count++ : UINT32_MAX;
+	}
+	// Constant buffers read through the constant cache: one load, bounds checked by the device
+	// (robustBufferAccess2), where a storage buffer read computes and checks the address.
+	auto& uniform_count = counts[static_cast<size_t>(Kind::UniformBuffers)];
+	for (auto& buffer: info.buffers) {
+		buffer.uniform_index = UniformBuffersEnabled() && state.profile.robust_buffer_access &&
+		                               buffer.descriptor_index != UINT32_MAX && buffer.constant_only
+		                           ? uniform_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -251,22 +286,42 @@ void DefineDescriptors(EmitterState& state) {
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
 		count += image.mip_count;
 	}
+	std::array<bool, IR::ImageBindingCount> image_tables {};
+	const auto table_bases = IR::AllocateImageTableDescriptors(info.images, counts);
+	for (size_t index = 0; index < info.images.size(); ++index) {
+		auto& image                 = info.images[index];
+		image.table_descriptor_base = table_bases[index];
+		if (image.table_capacity != 0u) {
+			image_tables[IR::ImageBindingIndex(*IR::DescriptorBindingForImage(image))] = true;
+		}
+	}
 	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
 	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
+	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt && !table;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
-	if (info.ray_query) {
+	if (info.ray_query_mirror) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 2u;
 	}
+	if (UsesMipStats(state.program)) {
+		counts[static_cast<size_t>(Kind::MipStats)] = 1;
+		bindings.mip_stats_count = static_cast<uint32_t>(info.images.size());
+	}
+	if (std::ranges::any_of(info.buffers, [](const IR::BufferResource& buffer) {
+		    return buffer.descriptor_index != UINT32_MAX && IR::HasRuntimeStride(buffer.packed_stride);
+	    })) {
+		bindings.stride_count = counts[static_cast<size_t>(Kind::Buffers)];
+	}
+	// The block's device address, after the user data.
+	bindings.table_block_dwords = table ? 2u : 0u;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
@@ -330,6 +385,10 @@ void DefineDescriptors(EmitterState& state) {
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
 				break;
+			case IR::DescriptorBindingKind::MipStats:
+				state.mip_stats_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "mip_stats");
+				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
@@ -344,6 +403,17 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Gds:
 				state.gds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "gds");
 				break;
+			case IR::DescriptorBindingKind::UniformBuffers: {
+				const auto array = state.builder.DecoratedType(
+				    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}},
+				    TypeU32(state), ConstantU32(state, IR::UniformBufferBytes / 4u));
+				const auto block = state.builder.DecoratedType(
+				    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+				                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+				state.uniform_buffer_variable =
+				    Define(ArrayType(block), "uniform_buffers", spv::StorageClassUniform);
+				break;
+			}
 			case IR::DescriptorBindingKind::SharedMemory:
 				state.lds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "lds_dwords");
 				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
@@ -364,6 +434,14 @@ void DefineDescriptors(EmitterState& state) {
 				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				if (image_tables[IR::ImageBindingIndex(kind)]) {
+					// Bindless table descriptors are indexed per lane.
+					state.builder.RequireVersion(0x00010500u);
+					state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+					state.builder.RequireCapability(spv::CapabilitySampledImageArrayDynamicIndexing);
+					state.builder.RequireCapability(
+					    spv::CapabilitySampledImageArrayNonUniformIndexing);
+				}
 				break;
 			}
 		}
@@ -491,6 +569,9 @@ void DefineInputs(EmitterState& state) {
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
+	} else if (state.program.lane_local && state.program.info.subgroup_local_invocation_id) {
+		// (A lane-local wave64 program's GCN lane: BufferLane.)
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 	}
 	for (auto& input: state.inputs) {
 		if (state.program.stage == ShaderType::Pixel &&
@@ -772,7 +853,8 @@ void DefineModule(EmitterState& state) {
 	}
 	const bool physical_addresses =
 	    state.program.info.uses_dma || state.program.info.uses_image_heap ||
-	    state.program.info.uses_device_address || state.program.info.ray_query;
+	    state.program.info.uses_device_address || state.program.info.ray_query_mirror ||
+	    state.program.table_mode;
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -810,23 +892,22 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 	}
 	if (state.program.info.ray_query) {
-		state.builder.RequireCapability(spv::CapabilityRayQueryKHR);
 		state.builder.RequireExtension("SPV_KHR_ray_query");
+		state.builder.RequireCapability(spv::CapabilityRayQueryKHR);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
 	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
-	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
+	    state.program.info.subgroup_ballot ||
 	    state.program.info.subgroup_shuffle ||
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.ray_stats) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
-	}
-	if (state.program.info.subgroup_vote) {
-		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
@@ -856,6 +937,11 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	if (state.program.info.float16) {
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               16u);
+	}
 	if (state.program.info.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);

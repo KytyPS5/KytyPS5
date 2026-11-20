@@ -11,8 +11,12 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <unordered_map>
 #include <utility>
+
+#include <cstdio>
+#define TESS_LOG(...) do { LOGF(__VA_ARGS__); std::fprintf(stderr, "[tess] " __VA_ARGS__); } while (0)
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -175,7 +179,14 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					const auto mask = lhs.kind == Kind::PackedControlPoint ? rhs
 					                : rhs.kind == Kind::PackedControlPoint ? lhs
 					                                                       : Address {};
+					// The patch ordinal (low byte of the packed HS ID) as an AND instead of a BFE (Wolverine's
+					// terrain HS a9f31c39ad53f06c, GTA V's tree trunk HS). With several control points the
+					// walk addresses one patch, so any mask that keeps only bits of that byte gives 0; with
+					// one, only the whole byte is the patch ordinal.
+					const bool low_byte = mask.kind == Kind::Affine && mask.coefficient == 0u &&
+					                      (mask.constant & ~0xffu) == 0u;
 					if (mask == constant(0xffu)) value = patch;
+					else if (low_byte && !single) value = constant(0u);
 					if (mask == constant(0x1f00u)) value = multiply(point, constant(256u));
 					break;
 				}
@@ -275,7 +286,7 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 
 } // namespace
 
-void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
+bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
@@ -286,15 +297,59 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	     "patch_base=0x%x patch_size=%u\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
 	     info.patch_base, info.patch_size);
+	return true;
 }
 
-void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
+bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
 	using namespace IR;
 	if (options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
 	    options.stage != ShaderType::TessellationEvaluation) {
-		return;
+		return true;
 	}
+	const auto unsupported = [&](const char* what) {
+		TESS_LOG("%s tessellation lowering does not model %s\n",
+		     options.stage == ShaderType::Local                 ? "LS"
+		     : options.stage == ShaderType::TessellationControl ? "HS"
+		                                                       : "TES",
+		     what);
+		return false;
+	};
 	const auto& tess = options.input_info.vertex->tess;
+	// The HS ID is InvocationId << 8; its low byte (the patch ordinal) is 0 for the one patch
+	// an invocation group runs. The terrain HS a9f31c39ad53f06c reads it with an AND 0xff or a
+	// byte extract, which constant propagation does not fold: fold those to 0 here, so the
+	// patch-relative ring and factor addresses become immediates.
+	{
+		const auto shift_amount = [](const Value& value, uint32_t& amount) {
+			const auto* shl = value.Resolve().TryInstruction();
+			if (shl == nullptr || shl->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+			    !shl->Arg(1).Resolve().IsImmediate())
+				return false;
+			amount = shl->Arg(1).Resolve().U32();
+			return amount < 32u;
+		};
+		for (auto* block: program.blocks) {
+			for (auto& inst: *block) {
+				uint32_t amount = 0;
+				if (inst.GetOpcode() == ValueOpcode::BitwiseAnd32) {
+					for (uint32_t side = 0; side < 2u; side++) {
+						const auto mask = inst.Arg(side).Resolve();
+						if (mask.IsImmediate() && shift_amount(inst.Arg(1u - side), amount) &&
+						    (mask.U32() >> amount) == 0u) {
+							inst.ReplaceUsesWith(Value(0u));
+							break;
+						}
+					}
+				} else if (inst.GetOpcode() == ValueOpcode::BitFieldUExtract &&
+				           inst.Arg(1).Resolve().IsImmediate() &&
+				           inst.Arg(2).Resolve().IsImmediate() &&
+				           shift_amount(inst.Arg(0), amount) &&
+				           inst.Arg(1).Resolve().U32() + inst.Arg(2).Resolve().U32() <= amount) {
+					inst.ReplaceUsesWith(Value(0u));
+				}
+			}
+		}
+	}
 	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
 	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
 	for (auto* block: program.blocks) {
@@ -322,11 +377,13 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			Value                 address, predicate;
 			if (shared != SharedAccess::None && memory.kind == ResourceKind::Lds) {
 				write = shared == SharedAccess::Write;
-				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u ||
-				                     (options.stage == ShaderType::Local
-				                          ? !write
-				                          : options.stage != ShaderType::TessellationControl ||
-				                                shared != SharedAccess::Read));
+				if (memory.data_bits != 32u ||
+				    (options.stage == ShaderType::Local
+				         ? !write
+				         : options.stage != ShaderType::TessellationControl ||
+				               shared != SharedAccess::Read)) {
+					return unsupported("this LDS access");
+				}
 				kind       = write ? TessellationAttribute::LocalOutput
 				                   : TessellationAttribute::ControlInput;
 				components = SharedComponentCount(inst.GetOpcode());
@@ -337,15 +394,18 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 				if (base == nullptr) {
 					continue;
 				}
-				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u || memory.formatted || memory.idxen ||
-				                     !memory.offen || buffer == BufferAccess::Atomic);
+				if (memory.data_bits != 32u || memory.formatted || memory.idxen || !memory.offen ||
+				    buffer == BufferAccess::Atomic) {
+					return unsupported("this ring buffer access");
+				}
 				write      = buffer == BufferAccess::Write;
 				components = BufferComponentCount(inst.GetOpcode());
 				address    = inst.Arg(2).Resolve();
 				predicate  = inst.Arg(inst.NumArgs() - 1u);
 				if (base->Arg(0).U32() == 1u) {
-					EXIT_NOT_IMPLEMENTED(!write ||
-					                     options.stage != ShaderType::TessellationControl);
+					if (!write || options.stage != ShaderType::TessellationControl) {
+						return unsupported("a tessellation factor access outside the HS");
+					}
 					kind = TessellationAttribute::Factor;
 					factors += components;
 				} else {
@@ -423,6 +483,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	     : options.stage == ShaderType::TessellationControl ? "HS"
 	                                                       : "TES",
 	     reads, writes, factors, patches);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

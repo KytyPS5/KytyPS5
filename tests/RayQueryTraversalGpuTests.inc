@@ -639,8 +639,27 @@
           Require(name, step, ok, "a ray found the wrong hit");
         }
       };
+      // Drain periodic counters before and after one dispatch with a settled mirror.
+      const auto read_counts = [&] {
+        for (u32 i = 0; i <= FaultManager::HackMarksPeriod; ++i) {
+          cache.ProcessFaultBuffer();
+          scheduler.Finish();
+        }
+        return RayTracing::GetRayCounts();
+      };
+      const bool stats = Config::RayTracingStatsEnabled();
+      const auto cold = stats ? read_counts() : RayTracing::RayCounts{};
       const auto walked = dispatch();
       expect("guest walk", walked);
+      if (stats) {
+        const auto after = read_counts();
+        const auto native = after.native - cold.native;
+        const auto guest = after.guest - cold.guest;
+        std::printf("[gpu]     %s cold: %llu native queries, %llu fallback rays\n", name,
+                    static_cast<unsigned long long>(native), static_cast<unsigned long long>(guest));
+        Require(name, "fallback counts", native == 0 && guest == lanes,
+                "cold-mirror rays were not counted as guest traversals");
+      }
       // A query iteration takes one candidate: fewer than the walk, which also visits boxes.
       const auto queried = [&](const std::vector<u32> &result) {
         for (u32 i = 0; i < lanes; ++i) {
@@ -656,9 +675,21 @@
       }
       Require(name, "ray query", queried(result), "the loop never traced the mirror");
       expect("ray query", result);
+      const auto before = stats ? read_counts() : RayTracing::RayCounts{};
       result = dispatch();
       Require(name, "ray query", queried(result), "the loop stopped tracing the mirror");
       expect("ray query", result);
+      if (stats) {
+        const auto after = read_counts();
+        const auto native = after.native - before.native;
+        const auto guest = after.guest - before.guest;
+        // The mirror path issues an empty-mask query for the NaN ray. Count it as an
+        // initialization as well as queries that miss or hit geometry.
+        std::printf("[gpu]     %s: %llu native queries, %llu fallback rays\n", name,
+                    static_cast<unsigned long long>(native), static_cast<unsigned long long>(guest));
+        Require(name, "ray counts", native == lanes && guest == 0,
+                "GPU counts differ from the queries initialized by this dispatch");
+      }
       context.UnmapMemory(blas, 4 * page);
       scheduler.Finish();
     });

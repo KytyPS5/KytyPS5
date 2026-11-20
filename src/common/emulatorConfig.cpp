@@ -2,9 +2,14 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/threads.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <string_view>
 
 namespace Config {
 
@@ -83,6 +88,10 @@ int GetPlayerFromUserId(int32_t user_id) {
 
 bool IsGuestUserId(int32_t user_id) {
 	return GetPlayerFromUserId(user_id) > 0;
+}
+
+bool PadHapticRumbleEnabled() {
+	return g_config->pad_haptic_rumble;
 }
 
 PresentMode GetPresentMode() {
@@ -169,6 +178,18 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
+bool PipelineManifestEnabled() {
+	return g_config->pipeline_manifest_enabled;
+}
+
+bool PipelineManifestRecord() {
+	return g_config->pipeline_manifest_record;
+}
+
+PipelinePrecompile GetPipelinePrecompile() {
+	return g_config->pipeline_precompile;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
@@ -195,6 +216,10 @@ LogDirection GetPrintfDirection() {
 
 std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
+}
+
+std::filesystem::path GetSessionLogFile() {
+	return g_config->session_log_file;
 }
 
 bool ProfilerEnabled() {
@@ -249,8 +274,16 @@ bool NativeRtEnabled() {
 	return g_config->native_rt;
 }
 
-bool LodStatsEnabled() {
-	return g_config->lod_stats_enabled;
+bool AsyncPipelinesEnabled() {
+	return g_config->async_pipelines_enabled;
+}
+
+bool NativeRayTracingEnabled() {
+	return g_config->native_rt;
+}
+
+bool RayTracingStatsEnabled() {
+	return g_config->native_rt && g_config->rt_stats_enabled;
 }
 
 bool TrophyEnabled() {
@@ -271,6 +304,74 @@ bool SkipNoticeScreen() {
 
 const std::string& GetLaunchActivity() {
 	return g_config->launch_activity;
+}
+
+uint32_t ParseGpuPipelineStages(const char* value) {
+	char*      end    = nullptr;
+	const auto parsed = std::strtoul(value, &end, 0);
+	if (end == value || *end != '\0') {
+		EXIT("invalid GPU pipeline stages: %s\n", value);
+	}
+	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
+}
+
+bool ResolveHelperEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RESOLVE_HELPER");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
+void ConfigureGpuStageThread(GpuStageThread stage) {
+	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
+	// from core 0: the stages share its L3. The resolve helper takes core 0, the last one there.
+	static const std::array<int, 6> cpus = [] {
+		std::array<int, 6> result {4, 6, 8, 10, 2, 0};
+		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		if (value == nullptr) {
+			return result;
+		}
+		if (std::string_view(value) == "off") {
+			return std::array<int, 6> {-1, -1, -1, -1, -1, -1};
+		}
+		// Stages without a listed CPU keep their default.
+		for (auto& cpu: result) {
+			if (*value == '\0') {
+				break;
+			}
+			char* end = nullptr;
+			cpu       = static_cast<int>(std::strtol(value, &end, 10));
+			if (end == value) {
+				EXIT("invalid KYTY_GPU_THREAD_CPUS: %s\n", std::getenv("KYTY_GPU_THREAD_CPUS"));
+			}
+			value = *end == ',' ? end + 1 : end;
+		}
+		return result;
+	}();
+	static const bool high_priority = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	if (high_priority) {
+		Common::Thread::RaiseCurrentPriority();
+	}
+	// Guest threads that spin while they wait for work (Demon's Souls keeps ~12 job workers at
+	// ~95% of a core each) otherwise run on the SMT siblings of the pinned stages and slow them
+	// down: give the stages whole physical cores.
+	static std::once_flag reserved;
+	std::call_once(reserved, [] {
+		Common::Thread::ReserveCores(std::span {cpus}.first(ResolveHelperEnabled() ? 6 : 5));
+	});
+	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+}
+
+uint32_t GpuPipelineStages() {
+	if (const char* value = std::getenv("KYTY_GPU_PIPELINE"); value != nullptr) {
+		return ParseGpuPipelineStages(value);
+	}
+	// Tools and tests that do not load a configuration run the GPU inline.
+	return g_config != nullptr ? g_config->gpu_pipeline_stages : 0;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

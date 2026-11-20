@@ -1,16 +1,74 @@
 #include "common/threads.h"
 
+#include <algorithm>
+#include <bit>
 #include <atomic>
 #include <cerrno>
 #include <chrono> // IWYU pragma: keep
 #include <ctime>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#include <tlhelp32.h>
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
+
+// The logical processors other than those of the cores Thread::ReserveCores() keeps for pinned
+// threads (0 while none are reserved), and the next ideal processor to hand out among them.
+static std::atomic<uint64_t> g_unreserved_processors {0};
+static std::atomic<uint32_t> g_next_ideal_processor {0};
+// Set by Thread::PinCurrent() on a processor of a reserved core.
+static thread_local bool t_reserved_core = false;
+
+// A default CPU set alone does not keep a thread off the reserved cores: Windows still gives the
+// thread an ideal processor there, and a thread made ready while every allowed processor is busy
+// waits in that processor's queue, which the thread pinned there never yields to. Astro Bot's
+// game threads waited there 2-6 s at a time. A hard affinity, with the ideal processor inside it,
+// keeps such threads among the processors they may use. Threads that chose their own processors
+// keep them.
+static void KeepThreadOffReservedCores(HANDLE thread) noexcept {
+	const auto unreserved = g_unreserved_processors.load(std::memory_order_acquire);
+	if (unreserved == 0) {
+		return;
+	}
+	DWORD_PTR process_mask = 0;
+	DWORD_PTR system_mask  = 0;
+	if (!::GetProcessAffinityMask(::GetCurrentProcess(), &process_mask, &system_mask)) {
+		return;
+	}
+	const auto previous = ::SetThreadAffinityMask(thread, static_cast<DWORD_PTR>(unreserved));
+	if (previous == 0) {
+		return;
+	}
+	if (previous != process_mask) {
+		(void)::SetThreadAffinityMask(thread, previous);
+		return;
+	}
+	auto       allowed = unreserved;
+	const auto count   = static_cast<uint32_t>(std::popcount(allowed));
+	for (auto skip = g_next_ideal_processor.fetch_add(1, std::memory_order_relaxed) % count;
+	     skip != 0; skip--) {
+		allowed &= allowed - 1;
+	}
+	(void)::SetThreadIdealProcessor(thread, static_cast<DWORD>(std::countr_zero(allowed)));
+}
+
+// Runs in every thread of the process when it starts, also in those that other libraries and the
+// graphics driver create.
+static void NTAPI KeepNewThreadOffReservedCores(PVOID /*module*/, DWORD reason, PVOID /*reserved*/) {
+	if (reason == DLL_THREAD_ATTACH) {
+		KeepThreadOffReservedCores(::GetCurrentThread());
+	}
+}
+
+#pragma section(".CRT$XLK", read)
+extern "C" __declspec(allocate(".CRT$XLK")) const PIMAGE_TLS_CALLBACK kyty_keep_new_thread_off_reserved_cores =
+    KeepNewThreadOffReservedCores;
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:kyty_keep_new_thread_off_reserved_cores")
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -57,6 +115,123 @@ static std::thread::id g_main_thread;
 
 void InitializeThreads() {
 	g_main_thread = std::this_thread::get_id();
+}
+
+void Thread::RaiseCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
+void Thread::LowerCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
+void Thread::PinCurrent(int logical_cpu) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (logical_cpu >= 0 && logical_cpu < 64) {
+		const auto mask = DWORD_PTR {1} << static_cast<uint32_t>(logical_cpu);
+		::SetThreadAffinityMask(::GetCurrentThread(), mask);
+		::SetThreadIdealProcessor(::GetCurrentThread(), static_cast<DWORD>(logical_cpu));
+		const auto unreserved = g_unreserved_processors.load(std::memory_order_acquire);
+		t_reserved_core = unreserved != 0 && (unreserved & mask) == 0;
+	}
+#else
+	(void)logical_cpu;
+#endif
+}
+
+bool Thread::HasReservedCore() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return t_reserved_core;
+#else
+	return false;
+#endif
+}
+
+void Thread::ReserveCores(std::span<const int> logical_cpus) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ULONG length = 0;
+	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
+	if (length == 0) {
+		return;
+	}
+	std::vector<uint8_t> buffer(length);
+	auto* const          first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (!::GetSystemCpuSetInformation(first, length, &length, ::GetCurrentProcess(), 0)) {
+		return;
+	}
+	const auto for_each_set = [&](auto&& func) {
+		for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+			const auto* info =
+			    reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+			if (info->Type == CpuSetInformation) {
+				func(info->CpuSet);
+			}
+			offset += info->Size;
+		}
+	};
+	// The physical cores (group, core index) of the reserved logical processors.
+	std::vector<std::pair<WORD, BYTE>> reserved;
+	for_each_set([&](const auto& set) {
+		for (const auto cpu: logical_cpus) {
+			if (set.Group == 0 && cpu >= 0 && set.LogicalProcessorIndex == cpu) {
+				reserved.emplace_back(set.Group, set.CoreIndex);
+			}
+		}
+	});
+	std::vector<ULONG>                 others;
+	std::vector<std::pair<WORD, BYTE>> other_cores;
+	for_each_set([&](const auto& set) {
+		const std::pair core {set.Group, set.CoreIndex};
+		if (std::ranges::find(reserved, core) == reserved.end()) {
+			others.push_back(set.Id);
+			if (std::ranges::find(other_cores, core) == other_cores.end()) {
+				other_cores.push_back(core);
+			}
+		}
+	});
+	// Smaller processors keep every core for the guest, which expects about seven.
+	constexpr size_t MinOtherCores = 6;
+	if (reserved.empty() || other_cores.size() < MinOtherCores) {
+		return;
+	}
+	(void)::SetProcessDefaultCpuSets(::GetCurrentProcess(), others.data(),
+	                                 static_cast<ULONG>(others.size()));
+	// The default CPU sets stay for threads that start without the callback above; every other
+	// thread, those already running included, gets a hard affinity off the reserved cores. The
+	// calling thread pins itself next.
+	uint64_t unreserved = 0;
+	for_each_set([&](const auto& set) {
+		if (set.Group == 0 && set.LogicalProcessorIndex < 64 &&
+		    std::ranges::find(reserved, std::pair {set.Group, set.CoreIndex}) == reserved.end()) {
+			unreserved |= uint64_t {1} << set.LogicalProcessorIndex;
+		}
+	});
+	g_unreserved_processors.store(unreserved, std::memory_order_release);
+	if (HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	    snapshot != INVALID_HANDLE_VALUE) {
+		THREADENTRY32 entry {};
+		entry.dwSize = sizeof(entry);
+		for (BOOL ok = ::Thread32First(snapshot, &entry); ok; ok = ::Thread32Next(snapshot, &entry)) {
+			if (entry.th32OwnerProcessID != ::GetCurrentProcessId() ||
+			    entry.th32ThreadID == ::GetCurrentThreadId()) {
+				continue;
+			}
+			if (HANDLE thread = ::OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+			                                 FALSE, entry.th32ThreadID);
+			    thread != nullptr) {
+				KeepThreadOffReservedCores(thread);
+				::CloseHandle(thread);
+			}
+		}
+		::CloseHandle(snapshot);
+	}
+#else
+	(void)logical_cpus;
+#endif
 }
 
 void Thread::SleepMicro(uint32_t micros) {

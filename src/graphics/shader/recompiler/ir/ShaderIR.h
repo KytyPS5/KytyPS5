@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_
 
 #include "common/common.h"
+#include "graphics/shader/recompiler/ir/BdaReadPlan.h"
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -84,17 +85,56 @@ struct MemoryInfo {
 		       !typed && !formatted && data_bits == 32u;
 	}
 
+	[[nodiscard]] bool IsCoherentBufferPairStore(ValueOpcode opcode) const {
+		return kind == ResourceKind::Buffer && opcode == ValueOpcode::StoreBufferU32x2 && coherent &&
+		       !typed && !formatted && data_bits == 32u;
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4
 		                  : opcode == ValueOpcode::ReadConstBuffer ||
 		                        opcode == ValueOpcode::LoadBufferU32 ||
 		                        opcode == ValueOpcode::LoadBufferU32x2 ||
 		                        opcode == ValueOpcode::LoadBufferU32x3 ||
 		                        opcode == ValueOpcode::LoadBufferU32x4);
+	}
+	// Raw DWORD stores through a V# selected at runtime from a descriptor table.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+	// Raw 32-bit integer atomics through a V# selected at runtime: they run on guest memory by
+	// device address, as the stores write it.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		if (formatted || typed || data_bits != 32u) return false;
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return true;
+			default: return false;
+		}
+	}
+	[[nodiscard]] bool SupportsIndirectBufferWrite(ValueOpcode opcode) const {
+		return SupportsIndirectBufferStore(opcode) || SupportsIndirectBufferAtomic(opcode);
+	}
+	[[nodiscard]] bool SupportsIndirectBufferAccess(ValueOpcode opcode) const {
+		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferWrite(opcode);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -112,11 +152,26 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// A buffer's packed stride (ShaderBufferResource::PackedStride()) holds its stride in the low 14
+// bits. This stride says that the module does not have it compiled in: it reads the stride of the
+// bound buffer from its shader data (Bindings::StrideDword()), so that one module serves the
+// buffers of every stride. A shader that reads records of several sizes (Demon's Souls' particle
+// programs: their record sizes are the strides of their V#s) otherwise needs a module, and a
+// pipeline, per combination.
+inline constexpr uint32_t BufferStrideMask    = 0x3fffu;
+inline constexpr uint32_t RuntimeBufferStride = BufferStrideMask;
+[[nodiscard]] constexpr bool HasRuntimeStride(uint32_t packed_stride) {
+	return (packed_stride & BufferStrideMask) == RuntimeBufferStride;
+}
+
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
+	// The buffer's slot among the uniform buffers too (DescriptorBindingKind::UniformBuffers),
+	// which its constant reads use, or UINT32_MAX.
+	uint32_t               uniform_index      = UINT32_MAX;
 	uint32_t               first_use_pc       = 0;
 	uint32_t               max_byte_extent    = 0;
 	uint32_t               packed_stride      = 0;
@@ -128,10 +183,17 @@ struct BufferResource {
 	bool                   formatted          = false;
 	bool                   scalar             = false;
 	bool                   live               = false;
+	// Only read by ReadConstBuffer at immediate offsets inside UniformBufferBytes, so it can be
+	// bound as a uniform buffer too (see ShaderInfoCollection).
+	bool                   constant_only      = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	// This buffer is a table of V#s (16-byte entries starting at indirect_table_offset) that
+	// selects the targets of IndirectBuffer stores; the host caches every entry it names.
+	bool                   indirect_write_table  = false;
+	uint32_t               indirect_table_offset = 0;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -142,6 +204,7 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+	static constexpr uint32_t NoImageTable    = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      descriptor_index  = UINT32_MAX;
@@ -169,6 +232,17 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	// A root sampling a GPU-indexed T# table (bindless): the key selects table entry
+	// key & table_entry_mask, flattened_srt[table_mapping_offset] holds the entry count and
+	// then one slot per entry, and the slot indexes table_capacity descriptors of this image's
+	// binding that the host fills from the table (slot 0 is a null image).
+	uint32_t                      table                = NoImageTable;
+	uint32_t                      table_capacity       = 0;
+	uint32_t                      table_mapping_offset = 0;
+	uint32_t                      table_entry_mask     = 0;
+	// First element of the table's descriptors in this image's binding, after the binding's
+	// resources; roots of one table and binding share them.
+	uint32_t                      table_descriptor_base = UINT32_MAX;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -357,18 +431,28 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	SharedMemory,
+	UniformBuffers,
+	// GET_LOD_STATS counters, which instrumented pixel shaders record into (LodStatsCounter).
+	MipStats,
 	Count,
 };
 
+// The uniform buffer range every host binds (maxUniformBufferRange is at least 64 KiB on the
+// GPUs that run the emulator); constant reads stay below it with the base adjustment.
+inline constexpr uint32_t UniformBufferBytes = 65536u;
+inline constexpr uint32_t UniformBufferBaseSlack = 256u;
+
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 5;
-	// Indirect mesh draws read the draw parameters, then the record's first instance, from the
-	// task payload (gpu_mesh_indirect.task).
-	static constexpr uint32_t MeshTaskPayloadDwordCount = MeshDrawDwordCount + 1;
+	// Mesh draws: vertex count, vertex offset, index size, index address (2), first instance of the
+	// host draw (draws with more instances than the host allows go in several host draws).
+	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Indirect mesh draws read the first five draw parameters, then the record's first instance,
+	// from the task payload (gpu_mesh_indirect.task).
+	static constexpr uint32_t MeshTaskPayloadDwordCount = 6;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -491,6 +575,38 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// The first table descriptor of each image (UINT32_MAX without a bindless table): the
+// descriptors of a table follow the resources of its roots' binding, whose count grows by the
+// table capacity; roots of one table and binding share them.
+[[nodiscard]] inline std::vector<uint32_t> AllocateImageTableDescriptors(
+    const std::vector<ImageResource>& images,
+    std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)>& counts) {
+	std::vector<uint32_t> bases(images.size(), UINT32_MAX);
+	for (size_t i = 0; i < images.size(); i++) {
+		const auto& image = images[i];
+		if (image.table_capacity == 0u) {
+			continue;
+		}
+		const auto kind = *DescriptorBindingForImage(image);
+		for (size_t j = 0; j < i && bases[i] == UINT32_MAX; j++) {
+			if (bases[j] != UINT32_MAX && images[j].table == image.table &&
+			    DescriptorBindingForImage(images[j]) == kind) {
+				if (images[j].table_capacity != image.table_capacity) {
+					EXIT("shader binding layout failed: image table %u has two capacities",
+					     image.table);
+				}
+				bases[i] = bases[j];
+			}
+		}
+		if (bases[i] == UINT32_MAX) {
+			auto& count = counts[static_cast<size_t>(kind)];
+			bases[i]    = count;
+			count += image.table_capacity;
+		}
+	}
+	return bases;
+}
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
@@ -498,6 +614,13 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
+	uint32_t table_block_dwords  = 0; // table mode: the block's device address (TablePlan)
+	// GET_LOD_STATS field of each image (one dword each, LodStatsReport::ImageField) after the
+	// bound ranges; non-zero only for pixel shaders instrumented for mip statistics.
+	uint32_t mip_stats_count = 0;
+	// The stride of each bound buffer (one dword each, after the mip statistics fields); non-zero
+	// only for programs with a buffer whose stride is read at run time (HasRuntimeStride()).
+	uint32_t stride_count = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
 	// reads 0 for ranges of 2 GiB or more on NVIDIA.
@@ -505,10 +628,13 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t MipStatsDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
+	[[nodiscard]] uint32_t StrideDword() const { return MipStatsDword() + mip_stats_count; }
+	[[nodiscard]] uint32_t TableBlockDword() const { return StrideDword() + stride_count; }
+	[[nodiscard]] uint32_t ShaderDataDwords() const { return TableBlockDword() + table_block_dwords; }
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
@@ -522,9 +648,15 @@ struct Bindings {
 };
 
 struct ShaderInfo {
+	static constexpr uint32_t NoRayQuerySlot  = 0xffffffffu;
+	// ray_query_header_offset of a TLAS header address that is the user data pair itself (the low 48
+	// bits): the program loads nothing for it.
+	static constexpr uint32_t UserDataRayQueryHeader = 0xffffffffu;
 	static constexpr uint32_t MaxBufferRoots  = 64;
-	static constexpr uint32_t MaxImages       = 64;
-	static constexpr uint32_t MaxSamplers     = 32;
+	// Programs with inlined call targets (ray tracing hit groups) gather the images and samplers
+	// of every target: Wolverine's cs 1a04c58a9fbc2052 has more than 64 sampler roots.
+	static constexpr uint32_t MaxImages       = 256;
+	static constexpr uint32_t MaxSamplers     = 256;
 
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;
@@ -533,14 +665,85 @@ struct ShaderInfo {
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
+	// Upstream's traversal pass (RayQueryTraversal) traced BVH walks with ray queries over its BVH
+	// mirror (RayTracing): the program takes the mirror's context (Bindings::ray_query_dword).
+	bool                             ray_query_mirror = false;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
+	// User-data registers {low, high} of a base address that DMA (FLAT/global) accesses offset
+	// from: the low dword, and the next register for a 64-bit pointer or any other one for a V#
+	// whose dword 1 the shader builds from the high 16 bits of the base.
+	std::vector<std::array<uint32_t, 2>> dma_base_registers;
+	// The same for the bases of V#s the GPU computes (raw stores and atomics, see
+	// ResourceTracking): such a V# holds records past an offset the shader reads from memory,
+	// which can reach much farther from its base than a FLAT access does
+	// (RenderContext::CacheDmaBases()).
+	std::vector<std::array<uint32_t, 2>> vsharp_base_registers;
+	// The guest memory DMA reads, when every DMA access is a read whose address is a user-data
+	// base pair plus an offset with known possible bits (see DmaFootprint).
+	struct DmaWindow {
+		// Bytes [base + first, base + last) from the base in registers base_register and +1.
+		uint32_t base_register = 0;
+		int64_t  first         = 0;
+		uint64_t last          = 0;
+
+		bool operator==(const DmaWindow& other) const = default;
+	};
+	// V#s read from base + immediate + offset, for every offset whose set bits lie within
+	// offset_bits; the shader reads buffer memory through them.
+	struct DmaDescriptorTable {
+		uint32_t base_register = 0;
+		int64_t  immediate     = 0;
+		uint32_t offset_bits   = 0;
+
+		bool operator==(const DmaDescriptorTable& other) const = default;
+	};
+	// V#s read from the records of a buffer of the program (index into `buffers`): the three
+	// DWORDs at `offset` of every record of `stride` bytes; the shader reads buffer memory through
+	// them, within their bounds.
+	struct DmaRecordTable {
+		uint32_t buffer = 0;
+		uint32_t stride = 0;
+		uint32_t offset = 0;
+
+		bool operator==(const DmaRecordTable& other) const = default;
+	};
+	std::vector<DmaWindow>           dma_windows;
+	std::vector<DmaDescriptorTable>  dma_tables;
+	std::vector<DmaRecordTable>      dma_record_tables;
+	// A buffer whose V# takes its record count from a header at a fixed offset of the buffer's own
+	// base, which the GPU may write just before (GTA V's Psr BVH passes): the host would have to
+	// wait for the GPU to bind its range. Its accesses go through device addresses instead, with
+	// the V#'s own bounds checked on the GPU and the header read as a flattened SRT dword. The
+	// base is user data: register base_low_register, and the low 16 bits of base_high_register.
+	struct SelfSizedBuffer {
+		uint32_t base_low_register  = 0;
+		uint32_t base_high_register = 0;
+		bool     written            = false;
+
+		bool operator==(const SelfSizedBuffer& other) const = default;
+	};
+	std::vector<SelfSizedBuffer>     self_sized_buffers;
+	// Not empty: the program is not dma_bounded, but everything it reaches through device
+	// addresses follows from a table of records the host can read (Decoder::RecordReach::Pack()).
+	std::vector<uint32_t>            dma_record_reach;
+	// Not empty: the program is not dma_bounded, but everything it reaches through device
+	// addresses is in its windows and tables, in the guest BVH it traces natively and in the
+	// buffers of its alpha tests (Decoder::Program::ray_tracing_reach). The count of alpha tests,
+	// then for each one the buffers of the program (indices into `buffers`) that are its
+	// material table and its buffer table, whose V#s describe index and vertex buffers.
+	std::vector<uint32_t>            ray_query_reach;
+	// A table of ray_query_reach that is no buffer of the program: the V# in four slots of the
+	// flattened SRT from (value & ~RayQuerySrtVsharp).
+	static constexpr uint32_t        RayQuerySrtVsharp = 0x80000000u;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	// dma_windows and dma_tables hold everything DMA can read (only with uses_dma).
+	bool                            dma_bounded                   = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -551,9 +754,24 @@ struct ShaderInfo {
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
+	// Native ray tracing: ray query pseudo-instructions and the sites they belong to.
 	bool                            ray_query                     = false;
+	uint32_t                        ray_query_sites               = 0;
+	// Its guest TLAS: the header address is the 64-bit value at user data pointer
+	// `ray_query_user_sgpr` + `ray_query_header_offset` (UserDataRayQueryHeader: that pointer), the
+	// root node `ray_query_root`.
+	uint32_t                        ray_query_user_sgpr           = 0;
+	uint32_t                        ray_query_header_offset       = 0;
+	// Not NoRayQuerySlot: the header address is at the base of the V# at the user data pointer +
+	// this offset, + `ray_query_header_offset` (Marvel's Wolverine).
+	uint32_t                        ray_query_header_vsharp       = NoRayQuerySlot;
+	uint32_t                        ray_query_root                = 0;
+	// How its instance records are laid out (IR::RayTracingLayout::Pack()).
+	std::array<uint32_t, 4>         ray_query_layout {};
+	// The flattened SRT dwords (ReadConst slots) its sites read that header address from, low and
+	// high, when it loads it from its user data (NoRayQuerySlot otherwise).
+	std::array<uint32_t, 2>         ray_query_header_slots {NoRayQuerySlot, NoRayQuerySlot};
 	bool                            subgroup_ballot               = false;
-	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;
 	bool                            subgroup_shuffle              = false;
 	bool                            subgroup_arithmetic           = false;
@@ -570,6 +788,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	bool                            float16                       = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -615,6 +834,18 @@ struct DescriptorSource {
 			uint32_t stride = 0;
 			uint32_t count = 1;
 			bool indexed = false; // Parent pointers use raw MUBUF record addressing.
+			// The parent pointer names a record that holds, at `offset`, the V# of a descriptor
+			// table chosen by the GPU: its descriptors are at element_offset + key *
+			// element_stride (element_stride 0: one descriptor). Keys are row << 16 | element.
+			bool     buffer         = false;
+			uint32_t element_stride = 0;
+			uint32_t element_offset = 0;
+			// The inlined call target whose code reads the descriptor: only the rows that name it
+			// hold records of its layout (0 when the read is outside inlined code).
+			uint64_t function       = 0;
+			// The other call targets that run the same inlined code (InlinedCallBody::aliases):
+			// the rows that name them hold records of the same layout.
+			std::vector<uint64_t> functions;
 
 			bool operator==(const PointerTable& other) const = default;
 		};
@@ -633,6 +864,10 @@ struct DescriptorSource {
 		// Nonzero shift: workgroup keys are (selector_first + ID) * multiplier >> shift.
 		uint32_t workgroup_multiplier = 0;
 		uint32_t workgroup_shift      = 0;
+		// The table entry is at ((key * table_stride) & table_mask) + table_offset.
+		uint32_t table_mask      = UINT32_MAX;
+		// A bindless T# table: every table entry is a candidate.
+		bool     table_array     = false;
 		Value    key_count;
 		// First selector index, workgroup key base, or first descriptor key for a direct or bitmap
 		// range.
@@ -666,14 +901,73 @@ struct ResourceBlock {
 	std::vector<uint32_t> srt_reads;
 };
 
+// Table mode (Program::table_mode, chenxiao07's KytyPS5 fork): the flattened SRT's slots, the V#s of the buffers the
+// shader reads by device address, and the T#s and S#s of its images and samplers. Slot s holds the dword at
+// ((high:low) & 0xffff'ffff'ffff) + (offset & ~3) + immediate, dword aligned (a bounded slot, read through a V#: high and
+// `records` are its words 1 and 2, and a read past its range, NUM_RECORDS bytes or NUM_RECORDS times the stride, fails
+// the evaluation, as the normal path's); a descriptor is its words. An operand is an immediate, a user data register or
+// a lower slot. For each dispatch or draw the renderer evaluates the slots `cpu` marks (those the shader reads, `gpu`,
+// the image and sampler words, which choose its descriptors, and what their addresses are read through) as the guest
+// memory holds them then, and gives the shader a block: dword s is slot s; from BufferDword(i), buffer i's device
+// address (two dwords), size in dwords (0: none), buffer word and stride, resolved from its V#. The shader reads the
+// block through its device address (Bindings::TableBlockDword).
+struct TablePlan {
+	struct Operand {
+		// ShaderBaseLow/High: the low or high dword of the stage's code address plus `value` (a V# of constants the
+		// code embeds, addressed from s_getpc_b64; the renderer has the address from the registers).
+		enum class Kind : uint8_t { Immediate, UserData, Slot, ShaderBaseLow, ShaderBaseHigh };
+		Kind     kind  = Kind::Immediate;
+		uint32_t value = 0; // the immediate, the scalar register, the slot or the offset from the code address
+		bool     operator==(const Operand&) const = default;
+	};
+	struct Slot {
+		Operand low, high, offset;
+		int32_t immediate = 0; // dword aligned
+		Operand records;       // a bounded slot's V# word 2
+		bool    bounded = false;
+		bool    operator==(const Slot&) const = default;
+	};
+	struct Descriptor {
+		std::array<Operand, 8> words {};
+		uint32_t               count = 0;
+		bool                   operator==(const Descriptor&) const = default;
+	};
+	std::vector<Slot>                   slots;
+	std::vector<std::array<Operand, 4>> buffers;
+	std::vector<Descriptor>             images, samplers;
+	std::vector<uint8_t>                gpu, cpu; // per slot
+	// Flat or global memory reads: the renderer readies their page table ranges at every use, as the normal path's
+	// PrepareBda does.
+	bool global_memory = false;
+	// Formatted buffers (bits by buffer, the first 32) the program only loads from, with loads whose format the code
+	// can decode at run time: specialized for no format (kInvalid, the default dst_sel) the program takes the format
+	// and dst_sel of each load from the buffer word of its block (the V#'s fourth dword), so one program serves the
+	// V#s of every format.
+	uint32_t runtime_formats = 0;
+
+	// A buffer's dwords in the block: its device address (2), size in dwords, buffer word and stride, all from the V#
+	// the renderer resolved.
+	static constexpr uint32_t BufferDwords = 5;
+	[[nodiscard]] uint32_t BufferDword(size_t buffer) const {
+		return static_cast<uint32_t>(slots.size() + BufferDwords * buffer);
+	}
+	[[nodiscard]] uint32_t BlockDwords() const { return BufferDword(buffers.size()); }
+	bool                   operator==(const TablePlan&) const = default;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
+	// The memory the program's loads through device addresses can reach, from the user data and the flattened SRT (taken
+	// first: it reads the program's blocks).
+	BdaReadPlan bda_read_plan;
 	ShaderType stage              = ShaderType::Unknown;
 	uint64_t   shader_hash        = 0;
 	uint32_t   wave_size          = 64;
 	uint32_t   user_data_base     = 0;
 	uint32_t   param_export_mask  = 0;
 	bool       has_address_writes = false;
+	bool       table_mode         = false; // see Program::table_mode
+	TablePlan  table_plan;
 	ShaderInfo info;
 	Bindings   bindings;
 };
@@ -684,6 +978,20 @@ struct UniformFillPlan {
 	Value                pattern_size;
 	Value                element_count;
 };
+
+// What a descriptor source is for the refresh of its words on the execution thread.
+enum class DescriptorRefresh : uint8_t { None, Buffer, Image };
+
+// The bits of a descriptor word that nothing a resolution derives from the descriptor depends on:
+// the base address of a V# (the host binds the buffer at that address when the operation executes)
+// and the LOD warning, perf_mod and mip statistics fields of a T# (the host ignores them).
+constexpr uint32_t DescriptorRefreshMask(DescriptorRefresh kind, uint32_t word) {
+	switch (kind) {
+		case DescriptorRefresh::Buffer: return word == 0 ? 0xffffffffu : (word == 1 ? 0x0000ffffu : 0u);
+		case DescriptorRefresh::Image: return word == 5 ? 0x027fff00u : (word == 6 ? 0x000000ffu : 0u);
+		default: return 0u;
+	}
+}
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -717,16 +1025,48 @@ struct ResourcePlan {
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
+	// Per buffer, from the whole program: whether it has vector (non-scalar) accesses, which use
+	// its stride and bounds mode, and whether its scalar reads feed descriptors. Empty means
+	// unknown (both true). See BuildResourceSpecialization.
+	std::vector<uint8_t>                buffer_vector_access;
+	std::vector<uint8_t>                buffer_feeds_descriptors;
 	UniformFillPlan                     uniform_fill;
+	// By descriptor source: whether it is the descriptor of direct buffers or images only, whose
+	// words have bits the execution thread may refresh (see DescriptorRefreshMask()).
+	std::vector<DescriptorRefresh>      descriptor_refresh;
+	// By descriptor word (source * 8 + word): the flattened SRT dword the load of a refreshable
+	// word also fills, else UINT32_MAX.
+	std::vector<uint32_t>               descriptor_word_flat;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
-	// GPU-thread scratch for walker results and material keys.
+	// GPU-thread scratch for walker results and material keys, of the threads that walk under the
+	// program lock (see PlanScratch()).
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// The same scratch for each thread that walks ahead of execution without the lock
+	// (UsePlanScratchSlot()), made on its first walk.
+	struct ThreadScratch {
+		std::vector<uint64_t>     srt_scratch;
+		std::vector<uint32_t>     material_keys;
+		std::vector<SelectorKeys> selector_keys;
+	};
+	static constexpr uint32_t                             ThreadScratchSlots = 2;
+	mutable std::array<std::unique_ptr<ThreadScratch>, ThreadScratchSlots> thread_scratch;
 };
+
+// The walk and materialization scratch of `plan` for the calling thread.
+struct PlanScratchRef {
+	std::vector<uint64_t>&                   srt_scratch;
+	std::vector<uint32_t>&                   material_keys;
+	std::vector<ResourcePlan::SelectorKeys>& selector_keys;
+};
+PlanScratchRef PlanScratch(const ResourcePlan& plan);
+// The calling thread walks plans with scratch slot `slot` (< ResourcePlan::ThreadScratchSlots) of
+// their own instead of the plans' scratch: several threads walk the same plans at once.
+void UsePlanScratchSlot(uint32_t slot);
 
 struct Program: ResourcePlan {
 	Program() = default;
@@ -741,8 +1081,14 @@ struct Program: ResourcePlan {
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
+	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
+	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
+	bool                          lane_local     = false;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// Byte pcs where the code of an inlined call target starts (programs expanded by
+	// ShaderFunctionExpander): the SPIR-V emitter gives each its own function.
+	std::vector<uint32_t>         inlined_call_entries;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
 	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
@@ -751,6 +1097,10 @@ struct Program: ResourcePlan {
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
+	// Table mode (EnterTableMode): the SRT reads and the buffers' V#s come from a block the renderer fills for each use,
+	// read through its device address; no flattened SRT or buffer descriptors.
+	bool                          table_mode = false;
+	TablePlan                     table_plan;
 
 };
 

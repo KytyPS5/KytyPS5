@@ -1,21 +1,70 @@
 #include "common/archive.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "emulator.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineHelpers.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <string_view>
 #include <vector>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// The profile runtime writes its counters only at a normal exit, but the run scripts may stop the
+// emulator with TerminateProcess. With KYTY_PGO_FILE=<file.profraw>, a thread writes them every
+// KYTY_PGO_DUMP_SECONDS (default 20) to <file>.tmp and renames that over <file>, so the file always
+// holds the last complete dump.
+static void StartPgoDumps() {
+	const char* file = std::getenv("KYTY_PGO_FILE");
+	if (file == nullptr || *file == '\0') {
+		::printf("PGO: instrumented build without KYTY_PGO_FILE: no profile is written\n");
+		return;
+	}
+	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds =
+	    (seconds_text != nullptr && std::atoi(seconds_text) > 0) ? std::atoi(seconds_text) : 20;
+	static const std::string target = file;
+	static const std::string temp   = target + ".tmp";
+	::printf("PGO: writing the profile to %s every %d s\n", target.c_str(), seconds);
+	std::thread([seconds]() {
+		for (uint32_t dump = 1;; dump++) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			__llvm_profile_set_filename(temp.c_str());
+			const int       written = __llvm_profile_write_file();
+			std::error_code error;
+			if (written == 0) {
+				std::filesystem::rename(temp, target, error);
+			}
+			::printf("PGO: dump %u %s\n", dump,
+			         written != 0 ? "failed to write" : (error ? "failed to rename" : "written"));
+			::fflush(stdout);
+		}
+	}).detach();
+}
+#endif
 
 static void PrintUsage() {
 	::printf("%s, %s, ver = %s, git = %s, date = %s\n",
@@ -40,6 +89,8 @@ static void PrintUsage() {
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf("  --keyboard-player <0-4>             Keyboard player; 0 shares player 1 with the gamepad. Default: 0.\n");
+	::printf("  --pad-haptic-rumble                 Rumble pads that are not DualSenses from game haptic\n"
+	         "                                      audio.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -60,7 +111,7 @@ static void PrintUsage() {
 	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --fsr-folder <folder>                FidelityFX DLL folder (Windows).\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
-	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
+	::printf("  --no-guest-tsc                       Run the guest TSC at the host rate, not the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
@@ -70,11 +121,27 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
-	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
+	::printf("  --no-pipeline-manifest               Do not create the shaders and pipelines of the\n"
+	         "                                       title's pipeline manifest ahead of their draws.\n");
+	::printf("  --record-pipeline-manifest           Add the shaders and pipelines this session creates\n"
+	         "                                       to the title's manifest in _PipelineCache.\n");
+	::printf("  --pipeline-precompile <value>        When the pipelines to compile ahead of the game\n"
+	         "                                       would take long: ask whether to wait for them,\n"
+	         "                                       wait, or play at once (ask, wait, play).\n"
+	         "                                       Default: ask.\n");
+	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
+	::printf("  --no-occlusion-queries               Read occlusion queries as always visible.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
-	::printf("  --native-rt                          Use native RT on the GPU.\n");
-	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
+	::printf("  --native-rt                          Experimental: trace the ray tracing passes of\n"
+	         "                                       supported games (GTA V, ASTRO BOT) with the host\n"
+	         "                                       GPU's ray tracing hardware. Default: off.\n"
+	         "                                       --native-raytracing is an alias.\n");
+	::printf(
+	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
+	    "                                       draws that need them while they compile.\n");
+	::printf("  --rt-stats                           With --native-rt: count Vulkan ray queries and guest\n"
+	         "                                       fallback rays on the GPU\n"
+	         "                                       (in the [RT] summaries of the log).\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -82,6 +149,9 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump                Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf("  --session-log <path>                 Keep the warnings, errors and the report of a\n"
+	         "                                       fatal error of this session in a file, without\n"
+	         "                                       the printf log.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
@@ -97,8 +167,12 @@ static void PrintUsage() {
 	::printf("  --playgo-hack                        Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable ASCII chars).\n");
+	::printf("  --gpu-pipeline <0|1|mask>            Emulated GPU stages on their own threads.\n"
+	         "                                       0: all inline, 1: all (default). The\n"
+	         "                                       KYTY_GPU_PIPELINE variable overrides it.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone (default).\n");
+	::printf("  --no-redzone                         Do not protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -200,22 +274,31 @@ static constexpr Flag FLAGS[] = {
     {"--trinity", &ConfigOptions::pro_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
+    {"--no-guest-tsc", &ConfigOptions::guest_tsc_enabled, false},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
+    {"--pipeline-manifest", &ConfigOptions::pipeline_manifest_enabled},
+    {"--no-pipeline-manifest", &ConfigOptions::pipeline_manifest_enabled, false},
+    {"--record-pipeline-manifest", &ConfigOptions::pipeline_manifest_record},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
-    {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
+    {"--no-occlusion-queries", &ConfigOptions::occlusion_queries_enabled, false},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
     {"--native-rt", &ConfigOptions::native_rt},
-    {"--lod-stats", &ConfigOptions::lod_stats_enabled},
+    {"--native-raytracing", &ConfigOptions::native_rt}, // alias of --native-rt
+    {"--async-pipelines", &ConfigOptions::async_pipelines_enabled},
+    {"--no-async-pipelines", &ConfigOptions::async_pipelines_enabled, false},
+    {"--rt-stats", &ConfigOptions::rt_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
+    {"--no-readback-linear-images", &ConfigOptions::readback_linear_images, false},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--readback-storage-images", &ConfigOptions::readback_storage_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
@@ -223,8 +306,10 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+    {"--pad-haptic-rumble", &ConfigOptions::pad_haptic_rumble},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
+    {"--no-redzone", &ConfigOptions::red_zone_protection_enabled, false},
 #endif
 };
 
@@ -253,6 +338,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		if (!NextArg(argc, argv, i, value)) {
 			::printf("missing value for %s\n", arg.c_str());
 			return false;
+		}
+
+		if (arg == "--gpu-pipeline") {
+			options.config.gpu_pipeline_stages = Config::ParseGpuPipelineStages(value.c_str());
+			continue;
 		}
 
 		if (arg == "--game") {
@@ -397,6 +487,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
 		} else if (arg == "--fsr-folder") {
 			options.config.fsr_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--pipeline-precompile") {
+			if (value == "ask") {
+				options.config.pipeline_precompile = Config::PipelinePrecompile::Ask;
+			} else if (value == "wait") {
+				options.config.pipeline_precompile = Config::PipelinePrecompile::Wait;
+			} else if (value == "play") {
+				options.config.pipeline_precompile = Config::PipelinePrecompile::Play;
+			} else {
+				::printf("invalid pipeline precompile mode (ask, wait or play): %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -438,6 +539,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--session-log") {
+			options.config.session_log_file = Common::PathFromUtf8(value);
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {
@@ -458,8 +561,51 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// An exception no one catches (a worker thread of the program cache, for one) ends the process
+// with 0xC0000409 and no message: name the exception first.
+static void ReportUncaughtException() {
+	std::string message;
+#if defined(__cpp_exceptions)
+	try {
+		if (const auto exception = std::current_exception(); exception != nullptr) {
+			std::rethrow_exception(exception);
+		}
+		message = "terminate called without an active exception\n";
+	} catch (const std::exception& error) {
+		message = std::string("terminate: uncaught exception: ") + error.what() + "\n";
+	} catch (...) {
+		message = "terminate: uncaught exception of an unknown type\n";
+	}
+#else
+	message = "terminate called\n";
+#endif
+	std::fputs(message.c_str(), stderr);
+	std::fflush(stderr);
+	Log::WriteToSessionLog(message);
+	Log::Flush();
+	std::abort();
+}
+
 static int Main(int argc, char* argv[]) {
+	std::set_terminate(ReportUncaughtException);
+	// A pipeline helper of an emulator (see PipelineHelpers): its spec, then the emulator's own
+	// options, for the device.
+	if (argc >= 3 && std::string_view(argv[1]) == "--pipeline-helper") {
+		InitializeThreads();
+		std::vector<char*> arguments {argv[0]};
+		arguments.insert(arguments.end(), argv + 3, argv + argc);
+		RunOptions options;
+		bool       show_help = false;
+		(void)ParseArgs(static_cast<int>(arguments.size()), arguments.data(), options, show_help);
+		return Libs::Graphics::RunPipelineHelper(argv[2], options.config);
+	}
+	// After a LoadExec, the guest memory of the process that started this one must be gone first.
+	Emulator::WaitForLoadExecParent();
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	// After the address-space reservations: the thread's stack must not land in the guest range.
+	StartPgoDumps();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;

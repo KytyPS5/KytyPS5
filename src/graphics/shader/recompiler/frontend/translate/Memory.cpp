@@ -379,6 +379,35 @@ void Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
 	}
 }
 
+std::array<IR::U32, 4> Translator::LoadScalarAddressDwords(uint32_t base, uint32_t offset, uint32_t count,
+                                                           uint32_t pc) {
+	Decoder::Instruction load;
+	load.family      = Decoder::Family::SMEM;
+	load.opcode      = Decoder::Opcode::S_LOAD_DWORDX4;
+	load.src0.kind   = Decoder::OperandKind::Sgpr;
+	load.src0.reg    = base;
+	load.src1.kind   = Decoder::OperandKind::Null;
+	load.offset      = offset;
+	load.data_dwords = count;
+	const auto memory   = MemoryInfoFromDecoded(load);
+	const auto resource = GetScalarAddressResource(base);
+	std::array<IR::U32, 4> loaded {};
+	for (uint32_t component = 0; component < 4u; component++) {
+		if (component >= count) {
+			loaded[component] = IR::U32(IR::Value(0u));
+			continue;
+		}
+		auto scalar = memory;
+		scalar.offset += component * sizeof(uint32_t);
+		scalar.data_dwords     = 1u;
+		scalar.component_index = component;
+		loaded[component] = IR::U32(ir.Emit(IR::ValueOpcode::LoadAddressU32,
+		                                    {resource, IR::Value(0u), IR::Value(0u), IR::Value(true)},
+		                                    AddMemoryInfo(scalar, pc)));
+	}
+	return loaded;
+}
+
 void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;

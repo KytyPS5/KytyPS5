@@ -143,40 +143,52 @@ template <class S, class T> void Io(S& io, T& value) {
 
 // Binds every field, so that a field added later fails to compile until it is listed.
 #define KYTY_IO_FIELDS(Struct, ...)                                                                \
-	template <class S, Is<Struct> T> void Io(S& io, T& object) {                                   \
+	template <class Stream, Is<Struct> Object> void Io(Stream& io, Object& object) {               \
 		auto& [__VA_ARGS__] = object;                                                              \
 		IoAll(io, __VA_ARGS__);                                                                    \
 	}
 KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
                y, z)
-KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
+KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u)
 KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w,
-               x, y, z)
+               x, y, z, A, B, C, D, E)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
 KYTY_IO_FIELDS(StageOutput, a, b, c, d)
+KYTY_IO_FIELDS(ShaderInfo::DmaWindow, a, b, c)
+KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
+KYTY_IO_FIELDS(ShaderInfo::DmaRecordTable, a, b, c)
+KYTY_IO_FIELDS(ShaderInfo::SelfSizedBuffer, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R)
+               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0,
+               a1, a2, a3, a4, a5, a6, a7, a8)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
                l, m, n, o)
-KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d)
+KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::PointerTable, a, b, c, d, e, f, g, h, i)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p,
-               q, r)
+               q, r, s, t)
 KYTY_IO_FIELDS(DescriptorSource, a, b, c)
 KYTY_IO_FIELDS(SrtRead, a, b)
 KYTY_IO_FIELDS(ResourceBlock, a, b, c, d, e)
-KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f)
+KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(UniformFillPlan, a, b, c, d)
 KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m)
+KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
-KYTY_IO_FIELDS(Bindings, a, b, c, d, e, f)
-KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g, h)
+KYTY_IO_FIELDS(Bindings, a, b, c, d, e, f, g, h, i)
+KYTY_IO_FIELDS(TablePlan::Operand, a, b)
+KYTY_IO_FIELDS(TablePlan::Slot, a, b, c, d, e, f)
+KYTY_IO_FIELDS(TablePlan::Descriptor, a, b)
+KYTY_IO_FIELDS(TablePlan, a, b, c, d, e, f, g, h)
+KYTY_IO_FIELDS(BdaReadWord, a, b)
+KYTY_IO_FIELDS(BdaReadSpan, a, b, c, d, e)
+KYTY_IO_FIELDS(BdaReadPlan, a, b)
+KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h, i, j, k)
+KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g, h, i)
 KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
 KYTY_IO_FIELDS(RectListParameter, a, b, c)
 #undef KYTY_IO_FIELDS

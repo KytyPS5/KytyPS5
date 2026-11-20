@@ -83,10 +83,12 @@ uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength();
 uint32_t KYTY_SYSV_ABI AgcDriverInitResourceRegistration();
 uint32_t KYTY_SYSV_ABI
 AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes);
-int KYTY_SYSV_ABI AgcDriverRegisterOwner();
-int KYTY_SYSV_ABI AgcDriverRegisterResource();
+int KYTY_SYSV_ABI AgcDriverRegisterOwner(uint32_t* owner_handle, const char* name);
+int KYTY_SYSV_ABI AgcDriverRegisterResource(uint32_t* resource_handle, uint32_t owner_handle,
+                                            const void* memory, uint64_t size, const char* name,
+                                            uint32_t type, uint64_t user_data);
 int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle);
-int KYTY_SYSV_ABI AgcDriverUnregisterResource();
+int KYTY_SYSV_ABI AgcDriverUnregisterResource(uint32_t resource_handle);
 int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream);
 
 uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords);

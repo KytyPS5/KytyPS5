@@ -175,11 +175,13 @@ add_dependencies(kyty_git_version KytyGitVersion)
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
 		kyty_emulator
+		kyty_emulator_objects
 		common
 		#launcher
 	)
 	list(APPEND KYTY_CLANG_TIDY
 		kyty_emulator
+		kyty_emulator_objects
 		#common
 		launcher
 	)
@@ -190,6 +192,97 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# Profile-guided optimization (clang and clang-cl), after Jetsku's U59 build. Use a separate build
+# directory for each step:
+# 1. KYTY_PGO_GENERATE=ON builds an instrumented emulator. Run it with KYTY_PGO_FILE=<x.profraw>:
+#    it writes its counters every KYTY_PGO_DUMP_SECONDS (default 20) to that file (main.cpp), so a
+#    run stopped with TerminateProcess keeps its last complete dump.
+# 2. llvm-profdata merge -o <x.profdata> <dumps>, with the llvm-profdata of the compiler's version.
+# 3. KYTY_PGO_USE=<x.profdata> builds the optimized emulator.
+# Only Kyty's own targets (declared below) get the flags: third-party code a training run does not
+# exercise (the SPIR-V optimizer, ...) keeps its normal optimization instead of being treated as
+# cold. They are compile options, not CMAKE_CXX_FLAGS.
+option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
+set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib (clang-cl; empty: search)")
+# KYTY_PGO: the profile kept in the repository, pgo/gtav.profdata (GTA V, Demon's Souls and ASTRO BOT,
+# recorded with LLVM 22.1.8; an older compiler cannot read it). KYTY_PGO_USE, when set, wins.
+option(KYTY_PGO "Optimize with pgo/gtav.profdata (clang)" OFF)
+if(KYTY_PGO AND NOT KYTY_PGO_USE AND NOT KYTY_PGO_GENERATE)
+	set(KYTY_PGO_USE "${CMAKE_CURRENT_SOURCE_DIR}/pgo/gtav.profdata")
+endif()
+if(KYTY_PGO_GENERATE OR KYTY_PGO_USE)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE/KYTY_PGO_USE need clang or clang-cl")
+	endif()
+	if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
+	endif()
+endif()
+if(KYTY_PGO_GENERATE)
+	add_compile_options(-fprofile-instr-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	if(KYTY_CLANG_CL)
+		# lld-link is called directly, so the profile runtime has to be named. Some clang-cl
+		# distributions do not ship it; the one of Visual Studio's LLVM of the same major version
+		# works too (KYTY_PGO_RUNTIME).
+		set(kyty_profile_runtime "${KYTY_PGO_RUNTIME}")
+		if(NOT kyty_profile_runtime)
+			cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+			file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		endif()
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}; set KYTY_PGO_RUNTIME")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		link_libraries("${kyty_profile_runtime}")
+		# clang 19 also asks for the runtime by its new name (clang_rt.profile.lib), which the
+		# older-layout runtimes do not have; the one named above provides the same symbols.
+		add_link_options("/NODEFAULTLIB:clang_rt.profile.lib")
+	else()
+		add_link_options(-fprofile-instr-generate)
+	endif()
+	message(STATUS "PGO: instrumented build (run with KYTY_PGO_FILE=<file.profraw>)")
+elseif(KYTY_PGO_USE)
+	if(NOT EXISTS "${KYTY_PGO_USE}")
+		# A missing profile never fails the build: it is built without one.
+		message(WARNING "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist, building without a profile")
+	else()
+		# No warnings for sources without profile data (launcher, tests) or per function; a
+		# function that changed since the profile was recorded is optimized without it.
+		add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+		                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+		message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
+	endif()
+endif()
+
+# Code generation for the machine class this runs on, both off by default (a release must run on
+# any x86-64 CPU and a clean build with ThinLTO takes about as long again):
+# - KYTY_NATIVE_V3: x86-64-v3 (AVX2, BMI1/2, FMA, LZCNT, MOVBE: Intel since Haswell 2013, AMD since
+#   Excavator/Zen). The emulator does not start on older CPUs.
+# - KYTY_THINLTO: ThinLTO across translation units (clang and clang-cl, with lld).
+option(KYTY_NATIVE_V3 "Compile for x86-64-v3 (AVX2/BMI2/FMA CPUs; clang)" OFF)
+option(KYTY_THINLTO "Optimize across translation units with ThinLTO (clang with lld)" OFF)
+if(KYTY_NATIVE_V3)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_NATIVE_V3 needs clang or clang-cl")
+	endif()
+	if(KYTY_CLANG_CL)
+		add_compile_options("/clang:-march=x86-64-v3")
+	else()
+		add_compile_options(-march=x86-64-v3)
+	endif()
+	message(STATUS "Code generation: x86-64-v3 (AVX2)")
+endif()
+if(KYTY_THINLTO)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_THINLTO needs clang or clang-cl")
+	endif()
+	add_compile_options(-flto=thin)
+	message(STATUS "Code generation: ThinLTO")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
@@ -286,7 +379,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -294,6 +387,71 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(indirect_thread_shader_source "${gpu_tiler_shader_dir}/indirect_thread_dispatch.comp")
+set(indirect_thread_shader_spv "${gpu_tiler_generated_dir}/indirect_thread_dispatch.spv")
+set(indirect_thread_shader_header "${gpu_tiler_generated_dir}/indirect_thread_dispatch_spv.h")
+add_custom_command(
+	OUTPUT "${indirect_thread_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${indirect_thread_shader_spv}" "${indirect_thread_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${indirect_thread_shader_spv} -DOUTPUT=${indirect_thread_shader_header}
+	        -DSYMBOL=INDIRECT_THREAD_DISPATCH_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${indirect_thread_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${indirect_thread_shader_header}")
+
+# The buffer cache's batched uploads (see BufferCache::FlushUploadBatch()).
+set(buffer_scatter_shader_source "${gpu_tiler_shader_dir}/buffer_scatter.comp")
+set(buffer_scatter_shader_spv "${gpu_tiler_generated_dir}/buffer_scatter.spv")
+set(buffer_scatter_shader_header "${gpu_tiler_generated_dir}/buffer_scatter_spv.h")
+add_custom_command(
+	OUTPUT "${buffer_scatter_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${buffer_scatter_shader_spv}" "${buffer_scatter_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${buffer_scatter_shader_spv} -DOUTPUT=${buffer_scatter_shader_header}
+	        -DSYMBOL=BUFFER_SCATTER_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${buffer_scatter_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${buffer_scatter_shader_header}")
+# Occlusion counters written on the GPU timeline (see OcclusionQueries::WriteForReaders()).
+set(occlusion_counters_shader_source "${gpu_tiler_shader_dir}/occlusion_counters.comp")
+set(occlusion_counters_shader_spv "${gpu_tiler_generated_dir}/occlusion_counters.spv")
+set(occlusion_counters_shader_header "${gpu_tiler_generated_dir}/occlusion_counters_spv.h")
+add_custom_command(
+	OUTPUT "${occlusion_counters_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${occlusion_counters_shader_spv}" "${occlusion_counters_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${occlusion_counters_shader_spv} -DOUTPUT=${occlusion_counters_shader_header}
+	        -DSYMBOL=OCCLUSION_COUNTERS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${occlusion_counters_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${occlusion_counters_shader_header}")
+# Native ray tracing: walks of the guest BVHs (see nativeRayTracing.h).
+foreach(shader_name IN ITEMS rt_tlas_walk rt_blas_walk hle_tlas hle_blas_refit)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_name}.comp")
+	set(shader_spv "${gpu_tiler_generated_dir}/${shader_name}.spv")
+	set(shader_header "${gpu_tiler_generated_dir}/${shader_name}_spv.h")
+	string(TOUPPER "${shader_name}_SPV" shader_symbol)
+	add_custom_command(
+		OUTPUT "${shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -DCACHING_PAGEBITS=14 "-I${gpu_tiler_shader_dir}"
+		        -o "${shader_spv}" "${shader_source}"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
+		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${shader_source}" "${gpu_tiler_shader_dir}/rt_common.inc"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${shader_header}")
+endforeach()
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -316,11 +474,11 @@ function(add_gpu_blit_shader shader_name shader_file)
 endfunction()
 add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
+add_gpu_blit_shader(gpu_blit_color_to_depth gpu_blit_color_to_depth.frag)
+add_gpu_blit_shader(gpu_blit_depth_to_color gpu_blit_depth_to_color.comp)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
-add_gpu_blit_shader(gpu_bvh_mirror gpu_bvh_mirror.comp)
-add_gpu_blit_shader(gpu_bvh_walk gpu_bvh_mirror.comp -DWALK=1)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
@@ -328,6 +486,8 @@ list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
+	"${KYTY_SOURCE_DIR}/local/local-platform.h"
+	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
@@ -367,9 +527,23 @@ list(APPEND check_headers
 	${KYTY_SOURCE_DIR}
 )
 
+# A test that needs the whole emulator links the objects of kyty_emulator_objects. OWN_SOURCES
+# compiles its own copy of the emulator sources instead, for a test that builds them with its own
+# definitions (virtual_memory_allocation_tests).
 function(add_kyty_full_emulator_test target source)
-	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
-	target_link_libraries(${target} ${kyty_emulator_link_libraries})
+	cmake_parse_arguments(PARSE_ARGV 2 arg "OWN_SOURCES" "" "")
+	if(arg_OWN_SOURCES)
+		add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+		target_link_libraries(${target} ${kyty_emulator_link_libraries})
+		# The macOS x86_64 guest address space needs its .zerofill segments anchored
+		# by linker flags, or the kernel kills the binary on load (posix_spawn EIO).
+		configure_macos_guest_address_space(${target})
+	else()
+		# The guest address space settings come with the objects. The libraries are named again so
+		# that the link line keeps their order.
+		add_executable(${target} EXCLUDE_FROM_ALL ${source})
+		target_link_libraries(${target} kyty_emulator_objects ${kyty_emulator_link_libraries})
+	endif()
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi dxgi)
@@ -378,32 +552,44 @@ function(add_kyty_full_emulator_test target source)
 		target_link_libraries(${target} onecore)
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
-	# The macOS x86_64 guest address space needs its .zerofill segments anchored
-	# by linker flags, or the kernel kills the binary on load (posix_spawn EIO).
-	configure_macos_guest_address_space(${target})
 endfunction()
 
+# PUBLIC: on kyty_emulator_objects, the definition and the segment addresses also reach the
+# executables that link its objects.
 function(configure_macos_guest_address_space target)
 	if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 			(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
 		target_sources(${target} PRIVATE "${KYTY_SOURCE_DIR}/kernel/macosGuestAddressSpace.cpp")
-		target_compile_definitions(${target} PRIVATE KYTY_LINKED_GUEST_ADDRESS_SPACE=1)
-		target_link_options(${target} PRIVATE
+		target_compile_definitions(${target} PUBLIC KYTY_LINKED_GUEST_ADDRESS_SPACE=1)
+		target_link_options(${target} PUBLIC
 			-Wl,-ld_classic,-no_pie,-no_fixup_chains,-no_huge,-pagezero_size,0x40000,-segaddr,SYSTEM_MANAGED,0x40000,-segaddr,SYSTEM_RESERVED,0x7ffffc000,-segaddr,USER_AREA,0x7000000000,-image_base,0x700000000000)
 	endif()
 endfunction()
 
+# The emulator sources are compiled once, here, and linked into kyty_emulator and the tests that
+# need the whole emulator (add_kyty_full_emulator_test), instead of once per executable.
+add_library(kyty_emulator_objects OBJECT ${kyty_emulator_src})
+target_link_libraries(kyty_emulator_objects PUBLIC ${kyty_emulator_link_libraries})
+target_include_directories(kyty_emulator_objects PRIVATE ${inc_headers})
+configure_macos_guest_address_space(kyty_emulator_objects)
+clang_tidy_check(kyty_emulator_objects "" "${check_headers}" "${inc_headers}")
+include_what_you_use(kyty_emulator_objects "${inc_headers}")
+
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(lane_local_tests "${KYTY_TESTS_DIR}/LaneLocalTests.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/common/hackNotice.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+target_compile_definitions(scalar_provenance_tests PRIVATE KYTY_HACK_NOTICE_STDOUT=1)
 
 add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
 
@@ -474,6 +660,13 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
+)
+target_link_libraries(gpu_pipeline_tests fmt::fmt common Vulkan::Headers)
+target_include_directories(gpu_pipeline_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"
@@ -482,15 +675,20 @@ target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
+	"${KYTY_SOURCE_DIR}/common/hackNotice.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+target_compile_definitions(resource_materialization_tests PRIVATE KYTY_HACK_NOTICE_STDOUT=1)
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
+	"${KYTY_SOURCE_DIR}/common/hackNotice.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
@@ -500,6 +698,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
+target_compile_definitions(resource_tracking_tests PRIVATE KYTY_HACK_NOTICE_STDOUT=1)
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
@@ -561,11 +760,6 @@ target_include_directories(jpeg_dec_tests PRIVATE ${inc_headers})
 add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.cpp")
 target_link_libraries(jpeg_enc_tests common fmt::fmt)
 target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
-
-add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/OcclusionQueriesTests.cpp")
-target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
-target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
 
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
@@ -644,6 +838,19 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+# Optimizing this 57 000-line file was the longest step of the build. The code it tests is in the
+# emulator objects; the file itself only builds the cases and checks their results. Unoptimized,
+# main() keeps a stack slot for every case it builds (750 KB): on Windows the test gets the 8 MB
+# main thread stack that Linux and macOS give by default.
+if(KYTY_CLANG_CL)
+	set_source_files_properties("${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp" PROPERTIES COMPILE_OPTIONS /Od)
+	target_link_options(shader_recompiler_compute_tests PRIVATE /STACK:8388608)
+else()
+	set_source_files_properties("${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp" PROPERTIES COMPILE_OPTIONS -O0)
+	if(WIN32)
+		target_link_options(shader_recompiler_compute_tests PRIVATE -Wl,--stack,8388608)
+	endif()
+endif()
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 foreach(test_shader gpu_test_ms_depth gpu_test_ray_query)
@@ -664,7 +871,9 @@ foreach(test_shader gpu_test_ms_depth gpu_test_ray_query)
 	target_sources(shader_recompiler_compute_tests PRIVATE "${test_shader_header}")
 endforeach()
 
-add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+# It compiles the emulator sources with KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS (below).
+add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp"
+	OWN_SOURCES)
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
 	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
 target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
@@ -704,6 +913,16 @@ add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
 target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
+
+# Common::SoftExitScope turns a fatal error of the current thread into a C++ exception: its
+# thrower and the renderer code that catches it need exceptions where they are off by default.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(common PRIVATE -fexceptions)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
+endif()
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
@@ -755,7 +974,6 @@ if(BUILD_TESTING)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
-	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -834,6 +1052,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME indirect_write_tables
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-write-tables-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -878,7 +1098,6 @@ if(BUILD_TESTING)
 		png_enc_tests
 		jpeg_dec_tests
 		jpeg_enc_tests
-		occlusion_queries_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
@@ -905,8 +1124,7 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
-add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
-configure_macos_guest_address_space(kyty_emulator)
+add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp")
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound
@@ -925,6 +1143,17 @@ add_custom_target(kyty_touch_cursors
 add_dependencies(kyty_emulator kyty_touch_cursors)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
+# Per-title pipeline manifests (<TITLE_ID>_<APP_VER>.kpm), read at boot.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/pipelines")
+	add_custom_target(kyty_pipeline_manifests
+		COMMAND ${CMAKE_COMMAND} -E copy_directory
+			"${CMAKE_CURRENT_SOURCE_DIR}/assets/pipelines"
+			"$<TARGET_FILE_DIR:kyty_emulator>/assets/pipelines"
+		VERBATIM)
+	add_dependencies(kyty_emulator kyty_pipeline_manifests)
+	install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/pipelines" DESTINATION assets)
+endif()
+
 set(KYTY_NOTO_SANS_FONTS
 	"${KYTY_NOTO_SANS_DIR}/NotoSans-Regular.ttf"
 	"${KYTY_NOTO_SANS_DIR}/NotoSans-Bold.ttf"
@@ -938,7 +1167,8 @@ add_custom_target(kyty_noto_sans_fonts
 add_dependencies(kyty_emulator kyty_noto_sans_fonts)
 install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
-target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+# The libraries again, so that the link line keeps their order.
+target_link_libraries(kyty_emulator kyty_emulator_objects ${kyty_emulator_link_libraries})
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)

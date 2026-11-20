@@ -1,0 +1,9 @@
+# kyty pipeline manifest v1
+M 071141ce0813 cs code=05546e1e296c919d ud=12 t=8,8,1 tid=2 wgr=12 gx gy gz sb=- si=n:Uint/d:2DArray
+M 6665e8ef60c1 vs code=21350cc0303c26a2
+M f116a6bf6e5e cs code=6561730ac5dd9232 ud=8 t=64,1,1 tid=1 wgr=8 gx sb=-,st:4/f:32UInt/sw:204
+M 94f778417676 cs code=c4b04a73afdf82aa ud=12 t=8,8,1 tid=2 wgr=12 gx gy gz sb=- si=n:Float/d:2DArray/sw:f2e
+M d678c7179d59 cs code=c4b04a73afdf82aa ud=12 t=8,8,1 tid=2 wgr=12 gx gy gz sb=- si=n:Float/d:2DArray
+M eefeceae8848 cs code=c4b04a73afdf82aa ud=12 t=8,8,1 tid=2 wgr=12 gx gy gz sb=- si=n:Uint/d:2DArray
+M 8e817e366ec6 cs code=ee24a6d3daa73988 ud=16 t=8,8,1 tid=2 wgr=16 gx gy gz sb=-,st:1/f:8UInt/sw:4 si=n:Uint/d:3D
+M ec157c8065d1 cs code=ee24a6d3daa73988 ud=16 t=8,8,1 tid=2 wgr=16 gx gy gz sb=-,st:2/f:16UInt/sw:4 si=n:Uint/d:3D

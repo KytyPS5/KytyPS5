@@ -5,6 +5,10 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -134,13 +138,101 @@ int MapPrtMemory(uint64_t vaddr, size_t size);
 int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// TryWriteBacking() of values[i] at vaddr + i * stride (8-byte aligned qwords), values[0] last.
+bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The
+// pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
+[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+// The backing store's bytes of [vaddr, vaddr + size) as one piece per run of contiguous backing, in order; false if a
+// part is not backed.
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+// What TryReadSparseBacking() reads, as pieces in order: the runs of contiguous backing, and the parts without backing
+// (null) it reads as zeros; false where it fails. The pointers stay readable as FindBackingPointer()'s do.
+bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
+// Linux: the pages of [address, address + size) of the backing view (an address in the view, as TryGetBackingPieces gives
+// them) freed from every view of them: a hole punched in the store, a later read gets zeros. False elsewhere.
+bool DiscardBacking(uint64_t address, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether a GPU cache's tracker watches a page of [vaddr, vaddr + size) (its guest pages are protected).
+[[nodiscard]] bool     GuestRangeWatched(uint64_t vaddr, uint64_t size);
+// The game freed [vaddr, vaddr + size) and keeps it mapped (Demon's Souls' page allocator): if a GPU cache's tracker
+// watches a page of it, the buffers over it go without waiting (RenderContext::FreedByGame).
+void                   NoteGameFree(uint64_t vaddr, uint64_t size);
+// The texture offload / hot reads are about to take [backing, backing + size) of the backing view: the pages read back
+// there are no longer locked.
+void                   DropHotReadsBacking(uint64_t backing, uint64_t size);
+// Whether TryReadGpuCleanBacking() would read the size bytes at expected, compared in place (by
+// `equal` when given, else memcmp).
+[[nodiscard]] bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
+                                         bool (*equal)(const void*, const void*, uint64_t) = nullptr);
+// Before a large strict read of the range (Graphics::StrictWatch): watches its pages; returns the version of the
+// bytes read after the call, 0 when the range is not watched.
+[[nodiscard]] uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size);
+// GpuCleanBackingEquals() of the bytes of a read that WatchStrictRead() gave `version` (0: all compare): only the
+// pages written since compare.
+[[nodiscard]] bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version,
+                                              bool (*equal)(const void*, const void*, uint64_t) = nullptr);
+// GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
+bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
+// Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU
+// wrote that the backing store does not have yet.
+bool                   MayBeGpuWritten(uint64_t vaddr, uint64_t size);
+// GPU threads: whether bytes of the range were written by GPU work the backing store does not
+// have yet (the buffer cache's GPU-written ranges).
+bool                   HasGpuWrittenBytes(uint64_t vaddr, uint64_t size);
+// GPU threads: reads [vaddr, vaddr + size) from the backing store when its pages are GPU-owned
+// but the GPU wrote none of its bytes, where a direct load would fault and read back everything
+// the GPU has queued. False when the caller should load the bytes directly.
+bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size);
+// GPU threads: the backing store's bytes of the GPU-owned 4 KiB page holding vaddr when no
+// GPU-written image covers the page, for TryReadAroundGpuWritesOnPage(); null otherwise (also when
+// the GPU does not own the page). The answer holds until the GPU thread records more work.
+[[nodiscard]] const uint8_t* FindAroundBackingPage(uint64_t vaddr);
+// TryReadAroundGpuWrites() for a range within a page FindAroundBackingPage() gave `page_backing`
+// for: it only looks up which of the bytes the GPU wrote.
+bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
+                                  const uint8_t* page_backing);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadBacking or TryReadSparseBacking can read the whole range.
+bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
+// Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
+// means IsBackingReadable still answers as before.
+[[nodiscard]] uint64_t BackingEpoch() noexcept;
+// Appends the range (start, size) of every change after BackingEpoch() was `epoch`, oldest
+// first: IsBackingReadable answers as before for ranges none of them overlaps. False when the
+// history no longer reaches back that far.
+[[nodiscard]] bool BackingChangesSince(uint64_t epoch,
+                                       std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Whether the whole range is guest memory that is mapped (ClampRangeSize without the exit and the log for a range that
+// is not): a page unmapped meanwhile is not mapped again for the caller's epoch (RenderContext::MappingEpoch).
+[[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
+// The host is about to write [vaddr, vaddr + size) of guest memory over cached copies (chenxiao07's names): the caches
+// drop what they hold there first (the GPU-written bytes of it are read back, which a write over all of it need not
+// do: his drops them). False when the range is not memory the caches see.
+bool                   TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
+bool                   TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+bool                   TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
+// The emulator wrote [vaddr, vaddr + size) of guest memory itself (any thread, after the write): the epochs proofs of
+// unchanged bytes hold on move (MemoryTracker::NoteHostWrite) and the scout's host-write clock does (Scout::NoteHostWrite).
+void                   NoteEmulatorWrite(uint64_t vaddr, uint64_t size);
+// chenxiao07's names for the backing reads of host destinations (the scout and the table draws read the tables
+// through them): the backing store's bytes, and the backing store's bytes when no GPU work wrote the range.
+inline bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) { return TryReadBacking(vaddr, data, size); }
+inline bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return TryReadGpuCleanBacking(vaddr, data, size);
+}
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
+// over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
+// and returns the range's id. 0 for any other fault.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
@@ -216,6 +308,8 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
                             Common::VirtualMemory::Mode* old_mode = nullptr);
 // Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
+// Whether the guest mapped the byte at vaddr for execution.
+[[nodiscard]] bool IsGuestExecutable(uint64_t vaddr);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

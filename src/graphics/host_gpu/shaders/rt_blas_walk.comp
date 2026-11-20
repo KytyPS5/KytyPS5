@@ -1,0 +1,589 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Native ray tracing: walks one guest bottom-level AMD BVH per workgroup (GTA V layout: box nodes
+// whose leaves are lists of 8-byte entries in the BLAS buffer: an AMD triangle node pointer and a
+// primitive word, bit 31 = last entry, bit 30 = opaque).
+// MODE_COUNT: counts box nodes, leaves and triangles (opaque, alpha tested) of the BLASes the
+//             top-level walk found missing.
+// MODE_BUILD: writes the triangles (opaque ones as geometry 0, alpha tested ones as geometry 1)
+//             with their entry table, and pads both geometries with inactive (NaN) triangles.
+// MODE_VERIFY: recomputes the signature of the boxes of built slots and lists those that changed.
+//
+// A build with a layout (a BLAS whose build the host saw, see RayTracing::NoteGuestBlasBuilds())
+// places each triangle by its primitive: the geometry of its triangle node (the header's table of
+// the geometry of each triangle node: +40 offset, +108 geometry count, +124 first triangle node;
+// in BLASes of generation Base252, GTA V 01.005: +32, +112 and +128)
+// and the triangle index of its primitive word (bits 0-29), at the geometry's first host
+// primitive plus that index, in the host geometry of the guest geometry's opacity. Positions no
+// list entry names keep the inactive triangle the host filled them with, and a triangle named by
+// several leaves (split) is written once per leaf with the same values (a build without a layout
+// writes it once, see EmitLeaf). An entry that does not match the layout (no geometry, an index
+// past the geometry's triangles, an opacity other than the geometry's) is counted and fails the
+// build. So does memory that no longer holds the BLAS the layout describes (a header without the
+// magic and version 9, or with another geometry count: released and reused, or rebuilt since),
+// without placing anything. The host gives up such slots.
+
+#define RT_RECORD_PAGES
+#include "rt_common.inc"
+
+layout(local_size_x = 256) in;
+
+// A build job (written by the host).
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Job {
+	uint64_t blas_va;
+	uint     root;
+	uint     slot;
+	uint64_t vertices0;
+	uint64_t vertices1;
+	uint64_t entries;
+	uint     capacity0;
+	uint     capacity1;
+	uint     result;
+	// Where the BLAS header holds the fields of a layout build (0: generation Base460, 1: Base252).
+	uint     header_layout;
+	// The layout of the build (0: none) and its geometries, then (written back) the entries that
+	// did not match it.
+	uint64_t layout_va;
+	uint     layout_count;
+	uint     mismatches;
+	// Written back by a build: the leaves of the guest BLAS (the host sizes its next walk's queue).
+	uint     leaves;
+	uint     pad2;
+};
+
+// The layout of one guest geometry (written by the host): its first host primitive, its triangle
+// count and whether it is opaque.
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer LayoutRef {
+	uvec4 v;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer TriangleRef {
+	float v[9];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer EntryRef {
+	uvec4 v;
+};
+
+layout(push_constant, std430) uniform Push {
+	uint64_t jobs;
+	uint64_t pool;
+	uint64_t slots;
+	uint64_t state;
+	uint64_t changed;
+	uint     mode;
+	uint     pool_capacity;
+	uint     job_count;
+	uint     changed_capacity;
+	// The preparation (see SlotInfo::rebase).
+	uint     prepare_id;
+	// FLAG_NODE_COUNT_AT_80: the BLAS headers hold their node count at +80 instead of the T# size
+	// (the count less one) at +88. FLAG_PSR_HEADER: the BLASes of a Psr header layout (see
+	// LayoutPsrHeader() in rt_common.inc).
+	uint     flags;
+} pc;
+
+const uint FLAG_NODE_COUNT_AT_80 = 1u;
+const uint FLAG_PSR_HEADER       = 2u;
+
+// The node limit of the T# of a BLAS (the count of its nodes less one). A Psr header holds the
+// count at +0x50, 8 bytes higher in format 10.
+uint BlasNodeLimit(uint64_t blas_va) {
+	if ((pc.flags & FLAG_PSR_HEADER) != 0) {
+		return LoadGuestU32(blas_va + (PsrFormat(blas_va, true) == 10u ? 0x58u : 0x50u)) - 1u;
+	}
+	return (pc.flags & FLAG_NODE_COUNT_AT_80) != 0 ? LoadGuestU32(blas_va + 80) - 1u : LoadGuestU32(blas_va + 88);
+}
+
+// With FLAG_PSR_HEADER, the signature of a slot also covers its leaves: the words of their list
+// entries and the vertices of their triangles. The guest may refit a Psr BLAS without changing
+// its boxes, and the rewritten loops trace the host BLAS only while it is the guest's.
+uint LeafSignature(uint64_t blas_va, uint64_t base, uint leaf) {
+	uint       hash  = Mix(0x7654321u, leaf);
+	const uint first = leaf >> 3;
+	for (uint k = 0; k < kMaxLeafEntries; k++) {
+		const uvec2 pair = LoadGuestU32x2(blas_va + (uint64_t(first + k) << 3));
+		hash             = Mix(Mix(hash, pair.x), pair.y);
+		if (NodeType(pair.x) < 4u) {
+			vec3 p[3];
+			LoadTriangle(NodeAddress(base, pair.x), NodeType(pair.x), p);
+			for (uint v = 0; v < 3; v++) {
+				hash = Mix(Mix(Mix(hash, floatBitsToUint(p[v].x)), floatBitsToUint(p[v].y)), floatBitsToUint(p[v].z));
+			}
+		}
+		if ((pair.y & 0x80000000u) != 0) {
+			break;
+		}
+	}
+	return hash;
+}
+
+const uint MODE_COUNT  = 0u;
+const uint MODE_BUILD  = 1u;
+const uint MODE_VERIFY = 2u;
+// MODE_GATHER: rewrites the triangles of built slots whose guest BLAS was only refit since,
+//              through their entry tables (same triangles, same order).
+const uint MODE_GATHER = 3u;
+
+// The queue of a walk of a BLAS of known leaves: its box nodes (a 4 wide tree has about a third
+// of the leaves, a chain of boxes as many as there are leaves) and some room for growth; a walk
+// that needs more reports an overflow and the host builds the BLAS again with the node limit of
+// its header (0 leaves: not known, the node limit is used at once).
+uint QueueNodes(uint leaf_count) {
+	return leaf_count == 0 ? 0u : leaf_count + leaf_count / 2 + 64;
+}
+
+const uint kJobStride = 80;
+const uint kMaxQueue  = 1u << 20;
+
+shared uint s_head;
+shared uint s_tail;
+shared uint s_next_tail;
+shared uint s_leaves;
+shared uint s_opaque;
+shared uint s_alpha;
+shared uint s_signature;
+shared uint s_overflow;
+shared uint s_queue_base;
+shared uint s_queue_size;
+shared uint s_capacity0;
+shared uint s_capacity1;
+// Layout builds: the guest geometries (the header's), the table of the geometry of each triangle
+// node and the first triangle node, and the entries that did not match.
+shared uint     s_layout_geometries;
+shared uint64_t s_node_geometries;
+shared uint     s_node_first;
+shared uint     s_mismatches;
+// A layout build of memory that does not hold a BVH (not written yet, or released and reused).
+shared uint     s_layout_invalid;
+// The box of the whole BLAS (lo > hi: unknown).
+shared vec3 s_root_lo;
+shared vec3 s_root_hi;
+// Builds without a layout: the triangles of the leaves whose boxes do not hold them, an open
+// addressing set (empty: kInvalidNode) that writes each of them once (see EmitLeaf).
+const uint kSplitSetSize = 2048;
+shared uint s_split_set[kSplitSetSize];
+
+// True for the first leaf entry of the walk that names triangle `tri` (and when the set is full).
+bool FirstSplitEntry(uint tri) {
+	uint at = (tri * 0x9e3779b1u) >> 21;
+	for (uint probe = 0; probe < 32; probe++) {
+		const uint old = atomicCompSwap(s_split_set[at], kInvalidNode, tri);
+		if (old == kInvalidNode || old == tri) {
+			return old == kInvalidNode;
+		}
+		at = (at + 1) & (kSplitSetSize - 1);
+	}
+	return true;
+}
+
+// The host position of a list entry of a layout build (see the top), or kInvalidNode when it
+// does not match the layout.
+uint LayoutPosition(Job job, uint tri, uint word, bool opaque) {
+	if (NodeType(tri) > 3u || (tri >> 3) < s_node_first) {
+		return kInvalidNode;
+	}
+	// The geometry of the triangle node (the game's own leaf code looks it up the same way).
+	const uint lo = LoadGuestU32(s_node_geometries + uint64_t((tri >> 3) - s_node_first) * 4);
+	if (lo >= s_layout_geometries) {
+		return kInvalidNode;
+	}
+	const uvec4 geometry = LayoutRef(job.layout_va + uint64_t(lo) * 16).v;
+	const uint  triangle = word & 0x3fffffffu;
+	if (triangle >= geometry.y || (geometry.z != 0u) != opaque) {
+		return kInvalidNode;
+	}
+	return geometry.x + triangle;
+}
+
+// Counts (and in MODE_BUILD writes) the triangles of a guest leaf list.
+// `lo`/`hi`: the box of the leaf in its parent node (lo > hi: unknown, for a root leaf).
+void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3 hi) {
+	atomicAdd(s_leaves, 1u);
+	const uint first = leaf >> 3;
+	for (uint k = 0; k < kMaxLeafEntries; k++) {
+		const uvec2    pair   = LoadGuestU32x2(blas_va + (uint64_t(first + k) << 3));
+		const uint     tri    = pair.x;
+		const uint     word   = pair.y;
+		const bool     opaque = ((word >> 30) & 1u) != 0;
+		uint           index  = opaque ? atomicAdd(s_opaque, 1u) : atomicAdd(s_alpha, 1u);
+		if (pc.mode == MODE_BUILD && job.layout_va != 0) {
+			// Nothing to place from memory that holds another BLAS: the positions stay inactive.
+			if (s_layout_invalid != 0) {
+				return;
+			}
+			index = LayoutPosition(job, tri, word, opaque);
+			if (index == kInvalidNode) {
+				atomicAdd(s_mismatches, 1u);
+			}
+		}
+		if (pc.mode == MODE_BUILD) {
+			const uint capacity = opaque ? s_capacity0 : s_capacity1;
+			if (index < capacity) {
+				const uint64_t node = NodeAddress(base, tri);
+				TriangleRef out_triangle =
+				    TriangleRef((opaque ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
+				// A vertex the hardware cannot take (non-finite or absurdly far, as in a node the
+				// guest is rewriting) makes the triangle inactive (NaN) instead of undefined.
+				vec3 p[3];
+				LoadTriangle(node, NodeType(tri), p);
+				bool usable = true;
+				for (uint v = 0; v < 3; v++) {
+					usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
+				}
+				// A triangle outside the box of the whole BLAS (its root's children) is from a node the
+				// guest is rewriting: the game's BVH bounds every triangle it can hit (its refits skip
+				// only degenerate ones, which nothing hits). The box of the triangle's own leaf is not
+				// such a bound: the game's builder splits triangles among leaves, each leaf box holding
+				// its part of the triangle, and the guest's traversal tests the whole triangle in any
+				// leaf the ray enters (dropping those left the sun lighting the inside of a garage, and
+				// a third of the triangles of the foliage the game rebuilds every frame).
+				// The BLASes of a Psr header layout are mirrored as the guest holds them.
+				if ((pc.flags & FLAG_PSR_HEADER) == 0 && all(lessThanEqual(s_root_lo, s_root_hi))) {
+					const vec3 margin = (s_root_hi - s_root_lo) * 1e-3 + vec3(1e-3);
+					for (uint v = 0; v < 3; v++) {
+						usable = usable && all(greaterThanEqual(p[v], s_root_lo - margin)) &&
+						         all(lessThanEqual(p[v], s_root_hi + margin));
+					}
+				}
+				// A split triangle is in the list of each of those leaves (the same triangle node): a
+				// build without a layout takes it once, from the first of its entries the walk reaches,
+				// and leaves the others inactive, also for gathers (entry kInvalidNode); one with a
+				// layout places all of them at the same position. Copies would be candidates the ray
+				// queries test again (two entries per split triangle in GTA V's foliage).
+				bool split_copy = false;
+				if (usable && job.layout_va == 0 && all(lessThanEqual(lo, hi))) {
+					const vec3 margin = (hi - lo) * 1e-3 + vec3(1e-3);
+					bool       inside = true;
+					for (uint v = 0; v < 3; v++) {
+						inside = inside && all(greaterThanEqual(p[v], lo - margin)) &&
+						         all(lessThanEqual(p[v], hi + margin));
+					}
+					split_copy = !inside && !FirstSplitEntry(tri);
+					usable     = usable && !split_copy;
+				}
+				for (uint v = 0; v < 3; v++) {
+					const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
+					out_triangle.v[v * 3]     = q.x;
+					out_triangle.v[v * 3 + 1] = q.y;
+					out_triangle.v[v * 3 + 2] = q.z;
+				}
+				const uint table_index = opaque ? index : s_capacity0 + index;
+				// The barycentric remap of the triangle (node word 15, 8 bits per triangle type).
+				const uint remap = (LoadGuestU32(node + 60) >> (NodeType(tri) * 8u)) & 0xffu;
+				EntryRef(job.entries + uint64_t(table_index) * 16).v =
+				    uvec4(split_copy ? kInvalidNode : (first + k) << 3, word, tri, remap);
+			}
+		}
+		if ((word & 0x80000000u) != 0) {
+			break;
+		}
+	}
+}
+
+// MODE_GATHER: triangle `index` of geometry `geometry` (0 opaque, 1 alpha tested) of a job.
+void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
+	const uint     table_index  = geometry == 0u ? index : job.capacity0 + index;
+	const uvec4    entry        = EntryRef(job.entries + uint64_t(table_index) * 16).v;
+	const uint     tri          = entry.z;
+	const uint64_t node         = NodeAddress(base, tri);
+	TriangleRef    out_triangle = TriangleRef((geometry == 0u ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
+	vec3 p[3];
+	// A position of a layout build that no list entry named stays inactive.
+	bool usable = entry.x != kInvalidNode;
+	if (usable) {
+		LoadTriangle(node, NodeType(tri), p);
+	} else {
+		p[0] = p[1] = p[2] = vec3(0.0);
+	}
+	for (uint v = 0; v < 3; v++) {
+		usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
+	}
+	for (uint v = 0; v < 3; v++) {
+		const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
+		out_triangle.v[v * 3]     = q.x;
+		out_triangle.v[v * 3 + 1] = q.y;
+		out_triangle.v[v * 3 + 2] = q.z;
+	}
+}
+
+void main() {
+	const uint job_index  = gl_WorkGroupID.x;
+	const uint lid        = gl_LocalInvocationID.x;
+	if (pc.mode == MODE_GATHER) {
+		if (job_index >= pc.job_count) {
+			return;
+		}
+		Job            job    = Job(pc.jobs + uint64_t(job_index) * kJobStride);
+		SlotInfo       info   = SlotInfo(pc.slots + uint64_t(job.slot) * kSlotStride);
+		const uint64_t base   = (job.blas_va >> 8) << 8;
+		const uint     count0 = min(info.count0, job.capacity0);
+		const uint     count1 = min(info.count1, job.capacity1);
+		// The workgroups of a job (y) take its triangles in turns.
+		const uint     stride = gl_WorkGroupSize.x * gl_NumWorkGroups.y;
+		for (uint i = gl_WorkGroupID.y * gl_WorkGroupSize.x + lid; i < count0 + count1; i += stride) {
+			if (i < count0) {
+				GatherTriangle(job, base, i, 0u);
+			} else {
+				GatherTriangle(job, base, i - count0, 1u);
+			}
+		}
+		if (lid == 0 && gl_WorkGroupID.y == 0) {
+			info.rebase = 0x80000000u | (pc.prepare_id & 0x7fffffffu);
+		}
+		return;
+	}
+	RtState    state      = RtState(pc.state);
+	uint64_t   blas_va    = 0;
+	uint       root       = kInvalidNode;
+	uint       slot       = 0;
+	uint       queue_size = 0;
+	Job        job        = Job(pc.jobs + uint64_t(job_index) * kJobStride);
+	if (pc.mode == MODE_COUNT) {
+		MissingEntry missing = MissingEntry(pc.jobs + uint64_t(job_index) * kMissingStride);
+		blas_va = missing.blas_va;
+		root    = missing.root;
+	} else if (pc.mode == MODE_BUILD) {
+		if (job_index >= pc.job_count) {
+			return;
+		}
+		blas_va       = job.blas_va;
+		root          = job.root;
+		slot          = job.slot;
+		SlotInfo info = SlotInfo(pc.slots + uint64_t(slot) * kSlotStride);
+		queue_size    = QueueNodes(info.leaf_count);
+	} else {
+		slot          = U32Ref(pc.jobs + uint64_t(job_index) * 4).v;
+		SlotInfo info = SlotInfo(pc.slots + uint64_t(slot) * kSlotStride);
+		blas_va       = info.blas_va;
+		root          = info.root;
+		queue_size    = QueueNodes(info.leaf_count);
+	}
+	const uint64_t base = (blas_va >> 8) << 8;
+	if (lid == 0) {
+		s_head      = 0;
+		s_tail      = 0;
+		s_leaves    = 0;
+		s_opaque    = 0;
+		s_alpha     = 0;
+		s_signature = 0;
+		s_overflow  = 0;
+		s_capacity0 = pc.mode == MODE_BUILD ? job.capacity0 : 0;
+		s_capacity1 = pc.mode == MODE_BUILD ? job.capacity1 : 0;
+		s_root_lo   = vec3(1e30);
+		s_root_hi   = vec3(-1e30);
+		s_mismatches        = 0;
+		s_layout_geometries = 0;
+		s_layout_invalid    = 0;
+		s_node_first        = 0;
+		s_node_geometries   = 0;
+		if (pc.mode == MODE_BUILD && job.layout_va != 0) {
+			// Per header layout: the geometry count, the offset of the table of the geometry of
+			// each triangle node, the first triangle node, and the offset and value of the version.
+			const uint kLayoutFields[2][5] = {{108u, 40u, 124u, 252u, 9u},
+			                                  {112u, 32u, 128u, 252u, 6u}};
+			const uint hl         = min(job.header_layout, 1u);
+			// The header's geometries must be the layout's.
+			const uint geometries = LoadGuestU32(blas_va + kLayoutFields[hl][0]);
+			s_layout_geometries   = geometries == job.layout_count ? geometries : 0u;
+			s_node_geometries     = blas_va + LoadGuestU32(blas_va + kLayoutFields[hl][1]);
+			s_node_first          = LoadGuestU32(blas_va + kLayoutFields[hl][2]);
+			// "PSR_BVHL", the version, and the geometries of the build the layout describes: the
+			// guest may have built another BLAS there since (the build waits for a preparation).
+			s_layout_invalid = LoadGuestU32(blas_va) != 0x5f525350u || LoadGuestU32(blas_va + 4) != 0x4c485642u ||
+			                           LoadGuestU32(blas_va + kLayoutFields[hl][3]) != kLayoutFields[hl][4] ||
+			                           geometries != job.layout_count
+			                       ? 1u
+			                       : 0u;
+		}
+		if (IsBoxNode(root)) {
+			const BoxNode root_box = LoadBoxNode(base, root);
+			for (uint c = 0; c < 4; c++) {
+				if (root_box.children[c] != kInvalidNode &&
+				    all(lessThanEqual(root_box.lo[c], root_box.hi[c]))) {
+					s_root_lo = min(s_root_lo, root_box.lo[c]);
+					s_root_hi = max(s_root_hi, root_box.hi[c]);
+				}
+			}
+		}
+		// Box nodes never outnumber the node limit of the BVH descriptor, nor (with at least one
+		// leaf or box child each) twice the leaves of a known BLAS.
+		const uint limit = BlasNodeLimit(blas_va) + 1;
+		s_queue_size = min(queue_size > 16 ? min(queue_size, limit) : limit, kMaxQueue);
+		if (pc.mode == MODE_COUNT) {
+			// The node limit of a BLAS can be huge: the BLASes counted together share a quarter
+			// of the pool (the rest is for the builds and checks of this preparation), so that
+			// one of them cannot take it all. One that does not fit its share reports an overflow
+			// and is counted again later, with fewer of them missing.
+			s_queue_size = min(s_queue_size, max(pc.pool_capacity / 4u / gl_NumWorkGroups.x, 64u));
+		}
+		s_queue_base = atomicAdd(state.pool_cursor, s_queue_size);
+		if (s_queue_base + s_queue_size > pc.pool_capacity || s_queue_base + s_queue_size < s_queue_base) {
+			s_queue_size = 0;
+			s_overflow   = 4u;
+			atomicAdd(state.pool_overflow, 1u);
+		} else if (IsBoxNode(root)) {
+			U32Ref(pc.pool + uint64_t(s_queue_base) * 4).v = root;
+			s_tail = 1;
+		}
+	}
+	if (pc.mode == MODE_BUILD) {
+		for (uint i = lid; i < kSplitSetSize; i += gl_WorkGroupSize.x) {
+			s_split_set[i] = kInvalidNode;
+		}
+	}
+	barrier();
+	if (lid == 0 && s_overflow == 0 && !IsBoxNode(root) && NodeType(root) < 4u &&
+	    root != kInvalidNode) {
+		if (pc.mode == MODE_VERIFY) {
+			s_leaves = 1;
+		} else {
+			EmitLeaf(blas_va, base, root, job, vec3(1), vec3(0));
+		}
+	}
+	const uint64_t queue          = pc.pool + uint64_t(s_queue_base) * 4;
+	const uint     queue_capacity = s_queue_size;
+	uint           depth          = 0;
+	while (true) {
+		const uint head = s_head;
+		const uint tail = s_tail;
+		if (head == tail || depth > 64) {
+			break;
+		}
+		if (lid == 0) {
+			s_next_tail = tail;
+		}
+		barrier();
+		for (uint i = head + lid; i < tail; i += gl_WorkGroupSize.x) {
+			const uint    node = U32Ref(queue + uint64_t(i) * 4).v;
+			const BoxNode box  = LoadBoxNode(base, node);
+			uint          hash = Mix(0x1234567u, node);
+			for (uint c = 0; c < 4; c++) {
+				const uint child = box.children[c];
+				hash             = Mix(hash, child);
+				if (child == kInvalidNode) {
+					continue;
+				}
+				hash            = Mix(hash, floatBitsToUint(box.lo[c].x));
+				hash            = Mix(hash, floatBitsToUint(box.lo[c].y));
+				hash            = Mix(hash, floatBitsToUint(box.lo[c].z));
+				hash            = Mix(hash, floatBitsToUint(box.hi[c].x));
+				hash            = Mix(hash, floatBitsToUint(box.hi[c].y));
+				hash            = Mix(hash, floatBitsToUint(box.hi[c].z));
+				const uint type = NodeType(child);
+				if (type == 4u || type == 5u) {
+					const uint next = atomicAdd(s_next_tail, 1u);
+					if (next < queue_capacity) {
+						U32Ref(queue + uint64_t(next) * 4).v = child;
+					} else {
+						atomicOr(s_overflow, 1u);
+					}
+				} else if (type < 4u) {
+					if ((pc.flags & FLAG_PSR_HEADER) != 0) {
+						hash = Mix(hash, LeafSignature(blas_va, base, child));
+					}
+					if (pc.mode == MODE_VERIFY) {
+						atomicAdd(s_leaves, 1u);
+					} else {
+						EmitLeaf(blas_va, base, child, job, box.lo[c], box.hi[c]);
+					}
+				}
+			}
+			atomicAdd(s_signature, hash);
+		}
+		barrier();
+		if (lid == 0) {
+			s_head = tail;
+			s_tail = min(s_next_tail, queue_capacity);
+		}
+		depth++;
+		barrier();
+	}
+	if (depth > 64 && lid == 0) {
+		s_overflow |= 2u;
+	}
+	barrier();
+	const uint leaf_count = s_leaves;
+	const uint opaque     = s_opaque;
+	const uint alpha      = s_alpha;
+	if (pc.mode == MODE_COUNT) {
+		if (lid == 0) {
+			MissingEntry missing = MissingEntry(pc.jobs + uint64_t(job_index) * kMissingStride);
+			missing.leaf_count   = leaf_count;
+			missing.box_count    = s_tail;
+			missing.opaque_count = opaque;
+			missing.alpha_count  = alpha;
+			missing.node_limit   = BlasNodeLimit(blas_va);
+			missing.flags        = s_overflow;
+		}
+		return;
+	}
+	SlotInfo info = SlotInfo(pc.slots + uint64_t(slot) * kSlotStride);
+	if (pc.mode == MODE_BUILD && job.layout_va != 0) {
+		// Every position is used (the host filled them with inactive triangles before the walk).
+		if (lid == 0) {
+			info.leaf_count = leaf_count;
+			info.count0     = s_capacity0;
+			info.count1     = s_capacity1;
+			info.signature  = s_signature;
+			info.rebase     = 0;
+			job.mismatches  = s_mismatches;
+			job.leaves      = leaf_count;
+			job.result      = (s_overflow << 1) | (s_mismatches != 0 ? 16u : 0u) | (s_layout_invalid << 5);
+		}
+		return;
+	}
+	if (pc.mode == MODE_BUILD) {
+		// Inactive triangles (a NaN vertex) fill the rest of both geometries.
+		const float nan = uintBitsToFloat(0x7fc00000u);
+		for (uint i = opaque + lid; i < s_capacity0; i += gl_WorkGroupSize.x) {
+			TriangleRef(job.vertices0 + uint64_t(i) * 36).v[0] = nan;
+		}
+		for (uint i = alpha + lid; i < s_capacity1; i += gl_WorkGroupSize.x) {
+			TriangleRef(job.vertices1 + uint64_t(i) * 36).v[0] = nan;
+		}
+		if (lid == 0) {
+			info.leaf_count = leaf_count;
+			info.count0     = opaque;
+			info.count1     = alpha;
+			info.signature  = s_signature;
+			info.rebase     = 0;
+			job.leaves      = leaf_count;
+			const bool grow = opaque > s_capacity0 || alpha > s_capacity1;
+			job.result      = (grow ? 1u : 0u) | (s_overflow << 1);
+			// The host reads back the counts: to make room for them, or to give a slot with far
+			// more room its exact size.
+			job.capacity0 = opaque;
+			job.capacity1 = alpha;
+		}
+		return;
+	}
+	// A walk without room in its queue found more boxes than the BLAS had: it changed.
+	if (lid == 0 && s_overflow == 0 && info.rebase == (0x80000000u | (pc.prepare_id & 0x7fffffffu))) {
+		// Gathered in this preparation: the guest's refit moved the boxes and the host followed.
+		info.signature  = s_signature;
+		info.leaf_count = leaf_count;
+		info.rebase     = 0;
+		return;
+	}
+	if (lid == 0 && (s_overflow & 4u) == 0 && (s_overflow == 0 || (s_overflow & 1u) != 0)) {
+		if ((s_overflow & 1u) != 0 || info.signature != s_signature || info.leaf_count != leaf_count) {
+			const uint index = atomicAdd(state.changed_count, 1u);
+			if (index < pc.changed_capacity) {
+				U32Ref(pc.changed + uint64_t(index) * 4).v = slot;
+			}
+			// A rewritten loop of a Psr header layout walks the guest BVH until the host BLAS
+			// holds the change.
+			if (state.exact_context != 0) {
+				U32Ref(state.exact_context + kContextValid).v = 0u;
+			}
+			// Built again by the host; until then only reported once (a walk that overflowed saw
+			// only part of the BLAS: it is reported until the build counts it).
+			if (s_overflow == 0) {
+				info.signature  = s_signature;
+				info.leaf_count = leaf_count;
+				info.rebase     = 0;
+			}
+		}
+	}
+}

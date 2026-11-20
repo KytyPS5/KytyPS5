@@ -18,6 +18,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -33,6 +34,11 @@
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -56,12 +62,14 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	return {.samplerMirrorClampToEdge                     = VK_TRUE,
 	        .storageBuffer8BitAccess                      = VK_TRUE,
 	        .shaderBufferInt64Atomics                     = VK_TRUE,
+	        .shaderFloat16                                = VK_TRUE,
 	        .shaderSampledImageArrayNonUniformIndexing    = VK_TRUE,
 	        .shaderStorageBufferArrayNonUniformIndexing   = VK_TRUE,
 	        .shaderStorageImageArrayNonUniformIndexing    = VK_TRUE,
 	        .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
 	        .descriptorBindingUpdateUnusedWhilePending    = VK_TRUE,
 	        .descriptorBindingPartiallyBound              = VK_TRUE,
+	        .uniformBufferStandardLayout                  = VK_TRUE,
 	        .timelineSemaphore                            = VK_TRUE,
 	        .bufferDeviceAddress                          = VK_TRUE,
 	        .shaderOutputViewportIndex                    = VK_TRUE,
@@ -249,6 +257,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "descriptorBindingUpdateUnusedWhilePending");
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
+		check_feature(features12.shaderFloat16, "shaderFloat16");
+		check_feature(features12.uniformBufferStandardLayout, "uniformBufferStandardLayout");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering");
@@ -576,6 +586,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderStorageImageMultisample =
 	    supported2.features.shaderStorageImageMultisample;
+	// Bindless image tables index sampled image arrays per lane.
+	device_features.shaderSampledImageArrayDynamicIndexing =
+	    supported2.features.shaderSampledImageArrayDynamicIndexing;
+	if (supported2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+		LOGF("WARNING: dynamic sampled image indexing is not supported; bindless image "
+		     "tables will not work\n");
+	}
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.shaderResourceMinLod                 = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
@@ -596,7 +613,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
 		    vk::SampleCountFlagBits::e1;
 	}
-	// Occlusion queries reset their queries from the host and count samples exactly where they can.
+	// Host occlusion queries back the guest's ZPASS_DONE counters: exact sample counts, and slots
+	// reset from the host once their results were read.
 	graphics.occlusion_queries_enabled =
 	    Config::OcclusionQueriesEnabled() && supported12.hostQueryReset;
 	graphics.occlusion_query_precise_enabled =
@@ -607,6 +625,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
+	device_features.multiDrawIndirect         = supported2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance = supported2.features.drawIndirectFirstInstance;
+	features12.drawIndirectCount              = supported12.drawIndirectCount;
+	graphics.indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
+	                                  device_features.drawIndirectFirstInstance == VK_TRUE &&
+	                                  features12.drawIndirectCount == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported2.features.shaderFloat64 && float_controls.shaderSignedZeroInfNanPreserveFloat64;
@@ -622,18 +646,41 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		features13.shaderIntegerDotProduct     = supported13.shaderIntegerDotProduct;
 		features13.computeFullSubgroups        = supported13.computeFullSubgroups;
 	}
+	// Looks a pipeline up in a cache without compiling it (see PipelineHelpers).
+	features13.pipelineCreationCacheControl = supported13.pipelineCreationCacheControl;
+	graphics.pipeline_cache_lookup_enabled  = supported13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
 	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
-	const float                     queue_priority = 1.0f;
-	const vk::DeviceQueueCreateInfo queue_create_info {
+	// Host ray tracing of guest BVHs (see RayTracing).
+	graphics.native_ray_tracing_enabled = ray_query_enabled;
+	LOGF("Vulkan native ray tracing: %s\n", graphics.native_ray_tracing_enabled ? "true" : "false");
+	RayTracing::SetDeviceSupport(graphics.native_ray_tracing_enabled);
+	const float                              queue_priority = 1.0f;
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	queue_create_infos[0] = {
 	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+	// A transfer-only family serves buffer readbacks (GraphicContext::readback_queue).
+	uint32_t   queue_create_count = 1;
+	const auto families           = physical_device.getQueueFamilyProperties();
+	graphics.readback_family      = static_cast<uint32_t>(-1);
+	for (uint32_t family = 0; family < families.size(); family++) {
+		const auto flags = families[family].queueFlags;
+		if (family != queue_family && families[family].queueCount != 0 &&
+		    (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			graphics.readback_family = family;
+			queue_create_infos[queue_create_count++] = {
+			    .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+			break;
+		}
+	}
 	const auto                 extension_count = static_cast<uint32_t>(device_extensions.size());
-	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = 1,
-	                                        .pQueueCreateInfos       = &queue_create_info,
+	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = queue_create_count,
+	                                        .pQueueCreateInfos       = queue_create_infos.data(),
 	                                        .enabledExtensionCount   = extension_count,
 	                                        .ppEnabledExtensionNames = device_extensions.data(),
 	                                        .pEnabledFeatures        = &device_features};
@@ -778,6 +825,28 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 			r.enable_validation_layers = false;
 		}
 	}
+}
+
+// The device extensions every device needs; VulkanCreateDevice() adds the optional ones the
+// device has.
+static std::vector<const char*> RequiredDeviceExtensions() {
+	std::vector<const char*> device_extensions = {
+	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
+
+#if defined(__APPLE__)
+	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
+	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
+	device_extensions.push_back("VK_KHR_portability_subset");
+#else
+	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+#endif
+
+	if (Config::SpirvDebugPrintfEnabled()) {
+		device_extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+	}
+	return device_extensions;
 }
 
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
@@ -965,22 +1034,7 @@ void WindowContext::CreateVulkan() {
 
 	RecreateSurface();
 
-	std::vector<const char*> device_extensions = {
-	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
-
-#if defined(__APPLE__)
-	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
-	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
-	device_extensions.push_back("VK_KHR_portability_subset");
-#else
-	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-#endif
-
-	if (Config::SpirvDebugPrintfEnabled()) {
-		device_extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
-	}
+	auto device_extensions = RequiredDeviceExtensions();
 
 	std::string rejected_devices;
 	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions,
@@ -1008,6 +1062,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	}
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
@@ -1016,10 +1073,118 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 
+	// GTA V's ray tracing shader selects up to ~200 T#s by key from guest data that changes every
+	// frame; each new layout is a pipeline compile of several seconds.
+	ShaderRecompiler::IR::SetComputeIndirectFloors(256, 8);
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
 	Vr::OpenXrStartSession(graphic_ctx);
+}
+
+VulkanDeviceIdentity GetVulkanDeviceIdentity(const GraphicContext& graphics) {
+	const auto&          properties = graphics.GetPhysicalDeviceProperties();
+	VulkanDeviceIdentity identity {.vendor_id      = properties.vendorID,
+	                               .device_id      = properties.deviceID,
+	                               .driver_version = properties.driverVersion,
+	                               .queue_family   = graphics.queue_family};
+	std::memcpy(identity.cache_uuid.data(), properties.pipelineCacheUUID.data(),
+	            identity.cache_uuid.size());
+	return identity;
+}
+
+bool CreateHeadlessVulkan(GraphicContext& graphics, const VulkanDeviceIdentity* identity,
+                          std::string& error) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// No SDL video here: the loader the window would load.
+	HMODULE library = ::LoadLibraryW(L"vulkan-1.dll");
+	if (library == nullptr) {
+		error = "vulkan-1.dll not found";
+		return false;
+	}
+	auto get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+	    reinterpret_cast<void*>(::GetProcAddress(library, "vkGetInstanceProcAddr")));
+	if (get_instance_proc_addr == nullptr) {
+		error = "vkGetInstanceProcAddr not found";
+		return false;
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	VulkanCheckInstanceVersion();
+
+	const vk::ApplicationInfo app_info {.pApplicationName   = "Kyty",
+	                                    .applicationVersion = 1,
+	                                    .pEngineName        = "Kyty",
+	                                    .engineVersion      = 1,
+	                                    .apiVersion         = VULKAN_TARGET_API_VERSION};
+	// The surface extensions the window's instance has: the device enables VK_KHR_swapchain.
+	const auto available = EnumerateVulkan<vk::ExtensionProperties>(
+	    "vkEnumerateInstanceExtensionProperties", [](uint32_t* count, vk::ExtensionProperties* values) {
+		    return vk::enumerateInstanceExtensionProperties(nullptr, count, values);
+	    });
+	std::vector<const char*> extensions;
+	for (const char* name: {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_win32_surface"}) {
+		if (HasExtension(available, name)) {
+			extensions.push_back(name);
+		}
+	}
+	vk::InstanceCreateInfo inst_info {};
+	inst_info.pApplicationInfo        = &app_info;
+	inst_info.enabledExtensionCount   = static_cast<uint32_t>(extensions.size());
+	inst_info.ppEnabledExtensionNames = extensions.data();
+	if (vk::createInstance(&inst_info, nullptr, &graphics.instance) != vk::Result::eSuccess) {
+		error = "vkCreateInstance failed";
+		return false;
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.instance);
+
+	const auto devices = EnumerateVulkan<vk::PhysicalDevice>(
+	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
+		    return graphics.instance.enumeratePhysicalDevices(count, values);
+	    });
+	for (const auto& device: devices) {
+		vk::PhysicalDeviceProperties properties {};
+		device.getProperties(&properties);
+		if (identity == nullptr) {
+			if (graphics.physical_device == nullptr ||
+			    properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+				graphics.physical_device = device;
+			}
+			continue;
+		}
+		if (properties.vendorID == identity->vendor_id && properties.deviceID == identity->device_id &&
+		    properties.driverVersion == identity->driver_version &&
+		    std::memcmp(properties.pipelineCacheUUID.data(), identity->cache_uuid.data(),
+		                identity->cache_uuid.size()) == 0) {
+			graphics.physical_device = device;
+			break;
+		}
+	}
+	if (graphics.physical_device == nullptr) {
+		error = "the emulator's GPU was not found";
+		return false;
+	}
+	if (identity != nullptr) {
+		graphics.queue_family = identity->queue_family;
+	} else {
+		const auto families = graphics.physical_device.getQueueFamilyProperties();
+		const auto required = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute;
+		for (uint32_t family = 0; family < families.size(); family++) {
+			if ((families[family].queueFlags & required) == required) {
+				graphics.queue_family = family;
+				break;
+			}
+		}
+	}
+	graphics.physical_device.getMemoryProperties(&graphics.physical_device_memory_properties);
+	graphics.device = VulkanCreateDevice(graphics, RequiredDeviceExtensions());
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
+	return true;
+#else
+	(void)graphics;
+	(void)identity;
+	error = "not supported on this platform";
+	return false;
+#endif
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {

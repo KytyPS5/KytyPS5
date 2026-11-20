@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <unordered_map>
@@ -831,8 +832,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 	}
 }
 
-// Full and empty masks have a constant predicate in either wave size. In wave32,
-// ballot projection also survives scalar EXEC operations and loop-carried mask Phis.
+// Full and empty masks have a constant predicate in either wave size. Ballot projection also
+// survives scalar EXEC operations and loop-carried mask Phis. Wave64 reads a lane's bit from the
+// word holding it, so each word projects only through ballot words holding the same lanes.
 class LaneMaskProjection {
 public:
 	explicit LaneMaskProjection(FoldWorklist& worklist): m_worklist(worklist) {}
@@ -854,10 +856,30 @@ public:
 			Replace(inst, Value(mask.U32() != 0u));
 			return;
 		}
-		if (wave_size != 32u) return;
-		m_visited.clear();
-		m_grounded = false;
-		if (CanProject(mask) && m_grounded) Replace(inst, Project(mask));
+		if (wave_size == 32u) {
+			if (CanProjectWord(mask, 0)) Replace(inst, ProjectWord(mask, 0));
+			return;
+		}
+		const auto* select = mask.TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32) return;
+		const auto* low_lanes = Arg(*select, 0).TryInstruction();
+		if (low_lanes == nullptr || low_lanes->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    !Immediate(Arg(*low_lanes, 1), 32u)) return;
+		const auto* select_lane = Arg(*low_lanes, 0).TryInstruction();
+		if (select_lane == nullptr || select_lane->GetOpcode() != ValueOpcode::LaneId) return;
+		const auto low_word  = Arg(*select, 1);
+		const auto high_word = Arg(*select, 2);
+		// Masks of constant halves stay as they are; only ballots gain from projection.
+		if (!CanProjectWord(low_word, 0)) return;
+		bool from_ballot = m_from_ballot;
+		if (!CanProjectWord(high_word, 1) || !(from_ballot || m_from_ballot)) return;
+		const auto low  = ProjectWord(low_word, 0);
+		const auto high = ProjectWord(high_word, 1);
+		auto&      block  = *inst.Parent();
+		const auto result = m_worklist.Prepend(block, m_worklist.locations.at(&inst).instruction,
+		                                       ValueOpcode::SelectU1, {Arg(*select, 0), low, high});
+		FoldInstruction(block, result, m_worklist);
+		Replace(inst, Value(&*result).Resolve());
 	}
 
 private:
@@ -865,9 +887,23 @@ private:
 		return IsImmediate(value, Type::U32) && value.U32() == expected;
 	}
 
-	static Value BallotPredicate(const Inst& inst) {
+	bool CanProjectWord(Value value, uint32_t word) {
+		m_word = word;
+		m_visited.clear();
+		m_grounded    = false;
+		m_from_ballot = false;
+		return CanProject(value) && m_grounded;
+	}
+
+	Value ProjectWord(Value value, uint32_t word) {
+		m_word = word;
+		return Project(value);
+	}
+
+	// The predicate of a ballot word holding the lanes of the word being projected.
+	Value BallotPredicate(const Inst& inst) const {
 		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
-		    !Immediate(Arg(inst, 1), 0u)) return {};
+		    !Immediate(Arg(inst, 1), m_word)) return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
 		if (source == nullptr) return {};
 		// Helper lanes keep the per-lane EXEC, so the live mask projects to true.
@@ -883,8 +919,9 @@ private:
 		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return false;
-		if (m_values.contains(inst) || !BallotPredicate(*inst).IsEmpty()) {
-			m_grounded = true;
+		if (m_values[m_word].contains(inst) || !BallotPredicate(*inst).IsEmpty()) {
+			m_grounded    = true;
+			m_from_ballot = true;
 			return true;
 		}
 		if (!m_visited.insert(inst).second) return true;
@@ -901,7 +938,8 @@ private:
 	Value Project(Value value) {
 		if (value.IsImmediate()) return Value(value.U32() != 0u);
 		auto* source = value.TryInstruction();
-		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
+		if (const auto found = m_values[m_word].find(source); found != m_values[m_word].end())
+			return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
 		auto* block = source->Parent();
 		const auto where = m_worklist.locations.at(source).instruction;
@@ -916,7 +954,7 @@ private:
 		            : op == ValueOpcode::SelectU1
 		                ? m_worklist.Prepend(*block, where, op, {Arg(*source, 0), Value(false), Value(false)})
 		                : m_worklist.Prepend(*block, where, op, {Value(false), Value(false)});
-		m_values.emplace(source, Value(&*result));
+		m_values[m_word].emplace(source, Value(&*result));
 		if (op == ValueOpcode::Phi) result->SetFlags(Type::U1);
 		for (size_t arg = op == ValueOpcode::SelectU1 ? 1u : 0u; arg < source->NumArgs(); ++arg) {
 			const auto projected = Project(Arg(*source, arg));
@@ -929,8 +967,10 @@ private:
 
 	FoldWorklist& m_worklist;
 	std::unordered_set<const Inst*> m_visited;
-	std::unordered_map<const Inst*, Value> m_values;
+	std::array<std::unordered_map<const Inst*, Value>, 2> m_values;
+	uint32_t m_word = 0;
 	bool m_grounded = false;
+	bool m_from_ballot = false;
 };
 
 } // namespace

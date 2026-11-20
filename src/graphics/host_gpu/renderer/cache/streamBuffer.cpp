@@ -68,6 +68,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// The readback queue copies from buffers, without ownership transfers.
+	const std::array<uint32_t, 2> families {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
@@ -256,6 +263,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 		m_invalidation_mark    = invalidation_mark;
 		m_current_watch_cursor = 0;
 		std::swap(m_previous_watches, m_current_watches);
+		m_lap++;
 	}
 	m_wait_cursor = wait_cursor;
 	m_wait_bound  = wait_bound;

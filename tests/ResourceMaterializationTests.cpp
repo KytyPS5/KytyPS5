@@ -403,6 +403,214 @@ void TestSrtAliasesShareReads() {
         "unreadable pointer did not read as zero");
 }
 
+void TestAheadWalkNamesFlatOnlyLoads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Three flattened dwords above the null page: the root table's dword only fills its
+  // flattened dword (the descriptor it aliases has no resource), another is the word of a
+  // buffer's descriptor and the third is the root table's address.
+  auto program = SrtProgram(0x41000u);
+  auto &block = *program.blocks[0];
+  const auto append_read = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&read), slot});
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst,
+                                      {Value(&srt), Value(slot)}));
+  };
+  const auto word = append_read(0x42000u);
+  const auto pointer = append_read(0x43000u);
+  program.srt_reads[0].value.Instruction()->Arg(0).Instruction()->SetArg(0, pointer);
+  program.descriptor_sources.push_back({.dwords = {word, Value(0u)}, .dword_count = 2});
+  program.info.buffers.push_back({.source = 1});
+  auto plan = Extract(program);
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address == 0x41000u) words[0] = 0x1111u;
+        else if (address == 0x42000u) words[0] = 0x2222u;
+        else if (address == 0x43000u) words[0] = 0x41000u;
+        else return false;
+        return true;
+      });
+  struct Load {
+    uint64_t address = 0;
+    uint32_t value = 0;
+    uint32_t flat_slot = 0;
+  };
+  std::vector<Load> loads;
+  const SrtRuntime runtime{
+      .userdata = &loads,
+      .record_load = +[](void *data, uint64_t address, uint32_t value, uint32_t flat_slot) {
+        static_cast<std::vector<Load> *>(data)->push_back({address, value, flat_slot});
+      }};
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(plan, runtime, flat, nullptr) &&
+            flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x41000u} && loads.size() == 3,
+        "ahead walk did not report its three loads");
+  // The buffer's base word also fills a flattened dword: it is a refreshable descriptor word.
+  for (const auto &load : loads) {
+    const auto expected = load.address == 0x41000u   ? 0u
+                          : load.address == 0x42000u ? DescriptorSlot(1, 0)
+                                                     : NoFlatSlot;
+    Check(load.flat_slot == expected,
+          "ahead walk named the wrong loads as only filling a flattened dword");
+  }
+  Check(plan.descriptor_word_flat.size() == 16 && plan.descriptor_word_flat[8] == 1u,
+        "the refreshable descriptor word did not name the flattened dword it also fills");
+}
+
+void TestAheadWalkNamesDescriptorWordLoads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // A buffer V# loaded from guest memory: its base (word 0) only reaches the host binding, its
+  // record count (word 2) also decides the specialization. Only the base load names its word.
+  auto program = SrtProgram(0x41000u);
+  auto &block = *program.blocks[0];
+  const auto append_load = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    return Value(&read);
+  };
+  const auto base = append_load(0x42000u);
+  const auto records = append_load(0x42008u);
+  program.descriptor_sources.push_back(
+      {.dwords = {base, Value(0u), records, Value(0u)}, .dword_count = 4});
+  program.info.buffers.push_back({.source = 1});
+  auto plan = Extract(program);
+  Check(plan.descriptor_refresh.size() == 2 &&
+            plan.descriptor_refresh[1] == DescriptorRefresh::Buffer,
+        "a direct buffer source was not marked refreshable");
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address == 0x41000u) words[0] = 0x1111u;
+        else if (address == 0x42000u) words[0] = 0x50000u;
+        else if (address == 0x42008u) words[0] = 16u;
+        else return false;
+        return true;
+      });
+  struct Load {
+    uint64_t address = 0;
+    uint32_t flat_slot = 0;
+  };
+  std::vector<Load> loads;
+  const SrtRuntime runtime{
+      .userdata = &loads,
+      .record_load = +[](void *data, uint64_t address, uint32_t, uint32_t flat_slot) {
+        static_cast<std::vector<Load> *>(data)->push_back({address, flat_slot});
+      }};
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(plan, runtime, flat, nullptr), "ahead walk of a V# failed");
+  bool base_named = false;
+  for (const auto &load : loads) {
+    if (load.address == 0x42000u) {
+      base_named = load.flat_slot == DescriptorSlot(1, 0);
+    } else if (load.address == 0x42008u) {
+      Check(load.flat_slot == NoFlatSlot, "ahead walk named a V# record count as refreshable");
+    }
+  }
+  Check(base_named, "ahead walk did not name the V# base load as a refreshable word");
+  Check(DescriptorRefreshMask(DescriptorRefresh::Image, 5) == 0x027fff00u &&
+            DescriptorRefreshMask(DescriptorRefresh::Image, 3) == 0u &&
+            DescriptorRefreshMask(DescriptorRefresh::Buffer, 1) == 0x0000ffffu,
+        "descriptor refresh masks changed");
+}
+
+void TestAheadWalkReadsPendingWrites() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // An operation before the walked one writes the flattened dword with WRITE_DATA, which has not
+  // executed yet: a walk ahead of execution reads the written value, and logs it.
+  auto plan = Extract(SrtProgram(0x41000u));
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address != 0x41000u) return false;
+        words[0] = 0x1111u;
+        return true;
+      });
+  const auto pending = +[](uint64_t address, uint32_t &value) {
+    if (address != 0x41000u) return false;
+    value = 0x2222u;
+    return true;
+  };
+  std::vector<uint32_t> loads;
+  const auto record = +[](void *data, uint64_t, uint32_t value, uint32_t) {
+    static_cast<std::vector<uint32_t> *>(data)->push_back(value);
+  };
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(plan, {.userdata = &loads, .record_load = record, .pending_write = pending}, flat,
+                nullptr) &&
+            flat == std::vector<uint32_t>{0x2222u} && loads == std::vector<uint32_t>{0x2222u},
+        "ahead walk did not read the pending write");
+  // The execution thread's walk runs after the write: it reads guest memory.
+  Check(WalkSrt(plan, {.pending_write = pending}, flat, nullptr) &&
+            flat == std::vector<uint32_t>{0x1111u},
+        "walk on the execution thread read a pending write");
+}
+
+void TestAheadWalkNamesZeroTestedBounds() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  // `lane < count` decides a branch: the walk reads the count only to know whether it is 0, and
+  // reports the load as such. A walk ahead of execution leaves a GPU-produced count unread.
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(0x42000u), Value(0u)});
+  auto &count = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(0u), Value(0u), Value(true)});
+  count.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
+  auto &lane = block.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  auto &test = block.AppendNewInst(ValueOpcode::ULessThan32, {Value(&lane), Value(&count)});
+  auto &condition = block.AppendNewInst(ValueOpcode::ConditionRef, {Value(&test)});
+  AddValueBlock(program);
+  AddValueBlock(program);
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind = TerminatorKind::ConditionalBranch;
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+  static uint32_t memory_count = 0;
+  FakeGuestMemory fake(+[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (address != 0x42000u) return false;
+        words[0] = memory_count;
+        return true;
+      });
+  struct Load {
+    uint64_t address = 0;
+    uint32_t value = 0;
+    uint32_t flat_slot = 0;
+  };
+  std::vector<Load> loads;
+  const auto record = +[](void *data, uint64_t address, uint32_t value, uint32_t flat_slot) {
+    static_cast<std::vector<Load> *>(data)->push_back({address, value, flat_slot});
+  };
+  for (const uint32_t value : {5u, 0u}) {
+    auto plan = Extract(program);
+    memory_count = value;
+    loads.clear();
+    Check(ReachedBlocks(plan, {.userdata = &loads, .record_load = record}) ==
+              (value != 0 ? std::vector<uint8_t>{1, 1, 1} : std::vector<uint8_t>{1, 0, 1}),
+          "a zero-tested bound did not decide the reachable blocks");
+    Check(loads.size() == 1 && loads[0].address == 0x42000u && loads[0].value == value &&
+              loads[0].flat_slot == ZeroTestSlot && !IsDescriptorSlot(ZeroTestSlot),
+          "ahead walk did not name the zero-tested bound load");
+  }
+  // GPU-produced: unread ahead of execution, so a zero count still reaches both sides.
+  auto plan = Extract(program);
+  memory_count = 0;
+  loads.clear();
+  Check(ReachedBlocks(plan, {.userdata = &loads,
+                             .record_load = record,
+                             .gpu_produced = +[](uint64_t address) { return address == 0x42000u; }}) ==
+                std::vector<uint8_t>{1, 1, 1} &&
+            loads.empty(),
+        "ahead walk read a GPU-produced zero-tested bound");
+}
+
 void TestUniformVectorDescriptorRead() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -1204,6 +1412,36 @@ void TestEmptyScalarBufferSpecialization() {
           "empty root folded a scalar read with nonempty candidates");
 }
 
+// A pipeline manifest record may hold the specialization another build derived for the same
+// program: one element too many, one too few, or an added element whose root does not exist.
+void TestSpecializationFitsProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  auto plan = Extract(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "mixed sampler materialization failed");
+  Check(ResourceSpecializationFits(program, specialization),
+        "a specialization of the program did not fit it");
+  auto added = specialization;
+  added.samplers.push_back(added.samplers[0]);
+  Check(!ResourceSpecializationFits(program, added),
+        "an added element that is no variant of a resource fit the program");
+  added.samplers.back().indirect_root = 0u;
+  Check(ResourceSpecializationFits(program, added),
+        "an added variant of a resource did not fit the program");
+  added.samplers.back().indirect_root = static_cast<uint32_t>(program.info.samplers.size());
+  Check(!ResourceSpecializationFits(program, added),
+        "an added variant of a missing resource fit the program");
+  auto fewer = specialization;
+  fewer.samplers.pop_back();
+  Check(!ResourceSpecializationFits(program, fewer),
+        "a specialization without an element for each resource fit the program");
+}
+
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
@@ -1233,6 +1471,40 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
             snapshot.samplers[samplers[1].snapshot_index].dwords[0] == user_data[1] &&
             snapshot.samplers[samplers[2].snapshot_index].dwords[0] == user_data[1],
         "sampler variants retained stale or duplicated descriptors after refresh");
+}
+
+// A T# with format 16_16_16_16 USCALED/SSCALED used to be a fatal "unsupported format"; it now
+// materializes as a float image converted from the UNorm/SNorm backing. Formats that were
+// already supported keep their class and get no conversion.
+void TestScaled16SampledFormats() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  using N = Libs::Graphics::Prospero::TextureNumericClass;
+  struct Case {
+    F format;
+    N numeric_class;
+    bool converted;
+  };
+  for (const auto &[format, numeric_class, converted] :
+       {Case{F::k16_16_16_16UScaled, N::Float, true}, Case{F::k16_16_16_16SScaled, N::Float, true},
+        Case{F::k16_16_16_16UNorm, N::Float, false}, Case{F::k16_16_16_16Float, N::Float, false},
+        Case{F::k16_16_16_16UInt, N::Uint, false}, Case{F::k8UScaled, N::Float, true}}) {
+    auto program = MixedSamplerProgram();
+    auto &first = program.descriptor_sources[0];
+    first.dwords[0] = Value(0x100u);
+    first.dwords[1] = Value(static_cast<uint32_t>(format) << 20u);
+    first.dwords[3] = program.descriptor_sources[1].dwords[3];
+    auto plan = ExtractResourcePlan(program);
+    std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+    const SrtRuntime runtime{.user_data = user_data};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization.images[0].numeric_class == numeric_class &&
+              (specialization.images[0].conversion_format != F::kInvalid) == converted &&
+              (!converted || specialization.images[0].conversion_format == format),
+          "16_16_16_16 scaled sampled image changed its materialization");
+  }
 }
 
 void TestSignedStorageSpecialization() {
@@ -1483,6 +1755,10 @@ int main() {
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
+  TestAheadWalkNamesFlatOnlyLoads();
+  TestAheadWalkNamesDescriptorWordLoads();
+  TestAheadWalkNamesZeroTestedBounds();
+  TestAheadWalkReadsPendingWrites();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
@@ -1499,6 +1775,7 @@ int main() {
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestSpecializationFitsProgram();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);

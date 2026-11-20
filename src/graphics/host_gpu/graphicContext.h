@@ -42,8 +42,14 @@ struct GraphicContext {
 	bool                               sampler_filter_minmax_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
+	// Draws whose arguments the GPU writes read them on the GPU (vkCmdDraw*Indirect*).
+	bool                               indirect_draws_enabled                = false;
 	bool                               supports_block_texel_view              = false;
+	// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (pipelineCreationCacheControl).
+	bool                               pipeline_cache_lookup_enabled          = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// VK_KHR_acceleration_structure + VK_KHR_ray_query (see RayTracing).
+	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -54,6 +60,11 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// A queue of a transfer-only family (a copy engine that runs beside the graphics one), for
+	// buffer readbacks that must not wait for the work queued on `queue` after the writes they
+	// read. Null without such a family; buffers are then shared by `queue_family` alone.
+	vk::Queue                          readback_queue  = nullptr;
+	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -157,6 +168,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Created with parameters DeleteImage can describe again: kept for reuse when deleted.
+	bool recyclable = false;
 };
 
 

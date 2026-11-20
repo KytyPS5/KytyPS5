@@ -21,8 +21,135 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Deleted images are kept for reuse by an image created with the same parameters: the texture
+// cache recreates images whose use alternates (for example a buffer rendered as a color target
+// and sampled as a depth texture every frame), and each dedicated allocation can stall the driver
+// for hundreds of milliseconds when video memory is under pressure.
+struct RecycledImage {
+	vk::ImageCreateInfo create;
+	VkImage             image      = VK_NULL_HANDLE;
+	VmaAllocation       allocation = nullptr;
+	uint64_t            size       = 0;
+};
+
+constexpr size_t   RecycledImagesMax     = 32;
+constexpr uint64_t RecycledImageBytesMax = 256ull * 1024 * 1024;
+
+std::mutex                 g_recycled_mutex;
+std::vector<RecycledImage> g_recycled;
+uint64_t                   g_recycled_bytes = 0;
+
+bool Recyclable(const vk::ImageCreateInfo& create) {
+	return create.pNext == nullptr && create.tiling == vk::ImageTiling::eOptimal &&
+	       create.sharingMode == vk::SharingMode::eExclusive &&
+	       create.initialLayout == vk::ImageLayout::eUndefined;
+}
+
+bool SameCreateInfo(const vk::ImageCreateInfo& a, const vk::ImageCreateInfo& b) {
+	return a.flags == b.flags && a.imageType == b.imageType && a.format == b.format &&
+	       a.extent == b.extent && a.mipLevels == b.mipLevels && a.arrayLayers == b.arrayLayers &&
+	       a.samples == b.samples && a.usage == b.usage;
+}
+
+// Retired images are destroyed on a worker thread. Releasing the memory of a large render target
+// takes 0.2 to 0.4 ms in the driver, and a game that scales its resolution every frame (PPSA30528)
+// retires about ten of them per frame on the thread that records the draws.
+class ImageGraveyard {
+public:
+	ImageGraveyard() = default;
+	~ImageGraveyard() {
+		Flush();
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	ImageGraveyard(const ImageGraveyard&)            = delete;
+	ImageGraveyard& operator=(const ImageGraveyard&) = delete;
+
+	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+			m_items.push_back({allocator, image, allocation});
+		}
+		m_wake.notify_one();
+	}
+
+	// Returns once every image pushed so far is destroyed.
+	void Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_items.empty() && !m_busy; });
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkImage       image;
+		VmaAllocation allocation;
+	};
+
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_items.empty(); });
+			if (m_items.empty()) {
+				return;
+			}
+			batch.swap(m_items);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) {
+				vmaDestroyImage(item.allocator, item.image, item.allocation);
+			}
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	std::vector<Item>       m_items;
+	bool                    m_busy = false;
+	bool                    m_stop = false;
+	std::thread             m_thread;
+};
+
+ImageGraveyard& Graveyard() {
+	static ImageGraveyard graveyard;
+	return graveyard;
+}
+
+void DestroyRecycledImages(VmaAllocator allocator) {
+	Graveyard().Flush();
+	std::lock_guard lock(g_recycled_mutex);
+	for (const auto& entry: g_recycled) {
+		vmaDestroyImage(allocator, entry.image, entry.allocation);
+	}
+	g_recycled.clear();
+	g_recycled_bytes = 0;
+}
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -56,6 +183,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	DestroyRecycledImages(allocator);
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -155,14 +283,37 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	image.image = native_image;
-	if (result != vk::Result::eSuccess) {
-		LogMemoryBudget();
-		return false;
+	if (Recyclable(image_info)) {
+		std::lock_guard lock(g_recycled_mutex);
+		const auto      found =
+		    std::find_if(g_recycled.begin(), g_recycled.end(), [&](const auto& entry) {
+			    return SameCreateInfo(entry.create, image_info);
+		    });
+		if (found != g_recycled.end()) {
+			native_image     = found->image;
+			image.allocation = found->allocation;
+			g_recycled_bytes -= found->size;
+			g_recycled.erase(found);
+		}
 	}
+	if (native_image == VK_NULL_HANDLE) {
+		auto result = static_cast<vk::Result>(vmaCreateImage(
+		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
+		    &native_image, &image.allocation, nullptr));
+		if (result != vk::Result::eSuccess) {
+			// Memory kept for reuse may be what the new image needs.
+			DestroyRecycledImages(allocator);
+			result = static_cast<vk::Result>(vmaCreateImage(
+			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+			    &alloc_info, &native_image, &image.allocation, nullptr));
+		}
+		if (result != vk::Result::eSuccess) {
+			image.image = native_image;
+			LogMemoryBudget();
+			return false;
+		}
+	}
+	image.image = native_image;
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -171,6 +322,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	image.mip_levels = image_info.mipLevels;
 	image.samples    = static_cast<uint32_t>(image_info.samples);
 	image.usage      = image_info.usage;
+	image.recyclable = Recyclable(image_info);
 	image.flags      = image_info.flags;
 	image.state      = {.layout = image_info.initialLayout};
 	image.subresource_states.clear();
@@ -182,7 +334,34 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	// Deleted images are idle (their owners defer deletion until the GPU is done with them).
+	vk::ImageCreateInfo create {};
+	create.flags         = image.flags;
+	create.imageType     = image.image_type;
+	create.format        = image.format;
+	create.extent        = image.extent;
+	create.mipLevels     = image.mip_levels;
+	create.arrayLayers   = image.layers;
+	create.samples       = static_cast<vk::SampleCountFlagBits>(image.samples);
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.usage         = image.usage;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	if (image.recyclable) {
+		VmaAllocationInfo allocation_info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
+		std::lock_guard lock(g_recycled_mutex);
+		g_recycled.push_back({create, image.image, image.allocation, allocation_info.size});
+		g_recycled_bytes += allocation_info.size;
+		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > RecycledImageBytesMax) {
+			const auto& oldest = g_recycled.front();
+			Graveyard().Push(allocator, oldest.image, oldest.allocation);
+			g_recycled_bytes -= oldest.size;
+			g_recycled.erase(g_recycled.begin());
+		}
+	} else {
+		Graveyard().Push(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }

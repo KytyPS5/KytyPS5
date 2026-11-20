@@ -1,11 +1,13 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -15,15 +17,24 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -179,6 +190,36 @@ static std::atomic<uint64_t> g_test_free_range_visits {0};
 static std::recursive_mutex g_memory_operation_mutex;
 static std::shared_mutex    g_memory_state_mutex;
 
+static std::atomic<uint64_t> g_backing_epoch {0};
+// The range of the last backing changes, by epoch.
+static constexpr uint64_t                                      BackingChangeHistory = 4096;
+static std::mutex                                              g_backing_changes_mutex;
+static std::array<std::pair<uint64_t, uint64_t>, BackingChangeHistory> g_backing_changes {};
+
+static void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
+	std::lock_guard lock(g_backing_changes_mutex);
+	const auto epoch = g_backing_epoch.load(std::memory_order_relaxed) + 1;
+	g_backing_changes[epoch % BackingChangeHistory] = {start, size};
+	// Readers that see the epoch find its change under the lock.
+	g_backing_epoch.store(epoch, std::memory_order_release);
+}
+
+uint64_t BackingEpoch() noexcept {
+	return g_backing_epoch.load(std::memory_order_acquire);
+}
+
+bool BackingChangesSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& changes) {
+	std::lock_guard lock(g_backing_changes_mutex);
+	const auto current = g_backing_epoch.load(std::memory_order_relaxed);
+	if (current - epoch > BackingChangeHistory) {
+		return false;
+	}
+	for (auto change = epoch + 1; change <= current; ++change) {
+		changes.push_back(g_backing_changes[change % BackingChangeHistory]);
+	}
+	return true;
+}
+
 #include "memoryAddressSpace.inc"
 
 enum class VirtualRangeType {
@@ -243,10 +284,13 @@ public:
 		auto inserted = m_ranges.emplace_hint(position, start, r);
 		UpdatePageTableEntries(inserted->second, true);
 		MergeAroundUnlocked(inserted);
+		BumpBackingEpoch(start, size);
 		return true;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
+		BumpBackingEpoch(start, size);
+
 		auto position = m_ranges.find(start);
 		if (position != m_ranges.end() && position->second.size == size) {
 			EraseUnlocked(position);
@@ -796,12 +840,132 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->InvalidateMemory(vaddr, size);
+}
+
+bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
+}
+
+void NoteGameFree(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	if (g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) &&
+	    g_gpu_resources->WatchedSpan(vaddr, size, &first, &end))
+		g_gpu_resources->FreedByGame(vaddr, size);
+}
+
+void DropHotReadsBacking(uint64_t backing, uint64_t size) {
+	// Pages read back keep no access, their backing page locked in RAM, only with guard pages and the hot reads of the
+	// read-guard system (not in this tree yet): no backing page is locked, nothing to drop.
+	(void)backing, (void)size;
+}
+
+bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
+	return TryPrepareHostWrite(vaddr, size);
+}
+
+void NoteEmulatorWrite(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr) {
+		g_gpu_resources->GetBufferCache().NoteHostWrite(vaddr, size);
+		g_gpu_resources->GetTextureCache().NoteMetadataWrite(vaddr, size);
+		g_gpu_resources->GetStrictWatch().InvalidateMemory(vaddr, size);
+	}
+	Graphics::Scout::NoteHostWriteIfOn(vaddr, size);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (written) NoteEmulatorWrite(vaddr, size);
+	return written;
+}
+
+bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride) {
+	const bool written = g_guest_address_space->TryWriteBackingQwords(vaddr, values, count, stride);
+	if (written && count != 0) NoteEmulatorWrite(vaddr, uint64_t {count - 1u} * stride + sizeof(uint64_t));
+	return written;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
+}
+
+const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->FindBackingPointer(vaddr, size)
+	                                        : nullptr;
+}
+
+bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+	return g_guest_address_space != nullptr && g_guest_address_space->BackingPieces(vaddr, size, pieces);
+}
+
+bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces) {
+	return g_guest_address_space != nullptr && g_guest_address_space->SparseBackingPieces(vaddr, size, pieces);
+}
+
+bool DiscardBacking(uint64_t address, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->DiscardBacking(address, size);
+}
+
+static bool IsGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		// Byte ranges the GPU wrote lie on GPU-dirty pages: the lock-free page check answers
+		// for most reads.
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytes(vaddr, size)) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return IsGpuCleanBacking(vaddr, size) && TryReadBacking(vaddr, data, size);
+}
+
+bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
+                           bool (*equal)(const void*, const void*, uint64_t)) {
+	if (!IsGpuCleanBacking(vaddr, size)) {
+		return false;
+	}
+	if (const void* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
+		return equal != nullptr ? equal(backing, expected, size) : std::memcmp(backing, expected, size) == 0;
+	}
+	// A range over several mappings compares a copy.
+	thread_local std::vector<uint8_t> bytes;
+	bytes.resize(size);
+	return TryReadBacking(vaddr, bytes.data(), size) &&
+	       std::memcmp(bytes.data(), expected, size) == 0;
+}
+
+uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)
+	           ? GetGpuResources().GetStrictWatch().Watch(vaddr, size)
+	           : 0;
+}
+
+bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version,
+                                bool (*equal)(const void*, const void*, uint64_t)) {
+	const auto* backing = static_cast<const uint8_t*>(FindBackingPointer(vaddr, size));
+	if (version == 0 || backing == nullptr || g_gpu_resources == nullptr) {
+		return GpuCleanBackingEquals(vaddr, expected, size, equal);
+	}
+	if (!IsGpuCleanBacking(vaddr, size)) {
+		return false;
+	}
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
+	GetGpuResources().GetStrictWatch().Changed(vaddr, size, version, runs);
+	const auto* recorded = static_cast<const uint8_t*>(expected);
+	for (const auto& [offset, bytes]: runs) {
+		if (equal != nullptr ? !equal(backing + offset, recorded + offset, bytes)
+		                     : std::memcmp(backing + offset, recorded + offset, bytes) != 0) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -811,10 +975,92 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) {
+				return true;
+			}
 			buffers.ReadMemory(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool GuestRangeWatched(uint64_t vaddr, uint64_t size) {
+	uint64_t first = 0, end = 0;
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       g_gpu_resources->WatchedSpan(vaddr, size, &first, &end);
+}
+
+bool MayBeGpuWritten(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size);
+}
+
+bool HasGpuWrittenBytes(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) &&
+	       Graphics::GuestGpu::IsGpuThread() &&
+	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size) &&
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
+bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+}
+
+bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	// Pages the GPU does not own do not fault on reads (the region check needs no lock).
+	if (!buffers.MayBeGpuModified(vaddr, size) || !buffers.IsRegionGpuModified(vaddr, size) ||
+	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+const uint8_t* FindAroundBackingPage(uint64_t vaddr) {
+	constexpr uint64_t PageSize = 4096;
+	const auto         page     = vaddr & ~(PageSize - 1);
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(page, PageSize) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return nullptr;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (!buffers.MayBeGpuModified(page, PageSize) || !buffers.IsRegionGpuModified(page, PageSize) ||
+	    GetGpuResources().GetTextureCache().IsRegionGpuModified(page, PageSize)) {
+		return nullptr;
+	}
+	return static_cast<const uint8_t*>(FindBackingPointer(page, PageSize));
+}
+
+bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
+                                  const uint8_t* page_backing) {
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
+	}
+	std::memcpy(data, page_backing + (vaddr & 0xfffu), size);
+	return true;
+}
+
+bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr) {
+		return true;
+	}
+	if (size != 0 && size <= (uint64_t {1} << 24u) && g_guest_address_space->IsBacked(vaddr, size)) {
+		return true;
+	}
+	std::shared_lock state(g_memory_state_mutex);
+	return g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -864,6 +1110,35 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept {
+	return TransientUnmapWindows::Wait(fault_vaddr);
+}
+
+bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept {
+	// A page that keeps faulting after it was mapped again is a real access violation.
+	constexpr uint32_t    MaxRetries  = 16;
+	thread_local uint64_t last_page   = 0;
+	thread_local uint64_t last_window = 0;
+	thread_local uint32_t retries     = 0;
+	const auto            page        = fault_vaddr & ~uint64_t {0x3fff};
+	retries     = (page == last_page && window == last_window ? retries + 1 : 1);
+	last_page   = page;
+	last_window = window;
+	if (retries > MaxRetries) {
+		return false;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::printf("Memory: retried a guest access to 0x%016" PRIx64
+		            " made while its mapping was being replaced\n",
+		            fault_vaddr);
+		std::fflush(stdout);
+	}
+	Common::HackNotice::Report("guest access retried while its mapping was being replaced",
+	                           "RetryTransientUnmapFault", 0, page);
+	return true;
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;
@@ -890,6 +1165,23 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 	}
 
 	return false;
+}
+
+bool IsBackingReadable(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	if (g_guest_address_space->IsBacked(vaddr, size)) {
+		return true;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	std::shared_lock                  state(g_memory_state_mutex);
+	return g_virtual_ranges != nullptr && IsInPrtAperture(vaddr, size) &&
+	       g_virtual_ranges->QuerySpan(vaddr, size, &ranges) &&
+	       std::all_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		       return IsReservedRangeType(range.type) ||
+		              g_guest_address_space->IsBacked(range.start, range.size);
+	       });
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1551,6 +1843,10 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		EXIT("unknown prot: %d\n", prot);
 	}
 
+	// Guest threads may use a mapping that MAP_FIXED replaces: until the new one is in place,
+	// their faults wait and are retried.
+	std::optional<TransientUnmapWindows::Scope> replacing;
+
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
 	uint64_t out_addr        = 0;
 	bool     reserved_target = false;
@@ -1564,6 +1860,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 			return KERNEL_ERROR_ENOMEM;
 		}
 		if (!IsReservedSpan(in_addr, len)) {
+			replacing.emplace(in_addr, in_addr + len);
 			const int result = ReplaceFixedRangeWithReserved(in_addr, len);
 			if (result != OK) {
 				return result;
@@ -1663,6 +1960,10 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 		g_prt_apertures[static_cast<size_t>(index)] =
 		    len == 0 ? PrtAperture {} : PrtAperture {address, static_cast<uint64_t>(len)};
 	}
+	if (old.size != 0) {
+		BumpBackingEpoch(old.address, old.size);
+	}
+	BumpBackingEpoch(address, len);
 	if (len != 0) {
 		MapGpuRange(address, len);
 	}
@@ -2225,6 +2526,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_ENOMEM;
 	}
 
+	// Guest threads may use a mapping that MAP_FIXED replaces: until the new one is in place,
+	// their faults wait and are retried.
+	std::optional<TransientUnmapWindows::Scope> replacing;
+
 	auto                              in_addr        = reinterpret_cast<uint64_t>(*addr);
 	uint64_t                          target         = 0;
 	bool                              replace_target = false;
@@ -2251,6 +2556,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 #endif
 		{
 			if (!IsReservedSpan(in_addr, len)) {
+				replacing.emplace(in_addr, in_addr + len);
 				const int result = ReplaceFixedRangeWithReserved(in_addr, len);
 				if (result != OK) {
 					return result;
@@ -2911,6 +3217,12 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+}
+
+bool IsGuestExecutable(uint64_t vaddr) {
+	VirtualRanges::Range range;
+	return g_virtual_ranges != nullptr && g_virtual_ranges->Query(vaddr, 0, &range) &&
+	       (range.protection & PROT_CPU_EXEC) != 0;
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

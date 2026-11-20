@@ -1,0 +1,55 @@
+# kyty pipeline manifest v1
+M 57022baea4f9 ps code=05cfda4c29e99edb ud=16 sysbase=2 center=0 smask=f omode=4 faceall early in=0 sb=- si=n:Float/d:2D ss=-
+M 47fb5833fc6a ps code=1e9eac602994616e ud=12 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 886293392056 vs code=22e09045ac00935d
+M bfda82b7529f ps code=372e219de49fe539 ud=32 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall param=LastVertex kill in=0,1,2,3 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 4b3f69204b19 cs code=444dcb1ad39517da ud=8 t=64,1,1 tid=1 wgr=8 dims gx sb=st:16/f:32_32_32_32UInt
+M 0f084659913b vs code=621ff80087a0aeee ud=8 cur=5 fa=6 fb=4 dyn attr=180000.558.4a3ac.9.3.0.0.0,180000.558.38fac.12.4.1.0.0,180000.558.4022c.16.2.2.0.0 vbuf=24.558.0 sb=-
+M e16e0eebf756 vs code=6260342b7c01d0fa vsout=1240000
+M 202a29746017 ps code=71037802ae500046 ud=24 cur=6 sysbase=2 center=0 smask=f omode=4 faceall param=LastVertex kill in=0,1 sb=- si=n:Float/d:2D,n:Float/d:2D ss=-
+M a187e490b86f ps code=867cc26fdaec2535 ud=32 cur=6 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall param=LastVertex kill in=0,1,2 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M 1b700011d846 ps code=8708c4d9d2e9a1fc ud=8 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Uint/d:2D
+M 0244975d8242 vs code=8ac8b9d42f30dca3 ud=4 cur=1 sb=-
+M 31d278c9837b vs code=8ac8b9d42f30dca3 ud=4 cur=3 sb=-
+M 7310550c9a32 ps code=98ffdb2b32ba53a5 ud=12 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M b14a58c646f9 mesh code=c057c8a519f1ee74 ud=16 cur=11 mt=256,1,1 mlds=4096 mprim=2 mppg=25 mvpg=50 mmaxv=200 mmaxp=50 mprov=2 sb=-,st:40/f:32_32_32Float/sw:3ac,st:40/f:32_32Float/sw:22c,st:40/f:8_8_8_8UNorm,st:40/f:32_32_32_32Float
+M 9be32402c279 ps code=c711a55a529b442f ud=32 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall param=LastVertex kill in=0,1 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M bd66b133ec33 ps code=c711a55a529b442f ud=32 cur=6 sysbase=2 center=0 smask=f omode=4 posx posy posz faceall param=LastVertex kill in=0,1 sb=- si=n:Float/d:2D,n:Float/d:2D,n:Float/d:2D ss=-
+M aa2d3157ee61 ps code=c7f2980d9a921859 ud=12 sysbase=2 center=0 smask=f omode=4 faceall early in=0 si=n:Float/d:2D ss=-
+M 67ec643b154f vs code=ce74bf1901c0317f ud=8 cur=5 fa=6 fb=4 dyn attr=240000.15.4a3ac.9.3.0.0.0,240000.15.4a3ac.12.3.1.0.0,240000.15.38fac.15.4.2.0.0,240000.15.4022c.19.2.3.0.0 vbuf=36.15.0 sb=-
+M 295ce90ef59d cs code=d3ade27be29ef68e ud=12 t=64,1,1 tid=1 wgr=12 dims gx sb=st:16/f:32_32_32_32UInt
+M 3e9bb3946f5c ps code=dbb31770bae3f41e ud=24 sysbase=2 center=0 smask=f omode=4 faceall early in=0,1,2 si=n:Float/d:2DArray,n:Float/d:2D ss=-,-
+M 37db20571039 mesh code=dd3a468235a795e5 ud=16 cur=10 mt=256,1,1 mlds=3968 mprim=2 mppg=32 mvpg=64 mmaxv=256 mmaxp=64 mprov=2 sb=-,st:24/f:32_32_32Float/sw:3ac,st:24/f:32_32Float/sw:22c,st:24/f:8_8_8_8UNorm
+M c7e023830aff mesh code=dd3a468235a795e5 ud=16 cur=11 mt=256,1,1 mlds=3968 mprim=2 mppg=32 mvpg=64 mmaxv=256 mmaxp=64 mprov=2 sb=-,st:24/f:32_32_32Float/sw:3ac,st:24/f:32_32Float/sw:22c,st:24/f:8_8_8_8UNorm
+M 5d4726f9da09 vs code=e8d28d7ab84a22d2 ud=8 cur=2 fa=6 fb=4 dyn attr=180000.12.4022c.9.2.0.0.0,180000.12.4022c.11.2.1.0.0,180000.12.38fac.13.4.2.0.0,180000.12.16204.17.1.3.0.0 vbuf=24.12.0 sb=-
+M 9dd19509526b cs code=fa0e688ca175c6c6 ud=16 t=8,8,1 tid=2 wgr=16 dims gx gy si=n:Uint/d:2D,n:Uint/d:2D
+P v=0244975d8242 p=47fb5833fc6a plain cc=1 c0=R8G8B8A8Unorm m0=f neg noclip topo=TriangleStrip
+P v=0244975d8242 p=47fb5833fc6a plain cc=1 c0=R8G8B8A8Unorm m0=f neg topo=TriangleStrip
+P v=0244975d8242 p=7310550c9a32 plain cc=1 c0=R8G8B8A8Unorm m0=f neg noclip topo=TriangleStrip
+P v=0244975d8242 p=7310550c9a32 plain cc=1 c0=R8G8B8A8Unorm m0=f neg topo=TriangleStrip
+P v=0244975d8242 p=aa2d3157ee61 plain cc=1 c0=R8G8B8A8Unorm m0=f neg noclip topo=TriangleStrip
+P v=0244975d8242 p=aa2d3157ee61 plain cc=1 c0=R8G8B8A8Unorm m0=f neg topo=TriangleStrip
+P v=0f084659913b p=9be32402c279 plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 neg pvlast topo=TriangleList vb=24.0 va=0.0,12.0,16.0
+P v=0f084659913b p=9be32402c279 plain depth=D32SfloatS8Uint stencil neg pvlast topo=TriangleList vb=24.0 va=0.0,12.0,16.0
+P v=31d278c9837b p=57022baea4f9 plain cc=1 c0=R8G8B8A8Unorm m0=f neg noclip topo=TriangleStrip
+P v=31d278c9837b p=57022baea4f9 plain cc=1 c0=R8G8B8A8Unorm m0=f neg topo=TriangleStrip
+P v=37db20571039 p=202a29746017 plain cc=1 c0=R8G8B8A8Unorm m0=7 neg pvlast topo=LineList
+P v=5d4726f9da09 p=3e9bb3946f5c plain cc=1 c0=R8G8B8A8Unorm m0=7 b0=1.4.0.5.1.4.0.5 neg topo=TriangleList vb=24.0 va=0.0,8.0,16.0,20.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.0.0.5.1.0.0.5 neg noclip pvlast topo=TriangleList vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.1.1.4.0.1 neg noclip pvlast topo=TriangleList vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.1.1.4.0.1 neg noclip pvlast topo=TriangleStrip vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.5.1.4.0.5 neg noclip pvlast topo=TriangleList vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.5.1.4.0.5 neg noclip pvlast topo=TriangleStrip vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 neg noclip pvlast topo=TriangleList vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 neg noclip pvlast topo=TriangleStrip vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm m0=7 b0=1.4.0.5.1.4.0.5 neg noclip pvlast topo=TriangleFan vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm m0=7 b0=1.4.0.5.1.4.0.5 neg noclip pvlast topo=TriangleList vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain cc=1 c0=R8G8B8A8Unorm m0=7 b0=1.4.0.5.1.4.0.5 neg noclip pvlast topo=TriangleStrip vb=36.0 va=0.0,12.0,24.0,28.0
+P v=67ec643b154f p=bfda82b7529f plain depth=D32SfloatS8Uint stencil neg noclip pvlast topo=TriangleList vb=36.0 va=0.0,12.0,24.0,28.0
+P v=886293392056 p=1b700011d846 cc=1 c0=R8G8B8A8Unorm m0=8 neg noclip topo=TriangleStrip
+P v=886293392056 p=1b700011d846 cc=1 c0=R8G8B8A8Unorm m0=8 neg topo=TriangleStrip
+P v=b14a58c646f9 p=a187e490b86f plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.1.0.0.1.1 neg pvlast topo=LineList
+P v=b14a58c646f9 p=a187e490b86f plain depth=D32SfloatS8Uint stencil neg pvlast topo=LineList
+P v=c7e023830aff p=bd66b133ec33 plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.1.0.0.1.1 neg pvlast topo=LineList
+P v=c7e023830aff p=bd66b133ec33 plain cc=1 c0=R8G8B8A8Unorm depth=D32SfloatS8Uint stencil m0=7 b0=1.4.0.1.1.4.0.1 neg pvlast topo=LineList
+P v=c7e023830aff p=bd66b133ec33 plain neg pvlast topo=LineList

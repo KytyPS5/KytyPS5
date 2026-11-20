@@ -2,7 +2,9 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_
 
 #include "common/common.h"
+#include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 
+#include <array>
 #include <magic_enum.hpp>
 #include <span>
 #include <string_view>
@@ -814,7 +816,7 @@ enum class ImageDimension : uint32_t {
 };
 
 constexpr uint32_t MaxInstructionRawWords       = 5u;
-constexpr uint32_t MaxImageNsaAddressComponents = 12u;
+constexpr uint32_t MaxImageNsaAddressComponents = 16u;
 
 struct Operand {
 	OperandKind kind       = OperandKind::Unknown;
@@ -893,10 +895,62 @@ struct Instruction {
 	std::string_view unsupported_reason;
 };
 
+// The code an inlined call target occupies in an expanded program, by byte pc, and its address.
+struct InlinedCallBody {
+	uint32_t begin   = 0;
+	uint32_t end     = 0;
+	uint64_t address = 0;
+	// The other targets of the call whose code is the same, which run this body too.
+	std::vector<uint64_t> aliases;
+};
+
+// A direct branch of an expanded program whose target is beyond the reach of its 16-bit offset,
+// by byte pc: its encoding holds offset 0 and the decoded branch takes this target.
+// A literal of an expanded program that holds a guest address (a call target, a return or GETPC
+// address): the code carries `word`, an index into the expansion's runtime words, and the shader
+// reads the word at run time, so the program does not depend on where the game put its code.
+struct RuntimeLiteral {
+	uint32_t pc   = 0;
+	uint32_t word = 0;
+
+	bool operator==(const RuntimeLiteral&) const = default;
+};
+
+struct LongBranch {
+	uint32_t pc     = 0;
+	uint32_t target = 0;
+
+	bool operator==(const LongBranch&) const = default;
+};
+
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
+	// Set on programs expanded by ShaderFunctionExpander.
+	std::vector<InlinedCallBody> call_bodies;
+	std::vector<LongBranch>      long_branches; // ascending pc
+	std::vector<RuntimeLiteral>  runtime_literals; // ascending pc
+	// The guest TLAS of the native ray tracing forms (see IR::TraceNativeTraversals), set by
+	// TranslateProgram() for resource tracking (also without native ray tracing): the header
+	// address is the 64-bit value at user data pointer `user_sgpr` + `header_offset`.
+	struct RayTracingSource {
+		uint32_t                user_sgpr     = 0;
+		uint32_t                header_offset = 0;
+		// Not 0xffffffff: the header address is at the base of the V# at the pointer + this offset,
+		// + `header_offset` (Marvel's Wolverine).
+		uint32_t                header_vsharp = 0xffffffffu;
+		uint32_t                root          = 0;
+		// How its instance records are laid out (IR::RayTracingLayout::Pack()).
+		std::array<uint32_t, 4> layout {};
+		bool                    valid         = false;
+	} ray_tracing_source;
+	// With native traversals (TranslateProgram()): the instructions (ascending pc) whose
+	// device-address accesses stay within the guest BVH that the program traces and the buffers of
+	// its leaves' alpha test (NativeTraversals::reach); empty when that is not known.
+	std::vector<uint32_t> ray_tracing_reach;
+	// What it reaches through device addresses, when it works on a table of records.
+	RecordReach record_reach;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
@@ -904,7 +958,9 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
+// long_branches (ascending pc) give the targets of the branches an expansion could not encode.
+void DecodeProgram(std::span<const uint32_t> code, Program& program,
+                   std::span<const LongBranch> long_branches = {});
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 bool IsDsWriteOpcode(Opcode opcode);

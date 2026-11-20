@@ -18,14 +18,18 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -40,6 +44,8 @@ namespace Libs::Graphics {
 struct ShaderMapData: ShaderMappedData {
 	ShaderVertexMetadata vertex;
 	const char*          vertex_error = nullptr;
+	// The size of the whole binary (code, metadata and footer).
+	uint32_t binary_size_bytes = 0;
 };
 
 struct ShaderMapEntry {
@@ -49,6 +55,12 @@ struct ShaderMapEntry {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Moves whenever a shader is mapped: code mapped over an address changes what a pair of shader addresses means.
+static std::atomic<uint64_t> g_shader_map_generation {0};
+// Taken before g_shader_map_mutex when both are held.
+static std::mutex        g_shader_listener_mutex;
+static ShaderMapListener g_shader_listener          = nullptr;
+static void*             g_shader_listener_userdata = nullptr;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -81,12 +93,58 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto*   binary = reinterpret_cast<const uint32_t*>(addr);
 	ShaderMapData mapped {data};
 	// Translation reads the bytes the hash covers.
-	mapped.code_size_bytes = ShaderProgramSize(binary, data.code_size_bytes);
+	mapped.code_size_bytes   = ShaderProgramSize(binary, data.code_size_bytes);
+	mapped.binary_size_bytes = data.code_size_bytes;
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		(*g_shader_map)[addr] = {mapped, hash};
+		g_shader_map_generation.fetch_add(1, std::memory_order_release);
+	}
+	std::scoped_lock listener_lock(g_shader_listener_mutex);
+	if (g_shader_listener != nullptr) {
+		g_shader_listener(g_shader_listener_userdata, hash,
+		                  std::span(binary, mapped.code_size_bytes / sizeof(uint32_t)));
+	}
+}
+
+uint64_t ShaderMapGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
+uint64_t ShaderHashAt(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
 	std::scoped_lock lock(g_shader_map_mutex);
-	(*g_shader_map)[addr] = {mapped, hash};
+	const auto       found = g_shader_map->find(addr);
+	return found != g_shader_map->end() ? found->second.hash : 0;
+}
+
+void ShaderSetMapListener(ShaderMapListener listener, void* userdata) {
+	std::scoped_lock listener_lock(g_shader_listener_mutex);
+	g_shader_listener          = listener;
+	g_shader_listener_userdata = userdata;
+	if (listener == nullptr || g_shader_map == nullptr) {
+		return;
+	}
+	std::scoped_lock lock(g_shader_map_mutex);
+	for (const auto& [addr, entry]: *g_shader_map) {
+		listener(userdata, entry.hash,
+		         std::span(reinterpret_cast<const uint32_t*>(addr),
+		                   entry.data.code_size_bytes / sizeof(uint32_t)));
+	}
+}
+
+std::span<const uint32_t> ShaderMappedBinary(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+	const auto       iter = g_shader_map->find(addr);
+	if (iter == g_shader_map->end()) {
+		return {};
+	}
+	return {reinterpret_cast<const uint32_t*>(addr), iter->second.data.binary_size_bytes / sizeof(uint32_t)};
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -159,6 +217,29 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
+thread_local ShaderGuestReader t_guest_reader          = nullptr;
+thread_local void*             t_guest_reader_userdata = nullptr;
+
+ShaderGuestReaderScope::ShaderGuestReaderScope(ShaderGuestReader reader, void* userdata)
+    : m_previous_reader(t_guest_reader), m_previous_userdata(t_guest_reader_userdata) {
+	t_guest_reader          = reader;
+	t_guest_reader_userdata = userdata;
+}
+
+ShaderGuestReaderScope::~ShaderGuestReaderScope() {
+	t_guest_reader          = m_previous_reader;
+	t_guest_reader_userdata = m_previous_userdata;
+}
+
+static void ReadShaderGuest(const void* address, void* data, size_t size) {
+	if (t_guest_reader == nullptr) {
+		std::memcpy(data, address, size);
+	} else if (!t_guest_reader(t_guest_reader_userdata, reinterpret_cast<uint64_t>(address), data,
+	                           size)) {
+		std::memset(data, 0, size);
+	}
+}
+
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        std::span<const ShaderSemantic> input_semantics,
                                        const uint32_t* attrib, const uint32_t* buffer) {
@@ -176,20 +257,21 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attribute = 0;
+		ReadShaderGuest(&attrib[in.semantic], &attribute, sizeof(attribute));
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attribute);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t   index  = attribute & 0x1fu;
+		auto     format = static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		uint32_t offset = (attribute >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		uint32_t sharp[4] {};
+		ReadShaderGuest(&buffer[index * 4], sharp, sizeof(sharp));
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
@@ -409,120 +491,156 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
+namespace {
+
+// Static keys are assembled in a local buffer and copied once: pushing into the vector
+// reloads and stores its end pointer for every word.
+class StaticKeyBuilder {
+public:
+	void push_back(uint32_t word) {
+		EXIT_IF(m_size == m_words.size());
+		m_words[m_size++] = word;
+	}
+	void insert(std::initializer_list<uint32_t> words) {
+		for (const auto word: words) {
+			push_back(word);
+		}
+	}
+	template <typename Iterator>
+	void insert(Iterator first, Iterator last) {
+		for (; first != last; ++first) {
+			push_back(static_cast<uint32_t>(*first));
+		}
+	}
+	void CopyTo(std::vector<uint32_t>& key) const {
+		key.assign(m_words.begin(), m_words.begin() + m_size);
+	}
+
+private:
+	std::array<uint32_t, 512> m_words;
+	uint32_t                  m_size = 0;
+};
+
+} // namespace
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
-	key.clear();
-	key.push_back(static_cast<uint32_t>(info.has_dynamic_vertex_fetch));
-	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
-	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
-	key.push_back(info.resources_num);
-	key.push_back(info.wave_size);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.pa_cl_vs_out_cntl);
-	key.push_back(info.user_clip_planes);
-	key.push_back(info.indirect_offsets.vertex | (uint32_t {info.indirect_offsets.instance} << 8u) |
-	              (uint32_t {info.indirect_draw} << 16u));
-	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
+	StaticKeyBuilder words;
+	words.push_back(static_cast<uint32_t>(info.has_dynamic_vertex_fetch));
+	words.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
+	words.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
+	words.push_back(info.resources_num);
+	words.push_back(info.wave_size);
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(info.lds_size_dwords);
+	words.push_back(info.pa_cl_vs_out_cntl);
+	words.push_back(info.user_clip_planes);
+	words.push_back(info.indirect_offsets.vertex | (uint32_t {info.indirect_offsets.instance} << 8u) |
+	                (uint32_t {info.indirect_draw} << 16u));
+	words.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
-			key.push_back(std::bit_cast<uint32_t>(value));
+			words.push_back(std::bit_cast<uint32_t>(value));
 		}
 		for (const float value: info.clip_space.offset) {
-			key.push_back(std::bit_cast<uint32_t>(value));
+			words.push_back(std::bit_cast<uint32_t>(value));
 		}
 		for (const float value: info.clip_space.half_extent) {
-			key.push_back(std::bit_cast<uint32_t>(value));
+			words.push_back(std::bit_cast<uint32_t>(value));
 		}
 	}
 
-	key.push_back(info.mesh.threads_num[0]);
+	words.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
-		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.output_primitive_size, mesh.primitives_per_group,
-		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
-		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
+		words.insert({mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		              mesh.scratch_size_dwords, mesh.input_primitive, mesh.output_primitive_size,
+		              mesh.primitives_per_group, mesh.vertices_per_group, mesh.max_vertices,
+		              mesh.max_primitives, mesh.provoking_vertex,
+		              static_cast<uint32_t>(mesh.fast_launch)});
 	}
-	key.push_back(info.tess.input_control_points);
+	words.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
-		                       tess.output_topology});
+		words.insert({tess.output_control_points, tess.ls_stride, tess.hs_stride,
+		              tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
+		              tess.output_topology});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];
 		const auto& destination = info.resources_dst[i];
-		key.push_back(destination.registers_num);
-		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		words.push_back(destination.registers_num);
+		words.push_back(static_cast<uint32_t>(destination.attr_id));
+		words.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
 	}
+	words.CopyTo(key);
 }
 
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
-	key.clear();
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.input_num);
-	key.push_back(info.wave_size);
-	key.push_back(info.ps_system_input_base);
-	key.push_back(info.custom_interpolation_mask);
-	key.push_back(info.ps_perspective_center_vgpr);
-	key.push_back(info.ps_perspective_sample_vgpr);
-	key.push_back(info.ps_perspective_centroid_vgpr);
-	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_w));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
-	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
-	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
-	key.push_back(static_cast<uint32_t>(info.parameter_mode));
-	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_early_z));
-	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
-	key.push_back(static_cast<uint32_t>(info.object_primitive_id));
-	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
-	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
-	key.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u) |
+	StaticKeyBuilder words;
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(info.lds_size_dwords);
+	words.push_back(info.input_num);
+	words.push_back(info.wave_size);
+	words.push_back(info.ps_system_input_base);
+	words.push_back(info.custom_interpolation_mask);
+	words.push_back(info.ps_perspective_center_vgpr);
+	words.push_back(info.ps_perspective_sample_vgpr);
+	words.push_back(info.ps_perspective_centroid_vgpr);
+	words.push_back(static_cast<uint32_t>(info.ps_pos_x));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_y));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_z));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_w));
+	words.push_back(static_cast<uint32_t>(info.ps_front_face));
+	words.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
+	words.push_back(static_cast<uint32_t>(info.ps_ancillary));
+	words.push_back(static_cast<uint32_t>(info.ps_no_perspective));
+	words.push_back(static_cast<uint32_t>(info.parameter_mode));
+	words.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_early_z));
+	words.push_back(static_cast<uint32_t>(info.dual_source_blending));
+	words.push_back(static_cast<uint32_t>(info.object_primitive_id));
+	words.push_back(static_cast<uint32_t>(info.alpha_blend_source));
+	words.insert(std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	words.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u) |
 	              (uint32_t {info.target_uint_mask} << 16u) |
 	              (uint32_t {info.target_sint_mask} << 24u));
 	const auto mask = info.target_shader_mask;
-	key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
+	words.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
 			packed |= static_cast<uint32_t>(info.target_export_mapping[base + i].packed)
 			          << (i * 8u);
 		}
-		key.push_back(packed);
+		words.push_back(packed);
 	}
-	key.insert(key.end(), std::begin(info.interpolator_settings),
-	           std::begin(info.interpolator_settings) + info.input_num);
+	words.insert(std::begin(info.interpolator_settings),
+	             std::begin(info.interpolator_settings) + info.input_num);
+	words.CopyTo(key);
 }
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
-	key.clear();
-	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
-	key.push_back(info.host_subgroup_size);
-	key.push_back(info.thread_ids_num);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	StaticKeyBuilder words;
+	words.push_back(info.workgroup_register);
+	words.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
+	words.push_back(info.host_subgroup_size);
+	words.push_back(info.thread_ids_num);
+	words.push_back(info.lds_size_dwords);
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
+	                (static_cast<uint32_t>(info.async_compute) << 1u) |
+	                (static_cast<uint32_t>(info.dispatch_indirect_threads) << 2u));
 	for (int i = 0; i < 3; i++) {
-		key.push_back(info.threads_num[i]);
-		key.push_back(static_cast<uint32_t>(info.group_id[i]));
+		words.push_back(info.threads_num[i]);
+		words.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
-	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+	words.push_back(static_cast<uint32_t>(info.tg_size_en));
+	words.CopyTo(key);
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
@@ -794,6 +912,33 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	     info.tg_size_en ? "true" : "false");
 	LOGF("\t threadgroup_id     = {%s, %s, %s}\n", info.group_id[0] ? "true" : "false",
 	     info.group_id[1] ? "true" : "false", info.group_id[2] ? "true" : "false");
+}
+
+// Registered names by address. The names are interned and never released, so the pointers
+// ShaderRegisteredName() returns stay valid (a game registers a bounded set of names).
+static std::mutex                                g_registered_names_mutex;
+static std::unordered_set<std::string>           g_registered_name_strings;
+static std::unordered_map<uint64_t, const char*> g_registered_names;
+
+void ShaderSetRegisteredName(uint64_t addr, const char* name) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	if (name == nullptr) {
+		g_registered_names.erase(addr);
+		return;
+	}
+	const auto [iter, inserted] = g_registered_name_strings.emplace(name);
+	g_registered_names[addr]    = iter->c_str();
+}
+
+const char* ShaderRegisteredName(uint64_t addr) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	const auto       iter = g_registered_names.find(addr);
+	return iter != g_registered_names.end() ? iter->second : nullptr;
+}
+
+bool ShaderNameRegistered(const char* name) {
+	std::scoped_lock lock(g_registered_names_mutex);
+	return name != nullptr && g_registered_name_strings.contains(name);
 }
 
 } // namespace Libs::Graphics

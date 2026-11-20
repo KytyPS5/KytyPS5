@@ -115,9 +115,17 @@ struct EmitterState {
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
+	// By buffer binding: the stride read from the shader data, for the buffers whose stride is
+	// read at run time (0 for the others).
+	std::vector<uint32_t>                           memory_strides;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	// A compute program with outlined call targets: no function call sits under a lane guard.
+	bool                                             converged_calls         = false;
+	uint32_t                                         bda_masked_function     = 0;
+	// bda_load_u32 and its variants by {coherent, guarded}: see DefineBdaLoads.
+	std::map<std::array<uint32_t, 2>, uint32_t>      bda_load_functions;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
@@ -125,13 +133,72 @@ struct EmitterState {
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         bvh_stack_function      = 0;
-	std::array<uint32_t, 2>                          ray_query_variables {};
+	// Upstream's ray queries over its BVH mirror (RayQueryInitialize...): one per lane half.
+	std::array<uint32_t, 2>                          ray_query_mirror_variables {};
+	// Native ray tracing: per site and emulated lane half (see spirvEmitterRayQuery.cpp).
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_variables {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_states {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_nodes {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_slots {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_lists {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_counts {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_currents {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_bases {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_inline_records {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_t {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_word {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_instance {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_u {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_v {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_result_node {};
+	// Wave-uniform: the selected key.
+	std::array<uint32_t, 4>                          ray_query_selected_instance {};
+	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
+	// The per-lane alpha test (RayQueryAlpha): per site and half, its arguments; the guest leaf
+	// code's sample of the bindless table it samples (nullptr: the sites run the leaf code).
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
+	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_cache {};
+	std::array<bool, 4>                              ray_query_alpha_sites {};
+	// Sites whose alpha test reads its data as a closest hit leaf code does (RayQueryAlphaLane),
+	// those of them whose reference is threshold * factor (RayQueryAlphaFactor), and sites whose
+	// opacity comes from the geometry only (RayQueryInitGeometryOpacity).
+	std::array<bool, 4>                              ray_query_alpha_lane {};
+	std::array<bool, 4>                              ray_query_alpha_factor {};
+	std::array<bool, 4>                              ray_query_geometry_opacity {};
+	// The format of the guest data each site's alpha test reads (RayQueryAlpha's last argument,
+	// IR::RayTracingAlphaFields::Pack()).
+	std::array<uint32_t, 4>                          ray_query_alpha_format {};
+	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
+	// Sites whose alpha test is Resident Evil Village's (RayQueryAlphaEntry), and the program's two
+	// samples it stands for (the first texture's xy and the second one's x; nullptr: not found).
+	std::array<bool, 4>                              ray_query_alpha_entry {};
+	std::array<const IR::Inst*, 2>                   ray_query_entry_samples {};
+	bool                                             ray_stats              = false;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
+	// GET_LOD_STATS counters (DescriptorBindingKind::MipStats); mip_stats_records is false for the
+	// plain variant, which declares the binding but records nothing.
+	uint32_t                                         mip_stats_variable      = 0;
+	bool                                             mip_stats_records       = true;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Table mode (IR::Program::table_mode, EmitTableMode): the block's device address, each slot the shader reads (0:
+	// not given), and each buffer's device address and size in dwords.
+	uint32_t                                         table_block             = 0;
+	std::vector<uint32_t>                            table_slot_values;
+	std::vector<uint32_t>                            table_bases;
+	std::vector<uint32_t>                            table_lengths;
+	// Each buffer's stride, from its V# (the renderer gives a pair's program the V#s of other strides).
+	std::vector<uint32_t>                            table_strides;
+	// The buffer words (the V#s' fourth dwords) of the buffers whose format is decoded at run time
+	// (IR::TablePlan::runtime_formats), else 0.
+	std::vector<uint32_t>                            table_buffer_words;
+	uint32_t                                         uniform_buffer_variable = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
+	// Per-invocation memory (scratch and function-local LDS) lives in Function variables of
+	// main unless the program has outlined functions, which need it as Private.
+	spv::StorageClass                                scratch_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
@@ -180,6 +247,8 @@ uint32_t TypeBvh8Result(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
 uint32_t TypeF32(EmitterState& state);
+uint32_t TypeF16(EmitterState& state);
+uint32_t TypeF16x2(EmitterState& state);
 uint32_t TypeF64(EmitterState& state);
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components);
 
@@ -206,6 +275,16 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 }
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
+
+// Function control of the shared memory helpers (BDA pointer, runtime-V# buffer loads, format
+// conversion). Programs of inlined call targets call them from hundreds of sites, and the NVIDIA
+// compiler inlining each copy ran out of time and memory: Wolverine's 0xe6d76d24f59f8015 did
+// not compile in 10 minutes and 25 GB with them inlined, and takes 166 s and 5.5 GB with one
+// copy of each. Other programs keep inlining them.
+inline spv::FunctionControlMask SharedHelperControl(const EmitterState& state) {
+	return state.program.inlined_call_entries.empty() ? spv::FunctionControlMaskNone
+	                                                  : spv::FunctionControlDontInlineMask;
+}
 
 // Shared instruction construction; typed aliases add no forwarding functions.
 template <spv::Op opcode, IR::Type type, typename... Args>
@@ -418,10 +497,26 @@ struct MemoryResourceAccess {
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Table mode: object_pointer is a physical storage buffer pointer (EmitTableMode); loads and stores through it
+	// carry their alignment (EmitAccessLoad, EmitAccessStore).
+	bool                  physical         = false;
 };
+
+// A load or store through a buffer access's element pointer (with the alignment a physical pointer needs).
+uint32_t EmitAccessLoad(EmitterState& state, uint32_t type, uint32_t pointer, const MemoryResourceAccess& access);
+void     EmitAccessStore(EmitterState& state, uint32_t pointer, uint32_t value, const MemoryResourceAccess& access);
+// Table mode, at the function's entry (state.table_*).
+void EmitTableMode(EmitterState& state);
+uint32_t TypePhysicalStorageBufferPointer(EmitterState& state, uint32_t bits);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
+// Record tables (PointerTable::buffer): the record's key finds its block of elements,
+// [count, ordinal...], and the element its ordinal; anything else selects the root (0).
+uint32_t EmitRecordTableIndex(EmitterState& state, uint32_t key, uint32_t element,
+                              uint32_t mapping_offset, uint32_t search_iterations);
+// Whether a descriptor source is a record table.
+bool IsRecordTableSource(const EmitterState& state, uint32_t source);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
@@ -504,8 +599,8 @@ inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Typ
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
 
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
-uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask);
+uint32_t EmitClassMaskF32(ValueEmitContext& ctx, uint32_t value, IR::Value mask);
+uint32_t EmitClassMaskF16(ValueEmitContext& ctx, uint32_t bits, IR::Value mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
 
@@ -523,6 +618,9 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineBdaLoads(EmitterState& state);
+// Adds both subgroup counts to the fault-buffer entry for this shader.
+void EmitRayCounts(EmitterState& state, uint32_t guest, uint32_t native);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
@@ -532,7 +630,59 @@ uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32
                          std::array<uint32_t, 3> origin, std::array<uint32_t, 3> direction,
                          uint32_t remap, uint32_t triangle_id, uint32_t bary);
 void DefineTrinityFunctions(EmitterState& state);
+void DeclareRayQueryVariables(EmitterState& state);
+// After every function variable is declared.
+void InitializeRayQueryVariables(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active);
+// Guest memory reads of the native ray tracing alpha test (spirvEmitterRayQuery.cpp), with the
+// semantics of the guest instructions it stands for: a dword at a guest address (S_LOAD_DWORD),
+// a dword of a buffer through a V# (S_BUFFER_LOAD_DWORD) and an element through a V#
+// (BUFFER_LOAD_FORMAT_X idxen); zero where the guest would read zero.
+uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address);
+uint32_t EmitScalarBufferDwordLoad(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                   uint32_t offset);
+uint32_t EmitFormattedBufferLoadX(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                  uint32_t index);
+// A guest object of `size` bytes at a guest address: one translation when it lies in one
+// caching page (`inside`; `host` is then its host address, 0 when the page has no buffer).
+struct GuestObject {
+	uint32_t address = 0;
+	uint32_t host    = 0;
+	uint32_t inside  = 0;
+};
+GuestObject EmitGuestObject(ValueEmitContext& ctx, uint32_t address, uint32_t size);
+// The dword at `offset` (< size) of the object, as EmitGuestDwordLoad() would read it.
+uint32_t EmitGuestObjectDword(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset);
+// The same with the offset an id (a dword multiple below the size).
+uint32_t EmitGuestObjectDwordAt(ValueEmitContext& ctx, const GuestObject& object, uint32_t offset_id);
+// The three elements of a triangle of an index buffer through its V# from element `first`, as
+// EmitFormattedBufferLoadX() reads each.
+std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp,
+                                            uint32_t first);
+// `size` bytes of a buffer from `offset` through a V#, read dword by dword as
+// EmitScalarBufferDwordLoad() would.
+struct ScalarBufferObject {
+	uint32_t    size   = 0;
+	uint32_t    offset = 0;
+	GuestObject object;
+};
+void     EmitScalarBufferObject(ValueEmitContext& ctx, const std::array<uint32_t, 4>& vsharp, uint32_t offset,
+                                uint32_t size, ScalarBufferObject& object);
+uint32_t EmitScalarBufferObjectDword(ValueEmitContext& ctx, const ScalarBufferObject& object, uint32_t offset);
+// Whether `inst` samples a 2D float bindless table image at an explicit level, and that sample
+// at table entry `key`, coordinates (u, v) and level `lod` (F32): the texel as the instruction
+// returns it (U32x4).
+bool     IsImageTableSampleLod(const EmitterState& state, const IR::Inst& inst);
+uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod);
+// Whether `inst` samples a 2D float image of a bindless or indirect T# table at an explicit level
+// (the sample can then be emitted for another key, EmitImageSampleLodAtKey()), and that sample for
+// the T# at key `key` (the value the instruction computes from the T#'s offset in its table),
+// coordinates (u, v) and level `lod` (F32): the texel as the instruction returns it (U32x4).
+bool     IsImageKeySampleLod(const EmitterState& state, const IR::Inst& inst);
+uint32_t EmitImageSampleLodAtKey(ValueEmitContext& ctx, const IR::Inst& sample, uint32_t key,
+                                 uint32_t u, uint32_t v, uint32_t lod);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>

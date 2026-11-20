@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/precompileNotice.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -39,7 +40,7 @@ struct Presenter::Frame {
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
+	void Transit(CommandRecorder command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
@@ -171,7 +172,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 }
 
-void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
+void Presenter::Frame::Transit(CommandRecorder command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
 	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
 	                                access == vk::AccessFlagBits2::eTransferWrite
@@ -755,6 +756,8 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
+	// The overlay pipeline replaces any dynamic state draws set in this command buffer.
+	command.InvalidateDynamicState();
 	auto       vk_command      = command.Handle();
 	const bool convert_source =
 	    source != nullptr && VideoOutSourceNeedsDraw(source->source_flags, m_hdr_active);
@@ -866,19 +869,19 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			                           &to_present);
 		};
 		if (convert_source) {
-			DrawLayer(vk_command, {source, 0, false}, game_rect);
+			DrawLayer(vk_command.Direct(), {source, 0, false}, game_rect);
 			if (draw_overlay || draw_system_overlay) {
 				attachment_barrier();
 			}
 		}
 		if (draw_overlay) {
-			DrawLayer(vk_command, overlay, game_rect);
+			DrawLayer(vk_command.Direct(), overlay, game_rect);
 			if (draw_system_overlay) {
 				attachment_barrier();
 			}
 		}
 		if (draw_system_overlay) {
-			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
+			m_system_overlay->Record(vk_command.Direct(), m_image_views[m_image_index]);
 		}
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
@@ -1071,7 +1074,8 @@ void Presenter::Impl::Present() {
 		auto&      command = present_scheduler.BeginCommand();
 		const bool draw_system_overlay = [&] {
 			ScopedTimer overlay_time(Counter::OverlayNs);
-			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			return (overlay_visual.active || PerformanceOverlayEnabled() ||
+			        ManifestProgressVisible()) &&
 			       swapchain.PrepareSystemOverlay();
 		}();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],

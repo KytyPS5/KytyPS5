@@ -93,6 +93,17 @@ struct ImageInfo {
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
 	                                                            uint32_t levels        = 0) const;
 
+	// A run of `count` array layers of a layered, tiled, non-volume image, transferred apart from
+	// the other layers: each level's linear data is packed for the run alone.
+	struct LayerRunLayout {
+		std::array<uint64_t, 16> offsets {};
+		uint64_t                 size = 0;
+	};
+	[[nodiscard]] bool           LayersTransferable() const;
+	[[nodiscard]] LayerRunLayout LayerRunLinearLayout(uint32_t count) const;
+	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopiesLayers(uint32_t first, uint32_t count,
+	                                                                  uint64_t buffer_offset) const;
+
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
 		if (bgra16) return ColorTransform::SwapBgra16;
 		switch (guest_format) {

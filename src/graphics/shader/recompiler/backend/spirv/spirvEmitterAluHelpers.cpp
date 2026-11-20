@@ -85,12 +85,117 @@ static uint32_t EmitClassMaskBits(EmitterState& state, uint32_t bits, uint32_t m
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
-	return EmitClassMaskBits(state, EmitBitcastF32ToU32(state, value), mask, false);
+// A class test against a constant mask, the usual operand, builds only the classes the mask
+// selects: DS's v_cmp_class_f32 with 0x38 (negative and finite) is 6 instructions instead of 86.
+static uint32_t EmitClassMaskConstantBits(EmitterState& state, uint32_t bits, uint32_t mask,
+                                          bool half) {
+	mask &= 0x3ffu;
+	if (mask == 0u) return ConstantBool(state, false);
+	if (mask == 0x3ffu) return ConstantBool(state, true);
+	const uint32_t sign_mask     = half ? 0x8000u : 0x80000000u;
+	const uint32_t exponent_mask = half ? 0x7c00u : 0x7f800000u;
+	const uint32_t mantissa_mask = half ? 0x03ffu : 0x007fffffu;
+	const uint32_t quiet_mask    = half ? 0x0200u : 0x00400000u;
+	// Each value is emitted the first time a selected class needs it.
+	uint32_t   abs_bits = 0, exponent_bits = 0, mantissa_bits = 0;
+	const auto get_abs = [&]() {
+		if (abs_bits == 0) abs_bits = EmitAndConstant(state, bits, sign_mask - 1u);
+		return abs_bits;
+	};
+	const auto get_exponent = [&]() {
+		if (exponent_bits == 0) exponent_bits = EmitAndConstant(state, get_abs(), exponent_mask);
+		return exponent_bits;
+	};
+	const auto get_mantissa = [&]() {
+		if (mantissa_bits == 0) mantissa_bits = EmitAndConstant(state, get_abs(), mantissa_mask);
+		return mantissa_bits;
+	};
+	const auto exponent_is = [&](spv::Op op, uint32_t value) {
+		return EmitCompareU32Constant(state, op, get_exponent(), value);
+	};
+	const auto mantissa_is = [&](spv::Op op) {
+		return EmitCompareU32Constant(state, op, get_mantissa(), 0);
+	};
+	// Classes by mask bit: NaNs (0, 1) have no sign; the others are negative (2-5) or positive
+	// (9-6) infinity, normal, denormal and zero.
+	enum Class : uint32_t { Inf, Normal, Denorm, Zero, Finite, ClassCount };
+	const auto selected = [&](uint32_t bit) { return (mask >> bit) & 1u; };
+	std::array<uint32_t, ClassCount> signs {}; // bit 0: negative, bit 1: positive
+	for (uint32_t c = Inf; c <= Zero; c++) {
+		signs[c] = selected(2u + c) | (selected(9u - c) << 1u);
+	}
+	// Normal, denormal and zero of the same signs are the finite values.
+	if (signs[Normal] != 0u && signs[Normal] == signs[Denorm] && signs[Normal] == signs[Zero]) {
+		signs[Finite] = signs[Normal];
+		signs[Normal] = signs[Denorm] = signs[Zero] = 0u;
+	}
+	uint32_t   sign  = 0;
+	uint32_t   match = 0;
+	const auto add   = [&](uint32_t term) {
+		match = match == 0 ? term : EmitLogicalOrBool(state, match, term);
+	};
+	const auto add_signed = [&](uint32_t term, uint32_t which) {
+		if (which == 3u) {
+			add(term);
+			return;
+		}
+		if (sign == 0) {
+			sign = EmitCompareU32Constant(state, spv::OpINotEqual,
+			                              EmitAndConstant(state, bits, sign_mask), 0);
+		}
+		add(EmitLogicalAndBool(state, term,
+		                       which == 1u ? sign : EmitLogicalNotBool(state, sign)));
+	};
+	if (selected(0u) || selected(1u)) {
+		const auto nan = EmitLogicalAndBool(state, exponent_is(spv::OpIEqual, exponent_mask),
+		                                    mantissa_is(spv::OpINotEqual));
+		if (selected(0u) && selected(1u)) {
+			add(nan);
+		} else {
+			const auto quiet = EmitCompareU32Constant(
+			    state, spv::OpINotEqual, EmitAndConstant(state, get_mantissa(), quiet_mask), 0);
+			add(EmitLogicalAndBool(state, nan,
+			                       selected(1u) ? quiet : EmitLogicalNotBool(state, quiet)));
+		}
+	}
+	for (uint32_t c = Inf; c < ClassCount; c++) {
+		if (signs[c] == 0u) continue;
+		uint32_t term = 0;
+		switch (c) {
+			case Inf:
+				term = EmitLogicalAndBool(state, exponent_is(spv::OpIEqual, exponent_mask),
+				                          mantissa_is(spv::OpIEqual));
+				break;
+			case Normal:
+				term = EmitLogicalAndBool(state, exponent_is(spv::OpINotEqual, 0),
+				                          exponent_is(spv::OpINotEqual, exponent_mask));
+				break;
+			case Denorm:
+				term = EmitLogicalAndBool(state, exponent_is(spv::OpIEqual, 0),
+				                          mantissa_is(spv::OpINotEqual));
+				break;
+			case Zero: term = EmitCompareU32Constant(state, spv::OpIEqual, get_abs(), 0); break;
+			default: term = exponent_is(spv::OpINotEqual, exponent_mask); break;
+		}
+		add_signed(term, signs[c]);
+	}
+	return match;
 }
 
-uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
-	return EmitClassMaskBits(state, bits, mask, true);
+static uint32_t EmitClassMask(ValueEmitContext& ctx, uint32_t bits, IR::Value mask, bool half) {
+	mask = mask.Resolve();
+	if (mask.IsImmediate()) {
+		return EmitClassMaskConstantBits(ctx.state, bits, mask.U32(), half);
+	}
+	return EmitClassMaskBits(ctx.state, bits, ctx.Def(mask), half);
+}
+
+uint32_t EmitClassMaskF32(ValueEmitContext& ctx, uint32_t value, IR::Value mask) {
+	return EmitClassMask(ctx, EmitBitcastF32ToU32(ctx.state, value), mask, false);
+}
+
+uint32_t EmitClassMaskF16(ValueEmitContext& ctx, uint32_t bits, IR::Value mask) {
+	return EmitClassMask(ctx, bits, mask, true);
 }
 
 static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, uint32_t lhs_bits,
@@ -185,6 +290,17 @@ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signe
 	return Select(state, TypeF32(state),
 	              Binary(state, spv::OpIEqual, TypeBool(state), abs_bits, ConstantU32(state, 0)),
 	              src, fract);
+}
+
+uint32_t EmitConvertF32F16Lane(EmitterState& state, uint32_t bits, IR::Value lane) {
+	// UnpackHalf2x16 reads either half directly; hosts select the half in the conversion.
+	const auto unpacked = state.builder.AllocateId();
+	const auto ret      = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),
+	                          GLSLstd450UnpackHalf2x16, bits);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), ret, unpacked,
+	                          lane.Resolve().U32() != 0u ? 1u : 0u);
+	return ret;
 }
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {

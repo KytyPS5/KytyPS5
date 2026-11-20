@@ -19,6 +19,7 @@ struct Mip {
 	uint slice_bytes;
 	uint tiled_slice_bytes;
 	uint blocks_per_row;
+	uint surface_z;
 	uint tail_x;
 	uint tail_y;
 	uint num_texels;
@@ -27,6 +28,7 @@ struct Mip {
 layout(set = 0, binding = 2, std140) uniform TilingInfo {
 	uint num_texels;
 	uint color_transform;
+	uint packed_r8;
 	Mip mips[16];
 } info;
 
@@ -60,6 +62,8 @@ void main() {
 	if (texel >= info.num_texels) {
 		return;
 	}
+	bool packed = ELEMENT_BYTES == 1u && info.packed_r8 != 0u;
+	if (packed) texel *= 8u;
 	uint mip = 0u;
 	uint mip_texels = info.mips[mip].num_texels;
 	while (texel >= mip_texels) {
@@ -73,14 +77,19 @@ void main() {
 
 	uvec3 extent = block_extent();
 	uvec3 block = p / extent;
-	uvec3 swizzle = p + uvec3(params.tail_x, params.tail_y, 0u);
+	uvec3 swizzle = p + uvec3(params.tail_x, params.tail_y, params.surface_z);
 
 	uint block_index = block.y * params.blocks_per_row + block.x;
 	uint tiled = block.z * params.tiled_slice_bytes + block_index * BLOCK_BYTES +
 	             block_offset(swizzle);
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
-	if (TILE == 0) {
+	if (packed) {
+		uint src = (params.src_base + (TILE == 0 ? tiled : linear)) >> 2u;
+		uint dst = (params.dst_base + (TILE == 0 ? linear : tiled)) >> 2u;
+		output_buffer.data[dst] = input_buffer.data[src];
+		output_buffer.data[dst + 1u] = input_buffer.data[src + 1u];
+	} else if (TILE == 0) {
 		copy_element(params.src_base + tiled, params.dst_base + linear);
 	} else {
 		copy_element(params.src_base + linear, params.dst_base + tiled);

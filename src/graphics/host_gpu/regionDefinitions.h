@@ -33,6 +33,10 @@ struct GuestRange {
 };
 
 enum class DirtySource { Cpu, Gpu };
+// The users of the record of the pages the CPU wrote (MemoryTracker::ConsumeCpuWrites()): each
+// has its own.
+enum class CpuWriteConsumer : uint32_t { IndirectWriteTables, BufferTables };
+constexpr size_t CPU_WRITE_CONSUMERS = 2;
 using RegionBits = Common::BitArray<TRACKER_REGION_PAGES>;
 static_assert(sizeof(RegionBits) == TRACKER_REGION_PAGES / 8);
 

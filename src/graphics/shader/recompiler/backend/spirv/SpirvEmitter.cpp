@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvForwarding.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -19,9 +20,42 @@ namespace {
 
 } // namespace
 
+bool UsesMipStats(const IR::Program& program) {
+	if (program.stage != ShaderType::Pixel) {
+		return false;
+	}
+	const auto& images = program.info.images;
+	// Images whose T# the draw supplies; table elements and heap images have no field.
+	const auto drawn = [&](uint32_t resource) {
+		return resource < images.size() && !images[resource].heap &&
+		       images[resource].table_capacity == 0u;
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::ImageSampleRaw) {
+				continue;
+			}
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto resource = program.memory_info[index].resource;
+			if (drawn(resource)) {
+				return true;
+			}
+			if (resource < images.size() &&
+			    std::ranges::any_of(images[resource].indirect_resources, drawn)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
-                                  bool emit_debug_info) {
+                                  bool emit_debug_info,
+                                  bool mip_stats_records, bool ray_stats) {
 	using namespace Emitter;
 
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -38,9 +72,13 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		state.debug_source = state.builder.AddString(name);
 		state.builder.EnableNames();
 	}
+	state.mip_stats_records     = mip_stats_records;
+	state.ray_stats             = ray_stats && program.info.ray_query;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	// (A lane-local wave64 program: one GCN lane per invocation, each 32-wide subgroup a half wave.)
 	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+	            !program.lane_local
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
@@ -48,7 +86,9 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto module = state.builder.Build();
+	ForwardMaskedSelects(module, ForwardingMinBodyWords, state.fault_buffer_variable);
+	return module;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

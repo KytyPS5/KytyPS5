@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 
+#include <span>
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <condition_variable>
 #include <mutex>
@@ -21,6 +23,23 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+
+// Current thread: raises its priority to "highest", and restricts it to one logical
+// processor (when `logical_cpu` is not negative). No-ops where unsupported.
+void RaiseCurrentPriority();
+// Current thread: lowers its priority below normal, for background work that must not take
+// processors from the emulated machine. No-op where unsupported.
+void LowerCurrentPriority();
+void PinCurrent(int logical_cpu);
+
+// Keeps the threads of the process that pick no processors themselves off the physical cores
+// of `logical_cpus` (and their SMT siblings), for threads pinned there, when at least six
+// other physical cores remain: those running now and those that start later get a hard
+// affinity to the other processors.
+void ReserveCores(std::span<const int> logical_cpus);
+// Whether the calling thread pinned itself (PinCurrent) to a processor of the cores
+// ReserveCores() keeps the other threads off: it runs alone there.
+bool HasReservedCore();
 
 } // namespace Thread
 

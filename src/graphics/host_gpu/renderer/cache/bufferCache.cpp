@@ -204,12 +204,14 @@ void BufferCache::CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr, ui
                                         std::vector<vk::BufferCopy>& copies,
                                         uint64_t&                    total_size) {
 	const auto buffer_address = buffer.CpuAddress();
+	uint64_t copied_bytes = 0;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    copied_bytes += end - start;
 			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
@@ -218,8 +220,9 @@ void BufferCache::CollectDownloadCopies(const Buffer& buffer, uint64_t vaddr, ui
 		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
-	if (!copies.empty()) {
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	if (copied_bytes != 0) {
+		// total_size includes padding and earlier buffers packed into this readback.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, copied_bytes);
 	}
 }
 

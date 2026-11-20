@@ -1080,8 +1080,8 @@ struct SystemOverlay::Impl {
 			FinishSplash();
 			return;
 		}
-		const auto   frame = AnimateSplash(std::chrono::duration<float>(now - splash_born).count(),
-		                                   g_splash_logo_first);
+		const auto   layers = AnimateSplash(std::chrono::duration<float>(now - splash_born).count(),
+		                                    g_splash_logo_first);
 		const ImVec2 screen {static_cast<float>(frame_extent.width),
 		                     static_cast<float>(frame_extent.height)};
 		const float  fit = std::min(screen.x / 3840.0f, screen.y / 2160.0f);
@@ -1090,13 +1090,12 @@ struct SystemOverlay::Impl {
 		const ImVec2 end {begin.x + size.x, begin.y + size.y};
 		auto*        draw = ImGui::GetBackgroundDrawList();
 		draw->AddRectFilled({0, 0}, screen, IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha)));
-		draw->AddImage(
-		    splash_dds[0]->Texture(), begin, end, {frame.background_uv0, frame.background_uv0},
-		    {frame.background_uv1, frame.background_uv1},
-		    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * frame.background_alpha)));
-		draw->AddImage(
-		    splash_dds[1]->Texture(), begin, end, {0, 0}, {frame.logo_uv1, frame.logo_uv1},
-		    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * frame.logo_alpha)));
+		for (size_t i = 0; i < layers.size(); ++i) {
+			const auto& layer = layers[i];
+			draw->AddImage(splash_dds[i]->Texture(), begin, end, {layer.u0, layer.v0},
+			               {layer.u1, layer.v1},
+			               IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * layer.alpha)));
+		}
 	}
 
 	void EnsureVulkan(vk::Format format, uint32_t image_count) {

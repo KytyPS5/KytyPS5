@@ -2771,6 +2771,25 @@ public:
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
 
+    const auto release_tick = scheduler.CurrentTick();
+    uint32_t released = 0;
+    scheduler.DeferRelease([owned = std::make_unique<uint32_t>(4), &released] {
+      released += *owned;
+    });
+    scheduler.Wait(release_tick);
+    const auto restarted_tick = scheduler.CurrentTick();
+    scheduler.StartOperation();
+    Require("SchedulerTimeline", "release across a restart",
+            restarted_tick == release_tick + 1 && scheduler.IsFree(release_tick) &&
+                released == 0,
+            "a release ran while the command buffer restarted after it still recorded");
+    scheduler.Flush();
+    scheduler.Wait(restarted_tick);
+    scheduler.StartOperation();
+    scheduler.StartOperation();
+    Require("SchedulerTimeline", "release after the restarted tick", released == 4,
+            "a release did not run exactly once after the restarted command buffer completed");
+
     vk::SemaphoreTypeCreateInfo timeline_type{};
     timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
     timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;

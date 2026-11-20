@@ -46,7 +46,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	write(temporary->Mapped().data(), 0);
 	temporary->Flush(0, size);
 	auto* buffer = temporary.get();
-	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	scheduler.DeferRelease([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
 }
 
@@ -144,7 +144,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 void BufferCache::DeleteBuffer(BufferId id) {
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferRelease([this, id] { m_slot_buffers.erase(id); });
 	} else {
 		m_slot_buffers.erase(id);
 	}

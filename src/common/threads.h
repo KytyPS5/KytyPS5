@@ -6,6 +6,7 @@
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <condition_variable>
 #include <mutex>
+#include <thread>
 #endif
 
 namespace Common {

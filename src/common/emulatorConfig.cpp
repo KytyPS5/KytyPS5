@@ -282,6 +282,11 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
+// Reports the opt-in --keep-gpu-cache-on-reuse setting.
+bool KeepGpuCacheOnReuse() {
+	return g_config->keep_gpu_cache_on_reuse;
+}
+
 const std::string& GetLaunchActivity() {
 	return g_config->launch_activity;
 }

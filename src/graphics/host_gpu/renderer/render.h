@@ -624,7 +624,11 @@ private:
 	// they still hold (see TextureDescDerivation::Found).
 	[[nodiscard]] bool ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding);
 	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
-	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
+	using TextureDescMap = std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash>;
+	TextureDescMap m_texture_descs;
+	// Pointers to map nodes survive rehashing. Clear the hot entries when the map is cleared.
+	std::array<TextureDescMap::value_type*, 2048> m_recent_texture_descs {};
+	[[nodiscard]] TextureDescDerivation* FindTextureDesc(const TextureDescKey& key);
 	// Bindings point into m_texture_descs until their views are acquired: a full map is cleared
 	// once the bindings of the operation are reset.
 	bool m_clear_texture_descs = false;

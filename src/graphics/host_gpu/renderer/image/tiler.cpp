@@ -201,6 +201,16 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		params.num_texels += static_cast<uint32_t>(texels);
 	}
 
+	// These two 64 KiB swizzles preserve the low three x bits of a byte texel.
+	// Eight adjacent texels therefore form two complete words in both layouts.
+	const auto& first = params.mips[0];
+	if (levels == 1 && block.bytes_per_element == 1 &&
+	    (block.family == TileBlockFamily::RenderTarget64KB || block.family == TileBlockFamily::Standard64KB) &&
+	    ((first.width | first.pitch_bytes | first.slice_bytes | first.tiled_slice_bytes |
+	      first.src_base | first.dst_base | first.tail_x) & 7u) == 0) {
+		params.packed_r8 = 1;
+		params.num_texels /= 8u;
+	}
 	const auto params_size =
 	    static_cast<uint16_t>(offsetof(TilingParams, mips) + levels * sizeof(Mip));
 	const auto offset = m_stream_buffer.Copy(

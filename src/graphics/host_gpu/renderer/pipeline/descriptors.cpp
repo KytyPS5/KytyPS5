@@ -784,6 +784,22 @@ RenderExecutor::MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   
 	return key;
 }
 
+TextureDescDerivation* RenderExecutor::FindTextureDesc(const TextureDescKey& key) {
+	const uint32_t address = key.dwords[0];
+	const auto index = address ^ (address >> 7u) ^ (address >> 17u) ^ (key.view[0] >> 8u) ^
+	                   key.dwords[3] ^ key.view[3];
+	auto& recent = m_recent_texture_descs[index % m_recent_texture_descs.size()];
+	if (recent != nullptr && recent->first == key) {
+		return &recent->second;
+	}
+	const auto found = m_texture_descs.find(key);
+	if (found == m_texture_descs.end()) {
+		return nullptr;
+	}
+	recent = &*found;
+	return &recent->second;
+}
+
 bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding) {
 	auto&       texture_cache = m_context.GetTextureCache();
 	auto&       found         = derived.found;
@@ -847,15 +863,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	// The description is computed once per T# and view of it; images are looked up every time.
 	const auto key    = MakeTextureDescKey(resource, value);
-	auto       cached = m_texture_descs.find(key);
-	if (cached == m_texture_descs.end()) {
+	auto* cached = FindTextureDesc(key);
+	if (cached == nullptr) {
 		auto derived = DeriveTextureDesc(resource, descriptor);
 		if (m_texture_descs.size() >= MaxTextureDescs) {
 			m_clear_texture_descs = true;
 		}
-		cached = m_texture_descs.emplace(key, std::move(derived)).first;
+		cached = &m_texture_descs.emplace(key, std::move(derived)).first->second;
 	}
-	auto& derived = cached->second;
+	auto& derived = *cached;
 	// Candidates of a T# the shader selects at run time (bindless table and image heap elements,
 	// the T#s an indirect descriptor can name) are whatever the host finds where the shader could
 	// read one, also where the game keeps other data: Demon's Souls' pixel shader 3f7b19201073e188
@@ -1983,6 +1999,7 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 	if (m_clear_texture_descs) {
 		m_clear_texture_descs = false;
+		m_recent_texture_descs.fill(nullptr);
 		m_texture_descs.clear();
 		m_texture_descs_generation++;
 	}
@@ -2027,9 +2044,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			auto* derived = prepared.image_descs[i];
 			if (!same_images &&
 			    (derived == nullptr || !same_slots || prepared.last_images[i] != snapshot.images[i])) {
-				const auto cached =
-				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
-				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
+				derived = FindTextureDesc(MakeTextureDescKey(resource, snapshot.images[i]));
 			}
 			if (derived != nullptr && derived->found.valid &&
 			    ReuseTextureLookup(*derived, prepared.images[i])) {

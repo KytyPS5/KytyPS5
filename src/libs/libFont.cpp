@@ -1061,13 +1061,14 @@ static void init_outline(GlyphState* glyph, FontState* font) {
 		return;
 	}
 
-	const auto  code    = stb_supported_codepoint(font, glyph->code);
-	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
-	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+	const auto  glyph_face = resolve_stb_glyph(font, glyph->code);
+	const auto* info       = glyph_face.info;
+	const auto  code       = glyph_face.code;
+	const float scale_x    = stbtt_ScaleForMappingEmToPixels(info, font->scale_w);
+	const float scale_y    = stbtt_ScaleForMappingEmToPixels(info, font->scale_h);
 
-	stbtt_vertex* vertices = nullptr;
-	const int     num_vertices =
-	    stbtt_GetCodepointShape(&font->font_info, static_cast<int>(code), &vertices);
+	stbtt_vertex* vertices     = nullptr;
+	const int     num_vertices = stbtt_GetCodepointShape(info, static_cast<int>(code), &vertices);
 
 	auto&      points    = glyph->outline_points;
 	auto&      tags      = glyph->outline_tags;
@@ -1110,11 +1111,11 @@ static void init_outline(GlyphState* glyph, FontState* font) {
 		}
 	}
 	close_contour(begin);
-	stbtt_FreeShape(&font->font_info, vertices);
+	stbtt_FreeShape(const_cast<stbtt_fontinfo*>(info), vertices);
 
 	glyph->outline = {static_cast<int16_t>(contours.size()),
 	                  static_cast<int16_t>(points.size()),
-	                  (font->font_info.cff.size != 0 ? FONT_OUTLINE_REVERSE_FILL : 0u),
+	                  (info->cff.size != 0 ? FONT_OUTLINE_REVERSE_FILL : 0u),
 	                  points.data(),
 	                  tags.data(),
 	                  contours.data()};

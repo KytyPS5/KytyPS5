@@ -1591,6 +1591,7 @@ void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT = static_cast<int>(0x8a6c0035u);
 static constexpr int      GRAPHICS5_DRIVER_ERROR_FAILED           = static_cast<int>(0x8a6d0003u);
+static constexpr int      GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT     = static_cast<int>(0x8a6d0109u);
 static constexpr uint32_t WORKLOAD_STREAM_RECORD_SIZE             = 32;
 static constexpr uint32_t WORKLOAD_ACTIVE_PACKET_SIZE_DW          = 18;
 static constexpr uint32_t WORKLOAD_COMPLETE_PACKET_SIZE_DW        = 12;
@@ -4212,7 +4213,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 	AgcTrace("\t count = %" PRIu32 "\n", count);
 
 	if (count == 0) {
-		return OK;
+		return Gen5::GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT;
 	}
 	if (dcb_gpu_addrs == nullptr || dcb_sizes_in_dwords == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4294,7 +4295,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
 	         reinterpret_cast<uint64_t>(queue_context), count);
 
 	if (count == 0) {
-		return OK;
+		return Gen5::GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT;
 	}
 	if (queue_context == nullptr || command_buffers == nullptr || sizes_in_dwords == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4335,7 +4336,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
 	         queue, count);
 
 	if (count == 0) {
-		return OK;
+		return Gen5::GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT;
 	}
 	if (acbs == nullptr || sizes_in_dwords == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;

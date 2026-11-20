@@ -92,6 +92,13 @@ TEST(Agc, AgrSubmitFailsWithoutSubmitting) {
 	}
 }
 
+TEST(Agc, EmptyMultiSubmitsFail) {
+	constexpr auto empty = static_cast<int>(0x8a6d0109u);
+	EXPECT_EQ(Gen5Driver::AgcDriverSubmitMultiDcbs(nullptr, nullptr, 0), empty);
+	EXPECT_EQ(Gen5Driver::AgcDriverSubmitMultiCommandBuffers(nullptr, nullptr, nullptr, 0), empty);
+	EXPECT_EQ(Gen5Driver::AgcDriverSubmitMultiAcbs(0, nullptr, nullptr, 0), empty);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

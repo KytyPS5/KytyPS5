@@ -71,12 +71,11 @@ constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT  = 0x9F;
 
 /* Custom codes. Implemented via IT_NOP */
 
-constexpr uint32_t R_ZERO           = 0x00;
-constexpr uint32_t R_DISPATCH_RESET = 0x09;
-constexpr uint32_t R_PUSH_MARKER    = 0x0B;
-constexpr uint32_t R_POP_MARKER     = 0x0C;
-constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
-constexpr uint32_t R_PSSR           = 0x1B;
+constexpr uint32_t R_ZERO          = 0x00;
+constexpr uint32_t R_PUSH_MARKER   = 0x0B;
+constexpr uint32_t R_POP_MARKER    = 0x0C;
+constexpr uint32_t R_CONTEXT_STATE = 0x1A;
+constexpr uint32_t R_PSSR          = 0x1B;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 

@@ -55020,6 +55020,43 @@ void CheckPm4ResetQueue(RenderContext &renderer) {
           ctx.GetPrimitiveResetIndex() == 0xffffffffu &&
               processor.GetDispatchIndirectArgsBaseAddress() == 0,
           "the reset did not clear the context and the indirect bases");
+
+  // A compute queue resets Sh state only, and only when the op names it.
+  CommandProcessor compute(renderer, 0x20);
+  const auto reset_async = [&](uint32_t op, uint32_t gcr) {
+    std::array<uint32_t, 11> packet{};
+    CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                            packet.data(), packet.data() + packet.size(),
+                            nullptr, nullptr, 0};
+    Gen5::AgcAcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&acb), op);
+    const std::array<uint32_t, 11> expected{
+        0xc0017900u, 0x342u, 0xce000000u | op, gcr == 0 ? 0u : 0xc0065800u,
+        0,           0,      0,                0,
+        0,           0,      gcr};
+    Pm4Execution execution;
+    Require(name, "async packet",
+            packet == expected &&
+                compute.Process(execution, {packet.data(), acb.cursor_up}) ==
+                    Pm4ProcessResult::Complete,
+            "the async reset packets are not the native ones or did not complete");
+  };
+  compute.GetCtx().SetPrimitiveResetIndex(7);
+  compute.GetShCtx().SetCsUserSgpr(0, 7);
+  compute.GetUcfg().SetPrimitiveResetControl(7);
+  compute.SetDispatchIndirectArgsBaseAddress(0x1000);
+  const auto kept = [&](uint32_t sgpr) {
+    return compute.GetShCtx().GetCs().cs_user_sgpr.value[0] == sgpr &&
+           compute.GetCtx().GetPrimitiveResetIndex() == 7 &&
+           compute.GetUcfg().GetPrimitiveResetControl() == 7 &&
+           compute.GetDispatchIndirectArgsBaseAddress() == 0x1000;
+  };
+  reset_async(0x40u, 0xc1u);
+  reset_async(0x1c0u, 0xc3a1u);
+  Require(name, "async keeps state", kept(7),
+          "an async reset without Sh state reset the queue");
+  reset_async(Op::ShState, 0);
+  Require(name, "async Sh", kept(0),
+          "an async Sh reset did not reset only Sh state");
   std::printf("[host]    %-32s ok\n", name);
 }
 

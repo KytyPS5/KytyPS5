@@ -1995,12 +1995,19 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0x1c2u) != 0);
 
-	auto* cmd = buf->AllocateDW(2);
+	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	cmd[0] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_DISPATCH_RESET);
-	cmd[1] = 0;
+	cmd[0] = KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 0u);
+	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+	cmd[2] = Pm4::USERDATA_TAG_RESET_QUEUE | op;
+	// Cache flushes: 0x40 invalidates the instruction and scalar caches and writes the scalar one
+	// back; 0x100 instead invalidates every cache and writes GL2 back.
+	if ((op & 0x140u) != 0u &&
+	    AgcAcbAcquireMem(buf, (op & 0x100u) != 0u ? 0xc3a1u : 0xc1u, nullptr, 0, 0) == nullptr) {
+		return nullptr;
+	}
 
 	return cmd;
 }

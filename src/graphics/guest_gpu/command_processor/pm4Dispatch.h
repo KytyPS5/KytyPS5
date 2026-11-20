@@ -66,7 +66,6 @@ uint32_t CpOpIndirectCxRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32
 uint32_t CpOpIndirectShRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndirectUcRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpGetLodStats(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpDispatchReset(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem32(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPushMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

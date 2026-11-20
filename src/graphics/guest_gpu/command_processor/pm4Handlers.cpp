@@ -507,16 +507,6 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	return 4;
 }
 
-KYTY_CP_OP_PARSER(CpOpDispatchReset) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0001024);
-
-	cp.Reset();
-
-	return 1;
-}
-
 KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 	KYTY_PROFILER_FUNCTION();
 

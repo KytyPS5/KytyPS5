@@ -615,6 +615,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.pitch == cached.info.pitch &&
 	    (requested.resources == cached.info.resources || retain_cached_layout) &&
 	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
+	// PPSA18026
+	// An image heap samples a whole depth array while a draw renders one of its slices. A view the
+	// depth format can be sampled as, with more layers or levels, grows the depth image instead
+	// of moving it to a color copy.
+	const bool grow_depth =
+	    binding == BindingType::Texture && cached.info.IsDepth() && !cached.info.HasStencil() &&
+	    !requested.IsVolume() && requested.samples == cached.info.samples &&
+	    IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
@@ -643,12 +651,22 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.tiled_slice_stride = cached.info.tiled_slice_stride;
 		info.first_tail_level   = cached.info.first_tail_level;
 	}
+	if (grow_depth) {
+		info.pixel_format = cached.info.pixel_format;
+		info.guest_format = cached.info.guest_format;
+		info.metadata     = cached.info.metadata;
+	}
 	info.htile_initial_clear  = false;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+	}
+	// The copy below covers only the cached layers and levels; the rest start from guest memory.
+	if (info.resources.levels > cached.info.resources.levels ||
+	    info.resources.layers > cached.info.resources.layers) {
+		InitializeImage(replacement_id);
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
@@ -673,6 +691,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
+	}
+	if (grow_depth) {
+		// The grown image keeps the pending HTile clears of every slice.
+		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
+			metadata->second.owner = replacement_id;
+		}
 	}
 	FreeImage(cached_id);
 	return replacement_id;

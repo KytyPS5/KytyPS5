@@ -535,15 +535,26 @@ struct RenderExecutorTestAccess {
     if (pixel_active) {
       executor.PrepareBindings(pixel, result.pixel);
     }
+    DrawTargets targets{};
     executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u}, {});
+        std::span{stages.data(), pixel_active ? 2u : 1u}, targets);
     return result;
   }
 
   static void PrepareGraphicsBindings(RenderExecutor &executor,
                                       std::span<PreparedBindings *const> stages,
+                                      DrawTargets &targets) {
+    executor.PrepareGraphicsBindings(stages, targets);
+  }
+
+  static void PrepareGraphicsBindings(RenderExecutor &executor,
+                                      std::span<PreparedBindings *const> stages,
                                       std::span<RenderColorInfo> colors) {
-    executor.PrepareGraphicsBindings(stages, colors);
+    DrawTargets targets{};
+    std::ranges::copy(colors, targets.colors);
+    targets.color_count = static_cast<uint32_t>(colors.size());
+    executor.PrepareGraphicsBindings(stages, targets);
+    std::ranges::copy(std::span{targets.colors, colors.size()}, colors.begin());
   }
 
   static PipelineCache::Pipeline
@@ -8170,6 +8181,69 @@ public:
           "the partial depth view lost a layer or failed to restore raw UINT "
           "sampling");
       DestroyBuffer(&layered_raw_d16_readback);
+
+      // PPSA18026: an image heap samples a four-layer shadow array as R16 while a draw renders
+      // slice 1 of its two-layer D16 HTile depth target.
+      constexpr uint64_t grow_depth_offset = layered_raw_d16_offset + 0x1000;
+      constexpr uint64_t grow_htile_address = base + grow_depth_offset + 0x800;
+      constexpr std::array<uint16_t, 8> grow_depth_values{
+          0x1111u, 0x1112u, 0x2221u, 0x2222u, 0x3331u, 0x3332u, 0x4441u, 0x4442u};
+      std::memcpy(memory + grow_depth_offset, grow_depth_values.data(),
+                  sizeof(grow_depth_values));
+      DrawTargets grow_targets{};
+      auto &grow_depth = grow_targets.depth;
+      grow_depth.desc = MakeLinearDesc(
+          base + grow_depth_offset, sizeof(grow_depth_values) / 2, vk::Format::eD16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+          sizeof(uint16_t), 1);
+      grow_depth.desc.type = BindingType::DepthTarget;
+      grow_depth.desc.info.metadata.kind = ImageMetadataKind::Htile;
+      grow_depth.desc.info.metadata.range = {grow_htile_address, 0x200};
+      grow_depth.desc.info.htile_initial_clear = true;
+      grow_depth.desc.view_info.type = vk::ImageViewType::e2D;
+      grow_depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      grow_depth.desc.view_info.base_layer = 1;
+      grow_depth.desc.view_info.layer_count = 1;
+      grow_depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      grow_depth.image_id = texture_cache.FindImage(grow_depth.desc);
+      (void)texture_cache.FindDepthTarget(grow_depth.image_id, grow_depth.desc);
+      RenderExecutorTestAccess::BindRenderTarget(context.GetRenderExecutor(),
+                                                 grow_depth.image_id);
+      const auto two_layer_depth = grow_depth.image_id;
+      vk::ClearValue grow_clear{};
+      grow_clear.depthStencil.depth = 1.0f;
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), two_layer_depth,
+                                         {vk::ImageAspectFlagBits::eDepth, 0, 1, 1, 1},
+                                         grow_clear);
+      texture_cache.MarkGpuWritten(two_layer_depth);
+      auto grow_sampled = MakeLinearDesc(
+          base + grow_depth_offset, sizeof(grow_depth_values), vk::Format::eR16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 4,
+          sizeof(uint16_t), 1);
+      const auto grown = texture_cache.FindImage(grow_sampled);
+      Require(name, "sampled depth array grows as depth",
+              grown != two_layer_depth &&
+                  !TextureCacheTestAccess::Contains(texture_cache, two_layer_depth) &&
+                  texture_cache.GetImage(grown).backing.format == vk::Format::eD16Unorm &&
+                  texture_cache.GetImage(grown).info.resources.layers == 4 &&
+                  texture_cache.IsMetaCleared(grow_htile_address, 3) &&
+                  texture_cache.FindTexture(grown, grow_sampled) != nullptr,
+              "a sampled view of more layers moved the depth target to a color copy");
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          context.GetRenderExecutor(), std::span<PreparedBindings *const>{}, grow_targets);
+      const auto grow_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          context.GetRenderExecutor(), scheduler.Current(), grow_targets.colors, 0, grow_depth);
+      Require(name, "grown depth target rediscovery",
+              grow_depth.image_id == grown &&
+                  grow_rendering.depth_stencil_attachment.image_view != nullptr,
+              "the draw did not find its depth target in the grown image");
+      RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+      Require(name, "grown depth layers",
+              ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 1) ==
+                      std::vector<u32>{0xffffffffu} &&
+                  ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 3) ==
+                      std::vector<u32>{0x44424441u},
+              "the grown depth image lost a GPU-written layer or skipped guest memory");
 
       // RE2 converts a prefix of a 32-layer HTile depth array to R32F storage.
       constexpr uint32_t htile_layers = 32;

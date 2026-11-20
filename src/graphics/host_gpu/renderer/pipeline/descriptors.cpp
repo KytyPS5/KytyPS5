@@ -888,7 +888,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-                                             std::span<RenderColorInfo> colors) {
+                                             DrawTargets&                       targets) {
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
 	FindBuffers(stages);
@@ -906,7 +906,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
+	for (auto& target: std::span {targets.colors, targets.color_count}) {
 		EXIT_IF(!target.image_id);
 		auto& old_image = cache.m_slot_images[target.image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
@@ -915,6 +915,25 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			target.desc.view_info.base_layer = target.guest_array_layer;
 			target.image_id = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
+		}
+	}
+	// A sampled view can grow the depth image into a larger one at the same address.
+	if (auto& depth = targets.depth; depth.image_id) {
+		auto& old_image = cache.m_slot_images[depth.image_id];
+		if (!old_image.registered || old_image.binding.needs_rebind) {
+			old_image.binding = {};
+			depth.image_id    = cache.FindImage(depth.desc);
+			BindRenderTarget(depth.image_id);
+			// Depth found again from a color copy frees the image a binding of this draw holds.
+			for (auto* stage: stages) {
+				for (const auto& binding: stage->images) {
+					const auto* bound = cache.m_slot_images.try_get(binding.image_id);
+					if (binding.image_id &&
+					    (bound == nullptr || !bound->registered || bound->binding.needs_rebind)) {
+						EXIT("TextureCache: depth target rediscovery replaced a bound image\n");
+					}
+				}
+			}
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only

@@ -32,9 +32,9 @@ inline constexpr LaneSpills NoLaneSpills {};
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           const LaneSpills& lane_spills, bool flush_f32_inputs, bool graphics_compute)
+	           const LaneSpills& lane_spills, bool flush_f32_inputs)
 	    : program(program), ir(block), current_vector_limit(vector_limit), lane_spills(lane_spills),
-	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
+	      flush_f32_inputs(flush_f32_inputs) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -281,7 +281,6 @@ private:
 	uint32_t          current_vector_limit = 1;
 	const LaneSpills& lane_spills;
 	bool              flush_f32_inputs;
-	bool              graphics_compute;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

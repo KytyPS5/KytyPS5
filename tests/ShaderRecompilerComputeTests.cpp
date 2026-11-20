@@ -50115,6 +50115,38 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Graphics and async dispatches share a compute module; an async dispatch of one that reads HW_ID2 exits.
+void CheckComputeQueueModules(VulkanHarness &vulkan) {
+  constexpr const char *name = "ComputeQueueModules";
+  const std::vector<u32> plain{EncodeSopp(0x01)};
+  const std::vector<u32> queue_read{0xb96a1818u, EncodeSopp(0x01)}; // s_getreg_b32 vcc_lo, HW_ID2
+  for (const auto *code : {&plain, &queue_read})
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto compile = [&](const std::vector<u32> &code, bool async) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    ShaderComputeInputInfo input{};
+    input.async_compute = async;
+    return cache.GetComputeProgram(regs, input);
+  };
+  const auto *graphics = compile(plain, false);
+  Require(name, "shared module", compile(plain, true) == graphics,
+          "async compute recompiled a shader that does not read its queue");
+  Require(name, "queue read", compile(queue_read, false)->info.info.reads_queue_id,
+          "the graphics module did not record its HW_ID2 queue read");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal(name, [&] { (void)compile(queue_read, true); });
+#endif
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // With a shader store a restart compiles nothing and creates every pipeline before the first
 // lookup. A damaged record and everything after it are dropped; a stale store starts over.
 void CheckShaderStore(VulkanHarness &vulkan) {
@@ -58325,6 +58357,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckComputeQueueModules(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();

@@ -570,6 +570,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	bool                            reads_queue_id                = false; // HW_ID2 QUEUE or ME.
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

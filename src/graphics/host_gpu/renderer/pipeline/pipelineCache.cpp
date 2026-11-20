@@ -886,7 +886,11 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
-	return GetProgram(params, input_info, push_data_cursor);
+	const auto*       module           = GetProgram(params, input_info, push_data_cursor);
+	// HW_ID2 reads are translated with the graphics compute queue's values.
+	EXIT_NOT_IMPLEMENTED(module != nullptr && input_info.async_compute &&
+	                     module->info.info.reads_queue_id);
+	return module;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,

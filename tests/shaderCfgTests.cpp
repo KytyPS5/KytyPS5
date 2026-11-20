@@ -7324,10 +7324,12 @@ void TestGraphicsComputeGetreg() {
               decoded.src0.value == (word & 0xffffu), "GETREG field or VCC destination decoded incorrectly");
     for (const auto wave : {32u, 64u}) {
       IR::Program program;
+      program.stage = ShaderType::Compute;
       program.wave_size = wave;
       IR::Block block;
-      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false, true);
+      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false);
       translator.TranslateInstruction(decoded);
+      Check(program.info.reads_queue_id, "GETREG did not record its queue read");
       bool wrote_vcc = false;
       for (const auto& inst : block) {
         Check(inst.GetOpcode() != IR::ValueOpcode::SetScc, "GETREG changed SCC");
@@ -7351,13 +7353,10 @@ void TestGraphicsComputeGetreg() {
   (void)PrepareProgram(regs, graphics);
   (void)PrepareProgram(regs, async);
   Check(!graphics.async_compute && async.async_compute &&
-            MakeStageStaticKey(graphics) != MakeStageStaticKey(async) &&
-            MakeStageStaticKey(graphics).size() == MakeStageStaticKey(async).size(),
-        "compute input reset or cache identity lost queue provenance");
+            MakeStageStaticKey(graphics) == MakeStageStaticKey(async),
+        "compute input reset lost the queue, or the queue split the cache identity");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.input_info.compute = &async;
-  ExpectFatal([&] { (void)TranslateProgram(shader, options); }, "async GETREG used graphics constants");
   auto vertex = MakeCompileOptions(ShaderType::Vertex);
   ExpectFatal([&] { (void)TranslateProgram(shader, vertex); }, "vertex GETREG used compute constants");
   options.input_info.compute = &graphics;

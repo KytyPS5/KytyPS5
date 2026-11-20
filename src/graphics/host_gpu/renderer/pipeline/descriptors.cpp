@@ -423,6 +423,30 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	if (!info.IsTiled()) {
 		return false;
 	}
+	// A mip beyond MAX_MIP can still occupy the chain's already allocated tail
+	// (Astro Bot selects mip 6 of a 1920x1080 render target with MAX_MIP 5).
+	// Preserve the chain origin only when every stored mip and its slice stride
+	// remain unchanged; otherwise try the standalone-chain interpretation below.
+	if (base_level >= physical_levels) {
+		ImageInfo physical        = info;
+		ImageInfo extended        = info;
+		physical.resources.levels = physical_levels;
+		physical.UpdateSize();
+		extended.UpdateSize();
+		if (physical.first_tail_level < physical_levels &&
+		    physical.first_tail_level == extended.first_tail_level &&
+		    physical.tiled_slice_stride == extended.tiled_slice_stride &&
+		    physical.data.size == extended.data.size) {
+			bool matches = true;
+			for (uint32_t level = 0; level < physical_levels; ++level) {
+				matches &= physical.mip_layout[level] == extended.mip_layout[level];
+			}
+			if (matches) {
+				info = std::move(extended);
+				return true;
+			}
+		}
+	}
 	ImageInfo physical = info;
 	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
 	// compresses mip 1 through a T# that declares one level).

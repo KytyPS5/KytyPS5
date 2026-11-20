@@ -17295,6 +17295,43 @@ public:
       sampled_overwide_resource.read = true;
       sampled_overwide_resource.written = false;
       {
+        // Astro Bot selects a mip beyond MAX_MIP inside an existing RT tail.
+        constexpr uint64_t address = base + 0x200000;
+        ShaderRecompiler::IR::DescriptorValue descriptor{};
+        descriptor.dword_count = 8;
+        descriptor.dwords = {
+            static_cast<uint32_t>(address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u) |
+                ((1919u & 3u) << 30u),
+            (1919u >> 2u) | (1079u << 14u),
+            DstSel(4, 5, 6, 7) | (6u << 12u) | (6u << 16u) |
+                (static_cast<uint32_t>(Prospero::TileMode::kRenderTarget) << 20u) |
+                (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u | (5u << 4u), 0, 0};
+        ImageInfo physical{};
+        physical.data.address = address;
+        physical.pixel_format = vk::Format::eR32Uint;
+        physical.guest_format = Prospero::BufferFormat::k32UInt;
+        physical.extent = {1920, 1080, 1};
+        physical.resources = {6, 1};
+        physical.tile_mode = Prospero::TileMode::kRenderTarget;
+        physical.UpdateSize();
+        const auto tail = RenderExecutorTestAccess::ResolveTexture(
+            executor, sampled_overwide_resource, descriptor);
+        Require(name, "Astro Bot mip past MAX_MIP preserves allocated tail",
+                tail.desc.info.extent == physical.extent &&
+                    tail.desc.info.resources.levels == 7 &&
+                    tail.desc.info.data.size == physical.data.size &&
+                    tail.desc.info.tiled_slice_stride == physical.tiled_slice_stride &&
+                    tail.desc.view_info.base_level == 6 &&
+                    tail.desc.view_info.level_count == 1 &&
+                    std::equal(physical.mip_layout.begin(),
+                               physical.mip_layout.begin() + 6,
+                               tail.desc.info.mip_layout.begin()) &&
+                    texture_cache.FindTexture(tail.image_id, tail.desc) != nullptr,
+                "a shared tail mip was rejected or changed existing mip storage");
+      }
+      {
         // MLB The Show 21 compresses a standalone final block through mip 9.
         constexpr uint64_t address = base + 0x180000;
         ShaderRecompiler::IR::DescriptorValue descriptor{};

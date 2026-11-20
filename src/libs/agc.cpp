@@ -1503,8 +1503,8 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 
 	auto vaddr = reinterpret_cast<uint64_t>(target);
 
-	cmd[1] = static_cast<uint32_t>(vaddr & 0xffffffffu);
-	cmd[2] = (cmd[2] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
+	cmd[1] = (cmd[1] & 0x3u) | (static_cast<uint32_t>(vaddr) & ~0x3u);
+	cmd[2] = static_cast<uint32_t>(vaddr >> 32u);
 	cmd[3] = (cmd[3] & 0xfff00000u) | (size_in_dwords & 0xfffffu);
 
 	return OK;

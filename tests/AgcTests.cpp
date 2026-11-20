@@ -123,6 +123,14 @@ TEST(Agc, IndexedMultiDrawsAreTagged) {
 	EXPECT_TRUE(Gen5::AgcIsInternalDataPacket(dw[0], &dw[1]));
 }
 
+TEST(Agc, JumpPatchSetTargetKeepsLowBitsAndWritesHighDword) {
+	std::array<uint32_t, 4> jump {0xc0023f00u, 3u, 0xffff0000u, 0x12300000u};
+	EXPECT_EQ(Gen5::AgcJumpPatchSetTarget(jump.data(), reinterpret_cast<const volatile uint32_t*>(0x123456789abcull),
+	                                      0x10u),
+	          0);
+	EXPECT_EQ(jump, (std::array<uint32_t, 4> {0xc0023f00u, 0x56789abfu, 0x1234u, 0x12300010u}));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

@@ -7834,129 +7834,25 @@ void TestFaultReportReachesTheLogFile() {
   std::printf("[host]    %-48s ok\n", test);
 }
 
-int main(int argc, char **argv) {
-  if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
-    return RunTrinityTests();
+void TestGuestReservationIdempotence() {
+  const char *test = "GuestReservationIdempotence";
+  using namespace Libs::LibKernel::Memory;
+  const std::array<uint64_t, 3> pages{TestGuestRegionFreePage(0),
+                                      TestGuestRegionFreePage(1),
+                                      TestGuestRegionFreePage(2)};
+  for (const auto page : pages) {
+    Check(test,
+          page != 0 && TestGuestAddressRangeIsOwned(page, SceKernelPageSize),
+          "each guest region must contain an owned free page after Phase 2");
   }
-  if (argc == 3 && std::strcmp(argv[1], "--fault-report") == 0) {
-    ReportFaultTo(argv[2]);
+  ReserveGuestAddressSpace();
+  ReserveGuestAddressSpace();
+  for (size_t i = 0; i < pages.size(); ++i) {
+    Check(test, pages[i] == TestGuestRegionFreePage(i),
+          "repeated reservation must preserve free ranges");
   }
-  InitSubsystems();
-  if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
-    RunTest(TestFlexibleZeroingTracksBackingLifetime);
-    RunTest(TestFlexibleMemoryReuseIsZeroFilled);
-    RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
-    RunTest(TestFragmentedBackingPublication);
-    RunTest(TestSmallerFlexibleMapReusesReleasedHole);
-    RunTest(TestFragmentedGuestFreeRangeHints);
-    RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
-    RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
-    RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
-    RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-    RunTest(TestDirectTrimmedAliasRelease);
-    RunTest(TestDirectMappingNamesTypesAndValidation);
-    RunTest(TestAutomaticMemoryReuseAndAliases);
-    RunTest(TestAutomaticMemoryFragmentedMap);
-    RunTest(TestFragmentedMemoryPoolBacking);
-    RunTest(TestMemoryPoolMiddleDecommitAndReuse);
-    RunTest(TestMemoryPoolMultiRangeDecommit);
-    RunTest(TestFragmentedPoolDecommitOnSmallStack);
-    // Memory callbacks remain registered for the rest of the process.
-    RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
-    RunTest(TestAsanAliasedPhysicalRelease);
-    RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
-    RunTest(TestFlexibleNoCoalescePreservesBoundaries);
-    RunTest(TestFlexibleRangeEditsCoalesce);
-    RunTest(TestPageTableStatsTrackRangeEdits);
-    RunTest(TestPartialFlexibleMunmapAndFindNext);
-    RunTest(TestReserveMapFixedAndNoOverwrite);
-    RunTest(TestFixedNoOverwriteRejectsReservedRange);
-    RunTest(TestFixedArenaChurnKeepsRangesExact);
-    RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
-    RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-#if defined(__linux__)
-    RunTest(TestFixedDirectReplacementPreservesAccess);
-#endif
-    RunTest(TestFixedReserveReplacesPartialDirectMapping);
-    RunTest(TestMemoryPoolMultiRangeDecommit);
-    RunTest(TestProgramMemoryAllocationAndProtection);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
-    RunTest(TestFlexibleZeroingTracksBackingLifetime);
-    RunTest(TestConcurrentBackingReads);
-    RunTest(TestBackingReadsSkipMappingLock);
-    RunTest(TestQueriesSkipOperationLock);
-    RunTest(TestQueriesWaitForStateChanges);
-    RunTest(TestTrackerProtectSharesBackingReads);
-    RunTest(TestClampRangeSkipsStateLock);
-    RunTest(TestSparseBackingReadPreservesResidency);
-    RunTest(TestCopySparseMemoryMappings);
-    RunTest(TestSparseReadDuringDirectCommit);
-    RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
-    RunTest(TestFlexibleMemoryUsesSharedBacking);
-    RunTest(TestFlexibleMemoryReuseIsZeroFilled);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-#if defined(__linux__)
-  if (argc == 2 &&
-      std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
-    RunTest(TestFixedDirectReplacementPreservesAccess);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-  if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
-    RunTest(TestSmallFiberStacksAndMigration);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-#endif
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
-    RunTest(TestCpuExtensionContexts);
-    RunTest(TestPackedBitFieldInsert);
-    RunTest(TestCpuExtensionPatches);
-    RunTest(TestTimeStampCounterPatches);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
-    RunTest(TestPackedBitFieldExtract);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
-    RunTest(TestPackedReciprocalSquareRoot);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-#endif
-  if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
-    RunTest(TestWindowsGuestRedZoneStaticPatcher);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
->>>>>>> pr-2227
-
-  void TestGuestReservationIdempotence() {
-    const char *test = "GuestReservationIdempotence";
-    using namespace Libs::LibKernel::Memory;
-    const std::array<uint64_t, 3> pages{TestGuestRegionFreePage(0),
-                                        TestGuestRegionFreePage(1),
-                                        TestGuestRegionFreePage(2)};
-    for (const auto page : pages) {
-      Check(test,
-            page != 0 && TestGuestAddressRangeIsOwned(page, SceKernelPageSize),
-            "each guest region must contain an owned free page after Phase 2");
-    }
-    ReserveGuestAddressSpace();
-    ReserveGuestAddressSpace();
-    for (size_t i = 0; i < pages.size(); ++i) {
-      Check(test, pages[i] == TestGuestRegionFreePage(i),
-            "repeated reservation must preserve free ranges");
-    }
-        std::printf("[host]    %-48s ok
-", test);
-  }
+  std::printf("[host]    %-48s ok\n", test);
+}
 
   /// Initializes the test subsystems and runs the suite or the subset selected
   /// by one option. Returns a nonzero exit status if a selected test fails.

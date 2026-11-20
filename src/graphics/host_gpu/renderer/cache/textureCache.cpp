@@ -1298,7 +1298,10 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	ImageId association = FindStencilPlane(depth, stencil);
 	if (!association) {
 		ForEachImageWithAddress(stencil.address, [&](ImageId id, Image& owner) {
-			if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
+			// Small depth and stencil planes are one 64 KiB block each, so another depth surface
+			// can occupy this exact range. Adopting it would orphan its own stencil associations.
+			if (!owner.info.IsDepth() && owner.info.data == stencil &&
+			    owner.info.extent == depth.info.extent) {
 				association = id;
 			}
 		});

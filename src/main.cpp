@@ -113,6 +113,10 @@ static void PrintUsage() {
 	         "ASCII chars).\n");
 	::printf("  --no-poll-backoff                    Let failed event-flag polls spin instead of "
 	         "yielding.\n");
+	::printf("  --keep-gpu-cache-on-reuse            Keep GPU buffer caches when released direct "
+	         "memory\n"
+	         "                                       is mapped back unchanged. Experimental. "
+	         "Default: off.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -243,6 +247,7 @@ static constexpr Flag FLAGS[] = {
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
     {"--no-poll-backoff", &ConfigOptions::poll_backoff_enabled, false},
+    {"--keep-gpu-cache-on-reuse", &ConfigOptions::keep_gpu_cache_on_reuse},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

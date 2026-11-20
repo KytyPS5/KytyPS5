@@ -412,7 +412,7 @@ void TestCpuDirtyUpload() {
 void TestRepeatedUploadSkip() {
   uint8_t *memory = nullptr;
   uint64_t address = 0;
-  uint64_t page_size = 0;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   uint32_t ranges = 0;
   uint32_t uploads = 0;
   const auto upload = [&](MemoryTracker &tracker, bool written) {
@@ -425,8 +425,7 @@ void TestRepeatedUploadSkip() {
   {
     TrackerHarness harness;
     auto &tracker = harness.tracker;
-    page_size = harness.page_manager.GetPageSize();
-    memory = Allocate(harness.page_manager, 2);
+    memory = Allocate(2);
     address = reinterpret_cast<uint64_t>(memory);
 
     upload(tracker, false);
@@ -464,13 +463,13 @@ void TestRepeatedUploadSkip() {
           "repeated written upload changed the page's state");
 
     tracker.UnmarkRegionAsGpuModified(address, page_size * 2);
-    tracker.UntrackMemory(address, page_size * 2);
+    tracker.MarkRegionAsCpuModified(address, page_size * 2);
   }
   {
     TrackerHarness harness;
     upload(harness.tracker, false);
     Check(ranges == 1, "a new tracker skipped its first upload");
-    harness.tracker.UntrackMemory(address, page_size * 2);
+    harness.tracker.MarkRegionAsCpuModified(address, page_size * 2);
   }
   Release(memory);
 }

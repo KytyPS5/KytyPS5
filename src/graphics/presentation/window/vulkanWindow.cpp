@@ -1016,6 +1016,8 @@ void WindowContext::CreateVulkan() {
 
 	graphic_ctx.window = window;
 	render_context     = std::make_unique<RenderContext>(graphic_ctx);
+	// The kernel does not read Config, so the opt-in is handed over where the GPU is handed over.
+	LibKernel::Memory::SetKeepGpuCacheOnReuse(Config::KeepGpuCacheOnReuse());
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
 	Vr::OpenXrStartSession(graphic_ctx);

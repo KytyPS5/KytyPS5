@@ -94,7 +94,8 @@ static uint64_t                 g_cpu_table_memory     = INCLUDED_TABLE_MEMORY;
 static uint64_t                 g_gpu_table_memory     = INCLUDED_TABLE_MEMORY;
 static Graphics::RenderContext* g_gpu_resources        = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
+static void (*g_test_gpu_range)(bool, uint64_t, size_t)                  = nullptr;
+static void (*g_test_gpu_suspend)(TestGpuSuspendEvent, uint64_t, size_t) = nullptr;
 #endif
 
 static Graphics::RenderContext& GetGpuResources() {
@@ -106,7 +107,8 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
-static void MapGpuRange(uint64_t vaddr, uint64_t size) {
+// Maps a range on the GPU without looking at suspended memory.
+static void MapGpuRangeNow(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
 #endif
@@ -116,7 +118,8 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().MapMemory(vaddr, size);
 }
 
-static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
+// Unmaps a range from the GPU and invalidates its caches without looking at suspended memory.
+static void UnmapGpuRangeNow(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(false, vaddr, size);
 #endif
@@ -183,6 +186,237 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 	    (UINT64_MAX - right_start < right_size ? UINT64_MAX : right_start + right_size);
 
 	return left_start < right_end && right_start < left_end;
+}
+
+// Released direct memory whose GPU caches are being kept for a possible exact remap.
+//
+// With --keep-gpu-cache-on-reuse a release suspends the GPU caches of each alias instead of
+// invalidating them. A fixed read-write map of the same physical memory at the same address then
+// resumes them. Anything else cancels the entry, which applies the invalidation that an unmap
+// would have done. Cancel is always safe, so every path that could map or change the memory
+// cancels first. The table is serialized by g_memory_operation_mutex.
+constexpr size_t SUSPENDED_RANGE_CAPACITY = 32;
+
+struct SuspendedRange {
+	uint64_t vaddr       = 0;
+	uint64_t size        = 0;
+	uint64_t phys_offset = 0;
+	// Set only while MapDirectMemory decides whether this entry can be resumed.
+	bool resume_candidate = false;
+};
+
+static bool g_keep_gpu_cache_on_reuse = false;
+// Set once the flag has been turned on. Until then teardown has nothing to cancel and must not
+// take the memory lock, so a run without the flag behaves exactly as before.
+static std::atomic<bool>           g_suspension_ever_enabled {false};
+static std::vector<SuspendedRange> g_suspended_ranges; // Oldest first.
+
+// Suspends a range on the GPU and reports whether it stays suspended. A GPU that is stopping or
+// absent unmaps instead, so the caller must not track the range in that case.
+static bool SuspendGpuRange(uint64_t vaddr, uint64_t size) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_gpu_suspend != nullptr) {
+		g_test_gpu_suspend(TestGpuSuspendEvent::Suspend, vaddr, size);
+		// Without GPU resources the test hook stands in for the GPU.
+		if (g_gpu_resources == nullptr) {
+			return true;
+		}
+	}
+#endif
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		UnmapGpuRangeNow(vaddr, size);
+		return false;
+	}
+	GetGpuResources().SuspendMemory(vaddr, size);
+	return GetGpuResources().IsSuspended(vaddr, size);
+}
+
+// Puts a suspended range back on the GPU with its caches intact.
+static void ResumeGpuRange(uint64_t vaddr, uint64_t size) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_gpu_suspend != nullptr) g_test_gpu_suspend(TestGpuSuspendEvent::Resume, vaddr, size);
+#endif
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().ResumeMemory(vaddr, size);
+}
+
+// Drops the caches of a suspended range the way an unmap would have.
+static void CancelGpuRange(uint64_t vaddr, uint64_t size) {
+	LOGF("Memory: cancelled suspended GPU cache, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+	     vaddr, size);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_gpu_suspend != nullptr) g_test_gpu_suspend(TestGpuSuspendEvent::Cancel, vaddr, size);
+#endif
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().CancelSuspendedMemory(vaddr, size);
+}
+
+// Removes one table entry and cancels its GPU cache. The entry goes first so a cancel is never
+// seen twice.
+static void CancelSuspendedAt(size_t index) {
+	const SuspendedRange entry = g_suspended_ranges[index];
+	g_suspended_ranges.erase(g_suspended_ranges.begin() + static_cast<std::ptrdiff_t>(index));
+	CancelGpuRange(entry.vaddr, entry.size);
+}
+
+// Cancels every entry the predicate selects, oldest first.
+template <typename Predicate>
+static void CancelSuspendedWhere(Predicate&& selected) {
+	for (size_t index = 0; index < g_suspended_ranges.size();) {
+		if (selected(g_suspended_ranges[index])) {
+			CancelSuspendedAt(index);
+		} else {
+			++index;
+		}
+	}
+}
+
+// Cancels every entry, for shutdown and for losing the GPU.
+static void CancelAllSuspendedRanges() {
+	CancelSuspendedWhere([](const SuspendedRange&) { return true; });
+}
+
+// Cancels every entry that covers part of a virtual range.
+static void CancelSuspendedOverlapping(uint64_t vaddr, uint64_t size) {
+	CancelSuspendedWhere([vaddr, size](const SuspendedRange& entry) {
+		return VirtualRangesOverlap(entry.vaddr, entry.size, vaddr, size);
+	});
+}
+
+// Whether an entry is exactly the memory that a map would put back. The three values are compared
+// in this one place on purpose, so that every user of the match agrees.
+static bool IsExactReuse(const SuspendedRange& entry, uint64_t vaddr, uint64_t size,
+                         uint64_t phys_offset) {
+	return entry.vaddr == vaddr && entry.size == size && entry.phys_offset == phys_offset;
+}
+
+// Marks the entry, if there is one, that a fixed read-write direct map may resume.
+static void SelectResumeCandidate(uint64_t vaddr, uint64_t size, uint64_t phys_offset) {
+	for (auto& entry: g_suspended_ranges) {
+		if (IsExactReuse(entry, vaddr, size, phys_offset)) {
+			entry.resume_candidate = true;
+			return;
+		}
+	}
+}
+
+// Forgets which entry was a resume candidate.
+static void ClearResumeCandidate() {
+	for (auto& entry: g_suspended_ranges) {
+		entry.resume_candidate = false;
+	}
+}
+
+// Cancels the resume candidate if it is still in the table.
+static void CancelResumeCandidate() {
+	CancelSuspendedWhere([](const SuspendedRange& entry) { return entry.resume_candidate; });
+}
+
+// Whether the GPU still holds a range suspended. Without a GPU there is nothing to disagree.
+static bool GpuStillSuspended(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	return GetGpuResources().IsSuspended(vaddr, size);
+}
+
+// Resumes the candidate when it matches the finished map exactly. Returns false when the caller
+// must do the normal map, for example because a map in between cancelled the entry.
+static bool ResumeSuspendedGpuRange(uint64_t vaddr, uint64_t size, uint64_t phys_offset) {
+	const auto match = std::find_if(
+	    g_suspended_ranges.begin(), g_suspended_ranges.end(), [=](const SuspendedRange& entry) {
+		    return entry.resume_candidate && IsExactReuse(entry, vaddr, size, phys_offset);
+	    });
+	if (match == g_suspended_ranges.end()) {
+		return false;
+	}
+	g_suspended_ranges.erase(match);
+	if (!GpuStillSuspended(vaddr, size)) {
+		// The GPU side was undone behind the table's back. Resuming would be an error there, so
+		// the caller does the normal map instead.
+		CancelGpuRange(vaddr, size);
+		return false;
+	}
+	ResumeGpuRange(vaddr, size);
+	LOGF("Memory: resumed suspended GPU cache, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+	     vaddr, size);
+	return true;
+}
+
+// Maps a range on the GPU. Suspended memory under it is cancelled first, so a kernel entry never
+// outlives the GPU side of its suspension, whichever path maps the range.
+static void MapGpuRange(uint64_t vaddr, uint64_t size) {
+	if (!g_suspended_ranges.empty()) {
+		CancelSuspendedOverlapping(vaddr, size);
+	}
+	MapGpuRangeNow(vaddr, size);
+}
+
+// Scopes the resume candidate of one MapDirectMemory call. If the call fails after it created the
+// view, the memory was exposed to the guest and the entry can no longer be trusted.
+struct ResumeCandidateScope {
+	bool view_created = false;
+
+	ResumeCandidateScope() = default;
+	KYTY_CLASS_NO_COPY(ResumeCandidateScope);
+	~ResumeCandidateScope() {
+		if (view_created) {
+			CancelResumeCandidate();
+		}
+		ClearResumeCandidate();
+	}
+};
+
+// Unmaps a range from the GPU ahead of mapping something new there. Suspended memory under the
+// range is cancelled first, except the resume candidate, which the pending map will put back.
+static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
+	if (g_suspended_ranges.empty()) {
+		UnmapGpuRangeNow(vaddr, size);
+		return;
+	}
+	CancelSuspendedWhere([vaddr, size](const SuspendedRange& entry) {
+		return !entry.resume_candidate &&
+		       VirtualRangesOverlap(entry.vaddr, entry.size, vaddr, size);
+	});
+	const auto kept =
+	    std::find_if(g_suspended_ranges.begin(), g_suspended_ranges.end(),
+	                 [vaddr, size](const SuspendedRange& entry) {
+		                 return entry.resume_candidate &&
+		                        VirtualRangesOverlap(entry.vaddr, entry.size, vaddr, size);
+	                 });
+	if (kept == g_suspended_ranges.end()) {
+		UnmapGpuRangeNow(vaddr, size);
+		return;
+	}
+	// The candidate was chosen because it equals the map range, so this normally ends here and
+	// the pending map puts the cache back. A candidate that only partly overlaps would be left
+	// half unmapped, so it is cancelled and the whole range unmapped as usual. This check also
+	// backs up the size compare in IsExactReuse, which defines an exact match for every caller.
+	if (kept->vaddr == vaddr && kept->size == size) {
+		return;
+	}
+	CancelSuspendedAt(static_cast<size_t>(kept - g_suspended_ranges.begin()));
+	UnmapGpuRangeNow(vaddr, size);
+}
+
+// Releases the GPU side of a direct memory alias. With the flag on the cache is kept for a later
+// exact remap, otherwise this is the plain unmap. The table stays within its capacity.
+static void SuspendOrUnmapGpuRange(uint64_t vaddr, uint64_t size, uint64_t phys_offset) {
+	if (!g_keep_gpu_cache_on_reuse) {
+		UnmapGpuRange(vaddr, size);
+		return;
+	}
+	if (!SuspendGpuRange(vaddr, size)) {
+		return;
+	}
+	if (g_suspended_ranges.size() >= SUSPENDED_RANGE_CAPACITY) {
+		CancelSuspendedAt(0);
+	}
+	g_suspended_ranges.push_back({vaddr, size, phys_offset, false});
 }
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -610,6 +844,11 @@ private:
 	uint64_t m_gpu_page_table_entries = 0;
 };
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
+static bool     g_test_fail_next_fixed_reserve_range_add     = false;
+static bool     g_test_fail_next_physical_memory_map         = false;
+#endif
 static void RemoveFreeRange(std::map<uint64_t, uint64_t>& ranges, uint64_t start, uint64_t size) {
 	const auto end   = start + size;
 	auto       range = ranges.upper_bound(start);
@@ -781,6 +1020,26 @@ static callback_func_t                    g_free_callback         = nullptr;
 static std::atomic<uint64_t>              g_memory_pool_committed = 0;
 static void                               MemoryPoolSubtractCommitted(uint64_t len);
 
+// Maps a view of the shared backing for the guest. Suspended GPU caches that the new view would
+// make stale are cancelled first, while no address-space lock is held. That is any entry whose
+// address range or physical range overlaps the new mapping, except the one exact remap that is
+// about to resume. Every backing map of direct memory goes through here, since a host view is the
+// only way the bytes behind a released range can change.
+static bool MapBackingForGuest(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
+                               VirtualMemory::Mode               mode,
+                               GuestBackingStore::FailureReason* failure_reason = nullptr) {
+	if (!g_suspended_ranges.empty()) {
+		CancelSuspendedWhere([=](const SuspendedRange& entry) {
+			if (entry.resume_candidate && IsExactReuse(entry, vaddr, size, backing_offset)) {
+				return false;
+			}
+			return VirtualRangesOverlap(entry.vaddr, entry.size, vaddr, size) ||
+			       VirtualRangesOverlap(entry.phys_offset, entry.size, backing_offset, size);
+		});
+	}
+	return g_guest_address_space->MapBacking(vaddr, size, backing_offset, mode, failure_reason);
+}
+
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
 // heap below it), so hint-less searches must not fall back to the low system-managed range.
@@ -873,8 +1132,20 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+// Cancels everything still suspended, without locking when the feature was never used.
+static void CancelAllSuspendedRangesIfUsed() {
+	if (!g_suspension_ever_enabled.load()) {
+		return;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	CancelAllSuspendedRanges();
+}
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
+	// Suspended caches belong to the GPU that is going away. Left behind, they would keep page
+	// state alive that the page manager refuses to destroy.
+	CancelAllSuspendedRangesIfUsed();
 	g_gpu_resources                     = resources;
 	SysFileRecoverableDestination probe = nullptr;
 	if (resources != nullptr) {
@@ -902,6 +1173,19 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 		};
 	}
 	SysFileSetRecoverableDestination(probe);
+}
+
+void SetKeepGpuCacheOnReuse(bool enabled) noexcept {
+	if (!enabled && !g_suspension_ever_enabled.load()) {
+		return;
+	}
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (enabled) {
+		g_suspension_ever_enabled.store(true);
+	} else {
+		CancelAllSuspendedRanges();
+	}
+	g_keep_gpu_cache_on_reuse = enabled;
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
@@ -1055,6 +1339,7 @@ void ReserveGuestAddressSpace() {
 }
 
 void Shutdown() {
+	CancelAllSuspendedRangesIfUsed();
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();
@@ -1270,6 +1555,13 @@ bool PhysicalMemory::Release(uint64_t start, size_t len) {
 }
 
 bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_fail_next_physical_memory_map) {
+		g_test_fail_next_physical_memory_map = false;
+		return false;
+	}
+#endif
+	Common::LockGuard lock(m_mutex);
 	if (vaddr == 0 || len == 0 || UINT64_MAX - vaddr < len || !CanMapDirect(phys_addr, len)) {
 		return false;
 	}
@@ -1858,10 +2150,20 @@ static void UnmapMemoryOwner(const VirtualRanges::Range& range, bool keep_pool_r
 		case VirtualRangeType::PoolReserved:
 			unmapped = g_guest_address_space->ContainsFree(vaddr, len);
 			break;
-		case VirtualRangeType::Direct:
-			unmapped = g_guest_address_space->UnmapBacking(vaddr, len) &&
-			           g_physical_memory->Unmap(vaddr, len);
+		case VirtualRangeType::Direct: {
+			VirtualMemory::Mode direct_mode   = VirtualMemory::Mode::NoAccess;
+			const auto          direct_offset = range.offset + vaddr - range.start;
+			if (DecodeMemoryProtection(range.protection, &direct_mode) &&
+			    g_guest_address_space->BackingContains(vaddr, len) &&
+			    g_guest_address_space->UnmapBacking(vaddr, len)) {
+				if (g_physical_memory->Unmap(vaddr, len)) {
+					unmapped = true;
+				} else {
+					EXIT_IF(!MapBackingForGuest(vaddr, len, direct_offset, direct_mode));
+				}
+			}
 			break;
+		}
 		case VirtualRangeType::Flexible: unmapped = g_flexible_memory->Unmap(vaddr, len); break;
 		case VirtualRangeType::Pooled:
 			unmapped = g_guest_address_space->UnmapBacking(vaddr, len) &&
@@ -1877,18 +2179,19 @@ static void UnmapMemoryOwner(const VirtualRanges::Range& range, bool keep_pool_r
 		EXIT("failed to unmap guest memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr,
 		     len);
 	}
+}
 
-	g_virtual_ranges->Remove(vaddr, len);
-	if (range.type == VirtualRangeType::Code || range.type == VirtualRangeType::Runtime) {
-		return;
-	}
-	if (keep_pool_reserved) {
-		EXIT_IF(!g_virtual_ranges->Add(vaddr, len, 0, 0, 0, VirtualRangeType::PoolReserved,
-		                               range.name));
-	}
-	if (range.type == VirtualRangeType::Pooled) {
-		MemoryPoolSubtractCommitted(len);
-	}
+g_virtual_ranges->Remove(vaddr, len);
+if (range.type == VirtualRangeType::Code || range.type == VirtualRangeType::Runtime) {
+	return;
+}
+if (keep_pool_reserved) {
+	EXIT_IF(
+	    !g_virtual_ranges->Add(vaddr, len, 0, 0, 0, VirtualRangeType::PoolReserved, range.name));
+}
+if (range.type == VirtualRangeType::Pooled) {
+	MemoryPoolSubtractCommitted(len);
+}
 }
 
 // Runs after the state change that released the ranges' owners.
@@ -2230,11 +2533,20 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool skip_gaps
 	}
 
 	// Validation precedes the first unmap; failing after it is an emulator fault.
-	UnmapMemoryOwners(g_physical_memory->FindMappings(start, len), [&] {
+	const auto mapped_aliases = g_physical_memory->FindMappings(start, len);
+	for (const auto& alias: mapped_aliases) {
+		SuspendOrUnmapGpuRange(alias.start, alias.size, alias.offset);
+	}
+	{
+		std::lock_guard state(g_memory_state_mutex);
+		for (const auto& alias: mapped_aliases) {
+			UnmapMemoryOwner(alias);
+		}
 		for (const auto& block: allocated_span) {
 			EXIT_IF(!g_physical_memory->Release(block.start_addr, block.size));
 		}
-	});
+	}
+	FreeCallbacks(mapped_aliases);
 	return OK;
 }
 
@@ -2362,6 +2674,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	auto                              replaced_type  = VirtualRangeType::Reserved;
 	auto                              shared_failure = GuestBackingStore::FailureReason::None;
 	std::vector<VirtualRanges::Range> replaced;
+
+	// Lets a fixed read-write remap resume suspended memory, and cancels it if the call then fails.
+	ResumeCandidateScope resume_scope;
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
 		    (alignment != 0 && in_addr % alignment != 0)) {
@@ -2369,6 +2684,11 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
 			return KERNEL_ERROR_ENOMEM;
+		}
+		// Only a fixed read-write map can pick suspended memory back up. Any other map over it
+		// cancels it in UnmapGpuRange below, before a view exists.
+		if (mode == VirtualMemory::Mode::ReadWrite) {
+			SelectResumeCandidate(in_addr, len, static_cast<uint64_t>(direct_memory_start));
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -2414,9 +2734,9 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		}
 		// Direct mappings must remain views of the single backing object. Anonymous fallbacks
 		// break aliasing and lose direct-memory contents when a range is unmapped and mapped again.
-		if (g_guest_address_space->MapBacking(target, len, direct_memory_start, mode,
-		                                      &shared_failure)) {
-			out_addr = target;
+		if (MapBackingForGuest(target, len, direct_memory_start, mode, &shared_failure)) {
+			resume_scope.view_created = true;
+			out_addr                  = target;
 			// CanMapDirect and the target were validated under the operation lock.
 			EXIT_IF(!g_physical_memory->Map(out_addr, direct_memory_start, len));
 			const bool published =
@@ -2453,7 +2773,11 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 
 	PrefaultDirectMapping(out_addr, len, mode);
 
-	MapGpuRange(out_addr, len);
+	// Resuming happens here, after the view exists and before the guest call returns. Between the
+	// view and this point watched pages are not protected, which is why it must not be later.
+	if (!ResumeSuspendedGpuRange(out_addr, len, static_cast<uint64_t>(direct_memory_start))) {
+		MapGpuRange(out_addr, len);
+	}
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -2709,6 +3033,14 @@ void TestBeforeNextGuestReserve(callback_func_t callback) {
 	g_test_before_guest_reserve = callback;
 }
 
+void TestSetGpuSuspendCallback(void (*callback)(TestGpuSuspendEvent, uint64_t, size_t)) {
+	g_test_gpu_suspend = callback;
+}
+
+void TestSetKeepGpuCacheOnReuse(bool enabled) {
+	SetKeepGpuCacheOnReuse(enabled);
+}
+
 void TestBeforeNextBackingMap(callback_func_t callback) {
 	g_test_before_backing_map = callback;
 }
@@ -2717,6 +3049,33 @@ void TestSetBackingReadCallback(callback_func_t callback) {
 	g_test_backing_read = callback;
 }
 
+void TestFailNextPhysicalMemoryUnmap() {
+	TestFailPhysicalMemoryUnmapAfter(0);
+}
+
+void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps) {
+	g_test_physical_memory_unmaps_before_failure = successful_unmaps;
+}
+
+void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps) {
+	g_test_backing_store_unmaps_before_failure = successful_unmaps;
+}
+
+void TestFailNextPhysicalMemoryMap() {
+	g_test_fail_next_physical_memory_map = true;
+}
+
+size_t TestSuspendedRangeCapacity() {
+	return SUSPENDED_RANGE_CAPACITY;
+}
+
+void TestFailNextFixedReserveRangeRegistration() {
+	g_test_fail_next_fixed_reserve_range_add = true;
+}
+
+void TestFailNextVirtualRangeReplacement() {
+	g_test_fail_next_range_replace = true;
+}
 bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {
 	std::shared_lock state(g_memory_state_mutex);
 	return g_guest_address_space->ContainsFree(vaddr, size);
@@ -3360,31 +3719,33 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 		if (!g_pooled_memory->Allocate(vaddr, len, &mappings)) {
 			return KERNEL_ERROR_ENOMEM;
 		}
-		// Validation precedes the first backing map; failing after it is an emulator fault.
-		for (const auto& mapping: mappings) {
-			auto failure_reason = GuestBackingStore::FailureReason::None;
-			if (!g_guest_address_space->MapBacking(mapping.vaddr, mapping.size, mapping.phys_addr,
-			                                       mode, &failure_reason)) {
-				EXIT("failed to map pooled memory: %s\n",
-				     GuestBackingStore::GetFailureReasonName(failure_reason));
-			}
-		}
-		for (const auto& range: ranges) {
-			EXIT_IF(!g_virtual_ranges->ReplaceSpan(range.start, range.size,
-			                                       VirtualRangeType::PoolReserved, 0, prot, type,
-			                                       VirtualRangeType::Pooled, range.name));
+		return KERNEL_ERROR_ENOMEM;
+	}
+	// Validation precedes the first backing map; failing after it is an emulator fault.
+	for (const auto& mapping: mappings) {
+		auto failure_reason = GuestBackingStore::FailureReason::None;
+		if (!g_guest_address_space->MapBacking(mapping.vaddr, mapping.size, mapping.phys_addr, mode,
+		                                       &failure_reason)) {
+			EXIT("failed to map pooled memory: %s\n",
+			     GuestBackingStore::GetFailureReasonName(failure_reason));
 		}
 	}
-
-	MapGpuRange(vaddr, len);
-
-	if (g_alloc_callback != nullptr) {
-		g_alloc_callback(vaddr, len);
+	for (const auto& range: ranges) {
+		EXIT_IF(!g_virtual_ranges->ReplaceSpan(range.start, range.size,
+		                                       VirtualRangeType::PoolReserved, 0, prot, type,
+		                                       VirtualRangeType::Pooled, range.name));
 	}
+}
 
-	g_memory_pool_committed.fetch_add(len, std::memory_order_relaxed);
+MapGpuRange(vaddr, len);
 
-	return OK;
+if (g_alloc_callback != nullptr) {
+	g_alloc_callback(vaddr, len);
+}
+
+g_memory_pool_committed.fetch_add(len, std::memory_order_relaxed);
+
+return OK;
 }
 
 int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {

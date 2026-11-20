@@ -98,19 +98,22 @@ struct ConfigOptions {
 	bool                  readback_storage_images         = false;
 	bool                  sync_raw_image_buffers          = false;
 	bool                  skip_redundant_unmap_drains     = false;
-	uint32_t              flush_draws                     = 0; // 0 is off
-	bool                  tessellation_enabled            = false;
-	bool                  occlusion_queries_enabled       = false;
-	bool                  relaxed_shader_float            = false;
-	bool                  native_rt                       = false;
-	bool                  lod_stats_enabled               = false;
-	bool                  audio_compile_hold_enabled      = false;
-	bool                  trophy_enabled                  = true;
-	uint32_t              trophy_duration_seconds         = 6;
-	bool                  perf_overlay_enabled            = false;
-	bool                  playgo_hack_enabled             = false;
-	bool                  skip_notice_screen              = false;
-	std::string           launch_activity;
+	// Experimental. Keeps GPU buffer caches when direct memory is released and mapped back
+	// unchanged.
+	bool        keep_gpu_cache_on_reuse    = false;
+	uint32_t    flush_draws                = 0; // 0 is off
+	bool        tessellation_enabled       = false;
+	bool        occlusion_queries_enabled  = false;
+	bool        relaxed_shader_float       = false;
+	bool        native_rt                  = false;
+	bool        lod_stats_enabled          = false;
+	bool        audio_compile_hold_enabled = false;
+	bool        trophy_enabled             = true;
+	uint32_t    trophy_duration_seconds    = 6;
+	bool        perf_overlay_enabled       = false;
+	bool        playgo_hack_enabled        = false;
+	bool        skip_notice_screen         = false;
+	std::string launch_activity;
 	// Back-to-back failed zero-timeout event-flag polls back off: yield, then sleep briefly.
 	bool poll_backoff_enabled = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -195,6 +198,8 @@ bool     TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool     PlayGoHackEnabled();
 bool     SkipNoticeScreen();
+// Whether released direct memory keeps its GPU buffer caches for an exact remap. Default off.
+bool KeepGpuCacheOnReuse();
 // Activity ID of the one-shot launchActivity game intent; empty sends none.
 const std::string& GetLaunchActivity();
 bool               PollBackoffEnabled();

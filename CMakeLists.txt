@@ -726,7 +726,12 @@ target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
+if(KYTY_CLANG_CL)
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+			virtual_memory_allocation_tests)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	endforeach()
+else()
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)

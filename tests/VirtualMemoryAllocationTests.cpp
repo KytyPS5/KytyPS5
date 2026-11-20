@@ -7860,6 +7860,9 @@ void TestGuestReservationIdempotence() {
     if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
       return RunTrinityTests();
     }
+    if (argc == 3 && std::strcmp(argv[1], "--fault-report") == 0) {
+      ReportFaultTo(argv[2]);
+    }
     InitSubsystems();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     if (argc == 2 && std::strcmp(argv[1], "--guest-stack-only") == 0) {

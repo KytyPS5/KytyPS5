@@ -1,0 +1,181 @@
+﻿2455 | graphics: handle in-place depth-to-color copies (BO2 Monsoon crash) | HarrySpruce
+2452 | libc: implement guest getenv and store setenv values | yasaiiko
+2449 | ces: add ISO-8859-15 profile and CP932 to UTF-16 conversion | WlayerX
+2448 | build: register slot_vector and font unit tests with CTest | WlayerX
+2447 | ci: run the lightweight unit tests on Linux as well | WlayerX
+2443 | Fix DLSS initialization with staged guest address reservations | OlaiFG7
+2441 | libs: implement 14 Agc GetSize entry points GTA V imports | Moonwolf711
+2437 | Fix macOS guest address-space startup with Xcode 27 | igorbispo99
+2430 | tools: add optional Rust PS5 ShellUI launcher frontend for kyty_emulator | macbyclp
+2417 | graphics: recreate cached depth targets narrower than the requested target | user9517
+2416 | graphics: unmark render targets dropped for a sample-count mismatch | user9517
+2415 | shader: derive barycentric x on NVIDIA to avoid a pipeline-compile crash | user9517
+2410 | graphics: compare image subresources by containment (Uncharted: Legacy of Thieves Collection) | Nawid3333
+2407 | texture cache: queue a heap change when a stencil association adopts an image | Mcm190
+2403 | shader: append an unused acceleration-structure binding to ray-query layouts (#2339) | mitsa-ng
+2402 | vulkan: accept MoltenVK devices without minLod, buffer int64 atomics, and cull distance (#1068) | mitsa-ng
+2400 | tests: read guest TLS after the host took the first 64 TLS slots | Nawid3333
+2397 | graphics: sample a copy of depth targets on hosts without feedback loops (GTA V on Intel Arc) | oguzhanozfe
+2396 | window: reset held input instead of aborting on a gamepad remap (GTA V) | oguzhanozfe
+2394 | graphics: honour PS5 0x10 DCC register clears (GTA V black smoke) | oguzhanozfe
+2392 | Death Stranding bringup | shadowbeat070
+2387 | graphics: bind stencil-only depth targets with HTile | Nawid3333
+2364 | ngs2: accept and ignore mastering control 2 that Trackmania sends (PPSA02195) | simonbronk
+2363 | graphics: store write-only R16G16 signed images through their unsigned view | Nawid3333
+2361 | graphics: split mesh draws that exceed the host workgroup limits | Nawid3333
+2358 | shader: read BDA pages past the page table as missing | wuboo
+2357 | graphics: fall back to the stored chain for mip views past MAX_MIP | wuboo
+2356 | kernel: retry guest file reads that fault on a write-protected page | wuboo
+2355 | graphics: release retired resources only after the command buffer their handles reach | Nawid3333
+2305 | common: open Windows host paths beyond MAX_PATH | Oskie5802
+2304 |  A Game About Digging A Hole: fix crash after the intro | Oskie5802
+2302 |  A Game About Digging A Hole: fix crash, GPU hang and grey image on AMD (Windows) | Oskie5802
+2301 | Validate SGPR ranges for vertex table and add regression tests | msawe354
+2292 | shader: raise ShaderInfo::MaxImages from 64 to 128 | RubyUwU56
+2290 | graphics: map RGB9E5 color buffers to a renderable host format | saironbusatto
+2288 | kernel: implement libkernel_module_info module enumeration | saironbusatto
+2281 | ci: run shader_cfg_tests on every platform | Nawid3333
+2280 | ci: build and run one shared test list on every platform | Nawid3333
+2278 | shader: bound waterfall image keys by their clamp on the selected lanes | Nawid3333
+2274 | Fix DLSS and FSR crash: vkCreateDevice ErrorInitializationFailed | Ekt0re
+2270 | shader: translate for Metal without descriptor aliasing, graphics subgroups, or 64-bit atomics | bengidev
+2269 | graphics: accept Metal-backed Vulkan devices on macOS | bengidev
+2261 | Launcher: search Qt's library folder when bundling a cross-built Linux launcher | jgoyvaerts
+2245 | graphics: honour the data format of LOAD_*_REG_INDEX register lists | Nawid3333
+2230 | shader: leave planning-only reads out of the empty-table and zero-stride folds (Ghost of Yōtei) | Nawid3333
+2228 | kernel: run raised signals on their target thread on Windows | Nawid3333
+2227 | loader: write the guest fault context into the log file | Nawid3333
+2226 | graphics: advance Ghost of Yotei loading past shader and image-heap stops | mmf1ne
+2218 | launcher: pass cmd.exe arguments through environment variables | Nawid3333
+2205 | tests: read the fake SRT table from address space the test reserved | Nawid3333
+2201 | shader: bound the vertex entry mask by the highest running lane | Nawid3333
+2193 | graphics: small formatted reads sync GPU-written images | Nawid3333
+2191 | graphics: sample depth copies without attachment feedback loops | theantipopau
+2188 | kernel: give small fibers their own guest stacks (Pumpkin Jack) | Nawid3333
+2178 | Shader store: KYTY_SHADER_CACHE_STAMP=N keeps the cache across rebuilds | ew-sudo
+2177 | Shaders: give MRT component orders through specialization constants | ew-sudo
+2172 | graphics: keep views past MAX_MIP in the declared chain when its layout holds them (ASTRO BOT) | Nawid3333
+2132 | pipeline: warm up the shader cache serially on NVIDIA | theantipopau
+2129 | net: implement getpeername and sceNetGetpeername (007 First Light) | NevesHenry
+2128 | shader: place vertex-pipeline push data at the top of the push block | Nawid3333
+2127 | shader: key vertex shaders on the resolved fetch, not the raw format word | Nawid3333
+2125 | kernel: preserve Windows guest stack bounds | giulienh
+2118 | tests: probe the depth-stencil format with the usage the renderer requests | theantipopau
+2117 | 3rdparty: fix zarchive patch failure when reconfiguring | sajidahmed12
+2115 | build: run psml_tests from the kyty_tests aggregate | theantipopau
+2114 | tests: fix two latent failures that stop the kernel file system suite | theantipopau
+2099 | loader: extend Windows red-zone protection to functions missing from .eh_frame (Saros) | joaocaparroz
+2096 | shader: order F32 min, max and MED3 by their bits | Nawid3333
+2093 | buffer_cache: opt-in batched sync readbacks | MrBigBritches
+2091 | gpu: opt-in submit cadence so the GPU starts on long command streams sooner | MrBigBritches
+2067 | graphics: refresh only the buffer-written part of an image (opt-in) | MrBigBritches
+2066 | kernel: keep the GPU buffer cache when released direct memory is mapped back unchanged | MrBigBritches
+2064 | gpu: add opt-in skipping of redundant unmap drains | MrBigBritches
+2063 | gpu: invalidate whole ranges before CPU fills and copies | MrBigBritches
+2062 | graphics: create the image heap before the pipeline cache prewarms pipelines | Nawid3333
+2038 | tests: start the Vulkan harness without byte-granular robust buffer access | Nawid3333
+2037 | gpu: publish GPU writes to read-hot pages at completion | Nawid3333
+2022 | kernel: lower Windows priority for ASTRO BOT's Havok workers | Nawid3333
+2012 | Fix the Marvel-logo hang in Spider-Man: Miles Morales (PPSA01411) | Xx-LiDAF-xX
+2006 | graphics: no DCC metadata for block-compressed textures (Demon's Souls) | Nawid3333
+1980 | HFW: fix indirect texture tracking and loading-time Vulkan errors | tototomate123
+1979 | audio: hold guest audio while a long pipeline compile blocks the GPU | MrBigBritches
+1978 | shader: structurize S_SETPC_B64 jump tables instead of using the dispatcher | MrBigBritches
+1977 | shader: select bounds-checked buffer loads instead of branching around them | MrBigBritches
+1966 | tests: fix the vdecsw build on Windows and run vdecsw in CI | MrBigBritches
+1963 | graphics: ignore BASE_ARRAY for non-array 1D/2D textures | MrFr3di
+1961 | Fix for Call of Duty Vanguard to get to first mission screen | chaitan3
+1947 | texture cache: copy evicted images without holding the cache lock | paulohenriquesn
+1934 | gpu: release stale clean buffers without memory pressure | MrBigBritches
+1919 | tessellation: run Gran Turismo 7's patches | ew-sudo
+1918 | shader: keep EXEC words to the lanes the host subgroup runs | ew-sudo
+1899 | Fixes for The Last of Us Part I | claxten10
+1898 | graphics: fix sparse-wave reductions, BDA bounds and extra mip views | herrMirto
+1886 | graphics: skip memory tracker upload passes that cannot change anything | ArsenyYankovsky
+1879 | graphics: support stencil-only targets in TopSpin 2K25 | spicchio72
+1867 | shader: compare k32UInt textures as float depth | Nawid3333
+1853 | ngs2: implement the sampler voice peak meter that Trails in the Sky uses for lip-sync (PPSA28465) | MrBigBritches
+1849 | shader: link compute calls through function tables, fix call-target crash (PPSA01473) | MrBigBritches
+1828 | shader: read SRT words beside pending GPU writes without waiting | NeySlim
+1803 | gpu: fix vanishing models when freed depth-buffer metadata memory is reused (PPSA09809) | MrBigBritches
+1791 | shader: keep tessellation ring attributes static, reject HS stores outside their record | NeySlim
+1781 | gpu: fix corrupt textures when a shorter mip chain reuses a cached texture's memory (PPSA09809) | MrBigBritches
+1770 | tests: stop kernel_file_system assuming Linux host behavior | dexter288
+1754 | Font: fall back to a host CJK font so Chinese text is not drawn as '?' | ccxp
+1751 | renderer: do not adopt a depth image as a stencil association | 0xcrstn
+1748 | renderer: recreate a depth target that is larger than the cached image | 0xcrstn
+1743 | graphics: keep HTile clear state while its depth surface is bound (PPSA23566) | 0xcrstn
+1733 | shader: give depth-compare samplers their own sampler variant | Nawid3333
+1691 | launcher: PS5-style horizontal grid view | Pipe530
+1676 | Improved mouse camera movement and left handed layout | shadowbeat070
+1625 | renderer: drop compare state when a compare sampler is paired with a colour view | ricardocacco
+1622 | shader: keep a V_MUL_F32 product from being fused into a following add | Nawid3333
+1621 | graphics: survive host-rejected pipelines and retired cache slots | theantipopau
+1619 | shader: preserve f32 denorms when the guest MODE keeps them | Nawid3333
+1570 | shader: lower every whole-wave reduction of the 302240da idiom | Nawid3333
+1565 | shader: skip the f32 compare flush against a normal immediate | Nawid3333
+1560 | Teardown: fix the texture-cache and GPU-driven draw crashes | Almo7aya
+1559 | raytracing: Software RT with --raytracing | defektu
+1554 | shader: emit V_CMP_CLASS with a class index or range tests | Nawid3333
+1548 | graphics: mark guest fills/copies CPU-dirty so resets reach consumers | theantipopau
+1547 | macos: start on MoltenVK without minLod, 64-bit buffer atomics, or cull distance | theantipopau
+1535 | shader: bound loop-proof analysis for Wolverine | Qouo
+1521 | shader: emit legacy MADs without the optnone helpers on macOS (GTA V) | AN0DIN
+1518 | vulkan: preserve GPU contents across image aliases and buffer transfers | FxDrops
+1510 | loader: protect frame pointer red-zone accesses in the guest patcher | EmK530
+1506 | gpu: make guarded address ranges resident before the shader runs | NeySlim
+1503 | shader: fix black eyes from wave64 OR scans | NeySlim
+1496 | Add Swedish launcher localization | yeager
+1495 | Re engine bringup | shadowbeat070
+1457 | shader: select per-material T#s through their record's pointer chain (Guardians of the Galaxy, #1004) | overlordxrz-source
+1449 | avplayer: decode intro video on multiple threads (ASTRO's PLAYROOM, ASTRO BOT) | Takoroka
+1444 | shader: bound post-tested loop image tables by their start value (Guardians of the Galaxy, #1004) | overlordxrz-source
+1430 | Uncharted - LOFC boot to gameplay, fix rendering and frame rate | Almo7aya
+1412 | graphics: take the GPU's pages for the CPU in one critical section | Franseven
+1403 | gpu: allow compute dispatches to read buffers they write through scalar loads | ReverendOzmund
+1399 | memory: exclude AGC driver reservation from Demon's Souls guest budget | kewalker
+1395 | graphics: keep texture GC thresholds within the current memory budget | msfvn
+1394 | graphics: give images dedicated allocations where the driver allows many | msfvn
+1312 | fix: save pipeline cache on emulator crash | gavvahar
+1307 | memory: write-protect tracked guest pages with userfaultfd | NeySlim
+1297 | Hogwarts Legacy (PPSA01603): boot to gameplay, fix skin shading and the startup freeze | netwarex
+1295 | shader: forward EXEC-guarded selects into guarded ALU operands | NeySlim
+1294 | gpu: scan only summarized words of the BDA fault buffer | NeySlim
+1289 | renderer: reuse texture lookups for unchanged descriptors | NeySlim
+1284 | gpu: cheaper CPU write tracking for uploaded pages | NeySlim
+1282 | gpu: take GPU timestamps when the host GPU executes them | NeySlim
+1281 | loader: resolve jump tables and tail calls in the guest patcher | NeySlim
+1275 | net: map SO_REUSEADDR and SO_REUSEPORT on Linux and macOS hosts | popcoder565
+1270 | graphics: back the BDA page table with sparse memory | msfvn
+1269 | kernel: return released guest memory to the host | msfvn
+1263 | graphics: avoid draining unrelated priority work on guest unmap | popeee99
+1255 | shader: fix indirect light tables instead of tolerating stale slots | NeySlim
+1254 | gpu: read back submitted buffer data without a flush | NeySlim
+1200 | renderer: apply fast clears to texture views and metadata-only fills | NeySlim
+1199 | shader: serve DS_ORDERED_COUNT waves in dispatch order | NeySlim
+1198 | graphics: keep depth attachment layouts across draws | akar995
+1197 | shader: fold equality compares against impossible values | akar995
+1190 | graphics: drain submitted guest command buffer to fix CPU/GPU fence race (Dead Cells hang, #1189) | tyyyyyyyyyyyyyyyy
+1187 | graphics: use static feedback loop pipelines without the dynamic-state extension | overlordxrz-source
+1176 | graphics: keep image-to-image copies inside both images | overlordxrz-source
+1152 | gpu: avoid spec-constant vector selects in tiler shaders | NeySlim
+1145 | shader: pass vertex clip distances through the rect list tessellation stages (GTA V) | AN0DIN
+1118 | shader: plan more indirect image table shapes | NeySlim
+1071 | shader: fold branch-proven vertex selects | Abhi011999
+1050 |  kernel: keep guest threads below the GPU thread and run core-pinned spinning workers one step lower | tvhdev
+1019 | shader: treat an image format that names nothing as no descriptor instead of aborting | tvhdev
+1012 | shader: lower a conditional branch with identical targets to OpBranch | wuboo
+984 | loader: split 256-bit guest stores on macOS so Rosetta does not abort | wuboo
+937 | Wolverine: renderer threading, caches, AMPR/AJM and shader recompiler fixes | itsmemac
+907 | filesystem: encode Windows-forbidden characters in guest filenames | Aryansh1520
+902 | graphics: add experimental memory-pressure texture retention | gohansharma79-svg
+833 | Windows stability fixes found while bringing up Tekken 8 (PPSA10595) | hamzashakir99
+827 | kernel: allow munmap across released reservation holes | Pcniado
+793 | renderer: split oversized mesh draws into host-limit slices | prompterror
+780 | Spider-Man: Miles Morales to gameplay: recompiler, PM4, cache and diagnostics fixes | itsmemac
+720 | Astro Bot Intel CPU compatibility fixes | nomolao2-cell
+717 | graphics: clamp host mip levels and gate layered block views | YuhiAida
+616 | fix: PRX symbol resolution and user ID aliasing | bipinkrish
+458 | shader: support the remaining wave32 SAVEEXEC variants | brandostrong
+375 | renderer: clamp render area to attachment mip views | Techx3
+373 | renderer: preserve GPU-authored storage images during GC | Techx3

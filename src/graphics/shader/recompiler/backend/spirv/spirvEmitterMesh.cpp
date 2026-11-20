@@ -47,16 +47,19 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 	const auto& mesh = state.input_info.vertex->mesh;
 	for (auto& output: state.outputs) {
 		const auto type = MeshOutputType(state, output.kind);
+		output.raw = output.kind == IR::StageOutputKind::Parameter &&
+		             IsRawParameterOutput(state, output.location);
 		const bool clip = output.kind == IR::StageOutputKind::ClipDistance;
 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
 		auto& variable = clip ? state.clip_distance_variable
 		                 : cull ? state.cull_distance_variable : output.variable_id;
 		if (variable == 0) {
+			const auto interface_type = output.raw ? TypeU32Vector(state, 4) : type;
 			const auto element_type = clip || cull
 			                              ? state.builder.Type(spv::OpTypeArray, type,
 			                                                   ConstantU32(state, clip ? clip_distance_count
 			                                                                           : cull_distance_count))
-			                              : type;
+			                              : interface_type;
 			variable = MeshArray(state, spv::StorageClassOutput, element_type,
 			                     output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives
 			                                                             : mesh.max_vertices);
@@ -166,10 +169,13 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind == IR::StageOutputKind::Layer) {
 					continue;
 				}
-				const auto type  = MeshOutputType(state, output.kind);
-				const auto value =
-				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
-				             ConstantU32(state, half));
+				auto type  = MeshOutputType(state, output.kind);
+				auto value = MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate,
+				                      type, ConstantU32(state, half));
+				if (output.raw) {
+					type  = TypeU32Vector(state, 4);
+					value = Unary(state, spv::OpBitcast, type, value);
+				}
 				uint32_t pointer;
 				if (output.kind == IR::StageOutputKind::ClipDistance ||
 				    output.kind == IR::StageOutputKind::CullDistance) {

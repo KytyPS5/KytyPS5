@@ -179,11 +179,17 @@ uint32_t LoadVertexParameter(EmitterState& state, const InputBinding& input, uin
                              uint32_t chan) {
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeF32(state)), pointer,
-	    input.variable_id, ConstantU32(state, vertex), ConstantU32(state, chan & 3u));
-	state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, pointer);
-	return value;
+	const auto type    = input.raw ? TypeU32(state) : TypeF32(state);
+	state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, type),
+	                          pointer, input.variable_id, ConstantU32(state, vertex),
+	                          ConstantU32(state, chan & 3u));
+	state.builder.AddFunction(spv::OpLoad, type, value, pointer);
+	if (!input.raw) {
+		return value;
+	}
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), bits, value);
+	return bits;
 }
 
 // Interpolates a pixel input channel to f32. A half (0 low, 1 high) selects one f16 of a packed
@@ -204,9 +210,16 @@ uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint
 		return word;
 	};
 	if (!input.per_vertex) {
-		const auto vector    = state.builder.AllocateId();
+		auto       vector    = state.builder.AllocateId();
 		const auto component = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), vector, input.variable_id);
+		state.builder.AddFunction(spv::OpLoad,
+		                          input.raw ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4),
+		                          vector, input.variable_id);
+		if (input.raw) {
+			const auto bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeF32Vector(state, 4), bits, vector);
+			vector = bits;
+		}
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, vector,
 		                          chan & 3u);
 		return select(component);
@@ -709,6 +722,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    variable, ConstantU32(state, 0));
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
+			const auto output =
+			    std::ranges::find(state.outputs, variable, &OutputBinding::variable_id);
+			if (output != state.outputs.end() && output->raw) {
+				value = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+			}
 			state.builder.AddFunction(spv::OpStore, variable, value);
 		}
 	});

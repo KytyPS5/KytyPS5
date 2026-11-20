@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -969,6 +970,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	for (auto& stage: vertex_info) {
+		stage.raw_parameter_mask = 0;
+	}
 	if (pixel_active) {
 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
 		for (const auto& output: pixel_module.info.info.outputs) {
@@ -978,6 +982,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			}
 		}
 		state.mrt_mask &= color_output_mask;
+		// The last pre-rasterization stage writes the pixel shader's raw varyings as integers.
+		last_stage.raw_parameter_mask = ShaderRecompiler::Spirv::PixelRawParameterMask(
+		    pixel_info, pixel_module.info.info.inputs);
 	}
 	uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount;
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {

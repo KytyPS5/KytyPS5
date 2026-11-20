@@ -1,0 +1,1244 @@
+﻿[
+    {
+        "number":  2455,
+        "title":  "graphics: handle in-place depth-to-color copies (BO2 Monsoon crash)",
+        "head":  "bo2-inplace-depth-to-color",
+        "user":  "HarrySpruce"
+    },
+    {
+        "number":  2452,
+        "title":  "libc: implement guest getenv and store setenv values",
+        "head":  "libc-guest-getenv",
+        "user":  "yasaiiko"
+    },
+    {
+        "number":  2449,
+        "title":  "ces: add ISO-8859-15 profile and CP932 to UTF-16 conversion",
+        "head":  "ces/iso8859-15-and-utf16",
+        "user":  "WlayerX"
+    },
+    {
+        "number":  2448,
+        "title":  "build: register slot_vector and font unit tests with CTest",
+        "head":  "ci/register-and-run-more-unit-tests",
+        "user":  "WlayerX"
+    },
+    {
+        "number":  2447,
+        "title":  "ci: run the lightweight unit tests on Linux as well",
+        "head":  "ci/linux-run-lightweight-tests",
+        "user":  "WlayerX"
+    },
+    {
+        "number":  2443,
+        "title":  "Fix DLSS initialization with staged guest address reservations",
+        "head":  "fix-dlss-guest-reservations",
+        "user":  "OlaiFG7"
+    },
+    {
+        "number":  2441,
+        "title":  "libs: implement 14 Agc GetSize entry points GTA V imports",
+        "head":  "agc-getsize",
+        "user":  "Moonwolf711"
+    },
+    {
+        "number":  2437,
+        "title":  "Fix macOS guest address-space startup with Xcode 27",
+        "head":  "codex/macos-guest-address-space",
+        "user":  "igorbispo99"
+    },
+    {
+        "number":  2431,
+        "title":  "emulator: enable red zone protection for Call of Duty: Black Ops II (#1752)",
+        "head":  "redzone-bo2",
+        "user":  "HarrySpruce"
+    },
+    {
+        "number":  2430,
+        "title":  "tools: add optional Rust PS5 ShellUI launcher frontend for kyty_emulator",
+        "head":  "feat/rust-ps5-shellui",
+        "user":  "macbyclp"
+    },
+    {
+        "number":  2417,
+        "title":  "graphics: recreate cached depth targets narrower than the requested target",
+        "head":  "fix/ppsa24156-narrow-depth-target",
+        "user":  "user9517"
+    },
+    {
+        "number":  2416,
+        "title":  "graphics: unmark render targets dropped for a sample-count mismatch",
+        "head":  "fix/ppsa24156-dropped-target-layout",
+        "user":  "user9517"
+    },
+    {
+        "number":  2415,
+        "title":  "shader: derive barycentric x on NVIDIA to avoid a pipeline-compile crash",
+        "head":  "fix/ppsa24156-nvidia-barycentric-crash",
+        "user":  "user9517"
+    },
+    {
+        "number":  2410,
+        "title":  "graphics: compare image subresources by containment (Uncharted: Legacy of Thieves Collection)",
+        "head":  "fix/subresource-containment",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2409,
+        "title":  "graphics: bind a texture with no mapped byte as null (Uncharted: Legacy of Thieves Collection)",
+        "head":  "fix/unmapped-texture-null",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2407,
+        "title":  "texture cache: queue a heap change when a stencil association adopts an image",
+        "head":  "texture-cache-stencil-heap-change",
+        "user":  "Mcm190"
+    },
+    {
+        "number":  2403,
+        "title":  "shader: append an unused acceleration-structure binding to ray-query layouts (#2339)",
+        "head":  "ray-query-as-binding",
+        "user":  "mitsa-ng"
+    },
+    {
+        "number":  2402,
+        "title":  "vulkan: accept MoltenVK devices without minLod, buffer int64 atomics, and cull distance (#1068)",
+        "head":  "vulkan-moltenvk-features",
+        "user":  "mitsa-ng"
+    },
+    {
+        "number":  2400,
+        "title":  "tests: read guest TLS after the host took the first 64 TLS slots",
+        "head":  "tests/tcb-slot-after-host-tls",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2397,
+        "title":  "graphics: sample a copy of depth targets on hosts without feedback loops (GTA V on Intel Arc)",
+        "head":  "fix/depth-feedback-copy",
+        "user":  "oguzhanozfe"
+    },
+    {
+        "number":  2396,
+        "title":  "window: reset held input instead of aborting on a gamepad remap (GTA V)",
+        "head":  "fix/gamepad-remap-no-abort",
+        "user":  "oguzhanozfe"
+    },
+    {
+        "number":  2395,
+        "title":  "memory: retry guest accesses while a mapping is briefly replaced (GTA V HDD Streamer crash)",
+        "head":  "fix/gta5-hdd-streamer-map-fixed-retry",
+        "user":  "oguzhanozfe"
+    },
+    {
+        "number":  2394,
+        "title":  "graphics: honour PS5 0x10 DCC register clears (GTA V black smoke)",
+        "head":  "fix/gta5-dcc-0x10-register-clear",
+        "user":  "oguzhanozfe"
+    },
+    {
+        "number":  2392,
+        "title":  "Death Stranding bringup",
+        "head":  "death-stranding",
+        "user":  "shadowbeat070"
+    },
+    {
+        "number":  2387,
+        "title":  "graphics: bind stencil-only depth targets with HTile",
+        "head":  "fix/stencil-only-depth-target",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2364,
+        "title":  "ngs2: accept and ignore mastering control 2 that Trackmania sends (PPSA02195)",
+        "head":  "fix/trackmania-ngs2-mastering",
+        "user":  "simonbronk"
+    },
+    {
+        "number":  2363,
+        "title":  "graphics: store write-only R16G16 signed images through their unsigned view",
+        "head":  "fix/storage-sint16x2-writes",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2361,
+        "title":  "graphics: split mesh draws that exceed the host workgroup limits",
+        "head":  "fix/mesh-slice-oversized-draws",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2358,
+        "title":  "shader: read BDA pages past the page table as missing",
+        "head":  "pr/bda-page-guard",
+        "user":  "wuboo"
+    },
+    {
+        "number":  2357,
+        "title":  "graphics: fall back to the stored chain for mip views past MAX_MIP",
+        "head":  "pr/logo-mip-view",
+        "user":  "wuboo"
+    },
+    {
+        "number":  2356,
+        "title":  "kernel: retry guest file reads that fault on a write-protected page",
+        "head":  "pr/win-read-efault",
+        "user":  "wuboo"
+    },
+    {
+        "number":  2355,
+        "title":  "graphics: release retired resources only after the command buffer their handles reach",
+        "head":  "fix/release-after-commit",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2305,
+        "title":  "common: open Windows host paths beyond MAX_PATH",
+        "head":  "windows-long-paths",
+        "user":  "Oskie5802"
+    },
+    {
+        "number":  2304,
+        "title":  " A Game About Digging A Hole: fix crash after the intro",
+        "head":  "digging-hole-patcher-crash",
+        "user":  "Oskie5802"
+    },
+    {
+        "number":  2302,
+        "title":  " A Game About Digging A Hole: fix crash, GPU hang and grey image on AMD (Windows)",
+        "head":  "digging-hole-amd-mesh",
+        "user":  "Oskie5802"
+    },
+    {
+        "number":  2301,
+        "title":  "Validate SGPR ranges for vertex table and add regression tests",
+        "head":  "main",
+        "user":  "msawe354"
+    },
+    {
+        "number":  2292,
+        "title":  "shader: raise ShaderInfo::MaxImages from 64 to 128",
+        "head":  "patch-1",
+        "user":  "RubyUwU56"
+    },
+    {
+        "number":  2290,
+        "title":  "graphics: map RGB9E5 color buffers to a renderable host format",
+        "head":  "fix/ufc6-rgb9e5-format",
+        "user":  "saironbusatto"
+    },
+    {
+        "number":  2288,
+        "title":  "kernel: implement libkernel_module_info module enumeration",
+        "head":  "fix/ea-module-info",
+        "user":  "saironbusatto"
+    },
+    {
+        "number":  2287,
+        "title":  "dialog: print the text of user message dialogs",
+        "head":  "dialog/msg-dialog-user-text",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2284,
+        "title":  "memory: prefault large direct-memory mappings on Windows (Hades II)",
+        "head":  "fix/hades2-windows-prefault",
+        "user":  "JonathanBencke"
+    },
+    {
+        "number":  2281,
+        "title":  "ci: run shader_cfg_tests on every platform",
+        "head":  "ci/run-shader-cfg",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2280,
+        "title":  "ci: build and run one shared test list on every platform",
+        "head":  "ci/one-test-list",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2278,
+        "title":  "shader: bound waterfall image keys by their clamp on the selected lanes",
+        "head":  "shader/query-only-waterfall-image",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2274,
+        "title":  "Fix DLSS and FSR crash: vkCreateDevice ErrorInitializationFailed",
+        "head":  "fix-dlss-virtualAlloc",
+        "user":  "Ekt0re"
+    },
+    {
+        "number":  2270,
+        "title":  "shader: translate for Metal without descriptor aliasing, graphics subgroups, or 64-bit atomics",
+        "head":  "macos-metal-shaders",
+        "user":  "bengidev"
+    },
+    {
+        "number":  2269,
+        "title":  "graphics: accept Metal-backed Vulkan devices on macOS",
+        "head":  "macos-metal-device",
+        "user":  "bengidev"
+    },
+    {
+        "number":  2261,
+        "title":  "Launcher: search Qt\u0027s library folder when bundling a cross-built Linux launcher",
+        "head":  "port/launcher-qt",
+        "user":  "jgoyvaerts"
+    },
+    {
+        "number":  2260,
+        "title":  "Loader: patch a module\u0027s functions faster at load",
+        "head":  "port/fast-patch",
+        "user":  "jgoyvaerts"
+    },
+    {
+        "number":  2259,
+        "title":  "AvPlayer: threaded video decode, fix flickering video",
+        "head":  "port/avplayer",
+        "user":  "jgoyvaerts"
+    },
+    {
+        "number":  2245,
+        "title":  "graphics: honour the data format of LOAD_*_REG_INDEX register lists",
+        "head":  "fix/load-reg-index-data-format",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2230,
+        "title":  "shader: leave planning-only reads out of the empty-table and zero-stride folds (Ghost of Yōtei)",
+        "head":  "fix/planning-reads-specialization",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2228,
+        "title":  "kernel: run raised signals on their target thread on Windows",
+        "head":  "fix/guest-signal-on-target-thread",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2227,
+        "title":  "loader: write the guest fault context into the log file",
+        "head":  "fix/fault-report-in-log",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2226,
+        "title":  "graphics: advance Ghost of Yotei loading past shader and image-heap stops",
+        "head":  "ci/shader-cfg-atomic",
+        "user":  "mmf1ne"
+    },
+    {
+        "number":  2218,
+        "title":  "launcher: pass cmd.exe arguments through environment variables",
+        "head":  "fix/launcher-cmd-args-via-env",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2205,
+        "title":  "tests: read the fake SRT table from address space the test reserved",
+        "head":  "tests/srt-fake-address-space",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2201,
+        "title":  "shader: bound the vertex entry mask by the highest running lane",
+        "head":  "shader/vertex-entry-lane-bound",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2193,
+        "title":  "graphics: small formatted reads sync GPU-written images",
+        "head":  "fix/small-formatted-reads-sync-images",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2191,
+        "title":  "graphics: sample depth copies without attachment feedback loops",
+        "head":  "fix/depth-feedback-copy-fallback",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  2188,
+        "title":  "kernel: give small fibers their own guest stacks (Pumpkin Jack)",
+        "head":  "fix/fiber-small-context-stack",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2178,
+        "title":  "Shader store: KYTY_SHADER_CACHE_STAMP=N keeps the cache across rebuilds",
+        "head":  "pr-shader-cache-stamp",
+        "user":  "ew-sudo"
+    },
+    {
+        "number":  2177,
+        "title":  "Shaders: give MRT component orders through specialization constants",
+        "head":  "pr-export-mapping",
+        "user":  "ew-sudo"
+    },
+    {
+        "number":  2172,
+        "title":  "graphics: keep views past MAX_MIP in the declared chain when its layout holds them (ASTRO BOT)",
+        "head":  "fix/mipview-tail-chain",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2143,
+        "title":  "kernel: retry a guest address hole that another thread took first (ASTRO BOT)",
+        "head":  "fix/guest-reserve-retry",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2141,
+        "title":  "common: finish file reads that hit GPU-protected guest pages (ASTRO BOT)",
+        "head":  "fix/protected-guest-file-reads",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2139,
+        "title":  "libs: implement sceHttp2AbortRequest (Carmen Sandiego, Hot Wheels)",
+        "head":  "libs/http2-abort-request",
+        "user":  "QW1CKS"
+    },
+    {
+        "number":  2132,
+        "title":  "pipeline: warm up the shader cache serially on NVIDIA",
+        "head":  "fix/nvidia-shader-warmup",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  2129,
+        "title":  "net: implement getpeername and sceNetGetpeername (007 First Light)",
+        "head":  "kernel-getpeername",
+        "user":  "NevesHenry"
+    },
+    {
+        "number":  2128,
+        "title":  "shader: place vertex-pipeline push data at the top of the push block",
+        "head":  "shader/vertex-push-top",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2127,
+        "title":  "shader: key vertex shaders on the resolved fetch, not the raw format word",
+        "head":  "shader/vertex-fetch-signature",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2125,
+        "title":  "kernel: preserve Windows guest stack bounds",
+        "head":  "fix/pragmata-windows-stack",
+        "user":  "giulienh"
+    },
+    {
+        "number":  2119,
+        "title":  "graphics: Async shader compile",
+        "head":  "async_shader_compile",
+        "user":  "newblord"
+    },
+    {
+        "number":  2118,
+        "title":  "tests: probe the depth-stencil format with the usage the renderer requests",
+        "head":  "fix/depth-stencil-usage-mask",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  2117,
+        "title":  "3rdparty: fix zarchive patch failure when reconfiguring",
+        "head":  "main",
+        "user":  "sajidahmed12"
+    },
+    {
+        "number":  2115,
+        "title":  "build: run psml_tests from the kyty_tests aggregate",
+        "head":  "build/psml-tests-aggregate",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  2114,
+        "title":  "tests: fix two latent failures that stop the kernel file system suite",
+        "head":  "tests/kernel-suite-latent-failures",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  2110,
+        "title":  "kernel: back off on repeated failed event-flag polls (cp2077)",
+        "head":  "pr/event-flag-poll-backoff",
+        "user":  "ArtyomZabroda"
+    },
+    {
+        "number":  2106,
+        "title":  "graphics: run the GPU thread at highest priority on Windows (cp2077)",
+        "head":  "pr/gpu-thread-priority",
+        "user":  "ArtyomZabroda"
+    },
+    {
+        "number":  2099,
+        "title":  "loader: extend Windows red-zone protection to functions missing from .eh_frame (Saros)",
+        "head":  "redzone-unlisted-functions",
+        "user":  "joaocaparroz"
+    },
+    {
+        "number":  2096,
+        "title":  "shader: order F32 min, max and MED3 by their bits",
+        "head":  "shader/minmax-int-order",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2094,
+        "title":  "texture_cache: cheaper colour-clear check for multi-slice DCC textures",
+        "head":  "batched-color-clear-check",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2093,
+        "title":  "buffer_cache: opt-in batched sync readbacks",
+        "head":  "batch-hot-readbacks-v2",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2091,
+        "title":  "gpu: opt-in submit cadence so the GPU starts on long command streams sooner",
+        "head":  "gpu-submit-cadence-v2",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2067,
+        "title":  "graphics: refresh only the buffer-written part of an image (opt-in)",
+        "head":  "bufmod-partial-refresh",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2066,
+        "title":  "kernel: keep the GPU buffer cache when released direct memory is mapped back unchanged",
+        "head":  "keep-gpu-cache-on-reuse",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2064,
+        "title":  "gpu: add opt-in skipping of redundant unmap drains",
+        "head":  "skip-redundant-unmap-drains",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2063,
+        "title":  "gpu: invalidate whole ranges before CPU fills and copies",
+        "head":  "buffer-fill-bulk-invalidate",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  2062,
+        "title":  "graphics: create the image heap before the pipeline cache prewarms pipelines",
+        "head":  "fix/image-heap-before-warmup",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2038,
+        "title":  "tests: start the Vulkan harness without byte-granular robust buffer access",
+        "head":  "fix/harness-robust-optional",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2037,
+        "title":  "gpu: publish GPU writes to read-hot pages at completion",
+        "head":  "fix/publish-read-hot",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2026,
+        "title":  "Implementation of the fgIsQ10xYVA symbol (sceKernelChmod) and its POS…",
+        "head":  "Implementation-fgIsQ10xYVA",
+        "user":  "Ekt0re"
+    },
+    {
+        "number":  2022,
+        "title":  "kernel: lower Windows priority for ASTRO BOT\u0027s Havok workers",
+        "head":  "fix/astro-havok-priority",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  2012,
+        "title":  "Fix the Marvel-logo hang in Spider-Man: Miles Morales (PPSA01411)",
+        "head":  "codex/ppsa01411-linear-storage-readback",
+        "user":  "Xx-LiDAF-xX"
+    },
+    {
+        "number":  2006,
+        "title":  "graphics: no DCC metadata for block-compressed textures (Demon\u0027s Souls)",
+        "head":  "fix/des-bc-dcc",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1980,
+        "title":  "HFW: fix indirect texture tracking and loading-time Vulkan errors",
+        "head":  "fix/hfw-loading-consolidated",
+        "user":  "tototomate123"
+    },
+    {
+        "number":  1979,
+        "title":  "audio: hold guest audio while a long pipeline compile blocks the GPU",
+        "head":  "audio-compile-hold",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1978,
+        "title":  "shader: structurize S_SETPC_B64 jump tables instead of using the dispatcher",
+        "head":  "jumptable-structured",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1977,
+        "title":  "shader: select bounds-checked buffer loads instead of branching around them",
+        "head":  "guarded-loads",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1966,
+        "title":  "tests: fix the vdecsw build on Windows and run vdecsw in CI",
+        "head":  "vdecsw-windows-build",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1963,
+        "title":  "graphics: ignore BASE_ARRAY for non-array 1D/2D textures",
+        "head":  "fix/non-array-base-layer",
+        "user":  "MrFr3di"
+    },
+    {
+        "number":  1961,
+        "title":  "Fix for Call of Duty Vanguard to get to first mission screen",
+        "head":  "codv_new_debug",
+        "user":  "chaitan3"
+    },
+    {
+        "number":  1947,
+        "title":  "texture cache: copy evicted images without holding the cache lock",
+        "head":  "texture-cache-gc-copy-unlocked",
+        "user":  "paulohenriquesn"
+    },
+    {
+        "number":  1934,
+        "title":  "gpu: release stale clean buffers without memory pressure",
+        "head":  "stale-buffer-release",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1933,
+        "title":  "gpu: hold game-thread BDA events until the command processor resumes",
+        "head":  "bda-sync-defer",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1919,
+        "title":  "tessellation: run Gran Turismo 7\u0027s patches",
+        "head":  "pr-gt7-tessellation",
+        "user":  "ew-sudo"
+    },
+    {
+        "number":  1918,
+        "title":  "shader: keep EXEC words to the lanes the host subgroup runs",
+        "head":  "pr-exec-words",
+        "user":  "ew-sudo"
+    },
+    {
+        "number":  1899,
+        "title":  "Fixes for The Last of Us Part I",
+        "head":  "tlou-p1",
+        "user":  "claxten10"
+    },
+    {
+        "number":  1898,
+        "title":  "graphics: fix sparse-wave reductions, BDA bounds and extra mip views",
+        "head":  "fix/fc27-shader-mip-corrections",
+        "user":  "herrMirto"
+    },
+    {
+        "number":  1886,
+        "title":  "graphics: skip memory tracker upload passes that cannot change anything",
+        "head":  "perf/upload-memo",
+        "user":  "ArsenyYankovsky"
+    },
+    {
+        "number":  1879,
+        "title":  "graphics: support stencil-only targets in TopSpin 2K25",
+        "head":  "codex/stencil-only-topspin",
+        "user":  "spicchio72"
+    },
+    {
+        "number":  1872,
+        "title":  "audio: return synchronous AudioOut2 pushes once the queue has room",
+        "head":  "fix/audioout2-sync-room",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1867,
+        "title":  "shader: compare k32UInt textures as float depth",
+        "head":  "fix/k32uint-compare",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1865,
+        "title":  "ngs2: implement the Ngs2 reverb module (I3DL2) (PPSA28465)",
+        "head":  "ngs2-custom-reverb",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1856,
+        "title":  "ngs2: support submixer compressors so music volume reduces while characters speak (PPSA28465)",
+        "head":  "ngs2-submixer-sidechain",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1853,
+        "title":  "ngs2: implement the sampler voice peak meter that Trails in the Sky uses for lip-sync (PPSA28465)",
+        "head":  "ngs2-sampler-peak-meter",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1849,
+        "title":  "shader: link compute calls through function tables, fix call-target crash (PPSA01473)",
+        "head":  "rift-apart-shader-calls",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1828,
+        "title":  "shader: read SRT words beside pending GPU writes without waiting",
+        "head":  "perf/srt-pending-reads",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1803,
+        "title":  "gpu: fix vanishing models when freed depth-buffer metadata memory is reused (PPSA09809)",
+        "head":  "htile-reuse-dispatch-fix",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1802,
+        "title":  "graphics: retry required buffer allocations beyond the advisory budget",
+        "head":  "codex/buffer-budget-retry",
+        "user":  "kewalker"
+    },
+    {
+        "number":  1791,
+        "title":  "shader: keep tessellation ring attributes static, reject HS stores outside their record",
+        "head":  "fix/tess-static-ring",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1781,
+        "title":  "gpu: fix corrupt textures when a shorter mip chain reuses a cached texture\u0027s memory (PPSA09809)",
+        "head":  "texture-mip-layout-fix",
+        "user":  "MrBigBritches"
+    },
+    {
+        "number":  1770,
+        "title":  "tests: stop kernel_file_system assuming Linux host behavior",
+        "head":  "kernel-fs-tests-macos",
+        "user":  "dexter288"
+    },
+    {
+        "number":  1754,
+        "title":  "Font: fall back to a host CJK font so Chinese text is not drawn as \u0027?\u0027",
+        "head":  "main",
+        "user":  "ccxp"
+    },
+    {
+        "number":  1751,
+        "title":  "renderer: do not adopt a depth image as a stencil association",
+        "head":  "fix/ufc6-slot-freed",
+        "user":  "0xcrstn"
+    },
+    {
+        "number":  1748,
+        "title":  "renderer: recreate a depth target that is larger than the cached image",
+        "head":  "fix/ufc6-depth-target-extent",
+        "user":  "0xcrstn"
+    },
+    {
+        "number":  1743,
+        "title":  "graphics: keep HTile clear state while its depth surface is bound (PPSA23566)",
+        "head":  "fix/ufc6-htile-clear-recreate",
+        "user":  "0xcrstn"
+    },
+    {
+        "number":  1733,
+        "title":  "shader: give depth-compare samplers their own sampler variant",
+        "head":  "shader/sampler-compare-variants",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1691,
+        "title":  "launcher: PS5-style horizontal grid view",
+        "head":  "pipe530-ps5-style-grid-view",
+        "user":  "Pipe530"
+    },
+    {
+        "number":  1676,
+        "title":  "Improved mouse camera movement and left handed layout",
+        "head":  "mouse-camera",
+        "user":  "shadowbeat070"
+    },
+    {
+        "number":  1625,
+        "title":  "renderer: drop compare state when a compare sampler is paired with a colour view",
+        "head":  "guard-compare-sampler",
+        "user":  "ricardocacco"
+    },
+    {
+        "number":  1622,
+        "title":  "shader: keep a V_MUL_F32 product from being fused into a following add",
+        "head":  "shader/f32-mul-no-contraction",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1621,
+        "title":  "graphics: survive host-rejected pipelines and retired cache slots",
+        "head":  "fix/crash-hardening-1618-1586",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  1619,
+        "title":  "shader: preserve f32 denorms when the guest MODE keeps them",
+        "head":  "shader/f32-denorm-preserve",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1570,
+        "title":  "shader: lower every whole-wave reduction of the 302240da idiom",
+        "head":  "shader/lower-whole-wave-reductions",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1569,
+        "title":  "libc: forward guest diagnostics when normal logging is silent",
+        "head":  "fix/1540-guest-stdout",
+        "user":  "Buraddomoon"
+    },
+    {
+        "number":  1565,
+        "title":  "shader: skip the f32 compare flush against a normal immediate",
+        "head":  "shader/fcmp-flush-bits",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1560,
+        "title":  "Teardown: fix the texture-cache and GPU-driven draw crashes",
+        "head":  "fix/teardown-image-overlap",
+        "user":  "Almo7aya"
+    },
+    {
+        "number":  1559,
+        "title":  "raytracing: Software RT with --raytracing",
+        "head":  "pr/mfgt-raytracing",
+        "user":  "defektu"
+    },
+    {
+        "number":  1554,
+        "title":  "shader: emit V_CMP_CLASS with a class index or range tests",
+        "head":  "shader/cmp-class-ranges",
+        "user":  "Nawid3333"
+    },
+    {
+        "number":  1548,
+        "title":  "graphics: mark guest fills/copies CPU-dirty so resets reach consumers",
+        "head":  "buffer-fills-mark-cpu-dirty",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  1547,
+        "title":  "macos: start on MoltenVK without minLod, 64-bit buffer atomics, or cull distance",
+        "head":  "m5-moltenvk-fallback",
+        "user":  "theantipopau"
+    },
+    {
+        "number":  1535,
+        "title":  "shader: bound loop-proof analysis for Wolverine",
+        "head":  "fix/1513-loop-proof-limits",
+        "user":  "Qouo"
+    },
+    {
+        "number":  1521,
+        "title":  "shader: emit legacy MADs without the optnone helpers on macOS (GTA V)",
+        "head":  "pr/shader/fused-mad-macos",
+        "user":  "AN0DIN"
+    },
+    {
+        "number":  1518,
+        "title":  "vulkan: preserve GPU contents across image aliases and buffer transfers",
+        "head":  "publish/vulkan-memory-aliasing",
+        "user":  "FxDrops"
+    },
+    {
+        "number":  1510,
+        "title":  "loader: protect frame pointer red-zone accesses in the guest patcher",
+        "head":  "fix/sysv-patcher",
+        "user":  "EmK530"
+    },
+    {
+        "number":  1506,
+        "title":  "gpu: make guarded address ranges resident before the shader runs",
+        "head":  "fix/bda-range-residency",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1503,
+        "title":  "shader: fix black eyes from wave64 OR scans",
+        "head":  "fix/gow-black-eyes",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1496,
+        "title":  "Add Swedish launcher localization",
+        "head":  "l10n/swedish-launcher",
+        "user":  "yeager"
+    },
+    {
+        "number":  1495,
+        "title":  "Re engine bringup",
+        "head":  "re-engine-bringup",
+        "user":  "shadowbeat070"
+    },
+    {
+        "number":  1491,
+        "title":  "gpu: skip timeline polls that cannot release an operation",
+        "head":  "perf/timeline-idle-poll",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1457,
+        "title":  "shader: select per-material T#s through their record\u0027s pointer chain (Guardians of the Galaxy, #1004)",
+        "head":  "fix/gotg-material-chain",
+        "user":  "overlordxrz-source"
+    },
+    {
+        "number":  1449,
+        "title":  "avplayer: decode intro video on multiple threads (ASTRO\u0027s PLAYROOM, ASTRO BOT)",
+        "head":  "fix/astro-intro-video",
+        "user":  "Takoroka"
+    },
+    {
+        "number":  1444,
+        "title":  "shader: bound post-tested loop image tables by their start value (Guardians of the Galaxy, #1004)",
+        "head":  "fix/gotg-post-tested-loop",
+        "user":  "overlordxrz-source"
+    },
+    {
+        "number":  1430,
+        "title":  "Uncharted - LOFC boot to gameplay, fix rendering and frame rate",
+        "head":  "fix/uncharted-cleanup",
+        "user":  "Almo7aya"
+    },
+    {
+        "number":  1412,
+        "title":  "graphics: take the GPU\u0027s pages for the CPU in one critical section",
+        "head":  "pr/dirty-ownership",
+        "user":  "Franseven"
+    },
+    {
+        "number":  1405,
+        "title":  "CP: close a command buffer whose last dword cannot be a packet",
+        "head":  "pr/cp-tail",
+        "user":  "Franseven"
+    },
+    {
+        "number":  1403,
+        "title":  "gpu: allow compute dispatches to read buffers they write through scalar loads",
+        "head":  "fix/compute-self-overlap",
+        "user":  "ReverendOzmund"
+    },
+    {
+        "number":  1399,
+        "title":  "memory: exclude AGC driver reservation from Demon\u0027s Souls guest budget",
+        "head":  "codex/demons-souls-agc-startup",
+        "user":  "kewalker"
+    },
+    {
+        "number":  1395,
+        "title":  "graphics: keep texture GC thresholds within the current memory budget",
+        "head":  "texture-gc-budget-thresholds",
+        "user":  "msfvn"
+    },
+    {
+        "number":  1394,
+        "title":  "graphics: give images dedicated allocations where the driver allows many",
+        "head":  "vma-dedicated-images",
+        "user":  "msfvn"
+    },
+    {
+        "number":  1366,
+        "title":  "loader: load the bundled PRXs the executable imports at startup",
+        "head":  "fix/load-imported-bundled-prx",
+        "user":  "LukaszRozmej"
+    },
+    {
+        "number":  1312,
+        "title":  "fix: save pipeline cache on emulator crash",
+        "head":  "main",
+        "user":  "gavvahar"
+    },
+    {
+        "number":  1307,
+        "title":  "memory: write-protect tracked guest pages with userfaultfd",
+        "head":  "perf/uffd-write-watch",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1297,
+        "title":  "Hogwarts Legacy (PPSA01603): boot to gameplay, fix skin shading and the startup freeze",
+        "head":  "boot-hogwarts-legacy-PPSA01603",
+        "user":  "netwarex"
+    },
+    {
+        "number":  1295,
+        "title":  "shader: forward EXEC-guarded selects into guarded ALU operands",
+        "head":  "perf/select-forwarding",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1294,
+        "title":  "gpu: scan only summarized words of the BDA fault buffer",
+        "head":  "perf/fault-summary",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1289,
+        "title":  "renderer: reuse texture lookups for unchanged descriptors",
+        "head":  "perf/texture-lookup-cache",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1284,
+        "title":  "gpu: cheaper CPU write tracking for uploaded pages",
+        "head":  "perf/write-tracking",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1282,
+        "title":  "gpu: take GPU timestamps when the host GPU executes them",
+        "head":  "fix/gpu-clock-at-execution",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1281,
+        "title":  "loader: resolve jump tables and tail calls in the guest patcher",
+        "head":  "fix/patcher-jump-tables",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1275,
+        "title":  "net: map SO_REUSEADDR and SO_REUSEPORT on Linux and macOS hosts",
+        "head":  "fix/net-posix-socket-options",
+        "user":  "popcoder565"
+    },
+    {
+        "number":  1270,
+        "title":  "graphics: back the BDA page table with sparse memory",
+        "head":  "sparse-bda-pagetable",
+        "user":  "msfvn"
+    },
+    {
+        "number":  1269,
+        "title":  "kernel: return released guest memory to the host",
+        "head":  "release-guest-memory",
+        "user":  "msfvn"
+    },
+    {
+        "number":  1263,
+        "title":  "graphics: avoid draining unrelated priority work on guest unmap",
+        "head":  "fix/range-scoped-priority-unmap",
+        "user":  "popeee99"
+    },
+    {
+        "number":  1255,
+        "title":  "shader: fix indirect light tables instead of tolerating stale slots",
+        "head":  "fix/bitscan-mask-keys",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1254,
+        "title":  "gpu: read back submitted buffer data without a flush",
+        "head":  "perf/detached-downloads",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1200,
+        "title":  "renderer: apply fast clears to texture views and metadata-only fills",
+        "head":  "fix/metadata-clear-texture-view",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1199,
+        "title":  "shader: serve DS_ORDERED_COUNT waves in dispatch order",
+        "head":  "fix/ordered-append",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1198,
+        "title":  "graphics: keep depth attachment layouts across draws",
+        "head":  "fix/depth-attachment-layout",
+        "user":  "akar995"
+    },
+    {
+        "number":  1197,
+        "title":  "shader: fold equality compares against impossible values",
+        "head":  "perf/fold-movrels-known-zero",
+        "user":  "akar995"
+    },
+    {
+        "number":  1190,
+        "title":  "graphics: drain submitted guest command buffer to fix CPU/GPU fence race (Dead Cells hang, #1189)",
+        "head":  "fix/dcb-submit-ordering",
+        "user":  "tyyyyyyyyyyyyyyyy"
+    },
+    {
+        "number":  1187,
+        "title":  "graphics: use static feedback loop pipelines without the dynamic-state extension",
+        "head":  "graphics/feedback-loop-static-pipelines",
+        "user":  "overlordxrz-source"
+    },
+    {
+        "number":  1184,
+        "title":  "libRtc: implement sceRtcFormatRFC2822 and the local-time formatters",
+        "head":  "libs/rtc-rfc2822",
+        "user":  "overlordxrz-source"
+    },
+    {
+        "number":  1176,
+        "title":  "graphics: keep image-to-image copies inside both images",
+        "head":  "graphics/clamp-image-copy-extent",
+        "user":  "overlordxrz-source"
+    },
+    {
+        "number":  1152,
+        "title":  "gpu: avoid spec-constant vector selects in tiler shaders",
+        "head":  "fix/tiler-spec-vector-select",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1145,
+        "title":  "shader: pass vertex clip distances through the rect list tessellation stages (GTA V)",
+        "head":  "pr/kyty/rectlist-clip-distance",
+        "user":  "AN0DIN"
+    },
+    {
+        "number":  1118,
+        "title":  "shader: plan more indirect image table shapes",
+        "head":  "feat/indirect-table-shapes",
+        "user":  "NeySlim"
+    },
+    {
+        "number":  1071,
+        "title":  "shader: fold branch-proven vertex selects",
+        "head":  "fix/vertex-branch-selects",
+        "user":  "Abhi011999"
+    },
+    {
+        "number":  1050,
+        "title":  " kernel: keep guest threads below the GPU thread and run core-pinned spinning workers one step lower",
+        "head":  "feat/host-thread-priority",
+        "user":  "tvhdev"
+    },
+    {
+        "number":  1019,
+        "title":  "shader: treat an image format that names nothing as no descriptor instead of aborting",
+        "head":  "fix/undefined-image-format",
+        "user":  "tvhdev"
+    },
+    {
+        "number":  1012,
+        "title":  "shader: lower a conditional branch with identical targets to OpBranch",
+        "head":  "pr/degenerate-branch",
+        "user":  "wuboo"
+    },
+    {
+        "number":  984,
+        "title":  "loader: split 256-bit guest stores on macOS so Rosetta does not abort",
+        "head":  "pr/macos-wide-store-split",
+        "user":  "wuboo"
+    },
+    {
+        "number":  937,
+        "title":  "Wolverine: renderer threading, caches, AMPR/AJM and shader recompiler fixes",
+        "head":  "wolverine",
+        "user":  "itsmemac"
+    },
+    {
+        "number":  907,
+        "title":  "filesystem: encode Windows-forbidden characters in guest filenames",
+        "head":  "fix/windows-illegal-guest-filenames",
+        "user":  "Aryansh1520"
+    },
+    {
+        "number":  902,
+        "title":  "graphics: add experimental memory-pressure texture retention",
+        "head":  "lost-crown-texture-retention",
+        "user":  "gohansharma79-svg"
+    },
+    {
+        "number":  833,
+        "title":  "Windows stability fixes found while bringing up Tekken 8 (PPSA10595)",
+        "head":  "pr/windows-stability-fixes",
+        "user":  "hamzashakir99"
+    },
+    {
+        "number":  827,
+        "title":  "kernel: allow munmap across released reservation holes",
+        "head":  "fix/munmap-reserved-holes",
+        "user":  "Pcniado"
+    },
+    {
+        "number":  793,
+        "title":  "renderer: split oversized mesh draws into host-limit slices",
+        "head":  "mesh-draw-split-limits",
+        "user":  "prompterror"
+    },
+    {
+        "number":  780,
+        "title":  "Spider-Man: Miles Morales to gameplay: recompiler, PM4, cache and diagnostics fixes",
+        "head":  "spiderman-running-22-09-2026",
+        "user":  "itsmemac"
+    },
+    {
+        "number":  720,
+        "title":  "Astro Bot Intel CPU compatibility fixes",
+        "head":  "intel-astrobot-only",
+        "user":  "nomolao2-cell"
+    },
+    {
+        "number":  717,
+        "title":  "graphics: clamp host mip levels and gate layered block views",
+        "head":  "vulkan-shared-validations-dq7-issues",
+        "user":  "YuhiAida"
+    },
+    {
+        "number":  616,
+        "title":  "fix: PRX symbol resolution and user ID aliasing",
+        "head":  "fix-condvar-symbols-and-user-id",
+        "user":  "bipinkrish"
+    },
+    {
+        "number":  506,
+        "title":  "renderer: reduce FPS overhead in GPU scheduling and resource caching",
+        "head":  "techx3/fps-fixes",
+        "user":  "Techx3"
+    },
+    {
+        "number":  458,
+        "title":  "shader: support the remaining wave32 SAVEEXEC variants",
+        "head":  "fix/saveexec-b32",
+        "user":  "brandostrong"
+    },
+    {
+        "number":  375,
+        "title":  "renderer: clamp render area to attachment mip views",
+        "head":  "techx3/render-area-clamp-attachment-mips",
+        "user":  "Techx3"
+    },
+    {
+        "number":  373,
+        "title":  "renderer: preserve GPU-authored storage images during GC",
+        "head":  "techx3/texture-gc-preserve-gpu-storage",
+        "user":  "Techx3"
+    }
+]

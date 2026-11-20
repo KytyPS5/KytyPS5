@@ -1,0 +1,698 @@
+﻿################################################################################
+COMMENT INDEX: 0
+FILE: src/graphics/host_gpu/renderer/image/image.cpp : 372
+ID: 4645899653
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Functional Correctness** · **Quick win**
+
+**Preserve stencil in default copies of S8 images.**
+
+When both images use `eS8Uint`, `TextureCache::CopyImage` selects the direct path and calls this function with `stencil=false`. Lines 372 and 375 then remove the only available aspect. The copy regions select no stencil data, so the copy cannot preserve the image contents. Vulkan requires the regions to specify image aspects. ([docs.vulkan.org](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyImage.html))
+
+Use `PrimaryAspect` for both default selectors. This preserves stencil-only copies and keeps the existing color and depth behavior.
+
+<!-- fingerprinting:phantom:poseidon:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:0225303ba35dc3fb5b915bff -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 1
+FILE: src/graphics/host_gpu/renderer/pipeline/pipelineSerialization.cpp : 127
+ID: 4645899675
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Quick win**
+
+**Keep window-title updates on the main thread.**
+
+Both warm-up passes call `ReportShaderProgress` from helper threads. `ParallelFor` joins those helpers before returning. ([raw.githubusercontent.com](https://raw.githubusercontent.com/KytyPS5/KytyPS5/135901b88cbcfb7156d7fffe6d53b7c366236caa/src/common/parallelFor.h))
+
+SDL requires `SDL_SetWindowTitle` to run on the main thread. ([raw.githubusercontent.com](https://raw.githubusercontent.com/libsdl-org/SDL/release-3.4.x/include/SDL3/SDL_video.h)) On Windows, the backend calls `SetWindowText`, which sends a synchronous window message. A helper can wait for the window thread while holding `progress_mutex`. If the main thread waits for that mutex or joins the helper, warm-up cannot finish. ([raw.githubusercontent.com](https://raw.githubusercontent.com/libsdl-org/SDL/release-3.4.x/src/video/windows/SDL_windowswindow.c))
+
+Keep helper progress updates console-only. Set the window title before and after the parallel passes, or update it through a main-thread progress loop.
+
+<!-- fingerprinting:phantom:medusa:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:0dc3a650a0a4c300c8319c40 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 2
+FILE: src/graphics/host_gpu/renderer/renderDraw.cpp : 1033
+ID: 4645899681
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Functional Correctness** · **Heavy lift**
+
+**Check subresource identity before skipping the copy.**
+
+The same base address can contain different selected array layers. With depth layer 1 selected and color layer 0 selected, both one-layer views pass the guards above. `FindImage` preserves corresponding layers during replacement; it does not copy depth layer 1 into color layer 0. This branch then returns without that transfer. ([raw.githubusercontent.com](https://raw.githubusercontent.com/KytyPS5/KytyPS5/135901b88cbcfb7156d7fffe6d53b7c366236caa/src/graphics/host_gpu/renderer/cache/textureCache.cpp))
+
+Limit this shortcut to the same physical subresource. For different layers, preserve the source and perform the selected-layer copy.
+
+<!-- fingerprinting:phantom:poseidon:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:a890b486c2106d31eb39ff21 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 3
+FILE: src/graphics/host_gpu/vulkanCommon.cpp : 81
+ID: 4645899689
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Functional Correctness** · **Heavy lift**
+
+**Guest RGB9E5 textures will sample with wrong colors.**
+
+The lookup maps `k9_9_9_5Float` to `eB10G11R11UfloatPack32` for every caller. Guest RGB9E5 texel data is not converted, so it can be interpreted as B10G11R11 during sampling. This affects sampled-only textures, not only render targets. The code comment already states this decode mismatch.
+
+Preserve the guest RGB9E5 meaning for uploads. Either convert the texel data to the host format before upload, or keep the native `eE5B9G9R9UfloatPack32` format for guest uploads and use the B10G11R11 substitute only for render targets. The inspected source does not establish which option fits the renderer, so no code change is proposed here.
+
+<!-- fingerprinting:phantom:poseidon:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:d1cde9d3a8da3befeaa55d99 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 4
+FILE: src/graphics/shader/recompiler/ir/ShaderIR.h : 349
+ID: 4645899699
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Heavy lift**
+
+**Keep heap descriptor capacity within device limits.**
+
+This changes the allocated heap from 65,536 to 1,048,576 descriptors. On a device with a 500,000-descriptor limit, `ImageHeap` now exits during unconditional `RenderContext` construction, before any guest image is allocated. The former capacity passed this check. Vulkan permits that device limit. ([raw.githubusercontent.com](https://raw.githubusercontent.com/KytyPS5/KytyPS5/135901b88cbcfb7156d7fffe6d53b7c366236caa/src/graphics/host_gpu/renderer/pipeline/imageHeap.cpp))
+
+Separate the resident descriptor capacity from the 20-bit encoding capacity. Use a device-supported capacity consistently for host allocation and emitted image arrays.
+
+<!-- fingerprinting:phantom:poseidon:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:f55ded1c62957e30156b66f6 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 5
+FILE: src/kernel/eventFlag.cpp : 297
+ID: 4645899705
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Heavy lift**
+
+**Nested `Set` or `Clear` from a signal handler can deadlock `Cancel`.**
+
+`Cancel` sets the flag to `Canceled` and then dispatches pending signals on its own thread (line 297). A guest handler that calls `Set` or `Clear` on the same flag waits at line 246 until the status returns to `Set`. `Cancel` restores that status only after the handler returns (line 301). Releasing `m_mutex` does not break this cycle, and the cycle does not depend on the waiter count. The waiting thread can exit, and `Cancel` still never returns.
+
+The fix must preserve one of these behaviors: `Cancel` must not run guest handlers while the flag is `Canceled`, or a reentrant `Set` or `Clear` from the canceling thread must not block on the `Canceled` state. The choice between these options is left to the author.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:62fa275da2c87fc4382858e5 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 6
+FILE: src/kernel/fileSystem.cpp : 497
+ID: 4645899719
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Data Integrity & Integration** · **Heavy lift**
+
+**Preserve existing Windows files with literal percent escapes.**
+
+Before this change, a guest could open an existing `save%3A.dat` by that name. The new resolver looks for `save%253A.dat` and returns `ENOENT` if it is absent. The directory listing also reports the original file as `save:.dat`.
+
+Add a migration or a per-directory mapping that preserves the identity of existing files. Test a directory containing both spellings. An encoded-first lookup with a literal fallback cannot disambiguate both files on its own.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:446557bc15ae3bb902e411fb -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 7
+FILE: src/kernel/memory.cpp : 1163
+ID: 4645899728
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Quick win**
+
+**Take the state lock shared inside the recoverable-destination probe.**
+
+The probe walks `g_virtual_ranges` through `Query` without holding `g_memory_state_mutex`. Mapping writers modify that tree under the exclusive state lock, for example in the `Add`, `Remove`, and `ReplaceSpan` paths. The probe runs on the file-read path after a partial read fault. Such a fault can occur during a mapping replacement, so the traversal can race with node insertion, erase, or rebalancing. Rebalancing can affect nodes outside the read destination, so a non-overlapping edit does not prevent the race.
+
+The lock policy at `src/kernel/memory.cpp:196-198` requires readers outside a memory operation to take the state lock shared. `ClampRangeSize` already follows this pattern. Take the same lock in the probe for the duration of its traversal:
+
+<details>
+<summary>Suggested fix</summary>
+<dl>
+<dd>
+<br>
+
+```diff
+ 		probe = [](const void* data, uint64_t size) {
++			std::shared_lock state(g_memory_state_mutex);
+ 			if (g_virtual_ranges == nullptr) {
+ 				return false;
+ 			}
+```
+
+</dd>
+</dl>
+</details>
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:c67755cc983a111c457b4245 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 8
+FILE: src/kernel/memoryAddressSpace.inc : 1215
+ID: 4645899741
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Quick win**
+
+**Reject an empty required region on Windows.**
+
+If Region 2 contains only free gaps of 16 MiB or less, the loop reserves nothing and still completes. `ReserveRemainingGuestRegions` marks phase two complete. The self-tests can pass using Regions 0 and 1, but extended-memory mappings later fail the ownership check.
+
+Track successful reservations per region and fail phase two if a required region has none. The POSIX paths already reject this condition. Preserve the existing success path when every region has usable reserved space.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:35baaae6d5912ddf652b16df -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 9
+FILE: src/kernel/pthread.cpp : 3339
+ID: 4645899752
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Heavy lift**
+
+**Prevent a rejected signal from clearing a new thread's pending signal.**
+
+A sender can set signal 30 for thread A, see `almost_done`, and pause before clearing the bit. If A joins and its record is reused for B, a second sender can successfully queue signal 30 for B. The first sender then clears B's signal before B takes it.
+
+Make the lifecycle check and pending-mask update atomic with respect to record recycling. A rejected send must leave the new worker's mask unchanged. A send to a live worker must still set its pending bit.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:1150287696aeff42f6da9e1a -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 10
+FILE: src/libs/libFont.cpp : 779
+ID: 4645899765
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Quick win**
+
+**Require the full collection header before reading the first face offset.**
+
+`init_stb_info` accepts a 12-byte `ttcf` buffer. `stbtt_GetFontOffsetForIndex` then reads the face-0 offset at bytes 12 to 15 without a length check. For a collection with at least one face, that read exceeds the buffer. The `offset >= size` check runs too late to prevent it. Require 16 bytes for collections before calling the helper. Plain-font input keeps its current path.
+
+<details>
+<summary>Suggested fix</summary>
+<dl>
+<dd>
+<br>
+
+```diff
+--- "a/src/libs/libFont.cpp"
++++ "b/src/libs/libFont.cpp"
+@@ -775,8 +775,11 @@
+ 		return false;
+ 	}
+ 
+ 	// TrueType collections (.ttc) store a table of faces; use the first one.
++	if (size < 16 && data[0] == 't' && data[1] == 't' && data[2] == 'c' && data[3] == 'f') {
++		return false;
++	}
+ 	const int offset = stbtt_GetFontOffsetForIndex(data, 0);
+ 	if (offset < 0 || static_cast<uint32_t>(offset) >= size) {
+ 		return false;
+ 	}
+```
+
+</dd>
+</dl>
+</details>
+
+<!-- suggestion_start -->
+
+<details>
+<summary>Committable suggestion</summary>
+<dl>
+<dd>
+<br>
+
+> <picture><img src="https://storage.googleapis.com/coderabbit_public_assets/pre-merge-checks-warning.svg" width="20" height="20" align="absmiddle" alt=""></picture> **IMPORTANT**
+> Review the replacement and indentation, then test before committing.
+
+```suggestion
+	if (size < 16 && data[0] == 't' && data[1] == 't' && data[2] == 'c' && data[3] == 'f') {
+		return false;
+	}
+	const int offset = stbtt_GetFontOffsetForIndex(data, 0);
+```
+
+</dd>
+</dl>
+</details>
+
+<!-- suggestion_end -->
+
+<!-- fingerprinting:phantom:medusa:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:e55b7061a5db8572d8c3319a -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 11
+FILE: tests/AudioOut2PortTests.cpp : 757
+ID: 4645899868
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Quick win**
+
+**Allocate a complete stereo PCM grain.**
+
+When `device` is true, `SetPcm` copies 4096 bytes for 512 stereo float frames. This array contains only 2048 bytes. The copy reads beyond the stack array and can fail under a memory sanitizer. Use `float pcm[512 * 2]{}` to preserve the intended silent input. ([raw.githubusercontent.com](https://raw.githubusercontent.com/KytyPS5/KytyPS5/135901b88cbcfb7156d7fffe6d53b7c366236caa/src/libs/libAudio2.cpp))
+
+<!-- fingerprinting:phantom:medusa:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:c11272e5c98926711d065b46 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 12
+FILE: tests/PthreadPriorityTests.cpp : 133
+ID: 4645899874
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Quick win**
+
+**Initialize the guest memory lifecycle in this test entrypoint.**
+
+`main` initializes configuration and logging, but not `Libs::LibKernel::Memory::Lifecycle`. Each worker calls `CreateThreadTls` in `RunThread` before it runs guest code. That path calls `AllocateRuntimeMemory`, which uses memory globals created only during `Memory::Initialize`. The new test can therefore fail when it creates its workers. Initialize the lifecycle after logging and before the runtime linker. The sibling tests use the same order.
+
+<details>
+<summary>Suggested fix</summary>
+<dl>
+<dd>
+<br>
+
+```diff
+   subsystems.Initialize<Log::Lifecycle>();
++  subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+   Common::Singleton<Loader::RuntimeLinker>::Instance();
+```
+
+</dd>
+</dl>
+</details>
+
+<!-- fingerprinting:phantom:medusa:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:fbd9798f021ee4c3b7ff2fbf -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 13
+FILE: src/common/threads.h : 56
+ID: 4646643276
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/amber-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Minor** · **Stability & Availability** · **Quick win**
+
+**Keep the owner until the final recursive unlock.**
+
+`Mutex` explicitly supports recursive locking. With `Lock(); TryLock(); Unlock();`, the thread still owns one level of the underlying mutex, but this store clears `m_owner`. `IsHeldByCurrentThread()` then incorrectly returns false. Recursive ownership ends only after all acquisition levels are released. ([ece.uvic.ca](https://www.ece.uvic.ca/~frodo/cppbook/cppdraft/n4861/thread.mutex.recursive))
+
+This can bypass the supplied `EmergencyShutdown` same-thread guard. Track recursion depth for successful `Lock` and `TryLock` calls. Clear `m_owner` only when the depth reaches zero. Preserve the existing single-acquisition behavior.
+
+<!-- fingerprinting:phantom:poseidon:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:467f9fc3a4f9add791d6f39c -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 14
+FILE: src/graphics/host_gpu/memoryTracker.h : 95
+ID: 4646643285
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Data Integrity & Integration** · **Quick win**
+
+**Capture the clean state and generation under the same lock.**
+
+If a CPU invalidation occurs after Line 94 reads a clean page but before Line 95 reads its generation, this branch records the new generation without processing the dirty page. CPU invalidation can change that state under the region lock. ([raw.githubusercontent.com](https://raw.githubusercontent.com/KytyPS5/KytyPS5/7d2b333b010751005297d315ac93a707cf6e1679/src/graphics/host_gpu/memoryTracker.cpp))
+
+The next identical call then matches the memo and skips the required upload. Without memoization, that call would detect the dirty page.
+
+Hold `manager->lock` across the clean-state check and generation capture. This preserves the unchanged-page result and prevents a concurrent invalidation from being recorded as already processed.
+
+<!-- fingerprinting:phantom:medusa:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:102652a368a2b8cb65cfcd03 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 15
+FILE: tests/MemoryTrackerTests.cpp : 
+ID: 4646643289
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Functional Correctness** · **Quick win**
+
+**Use the supplied Allocate signature.**
+
+Line 429 passes two arguments, but the local helper at Line 263 accepts only `uint64_t pages`. This prevents the test executable from compiling against the supplied interface. Use `Allocate(2)`, as the neighboring tests do.
+
+<!-- fingerprinting:phantom:poseidon:wombat61 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:2006df1902fd3f8b9a9b642e -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+✅ Addressed in commits 8fc3ff3 to b56e901
+
+################################################################################
+COMMENT INDEX: 16
+FILE: src/graphics/host_gpu/pageManager.cpp : 326
+ID: 4646991047
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/critical-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Critical** · **Functional Correctness** · **Quick win**
+
+**Declare `GetPageSize` in `PageManager`, or remove its definition.**
+
+`PageManager` in `src/graphics/host_gpu/pageManager.h` does not declare `GetPageSize`. The out-of-class definition at `src/graphics/host_gpu/pageManager.cpp:326` therefore names a member that does not exist. The compiler rejects this in every build that compiles `pageManager.cpp`.
+
+Add `uint64_t GetPageSize() const;` to the public section of `PageManager`. If the method is not needed, remove the definition at `pageManager.cpp:326` instead.
+
+<!-- fingerprinting:phantom:medusa:pangolin -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:b59e882f2f64e92289ac0b97 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 17
+FILE: src/graphics/host_gpu/renderer/cache/textureCache.cpp : 146
+ID: 4646991055
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/amber-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Minor** · **Data Integrity & Integration** · **Quick win**
+
+**Dirty the image when a sequential write overwrites its head bytes.**
+
+`SequentialWriteReachesImage` returns `false` for a write that starts before the image and ends inside the image's first tracker page. The bytes from the image start through the write end are still overwritten. `InvalidateCpuAliases` then untracks the image head without marking the image CPU dirty. The fill and copy paths in `bufferCache.cpp` write the new bytes to guest memory without updating the native image. Sampling that GPU-written image can return the old texels for those bytes.
+
+The sequential path must mark the image CPU dirty when the write overlaps any image byte. The ordinary `Overlaps` path already does this. Apply the same rule here, or update the native image from the written bytes. Keep the other sequential cases unchanged.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:2f687ded4dd7bfa80ecd8a83 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 18
+FILE: src/graphics/host_gpu/renderer/renderContext.h : 95
+ID: 4646991060
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/critical-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Critical** · **Functional Correctness** · **Quick win**
+
+**Restore the `WaitWriteBacks` member declaration.**
+
+`renderContext.cpp` defines `RenderContext::WaitWriteBacks` at Line 87. `HandleFault` and `InvalidateMemory` still call it. The class no longer declares the member, so this translation unit cannot compile. Restore `[[nodiscard]] bool WaitWriteBacks(uint64_t vaddr, uint64_t size);` in the private section.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:390ca08cfcf4e43e8fc34eee -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 19
+FILE: src/kernel/memory.cpp : 1561
+ID: 4646991066
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Heavy lift**
+
+**Return a recoverable error for the injected map failure.**
+
+`RunRemapFailedAfterView` expects the map to return an error and leave the address usable for a retry. This hook returns `false` after the host view is installed, but the check at Line 2741 terminates instead of returning to the test. Roll back the new view and preserve the prior reservation before returning an error. Let `ResumeCandidateScope` cancel the exposed candidate so the next map uses the normal path.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:64819052df4ffdd5c9bec771 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 20
+FILE: src/kernel/memory.cpp : 1564
+ID: 4646991072
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/critical-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Critical** · **Functional Correctness** · **Quick win**
+
+**Declare or remove `m_mutex` in `PhysicalMemory::Map`. The identifier does not resolve.**
+
+`PhysicalMemory` declares no `m_mutex` member, and it has no base class that could provide one. `memory.h` and `memoryAddressSpace.inc` declare no such member either. The `Common::LockGuard lock(m_mutex);` at line 1564 therefore fails to compile in any build that includes this file.
+
+Fix this in one of two ways:
+- Declare the intended lock as a member of `PhysicalMemory` and use it for `m_mappings` and `m_physical`.
+- Remove the line if the lock that governs these structures is already held by callers of `Map`.
+
+Before you choose, confirm which lock protects these structures. Do not acquire a lock that the caller already holds, because a non-recursive mutex deadlocks when acquired twice.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:b1d3e3b5c777cc0a26bed94a -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 21
+FILE: src/kernel/memory.cpp : 2182
+ID: 4646991078
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/critical-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Critical** · **Functional Correctness** · **Quick win**
+
+**Keep the unmap bookkeeping inside `UnmapMemoryOwner`.**
+
+This brace ends the function before `g_virtual_ranges->Remove`. The remaining statements are at namespace scope and cannot use `vaddr`, `len`, or `range`. Remove the extra brace so a successful unmap updates the virtual range and pool accounting before the function returns.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:292bdf033c197e944b92e161 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 22
+FILE: src/kernel/memory.cpp : 2737
+ID: 4646991084
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Stability & Availability** · **Heavy lift**
+
+**Do not wait for GPU cache cancels while `g_memory_state_mutex` is held exclusively.**
+
+`MapBackingForGuest` runs under the exclusive `g_memory_state_mutex` lock (`src/kernel/memory.cpp:2729-2737`). When a new physical mapping overlaps a suspended entry, that entry's cancel runs through `CancelSuspendedWhere` and `CancelGpuRange` (`memory.cpp:1028-1041`, `255`). `RenderContext::CancelSuspendedMemory` requires the GPU thread (`renderContext.cpp:150-152`). The guest thread therefore waits on the GPU thread while it holds the lock.
+
+The GPU thread can reach `ClampRangeSize` while it records a draw (`renderDraw.cpp:715`, `descriptors.cpp:844`). When a request misses the lock-free fast path, `ClampRangeSize` takes a shared lock on `g_memory_state_mutex` (`memory.cpp:1104`). If the guest thread holds that lock exclusively, neither thread can proceed. The guest thread waits for the cancel, and the GPU thread waits for the lock.
+
+The stated lock contract at `memory.cpp:430-432` forbids a graphics call under this lock. Cancels that a map triggers must run after the state lock is released. The change must keep the table and virtual-range state consistent while the GPU cache cancel runs outside the lock. The exact split is not prescribed here.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:6c64498cad8723ad99289756 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 23
+FILE: src/kernel/memory.cpp : 2778
+ID: 4646991097
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Data Integrity & Integration** · **Heavy lift**
+
+**Protect retained cache entries before exposing a writable remap.**
+
+A second guest thread can store through the fresh view after `MapBackingForGuest` succeeds but before `ResumeMemory` restores page protection. The store does not fault, so the GPU can reuse buffer bytes from before the store. Returning from the mapping call only after protection is restored does not protect other threads during that interval. Either expose the view with the required tracking protection already in place or invalidate retained bytes for remaps that expose an untracked writable view.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:e77ff8eb06d4808d69b6e9bb -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 24
+FILE: src/kernel/memory.cpp : 3723
+ID: 4646991106
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/critical-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Critical** · **Functional Correctness** · **Quick win**
+
+**Keep the pool commit in scope and return `ENOMEM` only on allocation failure.**
+
+The closing brace puts `mappings` out of scope before the backing-map loop, so the code cannot compile. The extra return also exits after a successful `Allocate`, which has already recorded ownership. Remove the extra return and keep the mapping and virtual-range updates inside the state-lock block. Leave GPU notification and callbacks outside that block.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:81d78e8bdbb511b68d208f38 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 25
+FILE: src/kernel/memory.cpp : 3728
+ID: 4646991109
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Data Integrity & Integration** · **Heavy lift**
+
+**Cancel suspended GPU caches before pool commit maps physical pages.**
+
+The pool commit maps each allocated fragment with a direct `MapBacking` call. Unlike `MapBackingForGuest`, this path does not cancel suspended GPU entries whose physical range overlaps the new view. After a direct allocation is released, its physical blocks return to the physical allocator, but its suspended entry still records the old physical offset. Pool allocation can then return those pages. A CPU write through the pooled view can change them. Releasing the pool and remapping the original direct range exactly can then resume the cache with stale bytes.
+
+Route the pool commit through the same physical-overlap cancellation that `MapBackingForGuest` performs, before the new view is exposed. The `MapBackingForGuest` comment states that cancellation runs while no address-space lock is held, because it can wait on the GPU. Keep the pool path consistent with that, so the cancellation does not run under `g_memory_state_mutex`.
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:e3b4441ebaafc8b239f21be3 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+
+################################################################################
+COMMENT INDEX: 26
+FILE: tests/VirtualMemoryAllocationTests.cpp : 4563
+ID: 4646991117
+BODY:
+<!-- coderabbit-ai-generated:v1 -->
+
+**<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" alt=""></picture> Major** · **Functional Correctness** · **Heavy lift**
+
+**Connect the release failure hooks to the unmap operations.**
+
+`TestFailGuestBackingStoreUnmapAfter(0)` and `TestFailNextPhysicalMemoryUnmap()` set injection state, but neither unmap implementation reads it. The checked release therefore returns `OK` for this valid mapping. `CheckFailed` stops the suite before it checks cancellation or restored data. Connect each hook at its intended stage and make the checked release return an error after restoring any view it already removed. Keep the release without injection successful. ([raw.githubusercontent.com](https://raw.githubusercontent.com/KytyPS5/KytyPS5/b56e9015c74b275912ab8237091f01d3ddcda726/src/kernel/memory.cpp))
+
+<!-- fingerprinting:phantom:medusa:wombat62 -->
+
+<!-- cr-indicator-types:potential_issue -->
+
+<!-- cr-comment:v1:d3235655b713940c329b3708 -->
+
+<!-- This is an auto-generated comment by CodeRabbit -->
+

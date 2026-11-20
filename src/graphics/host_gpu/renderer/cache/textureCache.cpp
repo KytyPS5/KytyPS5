@@ -590,6 +590,29 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	destination.ClearBufferModified();
 }
 
+void TextureCache::CopyStencil(ImageId destination_id, ImageId source_id) {
+	auto&      source = m_slot_images[source_id];
+	const auto found  = std::ranges::find_if(source.stencil_ids, [&](ImageId id) {
+		return m_slot_images[id].info.data == source.info.stencil;
+	});
+	// Without a bound stencil plane, guest memory is current.
+	if (found == source.stencil_ids.end()) {
+		return;
+	}
+	const auto source_stencil_id = *found;
+	RefreshImage(source_stencil_id);
+	auto& destination                = m_slot_images[destination_id];
+	destination.stencil_subresources = source.stencil_subresources;
+	const auto stencil_id            = AssociateStencil(destination_id, source.info.stencil);
+	// The copy covers only the source extent; the rest comes from guest memory.
+	RefreshImage(stencil_id);
+	destination.CopyImage(source, true);
+	if (m_slot_images[source_stencil_id].IsGpuModified()) {
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+}
+
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
@@ -706,6 +729,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 				InitializeImage(replacement_id);
 			}
 			CopyImage(replacement_id, cached_id);
+			// Draws write stencil into the depth image only; it is lost when the image is freed.
+			if (binding == BindingType::DepthTarget && cached.info.IsDepth() &&
+			    cached.info.HasStencil() && requested.HasStencil() &&
+			    requested.stencil == cached.info.stencil &&
+			    cached.backing.format == replacement.backing.format) {
+				CopyStencil(replacement_id, cached_id);
+			}
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
 			           "TextureCache: unsupported cross-format multisample depth copy\n");

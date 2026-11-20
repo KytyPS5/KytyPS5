@@ -2046,6 +2046,17 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	return cmd;
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
+                                                 const uint32_t* workload_ids,
+                                                 uint32_t        workload_count) {
+	return AgcDcbSetWorkloadsActive(buf, stream_id, workload_ids, workload_count);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
+                                                  uint32_t workload_id) {
+	return AgcDcbSetWorkloadComplete(buf, stream_id, workload_id);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count) {
@@ -2136,6 +2147,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t s
 	return cmd;
 }
 
+uint32_t KYTY_SYSV_ABI AgcDcbSetShRegisterDirectGetSize() {
+	PRINT_NAME();
+
+	return 3u * 4u;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
 	PRINT_NAME();
 
@@ -2178,6 +2195,12 @@ uint32_t KYTY_SYSV_ABI AgcDcbSetCxRegisterDirectGetSize() {
 	PRINT_NAME();
 
 	return 12;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbSetUcRegisterDirectGetSize() {
+	PRINT_NAME();
+
+	return 3u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
@@ -2276,6 +2299,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*             
 	return cmd;
 }
 
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexSizeGetSize() {
+	PRINT_NAME();
+
+	return 3u * 4u;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_size,
                                            uint8_t cache_policy) {
 	PRINT_NAME();
@@ -2296,6 +2325,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_siz
 	return cmd;
 }
 
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexBufferGetSize() {
+	PRINT_NAME();
+
+	return 3u * 4u;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_addr) {
 	PRINT_NAME();
 
@@ -2313,6 +2348,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_
 	cmd[2] = static_cast<uint32_t>((index_addr >> 32u) & 0xffffffffu);
 
 	return cmd;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexCountGetSize() {
+	PRINT_NAME();
+
+	return 2u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_count) {
@@ -2618,6 +2659,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 	return cmd;
 }
 
+uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexIndirectGetSize() {
+	PRINT_NAME();
+
+	return 5u * 4u;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier) {
 	PRINT_NAME();
@@ -2668,6 +2715,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 	cmd[4] = decode_indirect_draw_initiator(modifier);
 
 	return cmd;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectMultiGetSize() {
+	PRINT_NAME();
+
+	return 16u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
@@ -2729,6 +2782,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	draw[9] = decode_indirect_draw_initiator(modifier);
 
 	return cmd;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMultiGetSize() {
+	PRINT_NAME();
+
+	return 10u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
@@ -2849,6 +2908,12 @@ uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
 	PRINT_NAME();
 
 	return (event_type & 0xfeu) == 0x38u ? 16u : 8u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbEventWriteGetSize() {
+	PRINT_NAME();
+
+	return 2u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
@@ -2999,6 +3064,12 @@ uint32_t KYTY_SYSV_ABI AgcAcbJumpGetSize() {
 	return 0x10u;
 }
 
+uint32_t KYTY_SYSV_ABI AgcAcbRewindGetSize() {
+	PRINT_NAME();
+
+	return AgcDcbRewindGetSize();
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload) {
 	auto* cmd = AgcDcbRewind(buf, initial_state);
 	if (cmd != nullptr) {
@@ -3012,6 +3083,72 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
 	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
 	                        poll_cycles);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address,
+                                        uint32_t size_in_bytes) {
+	PRINT_NAME();
+
+	return AgcDcbPrimeUtcl2(buf, address, size_in_bytes);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address,
+                                        uint32_t size_in_bytes) {
+	PRINT_NAME();
+
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(5);
+
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	const auto address_value = reinterpret_cast<uint64_t>(address);
+	cmd[0] = KYTY_PM4(5, Pm4::IT_NOP, 0u);
+	cmd[1] = 0u;
+	cmd[2] = static_cast<uint32_t>(address_value);
+	cmd[3] = static_cast<uint32_t>(address_value >> 32u);
+	cmd[4] = size_in_bytes;
+
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
+	return AgcAcbMemSemaphore(buf, address, mailbox, signal_type, op);
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicMemGetSize() {
+	PRINT_NAME();
+
+	return 9u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicGdsGetSize() {
+	PRINT_NAME();
+
+	return 11u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbPrimeUtcl2GetSize() {
+	PRINT_NAME();
+
+	return 5u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicMemGetSize() {
+	PRINT_NAME();
+
+	return 9u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicGdsGetSize() {
+	PRINT_NAME();
+
+	return 11u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
@@ -3054,6 +3191,12 @@ uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
 	PRINT_NAME();
 
 	return AgcDcbWaitOnAddressGetSize(size);
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbDmaDataGetSize() {
+	PRINT_NAME();
+
+	return 7u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
@@ -3133,6 +3276,12 @@ uint64_t KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
 	return AgcDcbCopyDataGetSize();
 }
 
+uint32_t KYTY_SYSV_ABI AgcAcbDispatchIndirectGetSize() {
+	PRINT_NAME();
+
+	return 4u * 4u;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
                                                const volatile void* indirect_args,
                                                uint32_t             modifier) {
@@ -3187,6 +3336,12 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 	memcpy(cmd + 4, data, static_cast<size_t>(num_dwords) * 4u);
 
 	return cmd;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbStallCommandBufferParserGetSize() {
+	PRINT_NAME();
+
+	return 2u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
@@ -3635,6 +3790,12 @@ uint32_t KYTY_SYSV_ABI AgcDcbWriteDataGetSize(uint32_t num_dwords) {
 	AgcTrace("\t num_dwords = %" PRIu32 "\n", num_dwords);
 
 	return 4u * num_dwords + 16u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbGetLodStatsGetSize() {
+	PRINT_NAME();
+
+	return 5u * 4u;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_policy,

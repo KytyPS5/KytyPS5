@@ -291,6 +291,10 @@ bool PollBackoffEnabled() {
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
 }
+
+void EnableRedZoneProtection() {
+	g_config->red_zone_protection_enabled = true;
+}
 #endif
 
 const Keymap& GetKeymap() {

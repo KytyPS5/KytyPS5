@@ -99,6 +99,12 @@ TEST(Agc, EmptyMultiSubmitsFail) {
 	EXPECT_EQ(Gen5Driver::AgcDriverSubmitMultiAcbs(0, nullptr, nullptr, 0), empty);
 }
 
+TEST(Agc, RegisterWorkloadStreamChecksRegistrationFirst) {
+	EXPECT_EQ(Gen5::AgcDriverRegisterWorkloadStream(5, "x"), 0);
+	EXPECT_EQ(Gen5::AgcDriverRegisterWorkloadStream(5, nullptr), static_cast<int>(0x8a6c0033u));
+	EXPECT_EQ(Gen5::AgcDriverRegisterWorkloadStream(6, nullptr), static_cast<int>(0x8a6c0035u));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

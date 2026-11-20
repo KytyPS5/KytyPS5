@@ -1592,7 +1592,6 @@ static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT = static_cast<int>(0x8a6c0035u);
 static constexpr int      GRAPHICS5_DRIVER_ERROR_FAILED           = static_cast<int>(0x8a6d0003u);
 static constexpr int      GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT     = static_cast<int>(0x8a6d0109u);
-static constexpr uint32_t WORKLOAD_STREAM_RECORD_SIZE             = 32;
 static constexpr uint32_t WORKLOAD_ACTIVE_PACKET_SIZE_DW          = 18;
 static constexpr uint32_t WORKLOAD_COMPLETE_PACKET_SIZE_DW        = 12;
 static constexpr uint32_t WORKLOAD_STREAM_MIN_ID                  = 1;
@@ -1602,7 +1601,6 @@ static constexpr uint32_t WORKLOAD_ACTIVE_COUNT_MAX               = 63;
 
 static std::mutex g_workload_stream_mutex;
 static uint32_t   g_workload_stream_mask = 0;
-static uint8_t    g_workload_streams[WORKLOAD_STREAM_MAX_ID + 1][WORKLOAD_STREAM_RECORD_SIZE] {};
 
 uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner() {
 	PRINT_NAME();
@@ -1670,19 +1668,16 @@ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void
 		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
 	}
 
-	if (stream == nullptr) {
-		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
-	}
-
 	std::lock_guard lock(g_workload_stream_mutex);
 
 	const uint32_t stream_bit = 1u << stream_id;
 	if ((g_workload_stream_mask & stream_bit) != 0) {
 		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
 	}
+	if (stream == nullptr) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
+	}
 
-	std::memset(g_workload_streams[stream_id], 0, WORKLOAD_STREAM_RECORD_SIZE);
-	std::memcpy(g_workload_streams[stream_id], stream, WORKLOAD_STREAM_RECORD_SIZE);
 	g_workload_stream_mask |= stream_bit;
 
 	return OK;

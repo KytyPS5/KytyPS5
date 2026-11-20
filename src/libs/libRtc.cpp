@@ -417,8 +417,10 @@ static int KYTY_SYSV_ABI RtcFormatRFC2822(char* date_time, const RtcTick* utc,
 	static constexpr const char* MONTHS[]    = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
 	                                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-	// RtcSetTick validated the date, so month is 1..12 and DayOfWeek() is 1..7 (7 = Sunday).
-	const auto dow = Common::Date(time.year, time.month, time.day).DayOfWeek() % 7;
+	// Sunday is 0.
+	const auto dow = static_cast<size_t>(std::chrono::weekday {
+	    std::chrono::sys_days {std::chrono::year {time.year} / time.month /
+	                           time.day}}.c_encoding());
 
 	const auto sign    = (time_zone_minutes < 0 ? '-' : '+');
 	const auto minutes = (time_zone_minutes < 0 ? -static_cast<int64_t>(time_zone_minutes)

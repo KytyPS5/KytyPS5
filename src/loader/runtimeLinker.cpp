@@ -867,6 +867,14 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		}
 	}
 
+	// The target comes from the file: never write outside the module image.
+	if (program->base_size < sizeof(uint64_t) || ri.vaddr < program->base_vaddr ||
+	    ri.vaddr - program->base_vaddr > program->base_size - sizeof(uint64_t)) {
+		EXIT("relocation target 0x%016" PRIx64 " outside module image [0x%016" PRIx64
+		     ", +0x%" PRIx64 "): %s\n",
+		     ri.vaddr, program->base_vaddr, program->base_size,
+		     Common::PathToString(program->file_name).c_str());
+	}
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
 	if (patched && stubbed) {
 		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64

@@ -123,6 +123,61 @@ bool TestCloseAndReset(Param& param) {
 	passed = TestRunningThenFinished(param) && passed;
 	return passed;
 }
+
+struct MsgUserMessage {
+	int32_t     button_type;
+	uint32_t    pad;
+	const char* msg;
+	void*       buttons_param;
+	uint8_t     reserved[24];
+};
+
+struct MsgParam {
+	BaseParam       base;
+	uint64_t        size;
+	int32_t         mode;
+	uint32_t        pad0;
+	MsgUserMessage* user_msg_param;
+	void*           prog_bar_param;
+	void*           sys_msg_param;
+	int32_t         user_id;
+	uint8_t         reserved[40];
+	uint32_t        pad1;
+};
+
+static_assert(offsetof(MsgParam, mode) == 0x38);
+static_assert(offsetof(MsgParam, user_msg_param) == 0x40);
+static_assert(offsetof(MsgUserMessage, msg) == 8);
+
+bool CheckText(const MsgParam& param, const char* expected, const char* stage) {
+	const auto text = Libs::Dialog::MsgDialog::UserMessageText(&param);
+	if (text != expected) {
+		std::fprintf(stderr, "SaveDataDialogTests: %s: expected \"%s\", got \"%s\"\n", stage,
+		             expected, text.c_str());
+		return false;
+	}
+	return true;
+}
+
+bool TestMsgDialogUserText() {
+	constexpr int32_t mode_user_msg     = 1;
+	constexpr int32_t mode_progress_bar = 2;
+	MsgUserMessage    user {};
+	user.msg = "Unable to launch: missing base entitlement.";
+	MsgParam param {};
+	param.size           = sizeof(MsgParam);
+	param.mode           = mode_user_msg;
+	param.user_msg_param = &user;
+	bool passed          = CheckText(param, user.msg, "user message");
+	param.mode           = mode_progress_bar;
+	passed               = CheckText(param, "", "progress bar mode") && passed;
+	param.mode           = mode_user_msg;
+	user.msg             = nullptr;
+	passed               = CheckText(param, "", "null message") && passed;
+	param.user_msg_param = nullptr;
+	passed               = CheckText(param, "", "null user message param") && passed;
+	return passed;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -157,6 +212,7 @@ int main(int argc, char** argv) {
 	passed = CheckLatestStatus("first poll after Open") && passed;
 	passed = CheckLatestStatus("second poll after Open") && passed;
 	if (!consistency_only) {
+		passed = TestMsgDialogUserText() && passed;
 		passed = TestRunningThenFinished(param) && passed;
 		passed = TestCloseAndReset(param) && passed;
 	}

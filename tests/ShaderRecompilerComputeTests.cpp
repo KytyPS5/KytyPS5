@@ -8844,11 +8844,13 @@ public:
           "partial depth synchronization was accepted or "
           "transferred ownership");
 
-      // A depth target reusing a smaller depth surface's address and padded pitch must not
-      // bind the smaller image: the render area follows the requested extent.
+      // A depth target reusing a smaller depth surface's address and padded
+      // pitch must not bind the smaller image: the render area follows the
+      // requested extent.
       constexpr uint64_t grown_depth_offset = 0x2e00000;
       constexpr uint32_t grown_depth_pitch = 128;
-      constexpr uint64_t grown_depth_size = grown_depth_pitch * 32u * sizeof(float);
+      constexpr uint64_t grown_depth_size =
+          grown_depth_pitch * 32u * sizeof(float);
       const auto make_padded_depth = [&](uint32_t width,
                                          uint64_t offset = grown_depth_offset) {
         auto desc = MakeLinearDesc(
@@ -8871,28 +8873,34 @@ public:
       const auto grown_depth_image = texture_cache.FindImage(grown_depth);
       const auto &grown_info = texture_cache.GetImage(grown_depth_image).info;
       Require(name, "grown depth target extent",
-              grown_info.extent.width >= 128u && grown_info.extent.height >= 32u,
-              "a 128x32 depth target bound a " + std::to_string(grown_info.extent.width) +
-                  "x" + std::to_string(grown_info.extent.height) +
+              grown_info.extent.width >= 128u &&
+                  grown_info.extent.height >= 32u,
+              "a 128x32 depth target bound a " +
+                  std::to_string(grown_info.extent.width) + "x" +
+                  std::to_string(grown_info.extent.height) +
                   " image created for a smaller target at the same address");
 
-      // The recreated target is larger than the cached image: the part outside the old extent
-      // comes from guest memory, the old extent from the cached GPU contents.
+      // The recreated target is larger than the cached image: the part outside
+      // the old extent comes from guest memory, the old extent from the cached
+      // GPU contents.
       constexpr uint64_t grown_init_offset = 0x2e10000;
       constexpr float grown_guest_inside = 0.25f;
       constexpr float grown_guest_outside = 0.5f;
       constexpr float grown_gpu_value = 0.75f;
       for (uint32_t texel = 0; texel < grown_depth_pitch * 32u; texel++) {
-        const float value =
-            texel % grown_depth_pitch < 32u ? grown_guest_inside : grown_guest_outside;
-        std::memcpy(memory + grown_init_offset + texel * sizeof(float), &value, sizeof(value));
+        const float value = texel % grown_depth_pitch < 32u
+                                ? grown_guest_inside
+                                : grown_guest_outside;
+        std::memcpy(memory + grown_init_offset + texel * sizeof(float), &value,
+                    sizeof(value));
       }
       auto small_init = make_padded_depth(32, grown_init_offset);
       const auto small_init_image = texture_cache.FindImage(small_init);
       (void)texture_cache.FindDepthTarget(small_init_image, small_init);
       vk::ClearValue grown_gpu_clear{};
       grown_gpu_clear.depthStencil.depth = grown_gpu_value;
-      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), small_init_image,
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), small_init_image,
           {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, grown_gpu_clear);
       auto grown_init = make_padded_depth(128, grown_init_offset);
       const auto grown_init_image = texture_cache.FindImage(grown_init);
@@ -8900,34 +8908,41 @@ public:
       auto grown_init_readback = CreateHostBuffer(
           name, 128 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::BufferImageCopy grown_init_row{
-          0, 0, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {0, 31, 0}, {128, 1, 1}};
-      texture_cache.GetImage(grown_init_image).Download(
-          std::span{&grown_init_row, 1}, grown_init_readback.buffer, 0,
-          grown_init_readback.size);
+          0,          0,          0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+          {0, 31, 0}, {128, 1, 1}};
+      texture_cache.GetImage(grown_init_image)
+          .Download(std::span{&grown_init_row, 1}, grown_init_readback.buffer,
+                    0, grown_init_readback.size);
       HostReadBarrier(grown_init_readback.buffer, grown_init_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
       scheduler.Finish();
-      std::vector<uint32_t> grown_init_expected(128,
-                                                std::bit_cast<uint32_t>(grown_guest_outside));
-      std::fill_n(grown_init_expected.begin(), 32, std::bit_cast<uint32_t>(grown_gpu_value));
+      std::vector<uint32_t> grown_init_expected(
+          128, std::bit_cast<uint32_t>(grown_guest_outside));
+      std::fill_n(grown_init_expected.begin(), 32,
+                  std::bit_cast<uint32_t>(grown_gpu_value));
       const auto grown_init_words = ReadBuffer(name, grown_init_readback, 128);
       Require(name, "grown depth target contents",
-              grown_init_image != small_init_image && grown_init_words == grown_init_expected,
-              "the recreated depth target lost the cached depth or left the grown region "
+              grown_init_image != small_init_image &&
+                  grown_init_words == grown_init_expected,
+              "the recreated depth target lost the cached depth or left the "
+              "grown region "
               "uninitialized (column 0 = " +
                   std::to_string(std::bit_cast<float>(grown_init_words[0])) +
                   ", column 32 = " +
-                  std::to_string(std::bit_cast<float>(grown_init_words[32])) + ")");
+                  std::to_string(std::bit_cast<float>(grown_init_words[32])) +
+                  ")");
 
-      // Stencil written by the GPU (as by a draw: the association is not marked) lives only in
-      // the cached image and must survive the recreate; the grown region comes from guest memory.
+      // Stencil written by the GPU (as by a draw: the association is not
+      // marked) lives only in the cached image and must survive the recreate;
+      // the grown region comes from guest memory.
       constexpr uint64_t grown_stencil_depth_offset = 0x2e20000;
       constexpr uint64_t grown_stencil_offset = 0x2e30000;
       constexpr uint64_t grown_stencil_size = grown_depth_pitch * 32u;
       constexpr uint8_t grown_stencil_guest = 0x11;
       constexpr uint8_t grown_stencil_gpu = 0x35;
-      std::memset(memory + grown_stencil_offset, grown_stencil_guest, grown_stencil_size);
+      std::memset(memory + grown_stencil_offset, grown_stencil_guest,
+                  grown_stencil_size);
       const auto make_padded_depth_stencil = [&](uint32_t width) {
         auto desc = make_padded_depth(width, grown_stencil_depth_offset);
         desc.info.pixel_format = vk::Format::eD32SfloatS8Uint;
@@ -8949,8 +8964,8 @@ public:
         const vk::ImageSubresourceRange stencil_range{
             vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1};
         scheduler.Current().Handle().clearDepthStencilImage(
-            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &stencil_value, 1,
-            &stencil_range);
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+            &stencil_value, 1, &stencil_range);
       }
       auto grown_stencil = make_padded_depth_stencil(128);
       const auto grown_stencil_image = texture_cache.FindImage(grown_stencil);
@@ -8958,15 +8973,20 @@ public:
       auto grown_stencil_readback = CreateHostBuffer(
           name, 128, vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::BufferImageCopy grown_stencil_row{
-          0, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {0, 31, 0}, {128, 1, 1}};
-      texture_cache.GetImage(grown_stencil_image).Download(
-          std::span{&grown_stencil_row, 1}, grown_stencil_readback.buffer, 0,
-          grown_stencil_readback.size);
-      HostReadBarrier(grown_stencil_readback.buffer, grown_stencil_readback.size,
+          0,          0,
+          0,          {vk::ImageAspectFlagBits::eStencil, 0, 0, 1},
+          {0, 31, 0}, {128, 1, 1}};
+      texture_cache.GetImage(grown_stencil_image)
+          .Download(std::span{&grown_stencil_row, 1},
+                    grown_stencil_readback.buffer, 0,
+                    grown_stencil_readback.size);
+      HostReadBarrier(grown_stencil_readback.buffer,
+                      grown_stencil_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
       scheduler.Finish();
-      const auto grown_stencil_words = ReadBuffer(name, grown_stencil_readback, 32);
+      const auto grown_stencil_words =
+          ReadBuffer(name, grown_stencil_readback, 32);
       std::array<uint8_t, 128> grown_stencil_bytes{};
       std::memcpy(grown_stencil_bytes.data(), grown_stencil_words.data(),
                   grown_stencil_bytes.size());
@@ -8976,9 +8996,11 @@ public:
       Require(name, "grown depth target stencil",
               grown_stencil_image != small_stencil_image &&
                   grown_stencil_bytes == grown_stencil_expected,
-              "the recreated depth target lost the cached stencil or left the grown region "
-              "uninitialized (column 0 = " + std::to_string(grown_stencil_bytes[0]) +
-                  ", column 32 = " + std::to_string(grown_stencil_bytes[32]) + ")");
+              "the recreated depth target lost the cached stencil or left the "
+              "grown region "
+              "uninitialized (column 0 = " +
+                  std::to_string(grown_stencil_bytes[0]) + ", column 32 = " +
+                  std::to_string(grown_stencil_bytes[32]) + ")");
 
       constexpr uint64_t raw_d16_offset = 0x27d0000;
       constexpr std::array<uint16_t, 2> raw_d16_values{0x2000u, 0xc000u};
@@ -11165,6 +11187,88 @@ public:
       Require(name, "reused metadata final retirement",
               !texture_cache.IsMeta(base + 0x28000),
               "retiring the HTile image left its metadata registered");
+
+      // EA SPORTS UFC 6 (PPSA23566) binds one depth surface alternately as D32
+      // with one HTile and as D32S8 with another, and fast-clears each HTile
+      // while the other variant is bound. Each switch replaces the native
+      // image; the clears must survive it.
+      constexpr uint64_t variant_data = 0x2f00000;
+      constexpr uint64_t variant_htile_d32 = 0x2f02000;
+      constexpr uint64_t variant_htile_d32s8 = 0x2f03000;
+      auto variant_d32 = MakeMetadataDepth(variant_data, variant_htile_d32);
+      variant_d32.info.htile_initial_clear = false;
+      auto variant_d32s8 = MakeMetadataDepth(variant_data, variant_htile_d32s8);
+      variant_d32s8.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      variant_d32s8.info.stencil = {base + 0x2f01000, 0x80};
+      variant_d32s8.info.htile_initial_clear = false;
+      variant_d32s8.view_info.format = vk::Format::eD32SfloatS8Uint;
+      variant_d32s8.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      auto bind_variant = [&](ImageDesc desc) {
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindDepthTarget(id, desc);
+        return id;
+      };
+      const auto variant_d32_id = bind_variant(variant_d32);
+      const auto variant_d32s8_id = bind_variant(variant_d32s8);
+      Require(
+          name, "depth variant replacement",
+          variant_d32s8_id != variant_d32_id &&
+              !TextureCacheTestAccess::Contains(texture_cache, variant_d32_id),
+          "the D32S8 binding did not replace the D32 image");
+      Require(name, "HTile clear while the other depth variant is bound",
+              texture_cache.ClearMeta(base + variant_htile_d32),
+              "the D32 HTile was forgotten when its depth surface switched to "
+              "D32S8");
+      (void)bind_variant(variant_d32);
+      Require(name, "HTile clear across depth variant replacement",
+              texture_cache.IsMetaCleared(base + variant_htile_d32, 0) &&
+                  texture_cache.ClearMeta(base + variant_htile_d32s8),
+              "the D32 rebinding lost its pending clear or the D32S8 HTile");
+      (void)bind_variant(variant_d32s8);
+      Require(name, "HTile clear across the reverse replacement",
+              texture_cache.IsMetaCleared(base + variant_htile_d32s8, 0),
+              "the D32S8 rebinding lost its pending clear");
+      auto variant_storage = MakeLinearDesc(
+          base + variant_data, sizeof(uint32_t), vk::Format::eR32Sfloat,
+          Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      variant_storage.type = BindingType::Storage;
+      variant_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      (void)texture_cache.FindImage(variant_storage);
+      Require(name, "HTile state ends with the depth surface",
+              !texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "a non-depth replacement kept the surface's HTile clear state");
+      (void)bind_variant(variant_d32s8);
+      (void)bind_variant(variant_d32);
+      Require(name, "HTile state while a depth variant remains",
+              texture_cache.IsMeta(base + variant_htile_d32) &&
+                  texture_cache.IsMeta(base + variant_htile_d32s8),
+              "the depth variants did not re-register both HTiles");
+      // A kept HTile reused by another depth surface starts from that surface's
+      // own state.
+      (void)texture_cache.ClearMeta(base + variant_htile_d32);
+      auto other_surface =
+          MakeMetadataDepth(variant_data + 0x800, variant_htile_d32);
+      other_surface.info.htile_initial_clear = false;
+      (void)bind_variant(other_surface);
+      Require(
+          name, "HTile clear does not move to another surface",
+          !texture_cache.IsMetaCleared(base + variant_htile_d32, 0),
+          "a depth surface inherited another surface's pending HTile clear");
+      texture_cache.UnmapMemory(base + variant_data, sizeof(uint32_t));
+      Require(name,
+              "HTile state of a rebinding surface survives the old surface",
+              texture_cache.IsMeta(base + variant_htile_d32) &&
+                  !texture_cache.IsMeta(base + variant_htile_d32s8),
+              "retiring a surface erased an HTile another surface had rebound");
+      texture_cache.UnmapMemory(base + variant_data + 0x800, sizeof(uint32_t));
+      Require(
+          name, "HTile state retires with the last depth image",
+          !texture_cache.IsMeta(base + variant_htile_d32) &&
+              !texture_cache.IsMeta(base + variant_htile_d32s8),
+          "deleting the surface's last depth image kept its HTile clear state");
 
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =

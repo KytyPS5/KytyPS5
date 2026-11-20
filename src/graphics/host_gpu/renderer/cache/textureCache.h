@@ -100,6 +100,9 @@ private:
 		std::bitset<8192> stencil_clear_mask;
 		// The depth image that last acquired this HTile range.
 		ImageId owner;
+		// Guest depth surface last bound with this HTile. One surface can use several HTile
+		// allocations, such as depth-only and depth-stencil variants.
+		uint64_t depth_address = 0;
 	};
 
 	struct OverlapResult {

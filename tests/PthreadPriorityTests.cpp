@@ -7,6 +7,7 @@
 #include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "loader/runtimeLinker.h"
@@ -127,6 +128,8 @@ int main() {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+  // Guest threads allocate their TLS in guest memory.
+  subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
   Common::Singleton<Loader::RuntimeLinker>::Instance();
   Libs::LibKernel::Initialize();
   Libs::LibKernel::PthreadInitSelfForMainThread();

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -854,6 +855,10 @@ public:
 			Replace(inst, Value(mask.U32() != 0u));
 			return;
 		}
+		if (CoversLaneBound(mask, wave_size)) {
+			Replace(inst, Value(true));
+			return;
+		}
 		if (wave_size != 32u) return;
 		m_visited.clear();
 		m_grounded = false;
@@ -863,6 +868,87 @@ public:
 private:
 	static bool Immediate(Value value, uint32_t expected) {
 		return IsImmediate(value, Type::U32) && value.U32() == expected;
+	}
+
+	std::optional<uint64_t> AtLaneBound(Value value, uint32_t bound) {
+		if (IsImmediate(value, Type::U32)) return value.U32();
+		if (IsImmediate(value, Type::U64)) return value.U64();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return std::nullopt;
+		if (inst->GetOpcode() == ValueOpcode::LaneBound) {
+			if (m_lane_bound == nullptr) m_lane_bound = inst;
+			return m_lane_bound == inst ? std::optional<uint64_t>(bound) : std::nullopt;
+		}
+		if (const auto found = m_at_bound.find(inst); found != m_at_bound.end())
+			return found->second;
+		if (++m_mask_nodes > MaxMaskNodes) return std::nullopt;
+		bool       defined = true;
+		const auto arg     = [&](size_t index) {
+            const auto operand = defined ? AtLaneBound(Arg(*inst, index), bound) : std::nullopt;
+            defined            = operand.has_value();
+            return operand.value_or(0u);
+		};
+		uint64_t result = 0;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitwiseAnd32: result = arg(0) & arg(1); break;
+			case ValueOpcode::BitwiseOr32: result = arg(0) | arg(1); break;
+			case ValueOpcode::ISub32: result = static_cast<uint32_t>(arg(0) - arg(1)); break;
+			case ValueOpcode::ShiftRightLogical64: result = arg(0) >> (arg(1) & 63u); break;
+			case ValueOpcode::CompositeExtractU64: {
+				const auto word = arg(1);
+				defined         = defined && word < 2u;
+				result          = static_cast<uint32_t>(arg(0) >> ((word & 1u) * 32u));
+				break;
+			}
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto shift = arg(1);
+				defined          = defined && shift < 32u;
+				result           = arg(0) >> (shift & 31u);
+				break;
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = arg(1);
+				const auto count  = arg(2);
+				defined           = defined && offset + count <= 32u;
+				result = defined ? (arg(0) >> offset) & ((uint64_t {1} << count) - 1u) : 0u;
+				break;
+			}
+			default: return std::nullopt;
+		}
+		if (!defined) return std::nullopt;
+		return m_at_bound.emplace(inst, result).first->second;
+	}
+
+	static bool SelectsWordByLaneHalf(const Inst& select) {
+		if (select.GetOpcode() != ValueOpcode::SelectU32) return false;
+		const auto* low_half = Arg(select, 0).TryInstruction();
+		if (low_half == nullptr || low_half->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    !Immediate(Arg(*low_half, 1), 32u))
+			return false;
+		const auto* lane = Arg(*low_half, 0).TryInstruction();
+		return lane != nullptr && lane->GetOpcode() == ValueOpcode::LaneId;
+	}
+
+	bool CoversLaneBound(Value mask, uint32_t wave_size) {
+		auto low  = mask;
+		auto high = Value(0u);
+		if (wave_size == 64u) {
+			const auto* select = mask.TryInstruction();
+			if (select == nullptr || !SelectsWordByLaneHalf(*select)) return false;
+			low  = Arg(*select, 1);
+			high = Arg(*select, 2);
+		}
+		m_lane_bound = nullptr;
+		for (uint32_t bound = 1; bound <= wave_size; ++bound) {
+			m_at_bound.clear();
+			m_mask_nodes         = 0;
+			const auto low_word  = AtLaneBound(low, bound);
+			const auto high_word = low_word ? AtLaneBound(high, bound) : std::nullopt;
+			if (!high_word) return false;
+			const auto lanes = UINT64_MAX >> (64u - bound);
+			if (((*high_word << 32u | *low_word) & lanes) != lanes) return false;
+		}
+		return true;
 	}
 
 	static Value BallotPredicate(const Inst& inst) {
@@ -930,6 +1016,10 @@ private:
 	FoldWorklist& m_worklist;
 	std::unordered_set<const Inst*> m_visited;
 	std::unordered_map<const Inst*, Value> m_values;
+	std::unordered_map<const Inst*, uint64_t> m_at_bound;
+	const Inst*                               m_lane_bound = nullptr;
+	uint32_t                                  m_mask_nodes = 0;
+	static constexpr uint32_t                 MaxMaskNodes = 64;
 	bool m_grounded = false;
 };
 

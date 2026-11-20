@@ -14,9 +14,9 @@ inline size_t ParallelThreads() {
 	return std::max(1u, std::thread::hardware_concurrency() / 2);
 }
 
-// Calls job(i) for every i below count on up to ParallelThreads() threads, the caller included.
+// Calls job(i) for every i below count on up to max_threads threads, the caller included.
 template <typename Job>
-void ParallelFor(size_t count, const Job& job) {
+void ParallelFor(size_t count, size_t max_threads, const Job& job) {
 	std::atomic_size_t next = 0;
 	const auto         work = [&] {
 		for (auto i = next++; i < count; i = next++) {
@@ -24,10 +24,16 @@ void ParallelFor(size_t count, const Job& job) {
 		}
 	};
 	std::vector<std::jthread> helpers;
-	for (auto i = std::min(count, ParallelThreads()); i > 1; i--) {
+	for (auto i = std::min(count, std::max<size_t>(1, max_threads)); i > 1; i--) {
 		helpers.emplace_back(work);
 	}
 	work();
+}
+
+// Calls job(i) for every i below count on up to ParallelThreads() threads, the caller included.
+template <typename Job>
+void ParallelFor(size_t count, const Job& job) {
+	ParallelFor(count, ParallelThreads(), job);
 }
 
 } // namespace Common

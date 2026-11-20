@@ -313,10 +313,8 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
     const auto texel = fixture->Emit(ValueOpcode::CompositeConstructU32x4,
                                     {Value(1u), Value(2u), Value(3u), Value(4u)});
     fixture->Emit(access, {image, address, texel, Value(true)}, flags);
-  } else if (access == ValueOpcode::ImageRead) {
+  } else if (access == ValueOpcode::ImageRead || access == ValueOpcode::ImageQueryDimensions) {
     result = fixture->Emit(access, {image, address, Value(true)}, flags);
-  } else if (access == ValueOpcode::ImageQueryDimensions) {
-    result = fixture->Emit(access, {image, address}, flags);
   } else if (access == ValueOpcode::ImageAtomicIAdd32) {
     result = fixture->Emit(access, {image, address, Value(1u), Value(true)}, flags);
   } else {
@@ -769,7 +767,7 @@ void TestExactUnfilteredImageCandidates() {
   const auto handle = std::ranges::find_if(*merged->block, [](const Inst &inst) {
     return inst.GetOpcode() == ValueOpcode::GetImageResource;
   });
-  merged->Emit(ValueOpcode::ImageQueryDimensions, {Value(&*handle), merged->ImageAddress()},
+  merged->Emit(ValueOpcode::ImageQueryDimensions, {Value(&*handle), merged->ImageAddress(), Value(true)},
       merged->AddMemory({.kind = ResourceKind::Image,
                          .image_dimension = Decoder::ImageDimension::Dim2D}, 0x1100));
   merged->PlanAndTrack();
@@ -2960,6 +2958,8 @@ void TestUniformizedMaterialImageKeys() {
     const bool first_lane = variant >= Variant::FirstLane;
     const bool packed = variant >= Variant::Packed;
     const bool merged = variant >= Variant::PackedMerged;
+    const bool proved = variant == Variant::Packed || variant == Variant::PackedUnalignedOffset ||
+                        variant == Variant::PackedMerged;
     const bool first_lane_loop = first_lane && variant != Variant::FirstLaneDirect;
     const uint32_t sample_entry_id = first_lane_loop ? 10u : 9u;
     const auto branch = [&](Value predicate, CFG::BranchCondition kind, Block *block) {
@@ -3281,7 +3281,11 @@ void TestUniformizedMaterialImageKeys() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
-    if (packed)
+    if (packed && !proved)
+      Check(indirect && !indirect->selector && indirect->table_maximum == 16383u &&
+                indirect->table_scalar && indirect->key_count.IsEmpty(),
+            "packed selector accepted an unproved OR guard, offset domain, or field extraction");
+    else if (packed)
       Check(indirect && indirect->selector && indirect->selector->stride == 16u &&
                 indirect->selector->offset == (variant == Variant::PackedUnalignedOffset ? 9u : 8u) &&
                 indirect->selector->global && indirect->selector->bit_offset == (merged ? 0u : 16u) &&
@@ -3429,8 +3433,7 @@ void TestUniformizedMaterialImageKeys() {
                              Variant::PackedWrongGuard, Variant::PackedSparseOffset,
                              Variant::PackedWrongField, Variant::PackedUnboundedMerge,
                              Variant::PackedCyclicMerge})
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "packed selector accepted an unproved OR guard, offset domain, or field extraction");
+    make_plan(variant);
 }
 
 void TestIndexedMaterialImageKeys() {
@@ -3499,7 +3502,7 @@ void TestIndexedMaterialImageKeys() {
       gather.kind = ResourceKind::Image;
       gather.image_dimension = Decoder::ImageDimension::Dim2D;
       if (index == 0u)
-        f.Emit(ValueOpcode::ImageQueryDimensions, {image_handle(), address}, f.AddMemory(gather, 0x180u), body);
+        f.Emit(ValueOpcode::ImageQueryDimensions, {image_handle(), address, active}, f.AddMemory(gather, 0x180u), body);
       const auto image = image_handle();
       if (index == 2u) shared_image = image;
       gather.image_sample_flags = Decoder::ImageSampleFlagLod;
@@ -7904,6 +7907,87 @@ void TestPackedDescriptorWaterfall() {
   }
 }
 
+void TestQueryOnlyImageWaterfall() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Query, QueryThenSample, WiderExec };
+  const auto make = [](Variant variant, bool loop) {
+    auto fixture = std::make_unique<Fixture>(ShaderType::Pixel);
+    auto &f = *fixture;
+    const auto index = f.Emit(ValueOpcode::GetInterpolationParameter, {Value(1u), Value(1u), Value(2u)});
+    const auto enabled = f.Emit(ValueOpcode::INotEqual32,
+        {Value(0u), f.Emit(ValueOpcode::GetInterpolationParameter, {Value(0u), Value(1u), Value(2u)})});
+    const auto local = f.Emit(ValueOpcode::SelectU32,
+        {enabled, f.Emit(ValueOpcode::UMin32, {Value(0x3fffu), index}), index});
+    const auto table = f.Address(f.UserData(0u), f.UserData(1u));
+    const MemoryInfo memory{.kind = ResourceKind::Image, .image_dimension = Decoder::ImageDimension::Dim2D};
+    const auto waterfall = [&](const auto &access) {
+      auto *entry = f.block;
+      auto mask = enabled;
+      Inst *carried = nullptr;
+      if (loop) {
+        auto *body = f.AddBlock();
+        entry->AddBranch(body);
+        entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body};
+        carried = &body->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+        carried->AddPhiOperand(entry, enabled);
+        mask = Value(carried);
+        f.block = body;
+      }
+      const auto key = f.Emit(ValueOpcode::ReadFirstLane, {local, mask});
+      const auto active = f.Emit(ValueOpcode::LogicalAnd,
+          {mask, f.Emit(ValueOpcode::IEqual32, {key, local})});
+      const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < words.size(); ++word)
+        words[word] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+            f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = word * 4u}, 0x1a0u));
+      access(f.Image(words), active);
+      if (!loop) return;
+      auto *body = f.block;
+      auto *exit = f.AddBlock();
+      const auto remaining = f.Emit(ValueOpcode::LogicalAnd,
+          {mask, f.Emit(ValueOpcode::LogicalNot, {active})});
+      carried->AddPhiOperand(body, remaining);
+      body->AddBranch(body);
+      body->AddBranch(exit);
+      body->condition = f.Emit(ValueOpcode::ConditionRef, {remaining}, CFG::BranchCondition::ExecNonZero);
+      body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = body,
+                          .false_block = exit};
+      exit->terminator.kind = CFG::TerminatorKind::Return;
+      f.block = exit;
+    };
+    waterfall([&](Value image, Value active) {
+      const auto size = f.Emit(ValueOpcode::ImageQueryDimensions,
+          {image, f.ImageAddress(), variant == Variant::WiderExec ? Value(true) : active},
+          f.AddMemory(memory, 0x1b4u));
+      f.Emit(ValueOpcode::ReferenceU32, {f.Emit(ValueOpcode::CompositeExtractU32x4, {size, Value(0u)})});
+    });
+    if (variant == Variant::QueryThenSample)
+      waterfall([&](Value image, Value active) {
+        const auto texel = f.Emit(ValueOpcode::ImageSampleRaw,
+            {image, f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}), f.ImageAddress(), active},
+            f.AddMemory(memory, 0x2c0u));
+        f.Emit(ValueOpcode::ReferenceU32, {f.Emit(ValueOpcode::CompositeExtractU32x4, {texel, Value(0u)})});
+      });
+    return fixture;
+  };
+  for (const bool loop : {false, true}) {
+    for (const auto variant : {Variant::Query, Variant::QueryThenSample}) {
+      auto fixture = make(variant, loop);
+      fixture->PlanAndTrack();
+      const auto plan = ExtractResourcePlan(fixture->program);
+      Check(!plan.info.images.empty() && std::ranges::all_of(plan.info.images, [&](const auto &image) {
+        const auto &table = plan.descriptor_sources[image.source].indirect_descriptor;
+        return table && !table->selector && table->table_stride == 32u &&
+               (table->key_count == Value(0x4000u) ||
+                (table->table_maximum == 0x3fffu && table->table_scalar && table->key_count.IsEmpty()));
+      }), "query-only waterfall lost the clamped address-table bound of its EXEC predicate");
+    }
+    CheckFatal([&] { make(Variant::WiderExec, loop)->PlanAndTrack(); }, "not a valid runtime value",
+               "query waterfall accepted a bound its EXEC predicate does not prove");
+  }
+}
+
 void TestFiniteImageWaterfall() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant { Valid, Staggered, Cycle, DifferentMask, MixedWord, DifferentSelect, WiderExec, BadLeaf };
@@ -9357,6 +9441,7 @@ int main() {
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
     Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);
+    Run("query-only image waterfall", TestQueryOnlyImageWaterfall);
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);

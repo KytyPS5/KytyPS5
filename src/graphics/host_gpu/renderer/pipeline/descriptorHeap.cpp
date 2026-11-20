@@ -68,6 +68,11 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	}
 
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+	const auto oldest = m_pending_pools.front().second;
+	if (!m_master_semaphore.IsFree(oldest) && oldest < m_master_semaphore.CurrentTick()) {
+		// The known GPU tick is polled on demand, so it can lag behind completed pools.
+		m_master_semaphore.Refresh();
+	}
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();
@@ -84,10 +89,20 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 }
 
 void DescriptorHeap::CreateDescriptorPool() {
+	// Ray-query layouts carry an unused acceleration-structure binding (see #2339), and
+	// non-push-descriptor sets allocate from this pool, so it needs matching capacity.
+	std::array<vk::DescriptorPoolSize, DescriptorPoolSizes.size() + 1> pool_sizes {};
+	for (size_t i = 0; i < DescriptorPoolSizes.size(); i++) {
+		pool_sizes[i] = DescriptorPoolSizes[i];
+	}
+	auto pool_size_count = DescriptorPoolSizes.size();
+	if (m_graphics.ray_query_enabled) {
+		pool_sizes[pool_size_count++] = {vk::DescriptorType::eAccelerationStructureKHR, 256};
+	}
 	vk::DescriptorPoolCreateInfo create {};
 	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.poolSizeCount = static_cast<uint32_t>(pool_size_count);
+	create.pPoolSizes    = pool_sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 }

@@ -63,7 +63,8 @@ public:
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
-	void CopyImage(Image& source);
+	// Copies the color or depth aspect, or with stencil=true only the stencil aspect.
+	void CopyImage(Image& source, bool stencil = false);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
@@ -104,7 +105,7 @@ public:
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const noexcept {
 		return info.data.address < address + size && address < info.data.End();
@@ -116,10 +117,11 @@ public:
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
-	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] uint64_t        HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+		return info.IsDepth() || info.pixel_format == vk::Format::eS8Uint
+		           ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		           : vk::ImageLayout::eShaderReadOnlyOptimal;
 	}
 	struct HeapChange {
 		GuestRange data;
@@ -140,22 +142,22 @@ public:
 	static inline std::atomic<uint64_t>   serials {0};
 
 	// Unique per image, unlike ImageId: freed slots are reused.
-	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
-	ImageInfo        info;
-	VulkanImage      backing;
+	const uint64_t               serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
-	uint64_t         track_addr     = 0;
-	uint64_t         track_addr_end = 0;
-	ImageId          depth_id {};
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered     = false;
+	uint64_t                     track_addr     = 0;
+	uint64_t                     track_addr_end = 0;
+	ImageId                      depth_id {};
 	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	uint64_t              tick_accessed_last = 0;
+	size_t                lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 
@@ -163,6 +165,7 @@ private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
+	[[nodiscard]] static vk::ImageAspectFlags PrimaryAspect(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>

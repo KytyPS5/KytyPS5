@@ -20,11 +20,19 @@ namespace LibCes {
 
 LIB_VERSION("Ces", 1, "Ces", 1, 1);
 
+// Single-byte profiles are opaque to the game; their address selects the code page.
+// Distinct values keep identical-constant folding from merging the two addresses.
+static const uint8_t CES_SBC_PROFILE_CP1252     = 0;
+static const uint8_t CES_SBC_PROFILE_ISO8859_15 = 1;
+
 static const uint8_t* KYTY_SYSV_ABI CesRefersUcsProfileCp1252() {
 	PRINT_NAME();
+	return &CES_SBC_PROFILE_CP1252;
+}
 
-	static const uint8_t profile = 0;
-	return &profile;
+static const uint8_t* KYTY_SYSV_ABI CesRefersUcsProfileIso8859_15() {
+	PRINT_NAME();
+	return &CES_SBC_PROFILE_ISO8859_15;
 }
 
 static uint32_t CesDecodeUtf8(const uint8_t* utf8, uint32_t utf8max, uint32_t* utf8_len) {
@@ -109,6 +117,49 @@ static uint32_t CesCp1252ToUnicode(uint8_t sbc) {
 	return sbc;
 }
 
+struct Iso8859_15Mapping {
+	uint8_t  iso8859_15;
+	uint32_t unicode;
+};
+
+// ISO-8859-15 matches ISO-8859-1 except for these eight positions.
+static constexpr Iso8859_15Mapping ISO8859_15_REPLACED_MAP[] = {
+    {0xa4, 0x20ac}, {0xa6, 0x0160}, {0xa8, 0x0161}, {0xb4, 0x017d},
+    {0xb8, 0x017e}, {0xbc, 0x0152}, {0xbd, 0x0153}, {0xbe, 0x0178},
+};
+
+static uint8_t CesUnicodeToIso8859_15(uint32_t code) {
+	for (const auto& map: ISO8859_15_REPLACED_MAP) {
+		if (map.unicode == code) {
+			return map.iso8859_15;
+		}
+		if (map.iso8859_15 == code) {
+			// The Latin-1 character that used to live here is not representable.
+			return '?';
+		}
+	}
+	return code <= 0xff ? static_cast<uint8_t>(code) : '?';
+}
+
+static uint32_t CesIso8859_15ToUnicode(uint8_t sbc) {
+	for (const auto& map: ISO8859_15_REPLACED_MAP) {
+		if (map.iso8859_15 == sbc) {
+			return map.unicode;
+		}
+	}
+	return sbc;
+}
+
+static uint8_t CesUnicodeToSbc(const uint8_t* profile, uint32_t code) {
+	return profile == &CES_SBC_PROFILE_ISO8859_15 ? CesUnicodeToIso8859_15(code)
+	                                              : CesUnicodeToCp1252(code);
+}
+
+static uint32_t CesSbcToUnicode(const uint8_t* profile, uint8_t sbc) {
+	return profile == &CES_SBC_PROFILE_ISO8859_15 ? CesIso8859_15ToUnicode(sbc)
+	                                              : CesCp1252ToUnicode(sbc);
+}
+
 static uint32_t CesEncodeUtf8(uint32_t code, uint8_t* utf8, uint32_t utf8max) {
 	uint8_t  tmp[4] {};
 	uint32_t len = 0;
@@ -153,7 +204,7 @@ static int KYTY_SYSV_ABI CesUtf8ToSbc(const uint8_t* utf8, uint32_t utf8max, uin
 	if (utf8_len != nullptr) {
 		*utf8_len = local_len;
 	}
-	*sbc = CesUnicodeToCp1252(code);
+	*sbc = CesUnicodeToSbc(profile, code);
 
 	return 0;
 }
@@ -166,7 +217,7 @@ static int KYTY_SYSV_ABI CesSbcToUtf8(const uint8_t* profile, uint8_t sbc, uint8
 		return -1;
 	}
 
-	const auto code = CesCp1252ToUnicode(sbc);
+	const auto code = CesSbcToUnicode(profile, sbc);
 	const auto len  = CesEncodeUtf8(code, utf8, utf8max);
 	if (utf8_len != nullptr) {
 		*utf8_len = len;
@@ -222,8 +273,8 @@ static int KYTY_SYSV_ABI CesMbcsUcsContextInit(CesContext* context, const CesPro
 
 #if defined(_WIN32)
 
-static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char** outbuf,
-                                 size_t* outbytesleft) {
+static size_t ConvertCp932(const char** inbuf, size_t* inbytesleft, char** outbuf,
+                           size_t* outbytesleft, bool utf16) {
 	const auto* in = reinterpret_cast<const uint8_t*>(*inbuf);
 	while (*inbytesleft != 0) {
 		const uint8_t lead = in[0];
@@ -248,17 +299,24 @@ static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char**
 			return SDL_ICONV_EILSEQ;
 		}
 
-		char      utf8[8];
-		const int utf8_len =
-		    WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, utf8, sizeof(utf8), nullptr, nullptr);
-		if (utf8_len <= 0 || static_cast<size_t>(utf8_len) > *outbytesleft) {
+		char encoded[8];
+		int  encoded_len = 0;
+		if (utf16) {
+			// wchar_t is UTF-16LE on Windows, which is the guest byte order as well.
+			encoded_len = wide_len * static_cast<int>(sizeof(wchar_t));
+			std::memcpy(encoded, wide, static_cast<size_t>(encoded_len));
+		} else {
+			encoded_len = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, encoded, sizeof(encoded),
+			                                  nullptr, nullptr);
+		}
+		if (encoded_len <= 0 || static_cast<size_t>(encoded_len) > *outbytesleft) {
 			*inbuf = reinterpret_cast<const char*>(in);
 			return SDL_ICONV_E2BIG;
 		}
 
-		std::memcpy(*outbuf, utf8, static_cast<size_t>(utf8_len));
-		*outbuf += utf8_len;
-		*outbytesleft -= static_cast<size_t>(utf8_len);
+		std::memcpy(*outbuf, encoded, static_cast<size_t>(encoded_len));
+		*outbuf += encoded_len;
+		*outbytesleft -= static_cast<size_t>(encoded_len);
 		in += char_len;
 		*inbytesleft -= char_len;
 	}
@@ -268,9 +326,23 @@ static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char**
 
 #endif
 
-static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_t source_max,
-                             uint32_t* source_len, uint8_t* destination, uint32_t destination_max,
-                             uint32_t* destination_len, bool measure) {
+enum class CesUnicodeForm { Utf8, Utf16 };
+
+static void WriteTerminator(void* destination, size_t unit, CesUnicodeForm form) {
+	if (form == CesUnicodeForm::Utf16) {
+		static_cast<uint16_t*>(destination)[unit] = 0;
+	} else {
+		static_cast<uint8_t*>(destination)[unit] = 0;
+	}
+}
+
+// destination_max and destination_len count code units of the requested form (bytes for
+// UTF-8, 16-bit units for UTF-16); one unit is always reserved for the terminator.
+static int ConvertMbcs(CesContext* context, const uint8_t* source, uint32_t source_max,
+                       uint32_t* source_len, void* destination, uint32_t destination_max,
+                       uint32_t* destination_len, bool measure, CesUnicodeForm form) {
+	const size_t unit_size = form == CesUnicodeForm::Utf16 ? sizeof(uint16_t) : sizeof(uint8_t);
+
 	if (source_len != nullptr) {
 		*source_len = 0;
 	}
@@ -278,7 +350,7 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		*destination_len = 0;
 	}
 	if (destination != nullptr && destination_max != 0) {
-		destination[0] = 0;
+		WriteTerminator(destination, 0, form);
 	}
 	if (context == nullptr) {
 		return CES_ERROR_INVALID_PARAMETER;
@@ -302,7 +374,8 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 	}
 	const bool bounded_end = source_max != 0 && source_size == source_max;
 #if !defined(_WIN32)
-	const auto converter = SDL_iconv_open("UTF-8", context->profile->encoding);
+	const auto converter = SDL_iconv_open(form == CesUnicodeForm::Utf16 ? "UTF-16LE" : "UTF-8",
+	                                      context->profile->encoding);
 	EXIT_IF(converter == reinterpret_cast<SDL_iconv_t>(-1));
 #endif
 
@@ -312,11 +385,13 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 	int                   result     = 0;
 	std::array<char, 256> scratch;
 	do {
-		char* output = measure ? scratch.data() : reinterpret_cast<char*>(destination) + produced;
-		const size_t capacity    = measure ? scratch.size() : destination_max - 1 - produced;
-		size_t       output_left = capacity;
+		char* output = measure ? scratch.data() : static_cast<char*>(destination) + produced;
+		const size_t capacity =
+		    measure ? scratch.size() : (destination_max - 1) * unit_size - produced;
+		size_t output_left = capacity;
 #if defined(_WIN32)
-		const auto status = ConvertCp932ToUtf8(&input, &input_left, &output, &output_left);
+		const auto status = ConvertCp932(&input, &input_left, &output, &output_left,
+		                                 form == CesUnicodeForm::Utf16);
 #else
 		const auto status = SDL_iconv(converter, &input, &input_left, &output, &output_left);
 #endif
@@ -343,13 +418,13 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 #endif
 
 	if (!measure) {
-		destination[produced] = 0;
+		WriteTerminator(destination, produced / unit_size, form);
 	}
 	if (source_len != nullptr) {
 		*source_len = static_cast<uint32_t>(source_size - input_left);
 	}
 	if (destination_len != nullptr) {
-		*destination_len = static_cast<uint32_t>(produced);
+		*destination_len = static_cast<uint32_t>(produced / unit_size);
 	}
 	return result;
 }
@@ -358,8 +433,8 @@ static int KYTY_SYSV_ABI CesMbcsStrGetUtf8Len(CesContext* context, const uint8_t
                                               uint32_t source_max, uint32_t* source_len,
                                               uint32_t* destination_len) {
 	PRINT_NAME();
-	return ConvertMbcsToUtf8(context, source, source_max, source_len, nullptr, 0, destination_len,
-	                         true);
+	return ConvertMbcs(context, source, source_max, source_len, nullptr, 0, destination_len, true,
+	                   CesUnicodeForm::Utf8);
 }
 
 static int KYTY_SYSV_ABI CesMbcsStrToUtf8Str(CesContext* context, const uint8_t* source,
@@ -367,8 +442,25 @@ static int KYTY_SYSV_ABI CesMbcsStrToUtf8Str(CesContext* context, const uint8_t*
                                              uint8_t* destination, uint32_t destination_max,
                                              uint32_t* destination_len) {
 	PRINT_NAME();
-	return ConvertMbcsToUtf8(context, source, source_max, source_len, destination, destination_max,
-	                         destination_len, false);
+	return ConvertMbcs(context, source, source_max, source_len, destination, destination_max,
+	                   destination_len, false, CesUnicodeForm::Utf8);
+}
+
+static int KYTY_SYSV_ABI CesMbcsStrGetUtf16Len(CesContext* context, const uint8_t* source,
+                                               uint32_t source_max, uint32_t* source_len,
+                                               uint32_t* destination_len) {
+	PRINT_NAME();
+	return ConvertMbcs(context, source, source_max, source_len, nullptr, 0, destination_len, true,
+	                   CesUnicodeForm::Utf16);
+}
+
+static int KYTY_SYSV_ABI CesMbcsStrToUtf16Str(CesContext* context, const uint8_t* source,
+                                              uint32_t source_max, uint32_t* source_len,
+                                              uint16_t* destination, uint32_t destination_max,
+                                              uint32_t* destination_len) {
+	PRINT_NAME();
+	return ConvertMbcs(context, source, source_max, source_len, destination, destination_max,
+	                   destination_len, false, CesUnicodeForm::Utf16);
 }
 
 LIB_DEFINE(InitCes_1) {
@@ -376,7 +468,10 @@ LIB_DEFINE(InitCes_1) {
 	LIB_FUNC("538bRGc6Zo8", LibCes::CesMbcsUcsContextInit);
 	LIB_FUNC("r7Sr1i7KLus", LibCes::CesMbcsStrGetUtf8Len);
 	LIB_FUNC("yGKn6vdYInc", LibCes::CesMbcsStrToUtf8Str);
+	LIB_FUNC("KkcyBpHeV6Q", LibCes::CesMbcsStrGetUtf16Len);
+	LIB_FUNC("RO-MRURI76g", LibCes::CesMbcsStrToUtf16Str);
 	LIB_FUNC("LPzYZ+FR0BI", LibCes::CesRefersUcsProfileCp1252);
+	LIB_FUNC("NLW0QcvJY-E", LibCes::CesRefersUcsProfileIso8859_15);
 	LIB_FUNC("3Q1gOWWarcw", LibCes::CesUtf8ToSbc);
 	LIB_FUNC("xTd54EEL1Ao", LibCes::CesSbcToUtf8);
 }

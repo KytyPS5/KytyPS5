@@ -5,8 +5,10 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshSlices.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -144,7 +146,8 @@ struct TestCompileResult {
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
-    uint32_t push_data_start_dword = 0) {
+    uint32_t push_data_start_dword = 0,
+    uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -158,7 +161,8 @@ TestCompileResult RecompileForTest(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), options, specialization, push_data_start_dword,
+      push_data_ceiling);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -1407,7 +1411,7 @@ void TestShaderFeatureCollection() {
 
   block->AppendNewInst(ValueOpcode::DppMoveU32, {Value(0u), Value(true)});
   block->AppendNewInst(ValueOpcode::ImageQueryLod,
-                       {Value(0u), Value(0u), Value(0u)});
+                       {Value(0u), Value(0u), Value(0u), Value(true)});
   block->AppendNewInst(ValueOpcode::ImageGatherRaw,
                        {Value(0u), Value(0u), Value(0u), Value(0u),
                         Value(0u), Value(0u), Value(0u), Value(true)});
@@ -1941,6 +1945,63 @@ void TestNggVertexEntryState() {
     Check(result.program.wave_size == wave_size,
           "NGG wave size was lost during translation");
     CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestVertexEntryMaskCoversRunningLanes() {
+  constexpr uint32_t exec = 126;
+  constexpr uint32_t vcc_lo = 106;
+  constexpr uint32_t zero = 128;
+  constexpr uint32_t one = 129;
+  constexpr uint32_t all_ones = 193;
+  constexpr uint32_t s_sub_i32 = 0x03;
+  constexpr uint32_t s_lshr_b64 = 0x21;
+  constexpr uint32_t s_mov_b64 = 0x04;
+  constexpr uint32_t v_mov_b32 = 0x01;
+  constexpr uint32_t packed_vertex_count = 3;
+  constexpr uint32_t one_float = 242;
+  static_assert(EncodeSop2(s_sub_i32, vcc_lo, zero, packed_vertex_count) ==
+                0x81ea0380u);
+  static_assert(EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo) == 0x90fe6ac1u);
+  const auto compile = [&](uint32_t wave_size, uint32_t count_base,
+                           uint32_t value,
+                           std::initializer_list<uint32_t> later_exec = {}) {
+    std::vector<uint32_t> shader = {
+        0xbefe04c1u,
+        0x906a8803u,
+        0x81ea6a80u,
+        0x90fe6ac1u,
+        EncodeVop1(v_mov_b32, 1, one_float),
+        EncodeSop2(s_sub_i32, vcc_lo, count_base, packed_vertex_count),
+        EncodeSop2(s_lshr_b64, exec, all_ones, vcc_lo)};
+    shader.insert(shader.end(), later_exec);
+    shader.insert(shader.end(),
+                  {EncodeVop1(v_mov_b32, 0, value), EncodeExp0(0x0c, 0xf),
+                   EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01)});
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.wave_size = wave_size;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv);
+  };
+  const auto reads_lane = [](const std::string &source) {
+    return source.find("gl_SubgroupInvocationID") != std::string::npos;
+  };
+  for (const uint32_t wave_size : {32u, 64u}) {
+    const auto captured = compile(wave_size, zero, one_float);
+    Check(!reads_lane(captured) &&
+              captured.find("OpGroupNonUniform") == std::string::npos,
+          "a running vertex lane stayed predicated by the entry mask of its "
+          "own lane bound");
+    Check(compile(wave_size, zero, packed_vertex_count)
+                  .find("OpGroupNonUniformBallotFindMSB") != std::string::npos,
+          "the packed vertex count lost its lane bound");
+    Check(reads_lane(compile(wave_size, one, one_float)),
+          "an entry mask one lane short of the lane bound was taken as "
+          "covering it");
+    Check(reads_lane(compile(wave_size, zero, one_float,
+                             {EncodeSop1(s_mov_b64, exec, one)})),
+          "an EXEC write after the vertex entry mask stopped predicating");
   }
 }
 
@@ -4455,6 +4516,84 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
             result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer)] != 0,
         "unbased FLAT did not compile through BDA");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // A guest page past the BDA table is a missing page: get_bda_pointer compares the 64-bit page
+  // with the table size before it indexes the table or records a fault.
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto begin  = source.find("%get_bda_pointer = OpFunction");
+  const auto end    = source.find("OpFunctionEnd", begin);
+  const auto body   = begin == std::string::npos ? std::string {} : source.substr(begin, end - begin);
+  const auto pages  = std::to_string(Libs::Graphics::BufferCache::CACHING_NUMPAGES);
+  std::string pages_id;
+  for (size_t line = 0; line < source.size();) {
+    const auto next = std::min(source.find('\n', line), source.size());
+    const auto text = source.substr(line, next - line);
+    if (text.find("OpConstant %ulong " + pages) != std::string::npos ||
+        text.find("OpConstant %uint64 " + pages) != std::string::npos) {
+      pages_id = text.substr(text.find('%'), text.find(' ', text.find('%')) - text.find('%'));
+    }
+    line = next + 1;
+  }
+  Check(!pages_id.empty(), "BDA page lookup has no page table size constant");
+
+  // Follow the comparison: it must pick the table index and guard the fault record.
+  std::vector<std::vector<std::string>> instructions;
+  {
+    std::istringstream lines(body);
+    for (std::string line; std::getline(lines, line);) {
+      std::istringstream words(line);
+      std::vector<std::string> tokens;
+      for (std::string word; words >> word;) {
+        tokens.push_back(word);
+      }
+      instructions.push_back(std::move(tokens));
+    }
+  }
+  // Empty pattern entries match any operand.
+  const auto find = [&](std::initializer_list<std::string> pattern) -> std::string {
+    for (const auto &tokens: instructions) {
+      if (tokens.size() == pattern.size() &&
+          std::equal(pattern.begin(), pattern.end(), tokens.begin(),
+                     [](const std::string &p, const std::string &t) { return p.empty() || p == t; })) {
+        return tokens[0];
+      }
+    }
+    return {};
+  };
+  const auto in_range = find({"", "=", "OpULessThan", "%bool", "", pages_id});
+  const auto index    = find({"", "=", "OpSelect", "%uint", in_range, "", "%uint_0"});
+  const auto missing  = find({"", "=", "OpLogicalNot", "%bool", in_range});
+  auto       unbacked = find({"", "=", "OpLogicalOr", "%bool", "", missing});
+  if (unbacked.empty()) {
+    unbacked = find({"", "=", "OpLogicalOr", "%bool", missing, ""});
+  }
+  Check(!in_range.empty() && !index.empty() && !missing.empty() && !unbacked.empty() &&
+            !find({"", "=", "OpAccessChain", "", "%bda_pagetable", "%uint_0", index}).empty() &&
+            !find({"OpBranchConditional", unbacked, "", ""}).empty(),
+        "BDA page lookup did not select the table index with the bounds check");
+
+  // The fault bitmap is only touched in the block the bounds check branches into.
+  std::string record_label;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 4 && tokens[0] == "OpBranchConditional" && tokens[1] == in_range) {
+      record_label = tokens[2];
+    }
+  }
+  bool     in_record    = false;
+  bool     record_index = false;
+  uint32_t record_uses  = 0;
+  uint32_t total_uses   = 0;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 3 && tokens[1] == "=" && tokens[2] == "OpLabel") {
+      in_record = !record_label.empty() && tokens[0] == record_label;
+    }
+    const auto uses = static_cast<uint32_t>(std::count(tokens.begin(), tokens.end(), "%fault_buffer"));
+    total_uses += uses;
+    record_uses += in_record ? uses : 0;
+    record_index |= in_record && std::find(tokens.begin(), tokens.end(), index) != tokens.end();
+  }
+  Check(!record_label.empty() && record_uses != 0 && record_uses == total_uses && record_index,
+        "BDA fault record is not guarded by the page bounds check");
 }
 
 void TestNewShaderRecompilerDsReadWrite2Translation() {
@@ -7698,9 +7837,16 @@ void TestMeshExportStorage() {
         options, push_data_start);
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
-    Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
-              layout.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
-          "mesh shader did not retain its user-data placement and buffer offset");
+    Check(
+        layout.UsesPushData() ==
+                (push_data_start == PushData::MeshDrawDwordCount) &&
+            layout.push_data_start_dword ==
+                (push_data_start == PushData::MeshDrawDwordCount
+                     ? PushData::DwordCount - layout.ShaderDataDwords()
+                     : PushData::NoStart) &&
+            layout.descriptor_counts[static_cast<size_t>(
+                ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 1,
+        "mesh shader did not retain its user-data placement and buffer offset");
     Check(!result.program.info.uses_dma && result.program.info.uses_device_address,
           "mesh index fetch used the guest address domain");
     const auto reg = std::ranges::find(result.program.info.user_data_registers, 13u);
@@ -7712,7 +7858,9 @@ void TestMeshExportStorage() {
       const auto operand =
           std::string(layout.UsesPushData() ? "vsharp" : "shader_data") +
           " %uint_0 %uint_" +
-          std::to_string(dword + (layout.UsesPushData() ? push_data_start : 0u));
+          std::to_string(dword + (layout.UsesPushData()
+                                      ? layout.push_data_start_dword
+                                      : 0u));
       Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", operand.c_str()),
             "mesh user SGPR or buffer offset loaded from the wrong storage");
     }
@@ -8180,6 +8328,57 @@ void TestEmbeddedVertexFormatSwizzle() {
   }
 }
 
+void TestMeshSlices() {
+  using Libs::Graphics::MeshGridLimits;
+  using Libs::Graphics::MeshSlice;
+  struct Case {
+    uint32_t groups, instances;
+    MeshGridLimits limits;
+    std::vector<std::array<uint32_t, 4>> slices;
+  };
+  const MeshGridLimits amd{65535, 65535, 67107840};
+  const MeshGridLimits nvidia{4194304, 65535, 4194304};
+  const std::vector<Case> cases = {
+      {3, 4, amd, {{0, 0, 3, 4}}},
+      {1, 76426, nvidia, {{0, 0, 1, 65535}, {0, 65535, 1, 10891}}},
+      {173400, 1, amd, {{0, 0, 65535, 1}, {65535, 0, 65535, 1}, {131070, 0, 42330, 1}}},
+      {5, 2, {2, 8, 100}, {{0, 0, 2, 1}, {2, 0, 2, 1}, {4, 0, 1, 1}, {0, 1, 2, 1}, {2, 1, 2, 1}, {4, 1, 1, 1}}},
+      {4, 10, {8, 8, 12}, {{0, 0, 4, 3}, {0, 3, 4, 3}, {0, 6, 4, 3}, {0, 9, 4, 1}}},
+      {3, 6, {65535, 65535, 10}, {{0, 0, 3, 3}, {0, 3, 3, 3}}},
+      {65535, 2, amd, {{0, 0, 65535, 2}}},
+      {1, 1, {65535, 0, 4194304}, {}},
+      {1, 1, {0, 65535, 4194304}, {}},
+      {1, 1, {65535, 65535, 0}, {}},
+      {0, 5, amd, {}},
+      {5, 0, amd, {}},
+  };
+  for (const auto &test : cases) {
+    std::vector<std::array<uint32_t, 4>> slices;
+    Libs::Graphics::ForEachMeshSlice(test.groups, test.instances, test.limits, [&](const MeshSlice &slice) {
+      slices.push_back({slice.base_group, slice.base_instance, slice.groups, slice.instances});
+    });
+    Check(slices == test.slices, "mesh draw slices differ from the expected launch order");
+  }
+  for (const auto &[groups, instances, limits] :
+       {std::tuple{UINT32_MAX, 1u, amd}, std::tuple{1u, UINT32_MAX, nvidia}}) {
+    uint64_t covered = 0;
+    uint64_t next_group = 0;
+    uint64_t next_instance = 0;
+    Libs::Graphics::ForEachMeshSlice(groups, instances, limits, [&](const MeshSlice &slice) {
+      Check(slice.groups != 0 && slice.instances != 0 && slice.groups <= limits.groups &&
+                slice.instances <= limits.instances &&
+                uint64_t{slice.groups} * slice.instances <= limits.total,
+            "mesh draw slice exceeds a host workgroup limit");
+      Check(slice.base_group == next_group % groups && slice.base_instance == next_instance,
+            "mesh draw slices skip or repeat workgroups");
+      next_group = slice.base_group + uint64_t{slice.groups};
+      next_instance = slice.base_instance + (next_group == groups ? slice.instances : 0);
+      covered += uint64_t{slice.groups} * slice.instances;
+    });
+    Check(covered == uint64_t{groups} * instances, "mesh draw slices do not cover the draw");
+  }
+}
+
 void TestMeshInputAssembly() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -8289,50 +8488,56 @@ void TestMeshInputAssembly() {
     options.wave_size = test.wave_size;
     options.user_data_count = 0;
     options.input_info.vertex = &input;
-    auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, test.width,
-                             test.address_low, 0x12};
-    Inst *load = nullptr;
-    for (auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
-        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
-      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
-        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
-        const uint32_t value = kind == StageInputKind::LocalInvocationIndex
-                                   ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
-        inst.ReplaceUsesWith(Value(value));
-      } else if (inst.GetOpcode() == ValueOpcode::LoadDeviceAddressU32) {
-        Check(load == nullptr, "mesh index fetch emitted duplicate loads");
-        load = &inst;
+    struct Launch {
+      uint32_t group, instance, base_group, base_instance;
+    };
+    for (const Launch launch : {Launch{test.group, 2u, 0u, 0u}, Launch{0u, 0u, test.group, 2u}}) {
+      auto program = Frontend::TranslateProgram(decoded, graph, options);
+      const uint32_t draw[] = {test.count,   test.base_vertex, test.width,
+                               test.address_low, 0x12, launch.base_group,
+                               launch.base_instance};
+      Inst *load = nullptr;
+      for (auto &inst : *program.blocks.front()) {
+        if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+          inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+        } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+          const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+          const uint32_t value = kind == StageInputKind::LocalInvocationIndex
+                                     ? test.lane
+                                     : inst.Arg(1).U32() == 0 ? launch.group : launch.instance;
+          inst.ReplaceUsesWith(Value(value));
+        } else if (inst.GetOpcode() == ValueOpcode::LoadDeviceAddressU32) {
+          Check(load == nullptr, "mesh index fetch emitted duplicate loads");
+          load = &inst;
+        }
       }
-    }
-    ConstantPropagationPass(program.blocks);
-    if (test.fast_launch) {
-      Check(load == nullptr, "fast launch emitted an ordinary input-assembly index fetch");
-    } else {
-      Check(load != nullptr && load->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
-                load->Arg(1).Resolve().U32() == 0x12 &&
-                load->Arg(2).Resolve().U32() == test.byte_offset &&
-                load->Arg(3).Resolve().U1() == test.fetch,
-            "mesh index fetch address or active-lane predicate is wrong");
-      load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
       ConstantPropagationPass(program.blocks);
-    }
-    std::array<uint32_t, 9> vgprs{};
-    std::array<uint32_t, 4> sgprs{};
-    for (const auto &inst : *program.blocks.front()) {
-      if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
-        vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
-      } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
+      if (test.fast_launch) {
+        Check(load == nullptr, "fast launch emitted an ordinary input-assembly index fetch");
+      } else {
+        Check(load != nullptr && load->Arg(0).Resolve().U32() == (test.address_low & ~3u) &&
+                  load->Arg(1).Resolve().U32() == 0x12 &&
+                  load->Arg(2).Resolve().U32() == test.byte_offset &&
+                  load->Arg(3).Resolve().U1() == test.fetch,
+              "mesh index fetch address or active-lane predicate is wrong");
+        load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
+        ConstantPropagationPass(program.blocks);
       }
+      std::array<uint32_t, 9> vgprs{};
+      std::array<uint32_t, 4> sgprs{};
+      for (const auto &inst : *program.blocks.front()) {
+        if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
+          vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
+        } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
+          sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
+        }
+      }
+      Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
+                vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+                vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
+                vgprs[test.fast_launch ? 6 : 8] == 2u,
+            "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
     }
-    Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
-              vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-              vgprs[test.fast_launch ? 6 : 8] == 2u,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
 
@@ -9511,6 +9716,53 @@ void TestLaneMaskProjection() {
     const auto mixed_select = thread_bit(e, e.Select(selected, active_mask, raw));
     const auto different_lane = thread_bit(e, active_mask, false);
     const auto high_half = thread_bit(e, ballot(e, active, 1u));
+    const auto bound = U32(e.Emit(ValueOpcode::LaneBound));
+    const auto bound_bit = [&](uint64_t lanes, U32 shift,
+                               uint32_t low_lanes = 32u) {
+      const auto prefix =
+          e.Emit(ValueOpcode::ShiftRightLogical64, {Value(lanes), shift});
+      const auto word = [&](uint32_t index) {
+        return U32(
+            e.Emit(ValueOpcode::CompositeExtractU64, {prefix, Value(index)}));
+      };
+      const auto in_low_word =
+          e.ULessThan(U32(e.Emit(ValueOpcode::LaneId)), U32(Value(low_lanes)));
+      return thread_bit(e, wave_size == 64u
+                               ? e.Select(in_low_word, word(0u), word(1u))
+                               : word(0u));
+    };
+    const auto negated_bound = e.ISub(zero, bound);
+    const auto bounded = bound_bit(UINT64_MAX, negated_bound);
+    const auto packed_bound = e.BitwiseOr(bound, U32(Value(1u << 28u)));
+    const auto second_count = U32(e.Emit(ValueOpcode::BitFieldUExtract,
+                                         {packed_bound, Value(8u), Value(8u)}));
+    const auto prefix_of = [&](U32 count) {
+      return bound_bit(UINT64_MAX, e.ISub(U32(Value(64u)), count));
+    };
+    const auto extract_bound = [&](uint32_t offset, uint32_t count = 8u) {
+      return U32(e.Emit(ValueOpcode::BitFieldUExtract,
+                        {bound, Value(offset), Value(count)}));
+    };
+    const auto second_count_bounded = prefix_of(second_count);
+    const auto extracted_bounded = prefix_of(extract_bound(0u));
+    const auto extracted_half_bounded = prefix_of(extract_bound(1u));
+    const auto extracted_bit_bounded = prefix_of(extract_bound(0u, 1u));
+    const auto other_bound = U32(e.Emit(ValueOpcode::LaneBound));
+    const auto two_bounds =
+        bound_bit(UINT64_MAX, e.ISub(zero, e.ISub(bound, other_bound)));
+    auto deep_shift = negated_bound;
+    for (uint32_t step = 0; step < 80u; step++) {
+      deep_shift = e.ISub(deep_shift, U32(Value(64u)));
+    }
+    const auto deep_bounded = bound_bit(UINT64_MAX, deep_shift);
+    const auto shifted_half_bounded = prefix_of(
+        U32(e.Emit(ValueOpcode::ShiftRightLogical32, {bound, Value(1u)})));
+    const auto first_bound_uncovered =
+        bound_bit(UINT64_MAX >> 1u, e.ISub(bound, U32(Value(2u))));
+    const auto last_bound_uncovered = wave_size == 64u
+                                          ? mask_bit(UINT32_MAX, 0x7fffffffu)
+                                          : mask_bit(0x7fffffffu, 0u);
+    const auto wrong_word = bound_bit(UINT64_MAX, negated_bound, 31u);
     const auto initial_mask = e.BitwiseAnd(active_mask, ballot(e, selected));
     const auto raw_consumer = e.Emit(ValueOpcode::IAdd32, {initial_mask, Value(3u)});
     const auto initial_predicate = e.LogicalAnd(active, selected);
@@ -9550,6 +9802,28 @@ void TestLaneMaskProjection() {
           "constant EXEC mask retained lane extraction or register predication");
     Check(partial.Resolve().TryInstruction() != nullptr,
           "partial mask was incorrectly folded to a constant predicate");
+    Check(bounded.Resolve() == Value(true) &&
+              second_count_bounded.Resolve() == Value(true) &&
+              extracted_bounded.Resolve() == Value(true),
+          "a prefix mask of the lane bound still predicated a running lane");
+    Check(extracted_half_bounded.Resolve().TryInstruction() != nullptr &&
+              shifted_half_bounded.Resolve().TryInstruction() != nullptr,
+          "a prefix mask of half the lane bound was taken as covering it");
+    Check(extracted_bit_bounded.Resolve().TryInstruction() != nullptr,
+          "a prefix mask of the lane bound's lowest bit was taken as covering "
+          "it");
+    Check(two_bounds.Resolve().TryInstruction() != nullptr,
+          "a mask of two different lane bounds was evaluated as one bound");
+    Check(deep_bounded.Resolve().TryInstruction() != nullptr,
+          "a lane bound mask behind a long chain was evaluated without a "
+          "bound on the work");
+    Check(
+        first_bound_uncovered.Resolve().TryInstruction() != nullptr &&
+            last_bound_uncovered.Resolve().TryInstruction() != nullptr,
+        "a mask that misses one lane bound was taken as covering every bound");
+    Check(wave_size == 32u || wrong_word.Resolve().TryInstruction() != nullptr,
+          "wave64 lane bound projection accepted a word selected at the wrong "
+          "lane");
     if (wave_size == 32u) {
       Check(low_only.Resolve() == Value(true) && high_only.Resolve() == Value(false),
             "wave32 constant mask incorrectly consumed the high half");
@@ -10082,9 +10356,7 @@ void TestNativeWideValueValidation() {
       const auto sampler =
           ir.Emit(ValueOpcode::GetSamplerResource,
                   {Value(0u), Value(0u), Value(0u), Value(0u)});
-      ir.Emit(opcode, {image, sampler, address}, flags);
-    } else if (opcode == ValueOpcode::ImageQueryDimensions) {
-      ir.Emit(opcode, {image, address}, flags);
+      ir.Emit(opcode, {image, sampler, address, Value(true)}, flags);
     } else {
       ir.Emit(opcode, {image, address, Value(true)}, flags);
     }
@@ -12664,6 +12936,74 @@ void TestGraphicsPushConstantPlacement() {
   CheckSpirvBinaryValidates(spill.spirv);
 }
 
+void TestVertexPushConstantPlacement() {
+  using ShaderRecompiler::IR::PushData;
+  constexpr uint32_t PrefixDwords = PushData::GraphicsDrawDwords(false, true);
+  constexpr uint32_t FirstPixelDwords = 2;
+  constexpr uint32_t SecondPixelDwords = 7;
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 0),
+      EncodeVop1(0x01, 1, 1),
+      EncodeVop1(0x01, 2, 2),
+      EncodeVop1(0x01, 3, 3),
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 1, 2, 3),
+      0xbf810000u,
+  };
+  const auto options = MakeCompileOptions(ShaderType::Vertex);
+  const auto first =
+      RecompileForTest(shader, options, PrefixDwords + FirstPixelDwords);
+  const auto second =
+      RecompileForTest(shader, options, PrefixDwords + SecondPixelDwords);
+  const auto size = first.program.bindings.ShaderDataDwords();
+  Check(size != 0 && first.program.bindings.UsesPushData() &&
+            first.program.bindings.push_data_start_dword ==
+                PushData::DwordCount - size &&
+            first.program.bindings == second.program.bindings &&
+            first.spirv == second.spirv,
+        "vertex shader placement depended on the paired pixel data size");
+  CheckSpirvBinaryValidates(first.spirv);
+  constexpr uint32_t Ceiling = 16;
+  const auto exact = RecompileForTest(shader, options, Ceiling - size, Ceiling);
+  const auto spill =
+      RecompileForTest(shader, options, Ceiling - size + 1, Ceiling);
+  Check(exact.program.bindings.push_data_start_dword == Ceiling - size &&
+            !spill.program.bindings.UsesPushData(),
+        "vertex shader ignored the preceding vertex stage's push-data ceiling");
+  CheckSpirvBinaryValidates(exact.spirv);
+  CheckSpirvBinaryValidates(spill.spirv);
+}
+
+void TestGraphicsPushConstantFit() {
+  using ShaderRecompiler::IR::PushData;
+  for (uint32_t prefix = 0; prefix <= PushData::DwordCount; prefix++) {
+    for (uint32_t ps = 0; ps <= PushData::DwordCount; ps++) {
+      const bool ps_fits = ps != 0 && prefix + ps <= PushData::DwordCount;
+      const auto floor = prefix + (ps_fits ? ps : 0u);
+      const auto ps_start = ps_fits ? prefix : PushData::NoStart;
+      Check(PushData::StartFor(ShaderType::Pixel, prefix, ps) == ps_start &&
+                PushData::StartFor(ShaderType::Compute, prefix, ps) == ps_start,
+            "bottom-up shader data changed push/spill selection");
+      for (uint32_t used = 0; used <= PushData::DwordCount; used++) {
+        const auto ceiling = PushData::DwordCount - used;
+        for (uint32_t vs = 0; vs <= PushData::DwordCount; vs++) {
+          const bool fits =
+              vs != 0 && floor + used + vs <= PushData::DwordCount;
+          const auto start = fits ? ceiling - vs : PushData::NoStart;
+          for (const auto stage :
+               {ShaderType::Vertex, ShaderType::Mesh, ShaderType::Local,
+                ShaderType::TessellationControl,
+                ShaderType::TessellationEvaluation}) {
+            Check(PushData::StartFor(stage, floor, vs, ceiling) == start,
+                  "top-down shader data changed push/spill selection or "
+                  "placement");
+          }
+        }
+      }
+    }
+  }
+}
+
 void TestCapturedBufferLoadUbyteD16Decode() {
   namespace Decoder = ShaderRecompiler::Decoder;
   const uint32_t code[] = {0xe080e000u, 0x80040003u};
@@ -13545,6 +13885,7 @@ int main() {
   TestVertexBufferGrouping();
   TestShaderProgramHash();
   TestNggVertexEntryState();
+  TestVertexEntryMaskCoversRunningLanes();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
@@ -13662,6 +14003,7 @@ int main() {
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
+  TestMeshSlices();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
@@ -13725,6 +14067,8 @@ int main() {
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
+  TestVertexPushConstantPlacement();
+  TestGraphicsPushConstantFit();
   TestCapturedBufferLoadUbyteD16Decode();
   TestCapturedGlobalLoadShortD16HiDecode();
   TestFlatLoadShortD16HiLlvmEncodingAnchor();

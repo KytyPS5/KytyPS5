@@ -26,11 +26,33 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <string_view>
 #include <thread>
 
 namespace Emulator {
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Titles that keep live data below rsp across stores to GPU-tracked memory. Windows builds the
+// exception frame for the tracking fault on the guest stack and overwrites that data.
+static constexpr std::array<std::string_view, 1> RedZoneRequiredTitles = {
+    "PPSA34502", // Call of Duty: Black Ops II: CPU skinning keeps blend constants there (#1752)
+};
+
+static void EnableRequiredRedZoneProtection(const std::string& title_id) {
+	if (Config::RedZoneProtectionEnabled() ||
+	    std::find(RedZoneRequiredTitles.begin(), RedZoneRequiredTitles.end(), title_id) ==
+	        RedZoneRequiredTitles.end()) {
+		return;
+	}
+	Config::EnableRedZoneProtection();
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Red zone protection enabled: required by {}\n", title_id));
+}
+#endif
 
 static void PrintSystemInfo() {
 	const Common::SystemInfo info = Common::GetSystemInfo();
@@ -104,6 +126,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
+	// Memory::Initialize reserves Region 0 first. After the Vulkan device is created,
+	// agc.cpp reserves Regions 1 and 2, leaving room for driver initialization.
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
@@ -165,6 +189,9 @@ void Run(const RunOptions& options) {
 	if (!title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EnableRequiredRedZoneProtection(title_id);
+#endif
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);

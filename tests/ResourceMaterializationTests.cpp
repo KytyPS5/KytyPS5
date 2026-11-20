@@ -1204,6 +1204,40 @@ void TestEmptyScalarBufferSpecialization() {
           "empty root folded a scalar read with nonempty candidates");
 }
 
+void TestPlanningReadsSkipBufferFolds(bool vector_table, uint32_t raw_index) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 12u;
+  auto &block = AddValueBlock(program);
+  std::array<Value, 12> user_data;
+  for (uint32_t reg = 0; reg < 12u; ++reg)
+    user_data[reg] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(reg))}));
+  DescriptorSource source;
+  source.dword_count = 4u;
+  for (uint32_t word = 0; word < 4u; ++word) source.dwords[word] = user_data[8u + word];
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0u, .read = true, .scalar = !vector_table});
+  const auto table = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {user_data[0], user_data[1], user_data[2], user_data[3]}));
+  program.memory_info.push_back({.kind = vector_table ? ResourceKind::Buffer : ResourceKind::ScalarBuffer,
+                                 .resource = raw_index, .data_dwords = vector_table ? 4u : 1u, .planning_only = true});
+  auto &read = vector_table
+      ? block.AppendNewInst(ValueOpcode::LoadBufferU32x4, {table, Value(0u), Value(0u), Value(0u), Value(true)})
+      : block.AppendNewInst(ValueOpcode::ReadConstBuffer, {table, Value(0u)});
+  read.SetFlags(MemoryFlags{.index = 0u});
+  auto &use = block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
+  ResourceSpecialization specialization;
+  specialization.buffers.resize(1u);
+  specialization.buffers[0].zero_stride_oob = vector_table;
+  specialization.buffers[0].scalar_empty = !vector_table;
+  ApplyResourceSpecialization(program, specialization);
+  Check(use.Arg(0).Resolve().TryInstruction() == &read,
+        vector_table ? "planning-only descriptor load was folded through an unrelated zero-stride buffer"
+                     : "planning-only table read was folded through an unrelated empty scalar table");
+}
+
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
@@ -1260,12 +1294,14 @@ void TestSignedStorageSpecialization() {
   const SrtRuntime runtime{.user_data = data};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization, signed16;
-  for (const auto format : {F::k16SInt, F::k32SInt, F::k16SInt}) {
+  for (const auto format : {F::k16SInt, F::k32SInt, F::k16_16SInt, F::k16SInt}) {
     data[0] = uint32_t(format) << 20u;
     Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "write-only signed storage image failed materialization");
-    const auto conversion = format == F::k16SInt ? format : F::kInvalid;
-    const auto view = format == F::k16SInt ? F::k16UInt : F::k32UInt;
+    const auto conversion = format == F::k32SInt ? F::kInvalid : format;
+    const auto view = format == F::k16SInt     ? F::k16UInt
+                      : format == F::k16_16SInt ? F::k16_16UInt
+                                                : F::k32UInt;
     Check(specialization.images[0].numeric_class == N::Uint &&
               specialization.images[0].conversion_format == conversion &&
               specialization.images[0].shader_swizzle == swizzle &&
@@ -1283,7 +1319,7 @@ void TestSignedStorageSpecialization() {
     Check(binding && ImageBindingResourceClass(*binding) == ImageResourceClass::Storage,
           "signed storage conversion did not reuse the unsigned storage binding");
   }
-  for (const auto format : {F::k8SInt, F::k16SInt, F::k32SInt}) {
+  for (const auto format : {F::k8SInt, F::k16SInt, F::k16_16SInt, F::k32SInt}) {
     data[0] = uint32_t(format) << 20u;
     auto &image = plan.info.images[0];
     image.read = true;
@@ -1311,6 +1347,35 @@ void TestSignedStorageSpecialization() {
     image.written = true;
     image.read = false;
   }
+}
+
+void TestCompareSamplerUsesOwnVariant() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  program.descriptor_sources[program.info.images[1].source].dwords[1] = Value(
+      static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32Float) << 20u);
+  program.info.images[0].depth_compare = true;
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "compare sampler materialization failed");
+  ApplyResourceSpecialization(program, specialization);
+  const auto &samplers = program.info.samplers;
+  const auto &pairs = program.info.sampled_pairs;
+  Check(pairs.size() == 3 && samplers.size() == 3 && snapshot.samplers.size() == 2,
+        "shared compare sampler did not get its own variant");
+  for (const auto &pair : pairs) {
+    const auto &sampler = samplers[pair.sampler];
+    Check(sampler.depth_compare == program.info.images[pair.image].depth_compare &&
+              !sampler.integer_border && !sampler.force_point_filtering,
+          "sampler compare state does not match its paired image");
+  }
+  Check(samplers[pairs[1].sampler].snapshot_index == samplers[pairs[2].sampler].snapshot_index &&
+            pairs[1].sampler != pairs[2].sampler,
+        "compare and plain variants do not share the guest sampler descriptor");
 }
 
 // One descriptor serves a store, an atomic that a user-data condition guards, and an image no
@@ -1498,7 +1563,10 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
+  for (const bool vector_table : {false, true})
+    for (const uint32_t raw_index : {0u, 2u}) TestPlanningReadsSkipBufferFolds(vector_table, raw_index);
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestCompareSamplerUsesOwnVariant();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);

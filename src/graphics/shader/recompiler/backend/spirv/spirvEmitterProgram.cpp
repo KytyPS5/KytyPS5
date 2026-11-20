@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
@@ -56,11 +55,11 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
-	uint32_t                                      header_label       = 0;
-	uint32_t                                      select_label       = 0;
-	uint32_t                                      after_switch_label = 0;
-	uint32_t                                      continue_label     = 0;
-	uint32_t                                      merge_label        = 0;
+	uint32_t                                                     header_label       = 0;
+	uint32_t                                                     select_label       = 0;
+	uint32_t                                                     after_switch_label = 0;
+	uint32_t                                                     continue_label     = 0;
+	uint32_t                                                     merge_label        = 0;
 };
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -85,9 +84,10 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	if (ctx.state.object_primitive_id_variable != 0) {
-		auto& state = ctx.state;
-		const auto primitive = EmitGetBuiltin(
-		    ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)}, IR::Value {0u});
+		auto&      state = ctx.state;
+		const auto primitive =
+		    EmitGetBuiltin(ctx, IR::Value {static_cast<uint32_t>(IR::StageInputKind::PrimitiveId)},
+		                   IR::Value {0u});
 		const auto object = EmitPushDataLoad(state, ConstantU32(state, 0));
 		state.builder.AddFunction(spv::OpStore, state.object_primitive_id_variable,
 		                          EmitAddU32(state, object, primitive));
@@ -128,6 +128,12 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 			const auto* false_block = term.false_block;
 			if (true_block == nullptr || false_block == nullptr || block->condition.IsEmpty()) {
 				EmitReturn(ctx);
+				return;
+			}
+			if (!term.loop_header && true_block == false_block) {
+				// SPIRV-Cross discards all code after a selection whose branch targets equal its
+				// merge.
+				ctx.state.builder.AddFunction(spv::OpBranch, true_block->Definition());
 				return;
 			}
 			const auto condition = ctx.Def(block->condition);
@@ -232,7 +238,7 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	using Op = IR::ValueOpcode;
+	using Op      = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupReduceU32 ||
@@ -334,7 +340,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
-	const auto& program = ctx.state.program;
+	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -526,9 +532,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	const auto physical_lane =
 	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high          = state.builder.AllocateId();
-	const auto in_high       = state.builder.AllocateId();
-	const auto value         = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	const auto in_high = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
 	                          HalfArg(inst, index, 0), physical_lane);
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,
@@ -552,8 +558,7 @@ uint32_t ValueEmitContext::Result(const IR::Inst& inst) {
 uint32_t ValueEmitContext::Define(const IR::Inst& inst, uint32_t value) {
 	if (const auto id = inst.Definition(half); id != 0) {
 		if (id != value) {
-			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()),
-			                          id, value);
+			state.builder.AddFunction(spv::OpCopyObject, TypeId(state, inst.GetType()), id, value);
 		}
 		return id;
 	}
@@ -743,10 +748,12 @@ void EmitProgram(EmitterState& state) {
 		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
 		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
 		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
-		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
-		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
+		const auto row =
+		    EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index =
+		    EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords =
+		    EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryBindings(state);
 	if (program.blocks.empty()) {

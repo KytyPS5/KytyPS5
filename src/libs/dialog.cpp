@@ -607,6 +607,18 @@ struct MsgDialogParam {
 	uint32_t pad1;
 };
 
+struct MsgDialogUserMessageParam {
+	int32_t     button_type;
+	uint32_t    pad;
+	const char* msg;
+	void*       buttons_param;
+	uint8_t     reserved[24];
+};
+
+static_assert(sizeof(MsgDialogUserMessageParam) == 48);
+
+constexpr int32_t MODE_USER_MSG = 1;
+
 struct MsgDialogResult {
 	int32_t mode;
 	int32_t result;
@@ -626,6 +638,15 @@ int KYTY_SYSV_ABI MsgDialogInitialize() {
 	return OK;
 }
 
+std::string UserMessageText(const void* param) {
+	const auto* p = static_cast<const MsgDialogParam*>(param);
+	if (p == nullptr || p->mode != MODE_USER_MSG || p->user_msg_param == nullptr) {
+		return {};
+	}
+	const auto* user = static_cast<const MsgDialogUserMessageParam*>(p->user_msg_param);
+	return user->msg != nullptr ? std::string(user->msg) : std::string();
+}
+
 int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 	PRINT_NAME();
 
@@ -641,6 +662,9 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     p->size, p->mode, reinterpret_cast<uint64_t>(p->user_msg_param),
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
+		if (const auto text = UserMessageText(p); !text.empty()) {
+			Log::WriteToConsoleAndLog("Message dialog: " + text + "\n");
+		}
 	}
 
 	g_status = STATUS_FINISHED;

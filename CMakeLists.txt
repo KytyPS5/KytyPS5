@@ -441,6 +441,13 @@ add_executable(vdecsw_tests EXCLUDE_FROM_ALL
 target_link_libraries(vdecsw_tests common FFmpeg::ffmpeg)
 target_include_directories(vdecsw_tests PRIVATE ${inc_headers})
 
+add_executable(guest_printf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestPrintfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/guestPrintf.cpp"
+)
+target_link_libraries(guest_printf_tests common fmt::fmt)
+target_include_directories(guest_printf_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
@@ -571,6 +578,10 @@ add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
 
+add_executable(rtc_format_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/RtcFormatTests.cpp")
+target_link_libraries(rtc_format_tests common fmt::fmt)
+target_include_directories(rtc_format_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/dialog.cpp"
@@ -580,6 +591,11 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
+
+add_kyty_full_emulator_test(libc_environment_tests
+	"${KYTY_TESTS_DIR}/LibCEnvironmentTests.cpp")
+add_kyty_full_emulator_test(http2_abort_request_tests
+	"${KYTY_TESTS_DIR}/Http2AbortRequestTests.cpp")
 
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
@@ -629,6 +645,10 @@ target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
 add_kyty_full_emulator_test(kernel_module_info_tests "${KYTY_TESTS_DIR}/KernelModuleInfoTests.cpp")
 target_link_libraries(kernel_module_info_tests kyty_test_gtest)
+
+add_executable(gpu_stall_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/GpuStallTests.cpp")
+target_link_libraries(gpu_stall_tests common fmt::fmt)
+target_include_directories(gpu_stall_tests PRIVATE ${inc_headers})
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -706,7 +726,12 @@ target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
-if(NOT KYTY_CLANG_CL)
+if(KYTY_CLANG_CL)
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+			virtual_memory_allocation_tests)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	endforeach()
+else()
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
@@ -724,6 +749,12 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_audio_compile_hold_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --audio-compile-hold)
+	add_test(NAME emulator_skip_redundant_unmap_drains_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --skip-redundant-unmap-drains)
+	add_test(NAME emulator_keep_gpu_cache_on_reuse_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --keep-gpu-cache-on-reuse)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -736,6 +767,14 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME guest_printf COMMAND ${CMAKE_COMMAND} -E env KYTY_GUEST_STDOUT=1
+		$<TARGET_FILE:guest_printf_tests> enabled)
+	add_test(NAME guest_printf_disabled COMMAND ${CMAKE_COMMAND} -E env KYTY_GUEST_STDOUT=0
+		$<TARGET_FILE:guest_printf_tests> disabled)
+	add_test(NAME guest_printf_default COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_GUEST_STDOUT
+		$<TARGET_FILE:guest_printf_tests> disabled)
+	add_test(NAME guest_printf_invalid COMMAND ${CMAKE_COMMAND} -E env KYTY_GUEST_STDOUT=true
+		$<TARGET_FILE:guest_printf_tests> disabled)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -743,9 +782,16 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME gpu_stall COMMAND $<TARGET_FILE:gpu_stall_tests>)
+	# A missed wakeup shows up as a hang, so fail fast instead of at the default timeout.
+	set_tests_properties(gpu_stall PROPERTIES TIMEOUT 30)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	# A push or query wrongly held by GpuStall hangs, so fail fast instead of at the default timeout.
+	set_tests_properties(audio_out2_port PROPERTIES TIMEOUT 60)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
+	# A submit or query wrongly held by GpuStall hangs, so fail fast instead of at the default timeout.
+	set_tests_properties(audio_out_timing PROPERTIES TIMEOUT 60)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
@@ -757,8 +803,11 @@ if(BUILD_TESTING)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
+	add_test(NAME rtc_format COMMAND $<TARGET_FILE:rtc_format_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME libc_environment COMMAND $<TARGET_FILE:libc_environment_tests>)
+	add_test(NAME http2_abort_request COMMAND $<TARGET_FILE:http2_abort_request_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
@@ -785,6 +834,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_small_formatted_image_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --small-formatted-image-sync-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode
@@ -809,6 +860,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME srgb_texture
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
+	add_test(NAME unmapped_texture
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --unmapped-texture-only)
 	add_test(NAME device_creation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-creation-only)
 	add_test(NAME msaa_storage
@@ -834,6 +887,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_hot_publish
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-hot-publish-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -857,6 +912,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		guest_printf_tests
 		lru_cache_tests
 		common_tests
 		shader_vertex_metadata_tests
@@ -864,6 +920,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		gpu_stall_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
@@ -880,8 +937,11 @@ if(BUILD_TESTING)
 		jpeg_enc_tests
 		occlusion_queries_tests
 		ces_tests
+		rtc_format_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		libc_environment_tests
+		http2_abort_request_tests
 		rtc_tests
 		playgo_tests
 		vr_tracker2_tests
@@ -902,6 +962,32 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 		add_test(NAME macos_sse4a COMMAND $<TARGET_FILE:macos_sse4a_tests>)
 		set_tests_properties(macos_sse4a PROPERTIES TIMEOUT 15)
 		add_dependencies(kyty_tests macos_sse4a_tests)
+	endif()
+endif()
+
+if(WIN32)
+	add_kyty_full_emulator_test(pthread_priority_tests
+		"${KYTY_TESTS_DIR}/PthreadPriorityTests.cpp")
+	if(BUILD_TESTING)
+		add_test(NAME pthread_priority COMMAND $<TARGET_FILE:pthread_priority_tests>)
+		set_tests_properties(pthread_priority PROPERTIES TIMEOUT 60)
+		add_dependencies(kyty_tests pthread_priority_tests)
+	endif()
+endif()
+
+# Linux x86-64: the patcher's multi-threaded function scan gives the same patched code as one thread.
+if(NOT WIN32 AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+	add_executable(guest_instruction_patch_scan_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/GuestInstructionPatchScanTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+		"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
+	)
+	target_link_libraries(guest_instruction_patch_scan_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
+	target_include_directories(guest_instruction_patch_scan_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME guest_instruction_patch_scan COMMAND $<TARGET_FILE:guest_instruction_patch_scan_tests>)
+		set_tests_properties(guest_instruction_patch_scan PROPERTIES TIMEOUT 60)
+		add_dependencies(kyty_tests guest_instruction_patch_scan_tests)
 	endif()
 endif()
 

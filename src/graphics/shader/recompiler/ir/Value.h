@@ -119,12 +119,10 @@ public:
 	[[nodiscard]] const std::vector<Use>& Uses() const { return uses; }
 	// SRT walker output index, assigned by the resource plan that owns this instruction.
 	[[nodiscard]] uint32_t WalkOutput() const { return walk_output; }
-	void SetWalkOutput(uint32_t index) const { walk_output = index; }
+	void                   SetWalkOutput(uint32_t index) const { walk_output = index; }
 	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
 	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
-	void SetDefinition(uint32_t half, uint32_t definition) const {
-		definitions[half] = definition;
-	}
+	void SetDefinition(uint32_t half, uint32_t definition) const { definitions[half] = definition; }
 	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
@@ -155,29 +153,31 @@ private:
 
 	template <typename Self>
 	static auto& ArgSlot(Self& self, size_t index);
-	void AddUse(Inst* used, size_t operand);
-	void RemoveUse(Inst* used, size_t operand);
-	void ClearArgs();
+	void         AddUse(Inst* used, size_t operand);
+	void         RemoveUse(Inst* used, size_t operand);
+	void         ClearArgs();
 
 	static constexpr uint8_t InlineArity = 4;
-	static constexpr uint8_t PhiArity = UINT8_MAX;
+	static constexpr uint8_t PhiArity    = UINT8_MAX;
 
-	ValueOpcode         opcode;
-	uint8_t             num_args;
-	bool                live = false;
-	mutable uint32_t    walk_output = UINT32_MAX;
+	ValueOpcode                     opcode;
+	uint8_t                         num_args;
+	bool                            live        = false;
+	mutable uint32_t                walk_output = UINT32_MAX;
 	mutable std::array<uint32_t, 2> definitions {};
-	uint64_t            flags;
-	Block*              parent = nullptr;
+	uint64_t                        flags;
+	Block*                          parent = nullptr;
 	union {
-		std::array<Value, InlineArity> fixed_args {};
-		std::vector<Value> large_args;
+		std::array<Value, InlineArity>        fixed_args {};
+		std::vector<Value>                    large_args;
 		std::vector<std::pair<Block*, Value>> phi_args;
 	};
-	std::vector<Use>    uses;
+	std::vector<Use> uses;
 };
 
-static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
+// Debug standard libraries can add iterator bookkeeping to std::vector.
+static_assert(sizeof(Inst) <= 96 + sizeof(std::vector<Use>),
+              "Inst operand and backend storage unintentionally increased");
 
 // Called per operand by the IR passes and the resource walker; inline, as the build has no LTO.
 inline bool Value::IsIdentity() const {

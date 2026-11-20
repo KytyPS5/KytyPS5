@@ -2,7 +2,9 @@
 #include "common/archive.h"
 #include "ArchiveTestFixture.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <new>
 #include <thread>
@@ -31,6 +33,24 @@ std::filesystem::path GetRealFilename(const std::string& path) {
 }
 }
 }
+
+// A guest GPU whose work completes only when the test says so (agc.h).
+namespace Libs::Graphics {
+std::atomic<uint64_t> gpu_submitted {0};
+std::atomic<uint64_t> gpu_completed {0};
+uint64_t SubmittedGpuWork() {
+	return gpu_submitted;
+}
+bool WaitForGpuWork(uint64_t marker, const std::atomic_bool& cancel) {
+	while (gpu_completed < marker) {
+		if (cancel) {
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	return true;
+}
+} // namespace Libs::Graphics
 
 namespace {
 using namespace Libs::Audio::AvPlayer;
@@ -163,6 +183,53 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers");
 }
+
+// A frame the guest gives back is not written again while GPU work it submitted before that may
+// still read it (Astro Bot's intro copies each frame with a DMA that runs frames later).
+void CheckVideoOutputHeldForGpu() {
+	using Libs::Graphics::gpu_completed;
+	using Libs::Graphics::gpu_submitted;
+	VideoMemory memory;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source source(allocator, {}, {}, 6, false, 0);
+	Check(source.Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "open held-output fixture");
+	source.SetSync(1);
+	Check(source.Start() == 0, "start held-output video");
+	AvPlayerFrameInfoEx info {};
+	const auto next = [&](const char* message) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+		while (!source.Video(&info)) {
+			Check(std::chrono::steady_clock::now() < deadline, message);
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	};
+	next("first held-output frame");
+	auto* held = static_cast<uint8_t*>(info.data);
+	// The guest's frame: it marks it and submits GPU work that reads it.
+	std::memset(held, 0xab, 4096);
+	gpu_submitted = 1;
+	next("second held-output frame");
+	// The decoder has filled every other buffer and now waits for the held one.
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	for (unsigned i = 0; i < 4; ++i) {
+		next("frames decoded before the GPU completes");
+		Check(info.data != held, "a buffer with pending GPU work is not handed out again");
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	Check(std::all_of(held, held + 4096, [](uint8_t byte) { return byte == 0xab; }),
+	      "a buffer with pending GPU work is not written");
+	gpu_completed = 1;
+	bool reused = false;
+	for (unsigned i = 0; i < 6 && !reused; ++i) {
+		next("frames decoded after the GPU completes");
+		reused = info.data == held;
+	}
+	Check(reused && held[0] != 0xab, "the buffer is reused once the GPU work completed");
+	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
+	      "stop releases the held-output buffers");
+	gpu_submitted = 0;
+	gpu_completed = 0;
+}
 }
 
 int main() {
@@ -210,6 +277,7 @@ int main() {
 	}
 	content_root = root;
 	CheckVideoReadAhead(root);
+	CheckVideoOutputHeldForGpu();
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");

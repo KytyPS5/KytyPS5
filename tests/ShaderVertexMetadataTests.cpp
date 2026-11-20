@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 
 #include <array>
@@ -34,13 +35,14 @@ struct Fixture {
 	}
 };
 
-void CheckRejected(const ShaderMappedData& data, const char* text) {
+void CheckRejected(const ShaderMappedData& data, const char* text,
+                   uint32_t max_user_sgprs = 64) {
 	ShaderVertexMetadata output;
 	std::array<ShaderSemantic, 7> prior_semantics {};
 	output.vertex_buffer_reg = 37;
 	output.vertex_attrib_reg = 41;
 	output.input_semantics   = prior_semantics;
-	Check(ShaderReadVertexMetadata(data, 64, output) != nullptr, text);
+	Check(ShaderReadVertexMetadata(data, max_user_sgprs, output) != nullptr, text);
 	Check(output.vertex_buffer_reg == 37 && output.vertex_attrib_reg == 41 &&
 	          output.input_semantics.data() == prior_semantics.data() &&
 	          output.input_semantics.size() == prior_semantics.size(),
@@ -90,14 +92,17 @@ void TestValidAndInvalidMetadata() {
 	CheckRejected(excessive_semantics.mapped, "excessive vertex semantic count was accepted");
 
 	Fixture excessive_register;
-	excessive_register.offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 63;
-	CheckRejected(excessive_register.mapped, "out-of-domain vertex table SGPR was accepted");
+	excessive_register.offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 31;
+	CheckRejected(excessive_register.mapped,
+	              "last SGPR was accepted for a two-register vertex table pointer",
+	              HW::UserSgprInfo::SGPRS_MAX);
 
 	Fixture excessive_attrib_register;
-	excessive_attrib_register
-	    .offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 63;
+	excessive_attrib_register.offsets[static_cast<size_t>(
+	    DirectResourceType::PtrVertexAttribDescTable)] = 31;
 	CheckRejected(excessive_attrib_register.mapped,
-	              "out-of-domain vertex attribute table SGPR was accepted");
+	              "last SGPR was accepted for a two-register vertex attribute pointer",
+	              HW::UserSgprInfo::SGPRS_MAX);
 
 	Fixture missing_semantics;
 	missing_semantics.mapped.input_semantics = nullptr;

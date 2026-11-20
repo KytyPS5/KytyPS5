@@ -484,7 +484,7 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 		view->dirty_begin = std::min(view->dirty_begin, view->dirty_end);
 		if (view->slots.size() * sizeof(uint32_t) > view->buffer->Size()) {
 			if (scheduler.Active()) {
-				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+				scheduler.DeferRelease([buffer = std::move(view->buffer)] {});
 			}
 			view->buffer = SlotBuffer(m_context, size);
 			Widen(view->dirty_begin, view->dirty_end, 0u, view->slots.size());
@@ -676,7 +676,7 @@ void ImageHeap::Drop(Memory& memory) {
 			Release(view->slots[(view->first + probe * view->step) / 4u]);
 		}
 		if (scheduler.Active()) {
-			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+			scheduler.DeferRelease([buffer = std::move(view->buffer)] {});
 		}
 	}
 }

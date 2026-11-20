@@ -11,6 +11,10 @@
 #include <memory>
 #include <vector>
 
+namespace Common::HostException {
+struct ExceptionInfo;
+} // namespace Common::HostException
+
 namespace Loader {
 
 struct EntryParams {
@@ -104,25 +108,25 @@ struct Program {
 	Program();
 	~Program();
 
-	int32_t                      unique_id = -1;
-	RuntimeLinker*               rt        = nullptr;
-	uint32_t                     load_count = 0; // Successful sceKernelLoadStartModule calls.
-	std::filesystem::path        file_name;
-	std::unique_ptr<Elf64>       elf;
-	std::unique_ptr<DynamicInfo> dynamic_info;
-	uint64_t                     base_vaddr        = 0;
-	uint64_t                     base_size         = 0;
-	uint64_t                     base_size_aligned = 0;
-	uint64_t                     mapped_size       = 0;
-	uint64_t                     flexible_size     = 0;
-	uint64_t instruction_trampoline_size = 0;
+	int32_t                         unique_id  = -1;
+	RuntimeLinker*                  rt         = nullptr;
+	uint32_t                        load_count = 0; // Successful sceKernelLoadStartModule calls.
+	std::filesystem::path           file_name;
+	std::unique_ptr<Elf64>          elf;
+	std::unique_ptr<DynamicInfo>    dynamic_info;
+	uint64_t                        base_vaddr                  = 0;
+	uint64_t                        base_size                   = 0;
+	uint64_t                        base_size_aligned           = 0;
+	uint64_t                        mapped_size                 = 0;
+	uint64_t                        flexible_size               = 0;
+	uint64_t                        instruction_trampoline_size = 0;
 	std::unique_ptr<SymbolDatabase> export_symbols;
 	std::unique_ptr<SymbolDatabase> import_symbols;
 	ThreadLocalStorage              tls;
 	bool                            fail_if_global_not_resolved = true;
 	bool                            dbg_print_reloc             = false;
 	std::vector<uint8_t>            rela_bits;
-	uint64_t                        proc_param_vaddr            = 0;
+	uint64_t                        proc_param_vaddr = 0;
 };
 
 class RuntimeLinker {
@@ -177,6 +181,8 @@ public:
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:
+	std::vector<Program*> LoadImportedBundledModules(const std::filesystem::path& folder);
+
 	static void LoadProgramToMemory(Program* program);
 	static void ParseProgramDynamicInfo(Program* program);
 	static void CreateSymbolDatabase(Program* program);
@@ -196,10 +202,14 @@ private:
 };
 
 uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, uint16_t phnum);
+bool     IsGuestCodeAddress(uint64_t address);
+
+[[noreturn]] void ReportUnhandledHostException(const Common::HostException::ExceptionInfo& info);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-bool TestMainEntryUsesGuestStack();
-bool TestModuleRelocationUsesWritableHostMapping();
+bool     TestMainEntryUsesGuestStack();
+uint64_t TestMapGuestCode(uint64_t size, uint64_t occupied);
+bool     TestModuleRelocationUsesWritableHostMapping();
 #endif
 
 } // namespace Loader

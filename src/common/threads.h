@@ -6,6 +6,7 @@
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <condition_variable>
 #include <mutex>
+#include <thread>
 #endif
 
 namespace Common {
@@ -21,6 +22,11 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Windows only. Sets the calling thread to THREAD_PRIORITY_HIGHEST so busy guest threads do not
+// take its core. Returns false when the host refuses.
+bool SetCurrentPriorityHighest();
+#endif
 
 } // namespace Thread
 
@@ -33,6 +39,8 @@ public:
 
 	void Lock();
 	void Unlock();
+	bool TryLock();
+	bool IsHeldByCurrentThread() const;
 
 	KYTY_CLASS_NO_COPY(Mutex);
 
@@ -40,11 +48,28 @@ private:
 	// A CRITICAL_SECTION.
 	alignas(8) unsigned char m_cs[40];
 #else
-	void Lock() { m_mutex.lock(); }
-	void Unlock() { m_mutex.unlock(); }
+	void Lock() {
+		m_mutex.lock();
+		m_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+	}
+	void Unlock() {
+		m_owner.store({}, std::memory_order_relaxed);
+		m_mutex.unlock();
+	}
+	bool TryLock() {
+		if (m_mutex.try_lock()) {
+			m_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+			return true;
+		}
+		return false;
+	}
+	bool IsHeldByCurrentThread() const {
+		return m_owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
+	}
 
 private:
-	std::recursive_mutex m_mutex;
+	std::recursive_mutex         m_mutex;
+	std::atomic<std::thread::id> m_owner {};
 #endif
 
 	friend class CondVar;

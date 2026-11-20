@@ -24,7 +24,7 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 	// Closed when the thread exits.
 	thread_local const std::unique_ptr<void, decltype(&CloseHandle)> timer {
 	    CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-		                       TIMER_ALL_ACCESS),
+	                           TIMER_ALL_ACCESS),
 	    &CloseHandle};
 	LARGE_INTEGER due_time {};
 	due_time.QuadPart = -static_cast<LONGLONG>(units_100ns);
@@ -41,6 +41,10 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 
 static CRITICAL_SECTION* ToCs(unsigned char* storage) {
 	return reinterpret_cast<CRITICAL_SECTION*>(storage);
+}
+
+static const CRITICAL_SECTION* ToCs(const unsigned char* storage) {
+	return reinterpret_cast<const CRITICAL_SECTION*>(storage);
 }
 
 static CONDITION_VARIABLE* ToCv(void** storage) {
@@ -88,6 +92,12 @@ bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool Thread::SetCurrentPriorityHighest() {
+	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+}
+#endif
+
 int Thread::GetThreadIdUnique() {
 	static std::atomic<int> counter = 0;
 	static thread_local int tid     = ++counter;
@@ -111,6 +121,15 @@ void Mutex::Lock() {
 
 void Mutex::Unlock() {
 	LeaveCriticalSection(ToCs(m_cs));
+}
+
+bool Mutex::TryLock() {
+	return TryEnterCriticalSection(ToCs(m_cs)) != 0;
+}
+
+bool Mutex::IsHeldByCurrentThread() const {
+	return ToCs(m_cs)->OwningThread ==
+	       reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentThreadId()));
 }
 
 void CondVar::Signal() {

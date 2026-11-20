@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -29,11 +31,11 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	static constexpr uint32_t CACHING_PAGEBITS  = 14;
-	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t CACHING_PAGEBITS = 14;
+	static constexpr uint64_t CACHING_PAGESIZE = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES =
+	    (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
+	static constexpr uint64_t BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -52,7 +54,10 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Publishes GPU-written bytes of a range about to lose its host view, without marking pages
+	// CPU-dirty. Registered buffers and their tracker state are otherwise left as they are.
+	void                   FlushGpuDirtyForSuspend(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -70,10 +75,15 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	/// Fills GDS or guest memory with a dword. Ranges the GPU has not modified are written on the
+	/// CPU after one bulk invalidation, others are filled on the GPU. GPU thread only.
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	/// Copies between GDS and guest memory. Memory to memory copies run on the CPU after one bulk
+	/// invalidation of the destination when neither range is GPU modified and the source backs no
+	/// cached image. Others are copied on the GPU. GPU thread only.
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
@@ -89,11 +99,26 @@ public:
 	void               ProcessFaultBuffer();
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
-	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
-	void               RunGarbageCollector();
+	// Queue after the range's state change becomes visible, or a drain could consume it first. A
+	// deferred event (a write from any thread but the GPU thread) is held back until
+	// PromoteBdaSync().
+	void QueueBdaSync(uint64_t vaddr, uint64_t size, bool deferred = false);
+	// Makes game-thread writes visible to the next BDA synchronization.
+	void PromoteBdaSync();
+	void RunGarbageCollector();
+	void PublishReadHot();
+	void DecayReadHot();
+	void SupersedeAllPublishes();
+	void SupersedePublishes(uint64_t vaddr, uint64_t size);
 
 private:
+	struct PublishEntry {
+		uint64_t vaddr      = 0;
+		uint64_t size       = 0;
+		bool     superseded = false;
+	};
+	using PublishBatch = std::vector<PublishEntry>;
+
 	friend struct BufferCacheTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const { return !id || m_slot_buffers[id].is_deleted; }
@@ -121,44 +146,54 @@ private:
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void Unregister(BufferId id);
+	void                   Unregister(BufferId id);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
+	void               ChangeRegister(BufferId id);
+	void               DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	                                     bool is_written, Common::SlotId image);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
 	                  uint64_t total_size);
-	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, Common::SlotId id);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	void               NoteReadHot(uint64_t vaddr, uint64_t size);
+	void               ConfirmPublish(const std::shared_ptr<PublishBatch>& batch);
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
-	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
+	GraphicContext&                                    m_graphics;
+	CommandScheduler&                                  m_scheduler;
+	FaultManager                                       m_fault_manager;
+	Buffer                                             m_gds_buffer;
+	Buffer                                             m_bda_pagetable_buffer;
+	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	BufferMap                                         m_buffers;
-	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
+	BufferMap                                          m_buffers;
+	PageTable                                          m_page_table;
+	RangeSet                                           m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
-	std::array<RangeSet, 8>                           m_checked_color_metadata;
-	MemoryTracker                                     m_memory_tracker;
-	std::mutex                                        m_bda_sync_mutex;
-	RangeSet                                          m_bda_sync;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
-	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
-	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
-	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
-	uint64_t m_gc_tick            = 0;
+	std::array<RangeSet, 8> m_checked_color_metadata;
+	MemoryTracker           m_memory_tracker;
+	std::mutex              m_bda_sync_mutex;
+	RangeSet                m_bda_sync;
+	RangeSet                m_bda_sync_deferred;
+	// Set while m_bda_sync_deferred may be non-empty. Allows PromoteBdaSync to skip the lock.
+	std::atomic<bool>                          m_has_deferred_bda_sync {false};
+	StreamBuffer                               m_staging_buffer;
+	StreamBuffer                               m_stream_buffer;
+	StreamBuffer                               m_download_buffer;
+	StreamBuffer                               m_device_buffer;
+	TextureCache&                              m_texture_cache;
+	uint64_t                                   m_total_used_memory  = 0;
+	uint64_t                                   m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
+	uint64_t                                   m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	uint64_t                                   m_gc_tick            = 0;
+	std::map<uint64_t, uint64_t>               m_hot_pages;
+	RangeSet                                   m_hot_ranges;
+	RangeSet                                   m_publish_ranges;
+	std::vector<std::shared_ptr<PublishBatch>> m_inflight_publishes;
+	uint64_t                                   m_hot_flip = 0;
 };
 
 } // namespace Libs::Graphics

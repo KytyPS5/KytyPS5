@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/gpuStall.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -625,31 +626,69 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	return OK;
 }
 
+// A synchronous push returns once the context can take another buffer. A producer that renders
+// only into free slots (Wwise) waits for the push, not for the queue level, before rendering again.
+static void audioout2_wait_for_room(AudioOut2ContextHandle ctx, bool device_paced) {
+	for (;;) {
+		uint64_t wait = 0;
+		g_audioout2_state_mutex.Lock();
+		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+			audioout2_update_context_locked(state);
+			if (device_paced) {
+				// The device clock paced this push, so the modelled queue follows it.
+				state->queued = std::min(state->queued, state->queue_depth - 1);
+			} else if (state->queued >= state->queue_depth) {
+				const uint64_t next =
+				    state->last_update + audioout2_grain_micros(state->num_grains);
+				const uint64_t now = audioout2_clock();
+				wait               = (next > now ? next - now : 1);
+			}
+		}
+		g_audioout2_state_mutex.Unlock();
+		if (wait == 0) {
+			return;
+		}
+		Common::Thread::SleepMicro(static_cast<uint32_t>(wait));
+	}
+}
+
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
+		// Waits out a long pipeline compile on every pass, not only on entry. A push already
+		// waiting for queue space would otherwise slip through mid-compile once the modelled queue
+		// drains by wall-clock time, and the context is looked up again after the wait.
+		Common::GpuStall::WaitWhileStalled();
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
 		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
 		// vibration/failed-open handle) has no downstream operation that can block this call.
 		g_audioout2_state_mutex.Lock();
-		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
-			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
-				auto& submission = audioout2_submission(*state);
-				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
-				return OK;
+		auto* state = audioout2_find_context_locked(ctx);
+		if (state == nullptr) {
+			g_audioout2_state_mutex.Unlock();
+			// A blocking push to a context destroyed under it would otherwise wait forever. The
+			// console's error for this case is unknown, so both modes keep the non-blocking result.
+			return AUDIO_OUT2_ERROR_NOT_READY;
+		}
+		const bool use_device_clock =
+		    blocking != 0 && audioout2_context_has_queueable_device(*state);
+		audioout2_update_context_locked(state);
+		sleep_micros = audioout2_grain_micros(state->num_grains);
+		if (state->queued < state->queue_depth || use_device_clock) {
+			if (state->queued == 0) {
+				state->last_update = audioout2_clock();
 			}
+			if (state->queued < state->queue_depth) {
+				state->queued++;
+			}
+			auto& submission = audioout2_submission(*state);
+			g_audioout2_state_mutex.Unlock();
+			audioout2_queue_context_audio(ctx, submission, blocking != 0);
+			if (blocking != 0) {
+				audioout2_wait_for_room(ctx, use_device_clock);
+			}
+			return OK;
 		}
 		g_audioout2_state_mutex.Unlock();
 

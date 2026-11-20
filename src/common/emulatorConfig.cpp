@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuStall.h"
 
 #include <algorithm>
 #include <memory>
@@ -18,6 +19,8 @@ void Initialize() {
 
 void Shutdown() {
 	Common::DebugCounters::SetEnabled(false);
+	// A backstop that lets any audio thread still held go, so none waits through process exit.
+	Common::GpuStall::Configure(false);
 	g_config.reset();
 }
 
@@ -30,6 +33,8 @@ void Load(const ConfigOptions& cfg) {
 
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	// Pushed here rather than read by the audio code, so audio tests need no config.
+	Common::GpuStall::Configure(cfg.audio_compile_hold_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -229,6 +234,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+bool SkipRedundantUnmapDrainsEnabled() {
+	return g_config->skip_redundant_unmap_drains;
+}
+
 uint32_t GetFlushDraws() {
 	return g_config->flush_draws;
 }
@@ -253,6 +262,10 @@ bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }
 
+bool AudioCompileHoldEnabled() {
+	return g_config->audio_compile_hold_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }
@@ -269,13 +282,26 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
+// Reports the opt-in --keep-gpu-cache-on-reuse setting.
+bool KeepGpuCacheOnReuse() {
+	return g_config->keep_gpu_cache_on_reuse;
+}
+
 const std::string& GetLaunchActivity() {
 	return g_config->launch_activity;
+}
+
+bool PollBackoffEnabled() {
+	return g_config->poll_backoff_enabled;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
+}
+
+void EnableRedZoneProtection() {
+	g_config->red_zone_protection_enabled = true;
 }
 #endif
 

@@ -8,6 +8,8 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <string>
+#include <string_view>
 
 namespace Libs::LibKernel::FileSystem {
 
@@ -53,13 +55,21 @@ struct Lifecycle {
 };
 
 void Mount(const std::filesystem::path& folder, const std::string& point, bool read_only = false);
-void                  Umount(const std::string& folder_or_point);
+void Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 // Stats a resolved host path; a directory's size is its packed dirent size.
 int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb);
 // Returns whether d is an open file, directory or device descriptor.
-bool                  IsOpenDescriptor(int d);
+bool IsOpenDescriptor(int d);
+
+// Guest names may contain characters that Windows rejects in filenames (for example ':') or
+// strips (a trailing '.' or ' ' in a path component). Those are stored on the host as %XX, and a
+// literal '%' is stored as %25 only where it would otherwise read as such an escape. The mapping
+// is one-to-one, and names without these cases keep their existing host path.
+std::string EncodeHostFilename(std::string_view guest_name);
+// Reverses EncodeHostFilename.
+std::string DecodeHostFilename(std::string_view host_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);

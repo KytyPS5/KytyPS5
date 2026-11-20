@@ -22,18 +22,20 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
-#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -497,16 +499,47 @@ using exception_handler_func_t = KYTY_SYSV_ABI void (*)(int, void*);
 static thread_local bool g_dispatching_signal_handler = false;
 
 struct SignalDispatchScope {
-	SignalDispatchScope(): previous(g_dispatching_signal_handler) {
+	explicit SignalDispatchScope(Pthread thread)
+	    : thread(thread), owned(PthreadBeginSignalDispatch(thread)),
+	      previous(g_dispatching_signal_handler) {
 		g_dispatching_signal_handler = true;
 	}
-	~SignalDispatchScope() { g_dispatching_signal_handler = previous; }
+	~SignalDispatchScope() {
+		if (owned) {
+			PthreadEndSignalDispatch(thread);
+		}
+		g_dispatching_signal_handler = previous;
+	}
 
-	bool previous;
+	Pthread thread;
+	bool    owned;
+	bool    previous;
 };
 
 bool KernelIsDispatchingSignalOnCurrentThread() {
 	return g_dispatching_signal_handler;
+}
+
+template <typename Deliver>
+static void DispatchPendingSignals(Pthread thread, Deliver deliver) {
+	do {
+		SignalDispatchScope scope(thread);
+		if (!scope.owned) {
+			return;
+		}
+		for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers));) {
+			if (!PthreadTakePendingSignal(thread, signum)) {
+				signum++;
+				continue;
+			}
+			auto* handler =
+			    reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
+			if (handler != nullptr) {
+				deliver(handler, signum);
+			}
+			signum = 0;
+		}
+	} while (PthreadHasAnyPendingSignal(thread));
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -744,10 +777,6 @@ static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 	return ctx;
 }
 
-static bool IsGuestCodeAddress(uint64_t addr) {
-	return addr >= 0x0000000900000000ull && addr < 0x0000000980000000ull;
-}
-
 static bool IsAddressInRange(uint64_t addr, uint64_t base, uint64_t size) {
 	return size != 0 && addr >= base && addr < base + size;
 }
@@ -767,7 +796,7 @@ static uint64_t GetFallbackStackPointer(Pthread thread) {
 }
 
 static void SanitizeNonGuestSignalUcontext(SignalUcontext* ctx, Pthread thread) {
-	if (ctx == nullptr || IsGuestCodeAddress(ctx->uc_mcontext.mc_rip)) {
+	if (ctx == nullptr || Loader::IsGuestCodeAddress(ctx->uc_mcontext.mc_rip)) {
 		return;
 	}
 
@@ -961,27 +990,16 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 	}
 
 	auto* host_ctx = static_cast<ucontext_t*>(native_context);
-
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
-			continue;
+	DispatchPendingSignals(current, [&](exception_handler_func_t handler, int signum) {
+		auto ctx = CreateSignalUcontextFromHost(host_ctx);
+		if (Loader::IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
+			handler(signum, &ctx);
+			ApplySignalUcontextToHost(host_ctx, ctx);
+		} else {
+			SanitizeNonGuestSignalUcontext(&ctx, current);
+			handler(signum, &ctx);
 		}
-
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
-			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
-				handler(signum, &ctx);
-				ApplySignalUcontextToHost(host_ctx, ctx);
-			} else {
-				// Do not expose or restore a host frame.
-				SanitizeNonGuestSignalUcontext(&ctx, current);
-				handler(signum, &ctx);
-			}
-		}
-		return;
-	}
+	});
 }
 
 static bool EnsureHostSignalDispatchInstalled() {
@@ -989,7 +1007,7 @@ static bool EnsureHostSignalDispatchInstalled() {
 		struct sigaction action {};
 		action.sa_sigaction = HostSignalDispatchHandler;
 		sigemptyset(&action.sa_mask);
-		action.sa_flags = SA_SIGINFO | SA_RESTART;
+		action.sa_flags         = SA_SIGINFO | SA_RESTART;
 		const int signal_number = Common::HostException::GuestSignalDispatchSignal();
 		return ::sigaction(signal_number, &action, nullptr) == 0;
 	}();
@@ -1022,36 +1040,88 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 	return nt_queue_apc_thread_ex;
 }
 
-static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
-	auto*      thread = static_cast<Pthread>(arg1);
-	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!PthreadTakePendingSignal(thread, signum)) {
+static void SignalApcHandler(void* arg1, void* /*arg2*/, void* /*arg3*/, PCONTEXT context) {
+	auto* thread = static_cast<Pthread>(arg1);
+	PthreadClearSignalApcQueued(thread);
+	if (PthreadSelfOrNull() != thread || !Loader::IsGuestCodeAddress(context->Rip)) {
 		return;
 	}
-
-	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-	if (handler != nullptr) {
-		SignalDispatchScope scope;
-		auto                ctx           = CreateSignalUcontext(context);
-		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
-		if (!guest_context) {
-			SanitizeNonGuestSignalUcontext(&ctx, thread);
-			std::thread([thread, signum, handler, ctx,
-			             tcb = Loader::RuntimeLinker::GetThreadTcb()]() mutable {
-				SignalDispatchScope helper_scope;
-				Loader::RuntimeLinker::SetThreadTcb(tcb);
-				auto* previous_self = PthreadSwapSelfForSignal(thread);
-				handler(signum, &ctx);
-				PthreadSwapSelfForSignal(previous_self);
-			}).detach();
-			return;
-		}
+	DispatchPendingSignals(thread, [context](exception_handler_func_t handler, int signum) {
+		auto ctx = CreateSignalUcontext(context);
 		handler(signum, &ctx);
-		if (guest_context) {
-			ApplySignalUcontext(context, ctx);
+		ApplySignalUcontext(context, ctx);
+	});
+}
+
+static bool QueueSignalApc(Pthread thread, int signum) {
+	if (PthreadIsDispatchingSignal(thread) || !PthreadMarkSignalApcQueued(thread)) {
+		return true;
+	}
+
+	auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
+	const auto thread_id              = static_cast<DWORD>(PthreadGetHostThreadId(thread));
+	HANDLE     target_thread =
+	    (nt_queue_apc_thread_ex != nullptr && thread_id != 0)
+	        ? OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, thread_id)
+	        : nullptr;
+	KytyUserApcOption option {};
+	option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
+	const bool queued =
+	    target_thread != nullptr && GetProcessIdOfThread(target_thread) == GetCurrentProcessId() &&
+	    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
+	                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)),
+	                           nullptr) == 0;
+	if (target_thread != nullptr) {
+		CloseHandle(target_thread);
+	}
+	if (!queued) {
+		PthreadClearSignalApcQueued(thread);
+	}
+	return queued;
+}
+
+class SignalRedelivery {
+public:
+	static SignalRedelivery& Instance() {
+		static auto* redelivery = new SignalRedelivery;
+		return *redelivery;
+	}
+
+	void Track(Pthread thread, int signum) {
+		std::lock_guard lock(m_mutex);
+		if (std::ranges::find(m_targets, std::pair {thread, signum}) == m_targets.end()) {
+			m_targets.emplace_back(thread, signum);
+		}
+		if (!m_started) {
+			m_started = true;
+			std::thread([this] { Run(); }).detach();
+		}
+		m_cv.notify_one();
+	}
+
+private:
+	void Run() {
+		constexpr auto REDELIVERY_INTERVAL = std::chrono::milliseconds(1);
+
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			m_cv.wait(lock, [this] { return !m_targets.empty(); });
+			m_cv.wait_for(lock, REDELIVERY_INTERVAL);
+			std::erase_if(m_targets, [](const auto& target) {
+				if (!PthreadHasPendingSignal(target.first, target.second)) {
+					return true;
+				}
+				QueueSignalApc(target.first, target.second);
+				return false;
+			});
 		}
 	}
-}
+
+	std::mutex                           m_mutex;
+	std::condition_variable              m_cv;
+	std::vector<std::pair<Pthread, int>> m_targets;
+	bool                                 m_started = false;
+};
 
 #endif
 
@@ -1060,21 +1130,11 @@ void KernelDispatchPendingSignalForCurrentThread() {
 	if (!PthreadHasAnyPendingSignal(current)) {
 		return;
 	}
-
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
-			continue;
-		}
-
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontext();
-			SanitizeNonGuestSignalUcontext(&ctx, current);
-			handler(signum, &ctx);
-		}
-		return;
-	}
+	DispatchPendingSignals(current, [current](exception_handler_func_t handler, int signum) {
+		auto ctx = CreateSignalUcontext();
+		SanitizeNonGuestSignalUcontext(&ctx, current);
+		handler(signum, &ctx);
+	});
 }
 
 static int KYTY_SYSV_ABI KernelInstallExceptionHandler(int signum, void* handler) {
@@ -1108,6 +1168,17 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 	return OK;
 }
 
+static int RaiseOnCurrentThread(Pthread thread, int signum, uint64_t return_address) {
+	if (!PthreadQueuePendingSignal(thread, signum)) {
+		return KERNEL_ERROR_ESRCH;
+	}
+	DispatchPendingSignals(thread, [return_address](exception_handler_func_t handler, int pending) {
+		auto ctx = CreateCurrentGuestCallSignalUcontext(return_address);
+		handler(pending, &ctx);
+	});
+	return OK;
+}
+
 static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	constexpr int POSIX_SIGUSR1 = 30;
 
@@ -1118,63 +1189,41 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const auto target_thread_id       = PthreadGetHostThreadId(thread);
-		auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
+		const auto target_thread_id = PthreadGetHostThreadId(thread);
 		if (target_thread_id == 0) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
-			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			handler(signum, &ctx);
-			return OK;
-		}
-		if (nt_queue_apc_thread_ex == nullptr) {
-			return KERNEL_ERROR_EINVAL;
+			return RaiseOnCurrentThread(thread, signum,
+			                            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 		}
 
-		HANDLE target_thread =
-		    OpenThread(THREAD_SET_CONTEXT, FALSE, static_cast<DWORD>(target_thread_id));
-		if (target_thread == nullptr) {
-			return KERNEL_ERROR_EINVAL;
+		if (!PthreadQueuePendingSignal(thread, signum)) {
+			return KERNEL_ERROR_ESRCH;
 		}
-
-		PthreadQueuePendingSignal(thread, signum);
-		KytyUserApcOption option {};
-		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
-
-		const auto status =
-		    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
-		                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)), nullptr);
-
-		if (status != 0) {
+		if (!QueueSignalApc(thread, signum)) {
 			PthreadTakePendingSignal(thread, signum);
-			CloseHandle(target_thread);
-			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
-			     "\n",
-			     target_thread_id, status);
+			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 "\n", target_thread_id);
 			return KERNEL_ERROR_EINVAL;
 		}
 
 		PthreadWakeForSignal(thread);
-		CloseHandle(target_thread);
+		SignalRedelivery::Instance().Track(thread, signum);
 		return OK;
 #elif defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
-			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
-			handler(signum, &ctx);
-			return OK;
+			return RaiseOnCurrentThread(thread, signum,
+			                            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 		}
 
 		if (!EnsureHostSignalDispatchInstalled()) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		PthreadQueuePendingSignal(thread, signum);
+		if (!PthreadQueuePendingSignal(thread, signum)) {
+			return KERNEL_ERROR_ESRCH;
+		}
 		if (!PthreadKillHost(thread, Common::HostException::GuestSignalDispatchSignal())) {
 			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");
@@ -1234,7 +1283,7 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 	rt->RelocateProgram(program);
 
 	program->load_count = 1;
-	int result = rt->StartModule(program, args, argp, nullptr);
+	int result          = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
 
@@ -1248,8 +1297,8 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 }
 
 int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
-                                        uint32_t flags, const KernelUnloadModuleOpt* opt,
-                                        int* res) {
+                                         uint32_t flags, const KernelUnloadModuleOpt* opt,
+                                         int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -2067,6 +2116,11 @@ int KYTY_SYSV_ABI getsockname(int s, void* addr, uint32_t* addrlen) {
 	return Network::Net::Getsockname(s, addr, addrlen);
 }
 
+int KYTY_SYSV_ABI getpeername(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+	return Network::Net::Getpeername(s, addr, addrlen);
+}
+
 int KYTY_SYSV_ABI getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
 	PRINT_NAME();
 	return Network::Net::Getsockopt(s, level, optname, optval, optlen);
@@ -2177,8 +2231,8 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
-                           void* uaddr, const void* timeout) {
+int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value, void* uaddr,
+                         const void* timeout) {
 	constexpr int UMTX_OP_WAIT = 2;
 	constexpr int UMTX_OP_WAKE = 3;
 
@@ -2193,12 +2247,13 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 					*GetErrorAddr() = POSIX_EINVAL;
 					return -1;
 				}
-				const auto max_ns = std::chrono::nanoseconds::max().count();
+				const auto max_ns     = std::chrono::nanoseconds::max().count();
 				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
 				                            ? max_ns
 				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
 				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
+				    static_cast<volatile uint64_t*>(address), value,
+				    std::chrono::nanoseconds(timeout_ns),
 				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
 			}
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
@@ -2297,6 +2352,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("TUuiYS2kE8s", Posix::shutdown);
 	LIB_FUNC("3e+4Iv7IJ8U", Posix::accept);
 	LIB_FUNC("RenI1lL1WFk", Posix::getsockname);
+	LIB_FUNC("TXFFFiNldU8", Posix::getpeername);
 	LIB_FUNC("6O8EwYOgH9Y", Posix::getsockopt);
 	LIB_FUNC("fFxGkxF2bVo", Posix::setsockopt);
 	LIB_FUNC("T8fER+tIGgk", Posix::select);
@@ -2433,7 +2489,29 @@ struct FiberThreadContext {
 	FiberObject*    returned_fiber;
 	FiberObject*    pending_idle_fiber;
 	FiberCpuContext cpu_context;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	uintptr_t thread_stack_base;
+	uintptr_t thread_stack_limit;
+#endif
 };
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+static void FiberGetThreadStackBounds(uintptr_t* stack_base, uintptr_t* stack_limit) {
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(*stack_base), "=r"(*stack_limit)
+	             :
+	             : "memory");
+}
+
+static void FiberSetThreadStackBounds(uintptr_t stack_base, uintptr_t stack_limit) {
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(stack_base), "r"(stack_limit)
+	             : "memory");
+}
+#endif
 
 static const auto g_fiber_context_key = [] {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2479,10 +2557,10 @@ static void FiberStoreState(FiberObject* fiber, uint32_t state) {
 }
 
 static void FiberCompleteSwitch(FiberObject* current) {
-	auto* context = FiberGetThreadContext();
+	auto* context          = FiberGetThreadContext();
 	context->current_fiber = current;
 	// Only publish IDLE after switching away from the departing fiber's stack.
-	auto* fiber = context->pending_idle_fiber;
+	auto* fiber                 = context->pending_idle_fiber;
 	context->pending_idle_fiber = nullptr;
 	if (fiber != nullptr) {
 		FiberStoreState(fiber, FIBER_STATE_IDLE);
@@ -2589,10 +2667,10 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
 	FiberSetContextValid(fiber, false);
-	fiber->arg_on_return  = 0;
-	auto* context = FiberGetThreadContext();
+	fiber->arg_on_return    = 0;
+	auto* context           = FiberGetThreadContext();
 	context->returned_fiber = fiber;
-	context->current_fiber = nullptr;
+	context->current_fiber  = nullptr;
 
 	FiberRestoreContext(&context->cpu_context, 1);
 }
@@ -2715,16 +2793,31 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	fiber->arg_on_return = 0;
 	// Register on the host stack; switching fibers only reads the native TLS slot.
 	FiberThreadContext context {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	FiberGetThreadStackBounds(&context.thread_stack_base, &context.thread_stack_limit);
+#endif
 	FiberSetThreadContext(&context);
 
 	if (FiberSaveContext(&context.cpu_context) == 0) {
+		// Fibers use guest-provided stacks that can be anywhere in memory. Host stack
+		// probing against the thread's bounds would walk from this fiber into unrelated
+		// pages, so leave the Windows TEB bounds unset until FiberRun resumes.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+		FiberSetThreadStackBounds(0, 0);
+#endif
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
 	}
 
-	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	// FiberReturnToThread and the fiber trampoline restore the caller context. Reinstate
+	// the bounds belonging to the native thread that entered FiberRun (fibers may migrate).
+	FiberSetThreadStackBounds(context.thread_stack_base, context.thread_stack_limit);
+#endif
+
+	auto* returned_fiber    = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
 	const auto return_value = returned_fiber->arg_on_return;
 	const auto return_code =
 	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
@@ -2786,7 +2879,7 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	}
 
 	const auto* context = FiberGetThreadContext();
-	*fiber = context != nullptr ? context->current_fiber : nullptr;
+	*fiber              = context != nullptr ? context->current_fiber : nullptr;
 
 	return OK;
 }
@@ -2804,7 +2897,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
 		FiberSetContextValid(fiber, true);
-		context->returned_fiber = fiber;
+		context->returned_fiber     = fiber;
 		context->pending_idle_fiber = fiber;
 		FiberRestoreContext(&context->cpu_context, 1);
 	}
@@ -2901,15 +2994,15 @@ void KYTY_SYSV_ABI KernelAioInitializeParam(void* param) {
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 }
 
-constexpr int32_t KERNEL_AIO_STATE_SUBMITTED  = 1;
-constexpr int32_t KERNEL_AIO_STATE_PROCESSING = 2;
-constexpr int32_t KERNEL_AIO_STATE_COMPLETED  = 3;
-constexpr int32_t KERNEL_AIO_STATE_ABORTED    = 4;
-constexpr int32_t KERNEL_AIO_STATE_NOTIFIED   = 0x10000;
-constexpr int32_t KERNEL_AIO_MAX_QUEUE        = 512;
-constexpr int32_t KERNEL_AIO_MAX_REQUESTS     = 128;
-constexpr uint32_t KERNEL_AIO_WAIT_AND        = 1;
-constexpr uint32_t KERNEL_AIO_WAIT_OR         = 2;
+constexpr int32_t  KERNEL_AIO_STATE_SUBMITTED  = 1;
+constexpr int32_t  KERNEL_AIO_STATE_PROCESSING = 2;
+constexpr int32_t  KERNEL_AIO_STATE_COMPLETED  = 3;
+constexpr int32_t  KERNEL_AIO_STATE_ABORTED    = 4;
+constexpr int32_t  KERNEL_AIO_STATE_NOTIFIED   = 0x10000;
+constexpr int32_t  KERNEL_AIO_MAX_QUEUE        = 512;
+constexpr int32_t  KERNEL_AIO_MAX_REQUESTS     = 128;
+constexpr uint32_t KERNEL_AIO_WAIT_AND         = 1;
+constexpr uint32_t KERNEL_AIO_WAIT_OR          = 2;
 
 struct KernelAioResult {
 	int64_t  return_value;
@@ -3018,9 +3111,10 @@ static int32_t kernel_aio_get_state(int32_t id, bool notify) {
 	}
 
 	auto current = g_kernel_aio_state[id].load(std::memory_order_acquire);
-	while (notify && (current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED)) {
-		if (g_kernel_aio_state[id].compare_exchange_weak(current, current | KERNEL_AIO_STATE_NOTIFIED,
-		                                                std::memory_order_acq_rel)) {
+	while (notify &&
+	       (current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED)) {
+		if (g_kernel_aio_state[id].compare_exchange_weak(
+		        current, current | KERNEL_AIO_STATE_NOTIFIED, std::memory_order_acq_rel)) {
 			break;
 		}
 	}
@@ -3063,21 +3157,23 @@ int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* stat
 	}
 
 	const auto collect_states = [&](bool notify) {
-		int32_t finished = 0;
-		bool newly_complete = false;
+		int32_t finished       = 0;
+		bool    newly_complete = false;
 		for (int32_t i = 0; i < num; i++) {
 			const auto current = kernel_aio_get_state(ids[i], notify);
-			states[i] = current;
+			states[i]          = current;
 			finished += current != KERNEL_AIO_STATE_PROCESSING;
-			newly_complete |= current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED;
+			newly_complete |=
+			    current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED;
 		}
 		return finished == num || (mode == KERNEL_AIO_WAIT_OR && newly_complete);
 	};
 	const auto start = std::chrono::steady_clock::now();
 	for (;;) {
-		const bool complete = collect_states(false);
-		const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-		                         std::chrono::steady_clock::now() - start).count();
+		const bool complete  = collect_states(false);
+		const auto elapsed   = std::chrono::duration_cast<std::chrono::microseconds>(
+		                           std::chrono::steady_clock::now() - start)
+		                           .count();
 		const bool timed_out = usec != nullptr && elapsed >= *usec;
 		if (complete || timed_out) {
 			// A competing waiter can claim the newly completed request after the first scan.

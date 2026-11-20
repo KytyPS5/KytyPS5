@@ -101,6 +101,7 @@ void CommandScheduler::Shutdown() {
 			    lock, [this] { return m_operation_state == OperationState::Closed; });
 			return;
 		}
+		SealReleasesLocked();
 		m_operation_state = OperationState::Draining;
 	}
 	if (!m_command.IsInvalid()) {
@@ -117,7 +118,7 @@ void CommandScheduler::Shutdown() {
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
-		        m_priority_active_tick != 0);
+		        !m_unsealed_releases.empty() || m_priority_active_tick != 0);
 		m_operation_state = OperationState::Closed;
 	}
 	m_operation_available.notify_all();
@@ -148,6 +149,10 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::Finish() {
 	CheckActive();
+	{
+		std::lock_guard lock(m_operation_mutex);
+		SealReleasesLocked();
+	}
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
@@ -173,25 +178,66 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	bool refreshed = false;
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
 			}
-			operation = std::move(m_pending_operations.front());
-			m_pending_operations.pop();
+			const auto tick = m_pending_operations.front().tick;
+			if (!m_master.IsFree(tick)) {
+				// The timeline is polled once, and not for the open tick: it is not submitted yet.
+				if (refreshed || tick >= CurrentTick()) {
+					return;
+				}
+			} else {
+				operation = std::move(m_pending_operations.front());
+				m_pending_operations.pop();
+			}
+		}
+		if (!operation.callback) {
+			m_master.Refresh();
+			refreshed = true;
+			continue;
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
 	}
 }
 
+void CommandScheduler::StartOperation() {
+	{
+		std::lock_guard lock(m_operation_mutex);
+		SealReleasesLocked();
+	}
+	PopPendingOperations();
+}
+
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
 	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
+	CheckActive();
+	EXIT_IF(!operation);
+	{
+		std::lock_guard lock(m_operation_mutex);
+		if (m_operation_state == OperationState::Open) {
+			m_unsealed_releases.push_back(std::move(operation));
+			return;
+		}
+	}
+	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::SealReleasesLocked() {
+	const auto last_recorded_tick = m_command.IsInvalid() ? CurrentTick() - 1 : CurrentTick();
+	for (auto& release: m_unsealed_releases) {
+		m_pending_operations.push({std::move(release), last_recorded_tick});
+	}
+	m_unsealed_releases.clear();
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {

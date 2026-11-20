@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "libatrac9.h"
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -18,9 +19,8 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <numbers>
+#include <span>
 #include <vector>
-
-#include "libatrac9.h"
 
 namespace Libs::Audio {
 
@@ -28,22 +28,20 @@ namespace Ngs2 {
 
 LIB_NAME("Ngs2", "Ngs2");
 
-constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE =
-    static_cast<int32_t>(0x804a8201u);
-constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
-    static_cast<int32_t>(0x804a8010u);
-constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
-    static_cast<int32_t>(0x804a8053u);
-constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
-    static_cast<int32_t>(0x804a8054u);
-constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA =
-    static_cast<int32_t>(0x804a8430u);
-constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT =
-    static_cast<int32_t>(0x804a8431u);
-constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
-    static_cast<int32_t>(0x804a8432u);
+constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE       = static_cast<int32_t>(0x804a8201u);
+constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS         = static_cast<int32_t>(0x804a8010u);
+constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS = static_cast<int32_t>(0x804a8053u);
+constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS        = static_cast<int32_t>(0x804a8054u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA       = static_cast<int32_t>(0x804a8430u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT     = static_cast<int32_t>(0x804a8431u);
+constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT     = static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
+// Sampler voice control that turns the voice's peak meter on or off.
+constexpr uint32_t NGS2_SAMPLER_CONTROL_PEAK_METER = 9;
+// Peak meter blocks a sampler rack asks for in every game seen so far (Trails in the Sky 1st
+// Chapter). What other counts mean is unknown, so the meter always reports each grain's peak.
+constexpr uint32_t NGS2_SAMPLER_PEAK_METER_BLOCKS = 1;
 
 struct Ngs2SystemOption {
 	size_t    size                     = 0;
@@ -437,6 +435,13 @@ static_assert(offsetof(Ngs2SamplerFilterParam, type) == 8 &&
               offsetof(Ngs2SamplerFilterParam, channel_mask) == 16 &&
               offsetof(Ngs2SamplerFilterParam, frequency) == 24);
 
+// The SDK's SamplerVoicePeakMeterParam, sent after the control header.
+struct Ngs2SamplerPeakMeterParam {
+	uint32_t enable_flag;
+	uint32_t reserved;
+};
+static_assert(sizeof(Ngs2SamplerPeakMeterParam) == 8);
+
 struct Ngs2SamplerFilter {
 	struct History {
 		double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
@@ -784,14 +789,14 @@ struct Ngs2VoiceInternal {
 	std::vector<float>              samples;
 	std::vector<float>              mix_samples;
 	std::vector<float>              output_matrix;
-	uint32_t                        channels        = 0;
-	uint32_t                        output_id       = 0;
-	float                           fbw_level       = 1.0f;
-	float                           lfe_level       = 1.0f;
+	uint32_t                        channels  = 0;
+	uint32_t                        output_id = 0;
+	float                           fbw_level = 1.0f;
+	float                           lfe_level = 1.0f;
 	Ngs2ReverbState                 reverb;
-	bool                            rendering       = false;
-	bool                            rendered        = false;
-	bool                            has_samples     = false;
+	bool                            rendering   = false;
+	bool                            rendered    = false;
+	bool                            has_samples = false;
 
 	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
 	std::vector<float>                  decoded_frame;
@@ -811,6 +816,10 @@ struct Ngs2VoiceInternal {
 	uint32_t                            skip_remaining     = 0;
 	const uint8_t*                      waveform_end       = nullptr;
 	std::vector<Ngs2SamplerFilter>      filters;
+	// The sampler voice peak meter. While it is enabled, peak_height holds the largest absolute
+	// sample of the voice's last render, which the sampler voice state reports.
+	bool  peak_meter_enabled = false;
+	float peak_height        = 0.0f;
 
 	const uint8_t* WaveformData() const {
 		if (blocks.empty()) {
@@ -865,6 +874,9 @@ struct Ngs2VoiceInternal {
 			matrix.clear();
 		}
 		filters.clear();
+		// Setup starts a new sound and clears the voice's other controls above, so the peak meter
+		// starts off too. SetEvent(4) has already cleared the last peak.
+		peak_meter_enabled = false;
 	}
 
 	void ClearWaveformBlocks() {
@@ -884,9 +896,8 @@ struct Ngs2VoiceInternal {
 		const bool deferred = format.waveform_type == 0 && format.num_channels == 0 &&
 		                      format.sample_rate == 0 && format.config_data == 0 &&
 		                      format.frame_margin == 0 && format.frame_offset == 0;
-		EXIT_NOT_IMPLEMENTED(!deferred &&
-		                     (format.frame_margin != 0 || format.frame_offset != 0 ||
-		                      format.sample_rate == 0 || format.num_channels == 0));
+		EXIT_NOT_IMPLEMENTED(!deferred && (format.frame_margin != 0 || format.frame_offset != 0 ||
+		                                   format.sample_rate == 0 || format.num_channels == 0));
 		ResetSetupState();
 		ClearWaveformBlocks();
 		channels        = format.num_channels;
@@ -936,8 +947,8 @@ struct Ngs2VoiceInternal {
 		const bool join      = only_data && (flags & 0x10u) == 0;
 		// CLEAR reopens a list that the previous addition closed.
 		EXIT_NOT_IMPLEMENTED((!accepts_blocks && !clear) || (flags & ~0x1fu) != 0);
-		const auto retained = clear ? 0 : blocks.size();
-		Block      tail     = retained == 0 ? Block {} : blocks.back();
+		const auto         retained = clear ? 0 : blocks.size();
+		Block              tail     = retained == 0 ? Block {} : blocks.back();
 		std::vector<Block> pending;
 		pending.reserve(count);
 		for (uint32_t i = 0; i < count; ++i) {
@@ -952,8 +963,7 @@ struct Ngs2VoiceInternal {
 				info.num_samples      = 0;
 			}
 			Block block {data + info.data_offset, info};
-			auto* previous = pending.empty() ? (retained == 0 ? nullptr : &tail)
-			                                 : &pending.back();
+			auto* previous = pending.empty() ? (retained == 0 ? nullptr : &tail) : &pending.back();
 			if (join && previous != nullptr &&
 			    previous->data + previous->info.data_size == block.data) {
 				previous->info.data_size += block.info.data_size;
@@ -970,7 +980,8 @@ struct Ngs2VoiceInternal {
 		} else if (retained != 0) {
 			blocks.back().info.data_size = tail.info.data_size;
 		}
-		// CANCEL marks the outstanding blocks; a marked block that has not started decodes as data only.
+		// CANCEL marks the outstanding blocks; a marked block that has not started decodes as data
+		// only.
 		if ((flags & 8u) != 0) {
 			for (auto& block: blocks) {
 				block.canceled = true;
@@ -1012,6 +1023,9 @@ struct Ngs2VoiceInternal {
 			case 8:
 				state = Ngs2VoicePlayState::Empty;
 				reverb.Reset();
+				// A killed or reset voice starts its next sound from silence, so its last peak must
+				// not be reported before it renders again.
+				peak_height = 0.0f;
 				break;
 			case 16:
 				if (state == Ngs2VoicePlayState::Playing) {
@@ -1257,7 +1271,8 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 			option->sampler.max_atrac9_decoders                = 256;
 			option->sampler.max_atrac9_channel_works           = 256;
 			option->sampler.max_ajm_atrac9_decoders            = 0;
-			option->sampler.num_peak_meter_blocks              = 8;
+			// The SDK's default is not known, so this uses the only count seen in a game.
+			option->sampler.num_peak_meter_blocks = NGS2_SAMPLER_PEAK_METER_BLOCKS;
 			break;
 		case 0x2000:
 			option->submixer.rack_option.size                   = sizeof(Ngs2SubmixerRackOption);
@@ -1402,8 +1417,8 @@ int KYTY_SYSV_ABI Ngs2SystemCreateWithAllocator(const Ngs2SystemOption*    optio
 
 int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* info,
                                     size_t info_size) {
-	constexpr int32_t ERROR_INVALID_OUT_ADDRESS   = static_cast<int32_t>(0x804a8010u);
-	constexpr int32_t ERROR_INVALID_OUT_SIZE      = static_cast<int32_t>(0x804a8011u);
+	constexpr int32_t ERROR_INVALID_OUT_ADDRESS = static_cast<int32_t>(0x804a8010u);
+	constexpr int32_t ERROR_INVALID_OUT_SIZE    = static_cast<int32_t>(0x804a8011u);
 
 	if (info == nullptr) {
 		return ERROR_INVALID_OUT_ADDRESS;
@@ -1555,6 +1570,14 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SamplerRackOption));
 			rack->option.sampler = *reinterpret_cast<const Ngs2SamplerRackOption*>(option);
 			rack->type           = Ngs2RackType::Sampler;
+			// Another count could mean a longer window, shorter sub-blocks or an allocation size.
+			// Logging it lets the first game that asks for one show which.
+			if (rack->option.sampler.num_peak_meter_blocks != NGS2_SAMPLER_PEAK_METER_BLOCKS) {
+				Log::WriteToConsoleAndLog(fmt::sprintf("warning: NGS2 sampler rack asks for %u "
+				                                       "peak meter blocks, using 1 (the peak of "
+				                                       "the last grain only)\n",
+				                                       rack->option.sampler.num_peak_meter_blocks));
+			}
 			break;
 		case 0x2000:
 			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2SubmixerRackOption));
@@ -1721,7 +1744,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 			for (size_t m = 0; m < voices[i].modules.size(); ++m) {
 				const auto& fx = rack->fx[m];
 				if (fx.cleanup != nullptr) {
-					auto&             module = voices[i].modules[m];
+					auto&              module = voices[i].modules[m];
 					Ngs2UserFx2Context context {rack->common[m].data(),
 					                            module.param.data(),
 					                            module.work.data(),
@@ -1794,7 +1817,7 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	const auto generation = voice.source_generation;
 	auto&      block      = voice.blocks.front();
 	const bool repeat     = block.info.num_repeats != 0;
-	voice.waveform_end = voice.WaveformData();
+	voice.waveform_end    = voice.WaveformData();
 	if (repeat) {
 		if (block.info.num_repeats != UINT32_MAX) {
 			--block.info.num_repeats;
@@ -1868,9 +1891,9 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			if (voice.duration_remaining == 0 ||
 			    block.info.data_size - block.data_cursor < frame_bytes) {
 				// A repeating block restarts its duration, so it must hold all of it.
-				EXIT_NOT_IMPLEMENTED(voice.duration_remaining != 0 &&
-				                     (block.data_cursor != block.info.data_size ||
-				                      block.info.num_repeats != 0));
+				EXIT_NOT_IMPLEMENTED(
+				    voice.duration_remaining != 0 &&
+				    (block.data_cursor != block.info.data_size || block.info.num_repeats != 0));
 				if (!Ngs2FinishBlock(voice)) {
 					return false;
 				}
@@ -1881,8 +1904,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			continue;
 		}
 		const auto skip =
-		    std::min(voice.skip_remaining,
-		             static_cast<uint32_t>(frame.size() / voice.channels));
+		    std::min(voice.skip_remaining, static_cast<uint32_t>(frame.size() / voice.channels));
 		Ajm::AjmGaplessState gapless;
 		gapless.Set({voice.duration_remaining, static_cast<uint16_t>(skip), 0}, true);
 		if (!voice.compressed_input.empty()) {
@@ -1908,8 +1930,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 		const auto result  = voice.decoder->Decode(
 		    pending ? voice.compressed_input.data() : block.data + block.data_cursor,
 		    pending ? voice.compressed_input.size() : block.info.data_size - block.data_cursor,
-		    frame.data(), frame.size() * sizeof(float), false,
-		    &gapless);
+		    frame.data(), frame.size() * sizeof(float), false, &gapless);
 		if (!pending && result.result == Ajm::AJM_RESULT_PARTIAL_INPUT &&
 		    result.input_consumed == 0) {
 			voice.compressed_input.insert(voice.compressed_input.end(),
@@ -1967,8 +1988,7 @@ static bool Ngs2CurrentFrame(Ngs2VoiceInternal& voice) {
 			return false;
 		}
 	}
-	return voice.state == Ngs2VoicePlayState::Playing &&
-	       voice.frame_cursor < voice.frame_samples;
+	return voice.state == Ngs2VoicePlayState::Playing && voice.frame_cursor < voice.frame_samples;
 }
 
 static void Ngs2AdvanceSamples(Ngs2VoiceInternal& voice) {
@@ -1989,8 +2009,8 @@ static void Ngs2AdvanceSamples(Ngs2VoiceInternal& voice) {
 }
 
 static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
-	const auto generation = voice.source_generation;
-	uint32_t   output     = 0;
+	const auto generation  = voice.source_generation;
+	uint32_t   output      = 0;
 	const auto output_rate = uint64_t(voice.rack->ngs->option.sample_rate) << 32u;
 	while (voice.state == Ngs2VoicePlayState::Playing && output < grain &&
 	       (!voice.blocks.empty() || voice.frame_cursor < voice.frame_samples ||
@@ -2013,12 +2033,11 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 			}
 		}
 		const float* current = voice.decoded_frame.data() + voice.frame_cursor * voice.channels;
-		const float* next = voice.frame_cursor + 1 < voice.frame_samples
-		                        ? current + voice.channels
-		                        : voice.next_frame_samples != 0 ? voice.next_decoded_frame.data()
-		                                                        : current;
-		const float fraction = static_cast<float>(voice.sample_phase) /
-		                       static_cast<float>(output_rate);
+		const float* next = voice.frame_cursor + 1 < voice.frame_samples ? current + voice.channels
+		                    : voice.next_frame_samples != 0 ? voice.next_decoded_frame.data()
+		                                                    : current;
+		const float  fraction =
+		    static_cast<float>(voice.sample_phase) / static_cast<float>(output_rate);
 		for (uint32_t c = 0; c < voice.channels; ++c) {
 			voice.samples[c * grain + output] = std::lerp(current[c], next[c], fraction);
 		}
@@ -2048,11 +2067,28 @@ static float Ngs2DefaultMatrixLevel(uint32_t src_channels, uint32_t src, uint32_
 	return src == dst ? 1.0f : 0.0f;
 }
 
+// Largest absolute sample in a voice's rendered output, as a linear level where 1.0 is full scale.
+// Levels above full scale are kept, since float sources and resonant filters can exceed it. A NaN
+// or infinite sample from a misbehaving filter is skipped, so the game never gets a peak it can't
+// turn into a level.
+static float Ngs2PeakHeight(std::span<const float> samples) {
+	float peak = 0.0f;
+	for (const float sample: samples) {
+		if (std::isfinite(sample)) {
+			peak = std::max(peak, std::abs(sample));
+		}
+	}
+	return peak;
+}
+
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
 		return;
 	}
+	// A voice renders silence unless it plays below, including one left without channels by a
+	// deferred sampler setup.
+	voice.peak_height = 0.0f;
 	if (voice.channels == 0) {
 		voice.has_samples = false;
 		voice.rendered    = true;
@@ -2073,9 +2109,16 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					voice.has_samples = true;
 				}
 			}
+			// The meter reads the voice after its filters and before port volume and routing, so
+			// muting or attenuating a port doesn't hide the voice's level. It should move after
+			// the envelope once envelopes are implemented. The peak is already 0 from the start of
+			// this render when the voice produced nothing.
+			if (voice.peak_meter_enabled && voice.has_samples) {
+				voice.peak_height =
+				    Ngs2PeakHeight({voice.Buffer(0, grain), size_t {grain} * voice.channels});
+			}
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
-			    voice.frame_cursor == voice.frame_samples &&
-			    voice.next_frame_samples == 0 &&
+			    voice.frame_cursor == voice.frame_samples && voice.next_frame_samples == 0 &&
 			    !voice.accepts_blocks &&
 			    std::ranges::none_of(voice.filters,
 			                         [](const auto& filter) { return filter.HasHistory(); })) {
@@ -2136,9 +2179,10 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				}
 				if (info.module_id != 0x19 && info.module_id != 0x1f) {
 					if (!module.render_warned) {
-						Log::WriteToConsoleAndLog(fmt::sprintf(
-						    "warning: NGS2 custom module 0x%02x at index %zu is ignored during render\n",
-						    info.module_id, m));
+						Log::WriteToConsoleAndLog(
+						    fmt::sprintf("warning: NGS2 custom module 0x%02x at index %zu is "
+						                 "ignored during render\n",
+						                 info.module_id, m));
 						module.render_warned = true;
 					}
 					continue;
@@ -2185,8 +2229,8 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
-	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
-	Common::LockGuard lock(ngs->mutex);
+	auto*                           ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	Common::LockGuard               lock(ngs->mutex);
 	std::vector<std::vector<float>> output_mix(num_buffer_info);
 	std::vector<Ngs2VoiceInternal*> voices;
 	{
@@ -2222,9 +2266,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		// Surround inputs mixed into fewer output channels use their own downmix levels.
 		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering && voice->channels > 2 &&
 		                     output.num_channels < voice->channels);
-		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
-		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
-		                                                                             : sizeof(float)));
+		EXIT_NOT_IMPLEMENTED(output.buffer_size <
+		                     grain * output.num_channels *
+		                         (output.waveform_type == 0x12 ? sizeof(int16_t) : sizeof(float)));
 		float* pcm = nullptr;
 		if (output.waveform_type == 0x12) {
 			auto& mix = output_mix[voice->output_id];
@@ -2266,8 +2310,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		auto* pcm = static_cast<int16_t*>(buffer_info[i].buffer);
 		for (size_t sample = 0; sample < mix.size(); ++sample) {
 			pcm[sample] = static_cast<int16_t>(std::clamp(
-			    std::lrintf(std::clamp(mix[sample], -1.0f, 1.0f) * 32768.0f), -32768l,
-			    32767l));
+			    std::lrintf(std::clamp(mix[sample], -1.0f, 1.0f) * 32768.0f), -32768l, 32767l));
 		}
 	}
 	for (auto* voice: voices) {
@@ -2295,15 +2338,14 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 }
 
 static bool Ngs2GetAtrac9CodecInfo(const std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE>& config,
-                                   Atrac9CodecInfo& codec) {
+                                   Atrac9CodecInfo&                                    codec) {
 	return Ajm::AjmAt9GetCodecInfo(config.data(), codec);
 }
 
 static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformInfo* info) {
-	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36,
-	                                            0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65,
-	                                            0x4f, 0x8c, 0x83, 0x6c};
-	const auto* bytes = static_cast<const uint8_t*>(data);
+	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d,
+	                                            0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c};
+	const auto*              bytes           = static_cast<const uint8_t*>(data);
 	if (bytes == nullptr || data_size < 12) {
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
@@ -2317,17 +2359,17 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	}
 	const auto riff_end = static_cast<size_t>(riff_end64);
 
-	const uint8_t* format           = nullptr;
-	const uint8_t* fact             = nullptr;
-	size_t         waveform_offset  = 0;
-	uint32_t       waveform_size    = 0;
+	const uint8_t* format          = nullptr;
+	const uint8_t* fact            = nullptr;
+	size_t         waveform_offset = 0;
+	uint32_t       waveform_size   = 0;
 
 	for (size_t offset = 12; offset + 8 <= std::min(riff_end, data_size);) {
-		const auto* chunk       = bytes + offset;
-		const auto  chunk_size  = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
-		const auto  payload     = offset + 8;
-		const auto  is_data     = Ngs2FourCcEquals(chunk, "data");
-		const uint64_t next    = static_cast<uint64_t>(payload) + chunk_size + (chunk_size & 1u);
+		const auto*    chunk      = bytes + offset;
+		const auto     chunk_size = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
+		const auto     payload    = offset + 8;
+		const auto     is_data    = Ngs2FourCcEquals(chunk, "data");
+		const uint64_t next       = static_cast<uint64_t>(payload) + chunk_size + (chunk_size & 1u);
 		if (next > riff_end || (next > data_size && !is_data)) {
 			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 		}
@@ -2367,8 +2409,8 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config {};
 	std::memcpy(config.data(), format + 44, config.size());
 	Atrac9CodecInfo codec {};
-	const bool valid_codec = Ngs2GetAtrac9CodecInfo(config, codec);
-	const uint64_t frame_samples =
+	const bool      valid_codec = Ngs2GetAtrac9CodecInfo(config, codec);
+	const uint64_t  frame_samples =
 	    static_cast<uint64_t>(codec.frameSamples) * static_cast<uint64_t>(codec.framesInSuperframe);
 	if (!valid_codec || codec.channels != Ngs2ReadLe16(format + 2) ||
 	    codec.samplingRate != static_cast<int>(Ngs2ReadLe32(format + 4)) ||
@@ -2381,22 +2423,21 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	info->format.waveform_type = NGS2_WAVEFORM_TYPE_ATRAC9;
 	info->format.num_channels  = static_cast<uint32_t>(codec.channels);
 	info->format.sample_rate   = static_cast<uint32_t>(codec.samplingRate);
-	info->format.config_data = (static_cast<uint32_t>(config[0]) << 24u) |
-	                           (static_cast<uint32_t>(config[1]) << 16u) |
-	                           (static_cast<uint32_t>(config[2]) << 8u) | config[3];
-	info->data_offset              = static_cast<uint32_t>(waveform_offset);
-	info->data_size                = waveform_size;
-	info->num_samples              = Ngs2ReadLe32(fact);
-	info->audio_unit_size          = static_cast<uint32_t>(codec.superframeSize /
-	                                                       codec.framesInSuperframe);
-	info->num_audio_unit_samples   = static_cast<uint32_t>(codec.frameSamples);
-	info->num_audio_unit_per_frame = static_cast<uint32_t>(codec.framesInSuperframe);
-	info->audio_frame_size         = static_cast<uint32_t>(codec.superframeSize);
-	info->num_audio_frame_samples  = static_cast<uint32_t>(frame_samples);
-	info->num_delay_samples        = Ngs2ReadLe32(fact + 4);
-	info->num_blocks               = 1;
-	info->blocks[0].data_offset    = waveform_offset;
-	info->blocks[0].data_size      = waveform_size;
+	info->format.config_data   = (static_cast<uint32_t>(config[0]) << 24u) |
+	                             (static_cast<uint32_t>(config[1]) << 16u) |
+	                             (static_cast<uint32_t>(config[2]) << 8u) | config[3];
+	info->data_offset          = static_cast<uint32_t>(waveform_offset);
+	info->data_size            = waveform_size;
+	info->num_samples          = Ngs2ReadLe32(fact);
+	info->audio_unit_size = static_cast<uint32_t>(codec.superframeSize / codec.framesInSuperframe);
+	info->num_audio_unit_samples     = static_cast<uint32_t>(codec.frameSamples);
+	info->num_audio_unit_per_frame   = static_cast<uint32_t>(codec.framesInSuperframe);
+	info->audio_frame_size           = static_cast<uint32_t>(codec.superframeSize);
+	info->num_audio_frame_samples    = static_cast<uint32_t>(frame_samples);
+	info->num_delay_samples          = Ngs2ReadLe32(fact + 4);
+	info->num_blocks                 = 1;
+	info->blocks[0].data_offset      = waveform_offset;
+	info->blocks[0].data_size        = waveform_size;
 	info->blocks[0].num_skip_samples = Ngs2ReadLe32(fact + 8);
 	info->blocks[0].num_samples      = info->num_samples;
 	return OK;
@@ -2436,17 +2477,17 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 		    static_cast<uint8_t>(format->config_data >> 8u),
 		    static_cast<uint8_t>(format->config_data)};
 		Atrac9CodecInfo codec {};
-		if (!Ngs2GetAtrac9CodecInfo(config, codec) ||
-		    codec.channels != format->num_channels || codec.samplingRate != format->sample_rate) {
+		if (!Ngs2GetAtrac9CodecInfo(config, codec) || codec.channels != format->num_channels ||
+		    codec.samplingRate != format->sample_rate) {
 			return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 		}
 		const uint64_t frame_samples = uint64_t(codec.frameSamples) * codec.framesInSuperframe;
 		const uint64_t skip          = sample_pos % frame_samples;
-		block->data_offset = uint64_t(sample_pos / frame_samples) * codec.superframeSize;
-		block->data_size = num_samples == 0
-		                       ? 0
-		                       : ((skip + num_samples + frame_samples - 1) / frame_samples) *
-		                             codec.superframeSize;
+		block->data_offset           = uint64_t(sample_pos / frame_samples) * codec.superframeSize;
+		block->data_size =
+		    num_samples == 0
+		        ? 0
+		        : ((skip + num_samples + frame_samples - 1) / frame_samples) * codec.superframeSize;
 		block->num_skip_samples = num_samples == 0 ? 0 : static_cast<uint32_t>(skip);
 	} else if (format->waveform_type == 0x12) {
 		// 16-bit PCM has fixed-size frames, so the block starts exactly at the sample.
@@ -2717,7 +2758,7 @@ int KYTY_SYSV_ABI Ngs2GeomApply(const Ngs2GeomListenerWork* listener,
 		const auto  axis        = GeomNormalize(source->direction, {0.0f, 0.0f, 1.0f});
 		const auto  to_listen   = GeomScale(offset, -1.0f / distance);
 		const float angle       = std::acos(std::clamp(GeomDot(axis, to_listen), -1.0f, 1.0f)) *
-		                          (180.0f / std::numbers::pi_v<float>) * 2.0f;
+		                          (180.0f / std::numbers::pi_v<float>)*2.0f;
 		const float inner_level = std::clamp(source->cone.inner_level, 0.0f, 2.0f);
 		const float outer_level = std::clamp(source->cone.outer_level, 0.0f, 2.0f);
 		float       cone        = 1.0f;
@@ -2939,10 +2980,10 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2SubmixerVoiceSetupParam));
 					const auto& setup =
 					    *reinterpret_cast<const Ngs2SubmixerVoiceSetupParam*>(param);
-					EXIT_NOT_IMPLEMENTED(
-					    setup.num_io_channels == 0 ||
-					    setup.num_io_channels > voice->rack->option.submixer.max_channels ||
-					    setup.flags != 0);
+					EXIT_NOT_IMPLEMENTED(setup.num_io_channels == 0 ||
+					                     setup.num_io_channels >
+					                         voice->rack->option.submixer.max_channels ||
+					                     setup.flags != 0);
 					voice->ResetSetupState();
 					voice->channels = setup.num_io_channels;
 				}
@@ -2996,6 +3037,18 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						                            matrix->levels + matrix->num_levels);
 						break;
 					}
+					case 2: {
+						// Seen from Trackmania (PPSA02195) with an 8-byte payload; its meaning
+						// is unknown, so it is accepted and ignored.
+						static bool warned = false;
+						if (!warned) {
+							Log::WriteToConsoleAndLog(fmt::sprintf(
+							    "warning: NGS2 mastering control 0x%08" PRIx32 " is ignored\n",
+							    param->id));
+							warned = true;
+						}
+						break;
+					}
 					case 4: {
 						const auto* levels = reinterpret_cast<const float*>(values);
 						voice->fbw_level   = std::clamp(levels[0], 0.0f, 4.0f);
@@ -3025,8 +3078,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					break;
 				}
 				if (module_id == 0x17) {
-					EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
-					                                       37 * 37 * sizeof(float));
+					EXIT_NOT_IMPLEMENTED(param->size !=
+					                     sizeof(Ngs2VoiceParamHeader) + 37 * 37 * sizeof(float));
 					const auto* levels = reinterpret_cast<const float*>(param + 1);
 					module.channel_matrix.resize(37 * 37);
 					std::transform(levels, levels + module.channel_matrix.size(),
@@ -3080,8 +3133,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							const Ngs2WaveformBlock* blocks;
 						};
 						const auto& blocks = *reinterpret_cast<const BlocksParam*>(param);
-						const auto result = voice->AddWaveformBlocks(
-						    blocks.data, blocks.flags, blocks.count, blocks.blocks);
+						const auto  result = voice->AddWaveformBlocks(blocks.data, blocks.flags,
+						                                              blocks.count, blocks.blocks);
 						if (result != OK) {
 							return result;
 						}
@@ -3096,12 +3149,26 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						}
 						break;
 					}
-						case 5: {
-							const float ratio = *reinterpret_cast<const float*>(param + 1);
+					case 5: {
+						const float ratio = *reinterpret_cast<const float*>(param + 1);
 						EXIT_NOT_IMPLEMENTED(!std::isfinite(ratio));
 						const float clamped_ratio = std::clamp(ratio, 0.0f, 4.0f);
-						voice->sample_step = static_cast<uint64_t>(std::llround(
-							    static_cast<double>(voice->sample_rate) * clamped_ratio * 4294967296.0));
+						voice->sample_step        = static_cast<uint64_t>(
+						    std::llround(static_cast<double>(voice->sample_rate) * clamped_ratio *
+						                 4294967296.0));
+						break;
+					}
+					case NGS2_SAMPLER_CONTROL_PEAK_METER: {
+						EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler);
+						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
+						                                        sizeof(Ngs2SamplerPeakMeterParam));
+						const auto& meter =
+						    *reinterpret_cast<const Ngs2SamplerPeakMeterParam*>(param + 1);
+						voice->peak_meter_enabled = meter.enable_flag != 0;
+						if (!voice->peak_meter_enabled) {
+							voice->peak_height = 0.0f;
+						}
+						LOGF("\t peak meter enable flag = 0x%08" PRIx32 "\n", meter.enable_flag);
 						break;
 					}
 					case 0xa: {
@@ -3126,7 +3193,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			case 0x4002: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSubmixer ||
 				                     (param->id & 0xffffu) != 0);
-				const auto* channels   = reinterpret_cast<const uint32_t*>(param + 1);
+				const auto* channels = reinterpret_cast<const uint32_t*>(param + 1);
 				EXIT_NOT_IMPLEMENTED(channels[0] != channels[1]);
 				voice->channels = channels[0];
 				break;
@@ -3140,7 +3207,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				switch (param->id & 0xffffu) {
 					case 0:
 						EXIT_NOT_IMPLEMENTED(values[0] == 0 ||
-						                     values[0] > voice->rack->option.common.max_voice_channels ||
+						                     values[0] >
+						                         voice->rack->option.common.max_voice_channels ||
 						                     values[1] != 0);
 						voice->channels = values[0];
 						break;
@@ -3238,14 +3306,16 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			const bool sampler = voice->rack->type == Ngs2RackType::CustomSampler;
 			const auto configured_size =
 			    voice->rack->option.custom_sampler.custom_rack_option.state_size;
-			EXIT_NOT_IMPLEMENTED(configured_size < (sampler ? sizeof(Ngs2CustomSamplerVoiceState)
-			                                                : sizeof(Ngs2CustomMasteringVoiceState)));
+			EXIT_NOT_IMPLEMENTED(configured_size < (sampler
+			                                            ? sizeof(Ngs2CustomSamplerVoiceState)
+			                                            : sizeof(Ngs2CustomMasteringVoiceState)));
 			if (state_size < configured_size) {
 				return static_cast<int32_t>(0x804a8011u);
 			}
 			std::memset(state, 0, configured_size);
 			if (sampler) {
-				Ngs2FillSamplerState(*voice, *reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state));
+				Ngs2FillSamplerState(*voice,
+				                     *reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state));
 			} else {
 				state->state_flags = Ngs2GetStateFlags(voice);
 			}
@@ -3265,10 +3335,10 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 				break;
 			}
 
-			auto* sampler                = reinterpret_cast<Ngs2SamplerVoiceState*>(state);
-			sampler->envelope_height     = 1.0f;
-			sampler->peak_height         = 0.0f;
-			sampler->reserved            = 0;
+			auto* sampler            = reinterpret_cast<Ngs2SamplerVoiceState*>(state);
+			sampler->envelope_height = 1.0f;
+			sampler->peak_height     = voice->peak_meter_enabled ? voice->peak_height : 0.0f;
+			sampler->reserved        = 0;
 			Ngs2FillSamplerState(*voice, *sampler);
 			break;
 		}

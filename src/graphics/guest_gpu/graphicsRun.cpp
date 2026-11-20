@@ -156,6 +156,30 @@ int GuestGpu::GetFrameNum() const {
 	return m_done_num;
 }
 
+uint64_t GuestGpu::SubmittedWork() {
+	Common::LockGuard lock(m_queue_mutex);
+	return m_next_submission_sequence - 1;
+}
+
+bool GuestGpu::WaitForWork(uint64_t marker, const std::atomic_bool& cancel) {
+	EXIT_IF(IsGpuThread());
+	Common::LockGuard lock(m_queue_mutex);
+	// Every submission admitted up to the marker has completed: none of them is in m_in_flight.
+	const auto done = [this, marker] {
+		return m_stopping || m_in_flight.empty() || *m_in_flight.begin() > marker;
+	};
+	if (done()) {
+		return true;
+	}
+	const auto wait = m_work_waits.insert(marker);
+	while (!done() && !cancel) {
+		// Neither `cancel` nor Shutdown signals m_work_progress: look again every 10 ms.
+		(void)m_work_progress.WaitFor(&m_queue_mutex, 10000);
+	}
+	m_work_waits.erase(wait);
+	return done();
+}
+
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	if (queue_id == 0) {
 		return *m_gfx_cp;
@@ -224,6 +248,7 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	m_renderer.GetBufferCache().PublishReadHot();
 	GetScheduler().Flush();
 	// The occlusion counters reach a guest that polls them without waiting for a later fence.
 	m_renderer.GetOcclusionQueries().Publish();
@@ -237,7 +262,17 @@ void CommandProcessor::BufferWait() {
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+		return;
 	}
+	// The game thread may have set the valid bit after writing the commands' data.
+	PromoteGuestWrites();
+}
+
+void CommandProcessor::PromoteGuestWrites() {
+	// Keep the caller's read of the guest value ahead of the promotion's check for held-back
+	// events. Otherwise the check could miss an event queued before the value was written.
+	std::atomic_thread_fence(std::memory_order_acquire);
+	m_renderer.GetBufferCache().PromoteBdaSync();
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -264,7 +299,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
+		return;
 	}
+	// The value may come from a game thread that wrote the data it guards first. Those writes
+	// must reach the BDA draws that follow, even though the submission never suspended.
+	PromoteGuestWrites();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -279,6 +318,8 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 		SuspendPm4();
 	} else {
 		(*counter)--;
+		// A game thread may have signalled the count after writing the data it guards.
+		PromoteGuestWrites();
 	}
 }
 
@@ -317,8 +358,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
 }
@@ -389,6 +429,8 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.sequence = m_next_submission_sequence++;
+	m_in_flight.insert(submission.sequence);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -406,6 +448,12 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Guest job threads spin while they wait for work; keep them from taking this core.
+	if (!Common::Thread::SetCurrentPriorityHighest()) {
+		LOGF("GPU: could not raise the GPU thread priority\n");
+	}
+#endif
 	g_gpu_state = gpu;
 
 	for (;;) {
@@ -493,6 +541,12 @@ void GuestGpu::ThreadRun(void* data) {
 					queue.front().blocked = false;
 				}
 			}
+			gpu->m_in_flight.erase(submission.sequence);
+			if (!gpu->m_work_waits.empty() &&
+			    (gpu->m_in_flight.empty() ||
+			     *gpu->m_in_flight.begin() > *gpu->m_work_waits.begin())) {
+				gpu->m_work_progress.SignalAll();
+			}
 		}
 		gpu->m_processing = false;
 		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -502,6 +556,9 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	// Game-thread writes made before this submission, or before the wait it resumes from, must
+	// reach the BDA draws it records.
+	m_renderer.GetBufferCache().PromoteBdaSync();
 	auto& cp = GetProcessor(submission.queue_id);
 
 	cp.BufferInit();
@@ -515,9 +572,7 @@ bool GuestGpu::Process(Submission& submission) {
 				cp.BufferFlush();
 			}
 			break;
-		case SubmissionType::FlipPreparation:
-			cp.PrepareCpuFlip(submission.flip_request_id);
-			break;
+		case SubmissionType::FlipPreparation: cp.PrepareCpuFlip(submission.flip_request_id); break;
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
@@ -588,7 +643,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		if (remaining_dw < 2) {
+			// A single dword is too short for any packet: a type-0/type-3 header with no body,
+			// or a type-2 NOP carrying a count, which is filler and not a length. Games really do
+			// leave one word behind the last real packet: consume it and the buffer is done.
+			static std::atomic<uint32_t> tail_log_count {0};
+			if (tail_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("CP: trailing dword 0x%08" PRIx32 " at offset=0x%05" PRIx32 "\n", packet[0],
+				     total_dw - remaining_dw);
+			}
+			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
 
 		if (debug_dump) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
@@ -684,15 +751,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
+		case 0x00: m_predicate_skip = false; return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			const auto*        results   = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
@@ -711,6 +776,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			PromoteGuestWrites();
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -764,8 +830,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 		if (location == Pm4::SH_NOP) {
 			return;
 		}
-		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
-		                     g_hw_sh_indirect_func[location] == nullptr);
+		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM || g_hw_sh_indirect_func[location] == nullptr);
 		g_hw_sh_indirect_func[location](cp, location, value);
 	};
 	write(registers.vertex_offset, vertex_offset);
@@ -933,6 +998,7 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
+	m_renderer.GetBufferCache().PublishReadHot();
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
@@ -1066,6 +1132,8 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	m_renderer.GetBufferCache().DecayReadHot();
+	m_renderer.GetBufferCache().PublishReadHot();
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
@@ -1076,6 +1144,8 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
+	m_renderer.GetBufferCache().DecayReadHot();
+	m_renderer.GetBufferCache().PublishReadHot();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });

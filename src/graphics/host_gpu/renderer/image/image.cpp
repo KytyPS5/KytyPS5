@@ -58,10 +58,9 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 		usage |= vk::ImageUsageFlagBits::eSampled;
 		if (graphics.supports_block_texel_view) {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
-			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
-			                                      vk::ImageTiling::eOptimal, storage,
-			                                      ImageCreateFlags(graphics, info, storage),
-			                                      nullptr) == vk::Result::eSuccess) {
+			if (graphics.GetImageFormatProperties(
+			        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, storage,
+			        ImageCreateFlags(graphics, info, storage), nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -79,9 +78,13 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}
-	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
+	const bool stencil_attachment =
+	    info.pixel_format == vk::Format::eS8Uint &&
+	    HasFormatFeature(properties, vk::FormatFeatureFlagBits::eDepthStencilAttachment);
+	if (info.IsDepth() || stencil_attachment) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
+		if (graphics.attachment_feedback_loop_enabled &&
+		    (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
 		}
 		return usage;
@@ -118,6 +121,13 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 		default: return vk::ImageAspectFlagBits::eColor;
 	}
+}
+
+vk::ImageAspectFlags Image::PrimaryAspect(vk::Format format) noexcept {
+	const auto aspects = FullAspectMask(format);
+	return aspects == vk::ImageAspectFlagBits::eStencil
+	           ? aspects
+	           : aspects & ~vk::ImageAspectFlagBits::eStencil;
 }
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
@@ -344,8 +354,11 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	return {source_layers, destination_layers};
 }
 
-void Image::CopyImage(Image& source) {
+void Image::CopyImage(Image& source, bool stencil) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	EXIT_IF(stencil &&
+	        (!(FullAspectMask(source.backing.format) & vk::ImageAspectFlagBits::eStencil) ||
+	         !(FullAspectMask(backing.format) & vk::ImageAspectFlagBits::eStencil)));
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	uint32_t       base_depth = source.backing.extent.depth;
@@ -355,9 +368,11 @@ void Image::CopyImage(Image& source) {
 		base_depth = backing.extent.depth;
 	}
 	const auto source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	            : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	    stencil ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eStencil}
+	            : FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
@@ -465,19 +480,17 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
-	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
-	const auto     source_aspect =
-	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto destination_aspect =
-	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	const auto     source_bytes      = DepthAspectTransferBytes(source.backing.format) != 0
-	                                       ? DepthAspectTransferBytes(source.backing.format)
-	                                       : source.info.bytes_per_block;
-	const auto     destination_bytes = DepthAspectTransferBytes(backing.format) != 0
-	                                       ? DepthAspectTransferBytes(backing.format)
-	                                       : info.bytes_per_block;
-	const uint32_t source_block      = source.info.IsBlock() ? 4u : 1u;
-	const uint32_t destination_block = info.IsBlock() ? 4u : 1u;
+	const uint32_t levels             = std::min(source.backing.mip_levels, backing.mip_levels);
+	const auto     source_aspect      = PrimaryAspect(source.backing.format);
+	const auto     destination_aspect = PrimaryAspect(backing.format);
+	const auto     source_bytes       = DepthAspectTransferBytes(source.backing.format) != 0
+	                                        ? DepthAspectTransferBytes(source.backing.format)
+	                                        : source.info.bytes_per_block;
+	const auto     destination_bytes  = DepthAspectTransferBytes(backing.format) != 0
+	                                        ? DepthAspectTransferBytes(backing.format)
+	                                        : info.bytes_per_block;
+	const uint32_t source_block       = source.info.IsBlock() ? 4u : 1u;
+	const uint32_t destination_block  = info.IsBlock() ? 4u : 1u;
 	EXIT_IF(levels == 0 || source_bytes == 0 || source_bytes != destination_bytes ||
 	        source_block != destination_block);
 	const auto source_transform = source.info.GetColorTransform();
@@ -637,7 +650,8 @@ void Validate(const ImageInfo& info) {
 		EXIT("multisampled images cannot have mip levels\n");
 	}
 
-	if (info.metadata.stencil_compressed && !info.HasStencil()) {
+	if (info.metadata.stencil_compressed && !info.HasStencil() &&
+	    info.pixel_format != vk::Format::eS8Uint) {
 		EXIT("compressed stencil metadata requires a stencil plane\n");
 	}
 	switch (info.metadata.kind) {
@@ -657,7 +671,8 @@ void Validate(const ImageInfo& info) {
 		case ImageMetadataKind::Dcc:
 		case ImageMetadataKind::Cmask:
 			if (!GuestRange {info.metadata.range.address,
-			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
+			                 std::max<uint64_t>(info.metadata.range.size, 1)}
+			         .Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
 				EXIT("invalid color metadata\n");
 			}
@@ -719,18 +734,18 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
-	SetVulkanObjectNameF(
-	    graphics.device, backing.image,
-	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
-	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
-	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
-	    info.samples);
+	SetVulkanObjectNameF(graphics.device, backing.image,
+	                     "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} "
+	                     "layers={} samples={}]",
+	                     info.data.address, info.data.size, info.extent.width, info.extent.height,
+	                     info.extent.depth, static_cast<uint32_t>(info.pixel_format),
+	                     info.resources.levels, info.resources.layers, info.samples);
 }
 
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes;
 	const auto                                 range = info.data;
-	const uint64_t head_end =
+	const uint64_t                             head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
 	const uint64_t tail_begin =
 	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));

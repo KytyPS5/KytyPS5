@@ -5,6 +5,11 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+#include <utility>
+#include <vector>
+#endif
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -13,19 +18,22 @@ enum class PageFaultAccess;
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
+// Reserves the host virtual address ranges that the PS5 guest uses. Must be called after
+// all host subsystems that allocate address space (e.g. Graphics / DLSS) are initialised.
+void ReserveGuestAddressSpace();
 void Shutdown();
 
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
-	uint64_t direct_total        = 0;
-	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
-	uint64_t pooled_allocated    = 0; // Memory pool expansions.
-	uint64_t automatic_allocated = 0; // Extended memory.
-	uint64_t direct_mapped       = 0;
-	uint64_t flexible_total      = 0;
-	uint64_t flexible_used       = 0;
-	uint64_t pool_committed      = 0;
+	uint64_t direct_total           = 0;
+	uint64_t direct_allocated       = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated       = 0; // Memory pool expansions.
+	uint64_t automatic_allocated    = 0; // Extended memory.
+	uint64_t direct_mapped          = 0;
+	uint64_t flexible_total         = 0;
+	uint64_t flexible_used          = 0;
+	uint64_t pool_committed         = 0;
 	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
 	uint64_t gpu_page_entries       = 0;
 	uint64_t cpu_page_entries_total = 0;
@@ -41,9 +49,9 @@ struct Lifecycle {
 
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
-constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
-constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
-constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
+constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH        = 32;
+constexpr uint64_t kExtendedMemoryBase               = 0x080000000000ull;
+constexpr uint64_t kExtendedMemorySize               = 512ull * 1024 * 1024 * 1024;
 constexpr int      AMM_ERROR_REGION_NOT_FULLY_MAPPED = static_cast<int>(0x81912011);
 
 struct VirtualQueryInfo {
@@ -126,22 +134,32 @@ struct KernelMemoryPoolBlockStats {
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
-void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
-                         int memory_type, int64_t* phys_addr_out, bool automatic = false);
-int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
-int MapPrtMemory(uint64_t vaddr, size_t size);
-int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot);
-int UnmapAmmMemory(uint64_t vaddr, size_t size);
-bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+int  AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
+                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
+int  MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+int  MapPrtMemory(uint64_t vaddr, size_t size);
+int  RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int prot);
+int  UnmapAmmMemory(uint64_t vaddr, size_t size);
+bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+// For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
+// over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
+// and returns the range's id. 0 for any other fault.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
+void               InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+// Opt-in. When on, releasing direct memory keeps the GPU buffer caches of its mappings, and a
+// fixed read-write map of the same memory at the same address picks them up again. Turning it off
+// drops anything still kept.
+void               SetKeepGpuCacheOnReuse(bool enabled) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
@@ -219,11 +237,29 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
-void     TestBeforeNextBackingMap(callback_func_t callback);
-void     TestSetBackingReadCallback(callback_func_t callback);
+// What the kernel asked of the GPU for a range that it holds, resumes or gives up on.
+enum class TestGpuSuspendEvent { Suspend, Resume, Cancel };
+void TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
+void TestBeforeNextGuestReserve(callback_func_t callback);
+// Reports every suspend, resume and cancel the kernel requests. Pass nullptr to stop.
+void TestSetGpuSuspendCallback(void (*callback)(TestGpuSuspendEvent event, uint64_t addr,
+                                                size_t size));
+// Turns the keep-GPU-cache feature on or off without going through Config.
+void TestSetKeepGpuCacheOnReuse(bool enabled);
+void TestBeforeNextBackingMap(callback_func_t callback);
+void TestSetBackingReadCallback(callback_func_t callback);
+void TestFailNextPhysicalMemoryUnmap();
+void TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
+void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
+void TestFailNextFixedReserveRangeRegistration();
+// Makes the next physical memory map fail, after the host view of a direct map already exists.
+void TestFailNextPhysicalMemoryMap();
+// How many suspended ranges the kernel keeps before it cancels the oldest.
+size_t   TestSuspendedRangeCapacity();
+void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
+uint64_t TestGuestRegionFreePage(size_t region);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
 uint64_t TestFlexibleBackingHighWater();
@@ -232,6 +268,11 @@ uint64_t TestDirectMappingCount();
 uint64_t TestFlexibleMappingCount();
 uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
+// Pure helper used by POSIX guest-region reservation; [start, end) occupied, aligned free out.
+std::vector<std::pair<uint64_t, uint64_t>>
+TestAlignedFreeRangesInRegion(uint64_t region_start, uint64_t region_end,
+                              const std::vector<std::pair<uint64_t, uint64_t>>& occupied,
+                              uint64_t                                          alignment);
 #endif
 
 } // namespace Libs::LibKernel::Memory

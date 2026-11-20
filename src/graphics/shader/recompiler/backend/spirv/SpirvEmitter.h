@@ -24,6 +24,9 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// Per-vertex interpolation computes BaryCoordKHR.x as 1 - y - z instead of reading it. NVIDIA's
+	// compiler stops on an internal breakpoint when a sample-shaded MSAA pipeline reads .x.
+	bool derive_barycentric_x = false;
 };
 
 inline constexpr Profile DefaultProfile {};
@@ -32,7 +35,8 @@ inline constexpr Profile DefaultProfile {};
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
-                                  bool           emit_debug_info       = false);
+                                  bool           emit_debug_info       = false,
+                                  uint32_t       push_data_ceiling     = IR::PushData::DwordCount);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

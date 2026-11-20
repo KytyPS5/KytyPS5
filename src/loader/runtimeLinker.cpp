@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <iterator>
 #include <magic_enum.hpp>
 #include <memory>
 #include <vector>
@@ -109,6 +110,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 	return changed;
 }
 
+/// Allocates an executable guest-call thunk that identifies and dispatches an unresolved import.
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	constexpr uint64_t thunk_size = 34;
 
@@ -127,13 +129,13 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	g_unresolved_stub_thunk_offset += thunk_size;
 
 	uint8_t bytes[thunk_size] = {
-	    0x48, 0x83, 0xec, 0x08,               // sub rsp, 8
-	    0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0, // mov rdi, record_id
-	    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, UnresolvedImportStub
-	    0xff, 0xd0,                           // call rax
-	    0x48, 0x83, 0xc4, 0x08,               // add rsp, 8
-	    0x0f, 0x57, 0xc0,                     // xorps xmm0, xmm0
-	    0xc3,                                 // ret
+	    0x48, 0x83, 0xec, 0x08,                   // sub rsp, 8
+	    0x48, 0xbf, 0,    0,    0, 0, 0, 0, 0, 0, // mov rdi, record_id
+	    0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, UnresolvedImportStub
+	    0xff, 0xd0,                               // call rax
+	    0x48, 0x83, 0xc4, 0x08,                   // add rsp, 8
+	    0x0f, 0x57, 0xc0,                         // xorps xmm0, xmm0
+	    0xc3,                                     // ret
 	};
 	const auto target = reinterpret_cast<uint64_t>(UnresolvedImportStub);
 	std::memcpy(bytes + 6, &record_id, sizeof(record_id));
@@ -192,13 +194,19 @@ constexpr uint64_t INVALID_OFFSET   = 0x040000000u;
 constexpr uint64_t CODE_BASE_OFFSET = 0x100000000u;
 constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 
-static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
-static uint64_t g_invalid_memory    = 0;
+static std::atomic<uint64_t> g_desired_base_addr {SYSTEM_RESERVED + CODE_BASE_OFFSET};
+static uint64_t              g_invalid_memory = 0;
 
 static Program* g_tls_main_program = nullptr;
 
+/**
+ * Calls a program entry with its startup parameters on the supplied guest stack.
+ * stack_top selects the initial stack position; stack_limit and stack_base describe
+ * the complete allocation's low and exclusive high bounds. On Windows, installs those
+ * bounds during the call and restores the original host bounds when the entry returns.
+ */
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
-                                   void* stack_top) {
+                                   void* stack_top, uintptr_t stack_limit, uintptr_t stack_base) {
 #if defined(__x86_64__) || defined(_M_X64)
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
@@ -241,38 +249,42 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
 		      "xmm13", "xmm14", "xmm15");
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Windows stack probes use the TEB stack limits during the guest stack switch.
-		// bounds, which describe the host stack and are invalid while RSP is in guest memory.
+		// Windows exception continuation validates RSP against the active stack bounds.
 		register entry_func_t func_reg asm("rbx")     = func;
 		register uintptr_t    guest_rsp_reg asm("r8") = guest_rsp;
 		register uintptr_t    guest_rbp_reg asm("r9") = guest_rbp;
-		asm volatile("pushq %%r12\n\t"
-		             "pushq %%r13\n\t"
-		             "pushq %%r14\n\t"
-		             "pushq %%r15\n\t"
-		             "movq %%gs:0x08, %%r14\n\t"
-		             "movq %%gs:0x10, %%r15\n\t"
-		             "xorq %%rcx, %%rcx\n\t"
-		             "movq %%rcx, %%gs:0x08\n\t"
-		             "movq %%rcx, %%gs:0x10\n\t"
-		             "movq %%rsp, %%r12\n\t"
-		             "movq %%rbp, %%r13\n\t"
-		             "movq %[guest_rsp], %%rsp\n\t"
-		             "movq %[guest_rbp], %%rbp\n\t"
-		             "callq *%[func]\n\t"
-		             "movq %%r13, %%rbp\n\t"
-		             "movq %%r12, %%rsp\n\t"
-		             "movq %%r14, %%gs:0x08\n\t"
-		             "movq %%r15, %%gs:0x10\n\t"
-		             "popq %%r15\n\t"
-		             "popq %%r14\n\t"
-		             "popq %%r13\n\t"
-		             "popq %%r12\n\t"
-		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
-		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
-		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-		               "xmm12", "xmm13", "xmm14", "xmm15");
+		asm volatile(
+		    "pushq %%r12\n\t"
+		    "pushq %%r13\n\t"
+		    "pushq %%r14\n\t"
+		    "pushq %%r15\n\t"
+		    "pushq %[stack_base]\n\t"
+		    "pushq %[stack_limit]\n\t"
+		    "movq %%gs:0x08, %%r14\n\t"
+		    "movq %%gs:0x10, %%r15\n\t"
+		    "popq %%rcx\n\t"
+		    "movq %%rcx, %%gs:0x10\n\t"
+		    "popq %%rcx\n\t"
+		    "movq %%rcx, %%gs:0x08\n\t"
+		    "movq %%rsp, %%r12\n\t"
+		    "movq %%rbp, %%r13\n\t"
+		    "movq %[guest_rsp], %%rsp\n\t"
+		    "movq %[guest_rbp], %%rbp\n\t"
+		    "callq *%[func]\n\t"
+		    "movq %%r13, %%rbp\n\t"
+		    "movq %%r12, %%rsp\n\t"
+		    "movq %%r14, %%gs:0x08\n\t"
+		    "movq %%r15, %%gs:0x10\n\t"
+		    "popq %%r15\n\t"
+		    "popq %%r14\n\t"
+		    "popq %%r13\n\t"
+		    "popq %%r12\n\t"
+		    : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
+		    : [func] "r"(func_reg), "D"(params),
+		      "S"(atexit_func), [stack_limit] "r"(stack_limit), [stack_base] "r"(stack_base)
+		    : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3",
+		      "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13",
+		      "xmm14", "xmm15");
 #else
 		// Clobbers prevent inputs from being allocated to r12/r13.
 		asm volatile("movq %%rsp, %%r12\n\t"
@@ -338,7 +350,26 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 #endif
 }
 
+static void ClaimGuestCode(uint64_t base, uint64_t size) {
+	g_desired_base_addr = base + CODE_BASE_INCR * (1 + size / CODE_BASE_INCR);
+}
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+uint64_t TestMapGuestCode(uint64_t size, uint64_t occupied) {
+	const uint64_t desired = g_desired_base_addr;
+	if (occupied != 0 && Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	                         desired, occupied, Common::VirtualMemory::Mode::ReadWrite,
+	                         "guest_code_test_occupied", true) != desired) {
+		return 0;
+	}
+	const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    desired, size, Common::VirtualMemory::Mode::ExecuteReadWrite, "guest_code_test");
+	if (base != 0) {
+		ClaimGuestCode(base, size);
+	}
+	return base;
+}
+
 struct MainEntryStackTestState {
 	bool      called = false;
 	uintptr_t rsp    = 0;
@@ -369,6 +400,7 @@ static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
 	state->called = true;
 }
 
+/// Checks main-entry RSP, the root frame, Windows guest bounds, host restoration, and cleanup.
 bool TestMainEntryUsesGuestStack() {
 	constexpr uint64_t stack_size = 0x10000;
 	const auto         stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
@@ -394,7 +426,7 @@ bool TestMainEntryUsesGuestStack() {
 #endif
 
 	RunEntry(reinterpret_cast<uint64_t>(TestMainEntryStackCallback), &params, nullptr,
-	         reinterpret_cast<void*>(stack_base + stack_size));
+	         reinterpret_cast<void*>(stack_base + stack_size), stack_base, stack_base + stack_size);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t restored_teb_stack_base  = 0;
@@ -404,7 +436,8 @@ bool TestMainEntryUsesGuestStack() {
 	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
 	             :
 	             : "memory");
-	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
+	const bool teb_ok = state.teb_stack_base == stack_base + stack_size &&
+	                    state.teb_stack_limit == stack_base &&
 	                    restored_teb_stack_base == original_teb_stack_base &&
 	                    restored_teb_stack_limit == original_teb_stack_limit;
 #else
@@ -512,6 +545,10 @@ static Common::VirtualMemory::Mode GetMode(Elf64_Word flags) {
 
 		default: return Common::VirtualMemory::Mode::NoAccess;
 	}
+}
+
+bool IsGuestCodeAddress(uint64_t address) {
+	return address >= SYSTEM_RESERVED + CODE_BASE_OFFSET && address < g_desired_base_addr;
 }
 
 struct GuestStackFrame {
@@ -622,6 +659,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+/// Resumes supported emulated faults and reports diagnostic context for unhandled exceptions.
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -645,48 +683,61 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+		        info->exception_address)) {
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
+		// A guest range briefly unmapped while the emulator replaced its mapping: wait until it
+		// is mapped again and retry the access. A retry that then hits GPU tracking comes back
+		// here and is resolved above.
+		const auto transient =
+		    Libs::LibKernel::Memory::WaitForTransientUnmap(info->access_violation_vaddr);
+		if (transient != 0 && Libs::LibKernel::Memory::RetryTransientUnmapFault(
+		                          info->access_violation_vaddr, transient)) {
+			return true;
+		}
 	}
-	// Report whatever guest context can be read safely before terminating: which guest thread
-	// faulted, the register file, the faulting code bytes and the top of its stack.
-	{
-		char thread_name[64] = "(host thread)";
-		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
-			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
-				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
-			}
+	ReportUnhandledHostException(exception_info);
+}
+
+[[noreturn]] void
+ReportUnhandledHostException(const Common::HostException::ExceptionInfo& exception_info) {
+	const auto* info            = &exception_info;
+	char        thread_name[64] = "(host thread)";
+	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
-			}
-			std::printf("\n");
-		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
-			}
-			std::printf("\n");
-		}
-		std::fflush(stdout);
 	}
+	fmt::basic_memory_buffer<char, 2048> report;
+	const auto                           out = std::back_inserter(report);
+	fmt::format_to(out, "--- Guest fault context ---\nthread: {}\n", thread_name);
+	fmt::format_to(out,
+	               "rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+	               "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+	               "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+	               "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+	               info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+	               info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+	               info->r14, info->r15);
+	if (IsReadableRange(info->exception_address - 48, 96)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
+		fmt::format_to(out, "code (pc-48 .. pc+48, fault at byte 48):");
+		for (int i = 0; i < 96; i++) {
+			fmt::format_to(out, "{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
+		}
+		report.push_back('\n');
+	}
+	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+		fmt::format_to(out, "stack:");
+		for (int i = 0; i < 32; i++) {
+			fmt::format_to(out, "{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
+		}
+		report.push_back('\n');
+	}
+	Log::WriteToConsoleAndLog(std::string_view(report.data(), report.size()));
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
@@ -845,6 +896,8 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	return ret;
 }
 
+/// Patches one relocation, using an import stub or invalid-object address when unresolved.
+/// Returns whether the symbol resolved, independently of whether the memory patch succeeded.
 static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool jmprela_table) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -854,10 +907,10 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	if (!ri.resolved) {
 		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
 		if (!weak) {
-			LOGF("Stubbed: %s\n",
-			     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
-			                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-			                 ri.dbg_name).c_str());
+			LOGF("Stubbed: %s\n", fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr,
+			                                  ri.value, ri.name, magic_enum::enum_name(ri.type),
+			                                  magic_enum::enum_name(ri.bind), ri.dbg_name)
+			                          .c_str());
 		}
 		if (ri.type == SymbolType::Object) {
 			value = g_invalid_memory;
@@ -879,10 +932,10 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	if (program->dbg_print_reloc && patched && !ri.bind_self &&
 	    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
 	     ri.type == SymbolType::TlsModule)) {
-		LOGF("Relocate: %s\n",
-		     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
-		                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-		                 ri.dbg_name).c_str());
+		LOGF("Relocate: %s\n", fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr,
+		                                   ri.value, ri.name, magic_enum::enum_name(ri.type),
+		                                   magic_enum::enum_name(ri.bind), ri.dbg_name)
+		                           .c_str());
 	}
 	return ri.resolved;
 }
@@ -1134,6 +1187,7 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	}
 }
 
+/// Removes a loaded program, invalidates imports into its mapping, and releases its resources.
 void RuntimeLinker::UnloadProgram(Program* program) {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -1145,15 +1199,15 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 
 	for (auto* importer: m_programs) {
 		const auto& info = *importer->dynamic_info;
-		const auto rela_count =
+		const auto  rela_count =
 		    static_cast<uint32_t>(info.rela_table_total_size / sizeof(Elf64_Rela));
 		ForEachRelocation(importer, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
 			const auto bit_index = (jmprela ? rela_count : 0) + index;
 			auto&      bits      = importer->rela_bits[bit_index >> 3u];
 			const auto mask      = 1u << (bit_index & 7u);
 			const auto type      = r->GetType();
-			if ((bits & mask) == 0 || (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT &&
-			                           type != R_X86_64_JUMP_SLOT)) {
+			if ((bits & mask) == 0 ||
+			    (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT && type != R_X86_64_JUMP_SLOT)) {
 				return;
 			}
 			const auto& symbol = info.symbol_table[r->GetSymbol()];
@@ -1237,6 +1291,31 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	return program;
 }
 
+std::vector<Program*>
+RuntimeLinker::LoadImportedBundledModules(const std::filesystem::path& folder) {
+	std::vector<Program*> modules;
+
+	const auto main = std::find_if(m_programs.begin(), m_programs.end(),
+	                               [](const Program* p) { return !p->elf->IsShared(); });
+	if (main == m_programs.end()) {
+		return modules;
+	}
+	// A bundled PRX is named after the module it exports, e.g. libSceNpCppWebApi.prx.
+	for (const auto& imported: (*main)->dynamic_info->import_modules) {
+		const std::filesystem::path file_name = imported.name + ".prx";
+		// The name comes from the ELF; only plain file names may resolve inside the folder.
+		if (file_name.filename() != file_name) {
+			continue;
+		}
+		const auto path = folder / file_name;
+		if (Common::File::IsFileExisting(path) && FindProgramByFileName(path) == nullptr) {
+			modules.push_back(LoadProgram(path));
+		}
+	}
+
+	return modules;
+}
+
 void RuntimeLinker::SaveMainProgram(const std::filesystem::path& elf_name) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -1267,26 +1346,35 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+/// Prepares the main guest stack and startup arguments, applies startup patches,
+/// and invokes the loaded programs' entry points.
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
-	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
+	auto*    main_stack_top  = Libs::LibKernel::PthreadCreateMainGuestStack();
+	uint64_t main_stack_low  = 0;
+	uint64_t main_stack_size = 0;
+	EXIT_IF(!Libs::LibKernel::PthreadGetGuestStack(Libs::LibKernel::PthreadSelfOrNull(),
+	                                               &main_stack_low, &main_stack_size));
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Guest code has no Windows stack probes and may jump over the guard page. Module
 	// initializers execute on the host stack too, so grow it before calling any guest code.
 	size_t expanded_size = 0;
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		const auto stack = SysStackUsage();
+		const auto stack                               = SysStackUsage();
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}
 #endif
 
-	// The runtime automatically loads libc; other PRXs are requested by the application.
-	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
-	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
+	// The runtime automatically loads libc and the bundled PRXs the executable imports modules
+	// from; other PRXs are requested by the application.
+	const auto libc_path =
+	    Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
+	auto*      libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
+	const auto bundled_modules = LoadImportedBundledModules(libc_path.parent_path());
 	RelocateAll();
 
 	if (!game_patch.empty()) {
@@ -1300,13 +1388,18 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
+	for (auto* module: bundled_modules) {
+		if (module->dynamic_info->init_vaddr != 0) {
+			StartModule(module, 0, nullptr, nullptr);
+		}
+	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
 		const auto& arguments = Config::GetGuestArguments();
-		const auto params_size = offsetof(EntryParams, argv) +
-		                         (arguments.size() + 2) * sizeof(const char*);
+		const auto  params_size =
+		    offsetof(EntryParams, argv) + (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
 		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
 		    ~static_cast<uintptr_t>(0x0f));
@@ -1318,7 +1411,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
 		RunEntry(entry, params, ProgramExitHandler,
-		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
+		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u),
+		         main_stack_low, main_stack_low + main_stack_size);
 	}
 }
 
@@ -1348,6 +1442,8 @@ void RuntimeLinker::Clear() {
 	m_symbols.reset();
 }
 
+/// Looks up a symbol in the requesting program and available exports under the linker lock.
+/// Writes the resolved record to out_info and reports self-binding when requested.
 void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* program,
                             SymbolRecord* out_info, bool* bind_self) {
 	KYTY_PROFILER_FUNCTION();
@@ -1406,7 +1502,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 
 			if (rec == nullptr) {
 				for (auto* p: m_programs) {
-					const auto& libs = p->dynamic_info->export_libs;
+					const auto& libs    = p->dynamic_info->export_libs;
 					const auto& modules = p->dynamic_info->export_modules;
 					if (p->export_symbols == nullptr ||
 					    std::find(libs.begin(), libs.end(), *l) == libs.end() ||
@@ -1637,6 +1733,7 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+/// Allocates and maps an ELF program's segments and prepares its guest instruction patches.
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1692,7 +1789,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
 	}
 
-	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
+	ClaimGuestCode(program->base_vaddr, program->mapped_size);
 
 	EXIT_IF(program->base_size_aligned < program->base_size);
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
@@ -1797,8 +1894,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
+				     module_name.c_str(), result.function_count, result.red_zone_function_count,
 				     result.memory_instruction_count, result.patched_memory_instruction_count,
 				     result.short_memory_instruction_count,
 				     result.stack_dependent_memory_instruction_count,
@@ -1865,6 +1961,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	}
 }
 
+/// Reads ELF dynamic tables into a newly allocated DynamicInfo for later symbol relocation.
 void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1929,7 +2026,7 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	GetDynValue(elf, &program->dynamic_info->rela_table_entry_size, DT_RELAENT);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table_total_size % sizeof(Elf64_Rela) != 0 ||
 	                     program->dynamic_info->jmprela_table_size % sizeof(Elf64_Rela) != 0);
-	const auto rela_count = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela);
+	const auto rela_count    = program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela);
 	const auto jmprela_count = program->dynamic_info->jmprela_table_size / sizeof(Elf64_Rela);
 	program->rela_bits.resize((rela_count + jmprela_count + 7u) / 8u);
 
@@ -1972,6 +2069,7 @@ void RuntimeLinker::ParseProgramDynamicInfo(Program* program) {
 	           DT_OS_EXPORT_LIB_1);
 }
 
+/// Applies pending program relocations and records which symbols resolved successfully.
 void RuntimeLinker::Relocate(Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1992,8 +2090,8 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->rela_table == nullptr);
 	EXIT_NOT_IMPLEMENTED(program->dynamic_info->symbol_table == nullptr);
 
-	const auto rela_count = static_cast<uint32_t>(
-	    program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
+	const auto rela_count =
+	    static_cast<uint32_t>(program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
 
 	ForEachRelocation(program, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
 		const auto bit_index = (jmprela ? rela_count : 0) + index;

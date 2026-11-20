@@ -102,6 +102,8 @@ static void PrintUsage() {
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
 	::printf("  --skip-redundant-unmap-drains        Skip the GPU drain when unmapping an already "
 	         "unmapped range.\n");
+	::printf("  --partial-buffer-refresh             Refresh only the buffer-written part of an "
+	         "image.\n");
 	::printf(
 	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
 	::printf(
@@ -246,6 +248,7 @@ static constexpr Flag FLAGS[] = {
     {"--readback-storage-images", &ConfigOptions::readback_storage_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--skip-redundant-unmap-drains", &ConfigOptions::skip_redundant_unmap_drains},
+    {"--partial-buffer-refresh", &ConfigOptions::partial_buffer_refresh_enabled},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},

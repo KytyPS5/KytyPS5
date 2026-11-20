@@ -97,6 +97,7 @@ struct ConfigOptions {
 	bool                  readback_tiled_images           = false;
 	bool                  readback_storage_images         = false;
 	bool                  sync_raw_image_buffers          = false;
+	bool                  partial_buffer_refresh_enabled  = false;
 	bool                  skip_redundant_unmap_drains     = false;
 	// Experimental. Keeps GPU buffer caches when direct memory is released and mapped back
 	// unchanged.
@@ -189,6 +190,7 @@ bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 // Skips the GPU drain when a range that is already unmapped is unmapped again.
 bool     SkipRedundantUnmapDrainsEnabled();
+bool     PartialBufferRefreshEnabled();
 uint32_t GetFlushDraws();
 bool     TessellationEnabled();
 bool     OcclusionQueriesEnabled();

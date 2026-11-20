@@ -238,6 +238,10 @@ bool SkipRedundantUnmapDrainsEnabled() {
 	return g_config->skip_redundant_unmap_drains;
 }
 
+bool PartialBufferRefreshEnabled() {
+	return g_config->partial_buffer_refresh_enabled;
+}
+
 uint32_t GetFlushDraws() {
 	return g_config->flush_draws;
 }

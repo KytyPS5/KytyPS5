@@ -31,7 +31,10 @@ enum class Counter {
 	TextureUploadBytes,
 	TextureDownloadBytes,
 	TextureEvictions,
-	ColorMetadataReadbacks, // CPU blocked reading back GPU-written DCC/CMASK metadata.
+	TexturePartialRefreshes,   // Images refreshed from only their buffer-written range.
+	TexturePartialUploadBytes, // Bytes those refreshes copied.
+	TexturePartialFallbacks,   // Range-marked images that needed the full upload instead.
+	ColorMetadataReadbacks,    // CPU blocked reading back GPU-written DCC/CMASK metadata.
 	ColorMetadataReadbackNs,
 	ColorMetadataChecks, // GPU clear-key checks of DCC/CMASK metadata.
 	BufferUploadBytes,

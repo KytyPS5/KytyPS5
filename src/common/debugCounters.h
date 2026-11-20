@@ -42,6 +42,8 @@ enum class Counter {
 	BufferCoDownloads, // Pieces of recent small GPU writes downloaded in another readback's wait.
 	BufferCoDownloadBytes,
 	BufferEvictions,
+	BufferReleases,        // Clean buffers released after going unbound, without memory pressure.
+	BufferReleaseRefaults, // Released ranges a shader read again through BDA, now kept.
 	// Presentation.
 	FlipsRequested,
 	FlipsRejected, // Guest flip queue was full.

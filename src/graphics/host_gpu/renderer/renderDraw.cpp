@@ -1119,7 +1119,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		const auto size = static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
 		index_begin     = index_source.address & ~uint64_t {3};
 		index_end       = (index_source.address + size + 3u) & ~uint64_t {3};
-		(void)m_context.GetBufferCache().FindBuffer(index_begin, index_end - index_begin);
+		(void)m_context.GetBufferCache().FindBufferForShaderRead(index_begin, index_end - index_begin);
 	}
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};

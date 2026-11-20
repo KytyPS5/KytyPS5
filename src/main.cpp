@@ -96,12 +96,9 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
-	::printf(
-	    "  --readback-linear-images             Read back writable linear images on submit.\n");
-	::printf("  --readback-tiled-images              Read back small writable tiled images on "
-	         "submit.\n");
-	::printf("  --readback-storage-images            Read back storage images on GL2 writeback.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf("  --skip-redundant-unmap-drains        Skip the GPU drain when unmapping an already "
+	         "unmapped range.\n");
 	::printf(
 	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
 	::printf(
@@ -240,6 +237,7 @@ static constexpr Flag FLAGS[] = {
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--readback-storage-images", &ConfigOptions::readback_storage_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
+    {"--skip-redundant-unmap-drains", &ConfigOptions::skip_redundant_unmap_drains},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},

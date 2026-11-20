@@ -97,6 +97,7 @@ struct ConfigOptions {
 	bool                  readback_tiled_images           = false;
 	bool                  readback_storage_images         = false;
 	bool                  sync_raw_image_buffers          = false;
+	bool                  skip_redundant_unmap_drains     = false;
 	uint32_t              flush_draws                     = 0; // 0 is off
 	bool                  tessellation_enabled            = false;
 	bool                  occlusion_queries_enabled       = false;
@@ -176,11 +177,13 @@ bool SpirvDebugPrintfEnabled();
 
 bool GpuAssistedValidationEnabled();
 
-bool     RenderDocEnabled();
-bool     ReadbackLinearImagesEnabled();
-bool     ReadbackTiledImagesEnabled();
-bool     ReadbackStorageImagesEnabled();
-bool     SyncRawImageBuffersEnabled();
+bool RenderDocEnabled();
+bool ReadbackLinearImagesEnabled();
+bool ReadbackTiledImagesEnabled();
+bool ReadbackStorageImagesEnabled();
+bool SyncRawImageBuffersEnabled();
+// Skips the GPU drain when a range that is already unmapped is unmapped again.
+bool     SkipRedundantUnmapDrainsEnabled();
 uint32_t GetFlushDraws();
 bool     TessellationEnabled();
 bool     OcclusionQueriesEnabled();

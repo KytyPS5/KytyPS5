@@ -72,6 +72,9 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	[[nodiscard]] bool NeedsUnmapDrain(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsUnmapDrainRedundant(uint64_t vaddr, uint64_t size);
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
@@ -80,25 +83,26 @@ private:
 	// Waits for the image write-backs over the range's pages; returns whether any overlapped.
 	bool WaitWriteBacks(uint64_t vaddr, uint64_t size);
 
-	GraphicContext&           m_graphics;
-	Common::Mutex             m_mutex;
-	RenderExecutor            m_render_executor;
-	CommandScheduler          m_command_scheduler;
-	DescriptorHeap            m_descriptor_heap;
-	SamplerCache              m_sampler_cache;
-	PageManager               m_page_manager;
-	BufferCache               m_buffer_cache;
-	TextureCache              m_texture_cache;
-	ImageHeap                 m_image_heap;
-	PipelineCache             m_pipeline_cache;
-	OcclusionQueries          m_occlusion_queries;
-	mutable std::shared_mutex m_mapped_ranges_mutex;
-	RangeSet                  m_mapped_ranges;
-	std::unique_ptr<GuestGpu> m_gpu;
-	VideoOut::VideoOutDriver* m_video_out             = nullptr;
-	bool                      m_fault_process_pending = false;
-
+	GraphicContext&             m_graphics;
+	Common::Mutex               m_mutex;
+	RenderExecutor              m_render_executor;
+	CommandScheduler            m_command_scheduler;
+	DescriptorHeap              m_descriptor_heap;
+	SamplerCache                m_sampler_cache;
+	PageManager                 m_page_manager;
+	BufferCache                 m_buffer_cache;
+	TextureCache                m_texture_cache;
+	ImageHeap                   m_image_heap;
+	PipelineCache               m_pipeline_cache;
+	OcclusionQueries            m_occlusion_queries;
+	mutable std::shared_mutex   m_mapped_ranges_mutex;
+	RangeSet                    m_mapped_ranges;
+	std::unique_ptr<GuestGpu>   m_gpu;
+	VideoOut::VideoOutDriver*   m_video_out             = nullptr;
+	bool                        m_fault_process_pending = false;
 	std::unique_ptr<RayTracing> m_ray_tracing;
+	// Read once so shutdown never reaches for a released config.
+	const bool m_skip_redundant_unmap_drains;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

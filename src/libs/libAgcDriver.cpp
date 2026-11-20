@@ -180,9 +180,9 @@ LIB_DEFINE(InitAgcDriver_1) {
 	PRINT_NAME_ENABLE(true);
 
 	LIB_FUNC("UglJIZjGssM", Gen5Driver::AgcDriverSubmitDcb);
-	LIB_FUNC("AhGvpITrf4M", Gen5Driver::AgcDriverSubmitDcb);       // sceAgcDriverAgrSubmitDcb
+	LIB_FUNC("AhGvpITrf4M", Gen5Driver::AgcDriverAgrSubmit); // sceAgcDriverAgrSubmitDcb
 	LIB_FUNC("6UzEidRZwkg", Gen5Driver::AgcDriverSubmitMultiDcbs);
-	LIB_FUNC("+T8Xo6LtFJI", Gen5Driver::AgcDriverSubmitMultiDcbs); // sceAgcDriverAgrSubmitMultiDcbs
+	LIB_FUNC("+T8Xo6LtFJI", Gen5Driver::AgcDriverAgrSubmit); // sceAgcDriverAgrSubmitMultiDcbs
 	LIB_FUNC("b4fpgH5ZXxQ", Gen5Driver::AgcDriverSubmitCommandBuffer);
 	LIB_FUNC("Fj7r9EHzF38", Gen5Driver::AgcDriverSubmitMultiCommandBuffers);
 	LIB_FUNC("gSRnr79F8tQ", Gen5Driver::AgcDriverSubmitAcb);

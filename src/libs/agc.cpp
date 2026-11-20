@@ -4198,6 +4198,13 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 	return OK;
 }
 
+// The queue that AGR submissions go to is never set up, so nothing is submitted.
+int KYTY_SYSV_ABI AgcDriverAgrSubmit() {
+	PRINT_NAME();
+
+	return Gen5::GRAPHICS5_DRIVER_ERROR_FAILED;
+}
+
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();

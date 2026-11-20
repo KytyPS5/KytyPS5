@@ -1,12 +1,18 @@
 #include "libs/agc.h"
+#include "loader/symbolDatabase.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
 
+namespace Libs {
+void InitAgcDriver_1(Loader::SymbolDatabase*);
+}
+
 namespace {
 
-namespace Gen5 = Libs::Graphics::Gen5;
+namespace Gen5       = Libs::Graphics::Gen5;
+namespace Gen5Driver = Libs::Graphics::Gen5Driver;
 
 // A command buffer over a fixed packet array, laid out as titles pass it.
 template <size_t N>
@@ -73,6 +79,17 @@ TEST(Agc, BranchLeavesNullTargetSlotsZero) {
 
 TEST(Agc, DebugRaiseExceptionFails) {
 	EXPECT_EQ(Gen5::AgcDebugRaiseException(0), static_cast<int>(0x8a6d0003u));
+}
+
+TEST(Agc, AgrSubmitFailsWithoutSubmitting) {
+	EXPECT_EQ(Gen5Driver::AgcDriverAgrSubmit(), static_cast<int>(0x8a6d0003u));
+	Loader::SymbolDatabase symbols;
+	Libs::InitAgcDriver_1(&symbols);
+	for (const char* nid: {"AhGvpITrf4M", "+T8Xo6LtFJI"}) {
+		const auto* func = symbols.FindByNid(nid, Loader::SymbolType::Func);
+		ASSERT_NE(func, nullptr);
+		EXPECT_EQ(func->vaddr, reinterpret_cast<uint64_t>(&Gen5Driver::AgcDriverAgrSubmit));
+	}
 }
 
 } // namespace

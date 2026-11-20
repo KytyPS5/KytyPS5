@@ -1,8 +1,8 @@
 // Internal memory address-space helpers included by memory.cpp.
 // Kept in the same translation unit because they depend on memory.cpp-local helpers.
 
-static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
-static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
+static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN = 0x0000040000ull;
+static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX = 0x07ffffbfffull;
 #if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
@@ -33,14 +33,15 @@ static uint64_t AlignDownValue(uint64_t value, uint64_t alignment) {
 		return 0;
 	}
 	return (alignment & (alignment - 1u)) == 0 ? value & ~(alignment - 1u)
-	                                         : value - (value % alignment);
+	                                           : value - (value % alignment);
 }
 
 // Pure helper: subtract occupied [start, end) intervals from [region_start, region_end).
 // Accept unordered/overlapping intervals, ignore empty/reversed ones, and align the gaps.
-[[nodiscard]] static std::vector<std::pair<uint64_t, uint64_t>> AlignedFreeRangesInRegion(
-    uint64_t region_start, uint64_t region_end,
-    const std::vector<std::pair<uint64_t, uint64_t>>& occupied, uint64_t alignment) {
+[[nodiscard]] static std::vector<std::pair<uint64_t, uint64_t>>
+AlignedFreeRangesInRegion(uint64_t region_start, uint64_t region_end,
+                          const std::vector<std::pair<uint64_t, uint64_t>>& occupied,
+                          uint64_t                                          alignment) {
 	std::vector<std::pair<uint64_t, uint64_t>> free_ranges;
 	if (region_end <= region_start || alignment == 0) {
 		return free_ranges;
@@ -183,13 +184,11 @@ public:
 		// The hint is not binding without MAP_FIXED, so verify and retry.
 		constexpr uint64_t AliasHintAlign    = 0x10000;
 		constexpr int      AliasHintAttempts = 8;
-		uint64_t hint =
-		    AlignUpValue(kExtendedMemoryBase + kExtendedMemorySize, AliasHintAlign);
+		uint64_t hint   = AlignUpValue(kExtendedMemoryBase + kExtendedMemorySize, AliasHintAlign);
 		uint8_t* mapped = nullptr;
 		for (int attempt = 0; attempt < AliasHintAttempts; ++attempt) {
-			void* backing =
-			    mmap(reinterpret_cast<void*>(hint), m_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-			         m_fd, 0);
+			void* backing = mmap(reinterpret_cast<void*>(hint), m_size, PROT_READ | PROT_WRITE,
+			                     MAP_SHARED, m_fd, 0);
 			if (backing == MAP_FAILED) {
 				EXIT("direct-memory backing: writable alias failed: %d\n", errno);
 			}
@@ -200,8 +199,8 @@ public:
 			}
 			uint64_t conflict_start = 0;
 			uint64_t conflict_end   = 0;
-			EXIT_IF(!FindOverlappingGuestAddressRegion(base, m_size, &conflict_start,
-			                                          &conflict_end));
+			EXIT_IF(
+			    !FindOverlappingGuestAddressRegion(base, m_size, &conflict_start, &conflict_end));
 			munmap(backing, m_size);
 			if (attempt + 1 == AliasHintAttempts) {
 				EXIT("direct-memory backing: alias landed at 0x%016" PRIx64 " size 0x%016" PRIx64
@@ -313,8 +312,8 @@ public:
 	}
 
 	// Mapping and unmapping hold the state lock exclusively.
-	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
-	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
+	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
+	              FailureReason* failure_reason = nullptr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (const auto callback = g_test_before_backing_map) {
 			g_test_before_backing_map = nullptr;
@@ -522,7 +521,7 @@ private:
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr =
 		    MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr),
-		                   backing_offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
+			               backing_offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
 				UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
@@ -667,8 +666,8 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		const auto end = vaddr + size;
-		auto covered = vaddr;
+		const auto end     = vaddr + size;
+		auto       covered = vaddr;
 		while (covered < end) {
 			auto next = covered;
 			for (const auto& [start, length]: m_owned) {
@@ -730,15 +729,16 @@ public:
 				return false;
 			}
 		}
-		m_backing->ReadSparseBacking(
-		    vaddr, data, size, [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
-			    if constexpr (copy_private) {
-				    // Backing gaps can contain private mappings or reservations only.
-				    CopyPrivateUnlocked(start, destination, bytes);
-			    } else {
-				    std::memset(destination, 0, bytes);
-			    }
-		    });
+		m_backing->ReadSparseBacking(vaddr, data, size,
+		                             [&](uint64_t start, uint8_t* destination, uint64_t bytes) {
+			                             if constexpr (copy_private) {
+				                             // Backing gaps can contain private mappings or
+											 // reservations only.
+				                             CopyPrivateUnlocked(start, destination, bytes);
+			                             } else {
+				                             std::memset(destination, 0, bytes);
+			                             }
+		                             });
 		return true;
 	}
 
@@ -839,8 +839,8 @@ public:
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
 			return false;
 		}
-		const auto end     = vaddr + size;
-		auto       current = vaddr;
+		const auto                                 end     = vaddr + size;
+		auto                                       current = vaddr;
 		std::vector<std::pair<uint64_t, uint64_t>> regions;
 		while (current < end) {
 			const auto it       = FindMappedContainingUnlocked(current);
@@ -1047,19 +1047,22 @@ private:
 		const auto regions = GuestAddressRegions();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		constexpr uint64_t MinimumRegionSize = 0x1000000;
-		const auto         process           = GetCurrentProcess();
+		constexpr uint64_t MinimumRegionSize  = 0x1000000;
+		constexpr uint32_t MaxReserveAttempts = 16;
+		const auto         process            = GetCurrentProcess();
 		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
 			const auto [guest_start, guest_end] = regions[i];
-			auto next_addr = guest_start;
+			auto     next_addr                  = guest_start;
+			uint32_t retries                    = 0;
 			while (next_addr < guest_end) {
 				MEMORY_BASIC_INFORMATION info {};
-				if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) == 0) {
+				if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) ==
+				    0) {
 					EXIT("failed to inspect guest address space at 0x%016" PRIx64 "\n", next_addr);
 				}
 
 				const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
-				const auto region_end = std::min<uint64_t>(
+				const auto region_end  = std::min<uint64_t>(
 				    guest_end, region_base + static_cast<uint64_t>(info.RegionSize));
 				const auto reserve_start =
 				    AlignUp(std::max(region_base, guest_start), m_granularity);
@@ -1067,10 +1070,20 @@ private:
 
 				if (info.State == MEM_FREE && reserve_end > reserve_start &&
 				    reserve_end - reserve_start > MinimumRegionSize) {
-					auto* ptr = VirtualAlloc2(
-					    process, reinterpret_cast<void*>(reserve_start), reserve_end - reserve_start,
-					    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+					if (const auto callback = g_test_before_guest_reserve) {
+						g_test_before_guest_reserve = nullptr;
+						callback(reserve_start, reserve_end - reserve_start);
+					}
+#endif
+					auto* ptr = VirtualAlloc2(process, reinterpret_cast<void*>(reserve_start),
+					                          reserve_end - reserve_start,
+					                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+					                          nullptr, 0);
 					if (reinterpret_cast<uint64_t>(ptr) != reserve_start) {
+						if (++retries < MaxReserveAttempts) {
+							continue;
+						}
 						EXIT("failed to reserve guest address space at 0x%016" PRIx64
 						     ", size 0x%016" PRIx64 "\n",
 						     reserve_start, reserve_end - reserve_start);
@@ -1080,12 +1093,13 @@ private:
 				}
 
 				next_addr = region_end;
+				retries   = 0;
 			}
 		}
 #else
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		uint64_t reserved_bytes = 0;
-		auto reserve_range = [this, &reserved_bytes](uint64_t start, uint64_t end) -> bool {
+		auto     reserve_range  = [this, &reserved_bytes](uint64_t start, uint64_t end) -> bool {
 			if (end <= start) {
 				return true;
 			}
@@ -1116,17 +1130,17 @@ private:
 		};
 
 		for (size_t i = first_region; i < last_region && i < regions.size(); ++i) {
-			const auto [region_start, region_end] = regions[i];
-			const auto before = reserved_bytes;
+			const auto [region_start, region_end]     = regions[i];
+			const auto         before                 = reserved_bytes;
 			constexpr unsigned MaxReservationAttempts = 4;
 			for (unsigned attempt = 0; attempt < MaxReservationAttempts; ++attempt) {
 				std::vector<std::pair<uint64_t, uint64_t>> occupied;
-				FILE* maps = fopen("/proc/self/maps", "r");
+				FILE*                                      maps = fopen("/proc/self/maps", "r");
 				EXIT_IF(maps == nullptr);
 				char line[512];
 				while (fgets(line, sizeof(line), maps) != nullptr) {
 					unsigned long long mapping_start = 0;
-					unsigned long long mapping_end = 0;
+					unsigned long long mapping_end   = 0;
 					if (sscanf(line, "%llx-%llx", &mapping_start, &mapping_end) == 2) {
 						occupied.emplace_back(static_cast<uint64_t>(mapping_start),
 						                      static_cast<uint64_t>(mapping_end));
@@ -1151,8 +1165,8 @@ private:
 			if (reserved_bytes == before) {
 				// Every guest region is needed for fixed-address guest mappings. Continuing
 				// without one would defer the failure until a guest tries to use it.
-				EXIT("required guest address space region [0x%016" PRIx64
-				     ", 0x%016" PRIx64 ") could not be reserved; check host address-space "
+				EXIT("required guest address space region [0x%016" PRIx64 ", 0x%016" PRIx64
+				     ") could not be reserved; check host address-space "
 				     "limits and conflicting mappings\n",
 				     region_start, region_end);
 			}
@@ -1204,15 +1218,18 @@ private:
 			for (uint32_t n = 0; n < header->ncmds; ++n) {
 				if (command->cmd == LC_SEGMENT_64) {
 					const auto* segment = reinterpret_cast<const segment_command_64*>(command);
-					uint64_t expected_start = 0;
-					uint64_t expected_end   = 0;
-					if (std::strncmp(segment->segname, "SYSTEM_MANAGED", sizeof(segment->segname)) == 0) {
+					uint64_t    expected_start = 0;
+					uint64_t    expected_end   = 0;
+					if (std::strncmp(segment->segname, "SYSTEM_MANAGED",
+					                 sizeof(segment->segname)) == 0) {
 						expected_start = HOST_SYSTEM_MANAGED_MIN;
 						expected_end   = HOST_SYSTEM_MANAGED_MAX + 1u;
-					} else if (std::strncmp(segment->segname, "SYSTEM_RESERVED", sizeof(segment->segname)) == 0) {
+					} else if (std::strncmp(segment->segname, "SYSTEM_RESERVED",
+					                        sizeof(segment->segname)) == 0) {
 						expected_start = HOST_SYSTEM_MANAGED_MAX + 1u;
 						expected_end   = HOST_SYSTEM_RESERVED_MAX + 1u;
-					} else if (std::strncmp(segment->segname, "USER_AREA", sizeof(segment->segname)) == 0) {
+					} else if (std::strncmp(segment->segname, "USER_AREA",
+					                        sizeof(segment->segname)) == 0) {
 						expected_start = HOST_USER_MIN;
 						expected_end   = HOST_USER_MAX + 1u;
 					}
@@ -1236,7 +1253,7 @@ private:
 			}
 #endif
 			constexpr unsigned MaxReservationAttempts = 4;
-			bool reserved = linked_reserved;
+			bool               reserved               = linked_reserved;
 			for (unsigned attempt = 0; attempt < MaxReservationAttempts; ++attempt) {
 				// Re-query after a failed reservation: a host thread may have mapped a
 				// previously free gap since the last snapshot.
@@ -1248,15 +1265,14 @@ private:
 				// mach_vm_region returns the mapping containing the cursor, or the next one.
 				mach_vm_address_t cursor = region_start;
 				while (cursor < region_end) {
-					mach_vm_address_t address = cursor;
-					mach_vm_size_t size = 0;
+					mach_vm_address_t              address = cursor;
+					mach_vm_size_t                 size    = 0;
 					vm_region_basic_info_data_64_t info {};
-					mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-					mach_port_t object = MACH_PORT_NULL;
-					const auto result = mach_vm_region(mach_task_self(), &address, &size,
-					                                   VM_REGION_BASIC_INFO_64,
-					                                   reinterpret_cast<vm_region_info_t>(&info),
-					                                   &count, &object);
+					mach_msg_type_number_t         count  = VM_REGION_BASIC_INFO_COUNT_64;
+					mach_port_t                    object = MACH_PORT_NULL;
+					const auto                     result =
+					    mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+						               reinterpret_cast<vm_region_info_t>(&info), &count, &object);
 					if (object != MACH_PORT_NULL) {
 						mach_port_deallocate(mach_task_self(), object);
 					}
@@ -1301,8 +1317,8 @@ private:
 			const auto free_ranges =
 			    AlignedFreeRangesInRegion(region_start, region_end, occupied, m_granularity);
 			if (free_ranges.empty()) {
-				EXIT("no free guest address space in region [0x%016" PRIx64
-				     ", 0x%016" PRIx64 ")\n", region_start, region_end);
+				EXIT("no free guest address space in region [0x%016" PRIx64 ", 0x%016" PRIx64 ")\n",
+				     region_start, region_end);
 			}
 			for (const auto& [start, end]: free_ranges) {
 				if (!reserve_range(start, end)) {
@@ -1439,9 +1455,9 @@ private:
 	}
 
 	std::map<uint64_t, uint64_t>               m_free;
-	std::map<uint64_t, MappedRegion>            m_mapped;
+	std::map<uint64_t, MappedRegion>           m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
-	uint64_t                                   m_granularity = 0x10000;
-	GuestBackingStore*                         m_backing     = nullptr;
+	uint64_t                                   m_granularity        = 0x10000;
+	GuestBackingStore*                         m_backing            = nullptr;
 	bool                                       m_remaining_reserved = false;
 };

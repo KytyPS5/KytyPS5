@@ -2708,10 +2708,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	         data_offset_in_bytes, count_indirect, max_count_or_count,
 	         reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
 
-	if (buf == nullptr) {
-		return nullptr;
-	}
-
 	constexpr uint32_t draw_packet_size_dw = 10u;
 	auto* cmd = allocate_tagged_draw(buf, AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG, draw_packet_size_dw);
 	if (cmd == nullptr) {

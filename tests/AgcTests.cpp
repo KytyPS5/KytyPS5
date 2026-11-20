@@ -149,6 +149,10 @@ TEST(Agc, AcbUserDataHasNoR) {
 	EXPECT_EQ((std::array {semaphore.dw[0], semaphore.dw[8]}), (std::array {0xc0027900u, 0xc0017900u}));
 }
 
+TEST(AgcDeathTest, DrawIndirectMultiNeedsABuffer) {
+	EXPECT_DEATH(Gen5::AgcDcbDrawIndirectMulti(nullptr, 0, 0, 0, nullptr, 0, 0), "");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

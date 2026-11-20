@@ -50609,16 +50609,21 @@ MergedHull MergedHullProgram(const std::vector<u32> &local, const std::vector<u3
 
 std::array<std::vector<u32>, 2> PrepareMergedHullHalves(const std::vector<u32> &merged,
                                                         const std::vector<u32> &evaluation,
+                                                        const std::vector<u32> &stale_back,
                                                         u32 control_points, u32 tf_param) {
   static ShaderUserData user_data{};
   for (const auto &[code, type] : {std::pair{&merged, Prospero::ShaderBinaryType::kHs},
-                                   std::pair{&evaluation, Prospero::ShaderBinaryType::kGs}}) {
-    ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
-                      {.type = type, .user_data = &user_data,
-                       .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+                                   std::pair{&evaluation, Prospero::ShaderBinaryType::kGs},
+                                   std::pair{&stale_back, Prospero::ShaderBinaryType::kHsBack}}) {
+    if (!code->empty()) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+                        {.type = type, .user_data = &user_data,
+                         .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+    }
   }
   HW::VertexShaderInfo regs{};
   regs.ls_regs.data_addr = reinterpret_cast<uint64_t>(merged.data());
+  regs.hs_regs.data_addr = reinterpret_cast<uint64_t>(stale_back.data());
   regs.es_regs.data_addr = reinterpret_cast<uint64_t>(evaluation.data());
   HW::Context context;
   context.SetLsHsConfig((control_points << 14u) | (control_points << 8u) | 1u);
@@ -50734,7 +50739,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
   if (merged) {
     const auto program = MergedHullProgram(local, control);
     const auto halves = PrepareMergedHullHalves(
-        program.code, evaluation, control_points,
+        program.code, evaluation, quad ? control : std::vector<u32>{}, control_points,
         domain | (partitioning << 2u) | (output_topology << 5u));
     Require(name, "merged prologue in both halves",
             std::ranges::all_of(halves,

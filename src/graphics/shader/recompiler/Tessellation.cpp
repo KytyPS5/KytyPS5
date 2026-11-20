@@ -299,7 +299,13 @@ MergedHullHalves SplitMergedHullProgram(std::span<const uint32_t> code) {
 		       (Decoder::IsDirectBranch(inst.opcode) &&
 		        (local ? inst.branch_target > join : inst.branch_target < join));
 	};
-	if (std::ranges::none_of(instructions, [join](const auto& inst) { return inst.pc == join; }) ||
+	const auto resets_exec = [join](const Decoder::Instruction& inst) {
+		return inst.pc == join && inst.opcode == Opcode::S_MOV_B64 &&
+		       inst.dst.kind == Decoder::OperandKind::ExecLo &&
+		       inst.src0.kind == Decoder::OperandKind::IntegerInlineConstant &&
+		       inst.src0.signed_val == -1;
+	};
+	if (std::ranges::none_of(instructions, resets_exec) ||
 	    std::ranges::any_of(instructions, crosses_join)) {
 		EXIT("merged LS+HS program cannot be split at 0x%x\n", join);
 	}

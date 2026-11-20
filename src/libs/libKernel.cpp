@@ -2440,7 +2440,29 @@ struct FiberThreadContext {
 	FiberObject*    returned_fiber;
 	FiberObject*    pending_idle_fiber;
 	FiberCpuContext cpu_context;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	uintptr_t thread_stack_base;
+	uintptr_t thread_stack_limit;
+#endif
 };
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+static void FiberGetThreadStackBounds(uintptr_t* stack_base, uintptr_t* stack_limit) {
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(*stack_base), "=r"(*stack_limit)
+	             :
+	             : "memory");
+}
+
+static void FiberSetThreadStackBounds(uintptr_t stack_base, uintptr_t stack_limit) {
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(stack_base), "r"(stack_limit)
+	             : "memory");
+}
+#endif
 
 static const auto g_fiber_context_key = [] {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2722,14 +2744,29 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	fiber->arg_on_return = 0;
 	// Register on the host stack; switching fibers only reads the native TLS slot.
 	FiberThreadContext context {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	FiberGetThreadStackBounds(&context.thread_stack_base, &context.thread_stack_limit);
+#endif
 	FiberSetThreadContext(&context);
 
 	if (FiberSaveContext(&context.cpu_context) == 0) {
+		// Fibers use guest-provided stacks that can be anywhere in memory. Host stack
+		// probing against the thread's bounds would walk from this fiber into unrelated
+		// pages, so leave the Windows TEB bounds unset until FiberRun resumes.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+		FiberSetThreadStackBounds(0, 0);
+#endif
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	// FiberReturnToThread and the fiber trampoline restore the caller context. Reinstate
+	// the bounds belonging to the native thread that entered FiberRun (fibers may migrate).
+	FiberSetThreadStackBounds(context.thread_stack_base, context.thread_stack_limit);
+#endif
 
 	auto* returned_fiber    = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
 	const auto return_value = returned_fiber->arg_on_return;

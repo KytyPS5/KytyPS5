@@ -943,7 +943,8 @@ bool TextureCache::RetireThroughGuestMemory(ImageId replacement_id, ImageId reti
 	if (replacement.type != retired.info.type ||
 	    replacement.resources.Contains(retired.info.resources) || replacement.samples != 1 ||
 	    replacement.metadata.compression != VideoOutCompression::Uncompressed ||
-	    !retired.SafeToDownload() || !BcAlias::Publish(*this, retired)) {
+	    (retired.IsGpuModified() &&
+	     (!retired.SafeToDownload() || !BcAlias::Publish(*this, retired)))) {
 		return false;
 	}
 	InitializeImage(replacement_id);

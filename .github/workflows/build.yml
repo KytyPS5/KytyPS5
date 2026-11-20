@@ -2,8 +2,25 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      build_windows:
+        description: 'Build Windows'
+        type: boolean
+        default: true
+      build_macos:
+        description: 'Build macOS'
+        type: boolean
+        default: true
+      build_linux:
+        description: 'Build Linux'
+        type: boolean
+        default: true
+      create_release:
+        description: 'Create GitHub Release'
+        type: boolean
+        default: true
   push:
-    branches: [ main, master ]
+    branches: [ main, master, unified-enhancements ]
   pull_request:
 
 concurrency:
@@ -31,6 +48,7 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
+    if: github.event_name != 'workflow_dispatch' || (inputs.build_windows != false && inputs.build_windows != 'false')
     needs: metadata
     runs-on: windows-2025
 
@@ -146,6 +164,7 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    if: github.event_name != 'workflow_dispatch' || (inputs.build_macos != false && inputs.build_macos != 'false')
     needs: metadata
     runs-on: macos-15
 
@@ -302,6 +321,7 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    if: github.event_name != 'workflow_dispatch' || (inputs.build_linux != false && inputs.build_linux != 'false')
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -448,8 +468,7 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.create_release != false && inputs.create_release != 'false')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')

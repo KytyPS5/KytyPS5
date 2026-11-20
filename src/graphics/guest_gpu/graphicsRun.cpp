@@ -282,7 +282,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	}
 }
 
-void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
+void CommandProcessor::WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
@@ -295,12 +295,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		case 6: break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
-	if (dw_num == 0) {
+
+	// A GDS destination is a 16-bit DWORD offset.
+	if (dst_sel == 6) {
+		for (uint32_t i = 0; i < dw_num; i++, dst += !write_one_address) {
+			m_renderer.GetBufferCache().FillBuffer((dst & 0xffffu) * 4u, 4u, src[i], true);
+		}
 		return;
 	}
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
+	auto* output = reinterpret_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;

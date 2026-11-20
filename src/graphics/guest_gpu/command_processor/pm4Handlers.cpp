@@ -1393,10 +1393,8 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
-	auto  write_control = buffer[0];
-	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-
-	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
+	cp.WriteData(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u), buffer + 3, dw_num - 2,
+	             buffer[0]);
 
 	return 1 + dw_num;
 }

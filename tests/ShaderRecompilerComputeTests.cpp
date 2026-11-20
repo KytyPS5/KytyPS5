@@ -56822,6 +56822,37 @@ int main(int argc, char **argv) {
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--mul-hi24-only") == 0) {
     VulkanHarness vulkan;
+void CheckPm4WriteDataGds(VulkanHarness &vulkan) {
+  constexpr const char *name = "Pm4WriteDataGds";
+  RenderContext context(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = context.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  CommandProcessor processor(context, 0x20);
+  // Increment 0 writes consecutive DWORDs, 1 writes one address.
+  const auto write = [&](uint64_t offset, uint8_t increment) {
+    constexpr std::array<uint32_t, 3> data{0x11u, 0x22u, 0x33u};
+    std::array<uint32_t, 7> packet{};
+    CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                            packet.data(), packet.data() + packet.size(),
+                            nullptr, nullptr, 0};
+    Gen5::AgcAcbWriteData(reinterpret_cast<Gen5::CommandBuffer *>(&acb), 3, 0,
+                          offset, data.data(), 3, increment, 0);
+    Pm4Execution execution;
+    return processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+  };
+  Require(name, "process", write(3, 0) && write(7, 1),
+          "the GDS writes did not complete");
+  scheduler.Finish();
+  std::array<uint32_t, 5> gds{};
+  Sync::ReadGds(*context.GetBufferCache().GetGdsBuffer(), gds.data(), 3, 5);
+  Require(name, "contents", gds == std::array<uint32_t, 5>{0x11u, 0x22u, 0x33u, 0, 0x33u},
+          "the GDS writes did not land at their DWORD offsets");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
     RunCase(&vulkan, VectorMulHi24(32));
     RunCase(&vulkan, VectorMulHi24(64));
     RunCase(&vulkan, Vop2SdwaMulI24Destinations(32));
@@ -57952,6 +57983,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBdaPageTableUploads();
+  if (argc == 2 && std::strcmp(argv[1], "--write-data-gds-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4WriteDataGds(vulkan);
+    return 0;
+  }
     vulkan.CheckBdaSyncUploads();
     vulkan.CheckFaultBufferScan();
     vulkan.CheckFaultRecordsOverflow();
@@ -58266,6 +58302,7 @@ int main(int argc, char **argv) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
         "device does not support the production rasterization features\n");
+  CheckPm4WriteDataGds(vulkan);
   }
   if (vulkan.SkippedCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",

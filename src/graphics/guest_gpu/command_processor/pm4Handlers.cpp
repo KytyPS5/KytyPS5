@@ -953,8 +953,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	const uint32_t control = buffer[2];
 
-	auto* indirect_buffer =
-	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
+	// The two low bits of the target DWORD are not address bits.
+	auto* indirect_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[0] & ~0x3u) | (static_cast<uint64_t>(buffer[1]) << 32u));
 	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {

@@ -55880,6 +55880,17 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
           processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
               selected == 11 && returned == 22,
           "long chain did not complete and return to the original caller");
+
+  // A jump fetches from its target with bits 1:0 of the low DWORD cleared.
+  auto jump = indirect(then_commands, false);
+  jump[1] |= 3u;
+  std::copy(jump.begin(), jump.end(), caller.begin());
+  selected = returned = 0;
+  Pm4Execution jump_execution;
+  Require(name, "jump low bits",
+          processor.Process(jump_execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 11 && returned == 22,
+          "a jump fetched its target with the low bits as address bits");
   std::printf("[host]    %-32s ok\n", name);
 }
 

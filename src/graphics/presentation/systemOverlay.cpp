@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/splashAnimation.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -249,7 +250,7 @@ std::atomic<bool>              g_trophy_notification_active {false};
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
-bool                                 g_splash_fast = false;
+bool                                 g_splash_logo_first = false;
 
 std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
 	std::vector<std::string_view> lines;
@@ -643,7 +644,7 @@ void InitializeSplashScreen(const std::filesystem::path& sce_sys) {
 	}
 	int32_t attribute = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute);
-	g_splash_fast = (attribute & 0x1000) != 0;
+	g_splash_logo_first = (attribute & 0x1000) != 0;
 	g_splash_hidden_at.store(0, std::memory_order_release);
 	g_splash_active.store(Common::File::IsFileExisting(g_splash_paths[0]) &&
 	                          Common::File::IsFileExisting(g_splash_paths[1]),
@@ -1079,8 +1080,8 @@ struct SystemOverlay::Impl {
 			FinishSplash();
 			return;
 		}
-		const float  age  = std::chrono::duration<float>(now - splash_born).count();
-		const float  logo = g_splash_fast ? 1.0f : std::clamp((age - 1.4f) / 2.2f, 0.0f, 1.0f);
+		const auto   frame = AnimateSplash(std::chrono::duration<float>(now - splash_born).count(),
+		                                   g_splash_logo_first);
 		const ImVec2 screen {static_cast<float>(frame_extent.width),
 		                     static_cast<float>(frame_extent.height)};
 		const float  fit = std::min(screen.x / 3840.0f, screen.y / 2160.0f);
@@ -1089,11 +1090,13 @@ struct SystemOverlay::Impl {
 		const ImVec2 end {begin.x + size.x, begin.y + size.y};
 		auto*        draw = ImGui::GetBackgroundDrawList();
 		draw->AddRectFilled({0, 0}, screen, IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha)));
-		for (size_t i = 0; i < g_splash_paths.size(); ++i) {
-			draw->AddImage(
-			    splash_dds[i]->Texture(), begin, end, {0, 0}, {1, 1},
-			    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * (i == 0 ? 1.0f : logo))));
-		}
+		draw->AddImage(
+		    splash_dds[0]->Texture(), begin, end, {frame.background_uv0, frame.background_uv0},
+		    {frame.background_uv1, frame.background_uv1},
+		    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * frame.background_alpha)));
+		draw->AddImage(
+		    splash_dds[1]->Texture(), begin, end, {0, 0}, {frame.logo_uv1, frame.logo_uv1},
+		    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * frame.logo_alpha)));
 	}
 
 	void EnsureVulkan(vk::Format format, uint32_t image_count) {

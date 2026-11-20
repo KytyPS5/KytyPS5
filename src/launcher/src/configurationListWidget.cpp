@@ -13,7 +13,6 @@
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
-#include "settingsElevation.h"
 #include "trophyViewerDialog.h"
 
 #include <QAbstractItemModel>
@@ -53,7 +52,6 @@
 #include <QSaveFile>
 #include <QSet>
 #include <QSettings>
-#include <QTemporaryFile>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStyle>
@@ -377,85 +375,6 @@ void ConfigurationListWidget::WriteSettings() {
 		it.value()->WriteSettings(s.get());
 	}
 	s->endArray();
-
-	// QSettings writes when it is destroyed and drops the error silently: write now to see it.
-	s->sync();
-	if (s->status() != QSettings::NoError) {
-		HandleSettingsWriteFailure(*s);
-	}
-}
-
-void ConfigurationListWidget::HandleSettingsWriteFailure(QSettings& failed) {
-	const QString file_name = QDir::toNativeSeparators(failed.fileName());
-	qWarning("Could not save the launcher configuration to %s", qUtf8Printable(file_name));
-	// Stay quiet after the user said no: every change would show the same question again.
-	if (m_settings_error_declined) {
-		return;
-	}
-
-	if (!SettingsElevation::IsSupported()) {
-		m_settings_error_declined = true;
-		QMessageBox::warning(
-		    this, tr("Configuration not saved"),
-		    tr("The launcher cannot save its configuration to:\n%1\n\nCheck that you have "
-		       "permission to write to that file and its folder. Your changes are lost when the "
-		       "launcher closes.")
-		        .arg(file_name));
-		return;
-	}
-
-	const auto answer = QMessageBox::question(
-	    this, tr("Configuration not saved"),
-	    tr("The launcher does not have permission to save its configuration to:\n%1\n\nDo you "
-	       "want to save it with administrator rights? Windows will ask you to confirm.")
-	        .arg(file_name),
-	    QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
-	if (answer != QMessageBox::Yes) {
-		m_settings_error_declined = true;
-		return;
-	}
-
-	// Everything the launcher would have written, including what it kept from the existing file,
-	// goes to a temporary file that the elevated copy puts in place.
-	QString error;
-	bool    ok = false;
-	QString temporary_name;
-	{
-		// QTemporaryFile::close() keeps the file open, and on Windows QSettings cannot then replace
-		// it when it saves: release the file before QSettings writes to it, and remove it here.
-		QTemporaryFile temporary(
-		    QDir(QDir::tempPath()).absoluteFilePath(QStringLiteral("Kyty_XXXXXX.ini")));
-		temporary.setAutoRemove(false);
-		if (temporary.open()) {
-			temporary_name = temporary.fileName();
-		} else {
-			error = temporary.errorString();
-		}
-	}
-	if (!temporary_name.isEmpty()) {
-		{
-			QSettings copy(temporary_name, QSettings::IniFormat);
-			for (const auto& key: failed.allKeys()) {
-				copy.setValue(key, failed.value(key));
-			}
-			copy.sync();
-			ok = copy.status() == QSettings::NoError;
-		}
-		if (ok) {
-			ok = SettingsElevation::RunElevatedCopy(temporary_name, failed.fileName(), &error);
-		} else {
-			error = tr("Could not prepare the configuration file.");
-		}
-		QFile::remove(temporary_name);
-	}
-
-	if (!ok) {
-		QMessageBox::warning(this, tr("Configuration not saved"),
-		                     tr("The configuration could not be saved to:\n%1\n\n%2")
-		                         .arg(file_name, error));
-	} else if (!error.isEmpty()) {
-		QMessageBox::warning(this, tr("Configuration saved"), error);
-	}
 }
 
 void ConfigurationListWidget::ReadSettings() {

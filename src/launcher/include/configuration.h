@@ -87,10 +87,6 @@ public:
 	enum class PssrUpscaler { Linear, DLSS, FSR };
 	Q_ENUM(PssrUpscaler)
 
-	// Experiment: the draw templates, the second resolve thread and the per-draw block of small buffers.
-	enum class DrawMode { Original, Experiment };
-	Q_ENUM(DrawMode)
-
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -125,19 +121,16 @@ public:
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
 	bool                   stretch_enabled             = false;
-	bool                   readback_linear_images      = true;
+	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	int                    flush_draws                 = 0;
-	bool                   tessellation_enabled        = true;
-	bool                   occlusion_queries_enabled   = true;
+	bool                   tessellation_enabled        = false;
+	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
-	DrawMode               draw_mode                   = DrawMode::Original;
 	bool                   shader_cache_enabled        = true;
-	bool                   async_pipelines_enabled     = true;
-	bool                   pipeline_manifest_record    = false;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled        = false;
@@ -161,9 +154,9 @@ public:
 	QString                dlss_folder;
 	QString                fsr_folder;
 	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = true;
+	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
-	bool red_zone_protection_enabled = true;
+	bool red_zone_protection_enabled = false;
 #endif
 	QStringList host_input_mapping;
 
@@ -189,10 +182,7 @@ public:
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		relaxed_shader_float        = other.relaxed_shader_float;
 		native_rt                   = other.native_rt;
-		draw_mode                   = other.draw_mode;
 		shader_cache_enabled        = other.shader_cache_enabled;
-		async_pipelines_enabled     = other.async_pipelines_enabled;
-		pipeline_manifest_record    = other.pipeline_manifest_record;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
 		perf_overlay_enabled        = other.perf_overlay_enabled;

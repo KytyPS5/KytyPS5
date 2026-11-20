@@ -40,10 +40,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(relaxed_shader_float);
 	KYTY_CFG_SET(native_rt);
-	KYTY_CFG_SET(draw_mode);
 	KYTY_CFG_SET(shader_cache_enabled);
-	KYTY_CFG_SET(async_pipelines_enabled);
-	KYTY_CFG_SET(pipeline_manifest_record);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
 	KYTY_CFG_SET(perf_overlay_enabled);
@@ -103,17 +100,11 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(flush_draws);
 	KYTY_CFG_GET(tessellation_enabled);
-	// On by default, also in configurations saved before the fork turned it on.
-	occlusion_queries_enabled = s.value("occlusion_queries_enabled", true).toBool();
+	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);
-	// Configurations saved before upstream's toggle keep the fork's native ray tracing setting.
-	native_rt = s.value("native_rt", s.value("native_ray_tracing_enabled", native_rt)).toBool();
-	KYTY_CFG_GET(draw_mode);
+	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
-	// On by default, also in configurations saved before the option existed.
-	async_pipelines_enabled = s.value("async_pipelines_enabled", true).toBool();
-	KYTY_CFG_GET(pipeline_manifest_record);
-	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
+	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);

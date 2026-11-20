@@ -181,13 +181,13 @@
             </item>
             <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
-              <property name="toolTip"><string>Draw tessellated geometry, such as GTA V's nearby tree trunks. Unsupported tessellation shaders may cause crashes.</string></property>
-              <property name="text"><string>Enable tessellation support</string></property>
+              <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
+              <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
             <item row="9" column="1">
              <widget class="QCheckBox" name="checkBox_occlusion_queries">
-              <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden (GTA V&apos;s sun flare and light glows).</string></property>
+              <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
               <property name="text"><string>Enable occlusion queries</string></property>
              </widget>
             </item>
@@ -204,12 +204,6 @@
              </widget>
             </item>
             <item row="12" column="1">
-             <widget class="QCheckBox" name="checkBox_async_pipelines">
-              <property name="toolTip"><string>Compile new pipelines in the background and skip the draws that need them meanwhile: an object may appear a moment late the first time it is seen, instead of the game stuttering.</string></property>
-              <property name="text"><string>Compile new pipelines in the background</string></property>
-             </widget>
-            </item>
-            <item row="14" column="1">
              <widget class="QCheckBox" name="checkBox_relaxed_shader_float">
               <property name="toolTip"><string>Use the host GPU's native float operations in shaders. Faster, but can be inaccurate.</string></property>
               <property name="text"><string>Relaxed shader float math</string></property>
@@ -217,18 +211,8 @@
             </item>
             <item row="13" column="1">
              <widget class="QCheckBox" name="checkBox_native_rt">
-              <property name="toolTip"><string>Experimental. Trace the ray tracing passes of supported games (GTA V's shadows and reflections in Fidelity mode, ASTRO BOT) with the GPU's ray tracing hardware instead of emulating the PS5's BVH instructions: much faster where it applies. Needs a GPU with Vulkan ray queries. Visual errors are possible; turn it off if a game looks wrong.</string></property>
+              <property name="toolTip"><string>Use native RT on the GPU.</string></property>
               <property name="text"><string>Native ray tracing (experimental)</string></property>
-             </widget>
-            </item>
-            <item row="15" column="0">
-             <widget class="QLabel" name="label_draw_mode">
-              <property name="text"><string>Draw mode:</string></property>
-             </widget>
-            </item>
-            <item row="15" column="1">
-             <widget class="QComboBox" name="comboBox_draw_mode">
-              <property name="toolTip"><string>Experiment: draw templates, a second resolve thread and a per-draw block of small buffers. Faster in GTA V, still being tested.</string></property>
              </widget>
             </item>
            </layout>
@@ -583,12 +567,6 @@
            <widget class="MandatoryLineEdit" name="lineEdit_cmd_dump_folder">
             <property name="toolTip"><string>Specify directory to dump command buffers</string></property>
             <property name="clearButtonEnabled"><bool>true</bool></property>
-           </widget>
-          </item>
-          <item row="5" column="0" colspan="2">
-           <widget class="QCheckBox" name="checkBox_record_pipeline_manifest">
-            <property name="toolTip"><string>Add the shaders and pipelines this session compiles to the game's pipeline manifest (_PipelineCache), which later cold starts compile while the game loads.</string></property>
-            <property name="text"><string>Record the pipeline manifest</string></property>
            </widget>
           </item>
          </layout>

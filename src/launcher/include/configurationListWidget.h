@@ -14,7 +14,6 @@ class ConfigurationItem;
 class CompatibilityDatabase;
 class ControllerPreview;
 class QEvent;
-class QSettings;
 class QTreeWidgetItem;
 
 namespace Ui {
@@ -80,7 +79,6 @@ private:
 	void               ImportGameSettings(QWidget* parent);
 	void               ExportGameSettings(QWidget* parent) const;
 	[[nodiscard]] bool HasValidGameDirectory() const;
-	void               HandleSettingsWriteFailure(QSettings& failed);
 
 	ConfigurationItem*            m_selected_item = nullptr;
 	bool                          m_run_enabled   = true;
@@ -94,7 +92,6 @@ private:
 	QMap<QString, Configuration*> m_custom_infos;
 	CompatibilityDatabase*        m_compatibility = nullptr;
 	ControllerPreview*            m_controller_preview = nullptr;
-	bool                          m_settings_error_declined = false;
 };
 
 #endif // CONFIGURATION_LIST_WIDGET_H

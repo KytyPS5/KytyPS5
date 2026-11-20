@@ -493,8 +493,15 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	m_context.GetCommandScheduler().NoteRecordedWork();
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// Read-only dispatches need ordering, but no memory visibility operation.
+	const bool writes_memory =
+	    HasStorageWrites(input_info, bindings) || program.info.uses_dma ||
+	    bindings.gds.buffer != nullptr ||
+	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
+	                [](const auto& resource) { return resource.written || resource.atomic; }) ||
+	    std::any_of(program.info.images.begin(), program.info.images.end(),
+	                [](const auto& resource) { return resource.written || resource.atomic; });
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
 	ResetBindings();
 }
 

@@ -217,6 +217,8 @@ private:
 		}
 	}
 
+	void ConfigureGarbageCollectionBudget(uint64_t available_budget);
+
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);

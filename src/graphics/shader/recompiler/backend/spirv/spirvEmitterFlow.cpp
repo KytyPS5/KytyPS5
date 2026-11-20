@@ -605,7 +605,39 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
-			if (!mapping.IsIdentity()) {
+			if (state.input_info.pixel->dynamic_export_mapping) {
+				// out[c] = value[mapping.Map(c)], the mapping a specialization constant.
+				auto& spec = state.export_mapping_specs[exp.index];
+				if (spec == 0) {
+					spec = state.builder.Constant(spv::OpSpecConstant, TypeU32(state),
+					                              0xe4u | (exp.index << 8u));
+					state.builder.AddAnnotation(spv::OpDecorate, spec, spv::DecorationSpecId,
+					                            ShaderExportMappingSpecId + exp.index);
+				}
+				const auto component_type = vector_type == TypeI32Vector(state, 4) ? TypeI32(state)
+				                            : vector_type == TypeU32Vector(state, 4) ? TypeU32(state)
+				                                                                     : TypeF32(state);
+				std::array<uint32_t, 4> components {};
+				for (uint32_t component = 0; component < 4; component++) {
+					auto shifted = spec;
+					if (component != 0) {
+						shifted = state.builder.Constant(spv::OpSpecConstantOp, TypeU32(state),
+						                                 spv::OpShiftRightLogical, spec,
+						                                 ConstantU32(state, component * 2u));
+					}
+					const auto index = state.builder.Constant(spv::OpSpecConstantOp, TypeU32(state),
+					                                          spv::OpBitwiseAnd, shifted,
+					                                          ConstantU32(state, 3u));
+					components[component] = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpVectorExtractDynamic, component_type,
+					                          components[component], value, index);
+				}
+				const auto mapped = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, mapped,
+				                          components[0], components[1], components[2],
+				                          components[3]);
+				value = mapped;
+			} else if (!mapping.IsIdentity()) {
 				const auto mapped = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, mapped, value, value,
 				                          mapping.Map(0), mapping.Map(1), mapping.Map(2),

@@ -67,9 +67,11 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	if (stamp == 0) {
 		return {};
 	}
+	// Raised when a stored record's layout changes (2: pipeline keys carry the PS export mappings).
+	constexpr uint32_t RecordLayout = 2;
 	Writer header;
 	IoAll(header, stamp, SpirvProfile(graphics),
-	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
+	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize, RecordLayout);
 	return std::move(header.bytes);
 }
 

@@ -977,8 +977,6 @@ if(NOT WIN32 AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$"
 		add_dependencies(kyty_tests guest_instruction_patch_scan_tests)
 	endif()
 endif()
-	endif()
-endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)

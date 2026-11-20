@@ -285,7 +285,6 @@ const std::string& GetLaunchActivity() {
 bool PollBackoffEnabled() {
 	return g_config->poll_backoff_enabled;
 }
-}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {

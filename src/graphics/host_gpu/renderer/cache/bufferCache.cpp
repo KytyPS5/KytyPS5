@@ -31,8 +31,8 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
-                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
-                                        vk::BufferUsageFlags usage, const auto& write) {
+                                          StreamBuffer& staging, uint64_t size, uint64_t alignment,
+                                          vk::BufferUsageFlags usage, const auto& write) {
 	const auto [mapped, offset] = staging.Map(size, alignment);
 	if (mapped != nullptr) {
 		write(mapped, offset);
@@ -41,8 +41,8 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	}
 
 	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
-	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
-	                                         usage, size);
+	auto temporary =
+	    std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0, usage, size);
 	write(temporary->Mapped().data(), 0);
 	temporary->Flush(0, size);
 	auto* buffer = temporary.get();
@@ -56,13 +56,13 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
                                   uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
 	while (size != 0) {
-		const auto chunk  = std::min(size, m_staging_buffer.Size());
+		const auto chunk = std::min(size, m_staging_buffer.Size());
 		// Copy waits for ring reuse and flushes the fresh host data before submission.
-		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
+		const auto offset             = m_staging_buffer.Copy(bytes, chunk, 4);
 		const auto destination_offset = buffer.Offset(address);
 		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
 		m_scheduler.EndRendering();
-		const auto command = m_scheduler.Current().Handle();
+		const auto               command = m_scheduler.Current().Handle();
 		vk::BufferMemoryBarrier2 before {};
 		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
@@ -70,9 +70,9 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		before.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
 		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer        = buffer.Handle();
-		before.offset        = destination_offset;
-		before.size          = chunk;
+		before.buffer              = buffer.Handle();
+		before.offset              = destination_offset;
+		before.size                = chunk;
 		vk::DependencyInfo dependency {};
 		dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 		dependency.bufferMemoryBarrierCount = 1;
@@ -103,7 +103,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
-	auto& buffer = m_slot_buffers[id];
+	auto&                buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
 	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -114,7 +114,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 			m_page_table[page] = {};
 		}
 	}
-	const auto size_pages = pages.last_exclusive - pages.first;
+	const auto size_pages   = pages.last_exclusive - pages.first;
 	const auto table_offset = PageIndex(buffer.CpuAddress()) * sizeof(vk::DeviceAddress);
 	if constexpr (insert) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
@@ -125,15 +125,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		WriteDataBuffer(m_bda_pagetable_buffer, table_offset, addresses.data(),
+		                addresses.size() * sizeof(vk::DeviceAddress));
 		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		m_bda_pagetable_buffer.Fill(table_offset, size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
 	}
 }
@@ -279,7 +278,12 @@ BufferCache::~BufferCache() {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size);
+	// Writes from threads other than the GPU thread (game threads, file I/O and so on) land before
+	// the work that reads them is submitted, or before a wait the command processor is blocked on
+	// is released. So their BDA synchronization events can wait until the command processor starts
+	// or resumes a submission. Synchronizing them at every BDA draw instead uploads data meant for
+	// later frames again and again.
+	QueueBdaSync(vaddr, size, !GuestGpu::IsGpuThread());
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -358,11 +362,14 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
 			// Reserve space in the incoming stream's direction of growth.
-			// The old buffer extending left of the request predicts growth to the right, and vice versa.
+			// The old buffer extending left of the request predicts growth to the right, and vice
+			// versa.
 			if (expands_left) {
-				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
-				                                       : LibKernel::Memory::kExtendedMemoryBase +
-				                                             LibKernel::Memory::kExtendedMemorySize) - end);
+				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE
+				                                     ? LOWER_ADDRESS_SIZE
+				                                     : LibKernel::Memory::kExtendedMemoryBase +
+				                                           LibKernel::Memory::kExtendedMemorySize) -
+				                                    end);
 			}
 			if (expands_right) {
 				const auto minimum = vaddr < LOWER_ADDRESS_SIZE
@@ -391,8 +398,8 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
-	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
+	const auto end     = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	vaddr              = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
@@ -446,7 +453,7 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 			    for (auto& copy: copies.subspan(first, upload.end - first)) {
 				    const auto address = upload.buffer->CpuAddress() + copy.dstOffset;
 				    if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
-					                                         copy.size)) {
+				                                             copy.size)) {
 					    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 				    }
 				    copy.srcOffset += base_offset;
@@ -459,7 +466,7 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 	const auto              native = command.Handle();
 	const vk::MemoryBarrier before {
 	    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                 vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
+	                     vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite,
 	    .dstAccessMask = vk::AccessFlagBits::eTransferWrite};
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
@@ -525,13 +532,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
+	return UploadMemory(
+	    m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
-			EXIT("BufferCache: failed to read mapped guest image backing\n");
-		}
-	});
+		    if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			    EXIT("BufferCache: failed to read mapped guest image backing\n");
+		    }
+	    });
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
@@ -581,7 +589,8 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		return;
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
-	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+	    !IsRegionGpuModified(src_vaddr, size) &&
+	    !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
@@ -677,7 +686,8 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			EXIT_NOT_IMPLEMENTED(
+			    !DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
@@ -707,11 +717,39 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
-	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+// Queues the pages of [vaddr, vaddr + size) for the next BDA synchronization. A deferred event
+// waits in its own set until PromoteBdaSync.
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool deferred) {
+	const auto      begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto      end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
+	if (deferred) {
+		m_bda_sync_deferred.Add(begin, end - begin);
+		m_has_deferred_bda_sync.store(true, std::memory_order_release);
+	} else {
+		m_bda_sync.Add(begin, end - begin);
+	}
+}
+
+// Moves the deferred BDA events into the set TakeBdaSync() returns.
+void BufferCache::PromoteBdaSync() {
+	// The command processor calls this at every submission slice and every passing wait. Most of
+	// the time nothing was deferred since the last call, so we can skip the lock. A game thread
+	// sets the flag before it submits or releases the wait, so its event will not be missed.
+	if (!m_has_deferred_bda_sync.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard lock(m_bda_sync_mutex);
+	m_has_deferred_bda_sync.store(false, std::memory_order_relaxed);
+	// The immediate set is typically empty here, since every BDA draw takes it. Then, instead of
+	// moving the deferred set range by range, it is moved as a whole.
+	if (m_bda_sync.Empty()) {
+		std::swap(m_bda_sync, m_bda_sync_deferred);
+	} else {
+		m_bda_sync_deferred.ForEach(
+		    [this](uint64_t begin, uint64_t end) { m_bda_sync.Add(begin, end - begin); });
+	}
+	m_bda_sync_deferred.Clear();
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {

@@ -237,7 +237,17 @@ void CommandProcessor::BufferWait() {
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+		return;
 	}
+	// The game thread may have set the valid bit after writing the commands' data.
+	PromoteGuestWrites();
+}
+
+void CommandProcessor::PromoteGuestWrites() {
+	// Keep the caller's read of the guest value ahead of the promotion's check for held-back
+	// events. Otherwise the check could miss an event queued before the value was written.
+	std::atomic_thread_fence(std::memory_order_acquire);
+	m_renderer.GetBufferCache().PromoteBdaSync();
 }
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
@@ -264,7 +274,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
+		return;
 	}
+	// The value may come from a game thread that wrote the data it guards first. Those writes
+	// must reach the BDA draws that follow, even though the submission never suspended.
+	PromoteGuestWrites();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -279,6 +293,8 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 		SuspendPm4();
 	} else {
 		(*counter)--;
+		// A game thread may have signalled the count after writing the data it guards.
+		PromoteGuestWrites();
 	}
 }
 
@@ -317,8 +333,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
-		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
-		     " size=%u\n",
+		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64 " size=%u\n",
 		     dst_address, value, num_bytes);
 	}
 }
@@ -502,6 +517,9 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	// Game-thread writes made before this submission, or before the wait it resumes from, must
+	// reach the BDA draws it records.
+	m_renderer.GetBufferCache().PromoteBdaSync();
 	auto& cp = GetProcessor(submission.queue_id);
 
 	cp.BufferInit();
@@ -515,9 +533,7 @@ bool GuestGpu::Process(Submission& submission) {
 				cp.BufferFlush();
 			}
 			break;
-		case SubmissionType::FlipPreparation:
-			cp.PrepareCpuFlip(submission.flip_request_id);
-			break;
+		case SubmissionType::FlipPreparation: cp.PrepareCpuFlip(submission.flip_request_id); break;
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
@@ -684,15 +700,13 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	uint64_t value = 0;
 
 	switch (op) {
-		case 0x00:
-			m_predicate_skip = false;
-			return;
+		case 0x00: m_predicate_skip = false; return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			m_renderer.GetOcclusionQueries().Publish();
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t ready_bit = 1ull << 63u;
-			const auto* results = reinterpret_cast<const volatile uint64_t*>(address);
+			const auto*        results   = reinterpret_cast<const volatile uint64_t*>(address);
 			for (uint32_t db = 0; db < 16u; db++) {
 				const auto begin = results[db * 2u];
 				const auto end   = results[db * 2u + 1u];
@@ -711,6 +725,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			PromoteGuestWrites();
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -764,8 +779,7 @@ static void PatchIndirectDrawOffsets(CommandProcessor& cp, IndirectDrawRegisters
 		if (location == Pm4::SH_NOP) {
 			return;
 		}
-		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM ||
-		                     g_hw_sh_indirect_func[location] == nullptr);
+		EXIT_NOT_IMPLEMENTED(location >= Pm4::SH_NUM || g_hw_sh_indirect_func[location] == nullptr);
 		g_hw_sh_indirect_func[location](cp, location, value);
 	};
 	write(registers.vertex_offset, vertex_offset);

@@ -99,6 +99,10 @@ public:
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void WaitForRewind(bool valid);
+	/// Call after reading a value from guest memory that a game thread may have written, such as
+	/// a flag that COND_EXEC or BRANCH tests. The game thread wrote the data the value guards
+	/// first, so its held-back BDA events are promoted for the draws that follow.
+	void PromoteGuestWrites();
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);
@@ -118,24 +122,24 @@ public:
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
-	void ProcessPm4(Pm4Execution& execution);
-	void SuspendPm4();
-	void                CountDraw();
-	uint32_t            NumInstances();
-	const void*         IndexAddress(uint32_t first_index) const;
-	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	void              ProcessPm4(Pm4Execution& execution);
+	void              SuspendPm4();
+	void              CountDraw();
+	uint32_t          NumInstances();
+	const void*       IndexAddress(uint32_t first_index) const;
+	CommandScheduler& GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	CommandBuffer&    CurrentBuffer() { return GetScheduler().Current(); }
 
-	RenderContext& m_renderer;
-	HW::Context    m_ctx;
+	RenderContext&             m_renderer;
+	HW::Context                m_ctx;
 	std::optional<HW::Context> m_saved_ctx;
-	HW::UserConfig m_ucfg;
-	HW::Shader     m_sh_ctx;
-	uint32_t       m_index_type_and_size              = 0;
-	uint32_t       m_index_buffer_size                = 0;
-	uint64_t       m_index_base_addr                  = 0;
-	uint64_t       m_draw_indirect_args_base_addr     = 0;
-	uint64_t       m_dispatch_indirect_args_base_addr = 0;
+	HW::UserConfig             m_ucfg;
+	HW::Shader                 m_sh_ctx;
+	uint32_t                   m_index_type_and_size              = 0;
+	uint32_t                   m_index_buffer_size                = 0;
+	uint64_t                   m_index_base_addr                  = 0;
+	uint64_t                   m_draw_indirect_args_base_addr     = 0;
+	uint64_t                   m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state. Indirect draws leave the address of their last instance count,
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;

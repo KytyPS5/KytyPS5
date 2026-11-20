@@ -231,7 +231,7 @@ private:
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t                                push_data_cursor);
+		                         uint32_t push_data_cursor, uint32_t push_data_ceiling);
 	};
 
 	struct ProgramKey {
@@ -271,13 +271,14 @@ private:
 	ShaderStoreWriter m_store;
 
 	template <typename InputInfo>
-	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
-	ShaderModule&       CompileModule(Program& program, const ProgramKey& key,
-	                                  ShaderRecompiler::CompileOptions  options,
-	                                  ShaderRecompiler::TranslateResult translated,
-	                                  uint32_t                          push_data_cursor);
-	void                InitializeDriverCache();
+	const ShaderModule*
+	GetProgram(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	           uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount);
+	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
+	                            ShaderRecompiler::CompileOptions  options,
+	                            ShaderRecompiler::TranslateResult translated,
+	                            uint32_t push_data_cursor, uint32_t push_data_ceiling);
+	void          InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();
 	void WriteDriverCache() const;

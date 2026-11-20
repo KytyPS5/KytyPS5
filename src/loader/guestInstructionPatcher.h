@@ -57,6 +57,16 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size);
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
+// Tests: the number of threads that scan a module's functions (0: automatic). The patched code is the
+// same for every thread count.
+void SetGuestInstructionPatchScanThreads(size_t threads);
+
+// Whether [begin, end) holds the bytes every instruction form the AMD instruction patch rewrites
+// contains: VRSQRTPS xmm, xmm (C5 [L=0 pp=00] 52 /r, C4 [map 0F] [L=0 pp=00] 52 /r, register
+// ModRM), EXTRQ/INSERTQ on registers (0F 78, 0F 79), RDPID (0F C7 /7, register) and CLWB
+// (0F AE /6, memory). A function without them has no rewrite site. Exposed for tests.
+bool MayContainAmdInstruction(const uint8_t* begin, const uint8_t* end);
+
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks. A nonzero
 // tsc_multiplier rewrites RDTSC/RDTSCP to return host TSC * tsc_multiplier >> 32.
 GuestInstructionPatchResult PatchGuestInstructions(

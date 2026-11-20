@@ -10,8 +10,10 @@
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <climits>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -19,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <xbyak/xbyak.h>
@@ -117,6 +120,9 @@ struct DecodedFunction {
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
+	// A jump table was read outside the function's own bytes, where another function's patch may
+	// write (PatchGuestInstructions then decodes it again in address order).
+	bool                                        reads_outside_function {};
 };
 
 enum class InstructionReplacement {
@@ -315,7 +321,7 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 std::optional<std::vector<uintptr_t>>
 ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
                         uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
-                        uintptr_t segment_end) {
+                        uintptr_t segment_end, bool& reads_outside_function) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
@@ -474,6 +480,9 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 			continue;
 		}
 
+		reads_outside_function |= table_address < function_start ||
+		                          *table_size > (function_end - std::min(table_address, function_end)) /
+		                                            sizeof(s32);
 		std::vector<uintptr_t> targets;
 		targets.reserve(*table_size);
 		bool valid = true;
@@ -559,8 +568,9 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			if (resolved_indirect_branches.contains(branch_address)) {
 				continue;
 			}
-			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			const auto targets =
+			    ResolveBoundedJumpTable(function, branch_address, function_start, function_end,
+			                            segment_start, segment_end, function.reads_outside_function);
 			if (!targets) {
 				continue;
 			}
@@ -976,6 +986,39 @@ void CollectTscInstructions(const DecodedFunction&                   function,
 		}
 	}
 }
+
+} // namespace
+
+bool MayContainAmdInstruction(const uint8_t* begin, const uint8_t* end) {
+	// The forms CollectAmdInstructions takes: VRSQRTPS xmm, xmm (VEX.128 map 0F, no SIMD prefix,
+	// register operand), EXTRQ/INSERTQ on XMM registers, RDPID on a register, CLWB on memory.
+	const auto register_form = [](uint8_t modrm) { return modrm >= 0xc0u; };
+	for (const uint8_t* p = begin; p < end; ++p) {
+		const auto left = end - p;
+		if (*p == 0xc5) {
+			if (left > 3 && (p[1] & 0x07u) == 0 && p[2] == 0x52 && register_form(p[3])) {
+				return true;
+			}
+		} else if (*p == 0xc4) {
+			if (left > 4 && (p[1] & 0x1fu) == 1 && (p[2] & 0x07u) == 0 && p[3] == 0x52 &&
+			    register_form(p[4])) {
+				return true;
+			}
+		} else if (*p == 0x0f && left > 2) {
+			const uint8_t opcode = p[1];
+			const uint8_t modrm  = p[2];
+			const uint8_t reg    = (modrm >> 3u) & 7u;
+			if (((opcode == 0x78 || opcode == 0x79) && register_form(modrm)) ||
+			    (opcode == 0xc7 && reg == 7 && register_form(modrm)) ||
+			    (opcode == 0xae && reg == 6 && !register_form(modrm))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+namespace {
 
 // Whether [start, end) holds an RDTSC (0F 31) or RDTSCP (0F 01 F9) encoding: only those functions
 // are decoded when nothing else is patched.
@@ -1533,6 +1576,36 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 	return features;
 }
 
+// 0: scan functions on one thread per CPU for modules with at least 1024 functions.
+static std::atomic<size_t> g_patch_scan_threads {0};
+
+void SetGuestInstructionPatchScanThreads(size_t threads) {
+	g_patch_scan_threads.store(threads);
+}
+
+namespace {
+
+void AddPatchCounts(GuestInstructionPatchResult& total, const GuestInstructionPatchResult& add) {
+	total.function_count += add.function_count;
+	total.instruction_count += add.instruction_count;
+	total.red_zone_function_count += add.red_zone_function_count;
+	total.memory_instruction_count += add.memory_instruction_count;
+	total.short_memory_instruction_count += add.short_memory_instruction_count;
+	total.patched_memory_instruction_count += add.patched_memory_instruction_count;
+	total.stack_dependent_memory_instruction_count += add.stack_dependent_memory_instruction_count;
+	total.control_flow_memory_instruction_count += add.control_flow_memory_instruction_count;
+	total.unrelocatable_memory_instruction_count += add.unrelocatable_memory_instruction_count;
+	total.indirect_red_zone_function_count += add.indirect_red_zone_function_count;
+	total.reciprocal_sqrt += add.reciprocal_sqrt;
+	total.extrq += add.extrq;
+	total.insertq += add.insertq;
+	total.rdpid += add.rdpid;
+	total.clwb += add.clwb;
+	total.rdtsc += add.rdtsc;
+}
+
+} // namespace
+
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
@@ -1566,40 +1639,217 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif
-	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
+	// A function's bytes: from its start to the next function's (empty: none).
+	const auto function_range = [&](size_t function_index) {
 		const uintptr_t function_start = starts[function_index];
 		const uintptr_t function_end =
 		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
-		if (function_end <= function_start ||
-		    (tsc_only && !MayReadTimeStampCounter(function_start, function_end))) {
-			continue;
+		return std::pair {function_start, std::max(function_start, function_end)};
+	};
+	// Whether the function is analyzed at all (and counted): when only RDTSC is patched, only the
+	// functions that may hold one.
+	const auto counted = [&](uintptr_t function_start, uintptr_t function_end) {
+		return function_end != function_start &&
+		       (!tsc_only || MayReadTimeStampCounter(function_start, function_end));
+	};
+	// Without red-zone protection only the AMD and TSC instructions are collected. They lie inside
+	// the function (decoding stops at its end), so a function without their opcode bytes has no
+	// rewrite site: decoding it would only add to the instruction counters, which only the red-zone
+	// report prints. Astro Bot: 4.7k of its 312697 functions remain.
+	const auto may_have_sites = [&](uintptr_t function_start, uintptr_t function_end) {
+		return protect_memory ||
+		       (emulate_amd &&
+		        MayContainAmdInstruction(reinterpret_cast<const uint8_t*>(function_start),
+		                                 reinterpret_cast<const uint8_t*>(function_end))) ||
+		       (tsc_multiplier != 0 && MayReadTimeStampCounter(function_start, function_end));
+	};
+	// Decodes and analyzes one function and collects its rewrite sites. Reads guest code only.
+	const auto analyze = [&](size_t function_index, GuestInstructionPatchResult& counts,
+	                         DecodedFunction&                         function,
+	                         std::map<uintptr_t, InstructionRewrite>& rewrite_sites) {
+		const auto [function_start, function_end] = function_range(function_index);
+		if (!counted(function_start, function_end)) {
+			return;
 		}
-
-		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		++counts.function_count;
+		if (!may_have_sites(function_start, function_end)) {
+			return;
+		}
+		function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
 		if (analyze_red_zone) {
 			AnalyzeRedZoneLiveness(function);
 		}
-		result.instruction_count += function.instructions.size();
-
-		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
-
+		counts.instruction_count += function.instructions.size();
 		if (function.uses_red_zone) {
-			++result.red_zone_function_count;
-			result.indirect_red_zone_function_count += function.has_indirect_branch;
+			++counts.red_zone_function_count;
+			counts.indirect_red_zone_function_count += function.has_indirect_branch;
 		}
 		if (protect_memory) {
-			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
+			CollectRedZoneMemoryInstructions(function, rewrite_sites, counts);
 		}
 		if (emulate_amd) {
-			CollectAmdInstructions(function, rewrite_sites, result, host_features);
+			CollectAmdInstructions(function, rewrite_sites, counts, host_features);
 		}
 		if (tsc_multiplier != 0) {
-			CollectTscInstructions(function, rewrite_sites, result);
+			CollectTscInstructions(function, rewrite_sites, counts);
 		}
+	};
+	const auto patch = [&](const DecodedFunction&                         function,
+	                       const std::map<uintptr_t, InstructionRewrite>& rewrite_sites) {
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result, tsc_multiplier);
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
+		}
+	};
+
+	// Decoding every function to find the few with rewrite sites is the costly part: Astro Bot's
+	// 252 MB eboot.bin took ~9 s at boot on one emulated core. Scan the functions on several
+	// threads first: without red-zone protection only through the opcode filters, with it by
+	// decoding them. The functions left (that may have, or have, rewrite sites) are then decoded on
+	// the workers and patched in address order on this thread, exactly as a single-threaded pass
+	// does: patching a function writes only inside that function and the module's trampolines, so
+	// the scan and the decode see the same code bytes, and the other functions only add to the
+	// counters.
+	const size_t forced_threads = g_patch_scan_threads.load();
+	const size_t scan_threads =
+	    forced_threads != 0 ? forced_threads
+	    : starts.size() < 1024 ? 1
+	                           : std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+	if (scan_threads <= 1) {
+		for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
+			DecodedFunction                         function;
+			std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+			analyze(function_index, result, function, rewrite_sites);
+			patch(function, rewrite_sites);
+		}
+	} else {
+		std::atomic<size_t>                      next_function {0};
+		std::vector<GuestInstructionPatchResult> scan_counts(scan_threads);
+		std::vector<std::vector<size_t>>         scan_candidates(scan_threads);
+		const auto                               scan = [&](size_t worker) {
+			constexpr size_t Batch = 64;
+			for (size_t begin = next_function.fetch_add(Batch); begin < starts.size();
+			     begin        = next_function.fetch_add(Batch)) {
+				for (size_t function_index = begin;
+				     function_index < std::min(begin + Batch, starts.size()); ++function_index) {
+					if (!protect_memory) {
+						const auto [function_start, function_end] = function_range(function_index);
+						if (!counted(function_start, function_end)) {
+							continue;
+						}
+						if (may_have_sites(function_start, function_end)) {
+							scan_candidates[worker].push_back(function_index);
+						} else {
+							++scan_counts[worker].function_count;
+						}
+						continue;
+					}
+					GuestInstructionPatchResult             counts {};
+					DecodedFunction                         function;
+					std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+					analyze(function_index, counts, function, rewrite_sites);
+					if (rewrite_sites.empty() && !function.reads_outside_function) {
+						AddPatchCounts(scan_counts[worker], counts);
+					} else {
+						scan_candidates[worker].push_back(function_index);
+					}
+				}
+			}
+		};
+		std::vector<std::thread> workers;
+		for (size_t worker = 1; worker < scan_threads; ++worker) {
+			workers.emplace_back(scan, worker);
+		}
+		scan(0);
+		for (auto& worker: workers) {
+			worker.join();
+		}
+		std::vector<size_t> candidates;
+		for (size_t worker = 0; worker < scan_threads; ++worker) {
+			AddPatchCounts(result, scan_counts[worker]);
+			candidates.insert(candidates.end(), scan_candidates[worker].begin(),
+			                  scan_candidates[worker].end());
+		}
+		std::ranges::sort(candidates);
+		// The workers decode the candidates at most Window functions ahead of this thread, which
+		// patches them in address order; a decoded function holds about 1 KiB per instruction, so
+		// the window bounds the memory. A patched function goes back to the worker that decoded it
+		// (consumed), which frees it: freeing other threads' decodes on this thread cost 0.9 s for
+		// Astro Bot.
+		struct DecodedSites {
+			GuestInstructionPatchResult             counts {};
+			DecodedFunction                         function;
+			std::map<uintptr_t, InstructionRewrite> rewrite_sites;
+			size_t                                  worker = 0;
+		};
+		constexpr size_t                                         Window = 64;
+		std::vector<std::unique_ptr<DecodedSites>>               decoded(Window);
+		std::vector<std::vector<std::unique_ptr<DecodedSites>>> consumed(scan_threads);
+		std::mutex                                               decoded_mutex;
+		std::condition_variable                                  decoded_changed;
+		size_t                                                   next_decode = 0;
+		size_t                                                   patched     = 0;
+		const auto                                               decode = [&](size_t worker) {
+			std::vector<std::unique_ptr<DecodedSites>> patched_functions;
+			for (;;) {
+				size_t candidate_index = 0;
+				{
+					std::unique_lock decoded_lock(decoded_mutex);
+					patched_functions.swap(consumed[worker]);
+					decoded_changed.wait(decoded_lock, [&] {
+						return next_decode >= candidates.size() ||
+						       next_decode < patched + Window;
+					});
+					if (next_decode >= candidates.size()) {
+						return;
+					}
+					candidate_index = next_decode++;
+				}
+				patched_functions.clear();
+				auto function    = std::make_unique<DecodedSites>();
+				function->worker = worker;
+				analyze(candidates[candidate_index], function->counts, function->function,
+				        function->rewrite_sites);
+				{
+					std::lock_guard decoded_lock(decoded_mutex);
+					decoded[candidate_index % Window] = std::move(function);
+				}
+				decoded_changed.notify_all();
+			}
+		};
+		workers.clear();
+		for (size_t worker = 1; worker < scan_threads; ++worker) {
+			workers.emplace_back(decode, worker);
+		}
+		for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+			std::unique_ptr<DecodedSites> function;
+			{
+				std::unique_lock decoded_lock(decoded_mutex);
+				auto&            slot = decoded[candidate_index % Window];
+				decoded_changed.wait(decoded_lock, [&] { return slot != nullptr; });
+				function = std::move(slot);
+			}
+			if (function->function.reads_outside_function) {
+				// Its jump table lies outside the function, where an earlier function's patch may
+				// have written while a worker read it: decode it again now, as a single-threaded
+				// pass does.
+				DecodedFunction                         again;
+				std::map<uintptr_t, InstructionRewrite> again_sites;
+				analyze(candidates[candidate_index], result, again, again_sites);
+				patch(again, again_sites);
+			} else {
+				AddPatchCounts(result, function->counts);
+				patch(function->function, function->rewrite_sites);
+			}
+			{
+				std::lock_guard decoded_lock(decoded_mutex);
+				consumed[function->worker].push_back(std::move(function));
+				patched = candidate_index + 1;
+			}
+			decoded_changed.notify_all();
+		}
+		for (auto& worker: workers) {
+			worker.join();
 		}
 	}
 	const auto trampoline_addr =

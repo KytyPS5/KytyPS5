@@ -7115,7 +7115,7 @@ public:
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x3000000;
+    constexpr uint64_t allocation_size = 0x4c00000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -7156,6 +7156,263 @@ public:
                   wide_download != nullptr && wide_download_offset % 16 == 0,
               "wide/block image readback was not aligned to its texel block");
       resources.MapMemory(base, allocation_size);
+
+      {
+        constexpr uint64_t offset = 0x4800000;
+        std::memset(memory + offset, 0x5a, 0x2c0000);
+        auto cached = MakeLinearDesc(
+            base + offset, 0, vk::Format::eR8Uint,
+            Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
+            {1024, 1024, 1}, 1, 1, 1);
+        cached.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        cached.info.resources = {11, 1};
+        cached.view_info.level_count = 11;
+        cached.info.UpdateSize();
+        auto requested = cached;
+        requested.info.data.size = 0;
+        requested.info.resources = {9, 2};
+        requested.view_info.level_count = 9;
+        requested.view_info.layer_count = 2;
+        requested.view_info.type = vk::ImageViewType::e2DArray;
+        requested.info.UpdateSize();
+        Require(name, "mixed resource footprints",
+                cached.info.data.size == 0x160000 &&
+                    requested.info.data.size == 0x2c0000 &&
+                    cached.info.first_tail_level == 3 &&
+                    requested.info.first_tail_level == 3,
+                "unexpected tiled fixture layout");
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        for (uint32_t mip = 0; mip < cached.info.resources.levels; ++mip) {
+          vk::ClearValue clear{};
+          clear.color.uint32.fill(0x10u + mip);
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), before,
+              {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
+        }
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "layer growth with fewer levels",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "insufficient backing was retained");
+        (void)texture_cache.FindTexture(after, requested);
+        for (uint32_t mip = 0; mip < 9; ++mip) {
+          Require(name, "mixed resource contents",
+                  ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 0, mip) ==
+                          std::vector<u32>{(0x10u + mip) * 0x01010101u} &&
+                      ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 1, mip) ==
+                          std::vector<u32>{0x5a5a5a5au},
+                  "lost GPU contents or failed to initialize the added layer");
+        }
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(restored, cached);
+        Require(name, "mixed resource round trip",
+                ReadCachedTexel(name, context, restored, {}, {2, 2, 1}, 0, 9) ==
+                    std::vector<u32>{0x19191919u},
+                "retiring the mip chain lost a GPU-only tail mip");
+      }
+      {
+        constexpr uint64_t offset = 0x4b10000;
+        constexpr uint32_t requested_layers = 8;
+        std::memset(memory + offset, 0x6b, 0x80000);
+        auto cached = MakeLinearDesc(
+            base + offset, 0, vk::Format::eR8Uint,
+            Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
+            {256, 256, 1}, 1, 1, 1);
+        cached.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        cached.info.resources = {9, 1};
+        cached.view_info.level_count = 9;
+        cached.info.UpdateSize();
+        auto requested = cached;
+        requested.info.data.size = 0;
+        requested.info.resources = {1, requested_layers};
+        requested.view_info.level_count = 1;
+        requested.view_info.layer_count = requested_layers;
+        requested.view_info.type = vk::ImageViewType::e2DArray;
+        requested.info.UpdateSize();
+        const uint64_t layer_size = requested.info.data.size / requested_layers;
+        const uint32_t mip0_layer =
+            static_cast<uint32_t>(cached.info.mip_layout[0].offset / layer_size);
+        Require(name, "array footprints",
+                requested.info.data.size == 0x80000 &&
+                    requested.info.data.size > cached.info.data.size &&
+                    cached.info.mip_layout[0].offset % layer_size == 0 &&
+                    mip0_layer + 1 < requested_layers,
+                "unexpected tiled array fixture layout");
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        vk::ClearValue clear{};
+        clear.color.uint32.fill(0x21u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), before,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        clear.color.uint32.fill(0x37u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), before,
+            {vk::ImageAspectFlagBits::eColor, 1, 1, 0, 1}, clear);
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "array growth with one level",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "insufficient backing was retained");
+        (void)texture_cache.FindTexture(after, requested);
+        Require(name, "array growth contents",
+                ReadCachedTexel(name, context, after, {}, {4, 1, 1}, mip0_layer) ==
+                        std::vector<u32>{0x21212121u} &&
+                    ReadCachedTexel(name, context, after, {}, {4, 1, 1},
+                                    requested_layers - 1) ==
+                        std::vector<u32>{0x6b6b6b6bu},
+                "lost GPU contents or failed to initialize the added layers");
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(restored, cached);
+        Require(name, "array resource round trip",
+                ReadCachedTexel(name, context, restored, {}, {4, 1, 1}, 0, 1) ==
+                    std::vector<u32>{0x37373737u},
+                "retiring the mip chain lost a GPU-only mip");
+      }
+      {
+        constexpr uint64_t offset = 0x4b00000;
+        const std::array<uint32_t, 4> values{
+            0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+        std::memcpy(memory + offset, values.data(), sizeof(values));
+        auto cached = MakeLinearDesc(
+            base + offset, sizeof(values), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {2, 1, 1}, 1, 4, 1);
+        cached.info.resources = {2, 1};
+        cached.info.mip_layout[0] = {0, 8, 2, 1};
+        cached.info.mip_layout[1] = {8, 4, 1, 1};
+        cached.view_info.level_count = 2;
+        auto requested = MakeLinearDesc(
+            base + offset, sizeof(values), vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {2, 1, 1}, 2, 4, 1);
+        requested.view_info.base_layer = 1;
+        requested.view_info.layer_count = 1;
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        vk::ClearValue clear{};
+        clear.color.uint32.fill(0xabcdef01u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), before,
+            {vk::ImageAspectFlagBits::eColor, 1, 1, 0, 1}, clear);
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "missing-layer fallback replacement",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "FindImage returned a backing without the requested layer");
+        Require(name, "missing-layer texture acquisition",
+                texture_cache.FindTexture(after, requested) != nullptr &&
+                    ReadCachedTexel(name, context, after, {}, {1, 1, 1}, 1) ==
+                        std::vector<u32>{0xabcdef01u},
+                "the requested layer lost GPU-written guest bytes");
+        clear.color.uint32.fill(0x55667788u);
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), after,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1}, clear);
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(restored, cached);
+        Require(name, "missing-layer round trip",
+                ReadCachedTexel(name, context, restored, {}, {1, 1, 1}, 0, 1) ==
+                    std::vector<u32>{0x55667788u},
+                "retiring the array lost GPU-written guest bytes");
+      }
+      const auto linear_d32 = [](uint64_t address, uint64_t size,
+                                 uint32_t levels, uint32_t layers) {
+        auto desc = MakeLinearDesc(address, size, vk::Format::eD32Sfloat,
+                                   Prospero::BufferFormat::k32Float,
+                                   Prospero::ImageType::kColor2D, {2, 1, 1},
+                                   layers, sizeof(float), 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.resources.levels = levels;
+        desc.view_info.format = vk::Format::eD32Sfloat;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        desc.view_info.level_count = levels;
+        desc.view_info.layer_count = layers;
+        desc.view_info.type = layers > 1 ? vk::ImageViewType::e2DArray
+                                         : vk::ImageViewType::e2D;
+        return desc;
+      };
+      const auto depth_texels = [](float first, float second) {
+        return std::vector<u32>{std::bit_cast<u32>(first),
+                                std::bit_cast<u32>(second)};
+      };
+      constexpr uint32_t depth_array_layers = 4;
+      constexpr std::array<float, 2 * depth_array_layers> depth_guest{
+          0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f, 1.0f};
+      {
+        constexpr uint64_t offset = 0x4ba0000;
+        constexpr std::array<float, 2> mip_clears{0.0625f, 0.9375f};
+        constexpr float layer_clear = 0.3125f;
+        std::memcpy(memory + offset, depth_guest.data(), sizeof(depth_guest));
+        auto cached = linear_d32(base + offset, 3 * sizeof(float), 2, 1);
+        cached.info.mip_layout[0] = {0, 2 * sizeof(float), 2, 1};
+        cached.info.mip_layout[1] = {2 * sizeof(float), sizeof(float), 1, 1};
+        auto requested =
+            linear_d32(base + offset, sizeof(depth_guest), 1, depth_array_layers);
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(before, cached);
+        for (uint32_t mip = 0; mip < mip_clears.size(); ++mip) {
+          vk::ClearValue clear{};
+          clear.depthStencil.depth = mip_clears[mip];
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), before,
+              {vk::ImageAspectFlagBits::eDepth, mip, 1, 0, 1}, clear);
+        }
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "depth layer growth",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before) &&
+                    texture_cache.GetImage(after).info.resources ==
+                        requested.info.resources,
+                "insufficient depth backing was retained");
+        (void)texture_cache.FindDepthTarget(after, requested);
+        Require(name, "depth layer growth contents",
+                ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 0) ==
+                        depth_texels(mip_clears[0], mip_clears[0]) &&
+                    ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 1) ==
+                        depth_texels(mip_clears[1], depth_guest[3]) &&
+                    ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 3) ==
+                        depth_texels(depth_guest[6], depth_guest[7]),
+                "lost a GPU-only depth mip or failed to initialize the added layers");
+        vk::ClearValue clear{};
+        clear.depthStencil.depth = layer_clear;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), after,
+            {vk::ImageAspectFlagBits::eDepth, 0, 1, 1, 1}, clear);
+        const auto restored = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(restored, cached);
+        Require(name, "depth mip round trip",
+                ReadCachedTexel(name, context, restored, {}, {1, 1, 1}, 0, 1) ==
+                    std::vector<u32>{std::bit_cast<u32>(layer_clear)},
+                "retiring the depth array lost GPU-written guest bytes");
+      }
+      {
+        constexpr uint64_t offset = 0x4bb0000;
+        std::memcpy(memory + offset, depth_guest.data(), sizeof(depth_guest));
+        auto cached = linear_d32(base + offset, 2 * sizeof(float), 1, 1);
+        auto requested =
+            linear_d32(base + offset, sizeof(depth_guest), 1, depth_array_layers);
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindDepthTarget(before, cached);
+        const auto after = texture_cache.FindImage(requested);
+        Require(name, "guest-only depth layer growth",
+                after != before &&
+                    !TextureCacheTestAccess::Contains(texture_cache, before),
+                "insufficient depth backing was retained");
+        (void)texture_cache.FindDepthTarget(after, requested);
+        Require(name, "guest-only depth layer contents",
+                ReadCachedTexel(name, context, after, {}, {2, 1, 1}, 3) ==
+                    depth_texels(depth_guest[6], depth_guest[7]),
+                "the added depth layers were never initialized from guest memory");
+      }
 
       auto sampled =
           MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,
@@ -53884,10 +54141,12 @@ void CheckDepthTargetFootprints() {
               IsSupportedDepthPlaneReadback(compressed_stencil),
           "stencil metadata incorrectly blocked independent depth-plane "
           "readback");
-  Require("DepthTargetFootprints", "lexicographic subresource comparison",
-          ImageSubresources{2, 1} > ImageSubresources{1, 4} &&
-              ImageSubresources{1, 4} < ImageSubresources{2, 1},
-          "subresource ordering diverged from required overlap semantics");
+  Require("DepthTargetFootprints", "subresource containment",
+          ImageSubresources{2, 4}.Contains(ImageSubresources{2, 1}) &&
+              ImageSubresources{2, 4}.Contains(ImageSubresources{1, 4}) &&
+              !ImageSubresources{2, 1}.Contains(ImageSubresources{1, 4}) &&
+              !ImageSubresources{1, 4}.Contains(ImageSubresources{2, 1}),
+          "a backing must cover both the requested levels and layers");
   struct TransferPlaneCase {
     const char *name;
     vk::Format attachment;

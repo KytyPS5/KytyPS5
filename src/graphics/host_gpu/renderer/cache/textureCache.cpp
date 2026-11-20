@@ -615,7 +615,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.pitch == cached.info.pitch &&
 	    (requested.resources == cached.info.resources || retain_cached_layout) &&
 	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = !cached.info.resources.Contains(requested.resources) ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -649,6 +649,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+	}
+	if (RetireThroughGuestMemory(replacement_id, cached_id)) {
+		return replacement_id;
+	}
+	if (!cached.info.resources.Contains(info.resources)) {
+		InitializeImage(replacement_id);
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
@@ -797,7 +803,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
 		if (requested.pixel_format == cached.info.pixel_format &&
-		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    requested.type == cached.info.type &&
+		    !cached.info.resources.Contains(requested.resources) &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
 		      requested.extent == cached.info.extent &&
@@ -859,6 +866,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
+	if (RetireThroughGuestMemory(expanded_id, source_id)) {
+		return expanded_id;
+	}
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
@@ -870,6 +880,20 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	}
 	FreeImage(source_id);
 	return expanded_id;
+}
+
+bool TextureCache::RetireThroughGuestMemory(ImageId replacement_id, ImageId retired_id) {
+	const auto& replacement = m_slot_images[replacement_id].info;
+	auto&       retired     = m_slot_images[retired_id];
+	if (replacement.type != retired.info.type ||
+	    replacement.resources.Contains(retired.info.resources) || replacement.samples != 1 ||
+	    replacement.metadata.compression != VideoOutCompression::Uncompressed ||
+	    !retired.SafeToDownload() || !BcAlias::Publish(*this, retired)) {
+		return false;
+	}
+	InitializeImage(replacement_id);
+	FreeImage(retired_id);
+	return true;
 }
 
 bool TextureCache::CanDownload(const Image& image) const {
@@ -1299,7 +1323,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
+				if (CanDownload(resolved)) {
+					RefreshImage(result);
+					if (resolved.SafeToDownload()) {
+						(void)BcAlias::Publish(*this, resolved);
+					}
+				}
 				FreeImage(result);
 				result = {};
 			}

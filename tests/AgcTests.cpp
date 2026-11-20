@@ -71,6 +71,10 @@ TEST(Agc, BranchLeavesNullTargetSlotsZero) {
 	                                             0x34567898u, 0x12u, 0x10000010u, 0u, 0u, 0u}));
 }
 
+TEST(Agc, DebugRaiseExceptionFails) {
+	EXPECT_EQ(Gen5::AgcDebugRaiseException(0), static_cast<int>(0x8a6d0003u));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

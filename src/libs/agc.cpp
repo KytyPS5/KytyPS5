@@ -1590,6 +1590,7 @@ void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
 
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT = static_cast<int>(0x8a6c0035u);
+static constexpr int      GRAPHICS5_DRIVER_ERROR_FAILED           = static_cast<int>(0x8a6d0003u);
 static constexpr uint32_t WORKLOAD_STREAM_RECORD_SIZE             = 32;
 static constexpr uint32_t WORKLOAD_ACTIVE_PACKET_SIZE_DW          = 18;
 static constexpr uint32_t WORKLOAD_COMPLETE_PACKET_SIZE_DW        = 12;
@@ -1930,7 +1931,7 @@ int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
 
 	AgcTrace("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
 
-	return OK;
+	return GRAPHICS5_DRIVER_ERROR_FAILED;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,

@@ -33,7 +33,7 @@ class GuestGpu;
 class RenderContext {
 public:
 	explicit RenderContext(GraphicContext&              graphics,
-	                       const std::filesystem::path& shader_store = ShaderStorePath());
+	                       const std::filesystem::path& shader_store = {});
 	~RenderContext();
 	KYTY_CLASS_NO_COPY(RenderContext);
 
@@ -43,17 +43,17 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
-	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
-	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
-	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
-	ImageHeap&          GetImageHeap() { return m_image_heap; }
-	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
-	BufferCache&        GetBufferCache() { return m_buffer_cache; }
-	TextureCache&       GetTextureCache() { return m_texture_cache; }
-	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
-	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
-	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
+	Common::Mutex&    GetMutex() { return m_mutex; }
+	CommandScheduler& GetCommandScheduler() { return m_command_scheduler; }
+	PipelineCache&    GetPipelineCache() { return m_pipeline_cache; }
+	DescriptorHeap&   GetDescriptorHeap() { return m_descriptor_heap; }
+	ImageHeap&        GetImageHeap() { return m_image_heap; }
+	SamplerCache&     GetSamplerCache() { return m_sampler_cache; }
+	BufferCache&      GetBufferCache() { return m_buffer_cache; }
+	TextureCache&     GetTextureCache() { return m_texture_cache; }
+	RenderExecutor&   GetRenderExecutor() { return m_render_executor; }
+	OcclusionQueries& GetOcclusionQueries() { return m_occlusion_queries; }
+	RayTracing*       GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -92,7 +92,7 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
-	VideoOut::VideoOutDriver* m_video_out = nullptr;
+	VideoOut::VideoOutDriver* m_video_out             = nullptr;
 	bool                      m_fault_process_pending = false;
 
 	std::unique_ptr<RayTracing> m_ray_tracing;

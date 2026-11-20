@@ -92,20 +92,6 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
-std::string PipelineCacheTitleId() {
-	std::string title_id;
-	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
-	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		return {};
-	}
-	if (!std::ranges::all_of(title_id, [](unsigned char c) {
-		    return std::isalnum(c) != 0 || c == '-' || c == '_';
-	    })) {
-		return {};
-	}
-	return title_id;
-}
-
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
@@ -252,16 +238,112 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .derive_barycentric_x   = graphics.physical_device_properties.vendorID == 0x10deu};
 }
 
-std::filesystem::path ShaderStorePath() {
-	if (KYTY_BUILD != KYTY_BUILD_RELEASE || !Config::ShaderCacheEnabled() ||
-	    Config::GraphicsDebugDumpEnabled()) {
+std::string PipelineCacheTitleId() {
+	std::string title_id;
+	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
+		// Valid title ID found
+	} else if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) &&
+	           !title_id.empty()) {
+		if (title_id.size() == 36 && title_id[6] == '-' && title_id[16] == '_') {
+			title_id = title_id.substr(7, 9);
+		}
+	} else {
+		return "GAME_DEFAULT";
+	}
+
+	std::string clean;
+	clean.reserve(title_id.size());
+	for (char c: title_id) {
+		if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') {
+			clean += c;
+		}
+	}
+	return clean.empty() ? "GAME_DEFAULT" : clean;
+}
+
+std::string PipelineCacheAppVersion() {
+	std::string app_ver;
+	if (Loader::SystemContentParamSfoGetString("APP_VER", &app_ver) && !app_ver.empty()) {
+		std::string clean;
+		clean.reserve(app_ver.size());
+		for (char c: app_ver) {
+			if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_') {
+				clean += c;
+			}
+		}
+		if (!clean.empty()) {
+			return clean;
+		}
+	}
+	return "01.000.000";
+}
+
+uint64_t PipelineCacheEnvironmentHash(const GraphicContext& graphics) {
+	const auto& properties = graphics.GetPhysicalDeviceProperties();
+	const auto  profile    = SpirvProfile(graphics);
+
+	struct alignas(8) EnvironmentFingerprint {
+		uint32_t vendor_id;
+		uint32_t device_id;
+		uint32_t driver_version;
+		uint32_t max_compute_shared_memory;
+		uint32_t device_clock_period_ps;
+		uint32_t flags;
+	} env {};
+
+	env.vendor_id                 = properties.vendorID;
+	env.device_id                 = properties.deviceID;
+	env.driver_version            = properties.driverVersion;
+	env.max_compute_shared_memory = properties.limits.maxComputeSharedMemorySize;
+	env.device_clock_period_ps    = profile.device_clock_period_ps;
+
+	env.flags |= (profile.maintenance8 ? 1u : 0u) << 0;
+	env.flags |= (profile.native_float_min_max ? 1u : 0u) << 1;
+	env.flags |= (profile.robust_buffer_access ? 1u : 0u) << 2;
+	env.flags |= (profile.r8_srgb_views ? 1u : 0u) << 3;
+	env.flags |= (profile.r8g8_srgb_views ? 1u : 0u) << 4;
+	env.flags |= (profile.relaxed_float ? 1u : 0u) << 5;
+	env.flags |= (profile.ray_query ? 1u : 0u) << 6;
+	env.flags |= (profile.derive_barycentric_x ? 1u : 0u) << 7;
+	env.flags |= (Config::TessellationEnabled() ? 1u : 0u) << 8;
+	env.flags |= (Config::NativeRtEnabled() ? 1u : 0u) << 9;
+	env.flags |= (Config::ShaderValidationEnabled() ? 1u : 0u) << 10;
+	env.flags |= (Config::GpuAssistedValidationEnabled() ? 1u : 0u) << 11;
+	env.flags |= (Config::SpirvDebugPrintfEnabled() ? 1u : 0u) << 12;
+
+	return XXH3_64bits(&env, sizeof(env));
+}
+
+std::filesystem::path ShaderStorePath(const GraphicContext* graphics) {
+	if (!Config::ShaderCacheEnabled() || Config::GraphicsDebugDumpEnabled()) {
 		return {};
 	}
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
 		return {};
 	}
-	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	const auto app_ver  = PipelineCacheAppVersion();
+	const auto base_dir = std::filesystem::path("_PipelineCache") / title_id / app_ver;
+
+	if (graphics != nullptr) {
+		const auto env_hash = PipelineCacheEnvironmentHash(*graphics);
+		return base_dir / fmt::format("shaders_{:016x}.shaders", env_hash);
+	}
+	return base_dir / "shaders.shaders";
+}
+
+std::filesystem::path DriverCachePath(const GraphicContext& graphics) {
+	if (!Config::ShaderCacheEnabled()) {
+		return {};
+	}
+	const auto title_id = PipelineCacheTitleId();
+	if (title_id.empty()) {
+		return {};
+	}
+	const auto app_ver  = PipelineCacheAppVersion();
+	const auto env_hash = PipelineCacheEnvironmentHash(graphics);
+	return std::filesystem::path("_PipelineCache") / title_id / app_ver /
+	       fmt::format("driver_{:016x}.bin", env_hash);
 }
 
 bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
@@ -507,15 +589,17 @@ PipelineCache::~PipelineCache() {
 }
 
 void PipelineCache::InitializeDriverCache() {
+	if (!Config::ShaderCacheEnabled()) {
+		return;
+	}
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
 		return;
 	}
-	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
+	m_driver_cache_path = DriverCachePath(m_graphics);
+	if (m_driver_cache_path.empty()) {
 		return;
 	}
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {

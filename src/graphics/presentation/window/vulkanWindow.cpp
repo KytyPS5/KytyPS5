@@ -387,23 +387,21 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		return available;
 	};
 	// Optional feature structs stay in the query only with their extension.
-	vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
-	                   vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
-	                   vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-	                   vk::PhysicalDeviceMeshShaderFeaturesEXT,
-	                   vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
-	                   vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
-	                   vk::PhysicalDeviceProvokingVertexFeaturesEXT,
-	                   vk::PhysicalDeviceMaintenance8FeaturesKHR,
-	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
-	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
-	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
-	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
-	                   vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
-	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
-	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
-	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
-	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
+	vk::StructureChain<
+	    vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
+	    vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
+	    vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+	    vk::PhysicalDeviceMeshShaderFeaturesEXT,
+	    vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
+	    vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
+	    vk::PhysicalDeviceProvokingVertexFeaturesEXT, vk::PhysicalDeviceMaintenance8FeaturesKHR,
+	    vk::PhysicalDeviceShaderClockFeaturesKHR,
+	    vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
+	    vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
+	    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
+	    vk::PhysicalDeviceAccelerationStructureFeaturesKHR, vk::PhysicalDeviceRayQueryFeaturesKHR,
+	    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
@@ -508,7 +506,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
 	physical_device.getProperties2(&properties2);
-	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
+	EXIT_NOT_IMPLEMENTED(
+	    !(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
@@ -537,8 +536,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&
 	    robustness2_props.robustStorageBufferAccessSizeAlignment == 1u;
-	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
-	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
+	graphics.r8_srgb_views        = graphics.SamplesFiltered(vk::Format::eR8Srgb);
+	graphics.r8g8_srgb_views      = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
 	constexpr auto blended_target = vk::FormatFeatureFlagBits::eColorAttachment |
 	                                vk::FormatFeatureFlagBits::eColorAttachmentBlend;
 	graphics.r4g4b4a4_render_targets =
@@ -550,8 +549,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
-	LOGF("Vulkan maintenance8 support: %s\n",
-	     graphics.maintenance8_enabled ? "true" : "false");
+	LOGF("Vulkan maintenance8 support: %s\n", graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -576,21 +574,21 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderStorageImageMultisample =
 	    supported2.features.shaderStorageImageMultisample;
-	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.shaderResourceMinLod                 = VK_TRUE;
-	device_features.independentBlend                     = VK_TRUE;
-	device_features.dualSrcBlend                         = VK_TRUE;
-	device_features.tessellationShader                   = VK_TRUE;
-	device_features.drawIndirectFirstInstance            = VK_TRUE;
-	device_features.multiDrawIndirect                    = VK_TRUE;
-	device_features.sampleRateShading                    = VK_TRUE;
-	device_features.depthBiasClamp                       = VK_TRUE;
-	device_features.shaderClipDistance                   = VK_TRUE;
-	device_features.shaderCullDistance                   = VK_TRUE;
-	device_features.largePoints                          = VK_TRUE;
-	device_features.multiViewport                        = VK_TRUE;
-	device_features.fillModeNonSolid                      = VK_TRUE;
-	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	device_features.shaderImageGatherExtended      = VK_TRUE;
+	device_features.shaderResourceMinLod           = VK_TRUE;
+	device_features.independentBlend               = VK_TRUE;
+	device_features.dualSrcBlend                   = VK_TRUE;
+	device_features.tessellationShader             = VK_TRUE;
+	device_features.drawIndirectFirstInstance      = VK_TRUE;
+	device_features.multiDrawIndirect              = VK_TRUE;
+	device_features.sampleRateShading              = VK_TRUE;
+	device_features.depthBiasClamp                 = VK_TRUE;
+	device_features.shaderClipDistance             = VK_TRUE;
+	device_features.shaderCullDistance             = VK_TRUE;
+	device_features.largePoints                    = VK_TRUE;
+	device_features.multiViewport                  = VK_TRUE;
+	device_features.fillModeNonSolid               = VK_TRUE;
+	device_features.vertexPipelineStoresAndAtomics = VK_TRUE;
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
@@ -927,7 +925,7 @@ void WindowContext::CreateVulkan() {
 	dbg_create_info.pfnUserCallback = VulkanDebugMessengerCallback;
 
 	vk::InstanceCreateInfo inst_info {};
-	inst_info.pNext                   = (r.enable_validation_layers ? &dbg_create_info : nullptr);
+	inst_info.pNext = (r.enable_validation_layers ? &dbg_create_info : nullptr);
 #if defined(__APPLE__)
 	// MoltenVK requires VK_KHR_portability_enumeration + flag to surface
 	// portability devices. Without this, enumeratePhysicalDevices hides the
@@ -966,9 +964,9 @@ void WindowContext::CreateVulkan() {
 	RecreateSurface();
 
 	std::vector<const char*> device_extensions = {
-	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+	    VK_KHR_SWAPCHAIN_EXTENSION_NAME,          VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
+	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,       "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
@@ -994,10 +992,10 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
 	    .format = vk::Format::eBc1RgbaUnormBlock,
-	    .type = vk::ImageType::e2D,
+	    .type   = vk::ImageType::e2D,
 	    .tiling = vk::ImageTiling::eOptimal,
-	    .usage = vk::ImageUsageFlagBits::eSampled,
-	    .flags = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+	    .usage  = vk::ImageUsageFlagBits::eSampled,
+	    .flags  = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
 	};
 	const auto block_texel_view_props =
 	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info);
@@ -1016,7 +1014,8 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 
-	render_context = std::make_unique<RenderContext>(graphic_ctx);
+	graphic_ctx.window = window;
+	render_context     = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
 	Vr::OpenXrStartSession(graphic_ctx);
@@ -1047,6 +1046,7 @@ WindowContext::~WindowContext() {
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
+	graphic_ctx.window = nullptr;
 	Dlss::Shutdown();
 	Fsr::Shutdown();
 

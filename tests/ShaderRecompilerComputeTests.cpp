@@ -47732,6 +47732,66 @@ void CheckSigned16ImageStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", "Signed16ImageAndBufferStore");
 }
 
+void CheckSigned16x2ImageStore(VulkanHarness &vulkan) {
+  constexpr std::array<int32_t, 8> values{INT32_MIN, -32769, -32768, -1, 0, 32767, 32768, INT32_MAX};
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = "Signed16x2ImageStore";
+    const u32 width = wave - 2u;
+    test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k16_16SInt);
+    test.user_data[1] |= ((width - 1u) & 3u) << 30u;
+    test.user_data[2] = ((width - 1u) >> 2u) | (1u << 14u);
+    test.has_user_data = test.has_compute_info = true;
+    test.image_descriptor_swizzle = DstSel(4, 5, 0, 1);
+    const std::array<u32, 4> descriptor{0x1000u, 8u << 16u, wave, 0x5204u};
+    std::copy(descriptor.begin(), descriptor.end(), test.user_data.begin() + 8u);
+    test.storage_buffer_ranges = {{0u, wave * 8u}};
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1u;
+    test.compute_info.lds_size_dwords = 0u;
+    test.initial.resize(wave * 2u);
+    std::vector<u32> pixels(width * 2u, 0x13572468u), expected = pixels;
+    for (u32 lane = 0; lane < wave; ++lane) {
+      const auto x = values[(lane / 2u) % values.size()];
+      const auto y = values[(lane / 2u + 4u) % values.size()];
+      test.initial[lane * 2u] = u32(x);
+      test.initial[lane * 2u + 1u] = u32(y);
+      const u32 encoded_x = uint16_t(std::clamp(x, -32768, 32767));
+      const u32 encoded_y = uint16_t(std::clamp(y, -32768, 32767));
+      const u32 encoded = encoded_x | (encoded_y << 16u);
+      if (lane < width) {
+        expected[lane] = encoded;
+        if (lane & 1u) expected[width + lane] = encoded;
+      }
+    }
+    auto &code = test.code;
+    code = {EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(4, 2, 0),
+            EncodeMubuf0(0x0c, 4, true, false), EncodeMubuf1(5, 2, 0),
+            EncodeSopp(0x0c, 0), EncodeVop1(0x01, 20, Vgpr(0))};
+    AppendVMovU32(&code, 21, 0u);
+    code.insert(code.end(), {EncodeMimg0(0x08, 0x3), EncodeMimg1(4, 20)});
+    AppendVMovU32(&code, 21, 1u);
+    AppendSMovLiteral(&code, 126, 0xaaaaaaaau);
+    AppendSMovLiteral(&code, 127, wave == 64u ? 0xaaaaaaaau : 0u);
+    code.insert(code.end(), {EncodeMimg0(0x08, 0x3), EncodeMimg1(4, 20)});
+    AppendEnd(&code);
+    test.opcodes = {ShaderOpcode::IMAGE_STORE};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    auto image = vulkan.CreateImage2D(test.name, width, 2u, vk::Format::eR16G16Sint,
+        vk::ImageUsageFlagBits::eStorage, pixels, 1u, vk::ImageLayout::eGeneral,
+        vk::Format::eR16G16Uint);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, &image);
+    CompareWords(test, "signed two-channel image saturation, masked lanes and OOB", expected,
+                 vulkan.ReadImage(test.name, &image));
+    vulkan.DestroyImage(&image);
+    vulkan.DestroyBuffer(&buffer);
+  }
+  std::printf("[compute] %-32s ok\n", "Signed16x2ImageStore");
+}
+
 TestCase ImageStoreR32SintUsesRawUintView() {
   using O = ShaderOpcode;
 
@@ -57329,6 +57389,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageLoadSintUsesSignedSampledImage<true>());
     vulkan.CheckPackedTextureComponents();
     CheckSigned16ImageStore(vulkan);
+    CheckSigned16x2ImageStore(vulkan);
     vulkan.CheckBgra16Readback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
     RunCase(&vulkan, ImageLoadPackedUnorm<false, false>());
@@ -58283,6 +58344,7 @@ int main(int argc, char **argv) {
   CheckPixelFrontFaceModes();
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);
+  CheckSigned16x2ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
   CheckBoundedRecordBufferAccess(vulkan);

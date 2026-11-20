@@ -7357,6 +7357,35 @@ public:
               "an exact backing with insufficient resources was expanded "
               "instead of being discarded and recreated");
 
+      // A view keeps its mip once later candidates resolve against its container.
+      const auto make_linear = [&](uint64_t offset, vk::Format format,
+                                   Prospero::BufferFormat guest, uint32_t bytes,
+                                   uint32_t extent, uint32_t levels) {
+        auto desc = MakeLinearDesc(base + offset, 0, format, guest,
+                                   Prospero::ImageType::kColor2D, {extent, extent, 1}, 1,
+                                   bytes, 1);
+        desc.info.resources.levels = levels;
+        desc.info.pitch = 0;
+        desc.info.UpdateSize();
+        desc.view_info.level_count = levels;
+        return desc;
+      };
+      constexpr uint64_t view_chain_offset = 0x780000;
+      auto view_chain = make_linear(view_chain_offset, vk::Format::eR8Unorm,
+                                    Prospero::BufferFormat::k8UNorm, 1, 64, 3);
+      const auto view_chain_id = texture_cache.FindImage(view_chain);
+      auto view_neighbor = make_linear(view_chain_offset + 0x2000, vk::Format::eR32Sfloat,
+                                       Prospero::BufferFormat::k32Float, 4, 8, 1);
+      const auto view_neighbor_id = texture_cache.FindImage(view_neighbor);
+      auto mip_view = make_linear(view_chain_offset + view_chain.info.mip_layout[1].offset,
+                                  vk::Format::eR8Unorm, Prospero::BufferFormat::k8UNorm, 1,
+                                  32, 1);
+      Require(name, "view mip after a later candidate",
+              view_neighbor_id != view_chain_id &&
+                  texture_cache.FindImage(mip_view) == view_chain_id &&
+                  mip_view.view_info.base_level == 1,
+              "a later overlapping candidate reset a view to its container's base level");
+
       ImageInfo chain = sampled.info;
       chain.data = {0x2394c1000, 0x384000};
       chain.extent = {64, 64, 1};

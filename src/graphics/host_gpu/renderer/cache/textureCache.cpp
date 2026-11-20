@@ -1280,13 +1280,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			// Later candidates resolve against a view's container and keep its layout, so
+			// only a new view replaces the view's mip and layer.
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {
-					result     = overlap.image;
+					result = overlap.image;
+				}
+				if (overlap.mip >= 0) {
 					view_mip   = overlap.mip;
 					view_layer = overlap.layer;
 				}

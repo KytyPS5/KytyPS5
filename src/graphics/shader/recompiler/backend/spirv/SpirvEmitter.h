@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -27,6 +28,11 @@ struct Profile {
 };
 
 inline constexpr Profile DefaultProfile {};
+
+// Locations of the pixel parameter inputs read only per-vertex or flat. Both stages declare these
+// varyings as integers so their 32-bit words cross the stage interface unchanged.
+[[nodiscard]] uint32_t PixelRawParameterMask(const ShaderPixelInputInfo&     info,
+                                             std::span<const IR::StageInput> inputs);
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,

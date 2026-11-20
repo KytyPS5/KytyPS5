@@ -154,6 +154,9 @@ struct ShaderVertexInputInfo {
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
 	uint32_t                user_clip_planes     = 0;
+	// Last pre-rasterization stage: locations the pixel shader reads only per-vertex or flat. These
+	// integer varyings keep raw 32-bit words, which float varyings need not do for NaN patterns.
+	uint32_t                raw_parameter_mask   = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;

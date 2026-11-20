@@ -845,6 +845,7 @@ struct Http2Request {
 	uint64_t                                         content_length = 0;
 	std::vector<std::pair<std::string, std::string>> headers;
 	int                                              send_result = HTTP2_ERROR_BEFORE_SEND;
+	bool                                             aborted     = false;
 	int                                              status_code = 0;
 	std::string                                      response_headers;
 	std::string                                      response_body;
@@ -1296,6 +1297,13 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	// An aborted request never reached the send step, so it keeps the result it already
+	// carries instead of being moved to a timeout. The console's own code for this case
+	// is not published.
+	if (request->second.aborted) {
+		return request->second.send_result;
+	}
+
 	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
 	return request->second.send_result;
@@ -1325,6 +1333,13 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.aborted) {
+		request->second.async_result = request->second.send_result;
+		request->second.async_event  = 0;
+		Http2TriggerUserEvent(kqueue_option);
+		return 0;
 	}
 
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
@@ -1520,6 +1535,26 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	return 0;
 }
 
+static int KYTY_SYSV_ABI Http2AbortRequest(int req_id) {
+	PRINT_NAME();
+
+	LOGF("\t req_id = %d\n", req_id);
+
+	// Abort only moves an unsent request to an aborted state; DeleteRequest is still
+	// the call that frees it. A request that already reached the send step keeps its
+	// result.
+	auto request = g_http2_requests.find(req_id);
+	if (request == g_http2_requests.end()) {
+		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (request->second.send_result == HTTP2_ERROR_BEFORE_SEND) {
+		request->second.aborted = true;
+	}
+
+	return 0;
+}
+
 static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 	PRINT_NAME();
 
@@ -1560,6 +1595,7 @@ LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("YrWX+DhPHQY", LibHttp2::Http2SetSslCallback);
 	LIB_FUNC("rbqZig38AT8", LibHttp2::Http2SendRequest);
 	LIB_FUNC("A+NVAFu4eCg", LibHttp2::Http2SendRequestAsync);
+	LIB_FUNC("IZ-qjhRqvjk", LibHttp2::Http2AbortRequest);
 	LIB_FUNC("o0DBQpFE13o", LibHttp2::Http2GetResponseContentLength);
 	LIB_FUNC("9XYJwCf3lEA", LibHttp2::Http2GetStatusCode);
 	LIB_FUNC("-rdXUi2XW90", LibHttp2::Http2GetAllResponseHeaders);

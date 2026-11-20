@@ -386,7 +386,7 @@ public:
 		return true;
 	}
 
-	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
+	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size, bool span_holes) {
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
@@ -394,6 +394,14 @@ public:
 		auto vma = FindContaining(virtual_addr);
 		if (vma == m_ranges.end() || !IsCommittedRangeType(vma->second.type)) {
 			return 0;
+		}
+		if (span_holes) {
+			// The last committed range starting inside the span; vma stops the walk.
+			auto last = m_ranges.lower_bound(virtual_addr + size);
+			do {
+				--last;
+			} while (!IsCommittedRangeType(last->second.type));
+			return std::min(End(last->second.start, last->second.size) - virtual_addr, size);
 		}
 		const auto vma_end = End(vma->second.start, vma->second.size);
 
@@ -817,7 +825,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes) {
 	// Backed pages lie in committed ranges, so a fully backed buffer needs no range walk. Up to
 	// 16 MiB (1024 pages) the page walk costs about as much as the locked range walk.
 	if (size <= (uint64_t {1} << 24u) && g_guest_address_space->IsBacked(vaddr, size)) {
@@ -825,7 +833,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	}
 
 	std::shared_lock state(g_memory_state_mutex);
-	const auto       clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	const auto       clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size, span_holes);
 	state.unlock();
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64

@@ -16462,6 +16462,58 @@ public:
       }
 
       {
+        // A GiB-sized pool descriptor whose window is mapped in pieces around a free hole.
+        constexpr uint64_t page = 0x10000;
+        constexpr uint64_t address = base + allocation_size - page;
+        constexpr uint64_t piece = base + allocation_size + page;
+        constexpr u32 resident_value = 0x2468ace1u;
+        int64_t piece_offset = -1;
+        void *piece_mapping = reinterpret_cast<void *>(piece);
+        Require(name, "pool piece mapping",
+                LibKernel::Memory::KernelAllocateDirectMemory(
+                    0, LibKernel::Memory::KernelGetDirectMemorySize(), page, page, 0,
+                    &piece_offset) == 0 &&
+                    LibKernel::Memory::KernelMapDirectMemory(&piece_mapping, page, 0x3, 0x10,
+                                                             piece_offset, page) == 0,
+                "pool piece fixed mapping failed");
+        resources.MapMemory(piece, page);
+        LibKernel::Memory::WriteBacking(piece, &resident_value, sizeof(resident_value));
+        const auto program = make_buffer_program(ShaderType::Compute, {.read = true});
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        auto &value = snapshot.buffers.emplace_back();
+        value.dword_count = 4;
+        value.dwords = {static_cast<u32>(address), static_cast<u32>(address >> 32), 0x40000000u};
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
+        executor.RebindBuffers(bindings);
+        const auto &source = bindings.buffer_sources[0];
+        const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
+        Require(name, "oversized descriptor across a free hole",
+                source.address == address && source.size == 3u * page &&
+                    bindings.buffers[0].range == 3u * page,
+                "oversized descriptor stopped at its first unmapped hole");
+        auto output = CreateHostBuffer(name, 2u * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array<vk::BufferCopy, 2> copies{{
+            {owner.Offset(base + allocation_size), 0, sizeof(u32)},
+            {owner.Offset(piece), sizeof(u32), sizeof(u32)}}};
+        scheduler.Current().Handle().copyBuffer(owner.Handle(), output.buffer, copies.size(), copies.data());
+        scheduler.Finish();
+        Require(name, "oversized descriptor upload across a free hole",
+                ReadBuffer(name, output, 2) == std::vector<u32>{0u, resident_value},
+                "pool upload lost its zero-filled hole or the piece past it");
+        DestroyBuffer(&output);
+        // The buffer also watches the hole, which the section's own unmap does not cover.
+        resources.UnmapMemory(base + allocation_size, 2u * page);
+        Require(name, "pool piece release",
+                LibKernel::Memory::KernelMunmap(piece, page) == 0 &&
+                    LibKernel::Memory::KernelReleaseDirectMemory(piece_offset, page) == 0,
+                "pool piece release failed");
+      }
+
+      {
         const auto buffer_program = make_buffer_program(ShaderType::Compute, {.read = true, .written = true});
         constexpr uint64_t buffer_address = base + 0xe0002;
         ShaderBufferResource descriptor{};

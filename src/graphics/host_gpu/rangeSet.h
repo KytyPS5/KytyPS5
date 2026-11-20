@@ -53,6 +53,8 @@ public:
 		}
 	}
 
+	void Clear() { m_ranges.clear(); }
+
 	template <typename Func>
 	void ForEach(Func&& func) const {
 		for (const auto& [begin, end]: m_ranges) {

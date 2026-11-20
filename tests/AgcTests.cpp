@@ -46,6 +46,14 @@ TEST(Agc, AcquireMemDbFlushIsGlobal) {
 	}
 }
 
+TEST(Agc, SetIndexCountWritesZeroAsOne) {
+	for (const auto [count, expected]: {std::pair {0u, 1u}, std::pair {5u, 5u}}) {
+		Packet<2> dcb;
+		Gen5::AgcDcbSetIndexCount(dcb.Buf(), count);
+		EXPECT_EQ(dcb.dw, (std::array<uint32_t, 2> {0xc0001300u, expected}));
+	}
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

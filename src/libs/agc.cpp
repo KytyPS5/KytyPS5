@@ -2327,7 +2327,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_c
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	cmd[0] = KYTY_PM4(2, Pm4::IT_INDEX_BUFFER_SIZE, 0u);
-	cmd[1] = index_count;
+	cmd[1] = std::max(index_count, 1u);
 
 	return cmd;
 }

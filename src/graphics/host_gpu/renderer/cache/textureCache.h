@@ -261,7 +261,10 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Caller holds m_lock. With unlocked_copy, m_lock is released while the guest bytes are copied
+	// and the download is dropped if the image changed meanwhile, so the caller must not keep
+	// references or iterators into the cache across the call.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool unlocked_copy = false);
 	[[nodiscard]] bool DownloadQueuedImages();
 
 	GraphicContext&                                   m_graphics;

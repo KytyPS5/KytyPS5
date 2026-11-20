@@ -666,7 +666,6 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
   AudioOut2::AudioOut2ContextDestroy(context);
 }
 
-<<<<<<< HEAD
 void TestPushConsumesPcm() {
   const auto context = CreateContext();
   const auto port = CreatePort(context, MakeParam());

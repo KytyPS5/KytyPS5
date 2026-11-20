@@ -7,6 +7,14 @@
 #include <memory>
 #include <thread>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#elif KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -97,6 +105,17 @@ bool Thread::SetCurrentPriorityHighest() {
 	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
 }
 #endif
+
+void Thread::LowerPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__APPLE__)
+	pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#else
+	// On Linux a nice value applies to the calling thread alone.
+	setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5);
+#endif
+}
 
 int Thread::GetThreadIdUnique() {
 	static std::atomic<int> counter = 0;

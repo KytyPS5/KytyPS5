@@ -27,6 +27,8 @@ int GetThreadIdUnique();
 // take its core. Returns false when the host refuses.
 bool SetCurrentPriorityHighest();
 #endif
+// Lowers the calling thread's priority so the game's own threads run first (the shader workers).
+void LowerPriority();
 
 } // namespace Thread
 

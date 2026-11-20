@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/pipeline/skippedDraws.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/performanceOverlay.h"
@@ -235,6 +236,8 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		// Draws before this flip were skipped for shaders still being built.
+		bool                        incomplete;
 	};
 
 	Graphics::Presenter& m_presenter;
@@ -247,6 +250,9 @@ private:
 	std::list<Request>   m_cpu_requests;
 	std::list<Request>   m_cancelled_requests;
 	uint64_t             m_next_request_id = 1;
+	// Present thread only: since when frames with skipped draws have been held back.
+	bool                                  m_holding = false;
+	std::chrono::steady_clock::time_point m_hold_since {};
 };
 
 struct VideoOutDriver::Impl {
@@ -959,6 +965,9 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+	// The draws recorded before this flip are the ones its frame is made of.
+	const bool incomplete = Graphics::TakeDrawsSkippedForShaders();
+	Graphics::NoteFrameFlipped();
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
@@ -1035,6 +1044,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	prepared->frame               = frame;
 	prepared->premultiplied_alpha = premultiplied_alpha;
+	prepared->incomplete = incomplete;
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1143,7 +1153,28 @@ bool FlipQueue::Flip() {
 			m_presenter.Discard(*hidden);
 		}
 		if (layer_count != 0) {
-			m_presenter.Present(std::span(layers.data(), layer_count));
+			// --async-shader-compile skipped draws of this frame whose shaders were not ready.
+			// Keep showing the last complete frame instead of one with parts missing, but only
+			// for a few seconds, so a shader that never arrives cannot freeze the picture.
+			constexpr auto MaxHold = std::chrono::seconds {3};
+			const auto        now          = std::chrono::steady_clock::now();
+			const bool     incomplete =
+			    std::any_of(requests.begin(), requests.begin() + count,
+			                [](const auto& r) { return r.incomplete; });
+			if (!incomplete) {
+				m_holding = false;
+			} else if (!m_holding) {
+				m_holding    = true;
+				m_hold_since = now;
+			}
+			if (incomplete && now - m_hold_since < MaxHold &&
+			    m_presenter.PresentLastFrame()) {
+				for (size_t i = 0; i < layer_count; i++) {
+					m_presenter.Discard(*layers[i].frame);
+				}
+			} else {
+				m_presenter.Present(std::span(layers.data(), layer_count));
+			}
 		}
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(m_width, m_height);

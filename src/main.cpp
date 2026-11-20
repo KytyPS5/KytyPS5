@@ -76,6 +76,9 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between "
 	         "boots (default: on).\n");
 	::printf("  --no-shader-cache                    Disable shader caching between boots.\n");
+	::printf("  --no-async-shader-compile            Compile shaders on the render thread, which waits for\n"
+	         "                                       them. By default they compile on worker threads and\n"
+	         "                                       draws using a shader still being compiled are skipped.\n");
 	::printf(
 	    "  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
@@ -235,6 +238,8 @@ static constexpr Flag FLAGS[] = {
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--no-shader-cache", &ConfigOptions::shader_cache_enabled, false},
+    {"--async-shader-compile", &ConfigOptions::async_shader_compile_enabled},
+    {"--no-async-shader-compile", &ConfigOptions::async_shader_compile_enabled, false},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},

@@ -304,6 +304,16 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	const auto& metadata = data.vertex;
 
 	if (metadata.vertex_attrib_reg >= 0) {
+		if (metadata.vertex_buffer_reg < 0 ||
+		    user_sgpr_num > HW::UserSgprInfo::SGPRS_MAX ||
+		    static_cast<uint32_t>(metadata.vertex_attrib_reg) + 1u >= user_sgpr_num ||
+		    static_cast<uint32_t>(metadata.vertex_buffer_reg) + 1u >= user_sgpr_num) {
+			LOGF("ShaderGetVertexInputInfo(): vertex table pointer exceeds user SGPRs "
+			     "shader=0x%016" PRIx64 " user_sgpr_num=%u attrib_reg=%d buffer_reg=%d\n",
+			     shader_addr, user_sgpr_num, metadata.vertex_attrib_reg,
+			     metadata.vertex_buffer_reg);
+			return false;
+		}
 		info.has_dynamic_vertex_fetch = true;
 		info.fetch_attrib_reg         = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg         = metadata.vertex_buffer_reg;

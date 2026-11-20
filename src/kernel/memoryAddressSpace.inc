@@ -431,6 +431,39 @@ public:
 		return true;
 	}
 
+	// Reads one byte from each of count addresses spaced stride apart. The result matches count
+	// separate one-byte TryReadBacking calls. The contents of out are unspecified when this returns false.
+	bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out) const {
+		if (out == nullptr || count == 0) {
+			return false;
+		}
+		// The last address must stay below UINT64_MAX, as a one-byte TryReadBacking requires.
+		// Dividing back detects a wrapped multiplication.
+		const uint64_t last_index  = static_cast<uint64_t>(count) - 1;
+		const uint64_t last_offset = stride * last_index;
+		if ((stride != 0 && last_offset / stride != last_index) ||
+		    UINT64_MAX - first <= last_offset) {
+			return false;
+		}
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			g_test_backing_read(first, last_offset + 1);
+		}
+#endif
+		for (uint32_t index = 0; index < count; ++index) {
+			const auto address = first + stride * index;
+			const auto page    = address >> PageBits;
+			const auto entry   = LoadPage(page);
+			if (entry == 0) {
+				return false;
+			}
+			const auto backing_offset = (uint64_t {entry - 1u} << PageBits) + (address & PageMask);
+			out[index]                = m_backing_base[backing_offset];
+		}
+		return true;
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) const {
 		auto* destination = static_cast<uint8_t*>(data);
@@ -851,6 +884,10 @@ public:
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		return m_backing->IsBacked(vaddr, size);
+	}
+
+	bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out) {
+		return m_backing->TryReadBackingStrided(first, stride, count, out);
 	}
 
 	template <bool copy_private>

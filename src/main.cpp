@@ -86,6 +86,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --audio-compile-hold                 Pause game audio while a long pipeline compile\n"
 	    "                                       blocks the GPU.\n");
+	::printf(
+	    "  --gpu-submit-cadence                 Submit GPU work periodically while a long command\n"
+	    "                                       stream records, so the GPU starts sooner.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -233,6 +236,7 @@ static constexpr Flag FLAGS[] = {
     {"--native-rt", &ConfigOptions::native_rt},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--audio-compile-hold", &ConfigOptions::audio_compile_hold_enabled},
+    {"--gpu-submit-cadence", &ConfigOptions::gpu_submit_cadence_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},

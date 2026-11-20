@@ -266,6 +266,10 @@ bool AudioCompileHoldEnabled() {
 	return g_config->audio_compile_hold_enabled;
 }
 
+bool GpuSubmitCadenceEnabled() {
+	return g_config->gpu_submit_cadence_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

@@ -100,10 +100,12 @@ struct ConfigOptions {
 	bool                  skip_redundant_unmap_drains     = false;
 	// Experimental. Keeps GPU buffer caches when direct memory is released and mapped back
 	// unchanged.
-	bool        keep_gpu_cache_on_reuse    = false;
-	uint32_t    flush_draws                = 0; // 0 is off
-	bool        tessellation_enabled       = false;
-	bool        occlusion_queries_enabled  = false;
+	bool     keep_gpu_cache_on_reuse   = false;
+	uint32_t flush_draws               = 0; // 0 is off
+	bool     tessellation_enabled      = false;
+	bool     occlusion_queries_enabled = false;
+	// Lets the GPU start on a long command stream instead of idling until the end-of-slice submit.
+	bool        gpu_submit_cadence_enabled = false;
 	bool        relaxed_shader_float       = false;
 	bool        native_rt                  = false;
 	bool        lod_stats_enabled          = false;
@@ -190,6 +192,7 @@ bool     SkipRedundantUnmapDrainsEnabled();
 uint32_t GetFlushDraws();
 bool     TessellationEnabled();
 bool     OcclusionQueriesEnabled();
+bool     GpuSubmitCadenceEnabled();
 bool     RelaxedShaderFloatEnabled();
 bool     NativeRtEnabled();
 bool     LodStatsEnabled();

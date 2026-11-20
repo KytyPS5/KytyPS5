@@ -34,7 +34,8 @@ void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
 			continue;
 		}
 		auto run = begin + 1u;
-		while (run < end && pred(run)) ++run;
+		while (run < end && pred(run))
+			++run;
 		fn(begin, run);
 		begin = run;
 	}
@@ -80,7 +81,7 @@ size_t ImageHeap::KeyHash::operator()(const Key& key) const noexcept {
 
 ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
     : m_context(context), m_page_manager(page_manager) {
-	auto& graphics = context.GetGraphics();
+	auto&                                graphics = context.GetGraphics();
 	vk::PhysicalDeviceVulkan12Properties limits {};
 	vk::PhysicalDeviceProperties2        properties {};
 	properties.pNext = &limits;
@@ -100,7 +101,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
 	                                              IR::ImageHeapCapacity,
 	                                              vk::ShaderStageFlagBits::eAll, nullptr};
-	vk::DescriptorSetLayoutCreateInfo layout_info {};
+	vk::DescriptorSetLayoutCreateInfo    layout_info {};
 	layout_info.pNext        = &flags_info;
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
 	layout_info.bindingCount = 1;
@@ -129,7 +130,8 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 }
 
 ImageHeap::~ImageHeap() {
-	for (const auto& memory: m_memories) Unwatch(*memory);
+	for (const auto& memory: m_memories)
+		Unwatch(*memory);
 	auto& graphics             = m_context.GetGraphics();
 	graphics.image_heap_layout = nullptr;
 	graphics.device.destroyDescriptorPool(m_pool, nullptr);
@@ -168,9 +170,9 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		if (!Refresh(**memory)) return false;
 		(*memory)->draw = m_draw;
 	}
-	const auto root    = IR::ImageHeapResource(*request.root, 0u);
-	const auto profile = static_cast<uint32_t>(std::ranges::find(m_profiles, root) -
-	                                           m_profiles.begin());
+	const auto root = IR::ImageHeapResource(*request.root, 0u);
+	const auto profile =
+	    static_cast<uint32_t>(std::ranges::find(m_profiles, root) - m_profiles.begin());
 	if (profile == m_profiles.size()) m_profiles.push_back(root);
 	auto&      views  = (*memory)->views;
 	const auto bytes  = (*memory)->size;
@@ -196,7 +198,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		// The first upload also clears the slots no probe selects.
 		created->dirty_begin = 0;
 		created->dirty_end   = created->slots.size();
-		view = views.insert(views.end(), std::move(created));
+		view                 = views.insert(views.end(), std::move(created));
 	} else {
 		// Empty after the first acquire in a draw, since the table refreshes once per draw.
 		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
@@ -204,9 +206,9 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	}
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	const auto& selected = **view;
-	result = {.slots      = selected.buffer->BufferDeviceAddress(),
-	          .slot_count = static_cast<uint32_t>(selected.slots.size() - 1u),
-	          .kinds      = selected.kinds};
+	result               = {.slots      = selected.buffer->BufferDeviceAddress(),
+	                        .slot_count = static_cast<uint32_t>(selected.slots.size() - 1u),
+	                        .kinds      = selected.kinds};
 	return true;
 }
 
@@ -229,8 +231,8 @@ bool ImageHeap::Refresh(Memory& memory) {
 	}
 	if (gpu_dirty) m_runs.assign(1u, {0u, pages});
 	for (size_t run = 0; run < m_runs.size(); ++run) {
-		const auto [address, end] = PageRange(memory.base, memory.size, m_runs[run].first,
-		                                      m_runs[run].second);
+		const auto [address, end] =
+		    PageRange(memory.base, memory.size, m_runs[run].first, m_runs[run].second);
 		m_scratch.resize((end - address) / 4u);
 		if (!LibKernel::Memory::TryReadBufferBacking(address, m_scratch.data(), end - address)) {
 			std::scoped_lock lock {m_mutex};
@@ -239,12 +241,14 @@ bool ImageHeap::Refresh(Memory& memory) {
 			}
 			return false;
 		}
-		const auto words = std::span(memory.words).subspan((address - memory.base) / 4u,
-		                                                   m_scratch.size());
-		size_t     first = 0;
-		size_t     last  = words.size();
-		while (first < last && words[first] == m_scratch[first]) ++first;
-		while (first < last && words[last - 1u] == m_scratch[last - 1u]) --last;
+		const auto words =
+		    std::span(memory.words).subspan((address - memory.base) / 4u, m_scratch.size());
+		size_t first = 0;
+		size_t last  = words.size();
+		while (first < last && words[first] == m_scratch[first])
+			++first;
+		while (first < last && words[last - 1u] == m_scratch[last - 1u])
+			--last;
 		if (first == last) continue;
 		std::copy(m_scratch.begin() + first, m_scratch.begin() + last, words.begin() + first);
 		const auto offset = address - memory.base;
@@ -283,8 +287,8 @@ void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 		// Watches cover whole pages, so a write next to the table must unwatch its page too.
 		const auto origin = Common::AlignDown(memory->base, TRACKER_PAGE_SIZE);
 		const auto begin  = std::max(address, origin);
-		const auto end    = std::min(address + size,
-		                             origin + memory->dirty_pages.size() * TRACKER_PAGE_SIZE);
+		const auto end =
+		    std::min(address + size, origin + memory->dirty_pages.size() * TRACKER_PAGE_SIZE);
 		if (begin >= end) continue;
 		MarkDirty(*memory, (begin - origin) / TRACKER_PAGE_SIZE,
 		          (end - 1u - origin) / TRACKER_PAGE_SIZE + 1u);
@@ -328,8 +332,8 @@ void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 }
 
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
-	const auto arm = static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) -
-	                                       view.kind_keys.begin());
+	const auto arm =
+	    static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) - view.kind_keys.begin());
 	if (arm == view.kind_keys.size()) {
 		view.kind_keys.push_back(kind);
 		view.kinds.push_back(key.value);
@@ -355,7 +359,8 @@ void ImageHeap::Release(uint32_t entry) {
 	if (auto* image = textures.m_slot_images.try_get(element.image);
 	    image != nullptr && image->serial == element.serial) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
-		image->tick_accessed_last = textures.m_gc_tick;
+		image->tick_accessed_last    = m_context.GetCommandScheduler().CurrentTick();
+		image->gc_tick_accessed_last = textures.m_gc_tick;
 	}
 	m_released.push_back(index);
 }
@@ -368,7 +373,8 @@ void ImageHeap::Retire() {
 	std::erase_if(m_held, released);
 	std::erase_if(m_dcc, released);
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
-	for (const auto index: m_released) m_retired.emplace_back(tick, index);
+	for (const auto index: m_released)
+		m_retired.emplace_back(tick, index);
 	m_released.clear();
 }
 
@@ -477,8 +483,8 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 		for (auto probe = count; probe < view->count; ++probe) {
 			Assign(*view, (view->first + probe * view->step) / 4u, 0u);
 		}
-		view->count       = count;
-		const auto slots  = view->slots.size();
+		view->count      = count;
+		const auto slots = view->slots.size();
 		view->slots.resize(size / 4u + 1u);
 		view->dirty_end   = std::min(view->dirty_end, view->slots.size());
 		view->dirty_begin = std::min(view->dirty_begin, view->dirty_end);
@@ -512,7 +518,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		return static_cast<bool>(id);
 	});
-	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	bool       stale   = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
 	const auto resolve = [&](const Element& element) {
 		const auto resource = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
 		return executor.ResolveTexture(resource, element.key.value);
@@ -583,8 +589,8 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 	KYTY_PROFILER_FUNCTION();
 	for (auto* view: m_active) {
 		if (view->dirty_begin == view->dirty_end) continue;
-		const auto slots  = std::span(view->slots).subspan(view->dirty_begin,
-		                                                   view->dirty_end - view->dirty_begin);
+		const auto slots =
+		    std::span(view->slots).subspan(view->dirty_begin, view->dirty_end - view->dirty_begin);
 		auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		const auto offset = stream.Copy(slots.data(), slots.size_bytes(), sizeof(uint32_t));
 		view->buffer->CopyFrom(buffer, stream, offset, view->dirty_begin * sizeof(uint32_t),
@@ -627,8 +633,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		               buffer.Handle());
 		return true;
 	});
-	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
-	                                   nullptr);
+	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0, nullptr);
 }
 
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {

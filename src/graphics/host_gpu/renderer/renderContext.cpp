@@ -12,7 +12,8 @@
 namespace Libs::Graphics {
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_render_executor(*this),
+      m_command_scheduler(*this, graphics, Config::GpuSubmitCadenceEnabled()),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),

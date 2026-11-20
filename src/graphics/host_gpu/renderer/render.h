@@ -129,6 +129,7 @@ private:
 	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
+	friend struct CommandBufferTestAccess;
 };
 
 namespace Pssr {
@@ -148,13 +149,13 @@ public:
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void                           FindBuffers(std::span<PreparedBindings* const> stages);
-	void                           RebindBuffers(PreparedBindings& bindings);
-	void                           RebindImages(PreparedBindings& bindings);
+	void FindBuffers(std::span<PreparedBindings* const> stages);
+	void RebindBuffers(PreparedBindings& bindings);
+	void RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
@@ -168,7 +169,7 @@ private:
 	};
 
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	                             std::span<RenderColorInfo>         colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slot, bool ignore_target_mask = false,
 	                              bool exact_format = false);
@@ -193,10 +194,10 @@ private:
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
-	                                        CommandBuffer& command, uint32_t group_x,
-	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
-	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
-	                                  Dlss::Inputs& inputs);
+	                                         CommandBuffer& command, uint32_t group_x,
+	                                         uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                           Dlss::Inputs& inputs);
 
 	// A null feature is one the upscaler refused or failed.
 	struct UpscalerContext {
@@ -213,20 +214,20 @@ private:
 		bool    unclamped    = false;
 	};
 
-	RenderContext&                        m_context;
-	bool                                  m_lod_stats = Config::LodStatsEnabled();
-	GraphicsBindings                     m_graphics_bindings;
+	RenderContext&   m_context;
+	bool             m_lod_stats = Config::LodStatsEnabled();
+	GraphicsBindings m_graphics_bindings;
 	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.
-	DrawTargets                           m_targets;
+	DrawTargets                          m_targets;
 	PreparedBindings                     m_compute_bindings;
-	std::vector<ImageId>                  m_bound_images;
-	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
-	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
-	vk::Pipeline                          m_pssr_pipeline          = nullptr;
-	std::vector<UpscalerContext>          m_upscaler_contexts;
-	std::array<MipStatsCounter, 256>      m_mip_stats {};
+	std::vector<ImageId>                 m_bound_images;
+	std::vector<vk::DescriptorImageInfo> m_descriptor_images;
+	std::vector<vk::WriteDescriptorSet>  m_descriptor_writes;
+	vk::DescriptorSetLayout              m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                   m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                         m_pssr_pipeline          = nullptr;
+	std::vector<UpscalerContext>         m_upscaler_contexts;
+	std::array<MipStatsCounter, 256>     m_mip_stats {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

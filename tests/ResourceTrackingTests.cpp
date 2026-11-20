@@ -5439,7 +5439,7 @@ void TestComputeBufferFill() {
     const bool expected = !options.conditional && !options.shifted &&
                           !options.extra_store && !options.branch;
     Check((snapshot.uniform_fill.words != 0) == expected,
-          "fill proof accepted an unsafe store or missed the real GTA3 clear");
+          "fill proof accepted an unsafe store or missed the unmodified clear");
     if (expected) {
       Check(snapshot.uniform_fill.words == 1 &&
                 snapshot.uniform_fill.group_stride[0] == 64 &&
@@ -8795,7 +8795,7 @@ ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use) {
 
 void TestConditionalBufferMaterialization() {
   auto plan = ConditionalBufferPlan(ConditionalBufferUse::Optional);
-  // GTA III leaves packet words in s[12:15] when its scalar control word is zero.
+  // The payload descriptor s[4:7] holds stale packet words while the scalar control word is zero.
   std::array<uint32_t, 8> user_data{
       0x1000, 16u << 16u, 1, 0x4dfac,
       0xc0107600, 0x8c, 0x97730000, 0x100020};

@@ -162,9 +162,9 @@ static int np_entitlement_poll_request(int64_t request_id, EntitlementRequestKin
 }
 
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
-    {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
-    {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
-    {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
+    {{{"85y-je"}, {}}, 3, 4},
+    {{{"5d5c48"}, {}}, 3, 4},
+    {{{"_mtqu6"}, {}}, 3, 4},
 };
 
 static NpEntitlementAccessAddcontEntitlementInfo

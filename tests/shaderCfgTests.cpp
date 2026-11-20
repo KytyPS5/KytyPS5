@@ -2088,7 +2088,7 @@ void TestSopkCompareImmediateExtension() {
     }
   }
 
-  // GTA3's LUT GS exports its UV parameter only when packed primitive count > 0.
+  // This LUT GS exports its UV parameter only when packed primitive count > 0.
   for (uint32_t counts : {0x00000006u, 0x00020006u}) {
     const std::array shader = {
         EncodeSMovB32(2, 255), counts,
@@ -3004,7 +3004,6 @@ void TestNewShaderDecoderArchitecture() {
             d16_hi_write.src1.sdwa_sel == 5u,
         "DS decoder rejected the captured high-half D16 write");
 
-  // Captured from GTA V (PPSA04264) compute shader, pc 0x1598.
   const uint32_t d16_hi_byte_write_ds[] = {0xda800200u, 0x00001413u};
   Instruction d16_hi_byte_write;
   ShaderRecompiler::Decoder::DecodeInstruction(d16_hi_byte_write_ds, 0u,
@@ -11180,7 +11179,7 @@ void TestTypedDescriptorRealWideMoveTranslation() {
 
 void TestComputeImageFill() {
   using namespace ShaderRecompiler::IR;
-  // Captured GTA3 stencil clear: one scalar load and one IMAGE_STORE, with
+  // A stencil clear: one scalar load and one IMAGE_STORE, with
   // x/y = local + 8 * group and array layer = group.z.
   const uint32_t shader[] = {
       0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u,

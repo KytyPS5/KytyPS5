@@ -56788,6 +56788,37 @@ void CheckPm4WriteDataGds(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckPm4DmaDataAddress(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DmaDataAddress";
+  namespace Memory = Libs::LibKernel::Memory;
+  constexpr uint64_t base = 0x0000000300030000ull;
+  constexpr uint64_t size = 0x10000;
+  // A destination whose low 32 bits are 0x3022c.
+  constexpr uint64_t destination = base + 0x22c;
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "map",
+          Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size,
+                                             size, 0, &direct_offset) == 0 &&
+              Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+              mapped == reinterpret_cast<void *>(base),
+          "the fixed direct-memory mapping failed");
+  const std::array<uint32_t, 7> fill{KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, 0x5eedu, 0,
+                                     static_cast<uint32_t>(destination),
+                                     static_cast<uint32_t>(destination >> 32u), 4};
+  CommandProcessor processor(renderer, 0);
+  Pm4Execution execution;
+  Require(name, "fill",
+          processor.Process(execution, fill) == Pm4ProcessResult::Complete &&
+              *reinterpret_cast<const uint32_t *>(destination) == 0x5eedu,
+          "the DMA fill skipped its destination");
+  Require(name, "unmap",
+          Memory::KernelMunmap(base, size) == 0 &&
+              Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+          "the direct-memory release failed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -57923,6 +57954,11 @@ int main(int argc, char **argv) {
     CheckPm4WriteDataGds(vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dma-data-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4DmaDataAddress(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -58238,6 +58274,7 @@ int main(int argc, char **argv) {
   CheckPm4LodStatsBoundTextures(vulkan, true);
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
   CheckPm4WriteDataGds(vulkan);
+  CheckPm4DmaDataAddress(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();

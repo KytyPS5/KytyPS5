@@ -351,7 +351,7 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
-	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	if (num_bytes == 0) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {

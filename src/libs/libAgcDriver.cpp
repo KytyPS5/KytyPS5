@@ -81,6 +81,12 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("0ZOG0jc9nRg", Gen5::AgcAcbRewindGetSize);
 	LIB_FUNC("htn36gPnBk4", Gen5::AgcAcbWaitRegMem);
 	LIB_FUNC("q4VuU-QsLOE", Gen5::AgcAcbMemSemaphore);
+	LIB_FUNC("jt3pl7EN17o", Gen5::AgcDcbMemSemaphore);
+	LIB_FUNC("da1Sm8-QDoU", Gen5::AgcAcbAtomicMemGetSize);
+	LIB_FUNC("hcIxS8pmXF4", Gen5::AgcAcbAtomicGdsGetSize);
+	LIB_FUNC("eCjKaqeeQ5s", Gen5::AgcAcbPrimeUtcl2GetSize);
+	LIB_FUNC("oz6zQq1JwCE", Gen5::AgcDcbAtomicMemGetSize);
+	LIB_FUNC("1tB0xkLNjcw", Gen5::AgcDcbAtomicGdsGetSize);
 	LIB_FUNC("idlaArvdXEs", Gen5::AgcAcbWaitOnAddressGetSize);
 	LIB_FUNC("-RnpfpxIhec", Gen5::AgcAcbDmaData);
 	LIB_FUNC("M0ttm8h7SKA", Gen5::AgcAcbDmaDataGetSize);
@@ -95,7 +101,9 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("TRO721eVt4g", Gen5::AgcDcbResetQueue);
 	LIB_FUNC("MWiElSNE8j8", Gen5::AgcDcbWaitUntilSafeForRendering);
 	LIB_FUNC("LFSPFmGc9Hg", Gen5::AgcDcbSetWorkloadsActive);
+	LIB_FUNC("rVOmPz2RBlg", Gen5::AgcAcbSetWorkloadsActive);
 	LIB_FUNC("hEK26Wdny6s", Gen5::AgcDcbSetWorkloadComplete);
+	LIB_FUNC("opR1JeJZCBU", Gen5::AgcAcbSetWorkloadComplete);
 	LIB_FUNC("QhCbS4X9Rl8", Gen5::AgcDcbSetMarker);
 	LIB_FUNC("pFLArOT53+w", Gen5::AgcDcbSetShRegisterDirect);
 	LIB_FUNC("QhPDD513V0w", Gen5::AgcDcbSetShRegisterDirectGetSize);

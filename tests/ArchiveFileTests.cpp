@@ -210,6 +210,55 @@ void CheckPackArchive(const std::filesystem::path &root, const std::vector<uint8
 #endif
 }
 
+// Windows limits plain paths to MAX_PATH (260) characters; game folders are often nested deeper.
+void CheckLongHostPaths(const std::filesystem::path &root) {
+  const auto base = root / "long";
+  auto directory = base;
+  while (directory.native().size() < 300) {
+    directory /= std::string(40, 'd');
+  }
+  // Mixed separators and a relative component, as guest paths are appended to the game folder.
+  const auto file = directory / "." / "sub/asset.bin";
+  const auto renamed = directory / "sub" / "renamed.bin";
+  constexpr std::string_view Payload = "long path";
+
+  Check(Common::File::CreateDirectories(directory / "sub") &&
+            Common::File::IsDirectoryExisting(directory / "sub"),
+        "create a directory beyond MAX_PATH");
+
+  Common::File output;
+  Check(output.Create(file), "create a file beyond MAX_PATH");
+  uint32_t written = 0;
+  output.Write(Payload.data(), static_cast<uint32_t>(Payload.size()), &written);
+  output.Close();
+  const auto info = Common::File::GetInfo(file);
+  Check(written == Payload.size() && info && info->is_file && info->size == Payload.size(),
+        "query a file beyond MAX_PATH");
+
+  const auto entries = Common::File::GetDirEntries(directory / "sub");
+  Check(std::any_of(entries.begin(), entries.end(), [](const auto &entry) {
+          return entry.is_file && entry.name == "asset.bin";
+        }), "enumerate a directory beyond MAX_PATH");
+
+  Common::File input;
+  std::string  text(Payload.size(), 0);
+  uint32_t     read = 0;
+  Check(input.Open(file, Common::File::Mode::Read), "open a file beyond MAX_PATH");
+  input.Read(text.data(), static_cast<uint32_t>(text.size()), &read);
+  input.Close();
+  Check(read == Payload.size() && text == Payload, "read a file beyond MAX_PATH");
+
+  Check(Common::File::RenameFile(file, renamed) && !Common::File::GetInfo(file) &&
+            Common::File::DeleteFile(renamed) && !Common::File::GetInfo(renamed),
+        "rename and delete a file beyond MAX_PATH");
+
+#ifdef _WIN32
+  // The temporary directory cleanup cannot remove these directories through plain paths.
+  std::error_code error;
+  std::filesystem::remove_all(std::filesystem::path(L"\\\\?\\" + base.native()), error);
+#endif
+}
+
 #if !defined(_WIN32) || defined(_GLIBCXX_GCC_GTHR_POSIX_H)
 void CheckCancellation(const std::filesystem::path &path,
                        const std::vector<uint8_t> &payload) {
@@ -277,6 +326,7 @@ int main() {
   Check(!Common::File::GetInfo(archive_path / "") && Common::File::Size(archive_path / "") == 0 &&
             !Common::File::GetInfo(temporary.Path() / "missing.bin"),
         "reject missing native paths and files with a trailing separator");
+  CheckLongHostPaths(temporary.Path());
 
   const auto root = Common::MakeArchivePath(archive_path);
   auto reader_pin = Common::OpenArchive(archive_path);

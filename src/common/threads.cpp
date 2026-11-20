@@ -88,6 +88,12 @@ bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool Thread::SetCurrentPriorityHighest() {
+	return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+}
+#endif
+
 int Thread::GetThreadIdUnique() {
 	static std::atomic<int> counter = 0;
 	static thread_local int tid     = ++counter;

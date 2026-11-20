@@ -21,6 +21,11 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Windows only. Sets the calling thread to THREAD_PRIORITY_HIGHEST so busy guest threads do not
+// take its core. Returns false when the host refuses.
+bool SetCurrentPriorityHighest();
+#endif
 
 } // namespace Thread
 

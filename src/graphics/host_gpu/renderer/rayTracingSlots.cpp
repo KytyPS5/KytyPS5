@@ -325,6 +325,8 @@ constexpr vk::BuildAccelerationStructureFlagsKHR BlasFlags =
     vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
 constexpr vk::BuildAccelerationStructureFlagsKHR FastBlasFlags =
     vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
+constexpr vk::BuildAccelerationStructureFlagsKHR TlasFlags =
+    vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
 // BLASes the guest refits every frame are gathered again from the refit vertices with the same
 // triangles (see RecordBuilds()): their builds allow updates, and a gathered build updates the
 // last build in place instead of building it again. A walk now and then builds them anew.
@@ -959,7 +961,7 @@ void RayTracing::CreateTlas(uint32_t capacity) {
 	geometry.geometry.instances.arrayOfPointers = VK_FALSE;
 	vk::AccelerationStructureBuildGeometryInfoKHR info {};
 	info.type          = vk::AccelerationStructureTypeKHR::eTopLevel;
-	info.flags         = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
+	info.flags         = TlasFlags;
 	info.mode          = vk::BuildAccelerationStructureModeKHR::eBuild;
 	info.geometryCount = 1;
 	info.pGeometries   = &geometry;
@@ -1914,7 +1916,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 			geometry.geometry.instances.data.deviceAddress = instances;
 			vk::AccelerationStructureBuildGeometryInfoKHR info {};
 			info.type                      = vk::AccelerationStructureTypeKHR::eTopLevel;
-			info.flags                     = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
+			info.flags                     = TlasFlags;
 			info.mode                      = vk::BuildAccelerationStructureModeKHR::eBuild;
 			info.dstAccelerationStructure  = handle;
 			info.geometryCount             = 1;

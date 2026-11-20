@@ -66,6 +66,7 @@ struct State {
 	XrSession   session     = XR_NULL_HANDLE;
 	XrSpace     view_space  = XR_NULL_HANDLE;
 	XrSpace     local_space = XR_NULL_HANDLE;
+	XrSpace     stage_space = XR_NULL_HANDLE; // Null when the runtime has no stage.
 	XrSwapchain swapchain   = XR_NULL_HANDLE; // Two array layers, one per eye.
 	std::vector<XrSwapchainImageVulkanKHR> swapchain_images;
 	vk::Extent2D                           eye {};
@@ -100,6 +101,7 @@ struct State {
 	VrControllerInput input[2];
 	VrPose            head;
 	VrPose            last_head_read;
+	VrPose            origin_in_stage;
 };
 
 State g;
@@ -162,29 +164,25 @@ void Barrier(const Command& command, vk::Image image, vk::ImageLayout from, vk::
 	command.pipelineBarrier2(dependency);
 }
 
-XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b) {
-	return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-	        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-	        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
-	        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+VrPose FromXr(const XrPosef& pose) {
+	const auto& [q, p] = pose;
+	return {true, {q.x, q.y, q.z, q.w}, {p.x, p.y, p.z}};
 }
 
-XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& v) {
-	const XrVector3f t {2.0f * (q.y * v.z - q.z * v.y), 2.0f * (q.z * v.x - q.x * v.z),
-	                    2.0f * (q.x * v.y - q.y * v.x)};
-	return {v.x + q.w * t.x + (q.y * t.z - q.z * t.y), v.y + q.w * t.y + (q.z * t.x - q.x * t.z),
-	        v.z + q.w * t.z + (q.x * t.y - q.y * t.x)};
+XrPosef ToXr(const VrPose& pose) {
+	const auto [x, y, z, w] = pose.orientation;
+	const auto [px, py, pz] = pose.position;
+	return {{x, y, z, w}, {px, py, pz}};
 }
 
-VrPose Locate(XrSpace space, XrTime time) {
-	VrPose          pose;
+VrPose Locate(XrSpace space, XrTime time, XrSpace base = g.local_space,
+              XrSpaceLocationFlags required = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) {
 	XrSpaceLocation location {XR_TYPE_SPACE_LOCATION};
-	if (XR_SUCCEEDED(xrLocateSpace(space, g.local_space, time, &location)) &&
-	    (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
-		const auto& [q, p] = location.pose;
-		pose               = {true, {q.x, q.y, q.z, q.w}, {p.x, p.y, p.z}};
+	if (base != XR_NULL_HANDLE && XR_SUCCEEDED(xrLocateSpace(space, base, time, &location)) &&
+	    (location.locationFlags & required) == required) {
+		return FromXr(location.pose);
 	}
-	return pose;
+	return {};
 }
 
 // The swapchain stores the eyes in a gamma-encoded format, so a raw copy of the display-encoded
@@ -306,7 +304,11 @@ bool CreateInput() {
 
 // The head is tracked while the frame loop runs; the controllers only while the session has focus.
 void PollInput(XrTime time) {
-	const auto        head = Locate(g.view_space, time);
+	const auto head = Locate(g.view_space, time);
+	// The local floor and stage systems also use the position.
+	const auto origin_in_stage =
+	    Locate(g.local_space, time, g.stage_space,
+	           XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT);
 	VrControllerInput input[2];
 	XrActiveActionSet active {g.action_set, XR_NULL_PATH};
 	XrActionsSyncInfo sync {XR_TYPE_ACTIONS_SYNC_INFO};
@@ -350,9 +352,10 @@ void PollInput(XrTime time) {
 		}
 	}
 	std::lock_guard lock(g.input_mutex);
-	g.head     = head;
-	g.input[0] = input[0];
-	g.input[1] = input[1];
+	g.head            = head;
+	g.origin_in_stage = origin_in_stage;
+	g.input[0]        = input[0];
+	g.input[1]        = input[1];
 }
 
 void HandleEvents() {
@@ -482,10 +485,7 @@ void PlaceViews(XrTime time, XrCompositionLayerProjection& layer,
 	const bool  valid =
 	    XR_SUCCEEDED(xrLocateViews(g.session, &locate, &state, 2, &count, located)) &&
 	    (state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-	const auto&         head = g.shown_head;
-	const XrQuaternionf head_q {head.orientation[0], head.orientation[1], head.orientation[2],
-	                            head.orientation[3]};
-	const XrVector3f    head_p {head.position[0], head.position[1], head.position[2]};
+	const auto& head = g.shown_head;
 	// The outer side of each eye is its temporal side: left for the left eye.
 	const float out    = std::atan(Hmd2::FOV_TAN_OUT);
 	const float in     = std::atan(Hmd2::FOV_TAN_IN);
@@ -496,9 +496,7 @@ void PlaceViews(XrTime time, XrCompositionLayerProjection& layer,
 		auto&       view = views[eye];
 		view.pose        = valid ? located[eye].pose : XrPosef {{0, 0, 0, 1}, {side, 0, 0}};
 		if (head.valid) {
-			const auto offset     = Rotate(head_q, view.pose.position);
-			view.pose.position    = {head_p.x + offset.x, head_p.y + offset.y, head_p.z + offset.z};
-			view.pose.orientation = Multiply(head_q, view.pose.orientation);
+			view.pose = ToXr(Compose(head, FromXr(view.pose)));
 		}
 		view.fov                = {eye == 0 ? -out : -in, eye == 0 ? in : out, top, -bottom};
 		view.subImage.swapchain = g.swapchain;
@@ -667,6 +665,9 @@ void OpenXrStartSession(GraphicContext& graphics) {
 		DestroyInstance("the headset session could not be created");
 		return;
 	}
+	if (!reference(XR_REFERENCE_SPACE_TYPE_STAGE, g.stage_space)) {
+		g.stage_space = XR_NULL_HANDLE;
+	}
 	if (!CreateInput()) {
 		g.action_set = XR_NULL_HANDLE;
 	}
@@ -718,6 +719,14 @@ VrPose OpenXrGetHeadPose() {
 		g.last_head_read = g.head;
 	}
 	return g.head;
+}
+
+VrPose OpenXrGetOriginInStage() {
+	if (!g.running) {
+		return {};
+	}
+	std::lock_guard lock(g.input_mutex);
+	return g.origin_in_stage;
 }
 
 VrControllerInput OpenXrGetController(int hand) {

@@ -833,6 +833,26 @@ void TestCompleteWaveReduction() {
   }
 }
 
+void TestSignedMinDescriptorInputs() {
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto low = fixture.Emit(ValueOpcode::SMin32, {user, Value(2u)});
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {low}, .dword_count = 1});
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  for (const auto [input, expected] :
+       std::array<std::pair<uint32_t, uint32_t>, 2>{
+           {{7u, 2u}, {0xfffffffdu, 0xfffffffdu}}}) {
+    const std::array user_data{input};
+    DescriptorValue result;
+    Check(EvaluateSource(plan, {.user_data = user_data}, 0, result) &&
+              result.dwords[0] == expected,
+          "descriptor signed minimum compared unsigned");
+  }
+}
+
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -963,6 +983,7 @@ int main() {
     TestUniformFirstLaneSamplerLod();
     TestFloatComparisonDescriptorInputs();
     TestSignedConversionDescriptorInputs();
+    TestSignedMinDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();

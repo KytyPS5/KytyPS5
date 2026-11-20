@@ -14,6 +14,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -255,6 +256,8 @@ int dispatched_signals = 0;
 
 void KYTY_SYSV_ABI CountDispatchedSignal(int, void *) { dispatched_signals++; }
 
+void *KYTY_SYSV_ABI ReturnFromGuestThread(void *) { return nullptr; }
+
 void TestPendingSignalDispatch() {
   using namespace Libs::LibKernel;
   Loader::SymbolDatabase symbols;
@@ -275,6 +278,17 @@ void TestPendingSignalDispatch() {
   Check(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50) &&
             dispatched_signals == 1,
         "a pending signal dispatches once and idle dispatches skip the signal scan");
+
+  // An exiting thread stops taking guest signals before it frees its TLS.
+  Pthread exiting = nullptr;
+  Check(PthreadCreate(&exiting, nullptr, ReturnFromGuestThread, nullptr, "Exiting") == OK,
+        "create exiting guest thread");
+  WaitForMutexTest([&] {
+    PthreadQueuePendingSignal(exiting, 30);
+    return !PthreadTakePendingSignal(exiting, 30);
+  });
+  Check(PthreadJoin(exiting, nullptr) == OK && !PthreadHasAnyPendingSignal(exiting),
+        "joining clears signals the exiting thread did not take");
   Check(remove(30) == OK, "remove signal handler");
 }
 
@@ -2874,6 +2888,8 @@ int main(int argc, char** argv) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+  // Guest threads allocate their TLS in guest memory.
+  subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
   if (argc == 2 && std::string_view(argv[1]) == "--network-only") {
 #if defined(__linux__)

@@ -50,7 +50,7 @@ PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
     : QDialog(parent), m_title_id(game.title_id.trimmed().toUpper()), m_version(game.gameVersion),
       m_process(QFileInfo(game.elf.isEmpty() ? QStringLiteral("eboot.bin") : game.elf).fileName()) {
 	setAttribute(Qt::WA_DeleteOnClose);
-	setWindowTitle(tr("Cheats (experimental) - %1").arg(game.name));
+	setWindowTitle(tr("Cheats and patches (experimental) - %1").arg(game.name));
 	resize(800, 640);
 
 	auto* layout     = new QVBoxLayout(this);
@@ -65,8 +65,10 @@ PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
 	auto* remote_layout = new QVBoxLayout(remote);
 	m_tabs->addTab(remote, tr("Remote"));
 	auto* credits = new QLabel(
-	    tr("Cheats by <a href=\"https://github.com/TeeKay87/HEN-Cheats-Collection\">TeeKay87 / HEN "
-	       "Cheats Collection</a> and its contributors."),
+	    tr("Patches and cheats by <a "
+		   "href=\"https://github.com/KytyPS5/KytyPS5-Modules\">KytyPS5-Modules"
+		   "</a> and <a href=\"https://github.com/TeeKay87/HEN-Cheats-Collection\">TeeKay87 / HEN "
+		   "Cheats Collection</a> and their contributors."),
 	    remote);
 	credits->setOpenExternalLinks(true);
 	credits->setWordWrap(true);
@@ -76,7 +78,7 @@ PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
 	remote_layout->addWidget(support);
 	auto* split = new QSplitter(Qt::Vertical, remote);
 	m_files     = new QTreeWidget(split);
-	m_files->setHeaderLabels({tr("Version"), tr("Format"), tr("File")});
+	m_files->setHeaderLabels({tr("Version"), tr("Type"), tr("Name")});
 	m_files->setRootIsDecorated(false);
 	m_files->setSelectionMode(QAbstractItemView::SingleSelection);
 	m_files->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
@@ -138,8 +140,8 @@ PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
 			    const auto& file = m_remote_files[index];
 			    auto*       item = new QTreeWidgetItem(
 			        m_files, {file.version == m_version ? tr("%1 (installed)").arg(file.version)
-			                                            : file.version,
-			                  file.format.toUpper(), file.name});
+					                                    : file.version,
+					          file.kind, file.name});
 			    item->setData(0, Qt::UserRole, index);
 			    for (int column = 0; column < 3; ++column) {
 				    item->setToolTip(column, file.title);
@@ -289,18 +291,27 @@ void PatchesDialog::ImportRemote() {
 		    tr("Could not read the local cheat file. Open Local and reload it before importing."));
 		return;
 	}
-	const auto path = Cheats::PlanPath(m_title_id);
-	if (QFile::exists(path) &&
-	    QMessageBox::question(this, tr("Replace local cheats?"),
-	                          tr("Replace the local cheat file and selections for %1? Imported "
-	                             "cheats will start unchecked.")
-	                              .arg(m_title_id),
-	                          QMessageBox::Yes | QMessageBox::No,
-	                          QMessageBox::No) != QMessageBox::Yes) {
-		return;
+	const auto path     = Cheats::PlanPath(m_title_id);
+	auto       document = Cheats::Merge({}, m_remote_document, m_process);
+	if (QFile::exists(path)) {
+		const auto  merged = Cheats::Merge(m_local_document, m_remote_document, m_process);
+		QMessageBox box(
+		    QMessageBox::Question, tr("Import to Local"),
+		    tr("A local cheat file for %1 exists. Imported cheats will start unchecked.")
+		        .arg(m_title_id),
+		    QMessageBox::Cancel, this);
+		const auto* replace = box.addButton(tr("Replace"), QMessageBox::DestructiveRole);
+		const auto* keep    = merged == document
+		                          ? nullptr
+		                          : box.addButton(tr("Keep other cheats"), QMessageBox::AcceptRole);
+		box.setDefaultButton(QMessageBox::Cancel);
+		box.exec();
+		if (keep != nullptr && box.clickedButton() == keep) {
+			document = merged;
+		} else if (box.clickedButton() != replace) {
+			return;
+		}
 	}
-	const auto mods     = m_remote_document.object().value(QStringLiteral("mods")).toArray();
-	const auto document = Cheats::WithSelection(m_remote_document, QList<bool>(mods.size(), false));
 	const auto save_error = Cheats::SaveDocument(path, document, m_local_data);
 	if (!save_error.isEmpty()) {
 		m_preview_status->setText(save_error);
@@ -309,6 +320,6 @@ void PatchesDialog::ImportRemote() {
 	Load();
 	m_status->setText(
 	    tr("Imported %1 cheat(s). Select cheats and apply your selection for the next game launch.")
-	        .arg(mods.size()));
+	        .arg(m_remote_document.object().value(QStringLiteral("mods")).toArray().size()));
 	m_tabs->setCurrentIndex(1);
 }

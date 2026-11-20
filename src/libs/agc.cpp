@@ -3837,6 +3837,24 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference)
 	return OK;
 }
 
+int KYTY_SYSV_ABI AgcWaitRegMemPatchCompareFunction(uint32_t* cmd, uint8_t compare_function) {
+	PRINT_NAME();
+
+	AgcTrace("\t cmd              = 0x%016" PRIx64 "\n"
+	         "\t compare_function = 0x%02" PRIx8 "\n",
+	         reinterpret_cast<uint64_t>(cmd), compare_function);
+
+	auto* wait = get_agc_wait_packet(cmd);
+	if (wait == nullptr) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+
+	// FUNCTION is bits [2:0] of the control DWORD in both packet sizes.
+	wait[1] = (wait[1] & ~0x7u) | (compare_function & 0x7u);
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
                                                       const volatile Label* address) {
 	PRINT_NAME();

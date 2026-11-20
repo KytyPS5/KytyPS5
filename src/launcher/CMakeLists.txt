@@ -47,6 +47,16 @@ target_link_libraries(launcher_game_views_tests Qt6::Widgets common)
 target_include_directories(launcher_game_views_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set_target_properties(launcher_game_views_tests PROPERTIES AUTOUIC ON AUTORCC ON)
 
+add_executable(launcher_cheat_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LauncherCheatTests.cpp"
+	include/cheatRepository.h
+	src/cheatFile.cpp
+	src/cheatRepository.cpp
+)
+target_link_libraries(launcher_cheat_tests Qt6::Network FFmpeg::ffmpeg kyty_test_gtest)
+target_include_directories(launcher_cheat_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(launcher_cheat_tests PROPERTIES AUTOMOC ON)
+
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
 elseif(LINUX)

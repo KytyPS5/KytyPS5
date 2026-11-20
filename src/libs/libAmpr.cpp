@@ -550,6 +550,8 @@ constexpr uint64_t APR_MAP_END_RECORD_SIZE       = 0x04;
 constexpr uint64_t AMM_MAP_RECORD_SIZE           = 0x20;
 constexpr uint64_t AMM_MAP_DIRECT_RECORD_SIZE    = 0x30;
 constexpr uint64_t AMM_UNMAP_RECORD_SIZE         = 0x20;
+constexpr uint64_t AMM_MAP_AS_PRT_RECORD_SIZE    = 0x0c;
+constexpr uint64_t AMM_REMAP_RECORD_SIZE         = 0x10;
 constexpr uint64_t AMM_PAGE_SIZE                 = 0x4000;
 constexpr int      AMM_MAP_FIXED                 = 0x10;
 constexpr int      AMM_USAGE_DIRECT              = 0;
@@ -573,6 +575,8 @@ constexpr uint32_t APR_TYPE_MAP_ACTIVE           = 0x00020000;
 enum class AmmCommandKind : uint32_t {
 	MapAuto,
 	MapDirect,
+	MapAsPrt,
+	RemapIntoPrt,
 	Unmap,
 };
 
@@ -610,6 +614,7 @@ struct CommandBufferState {
 	struct AmmMapCommand {
 		AmmCommandKind kind        = AmmCommandKind::MapAuto;
 		uint64_t       va          = 0;
+		uint64_t       old_va      = 0;
 		uint64_t       dmem_offset = 0;
 		uint64_t       size        = 0;
 		int32_t        type        = 0;
@@ -835,24 +840,6 @@ static bool UpdateCommandBufferTypeFlags(uint64_t command_buffer, uint32_t set_b
 	return true;
 }
 
-static std::unordered_map<uint64_t, CommandBufferState>::iterator
-ResolveCommandBufferStateLocked(uint64_t command_buffer) {
-	auto it = g_command_buffers.find(command_buffer);
-	if (it != g_command_buffers.end() && !it->second.commands.empty()) {
-		return it;
-	}
-
-	const auto alias = g_command_buffer_aliases.find(command_buffer);
-	if (alias != g_command_buffer_aliases.end()) {
-		const auto alias_it = g_command_buffers.find(alias->second);
-		if (alias_it != g_command_buffers.end()) {
-			return alias_it;
-		}
-	}
-
-	return it;
-}
-
 static bool WriteVisibleCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
                                               uint64_t size) {
 	if (size > std::numeric_limits<uint32_t>::max() ||
@@ -903,7 +890,9 @@ static bool TryGetCommandBufferState(uint64_t command_buffer, CommandBufferState
 
 	{
 		std::scoped_lock lock(g_command_buffer_mutex);
-		const auto       it = ResolveCommandBufferStateLocked(command_buffer);
+		const auto       alias = g_command_buffer_aliases.find(command_buffer);
+		const auto       it    = g_command_buffers.find(
+		    alias != g_command_buffer_aliases.end() ? alias->second : command_buffer);
 		if (it != g_command_buffers.end()) {
 			*out = it->second;
 			return true;
@@ -1084,6 +1073,13 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 
 	if (command.kind == AmmCommandKind::MapAuto) {
 		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
+		                                             NormalizeAmmProtection(command.prot));
+	}
+	if (command.kind == AmmCommandKind::MapAsPrt) {
+		return LibKernel::Memory::MapPrtMemory(command.va, command.size);
+	}
+	if (command.kind == AmmCommandKind::RemapIntoPrt) {
+		return LibKernel::Memory::RemapIntoPrtMemory(command.va, command.old_va, command.size,
 		                                             NormalizeAmmProtection(command.prot));
 	}
 
@@ -2261,6 +2257,55 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapDirectWithGpuMaskId(void* command_bu
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
+static int KYTY_SYSV_ABI AmmCommandBufferMapAsPrt(void* command_buffer, uint64_t va,
+                                                  uint64_t size) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAsPrt;
+	command.va   = va;
+	command.size = size;
+
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                           AMM_MAP_AS_PRT_RECORD_SIZE)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferRemapIntoPrt(void* command_buffer, uint64_t va,
+                                                      uint64_t old_va, uint64_t size, int32_t prot,
+                                                      int32_t prot_mask) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || (prot & PROT_CPU_EXEC) != 0 ||
+	    LibKernel::Memory::KernelWriteRemapIntoPrtCommand(nullptr, va, old_va, size, prot,
+	                                                      prot_mask, nullptr) != OK) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind   = AmmCommandKind::RemapIntoPrt;
+	command.va     = va;
+	command.old_va = old_va;
+	command.size   = size;
+	command.prot   = prot;
+
+	const auto header = reinterpret_cast<uint64_t>(command_buffer);
+	uint64_t   buffer = 0;
+	uint32_t   offset = 0;
+	AprShared::ReadGuest(header + COMMAND_BUFFER_DATA_OFFSET, &buffer);
+	AprShared::ReadGuest(header + COMMAND_BUFFER_OFFSET_OFFSET, &offset);
+	if (!AppendCommandRecord(header, command, AMM_REMAP_RECORD_SIZE)) {
+		return LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	return LibKernel::Memory::KernelWriteRemapIntoPrtCommand(
+	    reinterpret_cast<uint32_t*>(buffer + offset), va, old_va, size, prot, prot_mask, nullptr);
+}
+
 static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va, uint64_t size) {
 	PRINT_NAME();
 
@@ -2461,6 +2506,8 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("ojBkmG7+CgE", Ampr::AmmCommandBufferMapWithGpuMaskId);
 	LIB_FUNC("8TBE+9XCZbI", Ampr::AmmCommandBufferMapDirect);
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
+	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
+	LIB_FUNC("0Xo9g4goDXU", Ampr::AmmCommandBufferRemapIntoPrt);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);
 	LIB_FUNC("lwS-7y3jcBI", Ampr::AmmSubmitCommandBuffer);
 	LIB_FUNC("NnKhlMJtIsI", Ampr::AmmSubmitCommandBufferAndGetId);

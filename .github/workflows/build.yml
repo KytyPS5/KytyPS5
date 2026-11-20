@@ -43,6 +43,12 @@ jobs:
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Use the Clang that ships with Visual Studio
+        shell: pwsh
+        run: |
+          Join-Path $env:VCINSTALLDIR "Tools\Llvm\x64\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh

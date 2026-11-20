@@ -120,6 +120,7 @@ public:
 	Id   SslInit(uint64_t pool_size);
 	bool SslTerm(Id ssl_ctx_id);
 	bool SslValid(Id ssl_ctx_id);
+	int  SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats);
 
 	Id   HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size);
 	bool HttpTerm(Id http_ctx_id);
@@ -372,6 +373,23 @@ bool Network::SslValid(Id ssl_ctx_id) {
 
 	return ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
 	       ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used;
+}
+
+int Network::SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	if (stats == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	*stats = {};
+
+	Common::LockGuard lock(m_mutex);
+
+	if (!SslValid(ssl_ctx_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	// Nothing allocates from the pool.
+	stats->pool_size = m_ssl[ssl_ctx_id.GetId()].size;
+	return OK;
 }
 
 Network::Id Network::HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size) {
@@ -2306,7 +2324,9 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
+	// SO_ONESBCAST: Linux and Winsock have no equivalent and reject the raw ID. Black Ops II's
+	// local lobby sets it on its UDP socket after SO_BROADCAST and drops the socket on failure.
 	if (level == 0xffff && optname == 0x10000) {
 		if (optlen != sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
@@ -2830,6 +2850,13 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 	certs->pool          = nullptr;
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI SslGetMemoryPoolStats(int ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->SslGetMemoryPoolStats(Network::Id(ssl_ctx_id), stats);
 }
 
 } // namespace Ssl

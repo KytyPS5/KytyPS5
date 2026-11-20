@@ -114,6 +114,8 @@ static void PrintUsage() {
 	         "games.\n");
 	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable "
 	         "ASCII chars).\n");
+	::printf("  --no-poll-backoff                    Let failed event-flag polls spin instead of "
+	         "yielding.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -242,6 +244,7 @@ static constexpr Flag FLAGS[] = {
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
     {"--playgo-hack", &ConfigOptions::playgo_hack_enabled},
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
+    {"--no-poll-backoff", &ConfigOptions::poll_backoff_enabled, false},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
 #endif

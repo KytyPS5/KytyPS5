@@ -55,61 +55,10 @@ struct ConfigOptions {
 	int32_t                        user_id       = DEFAULT_USER_ID;
 	std::string                    audio_input_device;
 	std::optional<ControllerColor> controller_color;
-	uint32_t                       controller_speaker_volume      = 50;
-	uint32_t                       controller_vibration_intensity = 100;
-	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the
-	// keyboard.
-	uint32_t              keyboard_player     = 0;
-	PresentMode           present_mode        = PresentMode::Mailbox;
-	int32_t               gpu_index           = -1;
-	bool                  fullscreen_enabled  = false;
-	bool                  hdr_enabled         = false;
-	bool                  hide_cursor_enabled = false;
-	bool                  stretch_enabled     = false;
-	bool                  splash_enabled      = true;
-	bool                  vr_enabled          = false;
-	bool                  pro_enabled         = false;
-	PssrUpscaler          pssr_upscaler       = PssrUpscaler::Linear;
-	std::filesystem::path dlss_folder;
-	uint32_t              dlss_preset = 0; // 0 is the model default
-	std::filesystem::path fsr_folder;
-	bool                  amd_cpu_enabled                 = false;
-	bool                  guest_tsc_enabled               = false;
-	bool                  network_connected               = false;
-	bool                  psn_emulation_enabled           = false;
-	uint32_t              vblank_frequency                = 60;
-	uint32_t              console_language                = DEFAULT_CONSOLE_LANGUAGE;
-	bool                  vulkan_validation_enabled       = false;
-	bool                  shader_validation_enabled       = false;
-	bool                  shader_cache_enabled            = true;
-	LogDirection          shader_log_direction            = LogDirection::Silent;
-	std::filesystem::path shader_log_folder               = "_Shaders";
-	bool                  command_buffer_dump_enabled     = false;
-	std::filesystem::path command_buffer_dump_folder      = "_Buffers";
-	bool                  graphics_debug_dump_enabled     = false;
-	LogDirection          printf_direction                = LogDirection::Silent;
-	std::filesystem::path printf_output_file              = "_kyty.txt";
-	bool                  profiler_enabled                = false;
-	bool                  spirv_debug_printf_enabled      = false;
-	bool                  gpu_assisted_validation_enabled = false;
-	bool                  renderdoc_enabled               = false;
-	bool                  readback_linear_images          = false;
-	bool                  readback_tiled_images           = false;
-	bool                  readback_storage_images         = false;
-	bool                  sync_raw_image_buffers          = false;
-	uint32_t              flush_draws                     = 0; // 0 is off
-	bool                  tessellation_enabled            = false;
-	bool                  occlusion_queries_enabled       = false;
-	bool                  relaxed_shader_float            = false;
-	bool                  native_rt                       = false;
-	bool                  lod_stats_enabled               = false;
-	bool                  audio_compile_hold_enabled      = false;
-	bool                  trophy_enabled                  = true;
-	uint32_t              trophy_duration_seconds         = 6;
-	bool                  perf_overlay_enabled            = false;
-	bool                  playgo_hack_enabled             = false;
-	bool                  skip_notice_screen              = false;
-	std::string           launch_activity;
+	bool                           skip_notice_screen = false;
+	std::string                    launch_activity;
+	// Back-to-back failed zero-timeout event-flag polls back off: yield, then sleep briefly.
+	bool poll_backoff_enabled = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -192,6 +141,7 @@ bool     PlayGoHackEnabled();
 bool     SkipNoticeScreen();
 // Activity ID of the one-shot launchActivity game intent; empty sends none.
 const std::string& GetLaunchActivity();
+bool               PollBackoffEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

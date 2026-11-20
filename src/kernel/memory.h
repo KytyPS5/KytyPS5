@@ -26,14 +26,14 @@ void Shutdown();
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
-	uint64_t direct_total           = 0;
-	uint64_t direct_allocated       = 0; // sceKernelAllocateDirectMemory.
-	uint64_t pooled_allocated       = 0; // Memory pool expansions.
-	uint64_t automatic_allocated    = 0; // Extended memory.
-	uint64_t direct_mapped          = 0;
-	uint64_t flexible_total         = 0;
-	uint64_t flexible_used          = 0;
-	uint64_t pool_committed         = 0;
+	uint64_t direct_total        = 0;
+	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated    = 0; // Memory pool expansions.
+	uint64_t automatic_allocated = 0; // Extended memory.
+	uint64_t direct_mapped       = 0;
+	uint64_t flexible_total      = 0;
+	uint64_t flexible_used       = 0;
+	uint64_t pool_committed      = 0;
 	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
 	uint64_t gpu_page_entries       = 0;
 	uint64_t cpu_page_entries_total = 0;
@@ -232,6 +232,7 @@ void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
+uint64_t TestGuestRegionFreePage(size_t region);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
 uint64_t TestFlexibleBackingHighWater();

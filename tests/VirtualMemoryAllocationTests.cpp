@@ -218,8 +218,7 @@ void InitSubsystems() {
 	      "flexible memory does not default to 448 MiB without param.json");
 
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
-	// Regions 1–2 are reserved later via ReserveGuestAddressSpace() (see main), matching
-	// emulator order in agc.cpp after GPU init — without requiring GPU in this harness.
+	// Reserve Regions 1–2 after GPU initialization in the emulator (agc.cpp).
 
 	initialized = true;
 }
@@ -497,6 +496,28 @@ void TestAlignedFreeRangesInRegionHelper() {
 		      free.size() == 2 && free[0] == std::pair {uint64_t {0x11000}, uint64_t {0x20000}} &&
 		          free[1] == std::pair {uint64_t {0x31000}, uint64_t {0x4f000}},
 		      "free ranges must align up/down independently of occupied edges");
+	}
+
+	Check(test, TestAlignedFreeRangesInRegion(region_start, region_start, {}, alignment).empty() &&
+	                TestAlignedFreeRangesInRegion(region_end, region_start, {}, alignment).empty(),
+	      "empty or reversed region must yield no ranges");
+	Check(test, TestAlignedFreeRangesInRegion(region_start, region_end, {}, 0).empty(),
+	      "zero alignment must yield no ranges");
+	{
+		const std::vector<std::pair<uint64_t, uint64_t>> occupied {{0x20000, 0x38000}, {0x30000, 0x40000}};
+		const auto free = TestAlignedFreeRangesInRegion(region_start, region_end, occupied, alignment);
+		Check(test, free.size() == 2 && free[0] == std::pair {uint64_t {0x10000}, uint64_t {0x20000}} &&
+		                free[1] == std::pair {uint64_t {0x40000}, uint64_t {0x50000}},
+		      "overlapping occupied ranges must be merged");
+	}
+	{
+		const std::vector<std::pair<uint64_t, uint64_t>> occupied {{0x30000, 0x40000}, {0x20000, 0x38000}};
+		const auto free = TestAlignedFreeRangesInRegion(region_start, region_end, occupied, alignment);
+		Check(test, free.size() == 2 && free[0] == std::pair {uint64_t {0x10000}, uint64_t {0x20000}} &&
+		                free[1] == std::pair {uint64_t {0x40000}, uint64_t {0x50000}},
+		      "unsorted occupied ranges must be ordered");
+		const auto near_max = TestAlignedFreeRangesInRegion(UINT64_MAX - 0x7ff, UINT64_MAX, {}, alignment);
+		Check(test, near_max.empty(), "alignment near UINT64_MAX must not overflow");
 	}
 
 	std::printf("[host]    %-48s ok\n", test);
@@ -6191,13 +6212,57 @@ void EnsureGuestAddressSpaceReserved() {
 	Libs::LibKernel::Memory::ReserveGuestAddressSpace();
 }
 
+void TestGuestReservationIdempotence() {
+	const char* test = "GuestReservationIdempotence";
+	using namespace Libs::LibKernel::Memory;
+	const std::array<uint64_t, 3> pages {TestGuestRegionFreePage(0), TestGuestRegionFreePage(1),
+	                                     TestGuestRegionFreePage(2)};
+	for (const auto page: pages) {
+		Check(test, page != 0 && TestGuestAddressRangeIsOwned(page, SceKernelPageSize),
+		      "each guest region must contain an owned free page after Phase 2");
+	}
+	ReserveGuestAddressSpace();
+	ReserveGuestAddressSpace();
+	for (size_t i = 0; i < pages.size(); ++i) {
+		Check(test, pages[i] == TestGuestRegionFreePage(i),
+		      "repeated reservation must preserve free ranges");
+	}
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
 	InitSubsystems();
+	bool full_run = true;
+	if (argc == 2) {
+		full_run = std::strcmp(argv[1], "--memory-bottlenecks-only") != 0 &&
+		           std::strcmp(argv[1], "--virtual-ranges-only") != 0 &&
+		           std::strcmp(argv[1], "--backing-transfers-only") != 0 &&
+		           std::strcmp(argv[1], "--red-zone-patcher-only") != 0
+#if defined(__linux__)
+		           && std::strcmp(argv[1], "--fixed-direct-replacement-only") != 0
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+		           && std::strcmp(argv[1], "--fiber-only") != 0
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		           && std::strcmp(argv[1], "--cpu-extensions-only") != 0
+		           && std::strcmp(argv[1], "--extrq-only") != 0
+		           && std::strcmp(argv[1], "--rsqrt-only") != 0
+#endif
+		    ;
+	}
+	if (full_run) {
+		RunTest(TestAlignedFreeRangesInRegionHelper);
+#if defined(__linux__) && !defined(__APPLE__)
+		// This test needs Phase 2 to remain unreserved so it can install a foreign mapping.
+		RunTest(TestForeignMappingPreservedAcrossRemainingReservation);
+#endif
+	}
+	EnsureGuestAddressSpaceReserved();
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 		RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
@@ -6225,7 +6290,6 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 		RunTest(TestFlexibleRangeEditsCoalesce);
 		RunTest(TestPageTableStatsTrackRangeEdits);
@@ -6244,7 +6308,6 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestConcurrentBackingReads);
 		RunTest(TestBackingReadsSkipMappingLock);
@@ -6262,21 +6325,18 @@ int main(int argc, char** argv) {
 	}
 #if defined(__linux__)
 	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestFixedDirectReplacementPreservesAccess);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestSmallFiberStacksAndMigration);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestCpuExtensionContexts);
 		RunTest(TestPackedBitFieldInsert);
 		RunTest(TestCpuExtensionPatches);
@@ -6284,27 +6344,20 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestPackedBitFieldExtract);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
-		EnsureGuestAddressSpaceReserved();
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 
-	RunTest(TestAlignedFreeRangesInRegionHelper);
-#if defined(__linux__) && !defined(__APPLE__)
-	RunTest(TestForeignMappingPreservedAcrossRemainingReservation);
-#endif
-	EnsureGuestAddressSpaceReserved();
+	RunTest(TestGuestReservationIdempotence);
 
 	RunTest(TestFlexibleZeroingTracksBackingLifetime);
 #if defined(__x86_64__) || defined(_M_X64)

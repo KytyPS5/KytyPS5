@@ -104,12 +104,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
-	// NOTE: Memory initialises its data structures first (without reserving the guest
-	// address space). Graphics comes next so that the Vulkan device — including any NGX/DLSS
-	// extensions — is created while the host address space is still fully open. Only after
-	// the Vulkan device exists do we reserve the guest regions; this prevents the NVIDIA NGX
-	// driver from failing with VK_ERROR_INITIALIZATION_FAILED because the placeholder
-	// reservations had already consumed the ranges it needs for internal allocations.
+	// Memory::Initialize reserves Region 0 first. After the Vulkan device is created,
+	// agc.cpp reserves Regions 1 and 2, leaving room for driver initialization.
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();

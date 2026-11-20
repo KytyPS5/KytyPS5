@@ -7631,7 +7631,7 @@ public:
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x4c00000;
+    constexpr uint64_t allocation_size = 0x4e00000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -7791,6 +7791,48 @@ public:
                 "retiring the mip chain lost a GPU-only mip");
       }
       {
+        constexpr uint64_t offset = 0x4c00000;
+        constexpr uint32_t requested_layers = 8;
+        auto cached = MakeLinearDesc(
+            base + offset, 0, vk::Format::eR8Uint,
+            Prospero::BufferFormat::k8UInt, Prospero::ImageType::kColor2D,
+            {256, 256, 1}, 1, 1, 1);
+        cached.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        cached.info.resources = {9, 1};
+        cached.view_info.level_count = 9;
+        cached.info.UpdateSize();
+        auto requested = cached;
+        requested.info.data.size = 0;
+        requested.info.resources = {1, requested_layers};
+        requested.view_info.level_count = 1;
+        requested.view_info.layer_count = requested_layers;
+        requested.view_info.type = vk::ImageViewType::e2DArray;
+        requested.info.UpdateSize();
+        const uint64_t layer_size = requested.info.data.size / requested_layers;
+        const uint32_t mip0_layer =
+            static_cast<uint32_t>(cached.info.mip_layout[0].offset / layer_size);
+        for (uint32_t layer = 0; layer < requested_layers; ++layer) {
+          std::memset(memory + offset + layer * layer_size,
+                      static_cast<int>(0x40u + layer), layer_size);
+        }
+        const auto before = texture_cache.FindImage(cached);
+        (void)texture_cache.FindTexture(before, cached);
+        Require(name, "guest-current array source",
+                mip0_layer != 0 &&
+                    !texture_cache.GetImage(before).IsGpuModified(),
+                "the tiled array fixture was GPU-modified or kept level 0 in layer 0");
+        const auto after = texture_cache.FindImage(requested);
+        (void)texture_cache.FindTexture(after, requested);
+        Require(name, "guest-current array growth contents",
+                after != before &&
+                    ReadCachedTexel(name, context, after, {}, {4, 1, 1}, 0) ==
+                        std::vector<u32>{0x40404040u} &&
+                    ReadCachedTexel(name, context, after, {}, {4, 1, 1},
+                                    mip0_layer) ==
+                        std::vector<u32>{(0x40u + mip0_layer) * 0x01010101u},
+                "a guest-current source overwrote layers at the wrong guest offsets");
+      }
+      {
         constexpr uint64_t offset = 0x4b00000;
         const std::array<uint32_t, 4> values{
             0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
@@ -7934,6 +7976,9 @@ public:
               texture_cache, scheduler.Current(), before,
               {vk::ImageAspectFlagBits::eDepth, mip, 1, 0, 1}, clear);
         }
+        Require(name, "HTile slice consumed before growth",
+                texture_cache.TouchMeta(htile_address, 0, false),
+                "the depth target registered no HTile clear state");
         const auto grown = texture_cache.FindImage(sampled);
         Require(name, "sampled depth growth over a dropped mip",
                 grown != before &&
@@ -7942,8 +7987,9 @@ public:
                         vk::Format::eD32Sfloat &&
                     texture_cache.GetImage(grown).info.resources ==
                         sampled.info.resources &&
-                    texture_cache.IsMetaCleared(htile_address, 0),
-                "the grown depth array lost its pending HTile clears");
+                    !texture_cache.IsMetaCleared(htile_address, 0) &&
+                    texture_cache.IsMetaCleared(htile_address, 1),
+                "the grown depth array lost its HTile clear state");
         Require(name, "sampled depth growth contents",
                 texture_cache.FindTexture(grown, sampled) != nullptr &&
                     ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 0) ==
@@ -7961,7 +8007,10 @@ public:
         auto requested =
             linear_d32(base + offset, sizeof(depth_guest), 1, depth_array_layers);
         const auto before = texture_cache.FindImage(cached);
-        (void)texture_cache.FindDepthTarget(before, cached);
+        texture_cache.UpdateImage(before);
+        Require(name, "guest-only depth source",
+                !texture_cache.GetImage(before).IsGpuModified(),
+                "the guest-only depth source was GPU-modified before growth");
         const auto after = texture_cache.FindImage(requested);
         Require(name, "guest-only depth layer growth",
                 after != before &&

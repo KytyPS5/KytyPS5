@@ -852,22 +852,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		     static_cast<uint32_t>(cached.info.tile_mode));
 	}
 
-	const int32_t requested_mip = requested.MipOf(cached.info);
-	if (requested_mip >= 0) {
-		const int32_t layer = requested.SliceOf(cached.info, requested_mip);
-		return {cached_id, requested_mip, layer};
+	if (const auto view = requested.SubresourceOf(cached.info); view.mip >= 0) {
+		return {cached_id, view.mip, view.layer};
 	}
 
-	const int32_t mip = cached.info.MipOf(requested);
-	if (mip >= 0) {
-		const int32_t layer = cached.info.SliceOf(requested, mip);
+	if (const auto view = cached.info.SubresourceOf(requested); view.mip >= 0) {
 		if (!merged_id) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
-		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
+		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(view.mip),
+		             static_cast<uint32_t>(view.layer));
 		FreeImage(cached_id);
 		return {merged_id};
 	}
@@ -885,11 +881,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
-	const int32_t mip = source.info.MipOf(info);
-	const int32_t layer = source.info.SliceOf(info, mip);
-	if (layer >= 0) {
-		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
+	if (const auto view = source.info.SubresourceOf(info); view.mip >= 0) {
+		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(view.mip),
+		             static_cast<uint32_t>(view.layer));
 	} else {
 		CopyImage(expanded_id, source_id);
 	}

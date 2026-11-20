@@ -7373,9 +7373,8 @@ public:
       subresource.resources = {1, 1};
       subresource.mip_layout = {};
       subresource.mip_layout[0] = {0, 0x4000, 64, 64};
-      const auto mip = subresource.MipOf(chain);
       Require(name, "overlap resolution",
-              mip == 0 && subresource.SliceOf(chain, mip) == 0 &&
+              subresource.SubresourceOf(chain) == ImageSubresource{0, 0} &&
                   ImageRangeOverlaps(chain.data, subresource.data),
               "captured PS5 atlas mip/slice overlap did not resolve");
 

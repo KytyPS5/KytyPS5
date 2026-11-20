@@ -1177,8 +1177,7 @@ void TestNormalizedImageContracts() {
         "normalized image block extent changed");
   Check(subresource.IsCompatible(container),
         "normalized compatible image was rejected");
-  Check(subresource.MipOf(container) == 0 &&
-            subresource.SliceOf(container, 0) == 1,
+  Check(subresource.SubresourceOf(container) == ImageSubresource{0, 1},
         "PS5 mip-chain stride did not resolve the captured second array layer");
 
   auto smaller = subresource;
@@ -1186,29 +1185,29 @@ void TestNormalizedImageContracts() {
   smaller.extent = {128, 128, 1};
   smaller.pitch = 128;
   smaller.mip_layout[0] = {0, 0x10000, 128, 128};
-  Check(smaller.MipOf(container) == 1 && smaller.SliceOf(container, 1) == 0,
+  Check(smaller.SubresourceOf(container) == ImageSubresource{1, 0},
         "PS5 reversed mip ordering did not resolve the captured smaller mip");
 
   auto boundary = subresource;
   boundary.data.address = container.data.address + 99 * 0x56000 + 0x16000;
-  Check(boundary.SliceOf(container, 0) == 99,
+  Check(boundary.SubresourceOf(container) == ImageSubresource{0, 99},
         "PS5 array lookup rejected the final complete layer");
   boundary.data.address += 0x56000;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted a layer beyond the parent range");
   boundary = subresource;
   boundary.data.address += 0x1000;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted a misaligned layer address");
   boundary = subresource;
   boundary.resources.layers = 2;
   boundary.data.size *= 2;
   boundary.mip_layout[0].size *= 2;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted contiguous child layers with a different stride");
   boundary = subresource;
   boundary.mip_layout[0].pitch *= 2;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted a different storage pitch");
 
   auto small_atlas = container;
@@ -1225,17 +1224,33 @@ void TestNormalizedImageContracts() {
   small_child.extent = {32, 32, 1};
   small_child.pitch = 32;
   small_child.mip_layout[0] = {0, 0x1000, 32, 32};
-  Check(small_child.MipOf(small_atlas) == 0 &&
-            small_child.SliceOf(small_atlas, 0) == 6,
+  Check(small_child.SubresourceOf(small_atlas) == ImageSubresource{0, 6},
         "PS5 array lookup doubled the captured small-atlas layer index");
   small_child.data.address = 0x23900d000;
-  Check(small_child.MipOf(small_atlas) == -1,
+  Check(small_child.SubresourceOf(small_atlas).mip == -1,
         "PS5 array lookup treated a packed tail block as the full-size mip");
+
+  // A stencil plane must lie within the container's stencil plane.
+  auto stenciled = container;
+  stenciled.stencil = {0x250000000, 100 * 0x10000};
+  auto stencil_child = subresource;
+  stencil_child.stencil = {stenciled.stencil.End() - 0x10000, 0x10000};
+  Check(stencil_child.SubresourceOf(stenciled) == ImageSubresource{0, 1},
+        "PS5 array lookup rejected a stencil plane ending with its parent");
+  Check(subresource.SubresourceOf(stenciled).mip == -1 &&
+            stencil_child.SubresourceOf(container).mip == -1,
+        "PS5 array lookup ignored a missing stencil plane");
+  auto below = stencil_child;
+  below.stencil.address = stenciled.stencil.address - 0x10000;
+  auto past = stencil_child;
+  past.stencil.address += 0x1000;
+  Check(below.SubresourceOf(stenciled).mip == -1 && past.SubresourceOf(stenciled).mip == -1,
+        "PS5 array lookup accepted a stencil plane outside its parent");
 
   auto incompatible = subresource;
   incompatible.samples = 2;
   Check(!incompatible.IsCompatible(container) &&
-            incompatible.MipOf(container) == -1,
+            incompatible.SubresourceOf(container).mip == -1,
         "sample-count mismatch was accepted as a compatible image");
 
   auto compressed = container;
@@ -1293,13 +1308,12 @@ void TestRebasedTextureMipViews() {
                 view.tiled_slice_stride == std::max<uint64_t>(0x1000, bytes) &&
                 view.DataAlignment() == std::min<uint64_t>(0x1000,
                                                std::max<uint64_t>(0x100, bytes)) &&
-                view.MipOf(chain) == static_cast<int32_t>(level) &&
-                view.SliceOf(chain, static_cast<int32_t>(level)) ==
-                    static_cast<int32_t>(layer),
+                view.SubresourceOf(chain) ==
+                    ImageSubresource{static_cast<int32_t>(level), static_cast<int32_t>(layer)},
             "rebased mip footprint/origin or parent layer stride was incorrect");
       view.UpdateSize();
       Check(view.data.size == bytes && view.mip_layout[0].size == bytes &&
-                view.MipOf(chain) == static_cast<int32_t>(level),
+                view.SubresourceOf(chain).mip == static_cast<int32_t>(level),
             "resizing a normalized view lost its compact footprint");
     }
   }
@@ -1309,19 +1323,19 @@ void TestRebasedTextureMipViews() {
             view.LinearLayout().mips[0].pitch == 32 && view.LinearSize() == 0x1000,
         "captured 16x16 view changed its padded tiling or linear transfer size");
   view.data.address += 0x800;
-  Check(view.MipOf(chain) == -1, "tail view accepted the following mip's address");
+  Check(view.SubresourceOf(chain).mip == -1, "tail view accepted the following mip's address");
   view = make_view(4, 0);
   view.mip_layout[0].pitch /= 2;
-  Check(view.MipOf(chain) == -1, "tail view accepted a different padded pitch");
+  Check(view.SubresourceOf(chain).mip == -1, "tail view accepted a different padded pitch");
   view = make_view(4, 0);
   view.resources.layers = 2;
   view.data.size *= 2;
   view.mip_layout[0].size *= 2;
-  Check(view.MipOf(chain) == -1, "tail array view ignored the parent chain stride");
+  Check(view.SubresourceOf(chain).mip == -1, "tail array view ignored the parent chain stride");
   view = make_view(4, 0);
   view.data = {chain.data.address, 0x1000};
   view.UpdateSize();
-  Check(view.MipOf(chain) == -1,
+  Check(view.SubresourceOf(chain).mip == -1,
         "full-block child ignored the parent mip's nonzero tail origin");
 
   for (uint32_t variant = 0; variant < 9; ++variant) {
@@ -1379,14 +1393,14 @@ void TestRebasedTextureMipViews() {
   Check(sparse_chain.tiled_slice_stride == 0x16000 &&
             sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
             sparse.DataAlignment() == 0x100 && sparse.LinearSize() == 0x200 &&
-            sparse.MipOf(sparse_chain) == 5 && sparse.SliceOf(sparse_chain, 5) == 6,
+            sparse.SubresourceOf(sparse_chain) == ImageSubresource{5, 6},
         "captured sparse 2x2 view lost its byte span, tail origin, or array layer");
   sparse.UpdateSize();
   Check(sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
             sparse.DataAlignment() == 0x100,
         "repeated sparse view sizing changed its span or alignment");
   sparse.data.address -= 0x100;
-  Check(sparse.MipOf(sparse_chain) == -1,
+  Check(sparse.SubresourceOf(sparse_chain).mip == -1,
         "sparse view accepted a different mip-tail origin");
 }
 

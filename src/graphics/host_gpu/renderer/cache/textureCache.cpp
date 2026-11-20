@@ -644,6 +644,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			// PPSA24156: narrow depth targets of different widths share one address and pitch, so
+			// the cached image can be narrower than the render area; drawing past it faults on the
+			// host GPU (NVIDIA: "3D WIDTH ZT Violation"). A target view cannot grow its image.
+			recreate |= requested.extent.width > cached.info.extent.width ||
+			            requested.extent.height > cached.info.extent.height;
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
@@ -679,6 +684,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
 		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
 		if (copy_supported) {
+			// The copy covers only the cached extent. A larger replacement first loads the guest
+			// bytes, so texels outside the overlap hold guest contents rather than undefined data.
+			if (replacement.info.extent.width > cached.info.extent.width ||
+			    replacement.info.extent.height > cached.info.extent.height) {
+				InitializeImage(replacement_id);
+			}
 			CopyImage(replacement_id, cached_id);
 		} else {
 			LOGF_COLOR(Log::Color::BrightYellow,
@@ -696,6 +707,16 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
+	}
+	// Deleting the owner of an HTile range erases its clear state. When the replacement uses the
+	// same range, it takes ownership first, so a pending fast clear still reaches its next pass.
+	if (cached.info.metadata.kind == ImageMetadataKind::Htile &&
+	    replacement.info.metadata.kind == ImageMetadataKind::Htile &&
+	    replacement.info.metadata.range.address == cached.info.metadata.range.address) {
+		const auto metadata = m_surface_metas.find(cached.info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
+			metadata->second.owner = replacement_id;
+		}
 	}
 	FreeImage(cached_id);
 	return replacement_id;

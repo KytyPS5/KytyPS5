@@ -729,7 +729,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
-		// Access the guest mapping so write faults invalidate cached buffers and images.
+		// Invalidate cached buffers, images and image heaps for the whole range in one call.
+		// Letting the write fault page by page costs one fault per page on the GPU thread.
+		// Images end up as those faults would have left them on a fully watched range.
+		// If the range is not fully mapped, fill anyway so the write faults as it did before.
+		(void)m_scheduler.Context().InvalidateSequentialWrite(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
@@ -762,6 +766,11 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) &&
 	    !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		// Invalidate the destination in one call rather than faulting on each page. The source
+		// is not GPU modified so reading it cannot fault. An unmapped range falls through to a
+		// write that faults as before. memcpy's write order is unspecified, so images are
+		// invalidated as if the copy ran front to back like a fill, one rule on every platform.
+		(void)m_scheduler.Context().InvalidateSequentialWrite(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;

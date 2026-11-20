@@ -71,7 +71,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	/// Invalidates images for a CPU write treated as running front to back over the range, such as
+	/// a DMA fill or copy, as its page-by-page faults on a fully watched range would have.
+	void InvalidateSequentialWrite(uint64_t address, uint64_t size);
+	void InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
@@ -266,6 +269,8 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
+	// Caller holds m_lock. A sequential write marks only the images its per-page faults reach.
+	void InvalidateCpuAliases(uint64_t address, uint64_t size, bool sequential_write = false);
 	// Caller holds m_lock. With unlocked_copy, m_lock is released while the guest bytes are copied
 	// and the download is dropped if the image changed meanwhile, so the caller must not keep
 	// references or iterators into the cache across the call.

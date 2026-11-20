@@ -347,7 +347,7 @@ VALUE_OPCODE(BvhStack, U32x2, U32, U32, U32x4, U32x4, U1)
 // xyz, direction xyz, t_max and cull mask; then per candidate {t, u, v, guest prim record}, the
 // guest address of its instance and whether it faces the ray.
 VALUE_OPCODE(RayQueryValid, U1)
-VALUE_OPCODE(RayQueryInitialize, Void, U32, U32, U32, U32, U32, U32, U32, U32, U1)
+VALUE_OPCODE(RayQueryInitialize, Void, U32, U32, U32, U32, U32, U32, U32, U32, U1, U1)
 VALUE_OPCODE(RayQueryProceed, U1, U1)
 VALUE_OPCODE(RayQueryCandidate, U32x4, U1)
 VALUE_OPCODE(RayQueryCandidateInstance, U64, U1)

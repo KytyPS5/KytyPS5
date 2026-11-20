@@ -501,9 +501,9 @@ void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSourc
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
 	if (native && stage == ShaderType::Compute && RayTracing::NativeTraversals()) {
 		key.push_back(0x52545041u);
-		// They count the rays they send back to the guest traversal (--rt-stats).
+		// Instrumented modules count both initialized Vulkan queries and guest fallbacks.
 		if (Config::RayTracingStatsEnabled()) {
-			key.push_back(0x52545354u);
+			key.push_back(0x52545332u);
 		}
 	}
 }

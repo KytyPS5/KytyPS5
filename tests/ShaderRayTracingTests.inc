@@ -338,8 +338,7 @@ void TestRayTracingClosestLeafCalls() {
   layout.inline_offset = 0x80;
   layout.inline_root = 0x25;
   layout.flip_facing = false;
-  // --rt-stats: the site counts the rays it sends back to the guest traversal with a ballot per
-  // wave; without it the program has no ballot count.
+  // Only the instrumented module ballots lanes for the native and fallback counters.
   for (const bool stats : {false, true}) {
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.wave_size = 64;
@@ -648,6 +647,7 @@ struct NativeWalks {
   size_t reach = 0;
   // (Not for a pixel shader: its exports are not valid SPIR-V in the compute stage the walks are traced in.)
   bool validates = true;
+  bool check_ray_stats = false;
 };
 
 void CheckNativeWalks(const NativeWalks &expected) {
@@ -702,6 +702,21 @@ void CheckNativeWalks(const NativeWalks &expected) {
   if (expected.validates) {
     CheckSpirvBinaryValidates(compiled.spirv);
   }
+  if (expected.check_ray_stats) {
+    options.ray_stats = true;
+    auto instrumented = ShaderRecompiler::CompileProgram(
+        ShaderRecompiler::TranslateProgram(expected.code, options), options, specialization);
+    constexpr uint32_t ray_query_initialize = 4473u, atomic_add = 234u, ballot_count = 342u;
+    Check(SpirvInstructionOpcodeCount(instrumented.spirv, ray_query_initialize) ==
+              SpirvInstructionOpcodeCount(compiled.spirv, ray_query_initialize) &&
+              SpirvInstructionOpcodeCount(instrumented.spirv, atomic_add) >
+                  SpirvInstructionOpcodeCount(compiled.spirv, atomic_add) &&
+              SpirvInstructionOpcodeCount(instrumented.spirv, ballot_count) >
+                  SpirvInstructionOpcodeCount(compiled.spirv, ballot_count),
+          "ray statistics changed the query sites or did not count their lanes");
+    CheckSpirvBinaryValidates(instrumented.spirv);
+    std::printf("%s: instrumented shader validated\n", expected.name);
+  }
 }
 
 // The native walks of real programs of each form, with the sites, TLAS sources and instance record layouts the
@@ -714,7 +729,8 @@ void TestRayTracingNativeWalks() {
                     .user_sgpr = 4,
                     .header_offset = 0x10,
                     .layout = {0x76543210u, 0x1dc6ba98u, 0x000dbb8fu, 0u},
-                    .reach = 1});
+                    .reach = 1,
+                    .check_ray_stats = true});
   CheckNativeWalks({.name = "GTA V's cs 0b41af19bddf132c",
                     .code = kGtaFidelityPacketAlpha64,
                     .sites = 3,
@@ -728,7 +744,8 @@ void TestRayTracingNativeWalks() {
                     .user_sgpr = 4,
                     .header_offset = 0x10,
                     .layout = {0x76543210u, 0x3dc6ba98u, 0x000dbb8fu, 0u},
-                    .reach = 3});
+                    .reach = 3,
+                    .check_ray_stats = true});
   CheckNativeWalks({.name = "GTA V's cs 84ed00053b3771da",
                     .code = kGtaShortRaysClosestOpaque64,
                     .user_sgpr = 4,

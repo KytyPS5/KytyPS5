@@ -397,7 +397,9 @@ struct RtStats {
 	// left out). The last program.
 	RtCounter             walks_overflow;
 	std::atomic<uint64_t> last_overflow {0};
-	// --rt-stats: rays sent back to the guest traversal.
+	// GPU counts read from the instrumented sites (--rt-stats).
+	std::atomic<uint64_t>                native_rays {0};
+	uint64_t                             native_rays_reported = 0;
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
 	std::atomic<uint64_t>                last_guest_rays {0};
@@ -434,19 +436,21 @@ void SummarizeRayTracing() {
 	const auto uncached    = stats.walks_uncached.TakeDelta();
 	const auto overflow    = stats.walks_overflow.TakeDelta();
 	const auto unpublished = null_header + bad_header;
-	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
-	const auto rays       = rays_total - stats.guest_rays_reported;
-	stats.guest_rays_reported  = rays_total;
+	const auto totals = RayTracing::GetRayCounts();
+	const auto native_rays = totals.native - stats.native_rays_reported;
+	const auto rays = totals.guest - stats.guest_rays_reported;
+	stats.native_rays_reported = totals.native;
+	stats.guest_rays_reported = totals.guest;
 	const auto programs         = ShaderRecompiler::GetRayTracingPrograms();
 	const auto new_unrecognized = programs.unrecognized - stats.programs_reported.unrecognized;
 	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
 	stats.programs_reported     = programs;
 	// The first call starts the period; dispatches without a TLAS alone trace nothing.
-	if (next == 0 || unrecognized + unpublished + uncached + overflow + rays + new_unrecognized + new_always_guest == 0) {
+	if (next == 0 || unrecognized + unpublished + uncached + overflow + rays + native_rays + new_unrecognized + new_always_guest == 0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
-	log(fmt::format("[RT] summary of the last 10 s: {} dispatches traced through host TLASes, {} walked the guest BVH",
+	log(fmt::format("[RT] summary of the last 10 s: {} dispatches prepared host TLASes, {} used guest traversal",
 	                native, null_tlas + unrecognized));
 	if (unrecognized != 0) {
 		log(fmt::format("[RT]   {} of programs whose BVH walk no form recognizes (last cs {})", unrecognized,
@@ -471,6 +475,10 @@ void SummarizeRayTracing() {
 		                "(last cs {}): their rays missed the rest",
 		                overflow, RtShader(stats.last_overflow.load(std::memory_order_relaxed))));
 	}
+	if (native_rays != 0 || rays != 0) {
+		log(fmt::format("[RT]   instrumented sites: {} Vulkan ray queries initialized, {} rays used guest traversal",
+		                native_rays, rays));
+	}
 	if (rays != 0) {
 		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
 		                RtShader(stats.last_guest_rays.load(std::memory_order_relaxed))));
@@ -494,9 +502,17 @@ void RayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noe
 	}
 }
 
-void RayTracing::NoteGuestRays(uint64_t shader_hash, uint64_t rays) {
-	g_rt_stats.guest_rays.fetch_add(rays, std::memory_order_relaxed);
-	g_rt_stats.last_guest_rays.store(shader_hash, std::memory_order_relaxed);
+RayTracing::RayCounts RayTracing::GetRayCounts() noexcept {
+	return {g_rt_stats.native_rays.load(std::memory_order_relaxed),
+	        g_rt_stats.guest_rays.load(std::memory_order_relaxed)};
+}
+
+void RayTracing::NoteRayCounts(uint64_t shader_hash, uint32_t native, uint32_t guest) {
+	g_rt_stats.native_rays.fetch_add(native, std::memory_order_relaxed);
+	if (guest != 0) {
+		g_rt_stats.guest_rays.fetch_add(guest, std::memory_order_relaxed);
+		g_rt_stats.last_guest_rays.store(shader_hash, std::memory_order_relaxed);
+	}
 	SummarizeRayTracing();
 }
 
@@ -510,8 +526,9 @@ bool RayTracing::NativeTraversals() noexcept {
 
 bool RayTracing::FindTlasSource(const ShaderRecompiler::IR::ShaderInfo& info,
                                       TlasSource& source) noexcept {
-	// Only the programs whose walks the recompiler made native trace through the host structures.
-	if (!info.ray_query || !NativeTraversals()) {
+	// Mirror-only shaders prepare their TLAS through the flattened table in PrepareRayQuery.
+	// Preparing another TLAS here would overwrite the context before the dispatch.
+	if (info.ray_query_sites == 0 || !NativeTraversals()) {
 		return false;
 	}
 	source = {info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root, info.ray_query_layout,

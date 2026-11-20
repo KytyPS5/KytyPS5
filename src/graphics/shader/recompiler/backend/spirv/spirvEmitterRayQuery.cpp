@@ -1019,6 +1019,26 @@ uint32_t GroupMin(EmitterState& s, uint32_t value) {
 	return result;
 }
 
+// Each emitted half-wave counts its own active invocations. The elected lane updates
+// the shader's record once, including when 64 guest lanes span two hardware subgroups.
+void CountQueryLanes(EmitterState& s, uint32_t native, uint32_t guest) {
+	const auto scope = U32(s, spv::ScopeSubgroup);
+	const auto count_lanes = [&](uint32_t predicate) {
+		const auto ballot = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(s, 4), ballot, scope, predicate);
+		const auto count = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformBallotBitCount, TypeU32(s), count, scope,
+		                      spv::GroupOperationReduce, ballot);
+		return count;
+	};
+	const auto native_count = count_lanes(native);
+	const auto guest_count = count_lanes(guest);
+	const auto elected = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(s), elected, scope);
+	const auto any = Binary(s, spv::OpINotEqual, TypeBool(s), Or(s, guest_count, native_count), U32(s, 0));
+	EmitIfCondition(s, LogicalAnd(s, elected, any), [&] { EmitRayCounts(s, guest_count, native_count); });
+}
+
 } // namespace
 
 void DeclareRayQueryVariables(EmitterState& s) {
@@ -1188,28 +1208,6 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// (the same in every lane).
 	const auto& allow  = inst.Arg(14);
 	const auto  native = allow.IsImmediate() && allow.U1() ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
-	if (s.ray_stats) {
-		// --rt-stats: one ballot per wave, and one lane adds the rays that go back to the guest
-		// traversal (an emulated wave of 64 lanes adds both halves at once).
-		const auto guest  = LogicalAnd(s, exec, LogicalNot(s, native));
-		const auto ballot = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(s, 4), ballot,
-		                      U32(s, spv::ScopeSubgroup), guest);
-		auto count = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpGroupNonUniformBallotBitCount, u, count, U32(s, spv::ScopeSubgroup),
-		                      spv::GroupOperationReduce, ballot);
-		if (ctx.half != 0) {
-			count = Add(s, count, s.ray_stats_first_half[site]);
-		}
-		if (ctx.half + 1 < s.lane_count) {
-			s.ray_stats_first_half[site] = count;
-		} else {
-			const auto elected = s.builder.AllocateId();
-			s.builder.AddFunction(spv::OpGroupNonUniformElect, b, elected, U32(s, spv::ScopeSubgroup));
-			EmitIfCondition(s, LogicalAnd(s, elected, Binary(s, spv::OpINotEqual, b, count, U32(s, 0))),
-			                [&] { EmitGuestRayCount(s, count); });
-		}
-	}
 	// Lanes whose ray the hardware cannot take (NaN, infinite or negative extents) find nothing,
 	// as the guest's box tests would not.
 	auto lane_ok = LogicalAnd(s, native, exec);
@@ -1218,6 +1216,9 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	lane_ok = LogicalAnd(s, lane_ok,
 	                     Binary(s, spv::OpFOrdGreaterThanEqual, b, ray[6], ConstantF32Value(s, 0.0f)));
+	if (s.ray_stats) {
+		CountQueryLanes(s, lane_ok, LogicalAnd(s, exec, LogicalNot(s, native)));
+	}
 	const auto traversal = Select(s, u, LogicalAnd(s, native, exec), U32(s, TraversalBit), U32(s, 0));
 	Store(s, lane.state, Or(s, traversal, Select(s, u, lane_ok, U32(s, 0), U32(s, DoneBit))));
 	ClearKeys(s, lane);
@@ -1446,7 +1447,11 @@ uint32_t EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst) {
 // instance, a miss as in the guest's traversal.
 void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
-	EmitIfCondition(s, ctx.Arg(inst, 8), [&] {
+	const auto start = ctx.Arg(inst, 8);
+	if (s.ray_stats) {
+		CountQueryLanes(s, start, LogicalAnd(s, ctx.Arg(inst, 9), LogicalNot(s, start)));
+	}
+	EmitIfCondition(s, start, [&] {
 		const auto              f = TypeF32(s), b = TypeBool(s), zero = ConstantF32Value(s, 0.0f);
 		std::array<uint32_t, 7> ray {};
 		for (uint32_t i = 0; i < ray.size(); ++i) {

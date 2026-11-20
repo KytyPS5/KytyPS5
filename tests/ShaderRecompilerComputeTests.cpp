@@ -59246,9 +59246,21 @@ int main(int argc, char **argv) {
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--bvh-mirror-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--ray-query-stats-only") == 0 ||
+                    std::strcmp(argv[1], "--bvh-mirror-only") == 0)) {
+    const bool stats = std::strcmp(argv[1], "--ray-query-stats-only") == 0;
+    EnsureConfigInitialized();
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.gpu_pipeline_stages = 0;
+    options.async_pipelines_enabled = false;
+    options.native_rt = true;
+    options.rt_stats_enabled = stats;
+    Config::Load(options);
     VulkanHarness vulkan;
-    vulkan.CheckBvhMirror();
+    // The window publishes the device capability before compiling a game shader.
+    RayTracing::SetDeviceSupport(true);
+    if (!stats) vulkan.CheckBvhMirror();
     vulkan.CheckRayQueryTraversal();
     return 0;
   }

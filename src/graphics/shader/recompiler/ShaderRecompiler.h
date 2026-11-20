@@ -29,8 +29,7 @@ struct CompileOptions {
 	// Replace known guest BVH traversal loops with host ray queries (see
 	// IR::TraceNativeTraversals).
 	bool                        native_ray_tracing         = false;
-	// With native_ray_tracing: native traversals count the rays they send back to the guest
-	// walk in the fault buffer (BufferCache::HACK_MARK_GUEST_RAYS; --rt-stats).
+	// With native ray tracing, count initialized Vulkan queries and fallback rays in the fault buffer.
 	bool                        ray_stats                  = false;
 	bool                        table_mode                 = false; // IR::EnterTableMode
 	std::span<const uint32_t>   user_data;

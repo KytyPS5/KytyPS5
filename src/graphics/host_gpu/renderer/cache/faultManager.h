@@ -19,10 +19,10 @@ class BufferCache;
 // are read back asynchronously, as are the hack marks after them (BufferCache::HACK_MARKS_OFFSET).
 class FaultManager {
 	static constexpr size_t MaxPendingFaults = 8;
-	// Fault reads per read of the hack marks.
-	static constexpr uint32_t HackMarksPeriod = 32;
 
 public:
+	// Fault reads per read of the shader marks and ray counters.
+	static constexpr uint32_t HackMarksPeriod = 32;
 	using PagesHandler = Common::UniqueFunction<void, std::span<const uint64_t>>;
 
 	FaultManager(GraphicContext& graphics, CommandScheduler& scheduler, BufferCache& buffer_cache);

@@ -1255,7 +1255,7 @@ void Rewrite(Program& program, Traversal& t) {
 	const auto     invalid = entry(Op::LogicalNot, {valid});
 	const auto     start   = entry(Op::LogicalAnd, {valid, lanes});
 	entry(Op::RayQueryInitialize, {t.ray[0], t.ray[1], t.ray[2], t.ray[3], t.ray[4], t.ray[5],
-	                               t.ray[6], Value(t.cull_mask), start});
+	                               t.ray[6], Value(t.cull_mask), start, lanes});
 	const auto entering = entry(Op::SelectU1, {valid, entry(Op::RayQueryProceed, {start}), lanes});
 	for (auto* lane: t.lanes) {
 		lane->SetArg(Incoming(*lane, t.preheader), entering);
@@ -1371,7 +1371,7 @@ void RewriteWalk(Program& program, Walk& w) {
 	const auto     valid = entry(Op::RayQueryValid, {});
 	const auto     start = entry(Op::LogicalAnd, {valid, w.lanes});
 	entry(Op::RayQueryInitialize, {w.ray[0], w.ray[1], w.ray[2], w.ray[3], w.ray[4], w.ray[5],
-	                               w.ray[6], CullMask(w, Value(w.accepted)), start});
+	                               w.ray[6], CullMask(w, Value(w.accepted)), start, w.lanes});
 	const Inserter skip {w.skip->Parent(), Position(*w.skip)};
 	w.skip->SetArg(0, skip(Op::LogicalAnd, {w.skip->Arg(0), skip(Op::LogicalNot, {valid})}));
 	auto& alive = *w.header->PrependNewInst(w.header->begin(), Op::Phi);

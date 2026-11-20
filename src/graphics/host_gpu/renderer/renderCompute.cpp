@@ -105,7 +105,7 @@ static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 		    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
 		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
 		                  module.info.shader_hash);
-	} else if (info.bvh) {
+	} else if (info.bvh && !info.ray_query_mirror) {
 		// It walks a guest BVH on its own (see the "[RT]" summaries).
 		using Kind = RayTracing::GuestDispatch;
 		RayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unrecognized,

@@ -170,8 +170,10 @@ void FaultManager::ProcessHackMarks() {
 			// Two shaders that marked the entry leave a bit set in a dword and its complement.
 			const bool alone = (mark[0] ^ mark[2]) == ~0u && (mark[1] ^ mark[3]) == ~0u;
 			const auto hash  = alone ? (uint64_t {mark[1]} << 32u) | mark[0] : 0;
-			if (const auto rays = mark[BufferCache::HACK_MARK_GUEST_RAYS]; rays != 0) {
-				RayTracing::NoteGuestRays(hash, rays);
+			const auto guest = mark[BufferCache::HACK_MARK_GUEST_RAYS];
+			const auto native = mark[BufferCache::HACK_MARK_NATIVE_RAYS];
+			if (native != 0 || guest != 0) {
+				RayTracing::NoteRayCounts(hash, native, guest);
 			}
 			for (size_t kind = 0; kind < HackMarkNotices.size(); kind++) {
 				const auto count = mark[BufferCache::HACK_MARK_COUNTS + kind];

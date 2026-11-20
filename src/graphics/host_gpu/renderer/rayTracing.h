@@ -237,9 +237,13 @@ public:
 	// form recognizes. On the execution thread, before the dispatch.
 	enum class GuestDispatch : uint32_t { NullTlas, Unrecognized, Count };
 	static void NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept;
-	// --rt-stats: the rays that the native program `shader_hash` (0: not known) sent back to its
-	// guest traversal, read back from the fault buffer.
-	static void NoteGuestRays(uint64_t shader_hash, uint64_t rays);
+	// GPU counts for instrumented ray query sites; a hash of zero denotes a shared entry.
+	struct RayCounts {
+		uint64_t native;
+		uint64_t guest;
+	};
+	[[nodiscard]] static RayCounts GetRayCounts() noexcept;
+	static void NoteRayCounts(uint64_t shader_hash, uint32_t native, uint32_t guest);
 
 	// The device address of the context table the shaders look their TLAS up in (see
 	// ContextEntry in rt_tlas_walk.comp), 0 when disabled.

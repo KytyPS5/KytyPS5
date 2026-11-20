@@ -139,8 +139,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
 	    "                                       draws that need them while they compile.\n");
-	::printf("  --rt-stats                           With --native-rt: count on the GPU the\n"
-	         "                                       rays that go back to the game's own traversal\n"
+	::printf("  --rt-stats                           With --native-rt: count Vulkan ray queries and guest\n"
+	         "                                       fallback rays on the GPU\n"
 	         "                                       (in the [RT] summaries of the log).\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");

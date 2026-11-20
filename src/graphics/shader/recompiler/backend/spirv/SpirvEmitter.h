@@ -34,7 +34,7 @@ inline constexpr Profile DefaultProfile {};
 // mip_stats_records=false emits the plain variant of a pixel shader instrumented for GET_LOD_STATS
 // (UsesMipStats): the same bindings and code without the per-sample recording, whose storage
 // buffer atomics make the driver run the depth and stencil tests after a shader that can discard.
-// ray_stats: the native ray tracing sites count the rays they send back to the guest traversal
+// ray_stats: instrument the native ray tracing sites to count host queries and fallback rays
 // (CompileOptions::ray_stats).
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,

@@ -2936,19 +2936,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32
 	         "\t num_dwords = %" PRIu32 "\n",
 	         reinterpret_cast<uint64_t>(address), num_dwords);
 
-	if (buf == nullptr || address == nullptr) {
-		LOGF_COLOR(Log::Color::Red, "\t invalid arguments\n");
-		return nullptr;
-	}
-	if ((reinterpret_cast<uintptr_t>(address) & 0x3u) != 0) {
-		LOGF_COLOR(Log::Color::Red, "\t condExec command address is not 4-byte aligned\n");
-		return nullptr;
-	}
-	if (num_dwords > 0x3fffu) {
-		LOGF_COLOR(Log::Color::Red, "\t condExec range is too large: %" PRIu32 "\n", num_dwords);
-		return nullptr;
-	}
-
 	auto* cmd = buf->AllocateDW(5);
 
 	if (cmd == nullptr) {

@@ -54,6 +54,15 @@ TEST(Agc, SetIndexCountWritesZeroAsOne) {
 	}
 }
 
+TEST(Agc, CondExecWritesAnyArguments) {
+	Packet<5> null_large;
+	EXPECT_EQ(Gen5::AgcDcbCondExec(null_large.Buf(), nullptr, 0x4005u), null_large.dw.data());
+	EXPECT_EQ(null_large.dw, (std::array<uint32_t, 5> {0xc0032200u, 0u, 0u, 0u, 5u}));
+	Packet<5> unaligned;
+	Gen5::AgcDcbCondExec(unaligned.Buf(), reinterpret_cast<const volatile uint32_t*>(0x1234561002ull), 7u);
+	EXPECT_EQ(unaligned.dw, (std::array<uint32_t, 5> {0xc0032200u, 0x34561000u, 0x12u, 0u, 7u}));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

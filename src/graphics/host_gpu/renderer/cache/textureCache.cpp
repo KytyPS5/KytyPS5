@@ -1277,6 +1277,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			depth.stencil_ids.push_back(association);
 		}
 		ReleaseHtileOwner(association, record.info.metadata);
+		// A resident image heap may sample the adopted image, for example an R8 texture at
+		// the stencil range. Its references still belong to that image, so queue the change.
+		record.HeapChanged();
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;

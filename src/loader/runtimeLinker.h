@@ -11,6 +11,10 @@
 #include <memory>
 #include <vector>
 
+namespace Common::HostException {
+struct ExceptionInfo;
+} // namespace Common::HostException
+
 namespace Loader {
 
 struct EntryParams {
@@ -199,6 +203,8 @@ private:
 
 uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, uint16_t phnum);
 bool     IsGuestCodeAddress(uint64_t address);
+
+[[noreturn]] void ReportUnhandledHostException(const Common::HostException::ExceptionInfo& info);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool     TestMainEntryUsesGuestStack();

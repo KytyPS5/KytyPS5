@@ -1,5 +1,6 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/subsystems.h"
@@ -50,16 +51,24 @@
 
 #if defined(__linux__)
 #include <asm/prctl.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <ucontext.h>
 #include <unistd.h>
 #endif
 
 #if defined(__APPLE__)
+#include <climits>
+#include <csignal>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -7705,71 +7714,134 @@ void EnsureGuestAddressSpaceReserved() {
   Libs::LibKernel::Memory::ReserveGuestAddressSpace();
 }
 
-void TestGuestReservationIdempotence() {
-  const char *test = "GuestReservationIdempotence";
-  using namespace Libs::LibKernel::Memory;
-  const std::array<uint64_t, 3> pages{TestGuestRegionFreePage(0),
-                                      TestGuestRegionFreePage(1),
-                                      TestGuestRegionFreePage(2)};
-  for (const auto page : pages) {
-    Check(test,
-          page != 0 && TestGuestAddressRangeIsOwned(page, SceKernelPageSize),
-          "each guest region must contain an owned free page after Phase 2");
-  }
-  ReserveGuestAddressSpace();
-  ReserveGuestAddressSpace();
-  for (size_t i = 0; i < pages.size(); ++i) {
-    Check(test, pages[i] == TestGuestRegionFreePage(i),
-          "repeated reservation must preserve free ranges");
-  }
-        std::printf("[host]    %-48s ok
-", test);
+[[noreturn]] void ReportFaultTo(const char *log_path) {
+  static Common::Subsystems subsystems;
+  subsystems.Initialize<Config::Lifecycle>();
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::File;
+  options.printf_output_file = std::filesystem::path(log_path);
+  Config::Load(options);
+  subsystems.Initialize<Log::Lifecycle>();
+  static std::array<uint8_t, 96> code{};
+  static std::array<uint64_t, 32> stack{};
+  Common::HostException::ExceptionInfo info{};
+  code[48] = 0xc3;
+  stack[0] = 0x1122334455667788ull;
+  info.type = Common::HostException::ExceptionType::AccessViolation;
+  info.exception_address = reinterpret_cast<uint64_t>(code.data()) + 48;
+  info.rsp = reinterpret_cast<uint64_t>(stack.data());
+  info.rax = 0x0123456789abcdefull;
+  Loader::ReportUnhandledHostException(info);
 }
 
-/// Initializes the test subsystems and runs the suite or the subset selected by
-/// one option. Returns a nonzero exit status if a selected test fails.
+constexpr std::chrono::milliseconds FaultReportChildTimeout{30000};
+
+int RunFaultReportChild(const char *test,
+                        const std::filesystem::path &log_path) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  char self[MAX_PATH]{};
+  Check(test, GetModuleFileNameA(nullptr, self, MAX_PATH) != 0,
+        "GetModuleFileName failed");
+  std::string command = std::string("\"") + self + "\" --fault-report \"" +
+                        log_path.string() + "\"";
+  STARTUPINFOA startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  Check(test,
+        CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                       &process) != 0,
+        "CreateProcess failed");
+  const auto timeout = static_cast<DWORD>(FaultReportChildTimeout.count());
+  const bool exited =
+      WaitForSingleObject(process.hProcess, timeout) == WAIT_OBJECT_0;
+  if (!exited) {
+    TerminateProcess(process.hProcess, 1);
+    WaitForSingleObject(process.hProcess, INFINITE);
+  }
+  DWORD exit_code = 0;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  Check(test, exited, "the fault report child timed out");
+  return static_cast<int>(exit_code);
+#else
+#if defined(__APPLE__)
+  std::vector<char> self(PATH_MAX);
+  uint32_t self_size = static_cast<uint32_t>(self.size());
+  if (_NSGetExecutablePath(self.data(), &self_size) != 0) {
+    self.resize(self_size);
+    Check(test, _NSGetExecutablePath(self.data(), &self_size) == 0,
+          "_NSGetExecutablePath failed");
+  }
+  const char *self_path = self.data();
+#else
+  const char *self_path = "/proc/self/exe";
+#endif
+  const pid_t pid = ::fork();
+  Check(test, pid >= 0, "fork failed");
+  if (pid == 0) {
+    const int null_fd = ::open("/dev/null", O_WRONLY);
+    ::dup2(null_fd, STDOUT_FILENO);
+    ::dup2(null_fd, STDERR_FILENO);
+    ::execl(self_path, self_path, "--fault-report", log_path.c_str(), nullptr);
+    std::_Exit(0x7e);
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + FaultReportChildTimeout;
+  int status = 0;
+  pid_t waited = 0;
+  while ((waited = ::waitpid(pid, &status, WNOHANG)) == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (waited == 0) {
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+  }
+  Check(test, waited == pid, "the fault report child timed out");
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+void TestFaultReportReachesTheLogFile() {
+  const char *test = "FaultReportReachesTheLogFile";
+  const auto stamp =
+      std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto log_path = std::filesystem::temp_directory_path() /
+                        ("kyty_fault_report_" + std::to_string(stamp) + ".txt");
+  const int exit_code = RunFaultReportChild(test, log_path);
+  std::string text;
+  {
+    Common::File log(log_path, Common::File::Mode::Read);
+    if (!log.IsInvalid()) {
+      const auto data = log.ReadWholeBuffer();
+      text.assign(reinterpret_cast<const char *>(data.data()), data.size());
+    }
+  }
+  std::error_code ec;
+  std::filesystem::remove(log_path, ec);
+  Check(test, exit_code == 321 || exit_code == (321 & 0xff),
+        "the fault report did not end in EXIT");
+  Check(test, text.find("Unhandled host exception") != std::string::npos,
+        "the fault report is missing from the log file");
+  Check(test,
+        text.find("--- Guest fault context ---\nthread: (host "
+                  "thread)\nrax=0123456789abcdef") != std::string::npos &&
+            text.find("\n c3 00 00") != std::string::npos &&
+            text.find("stack:\n  1122334455667788 0000000000000000") !=
+                std::string::npos,
+        "the guest fault context is missing from the log file");
+  std::printf("[host]    %-48s ok\n", test);
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
     return RunTrinityTests();
   }
+  if (argc == 3 && std::strcmp(argv[1], "--fault-report") == 0) {
+    ReportFaultTo(argv[2]);
+  }
   InitSubsystems();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  if (argc == 2 && std::strcmp(argv[1], "--guest-stack-only") == 0) {
-    RunTest(TestGuestStackNormalReturn);
-    RunTest(TestGuestStackPthreadExit);
-    RunTest(TestGuestStackHandledFault);
-    RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
-    return g_failed_tests == 0 ? 0 : 1;
-  }
-#endif
-  bool full_run = true;
-  if (argc == 2) {
-    full_run = std::strcmp(argv[1], "--memory-bottlenecks-only") != 0 &&
-               std::strcmp(argv[1], "--virtual-ranges-only") != 0 &&
-               std::strcmp(argv[1], "--backing-transfers-only") != 0 &&
-               std::strcmp(argv[1], "--red-zone-patcher-only") != 0
-#if defined(__linux__)
-               && std::strcmp(argv[1], "--fixed-direct-replacement-only") != 0
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-               && std::strcmp(argv[1], "--fiber-only") != 0
-#endif
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-               && std::strcmp(argv[1], "--cpu-extensions-only") != 0 &&
-               std::strcmp(argv[1], "--extrq-only") != 0 &&
-               std::strcmp(argv[1], "--rsqrt-only") != 0
-#endif
-        ;
-  }
-  if (full_run) {
-    RunTest(TestAlignedFreeRangesInRegionHelper);
-#if defined(__linux__) && !defined(__APPLE__)
-    // This test needs Phase 2 to remain unreserved so it can install a foreign
-    // mapping.
-    RunTest(TestForeignMappingPreservedAcrossRemainingReservation);
-#endif
-  }
-  EnsureGuestAddressSpaceReserved();
   if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
     RunTest(TestFlexibleZeroingTracksBackingLifetime);
     RunTest(TestFlexibleMemoryReuseIsZeroFilled);
@@ -7784,8 +7856,6 @@ int main(int argc, char **argv) {
     RunTest(TestDirectTrimmedAliasRelease);
     RunTest(TestDirectMappingNamesTypesAndValidation);
     RunTest(TestAutomaticMemoryReuseAndAliases);
-    RunTest(TestAmmMapAsPrt);
-    RunTest(TestAmmRemapIntoPrt);
     RunTest(TestAutomaticMemoryFragmentedMap);
     RunTest(TestFragmentedMemoryPoolBacking);
     RunTest(TestMemoryPoolMiddleDecommitAndReuse);
@@ -7865,135 +7935,298 @@ int main(int argc, char **argv) {
     RunTest(TestWindowsGuestRedZoneStaticPatcher);
     return g_failed_tests == 0 ? 0 : 1;
   }
+>>>>>>> pr-2227
 
-  RunTest(TestGuestReservationIdempotence);
-  RunTest(TestGuestReservationRace);
-  RunTest(TestFlexibleZeroingTracksBackingLifetime);
-#if defined(__x86_64__) || defined(_M_X64)
-  RunTest(TestSmallFiberStacksAndMigration);
-#endif
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  RunTest(TestPackedReciprocalSquareRoot);
-  RunTest(TestPackedBitFieldExtract);
-  RunTest(TestCpuExtensionContexts);
-  RunTest(TestPackedBitFieldInsert);
-  RunTest(TestCpuExtensionPatches);
-  RunTest(TestTimeStampCounterPatches);
-#endif
-  RunTest(TestWindowsGuestRedZoneStaticPatcher);
-  RunTest(TestProsperoArgumentAndInfoSizeContracts);
-  RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
-  RunTest(TestSparseBackingReadPreservesResidency);
-  RunTest(TestCopySparseMemoryMappings);
-  RunTest(TestSparseReadDuringDirectCommit);
-  RunTest(TestConcurrentBackingReads);
-  RunTest(TestBackingReadsSkipMappingLock);
-  RunTest(TestQueriesSkipOperationLock);
-  RunTest(TestQueriesWaitForStateChanges);
-  RunTest(TestTrackerProtectSharesBackingReads);
-  RunTest(TestClampRangeSkipsStateLock);
-  RunTest(TestGuestAddressSpaceHasNoFixedFallback);
-  RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
-  RunTest(TestFragmentedGuestFreeRangeHints);
-  RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
-  RunTest(TestFlexibleMemoryCapacityIsBootFixed);
-  RunTest(TestFlexibleMemoryUsesSharedBacking);
-  RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
-  RunTest(TestFlexibleNoCoalescePreservesBoundaries);
-  RunTest(TestFlexibleMemoryReuseIsZeroFilled);
-  RunTest(TestSmallerFlexibleMapReusesReleasedHole);
-  RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  RunTest(TestGuestStackNormalReturn);
-  RunTest(TestGuestStackPthreadExit);
-  RunTest(TestGuestStackHandledFault);
-#endif
-  RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
-  RunTest(TestFragmentedBackingPublication);
-  RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
-  RunTest(TestRuntimeMemoryOwnerLifecycle);
-  RunTest(TestFlexibleMapQueryAndWholeMunmap);
-  RunTest(TestPartialFlexibleMunmapAndFindNext);
-  RunTest(TestFlexibleRangeEditsCoalesce);
-  RunTest(TestPageTableStatsTrackRangeEdits);
-  RunTest(TestReserveMapFixedAndNoOverwrite);
-  RunTest(TestFixedNoOverwriteRejectsReservedRange);
-  RunTest(TestReleasedReserveCanBeReused);
-  RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
-  RunTest(TestMunmapGpuRuns);
-  RunTest(TestMunmapRoundsToPages);
-  RunTest(TestRangeNamesCoverWholePages);
-  RunTest(TestMprotectSkipsUncommittedRanges);
-  RunTest(TestFixedReplacementGpuUnmaps);
-  RunTest(TestFixedReserveValidatesBeforeUnmapping);
-  RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
-  RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
-  RunTest(TestDirectTrimmedAliasRelease);
-  RunTest(TestFixedArenaChurnKeepsRangesExact);
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  RunTest(TestPartialUnmapPreservesHostPermissions);
-#endif
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  RunTest(TestAccessDuringMappingReplacement);
-  RunTest(TestWindowsBackingViewPermissions);
-#endif
-  RunTest(TestDirectMappingNamesTypesAndValidation);
-  RunTest(TestBatchMappingOperationsAndPartialFailure);
-  RunTest(TestDirectMapValidationBeforeOwnerMutation);
-  RunTest(TestDirectReleaseUnmapsGpuRuns);
-  RunTest(TestDirectReleaseContracts);
-  RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
-  RunTest(TestDirectMapAcrossContiguousAllocations);
-  RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
-  RunTest(TestDirectAlignmentStaysWithinSearchRange);
-  RunTest(TestDefaultDirectMapUsesSystemAddressRange);
-  RunTest(TestLargeDirectMapAliasesAcrossChunks);
-  RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
-  RunTest(TestDirectMemoryContentPersistsAcrossRemap);
-  RunTest(TestDirectMapUnmapReusesHostAddress);
-#if defined(__linux__)
-  RunTest(TestFixedDirectReplacementPreservesAccess);
-#endif
-  RunTest(TestFixedReserveReplacesPartialDirectMapping);
-  RunTest(TestLargeHintedReserveHostsSmallDirectMap);
-  RunTest(TestExtendedAndUserMappingsDoNotAlias);
-  RunTest(TestAutomaticMemoryReuseAndAliases);
-  RunTest(TestAmmMapAsPrt);
-  RunTest(TestAmmRemapIntoPrt);
-  RunTest(TestAmmSubmitReusedHeaderStorage);
-  RunTest(TestAutomaticMemoryFragmentedMap);
-  RunTest(TestMemoryPoolReserveInsideReservation);
-  RunTest(TestMemoryPoolAlignmentContracts);
-  RunTest(TestProsperoSampleMemoryPoolExpandCommit);
-  RunTest(TestFragmentedMemoryPoolBacking);
-  RunTest(TestMemoryPoolMiddleDecommitAndReuse);
-  RunTest(TestMemoryPoolMultiRangeDecommit);
-  RunTest(TestFragmentedPoolDecommitOnSmallStack);
-  RunTest(TestMemoryPoolCommitDecommitQueryFlags);
-  RunTest(TestProgramMemoryAllocationAndProtection);
-  RunTest(TestModuleRelocationUsesWritableHostMapping);
-  RunTest(TestModuleSegmentsUseFlexibleMemory);
-#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  RunTest(TestGuestTlsReadsUseThreadTcb);
-#endif
-  RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
-  // Memory callbacks remain registered for the rest of the process.
-  RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
-  RunTest(TestAsanAliasedPhysicalRelease);
-  RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
-  RunTest(TestRaisedSignalHoldsTarget);
-  RunTest(TestGuestCodeRangeFollowsAllocation);
-  RunTest(TestRaisedSignalInterruptsGuestCode);
-  RunTest(TestRaisedSignalWaitsForItsHandler);
-  RunTest(TestRaisedSignalReachesCancellingThread);
-  RunTest(TestRaisedSignalSkipsExitedTarget);
-
-  if (g_failed_tests != 0) {
-    std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n",
-                g_failed_tests);
-    return 1;
+  void TestGuestReservationIdempotence() {
+    const char *test = "GuestReservationIdempotence";
+    using namespace Libs::LibKernel::Memory;
+    const std::array<uint64_t, 3> pages{TestGuestRegionFreePage(0),
+                                        TestGuestRegionFreePage(1),
+                                        TestGuestRegionFreePage(2)};
+    for (const auto page : pages) {
+      Check(test,
+            page != 0 && TestGuestAddressRangeIsOwned(page, SceKernelPageSize),
+            "each guest region must contain an owned free page after Phase 2");
+    }
+    ReserveGuestAddressSpace();
+    ReserveGuestAddressSpace();
+    for (size_t i = 0; i < pages.size(); ++i) {
+      Check(test, pages[i] == TestGuestRegionFreePage(i),
+            "repeated reservation must preserve free ranges");
+    }
+        std::printf("[host]    %-48s ok
+", test);
   }
 
-  std::printf("VirtualMemoryAllocationTests: all cases passed\n");
-  return 0;
-}
+  /// Initializes the test subsystems and runs the suite or the subset selected
+  /// by one option. Returns a nonzero exit status if a selected test fails.
+  int main(int argc, char **argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
+      return RunTrinityTests();
+    }
+    InitSubsystems();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    if (argc == 2 && std::strcmp(argv[1], "--guest-stack-only") == 0) {
+      RunTest(TestGuestStackNormalReturn);
+      RunTest(TestGuestStackPthreadExit);
+      RunTest(TestGuestStackHandledFault);
+      RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+#endif
+    bool full_run = true;
+    if (argc == 2) {
+      full_run = std::strcmp(argv[1], "--memory-bottlenecks-only") != 0 &&
+                 std::strcmp(argv[1], "--virtual-ranges-only") != 0 &&
+                 std::strcmp(argv[1], "--backing-transfers-only") != 0 &&
+                 std::strcmp(argv[1], "--red-zone-patcher-only") != 0
+#if defined(__linux__)
+                 && std::strcmp(argv[1], "--fixed-direct-replacement-only") != 0
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+                 && std::strcmp(argv[1], "--fiber-only") != 0
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+                 && std::strcmp(argv[1], "--cpu-extensions-only") != 0 &&
+                 std::strcmp(argv[1], "--extrq-only") != 0 &&
+                 std::strcmp(argv[1], "--rsqrt-only") != 0
+#endif
+          ;
+    }
+    if (full_run) {
+      RunTest(TestAlignedFreeRangesInRegionHelper);
+#if defined(__linux__) && !defined(__APPLE__)
+      // This test needs Phase 2 to remain unreserved so it can install a
+      // foreign mapping.
+      RunTest(TestForeignMappingPreservedAcrossRemainingReservation);
+#endif
+    }
+    EnsureGuestAddressSpaceReserved();
+    if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
+      RunTest(TestFlexibleZeroingTracksBackingLifetime);
+      RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+      RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
+      RunTest(TestFragmentedBackingPublication);
+      RunTest(TestSmallerFlexibleMapReusesReleasedHole);
+      RunTest(TestFragmentedGuestFreeRangeHints);
+      RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
+      RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
+      RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+      RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+      RunTest(TestDirectTrimmedAliasRelease);
+      RunTest(TestDirectMappingNamesTypesAndValidation);
+      RunTest(TestAutomaticMemoryReuseAndAliases);
+      RunTest(TestAmmMapAsPrt);
+      RunTest(TestAmmRemapIntoPrt);
+      RunTest(TestAutomaticMemoryFragmentedMap);
+      RunTest(TestFragmentedMemoryPoolBacking);
+      RunTest(TestMemoryPoolMiddleDecommitAndReuse);
+      RunTest(TestMemoryPoolMultiRangeDecommit);
+      RunTest(TestFragmentedPoolDecommitOnSmallStack);
+      // Memory callbacks remain registered for the rest of the process.
+      RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
+      RunTest(TestAsanAliasedPhysicalRelease);
+      RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
+      RunTest(TestFlexibleNoCoalescePreservesBoundaries);
+      RunTest(TestFlexibleRangeEditsCoalesce);
+      RunTest(TestPageTableStatsTrackRangeEdits);
+      RunTest(TestPartialFlexibleMunmapAndFindNext);
+      RunTest(TestReserveMapFixedAndNoOverwrite);
+      RunTest(TestFixedNoOverwriteRejectsReservedRange);
+      RunTest(TestFixedArenaChurnKeepsRangesExact);
+      RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+      RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+#if defined(__linux__)
+      RunTest(TestFixedDirectReplacementPreservesAccess);
+#endif
+      RunTest(TestFixedReserveReplacesPartialDirectMapping);
+      RunTest(TestMemoryPoolMultiRangeDecommit);
+      RunTest(TestProgramMemoryAllocationAndProtection);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--backing-transfers-only") == 0) {
+      RunTest(TestFlexibleZeroingTracksBackingLifetime);
+      RunTest(TestConcurrentBackingReads);
+      RunTest(TestBackingReadsSkipMappingLock);
+      RunTest(TestQueriesSkipOperationLock);
+      RunTest(TestQueriesWaitForStateChanges);
+      RunTest(TestTrackerProtectSharesBackingReads);
+      RunTest(TestClampRangeSkipsStateLock);
+      RunTest(TestSparseBackingReadPreservesResidency);
+      RunTest(TestCopySparseMemoryMappings);
+      RunTest(TestSparseReadDuringDirectCommit);
+      RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+      RunTest(TestFlexibleMemoryUsesSharedBacking);
+      RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+#if defined(__linux__)
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
+      RunTest(TestFixedDirectReplacementPreservesAccess);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+    if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
+      RunTest(TestSmallFiberStacksAndMigration);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    if (argc == 2 && std::strcmp(argv[1], "--cpu-extensions-only") == 0) {
+      RunTest(TestCpuExtensionContexts);
+      RunTest(TestPackedBitFieldInsert);
+      RunTest(TestCpuExtensionPatches);
+      RunTest(TestTimeStampCounterPatches);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
+      RunTest(TestPackedBitFieldExtract);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
+      RunTest(TestPackedReciprocalSquareRoot);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+#endif
+    if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
+      RunTest(TestWindowsGuestRedZoneStaticPatcher);
+      return g_failed_tests == 0 ? 0 : 1;
+    }
+
+    RunTest(TestGuestReservationIdempotence);
+    RunTest(TestGuestReservationRace);
+    RunTest(TestFlexibleZeroingTracksBackingLifetime);
+#if defined(__x86_64__) || defined(_M_X64)
+    RunTest(TestSmallFiberStacksAndMigration);
+#endif
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    RunTest(TestPackedReciprocalSquareRoot);
+    RunTest(TestPackedBitFieldExtract);
+    RunTest(TestCpuExtensionContexts);
+    RunTest(TestPackedBitFieldInsert);
+    RunTest(TestCpuExtensionPatches);
+    RunTest(TestTimeStampCounterPatches);
+#endif
+    RunTest(TestWindowsGuestRedZoneStaticPatcher);
+    RunTest(TestProsperoArgumentAndInfoSizeContracts);
+    RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
+    RunTest(TestSparseBackingReadPreservesResidency);
+    RunTest(TestCopySparseMemoryMappings);
+    RunTest(TestSparseReadDuringDirectCommit);
+    RunTest(TestConcurrentBackingReads);
+    RunTest(TestBackingReadsSkipMappingLock);
+    RunTest(TestQueriesSkipOperationLock);
+    RunTest(TestQueriesWaitForStateChanges);
+    RunTest(TestTrackerProtectSharesBackingReads);
+    RunTest(TestClampRangeSkipsStateLock);
+    RunTest(TestGuestAddressSpaceHasNoFixedFallback);
+    RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
+    RunTest(TestFragmentedGuestFreeRangeHints);
+    RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
+    RunTest(TestFlexibleMemoryCapacityIsBootFixed);
+    RunTest(TestFlexibleMemoryUsesSharedBacking);
+    RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
+    RunTest(TestFlexibleNoCoalescePreservesBoundaries);
+    RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+    RunTest(TestSmallerFlexibleMapReusesReleasedHole);
+    RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    RunTest(TestGuestStackNormalReturn);
+    RunTest(TestGuestStackPthreadExit);
+    RunTest(TestGuestStackHandledFault);
+#endif
+    RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
+    RunTest(TestFragmentedBackingPublication);
+    RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
+    RunTest(TestRuntimeMemoryOwnerLifecycle);
+    RunTest(TestFlexibleMapQueryAndWholeMunmap);
+    RunTest(TestPartialFlexibleMunmapAndFindNext);
+    RunTest(TestFlexibleRangeEditsCoalesce);
+    RunTest(TestPageTableStatsTrackRangeEdits);
+    RunTest(TestReserveMapFixedAndNoOverwrite);
+    RunTest(TestFixedNoOverwriteRejectsReservedRange);
+    RunTest(TestReleasedReserveCanBeReused);
+    RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+    RunTest(TestMunmapGpuRuns);
+    RunTest(TestMunmapRoundsToPages);
+    RunTest(TestRangeNamesCoverWholePages);
+    RunTest(TestMprotectSkipsUncommittedRanges);
+    RunTest(TestFixedReplacementGpuUnmaps);
+    RunTest(TestFixedReserveValidatesBeforeUnmapping);
+    RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+    RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+    RunTest(TestDirectTrimmedAliasRelease);
+    RunTest(TestFixedArenaChurnKeepsRangesExact);
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    RunTest(TestPartialUnmapPreservesHostPermissions);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    RunTest(TestAccessDuringMappingReplacement);
+    RunTest(TestWindowsBackingViewPermissions);
+#endif
+    RunTest(TestDirectMappingNamesTypesAndValidation);
+    RunTest(TestBatchMappingOperationsAndPartialFailure);
+    RunTest(TestDirectMapValidationBeforeOwnerMutation);
+    RunTest(TestDirectReleaseUnmapsGpuRuns);
+    RunTest(TestDirectReleaseContracts);
+    RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
+    RunTest(TestDirectMapAcrossContiguousAllocations);
+    RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
+    RunTest(TestDirectAlignmentStaysWithinSearchRange);
+    RunTest(TestDefaultDirectMapUsesSystemAddressRange);
+    RunTest(TestLargeDirectMapAliasesAcrossChunks);
+    RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
+    RunTest(TestDirectMemoryContentPersistsAcrossRemap);
+    RunTest(TestDirectMapUnmapReusesHostAddress);
+#if defined(__linux__)
+    RunTest(TestFixedDirectReplacementPreservesAccess);
+#endif
+    RunTest(TestFixedReserveReplacesPartialDirectMapping);
+    RunTest(TestLargeHintedReserveHostsSmallDirectMap);
+    RunTest(TestExtendedAndUserMappingsDoNotAlias);
+    RunTest(TestAutomaticMemoryReuseAndAliases);
+    RunTest(TestAmmMapAsPrt);
+    RunTest(TestAmmRemapIntoPrt);
+    RunTest(TestAmmSubmitReusedHeaderStorage);
+    RunTest(TestAutomaticMemoryFragmentedMap);
+    RunTest(TestMemoryPoolReserveInsideReservation);
+    RunTest(TestMemoryPoolAlignmentContracts);
+    RunTest(TestProsperoSampleMemoryPoolExpandCommit);
+    RunTest(TestFragmentedMemoryPoolBacking);
+    RunTest(TestMemoryPoolMiddleDecommitAndReuse);
+    RunTest(TestMemoryPoolMultiRangeDecommit);
+    RunTest(TestFragmentedPoolDecommitOnSmallStack);
+    RunTest(TestMemoryPoolCommitDecommitQueryFlags);
+    RunTest(TestProgramMemoryAllocationAndProtection);
+    RunTest(TestModuleRelocationUsesWritableHostMapping);
+    RunTest(TestModuleSegmentsUseFlexibleMemory);
+#if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    RunTest(TestGuestTlsReadsUseThreadTcb);
+#endif
+    RunTest(TestGuestTlsGetAddrUsesPerThreadBlocks);
+    RunTest(TestFaultReportReachesTheLogFile);
+    // Memory callbacks remain registered for the rest of the process.
+    RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
+    RunTest(TestAsanAliasedPhysicalRelease);
+    RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
+    RunTest(TestRaisedSignalHoldsTarget);
+    RunTest(TestGuestCodeRangeFollowsAllocation);
+    RunTest(TestRaisedSignalInterruptsGuestCode);
+    RunTest(TestRaisedSignalWaitsForItsHandler);
+    RunTest(TestRaisedSignalReachesCancellingThread);
+    RunTest(TestRaisedSignalSkipsExitedTarget);
+
+    if (g_failed_tests != 0) {
+      std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n",
+                  g_failed_tests);
+      return 1;
+    }
+
+    std::printf("VirtualMemoryAllocationTests: all cases passed\n");
+    return 0;
+  }

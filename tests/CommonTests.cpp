@@ -21,6 +21,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
+
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace {
 
@@ -298,6 +303,62 @@ TEST(Thread, SleepsAtLeastTheRequestedTimeAndIdsAreUniquePerThread) {
 	EXPECT_NE(other_id, id);
 	EXPECT_FALSE(other_main);
 }
+
+#ifdef __linux__
+unsigned ReadCpuValue(int cpu, const char* file) {
+	unsigned value = 0;
+	std::ifstream("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file) >> value;
+	return value;
+}
+
+TEST(Thread, ReservesTheFastestCoreAndRestoresTheProcessAffinity) {
+	Common::InitializeThreads();
+	int       processor = -1;
+	cpu_set_t reserved {};
+	std::thread([&] {
+		processor = Common::Thread::ReserveCoreForCurrentThread();
+		ASSERT_EQ(sched_getaffinity(0, sizeof(reserved), &reserved), 0);
+	}).join();
+	cpu_set_t others {};
+	ASSERT_EQ(sched_getaffinity(0, sizeof(others), &others), 0);
+	const auto rank = [](int cpu) {
+		return std::tuple(ReadCpuValue(cpu, "acpi_cppc/highest_perf"),
+		                  ReadCpuValue(cpu, "cpufreq/cpuinfo_max_freq"),
+		                  ReadCpuValue(cpu, "topology/thread_siblings_list"));
+	};
+	if (processor < 0) {
+		// No core is reserved only where fewer than eight cores report a performance or frequency.
+		cpu_set_t cores {};
+		for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+			if (CPU_ISSET(cpu, &others)) {
+				const auto [performance, frequency, first] = rank(cpu);
+				if (performance != 0 || frequency != 0) {
+					CPU_SET(first, &cores);
+				}
+			}
+		}
+		EXPECT_LT(CPU_COUNT(&cores), 8);
+		return;
+	}
+	EXPECT_TRUE(CPU_ISSET(processor, &reserved));
+	for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (CPU_ISSET(cpu, &reserved)) {
+			EXPECT_EQ(std::get<2>(rank(cpu)), std::get<2>(rank(processor))) << cpu;
+		}
+		if (CPU_ISSET(cpu, &others)) {
+			EXPECT_LT(rank(cpu), rank(processor)) << cpu;
+		}
+	}
+
+	cpu_set_t restored {};
+	std::thread([&] {
+		Common::Thread::RestoreProcessAffinity();
+		ASSERT_EQ(sched_getaffinity(0, sizeof(restored), &restored), 0);
+	}).join();
+	CPU_OR(&reserved, &reserved, &others);
+	EXPECT_TRUE(CPU_EQUAL(&restored, &reserved));
+}
+#endif
 
 } // namespace
 

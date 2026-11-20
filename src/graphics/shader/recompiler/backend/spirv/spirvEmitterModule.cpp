@@ -492,10 +492,15 @@ void DefineInputs(EmitterState& state) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
 	}
+	const uint32_t raw_parameters =
+	    state.program.stage == ShaderType::Pixel
+	        ? PixelRawParameterMask(*state.input_info.pixel, state.program.info.inputs)
+	        : 0u;
 	for (auto& input: state.inputs) {
 		if (state.program.stage == ShaderType::Pixel &&
 		    input.kind == IR::StageInputKind::Parameter) {
 			const auto location = PixelParameterLocation(state, input.location);
+			input.raw           = location < 32u && (raw_parameters & (1u << location)) != 0;
 			const auto alias = std::ranges::find_if(state.inputs, [&](const InputBinding& other) {
 				return other.kind == IR::StageInputKind::Parameter && other.variable_id != 0 &&
 				       PixelParameterLocation(state, other.location) == location;
@@ -503,6 +508,7 @@ void DefineInputs(EmitterState& state) {
 			if (alias != state.inputs.end()) {
 				EXIT_IF(alias->per_vertex != input.per_vertex);
 				input.variable_id = alias->variable_id;
+				input.raw         = alias->raw;
 				continue;
 			}
 		}
@@ -535,10 +541,12 @@ void DefineInputs(EmitterState& state) {
 						type = state.builder.Type(spv::OpTypeVector, type, components);
 					}
 				} else if (input.per_vertex) {
-					type = state.builder.Type(spv::OpTypeArray, TypeF32Vector(state, 4),
+					type = state.builder.Type(spv::OpTypeArray,
+					                          input.raw ? TypeU32Vector(state, 4)
+					                                    : TypeF32Vector(state, 4),
 					                          ConstantU32(state, 3));
 				} else {
-					type = TypeF32Vector(state, 4);
+					type = input.raw ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				}
 				break;
 			default: break;
@@ -688,6 +696,12 @@ void DefineOutputs(EmitterState& state) {
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
 				auto type = TypeF32Vector(state, 4);
+				if (binding.kind == IR::StageOutputKind::Parameter &&
+				    state.program.stage != ShaderType::Pixel &&
+				    IsRawParameterOutput(state, binding.location)) {
+					binding.raw = true;
+					type        = TypeU32Vector(state, 4);
+				}
 				if (binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel && binding.index < 8u) {
 					// Packed UNorm stores its encoded bits.

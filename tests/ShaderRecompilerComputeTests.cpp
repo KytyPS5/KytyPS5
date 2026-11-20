@@ -1607,6 +1607,8 @@ struct CompiledShader {
   ShaderRecompiler::IR::Program program;
   ShaderRecompiler::IR::ResourceSnapshot resources;
   std::vector<u32> packed_user_data;
+  // Pixel parameter locations the previous stage must write as integer varyings.
+  u32 raw_parameter_mask = 0;
 };
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
@@ -1657,6 +1659,36 @@ size_t CountText(const std::string &text, const std::string &needle) {
     count++;
   }
   return count;
+}
+
+void CheckPixelRawParameterMask() {
+  constexpr const char *name = "PixelRawParameterMask";
+  using ShaderRecompiler::IR::StageInput;
+  using ShaderRecompiler::IR::StageInputKind;
+  ShaderPixelInputInfo pixel{};
+  pixel.input_num = 5;
+  pixel.interpolator_settings[0] = 0u;      // smooth at location 0
+  pixel.interpolator_settings[1] = 0x401u;  // flat at location 1
+  pixel.interpolator_settings[2] = 2u;      // per-vertex at location 2
+  pixel.interpolator_settings[3] = 0x400u;  // flat alias of the smooth location 0
+  pixel.interpolator_settings[4] = 0x404u;  // flat bit, but custom interpolation
+  pixel.custom_interpolation_mask = 1u << 4u;
+  std::vector<StageInput> inputs;
+  for (uint32_t input = 0; input < pixel.input_num; input++) {
+    StageInput stage_input{StageInputKind::Parameter, input, 4, "in_param"};
+    stage_input.per_vertex = input == 2u;
+    inputs.push_back(stage_input);
+  }
+  inputs.push_back({StageInputKind::FragCoord, 0, 4, "frag_coord"});
+  Require(name, "flat and per-vertex locations",
+          ShaderRecompiler::Spirv::PixelRawParameterMask(pixel, inputs) == 0x6u,
+          "only locations read flat or per-vertex, and not also interpolated, "
+          "cross the stage interface as integers");
+  pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  Require(name, "rectangle lists",
+          ShaderRecompiler::Spirv::PixelRawParameterMask(pixel, inputs) == 0u,
+          "rectangle lists forward parameters through generated float stages");
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckPixelParameterAliases() {
@@ -2138,8 +2170,10 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  const auto raw_parameter_mask = ShaderRecompiler::Spirv::PixelRawParameterMask(
+      pixel_info, result.program.info.inputs);
   return {std::move(result.spirv), std::move(result.program),
-          std::move(resources), std::move(packed_user_data)};
+          std::move(resources), std::move(packed_user_data), raw_parameter_mask};
 }
 
 std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
@@ -2148,7 +2182,9 @@ std::array<u32, 64> MakeSampledTextureData(Prospero::BufferFormat format) {
 
 namespace TestSpv {
 
-std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
+// A raw color is written as the integer varying a flat-only pixel input reads.
+std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f,
+                                            bool raw_color = false) {
   using ShaderRecompiler::Spirv::Builder;
 
   Builder b;
@@ -2166,8 +2202,11 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
       b.Type(spv::OpTypePointer, spv::StorageClassInput, vec2_type);
   const auto ptr_input_vec4 =
       b.Type(spv::OpTypePointer, spv::StorageClassInput, vec4_type);
+  const auto uvec4_type = b.Type(spv::OpTypeVector, uint_type, 4);
   const auto ptr_output_vec4 =
       b.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4_type);
+  const auto ptr_output_color = b.Type(spv::OpTypePointer, spv::StorageClassOutput,
+                                       raw_color ? uvec4_type : vec4_type);
   const auto ptr_output_per_vertex =
       b.Type(spv::OpTypePointer, spv::StorageClassOutput, per_vertex_type);
   const auto func_type = b.Type(spv::OpTypeFunction, void_type);
@@ -2181,7 +2220,7 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   const auto in_color =
       b.DefineGlobalVariable(ptr_input_vec4, spv::StorageClassInput);
   const auto out_color =
-      b.DefineGlobalVariable(ptr_output_vec4, spv::StorageClassOutput);
+      b.DefineGlobalVariable(ptr_output_color, spv::StorageClassOutput);
   const auto per_vertex =
       b.DefineGlobalVariable(ptr_output_per_vertex, spv::StorageClassOutput);
   u32 instance = 0;
@@ -2229,7 +2268,13 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
   b.AddFunction(spv::OpAccessChain, ptr_output_vec4, position_ptr, per_vertex,
                  const_u32_0);
   b.AddFunction(spv::OpStore, position_ptr, position);
-  b.AddFunction(spv::OpStore, out_color, color4);
+  if (raw_color) {
+    const auto bits = b.AllocateId();
+    b.AddFunction(spv::OpBitcast, uvec4_type, bits, color4);
+    b.AddFunction(spv::OpStore, out_color, bits);
+  } else {
+    b.AddFunction(spv::OpStore, out_color, color4);
+  }
   if (layered) {
     const auto index = b.AllocateId();
     b.AddFunction(spv::OpLoad, int_type, index, instance);
@@ -22349,8 +22394,8 @@ public:
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const bool object_id = !test.object_ids.empty();
-    const auto vertex_spirv =
-        TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
+    const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(
+        test.layers > 1, test.vertex_clip_w, (fragment.raw_parameter_mask & 1u) != 0u);
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
@@ -57714,6 +57759,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
     CheckPixelParameterAliases();
+    CheckPixelRawParameterMask();
     CheckRectListShaders();
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
@@ -58436,6 +58482,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
+  CheckPixelRawParameterMask();
   CheckPixelFrontFaceModes();
   CheckRectListShaders();
   CheckSigned16ImageStore(vulkan);

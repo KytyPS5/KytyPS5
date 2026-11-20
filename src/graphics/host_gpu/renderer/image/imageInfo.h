@@ -69,20 +69,20 @@ struct ImageLinearLayout {
 };
 
 struct ImageInfo {
-	GuestRange                   data;
-	GuestRange                   stencil;
-	ImageMetadataInfo            metadata;
-	bool                         htile_initial_clear = true;
-	vk::Format                   pixel_format     = vk::Format::eUndefined;
-	Prospero::BufferFormat       guest_format     = Prospero::BufferFormat::kInvalid;
-	Prospero::ImageType          type             = Prospero::ImageType::kColor2D;
-	vk::Extent3D                 extent           = {1, 1, 1};
-	ImageSubresources            resources;
-	uint32_t                     pitch           = 0;
-	uint32_t                     bytes_per_block = 0;
-	uint32_t                     samples         = 1;
-	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
-	bool                         bgra16          = false;
+	GuestRange             data;
+	GuestRange             stencil;
+	ImageMetadataInfo      metadata;
+	bool                   htile_initial_clear = true;
+	vk::Format             pixel_format        = vk::Format::eUndefined;
+	Prospero::BufferFormat guest_format        = Prospero::BufferFormat::kInvalid;
+	Prospero::ImageType    type                = Prospero::ImageType::kColor2D;
+	vk::Extent3D           extent              = {1, 1, 1};
+	ImageSubresources      resources;
+	uint32_t               pitch           = 0;
+	uint32_t               bytes_per_block = 0;
+	uint32_t               samples         = 1;
+	Prospero::TileMode     tile_mode       = Prospero::TileMode::kLinear;
+	bool                   bgra16          = false;
 	// Records of levels [0, resources.levels); an array image's level sizes span every layer.
 	std::array<TileMipLayout, 16> mip_layout {};
 	TileTextureBlockLayout        tiling;
@@ -100,10 +100,8 @@ struct ImageInfo {
 	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
 		if (bgra16) return ColorTransform::SwapBgra16;
 		switch (guest_format) {
-			case Prospero::BufferFormat::k10_11_11Float:
-				return ColorTransform::Reverse10_11_11;
-			case Prospero::BufferFormat::k2_10_10_10UNorm:
-				return ColorTransform::Rotate2_10_10_10;
+			case Prospero::BufferFormat::k10_11_11Float: return ColorTransform::Reverse10_11_11;
+			case Prospero::BufferFormat::k2_10_10_10UNorm: return ColorTransform::Rotate2_10_10_10;
 			default: return ColorTransform::None;
 		}
 	}
@@ -247,6 +245,12 @@ inline bool ImageInfo::IsDepth() const noexcept {
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
 	const auto* policy = FindGuestDepthFormatPolicy(info.guest_format);
+	if (info.pixel_format == vk::Format::eS8Uint) {
+		return info.guest_format == Prospero::BufferFormat::k8UInt && info.bytes_per_block == 1 &&
+		       !info.HasStencil() && info.samples == 1 && info.resources.levels == 1 &&
+		       info.metadata.kind != ImageMetadataKind::Dcc &&
+		       info.metadata.kind != ImageMetadataKind::Cmask;
+	}
 	return policy != nullptr && info.bytes_per_block == policy->bytes_per_element &&
 	       (info.HasStencil() ? IsStencilAttachmentFormat(*policy, info.pixel_format)
 	                          : info.pixel_format == policy->depth_attachment_format);
@@ -384,7 +388,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 [[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint64_t clear_words,
                                                  vk::ClearColorValue& clear) {
 	vk::ClearColorValue next {};
-	const auto packed = static_cast<uint32_t>(clear_words);
+	const auto          packed = static_cast<uint32_t>(clear_words);
 	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
 	const auto srgb8  = [](uint32_t value) {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
@@ -394,7 +398,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 		return static_cast<float>(value & 0xffffu) / 65535.0f;
 	};
 	const auto float16 = [](uint32_t value) {
-		const auto sign = (value & 0x8000u) << 16u;
+		const auto sign     = (value & 0x8000u) << 16u;
 		const auto exponent = (value >> 10u) & 0x1fu;
 		const auto mantissa = value & 0x3ffu;
 		if (exponent == 0) {
@@ -414,17 +418,13 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 			next.float32[2] = float16(static_cast<uint32_t>(clear_words >> 32u));
 			next.float32[3] = float16(static_cast<uint32_t>(clear_words >> 48u));
 			[[fallthrough]];
-		case vk::Format::eR16G16Sfloat:
-			next.float32[1] = float16(packed >> 16u);
-			[[fallthrough]];
+		case vk::Format::eR16G16Sfloat: next.float32[1] = float16(packed >> 16u); [[fallthrough]];
 		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
 		case vk::Format::eR16G16B16A16Unorm:
 			next.float32[2] = unorm16(clear_words >> 32u);
 			next.float32[3] = unorm16(clear_words >> 48u);
 			[[fallthrough]];
-		case vk::Format::eR16G16Unorm:
-			next.float32[1] = unorm16(packed >> 16u);
-			[[fallthrough]];
+		case vk::Format::eR16G16Unorm: next.float32[1] = unorm16(packed >> 16u); [[fallthrough]];
 		case vk::Format::eR16Unorm: next.float32[0] = unorm16(packed); break;
 		case vk::Format::eR16G16B16A16Uint:
 			for (uint32_t i = 0; i < 4; i++) {

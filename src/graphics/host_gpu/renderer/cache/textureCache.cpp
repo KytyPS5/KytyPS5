@@ -263,18 +263,35 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	m_download_images.erase(id);
-	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
-		// Only the last image to acquire an HTile range releases its clear state.
-		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
-		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
-			m_surface_metas.erase(metadata);
-		}
-	}
+	ReleaseHtileOwner(id, image.info.metadata);
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
+	}
+}
+
+void TextureCache::ReleaseHtileOwner(ImageId id, const ImageMetadataInfo& released) {
+	if (released.kind != ImageMetadataKind::Htile) {
+		return;
+	}
+	const auto metadata = m_surface_metas.find(released.range.address);
+	if (metadata == m_surface_metas.end() || metadata->second.owner != id) {
+		return;
+	}
+	ImageId heir;
+	m_slot_images.ForEach([&](ImageId other, const Image& candidate) {
+		if (other != id && candidate.registered &&
+		    candidate.info.metadata.kind == ImageMetadataKind::Htile &&
+		    candidate.info.metadata.range.address == metadata->first) {
+			heir = other;
+		}
+	});
+	if (heir) {
+		metadata->second.owner = heir;
+	} else {
+		m_surface_metas.erase(metadata);
 	}
 }
 
@@ -1161,8 +1178,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 
 void TextureCache::RefreshImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id && (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
-	                       m_slot_images[image.depth_id].info.samples != 1)) {
+	if ((image.depth_id && (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
+	                        m_slot_images[image.depth_id].info.samples != 1)) ||
+	    (image.info.pixel_format == vk::Format::eS8Uint &&
+	     image.info.metadata.stencil_compressed)) {
 		return;
 	}
 	TrackImage(id);
@@ -1236,6 +1255,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		ReleaseHtileOwner(association, record.info.metadata);
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1471,13 +1491,17 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                              static_cast<uint32_t>(offset / slice_size),
 		                              desc.info.resources.layers};
 	}
-	image.info.stencil  = desc.info.stencil;
+	image.info.stencil = desc.info.stencil;
+	if (image.info.metadata.range.address != desc.info.metadata.range.address) {
+		ReleaseHtileOwner(id, image.info.metadata);
+	}
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address);
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
+			metadata->second.stencil_clear_mask.set();
 		}
 		metadata->second.owner = id;
 	}
@@ -2007,6 +2031,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask.set();
+	found->second.stencil_clear_mask.set();
 	return true;
 }
 
@@ -2017,7 +2042,28 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 		return false;
 	}
 	found->second.clear_mask.set(slice, is_clear);
+	found->second.stencil_clear_mask.set(slice, is_clear);
 	return true;
+}
+
+vk::ImageAspectFlags TextureCache::TakeMetaClear(uint64_t address, uint32_t slice,
+                                                 vk::ImageAspectFlags aspects) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
+		return {};
+	}
+	vk::ImageAspectFlags cleared;
+	auto&                meta = found->second;
+	if ((aspects & vk::ImageAspectFlagBits::eDepth) && meta.clear_mask.test(slice)) {
+		meta.clear_mask.reset(slice);
+		cleared |= vk::ImageAspectFlagBits::eDepth;
+	}
+	if ((aspects & vk::ImageAspectFlagBits::eStencil) && meta.stencil_clear_mask.test(slice)) {
+		meta.stencil_clear_mask.reset(slice);
+		cleared |= vk::ImageAspectFlagBits::eStencil;
+	}
+	return cleared;
 }
 
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {

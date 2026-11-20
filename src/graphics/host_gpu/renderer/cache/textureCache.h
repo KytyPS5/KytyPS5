@@ -35,7 +35,7 @@ struct TextureCacheTestAccess;
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
 class TextureCache {
@@ -77,10 +77,12 @@ public:
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
-	[[nodiscard]] bool IsMeta(uint64_t address);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
-	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	[[nodiscard]] bool                 IsMeta(uint64_t address);
+	[[nodiscard]] bool                 IsMetaCleared(uint64_t address, uint32_t slice);
+	[[nodiscard]] bool                 ClearMeta(uint64_t address);
+	[[nodiscard]] bool                 TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	[[nodiscard]] vk::ImageAspectFlags TakeMetaClear(uint64_t address, uint32_t slice,
+	                                                 vk::ImageAspectFlags aspects);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -89,12 +91,13 @@ public:
 	[[nodiscard]] bool WriteBackImages();
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
-	void RunGarbageCollector();
+	void                   RunGarbageCollector();
 
 private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		std::bitset<8192> stencil_clear_mask;
 		// The depth image that last acquired this HTile range.
 		ImageId owner;
 	};
@@ -231,25 +234,25 @@ private:
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	[[nodiscard]] bool          RetireThroughGuestMemory(ImageId replacement, ImageId retired);
 	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	void ReleaseHtileOwner(ImageId id, const ImageMetadataInfo& released);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
 	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
 	// render area.
-	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
-	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level, uint32_t layer,
+	                               uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
-	void RefreshCopySource(ImageId id);
+	void       RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	// The depth image's stencil plane record covering exactly range, or none.

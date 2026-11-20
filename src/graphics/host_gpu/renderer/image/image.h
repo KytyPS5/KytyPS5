@@ -118,8 +118,9 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+		return info.IsDepth() || info.pixel_format == vk::Format::eS8Uint
+		           ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		           : vk::ImageLayout::eShaderReadOnlyOptimal;
 	}
 	struct HeapChange {
 		GuestRange data;
@@ -163,6 +164,7 @@ private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
+	[[nodiscard]] static vk::ImageAspectFlags PrimaryAspect(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>

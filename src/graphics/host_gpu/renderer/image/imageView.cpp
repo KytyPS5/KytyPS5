@@ -37,6 +37,9 @@ namespace {
 }
 
 [[nodiscard]] bool IsValidAspect(const VulkanImage& image, vk::ImageAspectFlags aspect) {
+	if (image.format == vk::Format::eS8Uint) {
+		return aspect == vk::ImageAspectFlagBits::eStencil;
+	}
 	const auto depth_format = DepthAspectTransferFormat(image.format);
 	if (depth_format == vk::Format::eUndefined) {
 		return aspect == vk::ImageAspectFlagBits::eColor;
@@ -255,6 +258,7 @@ vk::ImageAspectFlags DepthAspectMask(vk::Format format) {
 	switch (format) {
 		case vk::Format::eD16Unorm:
 		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
+		case vk::Format::eS8Uint: return vk::ImageAspectFlagBits::eStencil;
 		case vk::Format::eD16UnormS8Uint:
 		case vk::Format::eD24UnormS8Uint:
 		case vk::Format::eD32SfloatS8Uint:

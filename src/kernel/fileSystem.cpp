@@ -43,8 +43,8 @@ enum class SpecialFile {
 class MountPoints {
 public:
 	struct MountPair {
-		std::filesystem::path dir;
-		std::string           point;
+		std::filesystem::path                  dir;
+		std::string                            point;
 		std::shared_ptr<Common::ArchiveReader> archive;
 		bool                                   read_only;
 	};
@@ -67,20 +67,20 @@ private:
 };
 
 struct File {
-	Common::File                        f;
-	std::string                         name;
-	std::filesystem::path               real_name;
-	std::atomic_bool                    opened;
-	std::atomic_bool                    directory;
-	std::atomic_bool                    readable;
-	std::atomic_bool                    writable;
-	std::atomic_bool                    append;
-	std::atomic_bool                    sync_writes;
-	std::atomic_bool                    close_on_exec;
-	SpecialFile                         special;
-	Common::Mutex                       mutex;
-	std::vector<uint8_t>                dirents;
-	uint64_t                            dents_offset;
+	Common::File          f;
+	std::string           name;
+	std::filesystem::path real_name;
+	std::atomic_bool      opened;
+	std::atomic_bool      directory;
+	std::atomic_bool      readable;
+	std::atomic_bool      writable;
+	std::atomic_bool      append;
+	std::atomic_bool      sync_writes;
+	std::atomic_bool      close_on_exec;
+	SpecialFile           special;
+	Common::Mutex         mutex;
+	std::vector<uint8_t>  dirents;
+	uint64_t              dents_offset;
 };
 
 class FileDescriptors {
@@ -177,6 +177,19 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 		*last_reclen += static_cast<uint16_t>(dirents.size() - offset);
 	}
 	return dirents;
+}
+
+// Lists a host directory with the names the guest created, undoing EncodeHostFilename.
+static std::vector<Common::File::DirEntry> GetGuestDirEntries(const std::filesystem::path& path) {
+	auto entries = Common::File::GetDirEntries(path);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (!Common::IsArchivePath(path)) {
+		for (auto& entry: entries) {
+			entry.name = DecodeHostFilename(entry.name);
+		}
+	}
+#endif
+	return entries;
 }
 
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
@@ -279,14 +292,14 @@ void MountPoints::Mount(const std::filesystem::path& folder, const std::string& 
                         bool read_only) {
 	Common::LockGuard lock(m_mutex);
 
-	auto point_str  = Common::FixDirectorySlash(point);
+	auto point_str = Common::FixDirectorySlash(point);
 
 	Umount(point_str);
 
 	MountPair p;
-	p.dir   = folder;
-	p.point = point_str;
-	p.archive = Common::OpenArchive(folder);
+	p.dir       = folder;
+	p.point     = point_str;
+	p.archive   = Common::OpenArchive(folder);
 	p.read_only = read_only || Common::IsArchivePath(folder);
 
 	m_mount_pairs.push_back(std::move(p));
@@ -299,7 +312,8 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 
 	const auto it = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(), [&folder_or_point_str](const MountPair& p) {
-		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) == folder_or_point_str ||
+		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) ==
+		               folder_or_point_str ||
 		           p.point == folder_or_point_str;
 	    });
 	if (it != m_mount_pairs.end()) {
@@ -368,11 +382,91 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 
 	return resolved;
 }
-#else
-static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
-	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
-}
 #endif
+
+static bool IsHostForbiddenFilenameCharacter(unsigned char ch) {
+	constexpr std::string_view Forbidden = "<>:\"|?*";
+	return (ch != 0 && ch < 0x20) ||
+	       Forbidden.find(static_cast<char>(ch)) != std::string_view::npos;
+}
+
+// Characters EncodeHostFilename may store as %XX: forbidden ones, a '%' that would otherwise read
+// as an escape, and a trailing '.' or ' ' that Windows would strip from a path component.
+static bool IsHostEscapedCharacter(unsigned char ch) {
+	return IsHostForbiddenFilenameCharacter(ch) || ch == '%' || ch == '.' || ch == ' ';
+}
+
+static int HexDigitValue(char ch) {
+	if (ch >= '0' && ch <= '9') {
+		return ch - '0';
+	}
+	if (ch >= 'A' && ch <= 'F') {
+		return ch - 'A' + 10;
+	}
+	if (ch >= 'a' && ch <= 'f') {
+		return ch - 'a' + 10;
+	}
+	return -1;
+}
+
+// Returns the character that the escape at text[pos] stands for, or -1 if there is none there.
+// Hex digits match in either case because NTFS compares names case-insensitively.
+static int DecodeHostEscape(std::string_view text, size_t pos) {
+	if (text[pos] != '%' || pos + 2 >= text.size()) {
+		return -1;
+	}
+	const int high = HexDigitValue(text[pos + 1]);
+	const int low  = HexDigitValue(text[pos + 2]);
+	if (high < 0 || low < 0) {
+		return -1;
+	}
+	const auto ch = static_cast<unsigned char>((high << 4) | low);
+	return IsHostEscapedCharacter(ch) ? ch : -1;
+}
+
+std::string EncodeHostFilename(std::string_view guest_name) {
+	constexpr char Hex[] = "0123456789ABCDEF";
+
+	std::string out;
+	out.reserve(guest_name.size());
+	size_t component_begin = 0;
+	for (size_t i = 0; i < guest_name.size(); i++) {
+		const auto ch     = static_cast<unsigned char>(guest_name[i]);
+		bool       escape = IsHostForbiddenFilenameCharacter(ch);
+		if (ch == '%') {
+			escape = DecodeHostEscape(guest_name, i) >= 0;
+		} else if (ch == '.' || ch == ' ') {
+			const bool component_end = i + 1 == guest_name.size() || guest_name[i + 1] == '/';
+			const auto component     = guest_name.substr(component_begin, i + 1 - component_begin);
+			escape                   = component_end && component != "." && component != "..";
+		} else if (ch == '/') {
+			component_begin = i + 1;
+		}
+
+		if (escape) {
+			out += '%';
+			out += Hex[ch >> 4u];
+			out += Hex[ch & 0xfu];
+		} else {
+			out += static_cast<char>(ch);
+		}
+	}
+	return out;
+}
+
+std::string DecodeHostFilename(std::string_view host_name) {
+	std::string out;
+	out.reserve(host_name.size());
+	for (size_t i = 0; i < host_name.size(); i++) {
+		if (const int ch = DecodeHostEscape(host_name, i); ch >= 0) {
+			out += static_cast<char>(ch);
+			i += 2;
+		} else {
+			out += host_name[i];
+		}
+	}
+	return out;
+}
 
 std::filesystem::path MountPoints::ResolvePath(std::string_view mounted_name, bool* read_only) {
 	Common::LockGuard lock(m_mutex);
@@ -400,11 +494,7 @@ std::filesystem::path MountPoints::ResolvePath(std::string_view mounted_name, bo
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %.*s\n",
-			         static_cast<int>(mounted_name.size()), mounted_name.data());
-		}
-		return p.dir / native_rel_path;
+		return p.dir / Common::PathFromUtf8(EncodeHostFilename(rel_path));
 #else
 		return ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
@@ -526,8 +616,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	const auto info = Common::File::GetInfo(file->real_name);
-	const bool dir_exist = info && !info->is_file;
+	const auto info       = Common::File::GetInfo(file->real_name);
+	const bool dir_exist  = info && !info->is_file;
 	const bool file_exist = info && info->is_file;
 
 	// A missing path opened without O_CREAT is ENOENT
@@ -560,7 +650,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 		EXIT_NOT_IMPLEMENTED(rw_mode != Common::File::Mode::Read);
 
-		const auto entries = Common::File::GetDirEntries(file->real_name);
+		const auto entries = GetGuestDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
 		file->directory    = true;
@@ -653,7 +743,7 @@ int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
 
 	switch (command) {
 		case 1: return file->close_on_exec.load(std::memory_order_relaxed); // F_GETFD
-		case 2: // F_SETFD, FD_CLOEXEC
+		case 2:                                                             // F_SETFD, FD_CLOEXEC
 			file->close_on_exec.store((arg & 1) != 0, std::memory_order_relaxed);
 			return OK;
 		default: return KERNEL_ERROR_EINVAL;
@@ -1187,7 +1277,7 @@ int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb) {
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
 	const uint64_t size =
-	    is_dir ? PackDirents(Common::File::GetDirEntries(real_file_name)).size() : info->size;
+	    is_dir ? PackDirents(GetGuestDirEntries(real_file_name)).size() : info->size;
 	SetStatSize(&stat, size, is_dir);
 	SetStatTimes(&stat, is_dir ? std::nullopt : Common::File::GetTimes(real_file_name));
 	*sb = stat;

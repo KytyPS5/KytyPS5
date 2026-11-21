@@ -9,6 +9,19 @@
 
 using namespace Libs::Audio::Ngs2;
 
+// Guest-path mount used by the waveform file tests: /app0/ maps to a
+// per-test directory under the host temp path.
+static std::filesystem::path g_ngs2GuestRoot;
+
+namespace Libs::LibKernel::FileSystem {
+std::filesystem::path GetRealFilename(const std::string& mounted) {
+	if (mounted.starts_with("/app0/")) {
+		return g_ngs2GuestRoot / mounted.substr(6);
+	}
+	return {};
+}
+} // namespace Libs::LibKernel::FileSystem
+
 namespace {
 
 void Check(bool condition, const char* message) {
@@ -3191,8 +3204,11 @@ static void TestWaveformFileExtentLimits() {
 	appendLE16(riff, 200);
 
 	const auto dir = std::filesystem::temp_directory_path();
+	g_ngs2GuestRoot = dir;
 	const auto wavPath = (dir / "ngs2_extent_test.wav").string();
 	const auto vagPath = (dir / "ngs2_extent_test.vag").string();
+	const char* guestWav = "/app0/ngs2_extent_test.wav";
+	const char* guestVag = "/app0/ngs2_extent_test.vag";
 
 	// A small RIFF followed by trailing garbage must parse using only the
 	// declared extent.
@@ -3204,10 +3220,14 @@ static void TestWaveformFileExtentLimits() {
 			out.write(reinterpret_cast<const char*>(file.data()), file.size());
 		}
 		Ngs2WaveformInfo info {};
-		Check(Ngs2ParseWaveformFile(wavPath.c_str(), 0, &info) == OK,
+		Check(Ngs2ParseWaveformFile(guestWav, 0, &info) == OK,
 		      "ParseWaveformFile rejected a RIFF with trailing data");
 		Check(info.num_samples == 2 && info.data_offset == riff.size() - 4,
 		      "ParseWaveformFile returned wrong geometry for trailing-data RIFF");
+		// A host path outside the guest mount must not be opened directly.
+		Check(Ngs2ParseWaveformFile(wavPath.c_str(), 0, &info) ==
+		          NGS2_ERROR_INVALID_WAVEFORM_DATA,
+		      "ParseWaveformFile opened a file outside the guest mount");
 	}
 
 	// A RIFF whose declared extent runs past the end of the file must fail
@@ -3224,7 +3244,7 @@ static void TestWaveformFileExtentLimits() {
 			out.write(reinterpret_cast<const char*>(file.data()), file.size());
 		}
 		Ngs2WaveformInfo info {};
-		Check(Ngs2ParseWaveformFile(wavPath.c_str(), 0, &info) == NGS2_ERROR_INVALID_WAVEFORM_DATA,
+		Check(Ngs2ParseWaveformFile(guestWav, 0, &info) == NGS2_ERROR_INVALID_WAVEFORM_DATA,
 		      "ParseWaveformFile accepted a RIFF extent beyond the file size");
 	}
 
@@ -3238,7 +3258,7 @@ static void TestWaveformFileExtentLimits() {
 			out.write(reinterpret_cast<const char*>(vag.data()), vag.size());
 		}
 		Ngs2WaveformInfo info {};
-		Check(Ngs2ParseWaveformFile(vagPath.c_str(), 0, &info) == OK,
+		Check(Ngs2ParseWaveformFile(guestVag, 0, &info) == OK,
 		      "ParseWaveformFile rejected a valid VAG file");
 		Check(info.format.waveform_type == SCE_NGS2_WAVEFORM_TYPE_VAG && info.num_samples == 56,
 		      "ParseWaveformFile returned wrong VAG geometry");
@@ -4173,8 +4193,13 @@ static void TestStreamAndModulesPhase4() {
 	      "StreamQueryInfo 0xf24001 with size < 8 must return INVALID_OUT_SIZE");
 	Check(Ngs2StreamQueryInfo(streamHandle, 0xf24099, &qinfo, 8) == SCE_NGS2_ERROR_INVALID_STREAM_QUERY_ID,
 	      "StreamQueryInfo with an invalid query id must return INVALID_STREAM_QUERY_ID");
-	res = Ngs2StreamQueryInfo(streamHandle, 0xf24001, &qinfo, sizeof(qinfo));
-	Check(res == OK, "StreamQueryInfo 0xf24001 failed");
+	// Recognized but unimplemented queries must return a defined error and
+	// leave the output buffer untouched instead of reporting success.
+	qinfo = 0xdeadbeef;
+	Check(Ngs2StreamQueryInfo(streamHandle, 0xf24001, &qinfo, sizeof(qinfo)) ==
+	          SCE_NGS2_ERROR_INVALID_STREAM_QUERY_ID,
+	      "StreamQueryInfo 0xf24001 must report the unimplemented query");
+	Check(qinfo == 0xdeadbeef, "StreamQueryInfo modified the output on failure");
 
 	// 7. Stream destruction
 	res = Ngs2StreamDestroy(streamHandle, nullptr);
@@ -4601,6 +4626,46 @@ static void TestAtrac9GeometryChannelsPhase4() {
 	      "PCM geometry accepted more than eight channels");
 }
 
+static void TestSystemInfoAndRackRenderCountPhase6() {
+	// Oversized info buffers are accepted; undersized ones are rejected.
+	Ngs2SystemOption opt {};
+	Ngs2SystemResetOption(&opt);
+	opt.num_grain_samples = 64;
+	opt.sample_rate       = 48000;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	uintptr_t sysHandle = 0;
+	Check(Ngs2SystemCreate(&opt, &sbi, &sysHandle) == OK, "SystemCreate failed");
+	Ngs2SystemInfo info {};
+	Check(Ngs2SystemGetInfo(sysHandle, &info, sizeof(info)) == OK,
+	      "SystemGetInfo with the exact size failed");
+	Check(Ngs2SystemGetInfo(sysHandle, &info, sizeof(info) + 64) == OK,
+	      "SystemGetInfo must accept a buffer larger than the struct");
+	Check(info.system_handle == sysHandle && info.sample_rate == 48000,
+	      "SystemGetInfo wrote wrong fields into an oversized buffer");
+	Check(Ngs2SystemGetInfo(sysHandle, &info, sizeof(info) - 1) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "SystemGetInfo must reject a buffer smaller than the struct");
+	Ngs2SystemDestroy(sysHandle, nullptr);
+
+	// render_count increments once per rack per system render.
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 4;
+	Ngs2RackOptionUnion sampler_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	int16_t          out[8] = {};
+	Ngs2RenderBufferInfo buf {out, sizeof(out), 0x12, 1};
+	const auto       sys = reinterpret_cast<uintptr_t>(&system);
+	Check(Ngs2SystemRender(sys, &buf, 1) == OK, "first system render failed");
+	Check(Ngs2SystemRender(sys, &buf, 1) == OK, "second system render failed");
+	Ngs2RackInfo rinfo {};
+	Check(Ngs2RackGetInfo(sampler.handle, &rinfo, sizeof(rinfo)) == OK &&
+	          rinfo.render_count == 2,
+	      "rack render_count must increment once per system render");
+}
+
 } // namespace
 
 int main() {
@@ -4691,5 +4756,6 @@ int main() {
 	RUN_TEST(TestPitchShiftDrainPhase4);
 	RUN_TEST(TestExtensibleFloatWaveformPhase4);
 	RUN_TEST(TestAtrac9GeometryChannelsPhase4);
+	RUN_TEST(TestSystemInfoAndRackRenderCountPhase6);
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

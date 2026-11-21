@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/fileSystem.h"
 #include "libatrac9.h"
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/errno.h"
@@ -1910,7 +1911,8 @@ int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* inf
 	if (info == nullptr) {
 		return ERROR_INVALID_OUT_ADDRESS;
 	}
-	if (info_size != sizeof(Ngs2SystemInfo)) {
+	// Larger buffers are accepted; only sizeof(Ngs2SystemInfo) is written.
+	if (info_size < sizeof(Ngs2SystemInfo)) {
 		return ERROR_INVALID_OUT_SIZE;
 	}
 
@@ -2990,6 +2992,8 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 			if (rack->ngs != ngs) {
 				continue;
 			}
+			// One render pass per rack, not per voice.
+			++rack->render_count;
 			auto* items = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
 			for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
 				items[i].rendered = false;
@@ -3434,7 +3438,13 @@ int KYTY_SYSV_ABI Ngs2ParseWaveformFile(const char* path, uint32_t offset, Ngs2W
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
 
-	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	// Guest paths go through the same mount resolver as the other file APIs;
+	// an unmounted path must not fall through to the host filesystem.
+	const auto real_path = Libs::LibKernel::FileSystem::GetRealFilename(path);
+	if (real_path.empty()) {
+		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+	}
+	std::ifstream file(real_path, std::ios::binary | std::ios::ate);
 	if (!file) {
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
@@ -5824,7 +5834,9 @@ int KYTY_SYSV_ABI Ngs2StreamQueryInfo(uintptr_t stream_handle, uint32_t info_id,
 	if (stream == nullptr) {
 		return SCE_NGS2_ERROR_INVALID_STREAM_HANDLE;
 	}
-	return OK;
+	// The recognized query ids are not implemented; report that explicitly
+	// instead of returning success without writing the output buffer.
+	return SCE_NGS2_ERROR_INVALID_STREAM_QUERY_ID;
 }
 
 int KYTY_SYSV_ABI Ngs2JobSchedulerResetOption(void* option) {

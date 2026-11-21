@@ -690,6 +690,9 @@ target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
 add_kyty_full_emulator_test(video_dec2_tests "${KYTY_TESTS_DIR}/VideoDec2Tests.cpp")
 target_link_libraries(video_dec2_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(system_service_tests "${KYTY_TESTS_DIR}/SystemServiceTests.cpp")
+target_link_libraries(system_service_tests kyty_test_gtest)
+
 add_executable(dlss_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DlssTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/dlss.cpp")
@@ -778,6 +781,7 @@ if(BUILD_TESTING)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
 	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
+	add_test(NAME system_service COMMAND $<TARGET_FILE:system_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -901,6 +905,7 @@ if(BUILD_TESTING)
 		rtc_tests
 		playgo_tests
 		vr_tracker2_tests
+		system_service_tests
 	)
 endif()
 

@@ -494,21 +494,6 @@ static void* g_exception_handlers[130] = {};
 
 using exception_handler_func_t = KYTY_SYSV_ABI void (*)(int, void*);
 
-static thread_local bool g_dispatching_signal_handler = false;
-
-struct SignalDispatchScope {
-	SignalDispatchScope(): previous(g_dispatching_signal_handler) {
-		g_dispatching_signal_handler = true;
-	}
-	~SignalDispatchScope() { g_dispatching_signal_handler = previous; }
-
-	bool previous;
-};
-
-bool KernelIsDispatchingSignalOnCurrentThread() {
-	return g_dispatching_signal_handler;
-}
-
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 static void WaitForSignalDispatch(Pthread thread, int signum) {
 	constexpr auto DISPATCH_WAIT_STEP = std::chrono::microseconds(1000);
@@ -969,8 +954,7 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 
 		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontextFromHost(host_ctx);
+			auto ctx = CreateSignalUcontextFromHost(host_ctx);
 			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
 				handler(signum, &ctx);
 				ApplySignalUcontextToHost(host_ctx, ctx);
@@ -1031,14 +1015,11 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
-		SignalDispatchScope scope;
-		auto                ctx           = CreateSignalUcontext(context);
-		auto                guest_context = IsGuestCodeAddress(ctx.uc_mcontext.mc_rip);
-		if (!guest_context) {
+		auto ctx = CreateSignalUcontext(context);
+		if (!IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
 			SanitizeNonGuestSignalUcontext(&ctx, thread);
 			std::thread([thread, signum, handler, ctx,
 			             tcb = Loader::RuntimeLinker::GetThreadTcb()]() mutable {
-				SignalDispatchScope helper_scope;
 				Loader::RuntimeLinker::SetThreadTcb(tcb);
 				auto* previous_self = PthreadSwapSelfForSignal(thread);
 				handler(signum, &ctx);
@@ -1047,35 +1028,11 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 			return;
 		}
 		handler(signum, &ctx);
-		if (guest_context) {
-			ApplySignalUcontext(context, ctx);
-		}
+		ApplySignalUcontext(context, ctx);
 	}
 }
 
 #endif
-
-void KernelDispatchPendingSignalForCurrentThread() {
-	Pthread current = PthreadSelfOrNull();
-	if (!PthreadHasAnyPendingSignal(current)) {
-		return;
-	}
-
-	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
-			continue;
-		}
-
-		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
-		if (handler != nullptr) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateSignalUcontext();
-			SanitizeNonGuestSignalUcontext(&ctx, current);
-			handler(signum, &ctx);
-		}
-		return;
-	}
-}
 
 static int KYTY_SYSV_ABI KernelInstallExceptionHandler(int signum, void* handler) {
 	PRINT_NAME();
@@ -1124,8 +1081,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (target_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
+			auto ctx = CreateCurrentGuestCallSignalUcontext(
 			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			handler(signum, &ctx);
 			return OK;
@@ -1163,8 +1119,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 #elif defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
-			SignalDispatchScope scope;
-			auto                ctx = CreateCurrentGuestCallSignalUcontext(
+			auto ctx = CreateCurrentGuestCallSignalUcontext(
 			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			handler(signum, &ctx);
 			return OK;
@@ -1181,7 +1136,6 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		PthreadWakeForSignal(thread);
 		WaitForSignalDispatch(thread, signum);
 		return OK;
 #else
@@ -2153,24 +2107,21 @@ static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* f
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
                                           const uint32_t* timeout_micros) {
-	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
-	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
                                             const uint32_t* timeout_micros) {
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
-	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
-	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected,
                                             const uint32_t* timeout_micros) {
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
-	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,
-	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count) {
@@ -2197,13 +2148,12 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
 				                            ? max_ns
 				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
-				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
-				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
+				return POSIX_CALL(
+				    LibKernel::SyncOnAddress::Wait64(static_cast<volatile uint64_t*>(address),
+					                                 value, std::chrono::nanoseconds(timeout_ns)));
 			}
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-			    static_cast<volatile uint64_t*>(address), value, nullptr,
-			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
+			    static_cast<volatile uint64_t*>(address), value, nullptr));
 		case UMTX_OP_WAKE:
 			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
 		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);

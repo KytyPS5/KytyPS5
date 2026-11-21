@@ -495,8 +495,6 @@ void PthreadWakeForSignal(Pthread thread) {
 	}
 }
 
-void KernelDispatchPendingSignalForCurrentThread();
-
 static void SchedulerBackoffOnce() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (SwitchToThread() == 0) {
@@ -507,17 +505,12 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
-	if (nanoseconds == 0) {
-		KernelDispatchPendingSignalForCurrentThread();
-		return;
-	}
-
-	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
-	const auto         start      = Common::SteadyNs();
+// A guest signal queued as a special user APC runs only when the sleep returns.
+static void SleepNanoInSlices(uint64_t nanoseconds) {
+	constexpr uint64_t slice_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
+	const auto         start       = Common::SteadyNs();
 	for (uint64_t slept = 0; slept < nanoseconds; slept = Common::SteadyNs() - start) {
-		Common::Thread::SleepNano(std::min(nanoseconds - slept, poll_nanos));
-		KernelDispatchPendingSignalForCurrentThread();
+		Common::Thread::SleepNano(std::min(nanoseconds - slept, slice_nanos));
 	}
 }
 
@@ -1056,7 +1049,6 @@ void Initialize() {
 
 	g_pthread_context->SetPthreadStaticObjects(new PthreadStaticObjects);
 	g_pthread_context->SetPthreadPool(new PthreadPool);
-	Common::CondVar::SetWaitPollCallback(KernelDispatchPendingSignalForCurrentThread);
 
 	PthreadMutexattr  default_mutexattr  = nullptr;
 	PthreadRwlockattr default_rwlockattr = nullptr;
@@ -1290,11 +1282,6 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		}
 		waiter.cv.wait_until(lock, std::min(deadline, now +
 		    std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		if (mutex->owner != self) {
-			lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			lock.lock();
-		}
 	}
 	lock.unlock();
 	pthread_setcancelstate(previous_cancel_state, nullptr);
@@ -2340,62 +2327,55 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 	    (has_timeout ? std::chrono::steady_clock::now() + std::chrono::microseconds(*timeout_us)
 	                 : std::chrono::steady_clock::time_point {});
 	bool writer_wait_registered = false;
+	auto unregister_writer_wait = [&rwlock, &writer_wait_registered] {
+		if (writer_wait_registered) {
+			rwlock->waiting_writers--;
+			writer_wait_registered = false;
+		}
+	};
 
+	std::unique_lock lock(rwlock->m);
 	for (;;) {
-		{
-			std::unique_lock lock(rwlock->m);
-
-			auto unregister_writer_wait = [&rwlock, &writer_wait_registered] {
-				if (writer_wait_registered) {
-					rwlock->waiting_writers--;
-					writer_wait_registered = false;
-				}
-			};
-
-			if (write) {
-				if (rwlock->writer == self || RwlockFindReader(rwlock, self) != nullptr) {
-					unregister_writer_wait();
-					return KERNEL_ERROR_EDEADLK;
-				}
-				if (rwlock->writer == nullptr && rwlock->reader_count == 0) {
-					unregister_writer_wait();
-					rwlock->writer       = self;
-					rwlock->writer_count = 1;
-					return OK;
-				}
-				if (!writer_wait_registered) {
-					rwlock->waiting_writers++;
-					writer_wait_registered = true;
-				}
-			} else {
-				const bool already_reader = (RwlockFindReader(rwlock, self) != nullptr);
-				if ((rwlock->writer == nullptr &&
-				     (rwlock->waiting_writers == 0 || already_reader)) ||
-				    rwlock->writer == self) {
-					RwlockAddReader(rwlock, self);
-					return OK;
-				}
+		if (write) {
+			if (rwlock->writer == self || RwlockFindReader(rwlock, self) != nullptr) {
+				unregister_writer_wait();
+				return KERNEL_ERROR_EDEADLK;
 			}
-
-			if (has_timeout) {
-				const auto now = std::chrono::steady_clock::now();
-				if (*timeout_us == 0 || now >= deadline) {
-					unregister_writer_wait();
-					return KERNEL_ERROR_ETIMEDOUT;
-				}
-
-				const auto remaining = deadline - now;
-				const auto poll = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-				                       ? remaining
-				                       : std::chrono::steady_clock::duration(
-				                             std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-				rwlock->cv.wait_for(lock, poll);
-			} else {
-				rwlock->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+			if (rwlock->writer == nullptr && rwlock->reader_count == 0) {
+				unregister_writer_wait();
+				rwlock->writer       = self;
+				rwlock->writer_count = 1;
+				return OK;
+			}
+			if (!writer_wait_registered) {
+				rwlock->waiting_writers++;
+				writer_wait_registered = true;
+			}
+		} else {
+			const bool already_reader = (RwlockFindReader(rwlock, self) != nullptr);
+			if ((rwlock->writer == nullptr && (rwlock->waiting_writers == 0 || already_reader)) ||
+			    rwlock->writer == self) {
+				RwlockAddReader(rwlock, self);
+				return OK;
 			}
 		}
 
-		KernelDispatchPendingSignalForCurrentThread();
+		if (has_timeout) {
+			const auto now = std::chrono::steady_clock::now();
+			if (*timeout_us == 0 || now >= deadline) {
+				unregister_writer_wait();
+				return KERNEL_ERROR_ETIMEDOUT;
+			}
+
+			const auto remaining = deadline - now;
+			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
+			                            ? remaining
+			                            : std::chrono::steady_clock::duration(
+			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+			rwlock->cv.wait_for(lock, poll);
+		} else {
+			rwlock->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		}
 	}
 }
 
@@ -2881,12 +2861,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 			                            : std::chrono::steady_clock::duration(
 			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
 		}
 
 		result = (ready() ? OK : ETIMEDOUT);
@@ -2966,12 +2940,6 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		                            : std::chrono::steady_clock::duration(
 		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
 		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
 	}
 
 	result = (ready() ? OK : ETIMEDOUT);
@@ -3032,11 +3000,6 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
@@ -3100,10 +3063,6 @@ bool PthreadHasPendingSignal(Pthread thread, int signum) {
 
 	const auto mask = 1ull << static_cast<uint32_t>(signum);
 	return (thread->pending_signal_mask.load(std::memory_order_acquire) & mask) != 0;
-}
-
-bool PthreadHasAnyPendingSignal(Pthread thread) {
-	return thread != nullptr && thread->pending_signal_mask.load(std::memory_order_acquire) != 0;
 }
 
 bool PthreadTakePendingSignal(Pthread thread, int signum) {
@@ -3200,6 +3159,11 @@ static void* RunThread(void* arg) {
 #endif
 	thread->host_thread_id = os_thread_id;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// A thread created inside a guest signal handler starts with the dispatch signal blocked.
+	sigset_t dispatch_signal;
+	sigemptyset(&dispatch_signal);
+	sigaddset(&dispatch_signal, Common::HostException::GuestSignalDispatchSignal());
+	pthread_sigmask(SIG_UNBLOCK, &dispatch_signal, nullptr);
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)
 		pthread_setname_np(thread->name.substr(0, 63).c_str());
@@ -3845,12 +3809,12 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	SleepNanoWithSignalPoll(uint64_t {microseconds} * 1000u);
+	SleepNanoInSlices(uint64_t {microseconds} * 1000u);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	SleepNanoWithSignalPoll(seconds * NANOS_PER_SEC);
+	SleepNanoInSlices(seconds * NANOS_PER_SEC);
 	return OK;
 }
 
@@ -3871,7 +3835,7 @@ int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rm
 	uint64_t nanos =
 	    static_cast<uint64_t>(rqtp->tv_sec) * 1000000000ull + static_cast<uint64_t>(rqtp->tv_nsec);
 
-	SleepNanoWithSignalPoll(nanos);
+	SleepNanoInSlices(nanos);
 
 	if (rmtp != nullptr) {
 		rmtp->tv_sec  = 0;
@@ -3992,11 +3956,6 @@ int KYTY_SYSV_ABI pthread_once(void* once_control, void(KYTY_SYSV_ABI* init_rout
 					while (once->state == PTHREAD_ONCE_WAIT) {
 						g_pthread_once_cv.wait_for(
 						    lock, std::chrono::microseconds(LibKernel::SIGNAL_APC_POLL_MICROS));
-						if (once->state == PTHREAD_ONCE_WAIT) {
-							lock.unlock();
-							LibKernel::KernelDispatchPendingSignalForCurrentThread();
-							lock.lock();
-						}
 					}
 					break;
 				default: return POSIX_EINVAL;

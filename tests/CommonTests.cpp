@@ -264,13 +264,6 @@ TEST(Thread, MutexIsRecursiveAndCondVarTimesOutOrWakes) {
 	mutex.Unlock();
 	EXPECT_FALSE(cond_var.WaitFor(&mutex, 1000));
 
-	static int polls = 0;
-	polls            = 0;
-	Common::CondVar::SetWaitPollCallback([] { polls++; });
-	cond_var.Wait(&mutex);
-	Common::CondVar::SetWaitPollCallback(nullptr);
-	EXPECT_EQ(polls, 1);
-
 	bool        ready = false;
 	std::thread signaller([&] {
 		Common::LockGuard lock(mutex);

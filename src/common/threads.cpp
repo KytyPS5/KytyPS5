@@ -188,8 +188,6 @@ static int ReserveCore() {
 
 namespace Common {
 
-static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
-
 static std::thread::id g_main_thread;
 
 void InitializeThreads() {
@@ -283,22 +281,12 @@ void CondVar::SignalAll() {
 #endif
 
 void CondVar::Wait(Mutex* mutex) {
-	auto* callback = g_cond_wait_poll_callback;
-	if (callback == nullptr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		SleepConditionVariableCS(ToCv(&m_cv), ToCs(mutex->m_cs), INFINITE);
+	// A guest signal queued as a special user APC runs only when the wait returns.
+	SleepConditionVariableCS(ToCv(&m_cv), ToCs(mutex->m_cs), 10);
 #else
-		m_cv.wait(mutex->m_mutex);
+	m_cv.wait(mutex->m_mutex);
 #endif
-	} else if (!WaitFor(mutex, 10000)) {
-		mutex->Unlock();
-		callback();
-		mutex->Lock();
-	}
-}
-
-void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
-	g_cond_wait_poll_callback = callback;
 }
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {

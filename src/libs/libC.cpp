@@ -30,10 +30,6 @@
 
 namespace Libs {
 
-namespace LibKernel {
-void KernelDispatchPendingSignalForCurrentThread();
-} // namespace LibKernel
-
 namespace LibC {
 
 LIB_VERSION("libc", 1, "libc", 1, 1);
@@ -490,11 +486,6 @@ static KYTY_SYSV_ABI int std_execute_once(int* flag, execute_once_func_t func, v
 		std::unique_lock lock(g_execute_once_mutex);
 		while (*flag == once_running) {
 			g_execute_once_cv.wait_for(lock, std::chrono::microseconds(10000));
-			if (*flag == once_running) {
-				lock.unlock();
-				LibKernel::KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
-			}
 		}
 		if (*flag == once_done) {
 			return 1;

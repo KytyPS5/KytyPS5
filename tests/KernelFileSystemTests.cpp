@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -51,10 +52,6 @@
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
-}
-
-namespace Libs::LibKernel {
-void KernelDispatchPendingSignalForCurrentThread();
 }
 
 namespace Libs {
@@ -108,6 +105,38 @@ void WaitForMutexTest(Predicate ready) {
   }
 }
 
+struct SignalExports {
+  int(KYTY_SYSV_ABI *install)(int, void *);
+  int(KYTY_SYSV_ABI *remove)(int);
+  int(KYTY_SYSV_ABI *raise)(Libs::LibKernel::Pthread, int);
+};
+
+SignalExports ResolveSignalExports() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "signal exports resolve");
+    return symbol->vaddr;
+  };
+  return {reinterpret_cast<decltype(SignalExports::install)>(find("WkwEd3N7w0Y")),
+          reinterpret_cast<decltype(SignalExports::remove)>(find("Qhv5ARAoOEc")),
+          reinterpret_cast<decltype(SignalExports::raise)>(find("il03nluKfMk"))};
+}
+
+// Waits until a guest thread's host thread sleeps in a blocking call.
+void WaitUntilSleeping(Libs::LibKernel::Pthread thread) {
+  const auto path = "/proc/self/task/" +
+                    std::to_string(Libs::LibKernel::PthreadGetHostThreadId(thread)) + "/stat";
+  WaitForMutexTest([&] {
+    std::ifstream stat(path);
+    std::string line;
+    std::getline(stat, line);
+    const auto state = line.rfind(") ");
+    return state != std::string::npos && line[state + 2] == 'S';
+  });
+}
+
 void TestStaticRwlockDestroy() {
   using namespace Libs::LibKernel;
   PthreadRwlock rwlock = nullptr;
@@ -126,7 +155,7 @@ struct MutexWaiter {
   Libs::LibKernel::Pthread thread = nullptr;
   std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
   std::atomic<unsigned> parked{0}, resume{0};
-  std::atomic<bool> acquired{false}, release{false}, finished{false};
+  std::atomic<bool> locking{false}, acquired{false}, release{false}, finished{false};
   int result = 0;
 };
 
@@ -142,6 +171,7 @@ void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
   using namespace Libs::LibKernel;
   auto &waiter = *static_cast<MutexWaiter *>(arg);
   current_mutex_waiter = &waiter;
+  waiter.locking = true;
   waiter.result = waiter.timeout == 0 ? PthreadMutexLock(waiter.mutex)
                                       : PthreadMutexTimedlock(waiter.mutex, waiter.timeout);
   if (waiter.result == OK) {
@@ -157,7 +187,15 @@ void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
   return nullptr;
 }
 
-void QueueMutexWaiter(MutexWaiter &waiter) {
+// Parks a waiter that sleeps in the contended lock, after it enqueued itself.
+void ParkInLockWait(const SignalExports &signals, MutexWaiter &waiter) {
+  WaitUntilSleeping(waiter.thread);
+  const auto ticket = waiter.parked.load() + 1;
+  Check(signals.raise(waiter.thread, 30) == OK, "raise a signal on the mutex waiter");
+  WaitForMutexTest([&] { return waiter.parked.load() == ticket; });
+}
+
+void QueueMutexWaiter(const SignalExports &signals, MutexWaiter &waiter) {
   using namespace Libs::LibKernel;
   PthreadAttr attr = nullptr;
   Check(PthreadAttrInit(&attr) == OK &&
@@ -165,10 +203,9 @@ void QueueMutexWaiter(MutexWaiter &waiter) {
             PthreadCreate(&waiter.thread, &attr, RunMutexWaiter, &waiter, "MutexTest") == OK &&
             PthreadAttrDestroy(&attr) == OK,
         "create guest mutex waiter");
-  // Pending guest signals are dispatched inside the contended lock, after enqueueing.
-  // Holding that callback proves queue order without letting the waiter acquire.
-  PthreadQueuePendingSignal(waiter.thread, 30);
-  WaitForMutexTest([&] { return waiter.parked.load() == 1; });
+  WaitForMutexTest([&] { return waiter.locking.load(); });
+  // Holding the handler proves queue order without letting the waiter acquire.
+  ParkInLockWait(signals, waiter);
 }
 
 void TestMutexHandoff() {
@@ -176,14 +213,9 @@ void TestMutexHandoff() {
   Common::Singleton<Loader::RuntimeLinker>::Instance();
   Initialize();
   PthreadInitSelfForMainThread();
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
-  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
-  Check(install_symbol != nullptr && remove_symbol != nullptr, "mutex signal exports resolve");
-  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
-  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
-  Check(install(30, reinterpret_cast<void *>(ParkMutexWaiter)) == OK, "install mutex test signal");
+  const auto signals = ResolveSignalExports();
+  Check(signals.install(30, reinterpret_cast<void *>(ParkMutexWaiter)) == OK,
+        "install mutex test signal");
 
   PthreadMutexattr attr = nullptr;
   Check(PthreadMutexattrInit(&attr) == OK && PthreadMutexattrSettype(&attr, 2) == OK,
@@ -194,9 +226,10 @@ void TestMutexHandoff() {
               PthreadMutexLock(&mutex) == OK && PthreadMutexLock(&mutex) == OK,
           "lock recursive mutex twice");
     std::array<MutexWaiter, 3> waiters{{{&mutex}, {&mutex}, {&mutex}}};
-    waiters[timed].timeout = 5000;
+    // Long enough for the timed waiter to park before it expires.
+    waiters[timed].timeout = 200000;
     for (auto &waiter : waiters) {
-      QueueMutexWaiter(waiter);
+      QueueMutexWaiter(signals, waiter);
     }
     waiters[timed].resume = 1;
     Check(PthreadJoin(waiters[timed].thread, nullptr) == OK &&
@@ -233,11 +266,10 @@ void TestMutexHandoff() {
         "nonrecursive self timed lock reports deadlock");
   MutexWaiter waiter{&mutex};
   waiter.cancel = true;
-  QueueMutexWaiter(waiter);
+  QueueMutexWaiter(signals, waiter);
   Check(PthreadCancel(waiter.thread) == OK, "cancel queued mutex waiter");
-  PthreadQueuePendingSignal(waiter.thread, 30);
   waiter.resume = 1;
-  WaitForMutexTest([&] { return waiter.parked.load() == 2; });
+  ParkInLockWait(signals, waiter);
   Check(PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY,
         "canceled waiter retains its queue position");
@@ -248,38 +280,89 @@ void TestMutexHandoff() {
             result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
         "mutex lock defers cancellation until explicit cancellation point");
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
-            PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
+            PthreadMutexDestroy(&mutex) == OK && signals.remove(30) == OK,
         "mutex remains usable after waiter cancellation");
 }
 
-int dispatched_signals = 0;
+std::atomic<int> dispatched_signals{0}, sleepers_started{0};
+std::atomic<bool> release_signal{false}, stop_sleepers{false};
+std::atomic<Libs::LibKernel::Pthread> handler_child{nullptr};
 
 void KYTY_SYSV_ABI CountDispatchedSignal(int, void *) { dispatched_signals++; }
 
+// Sleeps in guest waits until released.
+void KYTY_SYSV_ABI HoldSignal(int, void *) {
+  dispatched_signals++;
+  while (!release_signal) {
+    Libs::LibKernel::KernelUsleep(1000);
+  }
+}
+
+void *KYTY_SYSV_ABI SleepUntilStopped(void *) {
+  sleepers_started++;
+  while (!stop_sleepers) {
+    Libs::LibKernel::KernelUsleep(1000);
+  }
+  return nullptr;
+}
+
+Libs::LibKernel::Pthread StartSleeper() {
+  Libs::LibKernel::Pthread sleeper = nullptr;
+  const auto started = sleepers_started.load();
+  Check(Libs::LibKernel::PthreadCreate(&sleeper, nullptr, SleepUntilStopped, nullptr,
+                                       "Sleeper") == OK,
+        "create a sleeping guest thread");
+  WaitForMutexTest([&] { return sleepers_started.load() > started; });
+  return sleeper;
+}
+
+void KYTY_SYSV_ABI CreateSleeperInHandler(int, void *) { handler_child = StartSleeper(); }
+
+void TestSignalWaitsForRunningHandler() {
+  using namespace Libs::LibKernel;
+  const auto signals = ResolveSignalExports();
+  Check(signals.install(30, reinterpret_cast<void *>(HoldSignal)) == OK,
+        "install holding signal handler");
+  auto *sleeper = StartSleeper();
+  Check(signals.raise(sleeper, 30) == OK, "raise a signal on a sleeping thread");
+  WaitForMutexTest([] { return dispatched_signals.load() == 1; });
+  Check(signals.raise(sleeper, 30) == OK, "raise a signal during its handler");
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  Check(dispatched_signals.load() == 1, "a raise during the handler waits until it returns");
+  release_signal = true;
+  WaitForMutexTest([] { return dispatched_signals.load() == 2; });
+  stop_sleepers = true;
+  Check(PthreadJoin(sleeper, nullptr) == OK && signals.remove(30) == OK,
+        "stop the signaled thread");
+}
+
+void TestThreadCreatedInHandlerTakesSignals() {
+  using namespace Libs::LibKernel;
+  const auto signals = ResolveSignalExports();
+  dispatched_signals = 0;
+  stop_sleepers = false;
+  Check(signals.install(30, reinterpret_cast<void *>(CreateSleeperInHandler)) == OK,
+        "install thread-creating signal handler");
+  auto *parent = StartSleeper();
+  Check(signals.raise(parent, 30) == OK, "raise a signal that creates a thread");
+  WaitForMutexTest([] { return handler_child.load() != nullptr; });
+  Check(signals.remove(30) == OK &&
+            signals.install(30, reinterpret_cast<void *>(CountDispatchedSignal)) == OK,
+        "install counting signal handler");
+  // The child starts with the dispatch signal its creator blocked inside the handler.
+  Check(signals.raise(handler_child, 30) == OK, "raise a signal on the child");
+  WaitForMutexTest([] { return dispatched_signals.load() == 1; });
+  stop_sleepers = true;
+  Check(PthreadJoin(parent, nullptr) == OK && PthreadJoin(handler_child, nullptr) == OK &&
+            signals.remove(30) == OK,
+        "stop the parent and child threads");
+}
+
 void *KYTY_SYSV_ABI ReturnFromGuestThread(void *) { return nullptr; }
 
-void TestPendingSignalDispatch() {
+// An exiting thread stops taking guest signals before it frees its TLS.
+void TestExitingThreadStopsTakingSignals() {
   using namespace Libs::LibKernel;
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
-  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
-  Check(install_symbol != nullptr && remove_symbol != nullptr, "signal handler exports resolve");
-  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
-  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
-  Check(install(30, reinterpret_cast<void *>(CountDispatchedSignal)) == OK,
-        "install signal handler");
-
-  PthreadQueuePendingSignal(PthreadSelf(), 30);
-  const auto start = std::chrono::steady_clock::now();
-  for (int call = 0; call < 1000000; ++call) {
-    KernelDispatchPendingSignalForCurrentThread();
-  }
-  Check(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50) &&
-            dispatched_signals == 1,
-        "a pending signal dispatches once and idle dispatches skip the signal scan");
-
-  // An exiting thread stops taking guest signals before it frees its TLS.
   Pthread exiting = nullptr;
   Check(PthreadCreate(&exiting, nullptr, ReturnFromGuestThread, nullptr, "Exiting") == OK,
         "create exiting guest thread");
@@ -287,9 +370,8 @@ void TestPendingSignalDispatch() {
     PthreadQueuePendingSignal(exiting, 30);
     return !PthreadTakePendingSignal(exiting, 30);
   });
-  Check(PthreadJoin(exiting, nullptr) == OK && !PthreadHasAnyPendingSignal(exiting),
+  Check(PthreadJoin(exiting, nullptr) == OK && !PthreadHasPendingSignal(exiting, 30),
         "joining clears signals the exiting thread did not take");
-  Check(remove(30) == OK, "remove signal handler");
 }
 
 class TempDirectory {
@@ -2904,7 +2986,9 @@ int main(int argc, char** argv) {
 
   TestMutexHandoff();
   TestStaticRwlockDestroy();
-  TestPendingSignalDispatch();
+  TestSignalWaitsForRunningHandler();
+  TestThreadCreatedInHandlerTakesSignals();
+  TestExitingThreadStopsTakingSignals();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");

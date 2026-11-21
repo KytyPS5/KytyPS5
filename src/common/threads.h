@@ -13,8 +13,6 @@ namespace Common {
 // Call on the main thread before starting other threads.
 void InitializeThreads();
 
-using wait_poll_func_t = void (*)();
-
 namespace Thread {
 
 void SleepMicro(uint32_t micros);
@@ -71,8 +69,6 @@ public:
 	void Signal() { m_cv.notify_one(); }
 	void SignalAll() { m_cv.notify_all(); }
 #endif
-
-	static void SetWaitPollCallback(wait_poll_func_t callback);
 
 	KYTY_CLASS_NO_COPY(CondVar);
 

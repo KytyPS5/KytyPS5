@@ -1993,6 +1993,19 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return found->second.clear_mask.test(slice);
 }
 
+uint64_t TextureCache::MetaRangeSize(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return 0;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	if (owner == nullptr || !owner->registered || owner->info.metadata.range.address != address) {
+		return 0;
+	}
+	return owner->info.metadata.range.size;
+}
+
 bool TextureCache::ClearMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);

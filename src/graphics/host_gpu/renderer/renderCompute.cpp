@@ -75,7 +75,13 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				// Games reuse the memory of HTile ranges for other data, and a cached depth image
+				// can outlive that reuse. Only a write of exactly the live HTile range is a
+				// metadata clear; consuming any other drops the dispatch's real writes (a work
+				// queue that is then never reset hangs the GPU, a larger buffer is never filled).
+				const auto base      = descriptor.Base48();
+				const auto meta_size = cache.MetaRangeSize(base);
+				if (meta_size != 0 && descriptor.GetSize() == meta_size && cache.ClearMeta(base)) {
 					return true;
 				}
 			}

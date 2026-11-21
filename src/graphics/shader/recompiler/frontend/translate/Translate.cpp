@@ -1399,11 +1399,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// ESVertCount describes input vertices, independently of lane ordinals.
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
+			const auto lane_bound = IR::U32(entry_ir.Emit(IR::ValueOpcode::LaneBound));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      entry_ir.BitwiseOr(active_lane_count(), IR::U32(IR::Value(1u << 28u))));
+			                      entry_ir.BitwiseOr(lane_bound, IR::U32(IR::Value(1u << 28u))));
 			// Vulkan adds an indirect record's bases to the indices; the hardware passes them
 			// only in the user SGPRs the packet patches. SH_NOP leaves those SGPRs unchanged;
 			// it does not make the record's bases zero.

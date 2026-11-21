@@ -174,6 +174,9 @@ set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
 set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Headers" CACHE PATH "" FORCE)
 add_subdirectory(SPIRV-Tools)
 
+target_precompile_headers(SPIRV-Tools-opt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Tools/source/opt/pch_source_opt.h")
+target_precompile_headers(SPIRV-Tools-static PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Tools/source/pch_source.h")
+
 add_library(spirv-tools ALIAS SPIRV-Tools-static)
 add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
 

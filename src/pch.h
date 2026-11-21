@@ -61,11 +61,14 @@
 #include <vector>
 
 // Core third-party headers
+#include <SDL3/SDL.h>
 #include <fmt/color.h>
 #include <fmt/format.h>
 #include <fmt/printf.h>
+#include <nlohmann/json.hpp>
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_hash.hpp>
+#include <xxhash.h>
 
 // Common project headers
 #include "common/abi.h"
@@ -76,6 +79,8 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/shader.h"
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"

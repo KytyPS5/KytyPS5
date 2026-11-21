@@ -1,12 +1,10 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
-#include "loader/runtimeLinker.h"
 
 #include <gtest/gtest.h>
 
@@ -60,10 +58,9 @@ int main(int argc, char** argv) {
 	subsystems.Initialize<Config::Lifecycle>();
 	subsystems.Initialize<Log::Lifecycle>();
 	// Guest threads allocate their TLS in guest memory.
-	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
-	Common::Singleton<Loader::RuntimeLinker>::Instance();
-	Libs::LibKernel::Initialize();
-	Libs::LibKernel::PthreadInitSelfForMainThread();
+	subsystems.Initialize<LibKernel::Memory::Lifecycle>();
+	LibKernel::Initialize();
+	LibKernel::PthreadInitSelfForMainThread();
 	testing::InitGoogleTest(&argc, argv);
 	return RUN_ALL_TESTS();
 }

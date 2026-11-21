@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -21,6 +22,7 @@ struct PssrParameters {
 	uint32_t input_size[2];
 	uint32_t output_size[2];
 	uint32_t output_channels[4];
+	uint32_t opaque_alpha;
 };
 
 // Upscalers read and write with stages and accesses of their own.
@@ -99,13 +101,19 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		        descriptor.Type() == Prospero::ImageType::kColor2DArray) &&
 		       descriptor.TileMode() != Prospero::TileMode::kDepth;
 	};
+	const auto is_legacy_output = [](const ShaderTextureResource& descriptor) {
+		return descriptor.Format() == Prospero::BufferFormat::k11_11_10Float &&
+		       descriptor.TileMode() == Prospero::TileMode::kStandard256B &&
+		       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
+		       descriptor.MaxMip() == 0 && descriptor.BaseArray5() == 0 && descriptor.Depth() == 0;
+	};
+	const bool from_mfsr2   = (request.flags & Pssr::kFromMfsr2) != 0;
+	const bool contract_met = from_mfsr2 ? Pssr::IsMfsr2Texture(input_descriptor) &&
+	                                           Pssr::IsMfsr2Texture(output_descriptor)
+	                                     : is_legacy_output(output_descriptor);
 	EXIT_IF(!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
-	        !Pssr::IsColorFormat(input_descriptor.Format()) ||
-	        output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
-	        output_descriptor.TileMode() != Prospero::TileMode::kStandard256B ||
-	        output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||
-	        output_descriptor.MaxMip() != 0 || output_descriptor.BaseArray5() != 0 ||
-	        output_descriptor.Depth() != 0 || request.width == 0 || request.height == 0);
+	        !Pssr::IsColorFormat(input_descriptor.Format()) || !contract_met ||
+	        request.width == 0 || request.height == 0);
 	const auto input_width = std::max(1u, (input_descriptor.Width5() + 1u) >>
 	                                         input_descriptor.BaseLevel());
 	const auto input_height = std::max(1u, (input_descriptor.Height5() + 1u) >>
@@ -113,10 +121,14 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	EXIT_IF(request.width > input_width || request.height > input_height);
 	PssrParameters parameters {{request.width, request.height},
 	                           {output_descriptor.Width5() + 1u, output_descriptor.Height5() + 1u},
-	                           {4, 4, 4, 4}};
-	for (uint32_t component = 0; component < 3; ++component) {
+	                           {4, 4, 4, 4},
+	                           from_mfsr2};
+	const auto     host_to_storage =
+	    TextureGetSurfaceFormatInfo(output_descriptor.Format()).host_to_storage;
+	for (uint32_t component = 0; component < 4; ++component) {
 		for (uint32_t source = 0; source < 4; ++source) {
-			if (GetDstSel(output_descriptor.DstSelXYZW(), source) == 4u + component) {
+			if (GetDstSel(output_descriptor.DstSelXYZW(), source) ==
+			    4u + host_to_storage.Map(component)) {
 				parameters.output_channels[component] = source;
 				break;
 			}
@@ -145,12 +157,15 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	BindImage(output.image_id, true);
 	EXIT_IF(input.desc.info.data.address < output.desc.info.data.End() &&
 	        output.desc.info.data.address < input.desc.info.data.End());
+	const bool output_has_alpha =
+	    output_descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float;
 	// Depth, motion vectors and exposure for DLSS or FSR, which write the output unswizzled.
 	const std::array<const uint32_t*, 3>         dlss_words {request.depth, request.motion,
 	                                                         request.exposure};
 	std::array<std::optional<TextureBinding>, 3> dlss_bindings;
-	if (Upscaler::Enabled() && Dlss::Accepts(request) && parameters.output_channels[0] == 0 &&
-	    parameters.output_channels[1] == 1 && parameters.output_channels[2] == 2) {
+	if (!output_has_alpha && Upscaler::Enabled() && Dlss::Accepts(request) &&
+	    parameters.output_channels[0] == 0 && parameters.output_channels[1] == 1 &&
+	    parameters.output_channels[2] == 2) {
 		for (size_t i = 0; i < dlss_words.size(); ++i) {
 			ShaderTextureResource descriptor {};
 			std::copy_n(dlss_words[i], 8, descriptor.fields);

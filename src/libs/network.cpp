@@ -27,6 +27,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/descriptors.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -49,6 +50,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -946,13 +948,11 @@ struct NetTimeval {
 	int64_t tv_usec;
 };
 
-static constexpr int                         SOCKET_FD_MIN = 128;
 static constexpr int                         SOCKET_FD_MAX = 1024;
 static Common::Mutex                         g_socket_mutex;
 static std::array<SocketSlot, SOCKET_FD_MAX> g_sockets;
 static std::atomic_bool                      g_winsock_initialized = false;
 
-constexpr int      EPOLL_ID_BASE = SOCKET_FD_MAX;
 constexpr uint32_t EPOLL_IN      = 0x00000001;
 constexpr uint32_t EPOLL_OUT     = 0x00000002;
 constexpr uint32_t EPOLL_ERR     = 0x00000008;
@@ -963,31 +963,22 @@ struct EpollRegistration {
 };
 
 struct EpollSlot {
-	bool                           used = false;
-	std::string                    name;
 	std::vector<EpollRegistration> registrations;
 };
 
-static std::mutex                g_epoll_mutex;
-static std::condition_variable   g_epoll_changed;
-static std::array<EpollSlot, 32> g_epolls;
+static std::mutex                         g_epoll_mutex;
+static std::condition_variable            g_epoll_changed;
+static std::unordered_map<int, EpollSlot> g_epolls;
 
 static EpollSlot* GetEpollSlot(int eid) {
-	const auto index = eid - EPOLL_ID_BASE;
-	if (index < 0 || index >= static_cast<int>(g_epolls.size())) {
-		return nullptr;
-	}
-	auto& slot = g_epolls[static_cast<size_t>(index)];
-	return slot.used ? &slot : nullptr;
+	const auto entry = g_epolls.find(eid);
+	return entry != g_epolls.end() ? &entry->second : nullptr;
 }
 
 static void RemoveSocketFromEpolls(int id) {
 	std::lock_guard lock(g_epoll_mutex);
-	for (auto& epoll: g_epolls) {
-		if (!epoll.used) {
-			continue;
-		}
-		std::erase_if(epoll.registrations,
+	for (auto& entry: g_epolls) {
+		std::erase_if(entry.second.registrations,
 		              [id](const auto& registration) { return registration.id == id; });
 	}
 	g_epoll_changed.notify_all();
@@ -1303,23 +1294,24 @@ static bool TakeSocketBackend(int guest_fd, SocketSlot* out) {
 
 	*out = std::move(slot);
 	slot = {};
+	LibKernel::Descriptors::Release(guest_fd);
 	return true;
 }
 
 static int AllocSocketFd(const std::shared_ptr<SocketTransport>& transport, bool p2p = false) {
-	Common::LockGuard lock(g_socket_mutex);
-	for (int fd = SOCKET_FD_MIN; fd < SOCKET_FD_MAX; fd++) {
-		auto& slot = g_sockets[static_cast<size_t>(fd)];
-		if (!slot.transport) {
-			slot.transport = transport;
-			if (p2p) {
-				slot.p2p.emplace();
-			}
-			return fd;
-		}
+	const int fd = LibKernel::Descriptors::Allocate();
+	if (fd >= SOCKET_FD_MAX) {
+		LibKernel::Descriptors::Release(fd);
+		return -1;
 	}
 
-	return -1;
+	Common::LockGuard lock(g_socket_mutex);
+	auto&             slot = g_sockets[static_cast<size_t>(fd)];
+	slot.transport         = transport;
+	if (p2p) {
+		slot.p2p.emplace();
+	}
+	return fd;
 }
 
 static int SelectSockets(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
@@ -1676,17 +1668,9 @@ int KYTY_SYSV_ABI EpollCreate(const char* name, int flags) {
 	}
 
 	std::lock_guard lock(g_epoll_mutex);
-	for (size_t index = 0; index < g_epolls.size(); index++) {
-		auto& slot = g_epolls[index];
-		if (!slot.used) {
-			slot.used = true;
-			slot.name = name;
-			slot.registrations.clear();
-			return EPOLL_ID_BASE + static_cast<int>(index);
-		}
-	}
-
-	return SetGuestSocketError(Posix::POSIX_EMFILE);
+	const int       eid = LibKernel::Descriptors::Allocate();
+	g_epolls.try_emplace(eid);
+	return eid;
 }
 
 int KYTY_SYSV_ABI EpollControl(int eid, int op, int id, const NetEpollEvent* event) {
@@ -1882,14 +1866,11 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 
 int KYTY_SYSV_ABI EpollDestroy(int eid) {
 	std::lock_guard lock(g_epoll_mutex);
-	auto*           slot = GetEpollSlot(eid);
-	if (slot == nullptr) {
+	if (g_epolls.erase(eid) == 0) {
 		return SetGuestSocketError(Posix::POSIX_EBADF);
 	}
 
-	slot->used = false;
-	slot->name.clear();
-	slot->registrations.clear();
+	LibKernel::Descriptors::Release(eid);
 	g_epoll_changed.notify_all();
 	return 0;
 }

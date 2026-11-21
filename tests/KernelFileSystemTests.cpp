@@ -549,6 +549,30 @@ void TestFileDescriptorFlags() {
   }
 }
 
+void TestSharedDescriptorTable() {
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  namespace Net = Libs::Network::Net;
+  const int file = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  Check(EventQueue::KernelCreateEqueue(&queue, "descriptors") == OK, "create an event queue");
+  const int epoll = Net::EpollCreate("descriptors", 0);
+  const int socket = Net::Socket(2, 2, 0);
+  Check(static_cast<int>(static_cast<uint32_t>(queue)) == file + 1 && (queue >> 32) > 0 &&
+            epoll == file + 2 && socket == file + 3,
+        "files, event queues, epolls and sockets take consecutive descriptors of one table");
+  Check(FileSystem::KernelClose(file) == OK && Net::Socket(2, 2, 0) == file,
+        "a socket takes the lowest descriptor a file freed");
+  Check(Net::SocketClose(file) == OK && EventQueue::KernelDeleteEqueue(queue) == OK &&
+            Net::EpollDestroy(epoll) == 0 && Net::SocketClose(socket) == OK,
+        "release the shared descriptors");
+  for (int d = file; d <= socket; d++) {
+    Check(FileSystem::KernelOpen("/dev/urandom", 0, 0) == d, "files reuse every released descriptor");
+  }
+  for (int d = file; d <= socket; d++) {
+    Check(FileSystem::KernelClose(d) == OK, "close the reopened files");
+  }
+}
+
 void TestSysmoduleReferences() {
   Loader::SymbolDatabase symbols;
   Libs::InitSysmodule_1(&symbols);
@@ -3040,6 +3064,7 @@ int main(int argc, char** argv) {
   TestAddContent(temporary.Path());
   TestRandomDevices();
   TestFileDescriptorFlags();
+  TestSharedDescriptorTable();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());

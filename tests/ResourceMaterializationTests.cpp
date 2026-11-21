@@ -1235,6 +1235,41 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// A storage table with filtered accesses materializes when its candidates share one swizzle,
+// whatever their formats.
+void TestIndirectStorageSwizzles() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  const auto x001 = Libs::Graphics::DstSel(4, 0, 0, 1);
+  for (const auto format : {F::k8UNorm, F::k8_8UNorm}) {
+    DescriptorSource source;
+    source.dword_count = 8u;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(0x100u);
+    source.dwords[1] = Value(uint32_t(format) << 20u);
+    source.dwords[3] =
+        Value(x001 | (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource root;
+  root.dword_count = 8u;
+  root.dwords.fill(Value(0u));
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(root);
+  program.info.images.push_back({.source = 2u, .resource_class = ImageResourceClass::Storage,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+      .written = true, .unfiltered_access_only = false});
+  auto plan = Extract(program);
+  const SrtRuntime runtime{};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "indirect storage candidates sharing one swizzle were incompatible");
+}
+
 // A storage swizzle that fills only the channels an unconverted format lacks becomes the identity.
 void TestStorageFillSwizzle() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -1539,6 +1574,7 @@ int main() {
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestIndirectStorageSwizzles();
   TestStorageFillSwizzle();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);

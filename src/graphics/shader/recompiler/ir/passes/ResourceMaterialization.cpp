@@ -1004,10 +1004,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
 		// An unconverted storage view applies its swizzle only to stores, which drop the channels
-		// its format lacks, so a swizzle that only fills those is the identity.
+		// its format lacks, so a swizzle that only fills those is the identity. Indirect table
+		// candidates keep theirs: a table with filtered accesses requires equal swizzles.
 		const auto swizzle = DescriptorImageSwizzle(descriptor);
 		if (image.conversion_format != Prospero::BufferFormat::kInvalid ||
-		    (storage && swizzle != FormatFillSwizzle(format))) {
+		    (storage && (image.indirect_root != ImageResource::NoIndirectImage ||
+		                 swizzle != FormatFillSwizzle(format)))) {
 			image.shader_swizzle = swizzle;
 		}
 		image.numeric_class = Prospero::SampledTextureNumericClass(

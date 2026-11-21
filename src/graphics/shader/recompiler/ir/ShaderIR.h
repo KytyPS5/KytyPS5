@@ -403,6 +403,11 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
+// AMD's ray-query driver path rejects pipeline layouts with no acceleration-structure binding,
+// even an unused one; the TLAS is reached by device address, so the binding stays unused (#2339).
+constexpr uint32_t UnusedAccelerationStructureBinding =
+    4u * static_cast<uint32_t>(DescriptorBindingKind::Count);
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {

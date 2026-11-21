@@ -465,12 +465,21 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
 		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
 	}
-	key.push_back(info.tess.input_control_points);
-	if (info.tess.input_control_points != 0) {
-		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
-		                       tess.output_topology});
+	// Each tessellation stage keys only the layout fields its module depends on.
+	const auto& tess = info.tess;
+	switch (info.logical_stage) {
+		case ShaderType::Local: key.push_back(tess.ls_stride); break;
+		case ShaderType::TessellationControl:
+			key.insert(key.end(), {tess.input_control_points, tess.output_control_points,
+			                       tess.ls_stride, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain});
+			break;
+		case ShaderType::TessellationEvaluation:
+			key.insert(key.end(), {tess.output_control_points, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain, tess.partitioning,
+			                       tess.output_topology});
+			break;
+		default: break;
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {

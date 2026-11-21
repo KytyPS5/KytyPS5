@@ -50677,6 +50677,15 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
   return result;
 }
 
+std::vector<u32> TessellationStageKey(ShaderType stage, const ShaderTessellationInputInfo &tess) {
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = stage;
+  vertex.tess = tess;
+  std::vector<u32> key;
+  BuildStageStaticKey(vertex, key);
+  return key;
+}
+
 // Whether a Patch uvec4[vectors] variable of a storage class sits at a Location.
 bool HasPatchInterface(const std::string &assembly, const std::string &storage, u32 vectors,
                        u32 location) {
@@ -50861,6 +50870,43 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
               ds.assembly.find(output_topology == 2 ? "VertexOrderCcw" : "VertexOrderCw") ==
                   std::string::npos,
           "TES must preserve guest domain, partitioning, and winding");
+
+  // Each stage keys exactly the layout fields its module depends on; the rest leave it unchanged.
+  using Layout = ShaderTessellationInputInfo;
+  struct Field {
+    u32 Layout::*member;
+    u32 value;
+    const char *stages; // The stages depending on the field: L(S), H(S), T(ES).
+  };
+  const Field fields[] = {
+      {&Layout::input_control_points, tess.input_control_points + 1, "H"},
+      {&Layout::output_control_points, tess.output_control_points + 1, "HT"},
+      {&Layout::ls_stride, tess.ls_stride + 16, "LH"},
+      {&Layout::hs_stride, tess.hs_stride + 16, "HT"},
+      {&Layout::patch_base, tess.patch_base + 16, "HT"},
+      {&Layout::patch_size, tess.patch_size + 16, "HT"},
+      {&Layout::domain, 3 - domain, "HT"},
+      {&Layout::partitioning, 5 - partitioning, "T"},
+      {&Layout::output_topology, 5 - output_topology, "T"},
+  };
+  const auto check_layout = [&](const char *what, char stage_letter, ShaderType stage,
+                                const std::vector<u32> &code, const std::string &assembly) {
+    const auto key = TessellationStageKey(stage, tess);
+    for (const auto &field : fields) {
+      auto layout = tess;
+      layout.*field.member = field.value;
+      const bool depends = std::strchr(field.stages, stage_letter) != nullptr;
+      Require(name, what,
+              (TessellationStageKey(stage, layout) != key) == depends &&
+                  (depends ||
+                   CompileTessellationStage(name, code, stage, layout).assembly == assembly),
+              "a tessellation stage key must hold exactly the layout fields its module depends on");
+    }
+  };
+  check_layout("LS layout key", 'L', ShaderType::Local, local, ls.assembly);
+  check_layout("HS layout key", 'H', ShaderType::TessellationControl, control, hs.assembly);
+  check_layout("TES layout key", 'T', ShaderType::TessellationEvaluation, evaluation,
+               ds.assembly);
   std::printf("[host]    %-32s ok\n", name);
 }
 

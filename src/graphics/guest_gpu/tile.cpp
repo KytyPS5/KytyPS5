@@ -16,6 +16,11 @@ static uint32_t ShiftCeil(uint32_t value, uint32_t shift) {
 	return static_cast<uint32_t>((static_cast<uint64_t>(value) + (1ull << shift) - 1ull) >> shift);
 }
 
+// Block dimensions are powers of two.
+static uint32_t AlignToBlock(uint32_t value, uint32_t block) {
+	return (value + block - 1u) & ~(block - 1u);
+}
+
 static uint32_t CalcLinearBlockWidth(uint32_t bytes_per_element) {
 	return 256u / bytes_per_element;
 }
@@ -231,18 +236,6 @@ static uint32_t FirstTailLevel(const MipTailLayout& tail, uint32_t width, uint32
 	return levels;
 }
 
-bool TileGetTextureElementLayout(Prospero::BufferFormat format, TileTextureElementLayout& out) {
-	if (const auto bytes = Prospero::NumBytesPerElement(format); std::has_single_bit(bytes)) {
-		out = {bytes, 1, 1};
-		return true;
-	}
-	if (const auto bytes = Prospero::BlockCompressedBytesPerBlock(format); bytes != 0) {
-		out = {bytes, 4, 4};
-		return true;
-	}
-	return false;
-}
-
 bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode tile, bool volume,
                                TileTextureBlockLayout& out) {
 	TileBlockFamily family = TileBlockFamily::Count;
@@ -303,8 +296,8 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 		return false;
 	}
 	const auto& block   = texture.block;
-	const auto  width0  = (description.width + texture.texel_width - 1u) / texture.texel_width;
-	const auto  height0 = (description.height + texture.texel_height - 1u) / texture.texel_height;
+	const auto  width0  = ShiftCeil(description.width, std::countr_zero(texture.texel_width));
+	const auto  height0 = ShiftCeil(description.height, std::countr_zero(texture.texel_height));
 	const uint32_t block_slices =
 	    volume ? ShiftCeil(description.depth, std::countr_zero(block.block_depth))
 	           : description.layers;
@@ -322,10 +315,8 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 			mips[level]       = {0, block.block_size, block.block_width, block.block_height, x, y};
 			continue;
 		}
-		const auto pitch =
-		    Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		const auto height =
-		    Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		const auto pitch  = AlignToBlock(ShiftCeil(width0, level), block.block_width);
+		const auto height = AlignToBlock(ShiftCeil(height0, level), block.block_height);
 		const auto size = uint64_t {block.block_depth} * pitch * height * block.bytes_per_element;
 		mips[level]     = {offset, size, pitch, height};
 		offset += size;

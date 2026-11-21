@@ -1989,6 +1989,20 @@ int KYTY_SYSV_ABI fsync(int d) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(d));
 }
 
+void* KYTY_SYSV_ABI mmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset) {
+	PRINT_NAME();
+
+	constexpr int GUEST_MAP_SHARING = 0x0003; // MAP_SHARED | MAP_PRIVATE
+	constexpr int GUEST_MAP_ANON    = 0x1000;
+
+	// Anonymous memory is flexible memory; the length rounds up to whole pages.
+	EXIT_NOT_IMPLEMENTED((flags & GUEST_MAP_ANON) == 0 || fd != -1 || offset != 0);
+	const int result = POSIX_CALL(LibKernel::Memory::KernelMapFlexibleMemory(
+	    &addr, (len + 0x3fff) & ~size_t {0x3fff}, prot,
+	    flags & ~(GUEST_MAP_SHARING | GUEST_MAP_ANON)));
+	return result == 0 ? addr : reinterpret_cast<void*>(-1);
+}
+
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -2242,6 +2256,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("-quPa4SEJUw", Posix::pthread_getstack);
 	LIB_FUNC("YQOfxL4QfeU", LibKernel::Memory::KernelMprotect);
 	LIB_FUNC("UqDGjXA5yUM", LibKernel::Memory::KernelMunmap);
+	LIB_FUNC("BPE9s9vQQXo", Posix::mmap);
 	LIB_FUNC("AqBioC2vF3I", LibKernel::read);
 	LIB_FUNC("TU-d9PfIHPM", Posix::socket);
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);

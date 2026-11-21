@@ -93,6 +93,10 @@ namespace Libs::LibAmpr {
 void InitAmpr_1(Loader::SymbolDatabase* symbols);
 }
 
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+}
+
 namespace {
 
 using Libs::LibKernel::Memory::VirtualQueryInfo;
@@ -1825,6 +1829,36 @@ void TestFlexibleMapQueryAndWholeMunmap() {
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "whole munmap should return flexible memory to Prospero-reported budget");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAnonymousMmapUsesFlexibleMemory() {
+	using Mmap = void*(KYTY_SYSV_ABI*)(void*, size_t, int, int, int, int64_t);
+	const char*            test             = "AnonymousMmapUsesFlexibleMemory";
+	constexpr int          prot_read_write  = 0x3;
+	constexpr int          map_private_anon = 0x1002;
+	Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* symbol = symbols.FindByNid("BPE9s9vQQXo", Loader::SymbolType::Func);
+	Check(test, symbol != nullptr, "mmap does not resolve");
+	const auto mmap     = reinterpret_cast<Mmap>(symbol->vaddr);
+	const auto baseline = AvailableFlexibleMemory(test);
+
+	const auto base = reinterpret_cast<uint64_t>(
+	    mmap(nullptr, SceKernelPageSize + 1, prot_read_write, map_private_anon, -1, 0));
+	Check(test, base != UINT64_MAX, "anonymous mmap failed");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize * 2, prot_read_write, 1, 0,
+	            0, 1, "");
+	Check(test, AvailableFlexibleMemory(test) + SceKernelPageSize * 2 == baseline,
+	      "anonymous mmap should consume whole flexible pages");
+	*Libs::Posix::GetErrorAddr() = 0;
+	Check(test,
+	      mmap(nullptr, 0, prot_read_write, map_private_anon, -1, 0) == reinterpret_cast<void*>(-1) &&
+	          *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+	      "zero-length mmap should fail with EINVAL");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6283,6 +6317,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
+	RunTest(TestAnonymousMmapUsesFlexibleMemory);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestFlexibleRangeEditsCoalesce);
 	RunTest(TestPageTableStatsTrackRangeEdits);

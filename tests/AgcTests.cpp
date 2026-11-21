@@ -69,6 +69,28 @@ TEST(Agc, CondExecWritesAnyArguments) {
 	EXPECT_EQ(unaligned.dw, (std::array<uint32_t, 5> {0xc0032200u, 0x34561000u, 0x12u, 0u, 7u}));
 }
 
+TEST(Agc, CondExecPatchesWrapWithoutArgumentChecks) {
+	std::array<uint32_t, 5> cmd {0xc0032200u, ~0u, ~0u, 0u, 0xffffc000u};
+	const auto at = [&cmd](uintptr_t dwords) {
+		return reinterpret_cast<const volatile uint32_t*>(reinterpret_cast<uintptr_t>(cmd.data()) + dwords * 4u);
+	};
+	const auto*    unaligned = reinterpret_cast<const volatile uint32_t*>(0x1234561002ull);
+	constexpr auto invalid   = static_cast<int>(0x8a6c000cu);
+	EXPECT_EQ(Gen5::AgcCondExecPatchSetEnd(cmd.data(), at(3)), 0);
+	EXPECT_EQ(cmd[4], 0xffffc000u | 0x3ffeu);
+	EXPECT_EQ(Gen5::AgcCondExecPatchSetEnd(cmd.data(), at(5 + 0x4001)), 0);
+	EXPECT_EQ(cmd[4], 0xffffc000u | 1u);
+	EXPECT_EQ(Gen5::AgcCondExecPatchSetCommandAddress(cmd.data(), nullptr), 0);
+	EXPECT_EQ((std::array {cmd[1], cmd[2]}), (std::array {3u, 0u}));
+	EXPECT_EQ(Gen5::AgcCondExecPatchSetCommandAddress(cmd.data(), unaligned), 0);
+	EXPECT_EQ((std::array {cmd[1], cmd[2]}), (std::array {0x34561003u, 0x12u}));
+
+	cmd[0] = 0xc0031000u;
+	EXPECT_EQ(Gen5::AgcCondExecPatchSetEnd(cmd.data(), at(9)), invalid);
+	EXPECT_EQ(Gen5::AgcCondExecPatchSetCommandAddress(cmd.data(), at(9)), invalid);
+	EXPECT_EQ(cmd, (std::array<uint32_t, 5> {0xc0031000u, 0x34561003u, 0x12u, 0u, 0xffffc001u}));
+}
+
 TEST(Agc, BranchLeavesNullTargetSlotsZero) {
 	const auto* then_target = reinterpret_cast<const volatile uint32_t*>(0x1234567898ull);
 	Packet<14> dcb;

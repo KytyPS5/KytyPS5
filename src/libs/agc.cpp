@@ -3532,27 +3532,12 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t*
 	         "\t buffer = 0x%016" PRIx64 "\n",
 	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
 
-	if (cmd == nullptr || buffer == nullptr) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_COND_EXEC) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 
-	auto op = (cmd[0] >> 8u) & 0xffu;
-	if (op != Pm4::IT_COND_EXEC) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
-	}
-
-	auto* packet_end = cmd + 5;
-	auto* range_end  = const_cast<uint32_t*>(reinterpret_cast<const volatile uint32_t*>(buffer));
-	if (range_end < packet_end) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
-	}
-
-	auto num_dwords = static_cast<uint64_t>(range_end - packet_end);
-	if (num_dwords > 0x3fffu) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
-	}
-
-	cmd[4] = (cmd[4] & ~0x3fffu) | static_cast<uint32_t>(num_dwords);
+	auto bytes = reinterpret_cast<uintptr_t>(buffer) - reinterpret_cast<uintptr_t>(cmd);
+	cmd[4]     = (cmd[4] & ~0x3fffu) | (static_cast<uint32_t>(bytes / 4u - 5u) & 0x3fffu);
 	return OK;
 }
 
@@ -3564,12 +3549,7 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd
 	         "\t command = 0x%016" PRIx64 "\n",
 	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
 
-	if (cmd == nullptr || command == nullptr) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
-	}
-
-	auto op = (cmd[0] >> 8u) & 0xffu;
-	if (op != Pm4::IT_COND_EXEC || (reinterpret_cast<uintptr_t>(command) & 0x3u) != 0) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_COND_EXEC) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
 

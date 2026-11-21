@@ -1080,21 +1080,54 @@ struct SystemOverlay::Impl {
 			FinishSplash();
 			return;
 		}
-		const auto   layers = AnimateSplash(std::chrono::duration<float>(now - splash_born).count(),
-		                                    g_splash_logo_first);
+		const float  age    = std::chrono::duration<float>(now - splash_born).count();
+		const auto   layers = AnimateSplash(age, g_splash_logo_first);
 		const ImVec2 screen {static_cast<float>(frame_extent.width),
 		                     static_cast<float>(frame_extent.height)};
 		const float  fit = std::min(screen.x / 3840.0f, screen.y / 2160.0f);
 		const ImVec2 size {3840.0f * fit, 2160.0f * fit};
 		const ImVec2 begin {(screen.x - size.x) * 0.5f, (screen.y - size.y) * 0.5f};
-		const ImVec2 end {begin.x + size.x, begin.y + size.y};
 		auto*        draw = ImGui::GetBackgroundDrawList();
-		draw->AddRectFilled({0, 0}, screen, IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha)));
+		// Black bars beside, or above and below, the image.
+		const ImU32  black = IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha));
+		const ImVec2 bar =
+		    begin.x > begin.y ? ImVec2 {begin.x, screen.y} : ImVec2 {screen.x, begin.y};
+		draw->AddRectFilled({0, 0}, bar, black);
+		draw->AddRectFilled({screen.x - bar.x, screen.y - bar.y}, screen, black);
+		// Each layer is a grid whose vertex colors darken it outside the reveal, so the unrevealed
+		// image is black and the background cannot show through the logo.
+		constexpr int COLUMNS = 32;
+		constexpr int ROWS    = 18;
 		for (size_t i = 0; i < layers.size(); ++i) {
 			const auto& layer = layers[i];
-			draw->AddImage(splash_dds[i]->Texture(), begin, end, {layer.u0, layer.v0},
-			               {layer.u1, layer.v1},
-			               IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * layer.alpha)));
+			if (layer.alpha == 0.0f) {
+				continue;
+			}
+			const int   opacity = static_cast<int>(255.0f * alpha * layer.alpha);
+			const float uv0     = 0.5f - 0.5f * layer.span;
+			draw->PushTexture(splash_dds[i]->Texture());
+			draw->PrimReserve(COLUMNS * ROWS * 6, (COLUMNS + 1) * (ROWS + 1));
+			const auto first = draw->_VtxCurrentIdx;
+			for (int row = 0; row <= ROWS; ++row) {
+				for (int column = 0; column <= COLUMNS; ++column) {
+					const float x     = static_cast<float>(column) / COLUMNS;
+					const float y     = static_cast<float>(row) / ROWS;
+					const int   shade = static_cast<int>(255.0f * RevealSplash(age, x, y));
+					draw->PrimWriteVtx({begin.x + size.x * x, begin.y + size.y * y},
+					                   {uv0 + layer.span * x, uv0 + layer.span * y},
+					                   IM_COL32(shade, shade, shade, opacity));
+				}
+			}
+			for (int row = 0; row < ROWS; ++row) {
+				for (int column = 0; column < COLUMNS; ++column) {
+					const auto top    = first + row * (COLUMNS + 1) + column;
+					const auto bottom = top + COLUMNS + 1;
+					for (const auto index: {top, top + 1, bottom, top + 1, bottom + 1, bottom}) {
+						draw->PrimWriteIdx(static_cast<ImDrawIdx>(index));
+					}
+				}
+			}
+			draw->PopTexture();
 		}
 	}
 

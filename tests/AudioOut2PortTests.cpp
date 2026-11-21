@@ -516,9 +516,10 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 	SetPcm(port, pcm);
 	ResetOutputCalls();
 
+	const auto start = g_process_time.load();
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "first sync push failed");
 	SetPcm(port, pcm);
-	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK,
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK && g_process_time - start < 10667,
 	      "device-paced sync push was blocked by modelled queue");
 	const auto calls = OutputCalls();
 	Check(calls.size() == 2, "sync pushes did not reach the device backend");
@@ -526,6 +527,29 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+// A synchronous push returns with a free queue entry, whether the device or the modelled queue
+// paces it.
+void TestSynchronousPushLeavesFreeEntry() {
+	uint32_t pcm[512] {};
+	uint32_t available = 0;
+	for (const uint32_t depth: {1u, 2u}) {
+		for (const bool with_pcm: {false, true}) {
+			const auto context = CreateContext(depth);
+			const auto port    = CreatePort(context, MakeParam());
+			for (int push = 0; push < 2; push++) {
+				if (with_pcm) {
+					SetPcm(port, pcm);
+				}
+				Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "sync push failed");
+				Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, nullptr, &available) == OK,
+				      "a sync push returned with a full queue");
+			}
+			AudioOut2::AudioOut2PortDestroy(port);
+			AudioOut2::AudioOut2ContextDestroy(context);
+		}
+	}
 }
 
 void TestFloat12ChannelPortOutputsPcm() {
@@ -589,9 +613,10 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	      "device port create failed");
 	ResetOutputCalls();
 
+	// The push waits for its 512-sample grain to drain from the queue.
+	const auto start = g_process_time.load();
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "empty sync push failed");
-	Check(AudioOut2::AudioOut2ContextPush(context, 0) != OK,
-	      "handle without PCM bypassed queue backpressure");
+	Check(g_process_time - start >= 10667, "handle without PCM bypassed queue backpressure");
 	Check(OutputCalls().empty(), "empty push reached the device backend");
 
 	AudioOut2::AudioOut2PortDestroy(port);
@@ -637,7 +662,8 @@ void TestQueueDrainsAtExactGrainRate() {
 }
 
 // The query rejects two null outputs and an unknown context, leaving the outputs alone, and
-// writes both levels before it reports NOT_READY for a queue with no free entry.
+// writes both levels before it reports NOT_READY for a queue with no free entry. A push to an
+// unknown context fails the same way.
 void TestQueueLevelResults() {
 	constexpr int invalid_param = static_cast<int>(0x80268001u);
 	constexpr int not_ready     = static_cast<int>(0x80268008u);
@@ -662,6 +688,9 @@ void TestQueueLevelResults() {
 	              invalid_param &&
 	          queued == 7 && available == 7,
 	      "a destroyed context answered the level query");
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == invalid_param &&
+	          AudioOut2::AudioOut2ContextPush(context, 1) == invalid_param,
+	      "a destroyed context accepted a push");
 }
 
 void TestPcmCopiedBeforeScratchBufferReuse() {
@@ -961,6 +990,7 @@ int main() {
 	TestConcurrentCreates();
 	TestContextDestroyCancelsPendingCreate();
 	TestSynchronousDevicePushBypassesModelledQueue();
+	TestSynchronousPushLeavesFreeEntry();
 	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();

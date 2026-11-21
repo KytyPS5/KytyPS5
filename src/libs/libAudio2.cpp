@@ -626,39 +626,40 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
-	uint32_t sleep_micros = audioout2_grain_micros(512);
-
-	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
-		g_audioout2_state_mutex.Lock();
-		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
-			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
-				auto& submission = audioout2_submission(*state);
-				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
-				return OK;
-			}
-		}
+	g_audioout2_state_mutex.Lock();
+	auto* state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
 		g_audioout2_state_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	audioout2_update_context_locked(state);
+	if (blocking == 0 && state->queued >= state->queue_depth) {
+		g_audioout2_state_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_NOT_READY;
+	}
+	// A synchronous push returns with a free queue entry. The SDL queue paces one carrying PCM to
+	// a real device, so the model counts it only if an entry stays free.
+	const bool device_paced = blocking != 0 && audioout2_context_has_queueable_device(*state);
+	if (state->queued < state->queue_depth - (device_paced ? 1u : 0u)) {
+		state->queued++;
+	}
+	auto&      submission   = audioout2_submission(*state);
+	const auto sleep_micros = audioout2_grain_micros(state->num_grains);
+	g_audioout2_state_mutex.Unlock();
+	audioout2_queue_context_audio(ctx, submission, blocking != 0);
 
-		if (blocking == 0) {
-			return AUDIO_OUT2_ERROR_NOT_READY;
+	while (blocking != 0) {
+		g_audioout2_state_mutex.Lock();
+		state = audioout2_find_context_locked(ctx);
+		audioout2_update_context_locked(state);
+		const bool full = state != nullptr && state->queued >= state->queue_depth;
+		g_audioout2_state_mutex.Unlock();
+		if (!full) {
+			break;
 		}
-
 		Common::Thread::SleepMicro(sleep_micros);
 	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,

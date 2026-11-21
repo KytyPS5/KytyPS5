@@ -36,6 +36,14 @@ namespace Libs::Graphics {
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
+CommandScheduler& CommandProcessor::GetScheduler() const {
+	return m_renderer.GetCommandScheduler();
+}
+
+CommandBuffer& CommandProcessor::CurrentBuffer() {
+	return GetScheduler().Current();
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);

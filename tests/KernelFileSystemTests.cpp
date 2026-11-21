@@ -298,6 +298,16 @@ void KYTY_SYSV_ABI HoldSignal(int, void *) {
   }
 }
 
+// Raises again on a thread whose HoldSignal runs and checks the raise waits for it to return.
+void CheckRaiseWaitsForHeldHandler(const SignalExports &signals, Libs::LibKernel::Pthread thread) {
+  WaitForMutexTest([] { return dispatched_signals.load() == 1; });
+  Check(signals.raise(thread, 30) == OK, "raise a signal during its handler");
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  Check(dispatched_signals.load() == 1, "a raise during the handler waits until it returns");
+  release_signal = true;
+  WaitForMutexTest([] { return dispatched_signals.load() == 2; });
+}
+
 void *KYTY_SYSV_ABI SleepUntilStopped(void *) {
   sleepers_started++;
   while (!stop_sleepers) {
@@ -325,15 +335,32 @@ void TestSignalWaitsForRunningHandler() {
         "install holding signal handler");
   auto *sleeper = StartSleeper();
   Check(signals.raise(sleeper, 30) == OK, "raise a signal on a sleeping thread");
-  WaitForMutexTest([] { return dispatched_signals.load() == 1; });
-  Check(signals.raise(sleeper, 30) == OK, "raise a signal during its handler");
-  std::this_thread::sleep_for(std::chrono::milliseconds(30));
-  Check(dispatched_signals.load() == 1, "a raise during the handler waits until it returns");
-  release_signal = true;
-  WaitForMutexTest([] { return dispatched_signals.load() == 2; });
+  CheckRaiseWaitsForHeldHandler(signals, sleeper);
   stop_sleepers = true;
   Check(PthreadJoin(sleeper, nullptr) == OK && signals.remove(30) == OK,
         "stop the signaled thread");
+}
+
+void *KYTY_SYSV_ABI RaiseOnSelf(void *arg) {
+  const auto &signals = *static_cast<const SignalExports *>(arg);
+  Check(signals.raise(Libs::LibKernel::PthreadSelf(), 30) == OK,
+        "raise a signal on the current thread");
+  return nullptr;
+}
+
+void TestSelfRaiseHoldsOtherRaises() {
+  using namespace Libs::LibKernel;
+  auto signals = ResolveSignalExports();
+  dispatched_signals = 0;
+  release_signal = false;
+  Check(signals.install(30, reinterpret_cast<void *>(HoldSignal)) == OK,
+        "install holding signal handler");
+  Pthread raiser = nullptr;
+  Check(PthreadCreate(&raiser, nullptr, RaiseOnSelf, &signals, "SelfRaiser") == OK,
+        "create a self-raising thread");
+  CheckRaiseWaitsForHeldHandler(signals, raiser);
+  Check(PthreadJoin(raiser, nullptr) == OK && signals.remove(30) == OK,
+        "stop the self-raising thread");
 }
 
 void TestThreadCreatedInHandlerTakesSignals() {
@@ -2987,6 +3014,7 @@ int main(int argc, char** argv) {
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   TestSignalWaitsForRunningHandler();
+  TestSelfRaiseHoldsOtherRaises();
   TestThreadCreatedInHandlerTakesSignals();
   TestExitingThreadStopsTakingSignals();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {

@@ -3160,10 +3160,7 @@ static void* RunThread(void* arg) {
 	thread->host_thread_id = os_thread_id;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	// A thread created inside a guest signal handler starts with the dispatch signal blocked.
-	sigset_t dispatch_signal;
-	sigemptyset(&dispatch_signal);
-	sigaddset(&dispatch_signal, Common::HostException::GuestSignalDispatchSignal());
-	pthread_sigmask(SIG_UNBLOCK, &dispatch_signal, nullptr);
+	Common::HostException::SetGuestSignalDispatchBlocked(false);
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)
 		pthread_setname_np(thread->name.substr(0, 63).c_str());

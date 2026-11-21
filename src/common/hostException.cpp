@@ -81,6 +81,15 @@ int GuestSignalDispatchSignal() {
 #endif
 }
 
+bool SetGuestSignalDispatchBlocked(bool blocked) {
+	sigset_t dispatch_signal;
+	sigset_t previous;
+	sigemptyset(&dispatch_signal);
+	sigaddset(&dispatch_signal, GuestSignalDispatchSignal());
+	pthread_sigmask(blocked ? SIG_BLOCK : SIG_UNBLOCK, &dispatch_signal, &previous);
+	return sigismember(&previous, GuestSignalDispatchSignal()) == 1;
+}
+
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

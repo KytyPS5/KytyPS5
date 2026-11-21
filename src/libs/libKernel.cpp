@@ -1119,9 +1119,12 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 #elif defined(__x86_64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
-			auto ctx = CreateCurrentGuestCallSignalUcontext(
+			// Raises from other threads wait until the handler returns, as for a delivered signal.
+			const bool was_blocked = Common::HostException::SetGuestSignalDispatchBlocked(true);
+			auto       ctx         = CreateCurrentGuestCallSignalUcontext(
 			    reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 			handler(signum, &ctx);
+			Common::HostException::SetGuestSignalDispatchBlocked(was_blocked);
 			return OK;
 		}
 

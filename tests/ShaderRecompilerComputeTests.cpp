@@ -726,10 +726,11 @@ struct PipelineCacheTestAccess {
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 
+  template <typename InputInfo>
   static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
-                                        ShaderVertexInputInfo &input) {
-    uint32_t push_data_cursor = 0;
-    return cache.GetProgram(params, input, push_data_cursor);
+                                        InputInfo &input,
+                                        ShaderRecompiler::IR::PushData::Window push_data = {}) {
+    return cache.GetProgram(params, input, push_data);
   }
 
   static void StoreLayout(PipelineCache &cache, uint64_t key,
@@ -1969,7 +1970,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, *options.profile, true);
+        result.program, options.input_info, {}, *options.profile, true);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -2127,7 +2128,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization,
-      static_cast<u32>(pixel_info.object_primitive_id));
+      {.begin = static_cast<u32>(pixel_info.object_primitive_id)});
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -44982,9 +44983,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     }
     program.shader_info_complete = false;
     CollectShaderInfo(program, {.compute = &compute});
-    const auto push_start = layout == Layout::ShiftedPushData ? 3u :
-                            layout == Layout::StorageData ? PushData::NoStart : 0u;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_start);
+    PushData::Window push_data;
+    if (layout == Layout::ShiftedPushData) push_data.begin = 3u;
+    if (layout == Layout::StorageData) push_data.begin = PushData::DwordCount;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_data);
     Require(test.name, "candidate bindings",
             program.bindings.descriptor_counts[0] == (single ? 1u : 2u) &&
                 program.info.buffers[0].descriptor_index == 0u &&
@@ -50112,6 +50114,37 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   const std::set<uint64_t> ids(forward.begin(), forward.end());
   Require(name, "distinct modules", ids.size() == forward.size(),
           "different code or specialization shared a module id");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A lookup finds the same pixel module whatever the draw data's size, and the same vertex
+// module whatever the pixel shader data's size.
+void CheckGraphicsPushDataModules(VulkanHarness &vulkan) {
+  using ShaderRecompiler::IR::PushData;
+  constexpr const char *name = "GraphicsPushDataModules";
+  // v_mov_b32 v0..v3, s0..s3; exp mrt0 v0..v3
+  const std::vector<u32> pixel{EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
+                               EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
+                               EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+  // v_mov_b32 v0, s8; exp pos0 v0, v0, v0, v0
+  const std::vector<u32> vertex{EncodeVop1(0x01, 0, 8), EncodeExp0(0x0c, 0xf),
+                                EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)};
+  const ShaderParams pixel_params{.code = pixel, .user_data_count = 4, .hash = 1};
+  const ShaderParams vertex_params{.code = vertex, .user_data_count = 1, .hash = 2};
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto lookup = [&](const ShaderParams &params, auto input, PushData::Window push_data) {
+    return PipelineCacheTestAccess::GetProgram(cache, params, input, push_data);
+  };
+  const auto *pixel_module = lookup(pixel_params, ShaderPixelInputInfo{}, {});
+  Require(name, "pixel module",
+          pixel_module->info.bindings.push_data_start_dword == PushData::DwordCount - 4 &&
+              lookup(pixel_params, ShaderPixelInputInfo{}, {.begin = 1}) == pixel_module,
+          "a pixel program's push data moved with the draw's");
+  const auto *vertex_module = lookup(vertex_params, ShaderVertexInputInfo{}, {.end = 28});
+  Require(name, "vertex module",
+          vertex_module->info.bindings.push_data_start_dword == 0 &&
+              lookup(vertex_params, ShaderVertexInputInfo{}, {}) == vertex_module,
+          "a vertex program's push data moved with the pixel program's");
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -58358,6 +58391,7 @@ int main(int argc, char **argv) {
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
   CheckComputeQueueModules(vulkan);
+  CheckGraphicsPushDataModules(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();

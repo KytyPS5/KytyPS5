@@ -144,7 +144,7 @@ struct TestCompileResult {
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
-    uint32_t push_data_start_dword = 0) {
+    ShaderRecompiler::IR::PushData::Window push_data = {}) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -158,7 +158,7 @@ TestCompileResult RecompileForTest(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), options, specialization, push_data);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -6104,7 +6104,7 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   Check(!materialize(), "material selection accepted a non-buffer descriptor type");
   batch_root[11] &= ~(1u << 30u);
   Check(materialize(), "restored material batch failed to materialize");
-  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
   CheckSpirvBinaryValidates(result.spirv);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   auto unbounded = code;
@@ -6866,7 +6866,7 @@ void TestNewShaderRecompilerPlanningOnlyLoads() {
   ir.Emit(IR::ValueOpcode::ReferenceU32, {read});
   program.shader_info_complete = false;
   IR::CollectShaderInfo(program, options.input_info);
-  const auto spirv = Spirv::EmitProgram(program, options.input_info, 0, {}, true);
+  const auto spirv = Spirv::EmitProgram(program, options.input_info, {}, {}, true);
   CheckSpirvBinaryValidates(spirv);
   Check(spirv == result.spirv,
         "planning-only loads or references emitted GPU operands/instructions");
@@ -7707,7 +7707,7 @@ void TestMeshExportStorage() {
     options.back_code = split ? std::span{back} : std::span<const uint32_t>{};
     const auto result = RecompileForTest(
         split ? std::span{front} : std::span<const uint32_t>{monolithic},
-        options, push_data_start);
+        options, {.begin = push_data_start});
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
     Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
@@ -10507,7 +10507,7 @@ void TestAutomaticObjectPrimitiveId() {
             PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
         "graphics draw data reserved an incorrect prefix");
   for (const uint32_t start : {prefix, PushData::DwordCount}) {
-    const auto result = RecompileForTest(shader, options, start);
+    const auto result = RecompileForTest(shader, options, {.begin = start});
     Check(result.program.bindings.UsesPushData() == (start == prefix),
           "object ID changed shader-data push/spill selection");
     Check(std::ranges::any_of(result.program.info.outputs, [](const StageOutput& output) {
@@ -10524,7 +10524,7 @@ void TestAutomaticObjectPrimitiveId() {
   }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   pixel.target_shader_mask = 0xf0000000u;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options, prefix); },
+  ExpectFatal([&] { (void)RecompileForTest(shader, options, {.begin = prefix}); },
               "automatic RT7 silently overlapped an explicit MRT7 export");
 #endif
 }
@@ -11061,7 +11061,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   const auto bindings = result.program.bindings;
   result.program.bindings = {};
   result.program.info.buffers[0].descriptor_index = UINT32_MAX;
-  Check(ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info, 0, {}, true) ==
+  Check(ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info, {}, {}, true) ==
                 result.spirv &&
             result.program.bindings == bindings &&
             result.program.info.buffers[0].descriptor_index == 0,
@@ -12643,36 +12643,40 @@ void TestGraphicsPushConstantPlacement() {
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
 
-  constexpr uint32_t PushDataStart = 7;
-  auto placed =
-      RecompileForTest(shader, options, PushDataStart);
+  using ShaderRecompiler::IR::PushData;
+  auto placed = RecompileForTest(shader, options, {.begin = 7});
   Check(placed.program.bindings.UsesPushData() &&
-            placed.program.bindings.push_data_start_dword == PushDataStart &&
+            placed.program.bindings.push_data_start_dword == 28 &&
             placed.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 0,
-        "pixel shader did not use its assigned shared push-data position");
+        "pixel shader data did not take the end of the push space");
   Check(SpirvHasMemberDecorationValue(placed.spirv, OffsetDecoration, 0),
         "SPIR-V push-data block did not use the canonical zero base");
   CheckSpirvBinaryValidates(placed.spirv);
+  PushData::Window window{.begin = 7};
+  placed.program.bindings.AdvancePushData(window, ShaderType::Pixel);
+  Check(window.StartFor(21, ShaderType::Vertex) == 7 &&
+            window.StartFor(22, ShaderType::Vertex) == PushData::NoStart,
+        "pixel shader data moved the vertex stages' start or let them overlap it");
 
-  auto exact = RecompileForTest(shader, options, 28);
+  auto exact = RecompileForTest(shader, options, {.begin = 28});
   Check(exact.program.bindings.UsesPushData() &&
             exact.program.bindings.push_data_start_dword == 28 &&
             exact.program.bindings.ShaderDataDwords() == 4,
         "exact-fit shader data did not use the remaining push space");
-  uint32_t cursor = 28;
-  exact.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 32, "exact-fit shader data advanced the cursor incorrectly");
+  window = {.begin = 28};
+  exact.program.bindings.AdvancePushData(window, ShaderType::Pixel);
+  Check(window.begin == 28 && window.end == 28, "exact-fit shader data left push space free");
   CheckSpirvBinaryValidates(exact.spirv);
 
-  auto spill = RecompileForTest(shader, options, 29);
-  auto full = RecompileForTest(shader, options, 32);
+  auto spill = RecompileForTest(shader, options, {.begin = 29});
+  auto full = RecompileForTest(shader, options, {.begin = 32});
   Check(!spill.program.bindings.UsesPushData() &&
             spill.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 1 &&
             spill.program.bindings == full.program.bindings && spill.spirv == full.spirv,
         "insufficient push space did not produce canonical storage-backed data");
-  cursor = 29;
-  spill.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 29, "spilled shader data consumed push space");
+  window = {.begin = 29};
+  spill.program.bindings.AdvancePushData(window, ShaderType::Pixel);
+  Check(window.begin == 29 && window.end == 32, "spilled shader data consumed push space");
   CheckSpirvBinaryValidates(spill.spirv);
 }
 
@@ -13238,7 +13242,7 @@ void CheckSpirvBlockSourceMapping(TestCompileResult &result) {
             SpirvInstructionOpcodeCount(plain, spv::OpName) == 0,
         "default emission unexpectedly contains debug info");
   const auto mapped =
-      Spirv::EmitProgram(result.program, options.input_info, 0, {}, true);
+      Spirv::EmitProgram(result.program, options.input_info, {}, {}, true);
   Check(SpirvInstructionOpcodeCount(mapped, spv::OpName) != 0,
         "debug emission omitted names");
   CheckSpirvBinaryValidates(mapped);

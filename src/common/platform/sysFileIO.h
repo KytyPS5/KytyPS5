@@ -19,6 +19,8 @@ struct sys_dir_entry_t {
 
 void        SysFileRead(void* data, uint32_t size, sys_file_t& f,
                         uint32_t* bytes_read = nullptr); // NOLINT(google-runtime-references)
+using SysFileRecoverableDestination = bool (*)(const void* data, uint64_t size);
+void        SysFileSetRecoverableDestination(SysFileRecoverableDestination probe);
 void        SysFileWrite(const void* data, uint32_t size, sys_file_t& f,
                          uint32_t* bytes_written = nullptr); // NOLINT(google-runtime-references)
 // The open functions return nullptr on failure.

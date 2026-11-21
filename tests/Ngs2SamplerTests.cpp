@@ -1002,7 +1002,7 @@ void TestPcmWaveformFormats() {
 	RenderRack sampler(system, 0x1000, sampler_option.common);
 	auto& voice = sampler.Voice();
 
-	// Test formati PCM: 0x11 (8-bit), 0x12 (16-bit), 0x14 (24-bit), 0x16 (32-bit int), 0x18 (32-bit float), 0x1a (64-bit double)
+	// PCM format tests: 0x11 (8-bit), 0x12 (16-bit), 0x14 (24-bit), 0x16 (32-bit integer), 0x18 (32-bit floating-point), 0x1a (64-bit double)
 	const uint32_t formats[] = {0x11, 0x12, 0x14, 0x16, 0x18, 0x1a};
 	for (uint32_t fmt : formats) {
 		struct {
@@ -2744,56 +2744,53 @@ void TestVoiceOwnerAndMatrixInfo() {
 	Check(Ngs2VoiceGetOwner(voice_handle, nullptr, &voice_index) == NGS2_ERROR_INVALID_OUT_ADDRESS, "null output pointer accepted");
 }
 
-// ================================================================
-// FASE 2 â€” Test FFT
-// Verifica: FftQuerySize, FftInit, FftProcess (forward/inverse).
-// ================================================================
+// Verify: FftQuerySize, FftInit, FftProcess (forward/inverse).
 static void TestFftPhase2() {
-	// --- FftQuerySize: boundary e casi validi ---
+	// --- FftQuerySize: Boundary and Valid Cases ---
 	uint64_t sz = 0;
-	Check(Ngs2FftQuerySize(7, 2, &sz) != OK,  "FftQuerySize: length 7 dovrebbe fallire");
-	Check(Ngs2FftQuerySize(13, 2, &sz) != OK, "FftQuerySize: length 13 dovrebbe fallire");
-	Check(Ngs2FftQuerySize(8, 2, nullptr) != OK, "FftQuerySize: out_size null dovrebbe fallire");
+	Check(Ngs2FftQuerySize(7, 2, &sz) != OK,  "FftQuerySize: length 7 should fail");
+	Check(Ngs2FftQuerySize(13, 2, &sz) != OK, "FftQuerySize: length 13 should fail");
+	Check(Ngs2FftQuerySize(8, 2, nullptr) != OK, "FftQuerySize: out_size null should fail");
 
-	// length=8, flags=2 â†’ count=64/2=32 â†’ size = 32*32+64 = 1088
-	Check(Ngs2FftQuerySize(8, 2, &sz) == OK, "FftQuerySize(8,2) dovrebbe riuscire");
-	Check(sz == 1088, "FftQuerySize(8,2): dimensione attesa 1088");
+	// length=8, flags=2 → count=64/2=32 → size = 32*32+64 = 1088
+	Check(Ngs2FftQuerySize(8, 2, &sz) == OK, "FftQuerySize(8,2) should succeed");
+	Check(sz == 1088, "FftQuerySize(8,2): expected size 1088");
 
-	// length=8, flags=0 â†’ count=64 â†’ size = 64*32+64 = 2112
-	Check(Ngs2FftQuerySize(8, 0, &sz) == OK, "FftQuerySize(8,0) dovrebbe riuscire");
-	Check(sz == 2112, "FftQuerySize(8,0): dimensione attesa 2112");
+	// length=8, flags=0 → count=64 → size = 64*32+64 = 2112
+	Check(Ngs2FftQuerySize(8, 0, &sz) == OK, "FftQuerySize(8,0) should succeed");
+	Check(sz == 2112, "FftQuerySize(8,0): expected size 2112");
 
-	// Verifica per tutti i length validi (8..12) con flags=2
+	// Check for all valid lengths (8–12) with flags=2
 	const uint32_t expectedSamples[5] = {64u, 128u, 256u, 512u, 1024u};
 	for (int len = 8; len <= 12; ++len) {
 		Check(Ngs2FftQuerySize(static_cast<uint32_t>(len), 2, &sz) == OK,
-		      "FftQuerySize loop length 8-12 fallita");
+		      "FftQuerySize loop length 8-12 failed");
 		const uint64_t expectedSz =
 		    static_cast<uint64_t>(expectedSamples[len - 8] / 2u) * 32u + 64u;
-		Check(sz == expectedSz, "FftQuerySize: dimensione loop mismatch");
+		Check(sz == expectedSz, "FftQuerySize: size mismatch in loop");
 	}
 
-	// --- FftInit: validazione parametri ---
+	// --- FftInit: Parameter Validation ---
 	void* handle = nullptr;
 	std::vector<uint8_t> tooSmall(64);
 	Check(Ngs2FftInit(tooSmall.data(), tooSmall.size(), 8, 2, &handle) != OK,
-	      "FftInit: buffer troppo piccolo dovrebbe fallire");
+	      "FftInit: buffer too small should fail");
 	Check(Ngs2FftInit(nullptr, 1088, 8, 2, &handle) != OK,
-	      "FftInit: work null dovrebbe fallire");
+	      "FftInit: work null should fail");
 	Check(Ngs2FftInit(tooSmall.data(), 1088, 8, 2, nullptr) != OK,
-	      "FftInit: out_handle null dovrebbe fallire");
+	      "FftInit: out_handle null should fail");
 	Check(Ngs2FftInit(tooSmall.data(), 1088, 7, 2, &handle) != OK,
-	      "FftInit: length 7 dovrebbe fallire");
+	      "FftInit: length 7 should fail");
 
-	// Init corretto (flags=2, length=8)
+	// Correct init (flags=2, length=8)
 	Ngs2FftQuerySize(8, 2, &sz);
 	std::vector<uint8_t> workBuf(sz);
 	handle = nullptr;
 	Check(Ngs2FftInit(workBuf.data(), sz, 8, 2, &handle) == OK,
-	      "FftInit flags=2 dovrebbe riuscire");
-	Check(handle == workBuf.data(), "FftInit: handle deve puntare al buffer");
+	      "FftInit flags=2 should succeed");
+	Check(handle == workBuf.data(), "FftInit: handle must point to the buffer");
 
-	// Verifica header scritto correttamente
+	// Verify the header was written correctly
 	int32_t  readLen  = 0;
 	uint32_t readFlgs = 0xdead;
 	std::memcpy(&readLen,  workBuf.data() + 0x10, sizeof(readLen));
@@ -2801,28 +2798,28 @@ static void TestFftPhase2() {
 	Check(readLen == 8, "FftInit: length in header mismatch");
 	Check(readFlgs == 2, "FftInit: flags in header mismatch");
 
-	// Indirizzo tabella seno/coseno deve essere allineato a 64 byte
+	// The sine/cosine table address must be 64-byte aligned
 	uint64_t tablePtr = 0;
 	std::memcpy(&tablePtr, workBuf.data() + 0x00, sizeof(tablePtr));
-	Check((tablePtr & 0x3fu) == 0, "FftInit: indirizzo tabella non allineato a 64 byte");
+	Check((tablePtr & 0x3fu) == 0, "FftInit: table address not aligned to 64 bytes");
 	Check(tablePtr >= reinterpret_cast<uintptr_t>(workBuf.data()),
-	      "FftInit: indirizzo tabella fuori dal buffer");
+	      "FftInit: table address outside the buffer");
 
 	// --- FftProcess: null guard ---
 	Check(Ngs2FftProcess(nullptr, nullptr, nullptr, nullptr, 0, 0) != OK,
-	      "FftProcess: handle null dovrebbe fallire");
+	      "FftProcess: handle null should fail");
 	{
 		float dummyIn[256]  = {};
 		float dummyOut[256] = {};
 		Check(Ngs2FftProcess(nullptr, dummyIn, dummyOut, nullptr, 0, 0) != OK,
-		      "FftProcess: handle null dovrebbe fallire (2)");
+		      "FftProcess: handle null should fail (2)");
 	}
 
-	// --- FftProcess flags=0: pass-through (copia work_buf in out) ---
+	// --- FftProcess flags=0: pass-through (copies work_buf to out) ---
 	Ngs2FftQuerySize(8, 0, &sz);
 	std::vector<uint8_t> workF0(sz);
 	void* handleF0 = nullptr;
-	Check(Ngs2FftInit(workF0.data(), sz, 8, 0, &handleF0) == OK, "FftInit flags=0 dovrebbe riuscire");
+	Check(Ngs2FftInit(workF0.data(), sz, 8, 0, &handleF0) == OK, "FftInit flags=0 should succeed");
 	const size_t points0 = 256; // 1<<8
 	std::vector<float> dummyIn(points0 * 2, 1.0f);
 	std::vector<float> scratchF0(points0 * 2);
@@ -2831,19 +2828,19 @@ static void TestFftPhase2() {
 	}
 	std::vector<float> outF0(points0 * 2, -1.0f);
 	Check(Ngs2FftProcess(handleF0, dummyIn.data(), outF0.data(), scratchF0.data(), 0, 0) == OK,
-	      "FftProcess flags=0 dovrebbe riuscire");
-	Check(outF0 == scratchF0, "FftProcess flags=0: output deve essere uguale a scratchF0");
+	      "FftProcess flags=0 should succeed");
+	Check(outF0 == scratchF0, "FftProcess flags=0: output must equal scratchF0");
 
 	// --- FftProcess flags=2: forward + inverse (round-trip identity) ---
-	for (int len = 8; len <= 10; ++len) { // test su 64, 128, 256 campioni (veloce)
+	for (int len = 8; len <= 10; ++len) { // test on 64, 128, 256 samples (fast)
 		Ngs2FftQuerySize(static_cast<uint32_t>(len), 2, &sz);
 		std::vector<uint8_t> fftWork(sz);
 		void* fftHandle = nullptr;
 		Check(Ngs2FftInit(fftWork.data(), sz, len, 2, &fftHandle) == OK,
-		      "FftInit loop dovrebbe riuscire");
+		      "FftInit loop should succeed");
 
 		const size_t N = size_t{1} << len;
-		// Segnale di test: seno + coseno per garantire spettro non banale
+		// Test signal: sine + cosine to guarantee a non-trivial spectrum
 		std::vector<float> timeIn(N);
 		for (size_t i = 0; i < N; ++i) {
 			timeIn[i] = static_cast<float>(
@@ -2852,17 +2849,17 @@ static void TestFftPhase2() {
 		}
 
 		// Forward: mode=0x5 (forward, internal order, no scaling)
-		// Output: N float (layout internal order per input IFFT)
+		// Output: N float (internal-order layout, used as IFFT input)
 		std::vector<float> intSpec(N, 0.0f);
 		Check(Ngs2FftProcess(fftHandle, timeIn.data(), intSpec.data(), nullptr, 0, 0x5) == OK,
-		      "FftProcess forward (internal) dovrebbe riuscire");
+		      "FftProcess forward (internal) should succeed");
 
 		// Inverse: mode=0xC (inverse, internal order, scaling 1/N) -> round-trip identity
 		std::vector<float> invScaled(N, 0.0f);
 		Check(Ngs2FftProcess(fftHandle, intSpec.data(), invScaled.data(), nullptr, 0, 0xC) == OK,
-		      "FftProcess inverse (internal, scaled) dovrebbe riuscire");
+		      "FftProcess inverse (internal, scaled) should succeed");
 
-		// Verifica round-trip
+		// Verify round trip
 		bool roundTrip = true;
 		for (size_t i = 0; i < N; ++i) {
 			if (std::abs(invScaled[i] - timeIn[i]) > 1e-3f) {
@@ -2870,12 +2867,12 @@ static void TestFftPhase2() {
 				break;
 			}
 		}
-		Check(roundTrip, "FftProcess: round-trip FFT->IFFT non ha riprodotto il segnale originale");
+		Check(roundTrip, "FftProcess: round-trip FFT->IFFT did not reproduce the original signal");
 
-		// Forward mode=0xD (forward + scale 1/N, internal order) deve essere intSpec / N
+		// Forward mode=0xD (forward + scale 1/N, internal order) must equal intSpec / N
 		std::vector<float> intSpecScaled(N, 0.0f);
 		Check(Ngs2FftProcess(fftHandle, timeIn.data(), intSpecScaled.data(), nullptr, 0, 0xD) == OK,
-		      "FftProcess forward (internal, scaled) dovrebbe riuscire");
+		      "FftProcess forward (internal, scaled) should succeed");
 		const float scaleF = 1.0f / static_cast<float>(N);
 		bool specScaleOk = true;
 		for (size_t i = 0; i < N; ++i) {
@@ -2888,10 +2885,8 @@ static void TestFftPhase2() {
 	}
 }
 
-// ================================================================
-// FASE 2 â€” Test GetWaveformFrameInfo
-// Verifica per PCM I16, PCM float32, format null, out null.
-// ================================================================
+// Check for PCM I16, PCM float32, null format, null output.
+
 static void TestWaveformFrameInfoPhase2() {
 	uint32_t frameSize = 0, numSamples = 0, unitsPerFrame = 0, delaySamples = 0;
 
@@ -2902,89 +2897,86 @@ static void TestWaveformFrameInfoPhase2() {
 		fmt.num_channels  = 2;
 		fmt.sample_rate   = 48000;
 		Check(Ngs2GetWaveformFrameInfo(nullptr, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: format null dovrebbe ritornare INVALID_WAVEFORM_FORMAT");
+		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: format null should return INVALID_WAVEFORM_FORMAT");
 		Check(Ngs2GetWaveformFrameInfo(&fmt, nullptr, &numSamples, &unitsPerFrame, &delaySamples)
-		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: frame_size null dovrebbe fallire");
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: frame_size null should fail");
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, nullptr, &unitsPerFrame, &delaySamples)
-		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: num_samples null dovrebbe fallire");
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: num_samples null should fail");
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, nullptr, &delaySamples)
-		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: units_per_frame null dovrebbe fallire");
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: units_per_frame null should fail");
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, nullptr)
-		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: delay_samples null dovrebbe fallire");
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: delay_samples null should fail");
 	}
 
-	// --- Formato non valido ---
+	// --- Invalid format ---
 	{
 		Ngs2WaveformFormat bad{};
 		bad.waveform_type = 0x12u;
-		bad.num_channels  = 0;   // invalido
+		bad.num_channels  = 0;   // invalid
 		bad.sample_rate   = 48000;
 		Check(Ngs2GetWaveformFrameInfo(&bad, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: num_channels=0 dovrebbe fallire");
+		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: num_channels=0 should fail");
 
 		bad.num_channels  = 2;
-		bad.sample_rate   = 0;   // invalido
+		bad.sample_rate   = 0;   // invalid
 		Check(Ngs2GetWaveformFrameInfo(&bad, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: sample_rate=0 dovrebbe fallire");
+		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: sample_rate=0 should fail");
 	}
 
-	// --- PCM 16-bit stereo (tipo 0x12) ---
+	// --- PCM 16-bit stereo (type 0x12) ---
 	{
 		Ngs2WaveformFormat fmt{};
 		fmt.waveform_type = 0x12u;
 		fmt.num_channels  = 2;
 		fmt.sample_rate   = 48000;
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == OK, "GetWaveformFrameInfo PCM16 stereo dovrebbe riuscire");
-		// frame = 2 canali * 2 byte = 4 byte
-		Check(frameSize     == 4,  "GetWaveformFrameInfo PCM16 stereo: frame_size atteso 4");
-		Check(numSamples    == 1,  "GetWaveformFrameInfo PCM16: num_frame_samples atteso 1");
-		Check(unitsPerFrame == 1,  "GetWaveformFrameInfo PCM16: units_per_frame atteso 1");
-		Check(delaySamples  == 0,  "GetWaveformFrameInfo PCM16: delay_samples atteso 0");
+		      == OK, "GetWaveformFrameInfo PCM16 stereo should succeed");
+		// frame = 2 channels * 2 bytes = 4 bytes
+		Check(frameSize     == 4,  "GetWaveformFrameInfo PCM16 stereo: frame_size expected 4");
+		Check(numSamples    == 1,  "GetWaveformFrameInfo PCM16: num_frame_samples expected 1");
+		Check(unitsPerFrame == 1,  "GetWaveformFrameInfo PCM16: units_per_frame expected 1");
+		Check(delaySamples  == 0,  "GetWaveformFrameInfo PCM16: delay_samples expected 0");
 	}
 
-	// --- PCM 32-bit float mono (tipo 0x18) ---
+	// --- PCM 32-bit float mono (type 0x18) ---
 	{
 		Ngs2WaveformFormat fmt{};
 		fmt.waveform_type = 0x18u;
 		fmt.num_channels  = 1;
 		fmt.sample_rate   = 44100;
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == OK, "GetWaveformFrameInfo PCM32F mono dovrebbe riuscire");
-		// frame = 1 canale * 4 byte = 4 byte
-		Check(frameSize     == 4,  "GetWaveformFrameInfo PCM32F mono: frame_size atteso 4");
-		Check(numSamples    == 1,  "GetWaveformFrameInfo PCM32F: num_frame_samples atteso 1");
-		Check(unitsPerFrame == 1,  "GetWaveformFrameInfo PCM32F: units_per_frame atteso 1");
-		Check(delaySamples  == 0,  "GetWaveformFrameInfo PCM32F: delay_samples atteso 0");
+		      == OK, "GetWaveformFrameInfo PCM32F mono should succeed");
+		// frame = 1 channel * 4 bytes = 4 bytes
+		Check(frameSize     == 4,  "GetWaveformFrameInfo PCM32F mono: frame_size expected 4");
+		Check(numSamples    == 1,  "GetWaveformFrameInfo PCM32F: num_frame_samples expected 1");
+		Check(unitsPerFrame == 1,  "GetWaveformFrameInfo PCM32F: units_per_frame expected 1");
+		Check(delaySamples  == 0,  "GetWaveformFrameInfo PCM32F: delay_samples expected 0");
 	}
 
-	// --- PCM 24-bit 6-canali (tipo 0x14) ---
+	// --- 24-bit 6-channel PCM (type 0x14) ---
 	{
 		Ngs2WaveformFormat fmt{};
 		fmt.waveform_type = 0x14u;
 		fmt.num_channels  = 6;
 		fmt.sample_rate   = 48000;
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == OK, "GetWaveformFrameInfo PCM24 6ch dovrebbe riuscire");
-		// frame = 6 * 3 = 18 byte
-		Check(frameSize == 18, "GetWaveformFrameInfo PCM24 6ch: frame_size atteso 18");
+		      == OK, "GetWaveformFrameInfo PCM24 6ch should succeed");
+		// frame = 6 * 3 = 18 bytes
+		Check(frameSize == 18, "GetWaveformFrameInfo PCM24 6ch: frame_size expected 18");
 	}
 
-	// --- Tipo waveform non riconosciuto ---
+	// --- Unknown waveform type ---
 	{
 		Ngs2WaveformFormat fmt{};
-		fmt.waveform_type = 0x99u; // sconosciuto
+		fmt.waveform_type = 0x99u; // unknown
 		fmt.num_channels  = 2;
 		fmt.sample_rate   = 48000;
 		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
-		      == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT, "GetWaveformFrameInfo: tipo sconosciuto dovrebbe fallire");
+		      == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT, "GetWaveformFrameInfo: unknown type should fail");
 	}
 }
 
-// ================================================================
-// FASE 2 — Test ParseWaveformUser
-// Verifica tramite un handler in-memory che legge da un buffer.
-// ================================================================
+// Validate using an in-memory handler that reads from a buffer.
 struct ParseWaveformUserTestCtx {
 	const std::vector<uint8_t>* data;
 };
@@ -3006,23 +2998,23 @@ static void TestParseWaveformUserPhase2() {
 	{
 		Ngs2WaveformInfo info{};
 		Check(Ngs2ParseWaveformUser(0, 0, &info) != OK,
-		      "ParseWaveformUser: handler=0 dovrebbe fallire");
+		      "ParseWaveformUser: handler=0 should fail");
 		Check(Ngs2ParseWaveformUser(1, 0, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-		      "ParseWaveformUser: out_info=null dovrebbe ritornare INVALID_OUT_ADDRESS");
+		      "ParseWaveformUser: out_info=null should return INVALID_OUT_ADDRESS");
 	}
 
-	// Costruiamo un buffer RIFF/WAVE PCM I16 stereo in-memory
-	// Struttura: RIFF <size> WAVE | fmt <16> <pcm_hdr> | data <size> <samples>
-	// Allineiamo a un WAV stereo 16-bit 48kHz con 4 campioni
+	// Build an in-memory RIFF/WAVE PCM I16 stereo buffer
+	// Structure: RIFF <size> WAVE | fmt <16> <pcm_hdr> | data <size> <samples>
+	// Use a 16-bit 48 kHz stereo WAV with 4 sample frames
 	const uint16_t numChannels     = 2;
 	const uint32_t sampleRate      = 48000;
 	const uint16_t bitsPerSample   = 16;
 	const uint16_t blockAlign      = numChannels * (bitsPerSample / 8);
 	const uint32_t byteRate        = sampleRate * blockAlign;
-	const uint32_t numFrames       = 4; // 4 campioni interleaved stereo
+	const uint32_t numFrames       = 4; // 4 interleaved stereo sample frames
 	const uint32_t dataSize        = numFrames * blockAlign;
 
-	// fmt chunk: 16 byte
+	// fmt chunk: 16 bytes
 	std::vector<uint8_t> riff;
 	auto appendU8  = [&](uint8_t v)  { riff.push_back(v); };
 	auto appendLE16 = [&](uint16_t v) {
@@ -3043,12 +3035,12 @@ static void TestParseWaveformUserPhase2() {
 	};
 	(void)appendU8;
 
-	// RIFF header (12 byte)
+	// RIFF header (12 bytes)
 	const uint32_t riffBodySize = 4 + 8 + 16 + 8 + dataSize; // "WAVE" + fmt chunk + data chunk
 	appendFourCC("RIFF");
 	appendLE32(riffBodySize);
 	appendFourCC("WAVE");
-	// fmt chunk (8+16 = 24 byte)
+	// fmt chunk (8+16 = 24 bytes)
 	appendFourCC("fmt ");
 	appendLE32(16);
 	appendLE16(1);                   // PCM
@@ -3070,13 +3062,13 @@ static void TestParseWaveformUserPhase2() {
 	    reinterpret_cast<uintptr_t>(&TestParseReadHandler),
 	    reinterpret_cast<uintptr_t>(&ctx),
 	    &winfo);
-	Check(parseResult == OK, "ParseWaveformUser: parsing RIFF PCM valido dovrebbe riuscire");
-	Check(winfo.format.waveform_type == 0x12u, "ParseWaveformUser: waveform_type dovrebbe essere PCM I16");
+	Check(parseResult == OK, "ParseWaveformUser: parsing a valid PCM RIFF should succeed");
+	Check(winfo.format.waveform_type == 0x12u, "ParseWaveformUser: waveform_type should be PCM I16");
 	Check(winfo.format.num_channels  == numChannels, "ParseWaveformUser: num_channels mismatch");
 	Check(winfo.format.sample_rate   == sampleRate,  "ParseWaveformUser: sample_rate mismatch");
 	Check(winfo.num_samples          == numFrames,   "ParseWaveformUser: num_samples mismatch");
 
-	// --- Handler che restituisce un file non WAVE (formato sconosciuto) ---
+	// --- Handler returning a non-WAVE file (unknown format) ---
 	{
 		const std::vector<uint8_t> junk(32, 0x00);
 		ParseWaveformUserTestCtx bctx{&junk};
@@ -3086,13 +3078,11 @@ static void TestParseWaveformUserPhase2() {
 		    reinterpret_cast<uintptr_t>(&bctx),
 		    &bad);
 		Check(r == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT,
-		      "ParseWaveformUser: dati non WAVE dovrebbero ritornare UNKNOWN_WAVEFORM_FORMAT");
+		      "ParseWaveformUser: Non-WAVE data should return UNKNOWN_WAVEFORM_FORMAT");
 	}
 }
 
-// ============================================================================
-// Test Fase 3: VAG Codec, Custom Gain, Channel Mixer, Pitch Shift DSP
-// ============================================================================
+// Phase 3 Test: VAG Codec, Custom Gain, Channel Mixer, Pitch Shift DSP
 
 static void PutBe32(std::vector<uint8_t>& data, size_t offset, uint32_t val) {
 	for (size_t i = 0; i < 4; ++i) {
@@ -3120,63 +3110,63 @@ static void SetVagUnit(std::vector<uint8_t>& data, uint32_t channels, uint32_t f
 }
 
 static void TestVagPhase3() {
-	// 1. Parsing Header VAG
-	auto vagData = MakeVagFile(2, 3, 44100); // 2 canali, 3 frame (ciascun blocco frame: 2*16 = 32 byte)
-	// Imposta flag di fine frame sul secondo frame per non farlo considerare come dropped frame
+	// 1. VAG header parsing
+	auto vagData = MakeVagFile(2, 3, 44100); // 2 channels, 3 frames (each frame block: 2*16 = 32 bytes)
+	// Set the end flag on the second frame so it is not treated as a dropped frame
 	SetVagUnit(vagData, 2, 1, 0, 0, 2, 0);
 
 	Ngs2WaveformInfo info {};
 	int res = Ngs2ParseWaveformData(vagData.data(), vagData.size(), &info);
-	Check(res == OK, "VAG Parse: parsing fallito per file VAG valido");
-	Check(info.format.waveform_type == SCE_NGS2_WAVEFORM_TYPE_VAG, "VAG Parse: waveform_type errato");
-	Check(info.format.num_channels == 2, "VAG Parse: channels errati");
-	Check(info.format.sample_rate == 44100, "VAG Parse: sample_rate errato");
-	Check(info.audio_unit_size == 32, "VAG Parse: audio_unit_size errato");
-	Check(info.num_audio_unit_samples == 28, "VAG Parse: num_audio_unit_samples errato");
-	Check(info.num_samples == 84, "VAG Parse: num_samples errato per 3 frame");
-	Check(info.num_blocks == 1, "VAG Parse: num_blocks errato");
+	Check(res == OK, "VAG Parse: parsing failed for a valid VAG file");
+	Check(info.format.waveform_type == SCE_NGS2_WAVEFORM_TYPE_VAG, "VAG Parse: waveform_type is wrong");
+	Check(info.format.num_channels == 2, "VAG Parse: channels are wrong");
+	Check(info.format.sample_rate == 44100, "VAG Parse: sample_rate is wrong");
+	Check(info.audio_unit_size == 32, "VAG Parse: audio_unit_size is wrong");
+	Check(info.num_audio_unit_samples == 28, "VAG Parse: num_audio_unit_samples is wrong");
+	Check(info.num_samples == 84, "VAG Parse: num_samples is wrong for 3 frames");
+	Check(info.num_blocks == 1, "VAG Parse: num_blocks is wrong");
 
-	// 2. Loop Parsing VAG
-	auto loopVag = MakeVagFile(1, 4, 48000); // 1 canale, 4 frame
+	// 2. VAG loop parsing
+	auto loopVag = MakeVagFile(1, 4, 48000); // 1 channel, 4 frames
 	// Frame 1: loop start (flag 6) -> sample 28
 	SetVagUnit(loopVag, 1, 1, 0, 0, 6, 0);
 	// Frame 2: loop end (flag 3) -> sample 84
 	SetVagUnit(loopVag, 1, 2, 0, 0, 3, 0);
 	Ngs2WaveformInfo loopInfo {};
 	res = Ngs2ParseWaveformData(loopVag.data(), loopVag.size(), &loopInfo);
-	Check(res == OK, "VAG Parse Loop: parsing fallito");
-	Check(loopInfo.loop_begin_position == 28, "VAG Parse Loop: loop_begin errato");
-	Check(loopInfo.loop_end_position == 84, "VAG Parse Loop: loop_end errato");
-	Check(loopInfo.num_blocks == 3, "VAG Parse Loop: num_blocks dovrebbe essere 3");
-	Check(loopInfo.blocks[0].num_repeats == 0, "VAG Parse Loop: blocco 0 non deve ripetere");
-	Check(loopInfo.blocks[1].num_repeats == UINT32_MAX, "VAG Parse Loop: blocco 1 deve ripetere all'infinito");
+	Check(res == OK, "VAG Parse Loop: parsing failed");
+	Check(loopInfo.loop_begin_position == 28, "VAG Parse Loop: loop_begin is wrong");
+	Check(loopInfo.loop_end_position == 84, "VAG Parse Loop: loop_end is wrong");
+	Check(loopInfo.num_blocks == 3, "VAG Parse Loop: num_blocks should be 3");
+	Check(loopInfo.blocks[0].num_repeats == 0, "VAG Parse Loop: block 0 must not repeat");
+	Check(loopInfo.blocks[1].num_repeats == UINT32_MAX, "VAG Parse Loop: block 1 must repeat forever");
 
-	// 3. Ngs2CalcWaveformBlock per VAG
+	// 3. Ngs2CalcWaveformBlock for VAG
 	Ngs2WaveformFormat vagFmt {};
 	vagFmt.waveform_type = SCE_NGS2_WAVEFORM_TYPE_VAG;
 	vagFmt.num_channels  = 1;
 	vagFmt.sample_rate   = 48000;
 	Ngs2WaveformBlock calcBlock {};
 	res = Ngs2CalcWaveformBlock(&vagFmt, 10, 50, &calcBlock);
-	Check(res == OK, "VAG CalcBlock fallito");
-	Check(calcBlock.data_offset == 0, "VAG CalcBlock offset errato");
-	Check(calcBlock.data_size == 48, "VAG CalcBlock data_size errato (3 frame * 16 byte)");
-	Check(calcBlock.num_skip_samples == 10, "VAG CalcBlock skip samples errato");
-	Check(calcBlock.num_samples == 84, "VAG CalcBlock num_samples errato (3 frame * 28)");
+	Check(res == OK, "VAG CalcBlock failed");
+	Check(calcBlock.data_offset == 0, "VAG CalcBlock offset is wrong");
+	Check(calcBlock.data_size == 48, "VAG CalcBlock data_size is wrong (3 frames * 16 bytes)");
+	Check(calcBlock.num_skip_samples == 10, "VAG CalcBlock skip samples are wrong");
+	Check(calcBlock.num_samples == 84, "VAG CalcBlock num_samples is wrong (3 frames * 28)");
 
-	// 4. Ngs2GetWaveformFrameInfo per VAG
+	// 4. Ngs2GetWaveformFrameInfo for VAG
 	uint32_t frameSize = 0, frameSamples = 0, unitsPerFrame = 0, delaySamples = 0;
 	res = Ngs2GetWaveformFrameInfo(&vagFmt, &frameSize, &frameSamples, &unitsPerFrame, &delaySamples);
-	Check(res == OK, "VAG GetWaveformFrameInfo fallito");
-	Check(frameSize == 16, "VAG GetWaveformFrameInfo frameSize errato");
-	Check(frameSamples == 28, "VAG GetWaveformFrameInfo frameSamples errato");
-	Check(delaySamples == 0, "VAG GetWaveformFrameInfo delaySamples errato");
+	Check(res == OK, "VAG GetWaveformFrameInfo failed");
+	Check(frameSize == 16, "VAG GetWaveformFrameInfo frameSize is wrong");
+	Check(frameSamples == 28, "VAG GetWaveformFrameInfo frameSamples is wrong");
+	Check(delaySamples == 0, "VAG GetWaveformFrameInfo delaySamples is wrong");
 
-	// 5. Test Decoding ADPCM VAG con Render reale
-	// Costruiamo un file VAG con frame 0 = nibble 7 (shift 12, pred 0) e frame 1 = nibble 0 (shift 12, pred 1: coeff 60)
+	// 5. ADPCM VAG decoding test with a real render
+	// Build a VAG file with frame 0 = nibble 7 (shift 12, pred 0) and frame 1 = nibble 0 (shift 12, pred 1: coeff 60)
 	auto decData = MakeVagFile(1, 2, 48000);
-	SetVagUnit(decData, 1, 0, 0, 0x0c, 0, 0x77); // Frame 0: shift 12, pred 0 -> campioni = 7
-	SetVagUnit(decData, 1, 1, 0, 0x1c, 0, 0x00); // Frame 1: shift 12, pred 1 -> decadimento ADPCM
+	SetVagUnit(decData, 1, 0, 0, 0x0c, 0, 0x77); // Frame 0: shift 12, pred 0 -> samples = 7
+	SetVagUnit(decData, 1, 1, 0, 0x1c, 0, 0x00); // Frame 1: shift 12, pred 1 -> ADPCM decay
 
 	Ngs2WaveformBlock testBlocks[2] = {
 		{48, 16, 0, 0, 28, 0, 0},
@@ -3192,7 +3182,7 @@ static void TestVagPhase3() {
 	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
 	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
 	res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
-	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test VAG");
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for VAG test");
 
 	uintptr_t samplerRack = 0;
 	Ngs2RackOptionUnion sOption {};
@@ -3202,7 +3192,7 @@ static void TestVagPhase3() {
 	std::vector<uint8_t> rackBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
 	Ngs2ContextBufferInfo rbi {rackBuf.data(), rackBuf.size(), {0}};
 	res = Ngs2RackCreate(sysHandle, 0x1000, &sOption.sampler.rack_option, &rbi, &samplerRack);
-	Check(res == OK && samplerRack != 0, "RackCreate Sampler fallito per test VAG");
+	Check(res == OK && samplerRack != 0, "RackCreate Sampler failed for VAG test");
 
 	uintptr_t masterRack = 0;
 	Ngs2RackOptionUnion mOption {};
@@ -3212,13 +3202,13 @@ static void TestVagPhase3() {
 	std::vector<uint8_t> mBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
 	Ngs2ContextBufferInfo mbi {mBuf.data(), mBuf.size(), {0}};
 	res = Ngs2RackCreate(sysHandle, 0x3000, &mOption.mastering.rack_option, &mbi, &masterRack);
-	Check(res == OK && masterRack != 0, "RackCreate Mastering fallito per test VAG");
+	Check(res == OK && masterRack != 0, "RackCreate Mastering failed for VAG test");
 
 	uintptr_t sVoice = 0, mVoice = 0;
 	Ngs2RackGetVoiceHandle(samplerRack, 0, &sVoice);
 	Ngs2RackGetVoiceHandle(masterRack, 0, &mVoice);
 
-	// Setup master: 1 canale
+	// Setup master: 1 channel
 	struct { Ngs2VoiceParamHeader h; uint32_t ch; } mSetup {{sizeof(Ngs2VoiceParamHeader) + 4, 0, 0x30000000}, 1};
 	Ngs2VoiceControl(mVoice, &mSetup.h);
 	struct { Ngs2VoiceParamHeader h; uint32_t outId; uint32_t r; } mOut {{sizeof(Ngs2VoiceParamHeader) + 8, 0, 0x30000005}, 0, 0};
@@ -3226,7 +3216,7 @@ static void TestVagPhase3() {
 	Ngs2VoiceEventParam mPlay {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
 	Ngs2VoiceControl(mVoice, &mPlay.header);
 
-	// Setup sampler per VAG
+	// Setup sampler for VAG
 	struct { Ngs2VoiceParamHeader h; Ngs2WaveformFormat fmt; } sSetup {
 		{sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2WaveformFormat), 0, 0x10000000},
 		{SCE_NGS2_WAVEFORM_TYPE_VAG, 1, 48000, 0, 0, 0}
@@ -3237,7 +3227,7 @@ static void TestVagPhase3() {
 	Ngs2VoicePatchParam patch {{sizeof(Ngs2VoicePatchParam), 0, 0x00000005}, 0, 0, masterRack};
 	Ngs2VoiceControl(sVoice, &patch.header);
 
-	// Aggiunta blocchi VAG
+	// Add VAG blocks
 	struct {
 		Ngs2VoiceParamHeader h;
 		const uint8_t* data;
@@ -3256,18 +3246,18 @@ static void TestVagPhase3() {
 	std::vector<float> renderOut(64, 0.0f);
 	Ngs2RenderBufferInfo rinfo {renderOut.data(), renderOut.size() * sizeof(float), 0x18, 1};
 	res = Ngs2SystemRender(sysHandle, &rinfo, 1);
-	Check(res == OK, "SystemRender fallito per test VAG");
+	Check(res == OK, "SystemRender failed for VAG test");
 
-	// Verifica: i primi 28 campioni devono essere ~ 7 / 32768.0f
+	// Verify: the first 28 samples must be ~ 7 / 32768.0f
 	const float expected7 = 7.0f / 32768.0f;
 	for (size_t i = 0; i < 28; ++i) {
-		Check(std::abs(renderOut[i] - expected7) < 1e-4f, "VAG decode sample != 7 nel frame 0");
+		Check(std::abs(renderOut[i] - expected7) < 1e-4f, "VAG decode sample != 7 in frame 0");
 	}
-	// E i campioni successivi del frame 1 devono seguire il decadimento {6, 5, 4, 3, 2, 1, 0, 0}
+	// And the following samples of frame 1 must follow the decay {6, 5, 4, 3, 2, 1, 0, 0}
 	constexpr int32_t decay[8] = {6, 5, 4, 3, 2, 1, 0, 0};
 	for (size_t i = 0; i < 8; ++i) {
 		const float expDecay = decay[i] / 32768.0f;
-		Check(std::abs(renderOut[28 + i] - expDecay) < 1e-4f, "VAG ADPCM decadimento errato");
+		Check(std::abs(renderOut[28 + i] - expDecay) < 1e-4f, "VAG ADPCM decay is wrong");
 	}
 
 	Ngs2SystemDestroy(sysHandle, nullptr);
@@ -3283,9 +3273,9 @@ static void TestCustomGainPhase3() {
 	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
 	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
 	int res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
-	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test Gain");
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for Gain test");
 
-	// Custom Submixer Rack con modulo Gain (ID 0x15)
+	// Custom Submixer Rack with Gain module (ID 0x15)
 	Ngs2CustomSubmixerRackOption subOpt {};
 	auto& custom = subOpt.custom_rack_option;
 	custom.rack_option.size              = sizeof(subOpt);
@@ -3305,28 +3295,28 @@ static void TestCustomGainPhase3() {
 	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
 	uintptr_t gainRack = 0;
 	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &gainRack);
-	Check(res == OK && gainRack != 0, "RackCreate CustomSubmixer fallito per test Gain");
+	Check(res == OK && gainRack != 0, "RackCreate CustomSubmixer failed for Gain test");
 
 	uintptr_t voice = 0;
 	Ngs2RackGetVoiceHandle(gainRack, 0, &voice);
 
-	// Setup custom submixer: 2 canali
+	// Setup custom submixer: 2 channels
 	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
 	Ngs2VoiceControl(voice, &vsetup.header);
 
-	// Imposta guadagno iniziale tramite SCE_NGS2_CUSTOM_VOICE_PARAM_GAIN (0x40001500)
+	// Set the initial gain via SCE_NGS2_CUSTOM_VOICE_PARAM_GAIN (0x40001500)
 	Ngs2CustomVoiceGainParam gparam {};
 	gparam.header = {sizeof(Ngs2CustomVoiceGainParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_GAIN};
 	gparam.gain[0] = 2.0f;
 	gparam.gain[1] = 0.5f;
 	res = Ngs2VoiceControl(voice, &gparam.header);
-	Check(res == OK, "VoiceControl Gain fallito");
+	Check(res == OK, "VoiceControl Gain failed");
 
-	// Avvia la voce
+	// Start the voice
 	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
 	Ngs2VoiceControl(voice, &playEv.header);
 
-	// Simula campioni in input tramite sorgente collegata
+	// Simulate input samples through a connected source
 	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
 	Fixture src(48000, 2);
 	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
@@ -3334,23 +3324,23 @@ static void TestCustomGainPhase3() {
 	for (int i = 0; i < 64 * 2; ++i) ones[i] = 32767;
 	src.Queue(ones, 64, 0);
 
-	// Imposta target gain per testare la rampa
+	// Set the target gain to test the ramp
 	gparam.gain[0] = 4.0f;
 	gparam.gain[1] = 0.0f;
 	Ngs2VoiceControl(voice, &gparam.header);
 
-	// Elaborazione modulo Gain
+	// Gain module processing
 	std::vector<Ngs2VoiceInternal*> voicesList {&src.voice};
 	Ngs2RenderVoice(*vInt, voicesList, 64);
 
 	float* b = vInt->Buffer(0, 64);
 
-	// Verifica: il primo campione deve partire dal valore precedente (2.0f e 0.5f)
-	// e l'ultimo campione della rampa deve tendere al nuovo target (4.0f e 0.0f)
-	Check(std::abs(b[0] - 2.0f) < 0.01f, "Gain rampa ch0 start errato");
-	Check(std::abs(b[64] - 0.5f) < 0.01f, "Gain rampa ch1 start errato");
-	Check(b[63] > 3.8f, "Gain rampa ch0 end non raggiunge il target");
-	Check(b[64 + 63] < 0.1f, "Gain rampa ch1 end non raggiunge il target");
+	// Verification: The first sample must start from the previous value (2.0f and 0.5f)
+	// and the last sample from the ramp should approach the new target (4.0f and 0.0f)
+	Check(std::abs(b[0] - 2.0f) < 0.01f, "Gain ramp ch0 start is wrong");
+	Check(std::abs(b[64] - 0.5f) < 0.01f, "Gain ramp ch1 start is wrong");
+	Check(b[63] > 3.8f, "Gain ramp ch0 end does not reach the target");
+	Check(b[64 + 63] < 0.1f, "Gain ramp ch1 end does not reach the target");
 
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
@@ -3365,9 +3355,9 @@ static void TestCustomChannelMixerPhase3() {
 	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
 	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
 	int res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
-	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test Mixer");
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for Mixer test");
 
-	// Custom Submixer con modulo Channel Mixer (ID 0x17)
+	// Custom Submixer with Channel Mixer module (ID 0x17)
 	Ngs2CustomSubmixerRackOption subOpt {};
 	auto& custom = subOpt.custom_rack_option;
 	custom.rack_option.size              = sizeof(subOpt);
@@ -3387,7 +3377,7 @@ static void TestCustomChannelMixerPhase3() {
 	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
 	uintptr_t mixerRack = 0;
 	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &mixerRack);
-	Check(res == OK && mixerRack != 0, "RackCreate CustomSubmixer fallito per test Mixer");
+	Check(res == OK && mixerRack != 0, "RackCreate CustomSubmixer failed for Mixer test");
 
 	uintptr_t voice = 0;
 	Ngs2RackGetVoiceHandle(mixerRack, 0, &voice);
@@ -3395,13 +3385,13 @@ static void TestCustomChannelMixerPhase3() {
 	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
 	Ngs2VoiceControl(voice, &vsetup.header);
 
-	// Configura matrice channel mixer: swap canali (L -> R, R -> L)
+	// Configure the channel mixer matrix: swap channels (L -> R, R -> L)
 	Ngs2CustomVoiceChannelMixerParam mparam {};
 	mparam.header = {sizeof(Ngs2CustomVoiceChannelMixerParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_CHANNEL_MIXER};
-	mparam.level[0][1] = 1.0f; // Dst 0 (L) riceve Src 1 (R)
-	mparam.level[1][0] = 1.0f; // Dst 1 (R) riceve Src 0 (L)
+	mparam.level[0][1] = 1.0f; // Dst 0 (L) receives Src 1 (R)
+	mparam.level[1][0] = 1.0f; // Dst 1 (R) receives Src 0 (L)
 	res = Ngs2VoiceControl(voice, &mparam.header);
-	Check(res == OK, "VoiceControl ChannelMixer fallito");
+	Check(res == OK, "VoiceControl ChannelMixer failed");
 
 	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
 	Ngs2VoiceControl(voice, &playEv.header);
@@ -3421,10 +3411,10 @@ static void TestCustomChannelMixerPhase3() {
 
 	float* b = vInt->Buffer(0, 64);
 
-	// Dopo il mix i canali devono essere invertiti: Ch 0 riceve 0.25f, Ch 1 riceve 0.75f
+	// After mixing the channels must be swapped: Ch 0 receives 0.25f, Ch 1 receives 0.75f
 	for (size_t i = 0; i < 64; ++i) {
-		Check(std::abs(b[i] - 0.25f) < 0.01f, "ChannelMixer Ch0 swap errato");
-		Check(std::abs(b[64 + i] - 0.75f) < 0.01f, "ChannelMixer Ch1 swap errato");
+		Check(std::abs(b[i] - 0.25f) < 0.01f, "ChannelMixer Ch0 swap is wrong");
+		Check(std::abs(b[64 + i] - 0.75f) < 0.01f, "ChannelMixer Ch1 swap is wrong");
 	}
 
 	Ngs2SystemDestroy(sysHandle, nullptr);
@@ -3440,9 +3430,9 @@ static void TestCustomPitchShiftPhase3() {
 	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
 	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
 	int res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
-	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test PitchShift");
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for PitchShift test");
 
-	// Custom Submixer con modulo Pitch Shift (ID 0x20)
+	// Custom Submixer with Pitch Shift module (ID 0x20)
 	Ngs2CustomSubmixerRackOption subOpt {};
 	auto& custom = subOpt.custom_rack_option;
 	custom.rack_option.size              = sizeof(subOpt);
@@ -3462,7 +3452,7 @@ static void TestCustomPitchShiftPhase3() {
 	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
 	uintptr_t pitchRack = 0;
 	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &pitchRack);
-	Check(res == OK && pitchRack != 0, "RackCreate CustomSubmixer fallito per test PitchShift");
+	Check(res == OK && pitchRack != 0, "RackCreate CustomSubmixer failed for PitchShift test");
 
 	uintptr_t voice = 0;
 	Ngs2RackGetVoiceHandle(pitchRack, 0, &voice);
@@ -3470,13 +3460,13 @@ static void TestCustomPitchShiftPhase3() {
 	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
 	Ngs2VoiceControl(voice, &vsetup.header);
 
-	// Imposta pitch shift: +700 cents, canale 1 in bypass (bypass_mask = 2: bit 1 attivo)
+	// Set pitch shift: +700 cents, channel 1 bypassed (bypass_mask = 2: bit 1 set)
 	Ngs2CustomVoicePitchShiftParam pparam {};
 	pparam.header = {sizeof(Ngs2CustomVoicePitchShiftParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_PITCH_SHIFT};
 	pparam.cents  = 700;
 	pparam.bypass_mask = 2; // bypass Ch 1
 	res = Ngs2VoiceControl(voice, &pparam.header);
-	Check(res == OK, "VoiceControl PitchShift fallito");
+	Check(res == OK, "VoiceControl PitchShift failed");
 
 	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
 	Ngs2VoiceControl(voice, &playEv.header);
@@ -3496,9 +3486,9 @@ static void TestCustomPitchShiftPhase3() {
 
 	float* b = vInt->Buffer(0, 64);
 
-	// Canale 1 è in bypass, quindi i suoi campioni non devono essere modificati dal processore
+	// Channel 1 is bypassed, so its samples must not be modified by the processor
 	for (size_t i = 0; i < 64; ++i) {
-		Check(std::abs(b[64 + i] - (10922.0f / 32768.0f)) < 0.01f, "PitchShift Ch1 bypass errato, valore modificato");
+		Check(std::abs(b[64 + i] - (10922.0f / 32768.0f)) < 0.01f, "PitchShift Ch1 bypass is wrong, value was modified");
 	}
 
 	Ngs2SystemDestroy(sysHandle, nullptr);
@@ -3517,7 +3507,7 @@ void TestCustomFilterModule() {
 
 	uintptr_t sysHandle = 0;
 	int res = Ngs2SystemCreate(&opt, &sysBufInfo, &sysHandle);
-	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test CustomFilter");
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for CustomFilter test");
 
 	Ngs2CustomSubmixerRackOption subOpt {};
 	auto& custom = subOpt.custom_rack_option;
@@ -3538,7 +3528,7 @@ void TestCustomFilterModule() {
 	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
 	uintptr_t filterRack = 0;
 	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &filterRack);
-	Check(res == OK && filterRack != 0, "RackCreate CustomSubmixer fallito per test Filter");
+	Check(res == OK && filterRack != 0, "RackCreate CustomSubmixer failed for Filter test");
 
 	uintptr_t voice = 0;
 	Ngs2RackGetVoiceHandle(filterRack, 0, &voice);
@@ -3546,16 +3536,16 @@ void TestCustomFilterModule() {
 	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
 	Ngs2VoiceControl(voice, &vsetup.header);
 
-	// Imposta filtro biquad passa-basso a 1000 Hz, Q=0.707, Level=1.0
+	// Set a biquad low-pass filter at 1000 Hz, Q=0.707, Level=1.0
 	Ngs2CustomVoiceFilterParam fparam {};
 	fparam.header = {sizeof(Ngs2CustomVoiceFilterParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER};
-	fparam.channel_mask = 0; // entrambi i canali filtrati
+	fparam.channel_mask = 0; // both channels filtered
 	fparam.type = 1;         // Low-pass
 	fparam.param.fcq.frequency = 1000.0f;
 	fparam.param.fcq.q         = 0.707f;
 	fparam.param.fcq.level     = 1.0f;
 	res = Ngs2VoiceControl(voice, &fparam.header);
-	Check(res == OK, "VoiceControl CustomFilter 0x40001300 fallito");
+	Check(res == OK, "VoiceControl CustomFilter 0x40001300 failed");
 
 	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
 	Ngs2VoiceControl(voice, &playEv.header);
@@ -3574,14 +3564,14 @@ void TestCustomFilterModule() {
 	Ngs2RenderVoice(*vInt, voicesList, 64);
 
 	float* b = vInt->Buffer(0, 64);
-	// Il filtro passa-basso a 1000 Hz ammorbidisce il gradino DC: all'inizio b[0] è minore del valore a regime
-	Check(b[0] > 0.0f && b[0] < 0.5f, "Custom Filter Ch0 output inatteso");
-	Check(b[64] > 0.0f && b[64] < 0.5f, "Custom Filter Ch1 output inatteso");
+	// The 1000 Hz low-pass filter smooths the DC step: at the start b[0] is below the steady-state value
+	Check(b[0] > 0.0f && b[0] < 0.5f, "Custom Filter Ch0 output unexpected");
+	Check(b[64] > 0.0f && b[64] < 0.5f, "Custom Filter Ch1 output unexpected");
 
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
-// --- Fase 4: Test per Stream API, Scheduler, Moduli e Reporting ---
+// --- Tests for Stream API, Scheduler, Modules, and Reporting ---
 struct TestStreamCommandRecord {
 	uint32_t id;
 	uint8_t  flags;
@@ -3625,63 +3615,63 @@ static int32_t KYTY_SYSV_ABI TestStreamBufferAlloc(Ngs2ContextBufferInfo* info) 
 static void TestStreamAndModulesPhase4() {
 	// 1. sceNgs2StreamResetOption
 	Check(Ngs2StreamResetOption(nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-	      "StreamResetOption su nullptr deve restituire INVALID_OUT_ADDRESS");
+	      "StreamResetOption on nullptr must return INVALID_OUT_ADDRESS");
 	Check(Ngs2StreamResetOption(reinterpret_cast<void*>(0x10)) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-	      "StreamResetOption su puntatore guest invalido deve restituire INVALID_OUT_ADDRESS");
+	      "StreamResetOption on an invalid guest pointer must return INVALID_OUT_ADDRESS");
 
 	Ngs2StreamOption opt {};
 	int res = Ngs2StreamResetOption(&opt);
-	Check(res == OK, "StreamResetOption fallito");
-	Check(opt.size == sizeof(Ngs2StreamOption), "StreamOption.size non conforme");
-	Check(opt.num_blocks == 4, "StreamOption.num_blocks default errato");
-	Check(opt.buffer_size_1 == 0x100, "StreamOption.buffer_size_1 errato");
-	Check(opt.buffer_size_2 == 0x10, "StreamOption.buffer_size_2 errato");
-	Check(opt.buffer_size_3 == 0x10000, "StreamOption.buffer_size_3 errato");
-	Check(std::abs(opt.default_param - 0.5f) < 1e-6f, "StreamOption.default_param errato");
+	Check(res == OK, "StreamResetOption failed");
+	Check(opt.size == sizeof(Ngs2StreamOption), "StreamOption.size does not match");
+	Check(opt.num_blocks == 4, "StreamOption.num_blocks default is wrong");
+	Check(opt.buffer_size_1 == 0x100, "StreamOption.buffer_size_1 is wrong");
+	Check(opt.buffer_size_2 == 0x10, "StreamOption.buffer_size_2 is wrong");
+	Check(opt.buffer_size_3 == 0x10000, "StreamOption.buffer_size_3 is wrong");
+	Check(std::abs(opt.default_param - 0.5f) < 1e-6f, "StreamOption.default_param is wrong");
 
 	// 2. sceNgs2StreamQueryBufferSize
 	Check(Ngs2StreamQueryBufferSize(&opt, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-	      "StreamQueryBufferSize su buffer_info nullptr deve restituire INVALID_OUT_ADDRESS");
+	      "StreamQueryBufferSize on null buffer_info must return INVALID_OUT_ADDRESS");
 	Check(Ngs2StreamQueryBufferSize(&opt, reinterpret_cast<void*>(0x10)) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-	      "StreamQueryBufferSize su out invalido deve restituire INVALID_OUT_ADDRESS");
+	      "StreamQueryBufferSize on an invalid out pointer must return INVALID_OUT_ADDRESS");
 
 	Ngs2ContextBufferInfo bufInfo {};
 	res = Ngs2StreamQueryBufferSize(nullptr, &bufInfo);
-	Check(res == OK, "StreamQueryBufferSize con opt nullptr fallito");
-	Check(bufInfo.host_buffer_size == 0x106c0ULL, "StreamQueryBufferSize default size deve essere 0x106c0");
+	Check(res == OK, "StreamQueryBufferSize with null opt failed");
+	Check(bufInfo.host_buffer_size == 0x106c0ULL, "StreamQueryBufferSize default size must be 0x106c0");
 
 	Check(Ngs2StreamQueryBufferSize(reinterpret_cast<const void*>(0x10), &bufInfo) == SCE_NGS2_ERROR_INVALID_OPTION_SIZE,
-	      "StreamQueryBufferSize con opt invalido deve restituire INVALID_OPTION_SIZE");
+	      "StreamQueryBufferSize with an invalid opt must return INVALID_OPTION_SIZE");
 
 	Ngs2StreamOption badOpt = opt;
 	badOpt.num_blocks = 0;
 	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_INVALID_NUM_BLOCKS,
-	      "num_blocks == 0 deve restituire INVALID_NUM_BLOCKS");
+	      "num_blocks == 0 must return INVALID_NUM_BLOCKS");
 	badOpt.num_blocks = 33;
 	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_INVALID_NUM_BLOCKS,
-	      "num_blocks > 32 deve restituire INVALID_NUM_BLOCKS");
+	      "num_blocks > 32 must return INVALID_NUM_BLOCKS");
 
 	badOpt = opt;
 	badOpt.buffer_size_3 = 0;
 	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_3_ZERO,
-	      "buffer_size_3 == 0 deve restituire STREAM_BUFFER_SIZE_3_ZERO");
+	      "buffer_size_3 == 0 must return STREAM_BUFFER_SIZE_3_ZERO");
 
 	badOpt = opt;
 	badOpt.buffer_size_1 = 0;
 	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_1_ZERO,
-	      "buffer_size_1 == 0 deve restituire STREAM_BUFFER_SIZE_1_ZERO");
+	      "buffer_size_1 == 0 must return STREAM_BUFFER_SIZE_1_ZERO");
 
 	badOpt = opt;
 	badOpt.buffer_size_2 = 0;
 	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_2_ZERO,
-	      "buffer_size_2 == 0 deve restituire STREAM_BUFFER_SIZE_2_ZERO");
+	      "buffer_size_2 == 0 must return STREAM_BUFFER_SIZE_2_ZERO");
 
 	badOpt = opt;
 	badOpt.size = 0x80;
 	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_INVALID_OPTION_SIZE,
-	      "size errata deve restituire INVALID_OPTION_SIZE");
+	      "wrong size must return INVALID_OPTION_SIZE");
 
-	// 3. Creazione e distruzione Stream
+	// 3. Stream creation and destruction
 	Ngs2SystemOption sysOpt {};
 	Ngs2SystemResetOption(&sysOpt);
 	sysOpt.max_grain_samples = 256;
@@ -3691,94 +3681,94 @@ static void TestStreamAndModulesPhase4() {
 	Ngs2ContextBufferInfo sysBufInfo {sysBuf.data(), sysBuf.size(), {0}};
 	uintptr_t sysHandle = 0;
 	res = Ngs2SystemCreate(&sysOpt, &sysBufInfo, &sysHandle);
-	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test Stream");
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for Stream test");
 
 	uintptr_t streamHandle = 0;
 	Check(Ngs2StreamCreate(sysHandle, &opt, nullptr, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_INFO,
-	      "StreamCreate su buffer_info nullptr deve restituire INVALID_BUFFER_INFO");
+	      "StreamCreate on null buffer_info must return INVALID_BUFFER_INFO");
 	Check(Ngs2StreamCreate(sysHandle, &opt, reinterpret_cast<const void*>(0x10), &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_INFO,
-	      "StreamCreate su buffer_info invalido deve restituire INVALID_BUFFER_INFO");
+	      "StreamCreate on invalid buffer_info must return INVALID_BUFFER_INFO");
 
 	Ngs2ContextBufferInfo emptyHost {};
 	Check(Ngs2StreamCreate(sysHandle, &opt, &emptyHost, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_INFO,
-	      "StreamCreate con host_buffer nullo deve restituire INVALID_BUFFER_INFO");
+	      "StreamCreate with null host_buffer must return INVALID_BUFFER_INFO");
 
 	bufInfo.host_buffer = reinterpret_cast<void*>(0x100000);
 	Check(Ngs2StreamCreate(sysHandle, reinterpret_cast<const void*>(0x10), &bufInfo, &streamHandle) == SCE_NGS2_ERROR_INVALID_OPTION_SIZE,
-	      "StreamCreate con opt invalido deve restituire INVALID_OPTION_SIZE");
+	      "StreamCreate with an invalid opt must return INVALID_OPTION_SIZE");
 	Check(Ngs2StreamCreate(sysHandle, &opt, &bufInfo, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-	      "StreamCreate con out handle nullo deve restituire INVALID_OUT_ADDRESS");
+	      "StreamCreate with a null out handle must return INVALID_OUT_ADDRESS");
 	Check(Ngs2StreamCreate(0xdead, &opt, &bufInfo, &streamHandle) == NGS2_ERROR_INVALID_SYSTEM_HANDLE,
-	      "StreamCreate con system nullo/invalido deve restituire INVALID_SYSTEM_HANDLE");
+	      "StreamCreate with a null/invalid system must return INVALID_SYSTEM_HANDLE");
 
 	std::vector<uint8_t> streamMem(0x106c0);
 	bufInfo.host_buffer = streamMem.data();
 	bufInfo.host_buffer_size = streamMem.size();
 	res = Ngs2StreamCreate(sysHandle, &opt, &bufInfo, &streamHandle);
-	Check(res == OK && streamHandle != 0, "StreamCreate fallito con parametri validi");
+	Check(res == OK && streamHandle != 0, "StreamCreate failed with valid parameters");
 
 	// 4. StreamCreateWithAllocator
 	Ngs2BufferAllocator alloc {};
 	Check(Ngs2StreamCreateWithAllocator(sysHandle, &opt, nullptr, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR,
-	      "StreamCreateWithAllocator su nullptr deve restituire INVALID_BUFFER_ALLOCATOR");
+	      "StreamCreateWithAllocator on nullptr must return INVALID_BUFFER_ALLOCATOR");
 	Check(Ngs2StreamCreateWithAllocator(sysHandle, &opt, reinterpret_cast<const void*>(0x10), &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR,
-	      "StreamCreateWithAllocator su puntatore non valido deve restituire INVALID_BUFFER_ALLOCATOR");
+	      "StreamCreateWithAllocator on an invalid pointer must return INVALID_BUFFER_ALLOCATOR");
 	Check(Ngs2StreamCreateWithAllocator(sysHandle, &opt, &alloc, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR,
-	      "StreamCreateWithAllocator con alloc_handler nullo deve restituire INVALID_BUFFER_ALLOCATOR");
+	      "StreamCreateWithAllocator with null alloc_handler must return INVALID_BUFFER_ALLOCATOR");
 
 	alloc.alloc_handler = &TestStreamBufferAlloc;
 	uintptr_t streamAllocHandle = 0;
 	res = Ngs2StreamCreateWithAllocator(sysHandle, &opt, &alloc, &streamAllocHandle);
-	Check(res == OK && streamAllocHandle != 0, "StreamCreateWithAllocator con allocatore valido fallito");
+	Check(res == OK && streamAllocHandle != 0, "StreamCreateWithAllocator failed with a valid allocator");
 
 	// 5. sceNgs2StreamRunCommands
 	Check(Ngs2StreamDestroy(0, nullptr) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
-	      "StreamDestroy su 0 deve restituire INVALID_STREAM_HANDLE");
+	      "StreamDestroy on 0 must return INVALID_STREAM_HANDLE");
 	Check(Ngs2StreamRunCommands(0, nullptr, 0) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
-	      "StreamRunCommands su stream 0 deve restituire INVALID_STREAM_HANDLE");
+	      "StreamRunCommands on stream 0 must return INVALID_STREAM_HANDLE");
 	Check(Ngs2StreamRunCommands(0x100, reinterpret_cast<const void*>(0x10), 1) == SCE_NGS2_ERROR_INVALID_STREAM_COMMANDS,
-	      "StreamRunCommands con commands invalido deve restituire INVALID_STREAM_COMMANDS");
+	      "StreamRunCommands with invalid commands must return INVALID_STREAM_COMMANDS");
 
 	TestStreamCommandRecord recs[2] {};
 	recs[0].id = 0xf20000; // nop/lock
 	recs[1].id = 0xf20002; // state
 	recs[1].value.u32 = 16;
 	res = Ngs2StreamRunCommands(streamHandle, recs, 2);
-	Check(res == OK, "StreamRunCommands con comandi validi fallito");
+	Check(res == OK, "StreamRunCommands failed with valid commands");
 
-	recs[1].value.u32 = 99; // Stato non valido
+	recs[1].value.u32 = 99; // Invalid state
 	Check(Ngs2StreamRunCommands(streamHandle, recs, 2) == SCE_NGS2_ERROR_INVALID_STREAM_STATE_COMMAND,
-	      "StreamRunCommands con stato errato deve restituire INVALID_STREAM_STATE_COMMAND");
+	      "StreamRunCommands with a wrong state must return INVALID_STREAM_STATE_COMMAND");
 
 	// 6. sceNgs2StreamQueryInfo
 	Check(Ngs2StreamQueryInfo(0, 0xf24001, nullptr, 0) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
-	      "StreamQueryInfo su stream 0 deve restituire INVALID_STREAM_HANDLE");
+	      "StreamQueryInfo on stream 0 must return INVALID_STREAM_HANDLE");
 	uint64_t qinfo = 0;
 	Check(Ngs2StreamQueryInfo(streamHandle, 0xf24001, &qinfo, 4) == NGS2_ERROR_INVALID_OUT_SIZE,
-	      "StreamQueryInfo 0xf24001 con size < 8 deve restituire INVALID_OUT_SIZE");
+	      "StreamQueryInfo 0xf24001 with size < 8 must return INVALID_OUT_SIZE");
 	Check(Ngs2StreamQueryInfo(streamHandle, 0xf24099, &qinfo, 8) == SCE_NGS2_ERROR_INVALID_STREAM_QUERY_ID,
-	      "StreamQueryInfo con query id non valido deve restituire INVALID_STREAM_QUERY_ID");
+	      "StreamQueryInfo with an invalid query id must return INVALID_STREAM_QUERY_ID");
 	res = Ngs2StreamQueryInfo(streamHandle, 0xf24001, &qinfo, sizeof(qinfo));
-	Check(res == OK, "StreamQueryInfo 0xf24001 fallito");
+	Check(res == OK, "StreamQueryInfo 0xf24001 failed");
 
-	// 7. Distruzione stream
+	// 7. Stream destruction
 	res = Ngs2StreamDestroy(streamHandle, nullptr);
-	Check(res == OK, "StreamDestroy streamHandle fallito");
+	Check(res == OK, "StreamDestroy streamHandle failed");
 	res = Ngs2StreamDestroy(streamAllocHandle, nullptr);
-	Check(res == OK, "StreamDestroy streamAllocHandle fallito");
+	Check(res == OK, "StreamDestroy streamAllocHandle failed");
 
 	// 8. Scheduler & Module Enums & Reports
 	Check(Ngs2JobSchedulerResetOption(nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
-	      "JobSchedulerResetOption con nullptr deve restituire INVALID_OUT_ADDRESS");
+	      "JobSchedulerResetOption with nullptr must return INVALID_OUT_ADDRESS");
 	Ngs2JobSchedulerOption jsOpt {};
 	res = Ngs2JobSchedulerResetOption(&jsOpt);
-	Check(res == OK, "JobSchedulerResetOption fallito");
-	Check(jsOpt.num_threads == 1, "JobSchedulerOption default errato");
+	Check(res == OK, "JobSchedulerResetOption failed");
+	Check(jsOpt.num_threads == 1, "JobSchedulerOption default is wrong");
 
 	void* cfgTable[4] = {};
-	Check(Ngs2ModuleEnumConfigs(cfgTable, 4) == 0, "ModuleEnumConfigs deve restituire 0");
-	Check(Ngs2ModuleArrayEnumItems(nullptr, nullptr, 0) == 0, "ModuleArrayEnumItems con nullptr deve restituire 0");
-	Check(Ngs2ModuleQueueEnumItems(nullptr, nullptr, 0) == 0, "ModuleQueueEnumItems con nullptr deve restituire 0");
+	Check(Ngs2ModuleEnumConfigs(cfgTable, 4) == 0, "ModuleEnumConfigs must return 0");
+	Check(Ngs2ModuleArrayEnumItems(nullptr, nullptr, 0) == 0, "ModuleArrayEnumItems with nullptr must return 0");
+	Check(Ngs2ModuleQueueEnumItems(nullptr, nullptr, 0) == 0, "ModuleQueueEnumItems with nullptr must return 0");
 
 	// Test array enum
 	alignas(8) uint8_t arrayData[64] = {};
@@ -3796,9 +3786,9 @@ static void TestStreamAndModulesPhase4() {
 	std::memcpy(arrayData + 0x28, &sampleVal3, 4);
 	uint32_t outItems[4] = {};
 	const int enumCount = Ngs2ModuleArrayEnumItems(arrayData, outItems, 2);
-	Check(enumCount == 3, "ModuleArrayEnumItems count errato");
+	Check(enumCount == 3, "ModuleArrayEnumItems count is wrong");
 	Check(outItems[0] == sampleVal1 && outItems[1] == sampleVal2 && outItems[2] == 0,
-	      "ModuleArrayEnumItems copia elementi errata");
+	      "ModuleArrayEnumItems item copy is wrong");
 
 	// Test queue enum
 	TestModuleQueue q {};
@@ -3810,13 +3800,13 @@ static void TestStreamAndModulesPhase4() {
 	q.ringLength      = 4;
 	uint32_t qOut[4] = {};
 	const int qEnumCount = Ngs2ModuleQueueEnumItems(&q, qOut, 3);
-	Check(qEnumCount == 3, "ModuleQueueEnumItems count errato");
+	Check(qEnumCount == 3, "ModuleQueueEnumItems count is wrong");
 	Check(qOut[0] == qItems[3] && qOut[1] == qItems[0] && qOut[2] == qItems[1] && qOut[3] == 0,
-	      "ModuleQueueEnumItems copia ring errata");
+	      "ModuleQueueEnumItems ring copy is wrong");
 
 	// Test report register/unregister
-	Check(Ngs2ReportRegisterHandler(nullptr, nullptr) == 0, "ReportRegisterHandler fallito");
-	Check(Ngs2ReportUnregisterHandler(nullptr) == 0, "ReportUnregisterHandler fallito");
+	Check(Ngs2ReportRegisterHandler(nullptr, nullptr) == 0, "ReportRegisterHandler failed");
+	Check(Ngs2ReportUnregisterHandler(nullptr) == 0, "ReportUnregisterHandler failed");
 
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }

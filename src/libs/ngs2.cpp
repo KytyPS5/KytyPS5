@@ -3065,7 +3065,7 @@ static int Ngs2ParseRiffWaveform(const void* data, size_t data_size, Ngs2Wavefor
 		}
 	}
 
-	// PCM o IEEE Float
+	// PCM or IEEE Float
 	if (tag == 1 || tag == 3 || tag == 0xfffe) {
 		const bool     is_float  = (tag == 3);
 		const uint16_t bits      = Ngs2ReadLe16(format + 14);
@@ -5169,7 +5169,7 @@ int KYTY_SYSV_ABI Ngs2GetWaveformFrameInfo(const Ngs2WaveformFormat* format,
 // and extract Ngs2WaveformInfo (delegates to Ngs2ParseWaveformData).
 // Callback signature: int32_t handler(uintptr_t user_data, uint32_t offset, void* buf, size_t size)
 
-// Typefor the reading callbacktura
+// Type for the reading callback
 using Ngs2ParseReadHandler = int32_t(KYTY_SYSV_ABI*)(uintptr_t user_data, uint32_t offset,
                                                      void* data, size_t size);
 

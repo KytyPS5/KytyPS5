@@ -15,13 +15,22 @@ namespace Libs::LibKernel {
 struct PthreadPrivate {
 	std::thread thread;
 };
+bool g_thread_create_fails = false;
 int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr*, pthread_entry_func_t entry,
                               void* arg, const char*) {
+	if (g_thread_create_fails) {
+		return EAGAIN;
+	}
 	*thread = new PthreadPrivate {std::thread([=] { entry(arg); })};
 	return 0;
 }
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void**) {
 	thread->thread.join();
+	delete thread;
+	return 0;
+}
+int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
+	thread->thread.detach();
 	delete thread;
 	return 0;
 }
@@ -163,6 +172,84 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers");
 }
+
+struct EventLog {
+	std::mutex              mutex;
+	std::condition_variable condition;
+	std::vector<int32_t>    ids;
+	std::thread::id         thread;
+	AvPlayerInternal*       close_on_ready          = nullptr;
+	bool                    add_source_returned     = false;
+	bool                    ready_waited_for_caller = false;
+};
+void KYTY_SYSV_ABI RecordEvent(void* object, int32_t id, int32_t, void*) {
+	auto&            log = *static_cast<EventLog*>(object);
+	std::unique_lock lock(log.mutex);
+	if (id == AVPLAYER_EVENT_STATE_READY) {
+		log.ready_waited_for_caller = log.condition.wait_for(
+		    lock, std::chrono::seconds(2), [&] { return log.add_source_returned; });
+		if (log.close_on_ready != nullptr) {
+			Check(AvPlayerClose(log.close_on_ready) == 0, "close the player from its READY handler");
+		}
+	}
+	log.ids.push_back(id);
+	log.thread = std::this_thread::get_id();
+	log.condition.notify_all();
+}
+
+void CheckStateEvents() {
+	struct Case {
+		bool auto_start;
+		bool close_on_ready;
+		bool stop;
+	};
+	for (const auto test: {Case {false, false, false}, Case {true, false, false}, Case {true, true, false},
+	                       Case {true, false, true}}) {
+		VideoMemory                memory;
+		EventLog                   log;
+		const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+		auto* player = create_player(allocator, {}, {&log, RecordEvent}, test.auto_start, 6);
+		log.close_on_ready = test.close_on_ready ? player : nullptr;
+		Check(add_source(player, "/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "add video source");
+		std::unique_lock lock(log.mutex);
+		log.add_source_returned = true;
+		log.condition.notify_all();
+		auto expected = test.auto_start && !test.close_on_ready
+		                          ? std::vector {AVPLAYER_EVENT_STATE_READY, AVPLAYER_EVENT_STATE_PLAY}
+		                          : std::vector {AVPLAYER_EVENT_STATE_READY};
+		Check(log.condition.wait_for(lock, std::chrono::seconds(5),
+		                             [&] { return log.ids.size() == expected.size(); }),
+		      "deliver the state events");
+		Check(log.ready_waited_for_caller && log.thread != std::this_thread::get_id(),
+		      "AddSource returns while the READY handler runs on the player's event thread");
+		if (test.stop) {
+			lock.unlock();
+			Check(AvPlayerStop(player) == 0, "stop the playing player");
+			lock.lock();
+			expected.push_back(AVPLAYER_EVENT_STATE_STOP);
+			Check(log.condition.wait_for(lock, std::chrono::seconds(5),
+			                             [&] { return log.ids.size() == expected.size(); }),
+			      "deliver STOP after PLAY");
+		}
+		lock.unlock();
+		if (test.close_on_ready) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		} else {
+			Check(AvPlayerClose(player) == 0, "close the player");
+		}
+		std::lock_guard final_lock(log.mutex);
+		Check(log.ids == expected, "state events keep their order and stop at close");
+	}
+	VideoMemory                memory;
+	EventLog                   log;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Libs::LibKernel::g_thread_create_fails = true;
+	auto* silent = create_player(allocator, {}, {}, false, 6);
+	Check(create_player(allocator, {}, {&log, RecordEvent}, false, 6) == nullptr && silent != nullptr,
+	      "a player with an event callback needs its event thread");
+	Libs::LibKernel::g_thread_create_fails = false;
+	Check(AvPlayerClose(silent) == 0, "close the player without events");
+}
 }
 
 int main() {
@@ -210,6 +297,7 @@ int main() {
 	}
 	content_root = root;
 	CheckVideoReadAhead(root);
+	CheckStateEvents();
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");

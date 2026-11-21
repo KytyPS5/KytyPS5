@@ -24,6 +24,9 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// Per-vertex interpolation computes BaryCoordKHR.x as 1 - y - z instead of reading it. NVIDIA's
+	// compiler stops on an internal breakpoint when a sample-shaded MSAA pipeline reads .x.
+	bool derive_barycentric_x = false;
 };
 
 inline constexpr Profile DefaultProfile {};

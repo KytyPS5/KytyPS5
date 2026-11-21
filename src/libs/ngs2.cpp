@@ -3800,8 +3800,11 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
 
 	LOGF("\t voice_id = %u\n", voice_id);
 
-	auto* rack   = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
-	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack_handle + sizeof(Ngs2RackInternal));
+	auto* rack = Ngs2FindRack(rack_handle);
+	if (rack == nullptr) {
+		return NGS2_ERROR_INVALID_RACK_HANDLE;
+	}
+	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
 
 	if (voice_id >= rack->option.common.max_voices) {
 		LOGF("\t warning: voice_id %u >= max_voices %u, using last available stub voice\n",

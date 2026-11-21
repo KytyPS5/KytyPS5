@@ -4131,6 +4131,104 @@ static void TestStreamAndModulesPhase4() {
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
+static uintptr_t g_nestedDestroyHandle = 0;
+static int32_t   KYTY_SYSV_ABI TestStreamFreeDestroyOther(Ngs2ContextBufferInfo* info) {
+	if (g_nestedDestroyHandle != 0) {
+		Ngs2StreamDestroy(g_nestedDestroyHandle, nullptr);
+		g_nestedDestroyHandle = 0;
+	}
+	return 0;
+}
+
+static void TestRegistryLifetimeAndLocking() {
+	// --- 2.2: a destroyed system disappears from enumeration ---
+	Ngs2SystemOption sysOpt {};
+	Ngs2SystemResetOption(&sysOpt);
+	sysOpt.num_grain_samples = 256;
+	sysOpt.sample_rate       = 48000;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	uintptr_t sysHandle = 0;
+	Check(Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle) == OK && sysHandle != 0,
+	      "SystemCreate failed for registry test");
+
+	uintptr_t handles[8] = {};
+	const int  before    = Ngs2SystemEnumHandles(handles, 8);
+	bool       found     = false;
+	for (int i = 0; i < before && i < 8; ++i) {
+		found = found || handles[i] == sysHandle;
+	}
+	Check(found, "created system missing from Ngs2SystemEnumHandles");
+	Check(Ngs2SystemDestroy(sysHandle, nullptr) == OK, "SystemDestroy failed");
+	const int after = Ngs2SystemEnumHandles(handles, 8);
+	for (int i = 0; i < after && i < 8; ++i) {
+		Check(handles[i] != sysHandle, "destroyed system still enumerated");
+	}
+
+	// Recreate a system for the rack tests.
+	uintptr_t sys2 = 0;
+	Check(Ngs2SystemCreate(&sysOpt, &sbi, &sys2) == OK && sys2 != 0,
+	      "second SystemCreate failed for registry test");
+
+	// --- 2.1/2.4: rack registry checks and lock ownership ---
+	Ngs2RackOptionUnion optA {}, optB {};
+	Ngs2FillDefaultRackOption(0x1000, &optA);
+	Ngs2FillDefaultRackOption(0x1000, &optB);
+	optA.sampler.rack_option.max_voices = 1;
+	optB.sampler.rack_option.max_voices = 1;
+	std::vector<uint8_t> rackBufA(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	std::vector<uint8_t> rackBufB(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbiA {rackBufA.data(), rackBufA.size(), {0}};
+	Ngs2ContextBufferInfo rbiB {rackBufB.data(), rackBufB.size(), {0}};
+	uintptr_t rackA = 0, rackB = 0;
+	Check(Ngs2RackCreate(sys2, 0x1000, &optA.sampler.rack_option, &rbiA, &rackA) == OK,
+	      "RackCreate A failed");
+	Check(Ngs2RackCreate(sys2, 0x1000, &optB.sampler.rack_option, &rbiB, &rackB) == OK,
+	      "RackCreate B failed");
+
+	uintptr_t voiceHandle = 0;
+	Check(Ngs2RackGetVoiceHandle(rackA, 0, &voiceHandle) == OK && voiceHandle != 0,
+	      "RackGetVoiceHandle on live rack failed");
+
+	// Lock A, then try to unlock B on the same system: must fail and leave A locked.
+	Check(Ngs2RackLock(rackA) == OK, "RackLock A failed");
+	Check(Ngs2RackUnlock(rackB) == NGS2_ERROR_INVALID_RACK_HANDLE,
+	      "unlocking a different rack must fail");
+	Check(Ngs2RackUnlock(rackA) == OK, "balanced unlock of the locked rack failed");
+
+	// Destroying the rack invalidates its voice handle lookup.
+	Check(Ngs2RackDestroy(rackB, nullptr) == OK, "RackDestroy B failed");
+	Check(Ngs2RackGetVoiceHandle(rackB, 0, &voiceHandle) == NGS2_ERROR_INVALID_RACK_HANDLE,
+	      "RackGetVoiceHandle on a destroyed rack must fail");
+	Check(Ngs2RackGetVoiceHandle(rackA, 0, &voiceHandle) == OK,
+	      "RackGetVoiceHandle on surviving rack failed");
+	Check(Ngs2RackDestroy(rackA, nullptr) == OK, "RackDestroy A failed");
+
+	// --- 2.6: a stream free handler may destroy another stream ---
+	Ngs2StreamOption sopt {};
+	Ngs2StreamResetOption(&sopt);
+	Ngs2BufferAllocator nestedAlloc {};
+	nestedAlloc.alloc_handler = &TestStreamBufferAlloc;
+	nestedAlloc.free_handler  = &TestStreamFreeDestroyOther;
+	std::vector<uint8_t> streamMem(0x106c0);
+	Ngs2ContextBufferInfo streamBuf {streamMem.data(), streamMem.size(), {0}};
+
+	uintptr_t streamOuter = 0, streamInner = 0;
+	Check(Ngs2StreamCreateWithAllocator(sys2, &sopt, &nestedAlloc, &streamOuter) == OK,
+	      "outer stream create failed");
+	Check(Ngs2StreamCreate(sys2, &sopt, &streamBuf, &streamInner) == OK,
+	      "inner stream create failed");
+	g_nestedDestroyHandle = streamInner;
+	// The free handler runs after the stream is detached from the registry, so
+	// destroying another stream inside it must not deadlock or corrupt state.
+	Check(Ngs2StreamDestroy(streamOuter, nullptr) == OK,
+	      "StreamDestroy with nested free handler failed");
+	Check(Ngs2StreamDestroy(streamInner, nullptr) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
+	      "nested stream destroy inside free handler did not run");
+
+	Ngs2SystemDestroy(sys2, nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -4214,5 +4312,6 @@ int main() {
 	RUN_TEST(TestCustomChannelMixerPhase3);
 	RUN_TEST(TestCustomPitchShiftPhase3);
 	RUN_TEST(TestStreamAndModulesPhase4);
+	RUN_TEST(TestRegistryLifetimeAndLocking);
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

@@ -14900,7 +14900,9 @@ public:
                 &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "captured scene mapping failed");
-    for (const auto initial_size : {metadata_size - 0x1000, metadata_size}) {
+    // Partial fills end at a 4 KiB block boundary or inside a block.
+    for (const auto initial_size :
+         {metadata_size - 0x1000, metadata_size - 0x800, metadata_size}) {
       std::memset(mapped, 0x5a, color_size);
       std::memset(reinterpret_cast<void *>(dcc_address), 0xff, metadata_size);
       RenderContext context(m_runtime_context);

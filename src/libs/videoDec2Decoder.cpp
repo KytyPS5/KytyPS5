@@ -133,14 +133,7 @@ public:
 
 	[[nodiscard]] Result Finalize() {
 		std::scoped_lock lock(m_mutex);
-		if (m_finalized) return Result::Ok;
-		const auto drained = DrainFrames();
-		if (drained != Result::Ok) return drained;
-		const int result = avcodec_send_packet(m_codec, nullptr);
-		if (result == AVERROR(EAGAIN)) return Result::InputFull;
-		if (result < 0 && result != AVERROR_EOF) return Result::ApiFail;
-		m_finalized = true;
-		return DrainFrames();
+		return EndStream();
 	}
 
 	[[nodiscard]] Result DecodeInput(const Input& input, const FrameBuffer& frame_buffer,
@@ -162,16 +155,20 @@ public:
 
 	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output) {
 		std::scoped_lock lock(m_mutex);
+		// A full output queue defers the end of stream to a call after a frame has left it.
+		const auto ended = EndStream();
+		if (ended != Result::Ok && ended != Result::InputFull) return ended;
 		const auto result = ReceiveOutput(frame_buffer, output);
+		// Decoding resumes once the last frame is out.
+		if (m_eof && m_frames.empty()) RestartSequence();
 		return result == Result::NoFrame ? Result::Ok : result;
 	}
 
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
-		avcodec_flush_buffers(m_codec);
+		RestartSequence();
 		ClearFrames();
 		ClearPictureMetadata();
-		m_finalized = m_eof = false;
 	}
 
 private:
@@ -179,6 +176,11 @@ private:
 		AVFrame*    frame;
 		PictureInfo picture;
 	};
+
+	void RestartSequence() {
+		avcodec_flush_buffers(m_codec);
+		m_finalized = m_eof = false;
+	}
 
 	void ClearFrames() {
 		for (auto& pending: m_frames) av_frame_free(&pending.frame);
@@ -202,6 +204,17 @@ private:
 			if (produced != nullptr) ++*produced;
 		}
 		return Result::Ok;
+	}
+
+	[[nodiscard]] Result EndStream() {
+		if (m_finalized) return Result::Ok;
+		const auto drained = DrainFrames();
+		if (drained != Result::Ok) return drained;
+		const int result = avcodec_send_packet(m_codec, nullptr);
+		if (result == AVERROR(EAGAIN)) return Result::InputFull;
+		if (result < 0 && result != AVERROR_EOF) return Result::ApiFail;
+		m_finalized = true;
+		return DrainFrames();
 	}
 
 	[[nodiscard]] Result SubmitInput(const Input& input, uint32_t* produced) {

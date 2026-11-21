@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace Libs::VideoDec2 {
@@ -149,46 +150,99 @@ constexpr std::array<uint8_t, 197> TEN_BIT_FRAME {
     0x3f, 0x89, 0x3f, 0x89, 0x3f, 0x89, 0x3f, 0x89, 0x3f, 0x89, 0x3f, 0x89, 0x3f, 0x89, 0x1c, 0xed,
     0x9b, 0x51, 0x55, 0x53, 0xf8};
 
+// A 16x16 decoder created through the exported functions, decoding into one frame buffer.
+class TestDecoder {
+public:
+	TestDecoder(uint32_t codec, uint32_t profile) {
+		DecoderConfig config {.codec_type = codec, .profile = profile, .max_frame_width = 16, .max_frame_height = 16};
+		EXPECT_EQ(Export<Query>("qqMCwlULR+E")(&config, &m_memory), 0);
+		m_cpu.resize(m_memory.cpu_memory_size);
+		m_gpu.resize(m_memory.gpu_memory_size);
+		m_shared.resize(m_memory.cpu_gpu_memory_size);
+		m_memory.cpu_memory     = m_cpu.data();
+		m_memory.gpu_memory     = m_gpu.data();
+		m_memory.cpu_gpu_memory = m_shared.data();
+		config.compute_queue    = m_shared.data();
+		using Create = int32_t(KYTY_SYSV_ABI*)(const DecoderConfig*, const DecoderMemory*, void**);
+		EXPECT_EQ(Export<Create>("CNNRoRYd8XI")(&config, &m_memory, &m_handle), 0);
+		frame.resize(m_memory.max_frame_buffer_size / 2);
+		m_buffer = {.frame_buffer = frame.data(), .frame_buffer_size = m_memory.max_frame_buffer_size};
+	}
+
+	~TestDecoder() { EXPECT_EQ(Export<int32_t(KYTY_SYSV_ABI*)(void*)>("jwImxXRGSKA")(m_handle), 0); }
+
+	OutputInfo Decode(std::span<const uint8_t> au) {
+		using Function = int32_t(KYTY_SYSV_ABI*)(void*, const InputData*, FrameBuffer*, OutputInfo*);
+		const InputData input {.au_data = au.data(), .au_size = au.size()};
+		OutputInfo      output;
+		EXPECT_EQ(Export<Function>("852F5+q6+iM")(m_handle, &input, &m_buffer, &output), 0);
+		return output;
+	}
+
+	OutputInfo Flush() {
+		using Function = int32_t(KYTY_SYSV_ABI*)(void*, FrameBuffer*, OutputInfo*);
+		OutputInfo output;
+		EXPECT_EQ(Export<Function>("l1hXwscLuCY")(m_handle, &m_buffer, &output), 0);
+		return output;
+	}
+
+	std::vector<uint16_t> frame;
+
+private:
+	DecoderMemory        m_memory;
+	std::vector<uint8_t> m_cpu;
+	std::vector<uint8_t> m_gpu;
+	std::vector<uint8_t> m_shared;
+	FrameBuffer          m_buffer {};
+	void*                m_handle = nullptr;
+};
+
 TEST(VideoDec2, TenBitFramesKeepTheirSamplesInTheLowBits) {
-	const auto query   = Export<Query>("qqMCwlULR+E");
-	const auto create  = Export<int32_t(KYTY_SYSV_ABI*)(const DecoderConfig*, const DecoderMemory*, void**)>("CNNRoRYd8XI");
-	const auto decode  = Export<int32_t(KYTY_SYSV_ABI*)(void*, const InputData*, FrameBuffer*, OutputInfo*)>("852F5+q6+iM");
-	const auto flush   = Export<int32_t(KYTY_SYSV_ABI*)(void*, FrameBuffer*, OutputInfo*)>("l1hXwscLuCY");
-	const auto picture = Export<int32_t(KYTY_SYSV_ABI*)(const OutputInfo*, void*, void*)>("NtXRa3dRzU0");
-	const auto destroy = Export<int32_t(KYTY_SYSV_ABI*)(void*)>("jwImxXRGSKA");
-
-	DecoderConfig config {.codec_type = HEVC, .profile = 2, .max_frame_width = 16, .max_frame_height = 16};
-	DecoderMemory memory;
-	ASSERT_EQ(query(&config, &memory), 0);
-	std::vector<uint8_t> cpu(memory.cpu_memory_size);
-	std::vector<uint8_t> gpu(memory.gpu_memory_size);
-	std::vector<uint8_t> shared(memory.cpu_gpu_memory_size);
-	memory.cpu_memory     = cpu.data();
-	memory.gpu_memory     = gpu.data();
-	memory.cpu_gpu_memory = shared.data();
-	config.compute_queue  = shared.data();
-	void* decoder         = nullptr;
-	ASSERT_EQ(create(&config, &memory, &decoder), 0);
-
-	std::vector<uint16_t> frame(memory.max_frame_buffer_size / 2);
-	FrameBuffer           buffer {.frame_buffer = frame.data(), .frame_buffer_size = memory.max_frame_buffer_size};
-	const InputData       input {.au_data = TEN_BIT_FRAME.data(), .au_size = TEN_BIT_FRAME.size()};
-	OutputInfo            output;
-	ASSERT_EQ(decode(decoder, &input, &buffer, &output), 0);
+	TestDecoder decoder(HEVC, 2);
+	auto        output = decoder.Decode(TEN_BIT_FRAME);
 	if (!output.is_valid) {
-		ASSERT_EQ(flush(decoder, &buffer, &output), 0);
+		output = decoder.Flush();
 	}
 	ASSERT_TRUE(output.is_valid);
 	EXPECT_EQ((std::array {output.frame_pitch, output.frame_pitch_in_bytes}), (std::array {128u, 256u}));
+	const auto& frame = decoder.frame;
 	EXPECT_EQ((std::array {frame[0], frame[128 * 16], frame[128 * 16 + 1]}),
 	          (std::array<uint16_t, 3> {0x123, 0x234, 0x345}));
 
 	// The HEVC picture information holds bit_depth_luma_minus8 and bit_depth_chroma_minus8 at 48.
 	alignas(8) std::array<uint8_t, 184> info {};
 	info[0] = info.size();
-	ASSERT_EQ(picture(&output, info.data(), nullptr), 0);
+	using Picture = int32_t(KYTY_SYSV_ABI*)(const OutputInfo*, void*, void*);
+	ASSERT_EQ(Export<Picture>("NtXRa3dRzU0")(&output, info.data(), nullptr), 0);
 	EXPECT_EQ((std::array {info[48], info[49]}), (std::array<uint8_t, 2> {2, 2}));
-	EXPECT_EQ(destroy(decoder), 0);
+}
+
+// A 16x16 AVC Main stream of five gray frames, decoded as I P B B P with one frame of reorder delay.
+constexpr std::array<uint8_t, 81> B_FRAME_STREAM {
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x0a, 0xe9, 0xbd, 0x80, 0x88, 0x00, 0x00, 0x03, 0x00,
+    0x08, 0x00, 0x00, 0x03, 0x01, 0x90, 0x78, 0x91, 0x29, 0xc0, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce,
+    0x03, 0x9c, 0x80, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x01, 0xd1, 0x37, 0x80, 0x00, 0x00, 0x00,
+    0x01, 0x41, 0x9a, 0x26, 0x14, 0xa0, 0x00, 0x00, 0x00, 0x01, 0x01, 0x9e, 0x42, 0x82, 0x25, 0x00,
+    0x00, 0x00, 0x01, 0x01, 0x9e, 0x44, 0x82, 0x25, 0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x48, 0x14,
+    0xa0};
+constexpr std::array<size_t, 5> B_FRAME_AU_SIZES {45, 9, 9, 9, 9};
+
+TEST(VideoDec2, FlushOutputsHeldFramesAndDecodingResumesAfterTheLast) {
+	TestDecoder decoder(AVC, 77);
+	for (int pass = 0; pass < 2; pass++) {
+		int    decoded = 0;
+		size_t offset  = 0;
+		for (const auto size: B_FRAME_AU_SIZES) {
+			decoded += decoder.Decode(std::span(B_FRAME_STREAM).subspan(offset, size)).is_valid ? 1 : 0;
+			offset += size;
+		}
+		// No flush past the last frame: the next pass decodes right after it.
+		ASSERT_LT(decoded, 5);
+		for (; decoded < 5; decoded++) {
+			ASSERT_TRUE(decoder.Flush().is_valid);
+		}
+	}
+	EXPECT_FALSE(decoder.Flush().is_valid);
 }
 
 } // namespace

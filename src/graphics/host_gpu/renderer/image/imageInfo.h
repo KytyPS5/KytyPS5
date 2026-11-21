@@ -152,6 +152,12 @@ struct ImageViewInfo {
 	[[nodiscard]] bool operator==(const ImageViewInfo&) const noexcept = default;
 };
 
+// A tiled T# whose LAST_LEVEL runs past the stored chain. A view that lies entirely past MAX_MIP
+// is rebased onto an image of its base mip's extent when that mip is tiled as such an image;
+// otherwise the view is matched against the mips the chain stores. False means neither fits.
+bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                           uint32_t view_levels, uint32_t& base_level);
+
 struct DepthFormatPolicy {
 	Prospero::DepthFormat     depth_format;
 	Prospero::BufferFormat    guest_format;

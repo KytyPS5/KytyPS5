@@ -412,7 +412,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    ImageId image) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	m_memory_tracker.ForEachUploadRange(
@@ -425,8 +425,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    const BufferUpload upload {&buffer, copies.size()};
 		    UploadCopies({&upload, 1}, copies, total_size);
 	    });
-	if (is_texel_buffer && !is_written) {
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	if (image) {
+		return SynchronizeBufferFromImage(buffer, image);
 	}
 	return false;
 }
@@ -483,9 +483,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        BufferId id) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
+	const auto image             = is_texel_buffer && !is_written
+	                                   ? m_texture_cache.FindImageFromRange(vaddr, size)
+	                                   : ImageId {};
+	auto       end               = vaddr + size;
+	bool       written_past_read = false;
+	if (image) {
+		const auto image_end = [&] {
+			std::scoped_lock lock {m_texture_cache.m_lock};
+			const auto&      range = m_texture_cache.m_slot_images[image].info.data;
+			return range.address == vaddr ? range.End() : end;
+		}();
+		if (image_end > end) {
+			written_past_read = m_memory_tracker.IsRegionGpuModified(end, image_end - end);
+			end               = written_past_read ? end : image_end;
+		}
+	}
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && (!image || written_past_read)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -498,12 +514,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
-		id = FindBuffer(vaddr, size);
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
+		id = FindBuffer(vaddr, end - vaddr);
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
@@ -517,7 +533,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
-			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, {});
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}

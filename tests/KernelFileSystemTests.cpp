@@ -73,6 +73,10 @@ namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibNpSessionSignaling {
+void InitNet_1_NpSessionSignaling(Loader::SymbolDatabase *symbols);
+}
+
 namespace Libs::LibNpCommerce {
 void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
 }
@@ -571,6 +575,40 @@ void TestSharedDescriptorTable() {
   for (int d = file; d <= socket; d++) {
     Check(FileSystem::KernelClose(d) == OK, "close the reopened files");
   }
+}
+
+void TestSessionSignalingDescriptors() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpSessionSignaling::InitNet_1_NpSessionSignaling(&symbols);
+  const auto *initialize_symbol = symbols.Find(
+      {"ysmw6J-P8Ak", "NpSessionSignaling", "NpSessionSignaling", Loader::SymbolType::Func});
+  const auto *terminate_symbol = symbols.Find(
+      {"CqJuNXo5yiM", "NpSessionSignaling", "NpSessionSignaling", Loader::SymbolType::Func});
+  Check(initialize_symbol != nullptr && terminate_symbol != nullptr,
+        "NpSessionSignaling initialize and terminate exports resolve");
+  const auto initialize =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const void *)>(initialize_symbol->vaddr);
+  const auto terminate = reinterpret_cast<int (KYTY_SYSV_ABI *)()>(terminate_symbol->vaddr);
+  constexpr int NotInitialized = static_cast<int>(0x80553301u);
+  constexpr int AlreadyInitialized = static_cast<int>(0x80553302u);
+  const int file = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(FileSystem::KernelClose(file) == OK, "find the lowest free descriptor");
+  struct InitParam {
+    int http2_context = 0;
+    size_t pool_size = 0x80000;
+    uint64_t cpu_affinity_mask = 0;
+    int32_t thread_priority = 700;
+    size_t thread_stack_size = 0x8000;
+  } param;
+  Check(initialize(&param) == OK && initialize(&param) == AlreadyInitialized,
+        "NpSessionSignaling initializes once");
+  const int after_initialize = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(after_initialize == file + 3 && FileSystem::KernelClose(after_initialize) == OK,
+        "the initialized library holds three descriptors");
+  Check(terminate() == OK && terminate() == NotInitialized, "NpSessionSignaling terminates once");
+  const int after_terminate = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(after_terminate == file && FileSystem::KernelClose(after_terminate) == OK,
+        "terminate releases the library's descriptors");
 }
 
 void TestSysmoduleReferences() {
@@ -3065,6 +3103,7 @@ int main(int argc, char** argv) {
   TestRandomDevices();
   TestFileDescriptorFlags();
   TestSharedDescriptorTable();
+  TestSessionSignalingDescriptors();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());

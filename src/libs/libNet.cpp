@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "kernel/descriptors.h"
 #include "kernel/eventQueue.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -11,6 +12,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -1791,16 +1793,43 @@ namespace LibNpSessionSignaling {
 
 LIB_NAME("NpSessionSignaling", "NpSessionSignaling");
 
+constexpr int NP_SESSION_SIGNALING_ERROR_NOT_INITIALIZED     = -2141900031; /* 0x80553301 */
+constexpr int NP_SESSION_SIGNALING_ERROR_ALREADY_INITIALIZED = -2141900030; /* 0x80553302 */
+
+// While initialized, the library keeps its command event queue and both ends of its event socket
+// pair open.
+static std::array<int, 3> g_descriptors {};
+
 static int KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
 	PRINT_NAME();
 
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	return 0;
+	if (g_descriptors[0] != 0) {
+		return NP_SESSION_SIGNALING_ERROR_ALREADY_INITIALIZED;
+	}
+	for (auto& d: g_descriptors) {
+		d = LibKernel::Descriptors::Allocate();
+	}
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpSessionSignalingTerminate() {
+	PRINT_NAME();
+
+	if (g_descriptors[0] == 0) {
+		return NP_SESSION_SIGNALING_ERROR_NOT_INITIALIZED;
+	}
+	for (auto& d: g_descriptors) {
+		LibKernel::Descriptors::Release(d);
+		d = 0;
+	}
+	return OK;
 }
 
 LIB_DEFINE(InitNet_1_NpSessionSignaling) {
 	LIB_FUNC("ysmw6J-P8Ak", NpSessionSignalingInitialize);
+	LIB_FUNC("CqJuNXo5yiM", NpSessionSignalingTerminate);
 }
 
 } // namespace LibNpSessionSignaling

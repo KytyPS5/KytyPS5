@@ -54999,7 +54999,7 @@ void CheckShaderFusion() {
         back.type = static_cast<uint8_t>(c.gs ? Prospero::ShaderBinaryType::kGsBack
                                             : Prospero::ShaderBinaryType::kHsBack);
         Shader fused{};
-        const auto fuse = older ? Gen5::AgcFuseShaderHalves : Gen5::AgcFuseShaderHalves_0200;
+        const auto fuse = older ? Agc::AgcFuseShaderHalves : Agc::AgcFuseShaderHalves_0200;
         const auto result = fuse(&fused, &front, &back, in_place ? nullptr : scratch.data());
         const auto *regs = fused.sh_registers;
         Require("ShaderFusion", "native fused registers",
@@ -55028,7 +55028,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
       0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
       0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e};
   LibKernel::Memory::InstallGpuResources(&renderer);
-  Require(name, "driver module startup", Gen5Driver::Initialize() == 0,
+  Require(name, "driver module startup", AgcDriver::Initialize() == 0,
           "driver module startup failed before guest initialization");
   const auto direct_memory_size = LibKernel::Memory::KernelGetDirectMemorySize();
   int64_t available_offset = -1;
@@ -55044,7 +55044,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
               0, direct_memory_size, available_size, 0x4000, 0, &guest_allocation) == 0,
           "guest could not allocate all remaining direct memory");
   uint32_t state = 0xabcdef01u;
-  Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
+  Require(name, "driver startup", Agc::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
           "Agc startup required free guest memory or changed its ignored public state pointer");
   LibKernel::Memory::VirtualQueryInfo mapping{};
   Require(name, "shared driver backing",
@@ -55072,8 +55072,8 @@ void CheckAgcSystemTable(RenderContext &renderer) {
   Require(name, "default instrumentation", *instrumentation == 0,
           "unused vertex validation was enabled at startup");
   *instrumentation = 0x12340000u;
-  Require(name, "repeat startup", Gen5Driver::Initialize() == 0 &&
-              Gen5::AgcInit(nullptr, 13) == 0 &&
+  Require(name, "repeat startup", AgcDriver::Initialize() == 0 &&
+              Agc::AgcInit(nullptr, 13) == 0 &&
               *instrumentation == 0x12340000u,
           "repeat Agc initialization reset existing system state");
   *instrumentation = 0;
@@ -55085,7 +55085,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
 }
 
 struct CommandBufferLayout {
-  using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
+  using Callback = KYTY_SYSV_ABI bool (*)(Agc::CommandBuffer *, uint32_t,
                                           void *);
 
   uint32_t *bottom;
@@ -55124,19 +55124,19 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
       {"async byte range", true, 0, 0, 0x9000, 0x2036000308ull, 0x20, 400,
        {0xc0065800, 0, 1, 0, 0x20360003, 0, 25, 0x9000}},
   };
-  Require(name, "packet sizes", Gen5::AgcDcbAcquireMemGetSize() == 32 &&
-              Gen5::AgcAcbAcquireMemGetSize() == 32,
+  Require(name, "packet sizes", Agc::AgcDcbAcquireMemGetSize() == 32 &&
+              Agc::AgcAcbAcquireMemGetSize() == 32,
           "native single ACQUIRE_MEM packet size changed");
   for (const auto &test : cases) {
     std::array<uint32_t, 8> packet{};
     CommandBufferLayout layout{packet.data(), packet.data() + packet.size(),
                                packet.data(), packet.data() + packet.size(),
                                nullptr, nullptr, 0};
-    auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&layout);
+    auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&layout);
     const auto *base = reinterpret_cast<const volatile void *>(test.base);
     auto *emitted = test.async
-        ? Gen5::AgcAcbAcquireMem(buffer, test.gcr, base, test.size, test.poll)
-        : Gen5::AgcDcbAcquireMem(buffer, test.engine, test.cb_db, test.gcr,
+        ? Agc::AgcAcbAcquireMem(buffer, test.gcr, base, test.size, test.poll)
+        : Agc::AgcDcbAcquireMem(buffer, test.engine, test.cb_db, test.gcr,
                                  base, test.size, test.poll);
     Require(name, test.label, emitted == packet.data() &&
                 layout.cursor_up == packet.data() + packet.size() && packet == test.expected,
@@ -55165,7 +55165,7 @@ void CheckPm4ResetQueue(RenderContext &renderer) {
     CommandBufferLayout dcb{packets.data(), packets.data() + packets.size(),
                             packets.data(), packets.data() + packets.size(),
                             nullptr, nullptr, 0};
-    Gen5::AgcDcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), op,
+    Agc::AgcDcbResetQueue(reinterpret_cast<Agc::CommandBuffer *>(&dcb), op,
                            0);
     Pm4Execution execution;
     Require(name, "processed",
@@ -55212,7 +55212,7 @@ void CheckPm4ResetQueue(RenderContext &renderer) {
     CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
                             packet.data(), packet.data() + packet.size(),
                             nullptr, nullptr, 0};
-    Gen5::AgcAcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&acb), op);
+    Agc::AgcAcbResetQueue(reinterpret_cast<Agc::CommandBuffer *>(&acb), op);
     const std::array<uint32_t, 11> expected{
         0xc0017900u, 0x342u, 0xce000000u | op, gcr == 0 ? 0u : 0xc0065800u,
         0,           0,      0,                0,
@@ -55264,10 +55264,10 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
                             0};
   const auto address32 = reinterpret_cast<uint64_t>(&label32);
   auto *emitted32 =
-      Gen5::AgcDcbWaitRegMem(reinterpret_cast<Gen5::CommandBuffer *>(&dcb32), 0,
+      Agc::AgcDcbWaitRegMem(reinterpret_cast<Agc::CommandBuffer *>(&dcb32), 0,
                              3, 0, 0, &label32, label32, UINT32_MAX, 400);
   Require("Pm4WaitPackets", "native 32-bit packet",
-          Gen5::AgcDcbWaitOnAddressGetSize(0) == 56 &&
+          Agc::AgcDcbWaitOnAddressGetSize(0) == 56 &&
               emitted32 == packet32.data() &&
               dcb32.cursor_up == packet32.data() + 14 &&
               packet32[0] == 0xc0027904u && packet32[1] == 0x342u &&
@@ -55291,8 +55291,8 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
   packet32[7] |= 0xa5a40000u;
   Require(
       "Pm4WaitPackets", "native 32-bit patch",
-      Gen5::AgcWaitRegMemPatchAddress(packet32.data(), &patched_label32) == 0 &&
-          Gen5::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) ==
+      Agc::AgcWaitRegMemPatchAddress(packet32.data(), &patched_label32) == 0 &&
+          Agc::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) ==
               0 &&
           packet32[2] ==
               (0xc8010000u |
@@ -55313,7 +55313,7 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
     auto expected = packet;
     expected[5] = 0x06000014u;
     Pm4Execution execution;
-    return Gen5::AgcWaitRegMemPatchCompareFunction(packet.data(), 0xfc) == 0 &&
+    return Agc::AgcWaitRegMemPatchCompareFunction(packet.data(), 0xfc) == 0 &&
            packet == expected &&
            processor.Process(execution, {packet.data(), size_dw}) ==
                Pm4ProcessResult::Blocked;
@@ -55333,11 +55333,11 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
                             0};
   const auto address64 = reinterpret_cast<uint64_t>(&label64);
   auto *emitted64 =
-      Gen5::AgcDcbWaitRegMem(reinterpret_cast<Gen5::CommandBuffer *>(&dcb64), 1,
+      Agc::AgcDcbWaitRegMem(reinterpret_cast<Agc::CommandBuffer *>(&dcb64), 1,
                              3, 0, 0, &label64, label64, UINT64_MAX, 400);
   Require("Pm4WaitPackets", "native 64-bit packet",
-          Gen5::AgcDcbWaitOnAddressGetSize(1) == 64 &&
-              Gen5::AgcDcbWaitOnAddressGetSize(2) == 0 &&
+          Agc::AgcDcbWaitOnAddressGetSize(1) == 64 &&
+              Agc::AgcDcbWaitOnAddressGetSize(2) == 0 &&
               emitted64 == packet64.data() &&
               dcb64.cursor_up == packet64.data() + packet64.size() &&
               packet64[0] == 0xc0027904u && packet64[1] == 0x342u &&
@@ -55363,8 +55363,8 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
   packet64[7] |= 0x5a580000u;
   Require(
       "Pm4WaitPackets", "native 64-bit patch",
-      Gen5::AgcWaitRegMemPatchAddress(packet64.data(), &patched_label64) == 0 &&
-          Gen5::AgcWaitRegMemPatchReference(packet64.data(),
+      Agc::AgcWaitRegMemPatchAddress(packet64.data(), &patched_label64) == 0 &&
+          Agc::AgcWaitRegMemPatchReference(packet64.data(),
                                             0xdeadbeefaabbccddull) == 0 &&
           packet64[2] ==
               (0xc8020000u |
@@ -55387,14 +55387,14 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
   const uint32_t short_payload = 0x342u;
   Require(
       "Pm4WaitPackets", "invalid packet",
-      Gen5::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
+      Agc::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
               packet_mismatch &&
-          Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
+          Agc::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
               packet_mismatch &&
-          Gen5::AgcWaitRegMemPatchCompareFunction(invalid.data(), 4) ==
+          Agc::AgcWaitRegMemPatchCompareFunction(invalid.data(), 4) ==
               packet_mismatch &&
           invalid == std::array<uint32_t, 16>{} &&
-          !Gen5::AgcIsInternalDataPacket(
+          !Agc::AgcIsInternalDataPacket(
               KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
       "wait patch accepted a packet without the metadata prefix");
   std::printf("[host]    %-32s ok\n", "Pm4WaitPackets");
@@ -55426,8 +55426,8 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
                           nullptr,
                           nullptr,
                           0};
-  auto *emitted = Gen5::AgcDcbDrawIndirectMulti(
-      reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0x11223344u, 1u,
+  auto *emitted = Agc::AgcDcbDrawIndirectMulti(
+      reinterpret_cast<Agc::CommandBuffer *>(&dcb), 0x11223344u, 1u,
       0x55667788u, count_address, 0xaabbccddu, modifier);
 
   const uint32_t invalid_payload[]{0x342u, 0xc6000010u};
@@ -55436,11 +55436,11 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
               dcb.cursor_up == packet.data() + packet.size() &&
               packet == expected && execute(packet.data(), 3u) &&
               execute(packet.data() + 13u, 3u) &&
-              Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
+              Agc::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
                   packet_mismatch &&
-              Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
+              Agc::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
                   packet_mismatch &&
-              !Gen5::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
+              !Agc::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
           "indirect multi-draw packet differs from the expected stream");
 
   constexpr uint32_t data_offset = 0x5c08;
@@ -55466,16 +55466,16 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
       for (const uint64_t draw_modifier : {0ull, 0x100ull, 1ull << 32u, (1ull << 32u) | 0x100ull}) {
         packet.fill(0);
         dcb.cursor_up = packet.data();
-        auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+        auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&dcb);
         alignas(4) uint32_t draw_count = 3;
         if (multi) {
-          emitted = indexed ? Gen5::AgcDcbDrawIndexIndirectMulti(buffer, data_offset, 1, 2,
+          emitted = indexed ? Agc::AgcDcbDrawIndexIndirectMulti(buffer, data_offset, 1, 2,
                                   &draw_count, stride, draw_modifier)
-                            : Gen5::AgcDcbDrawIndirectMulti(buffer, data_offset, 1, 2,
+                            : Agc::AgcDcbDrawIndirectMulti(buffer, data_offset, 1, 2,
                                   &draw_count, stride, draw_modifier);
         } else {
-          emitted = indexed ? Gen5::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
-                            : Gen5::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
+          emitted = indexed ? Agc::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
+                            : Agc::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
         }
         const uint32_t begin = multi ? 3 : 0;
         const uint32_t words = multi ? 16 : 5;
@@ -55673,9 +55673,9 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
       break;
     }
     const auto size_dw = static_cast<size_t>(
-        Gen5::AgcDcbContextStateOpGetSize(operation_value) / 4);
-    auto *emitted = Gen5::AgcDcbContextStateOp(
-        reinterpret_cast<Gen5::CommandBuffer *>(&dcb), operation_value);
+        Agc::AgcDcbContextStateOpGetSize(operation_value) / 4);
+    auto *emitted = Agc::AgcDcbContextStateOp(
+        reinterpret_cast<Agc::CommandBuffer *>(&dcb), operation_value);
     bool packet_matches = true;
     size_t segment_offset = 0;
     for (size_t i = 0; i < segment_count; i++) {
@@ -55815,11 +55815,11 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
           "processor reset retained an invalid saved Cx state");
 
   Require("Pm4ContextState", "HLE packet size",
-          Gen5::AgcDcbContextStateOpGetSize(0) == 20 &&
-              Gen5::AgcDcbContextStateOpGetSize(1) == 108 &&
-              Gen5::AgcDcbContextStateOpGetSize(2) == 108 &&
-              Gen5::AgcDcbContextStateOpGetSize(3) == 128 &&
-              Gen5::AgcDcbContextStateOpGetSize(4) == 0,
+          Agc::AgcDcbContextStateOpGetSize(0) == 20 &&
+              Agc::AgcDcbContextStateOpGetSize(1) == 108 &&
+              Agc::AgcDcbContextStateOpGetSize(2) == 108 &&
+              Agc::AgcDcbContextStateOpGetSize(3) == 128 &&
+              Agc::AgcDcbContextStateOpGetSize(4) == 0,
           "context-state HLE sizes do not match the expected packet layout");
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
@@ -55852,19 +55852,19 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   std::array<uint32_t, 7> nop_commands{};
   CommandBufferLayout nop_dcb{nop_commands.data(), nop_commands.data() + nop_commands.size(),
       nop_commands.data(), nop_commands.data() + nop_commands.size(), nullptr, nullptr, 0};
-  auto* nop_cb = reinterpret_cast<Gen5::CommandBuffer*>(&nop_dcb);
-  Require(name, "zero-sized NOP", Gen5::AgcCbNop(nop_cb, 0) == nullptr &&
+  auto* nop_cb = reinterpret_cast<Agc::CommandBuffer*>(&nop_dcb);
+  Require(name, "zero-sized NOP", Agc::AgcCbNop(nop_cb, 0) == nullptr &&
               nop_dcb.cursor_up == nop_commands.data() && nop_commands[0] == 0,
           "zero-sized reservation changed the command buffer");
-  Require(name, "empty command list NOP", Gen5::AgcCbNop(nop_cb, 1) == nop_commands.data() &&
+  Require(name, "empty command list NOP", Agc::AgcCbNop(nop_cb, 1) == nop_commands.data() &&
               nop_dcb.cursor_up == nop_commands.data() + 1 && nop_commands[0] == 0xffff1000u &&
-              Gen5::AgcCbNopGetSize(1) == 4 && Gen5::AgcGetPacketSize(nop_commands.data()) == 1,
+              Agc::AgcCbNopGetSize(1) == 4 && Agc::AgcGetPacketSize(nop_commands.data()) == 1,
           "native NOP(1) did not reserve one DWORD");
   const auto completion = write(&selected, 7);
   std::copy(completion.begin(), completion.end(), nop_commands.begin() + 1);
   nop_commands.back() = 0xffff1000u;
   for (uint32_t predication : {1u, 0u}) {
-    Gen5::AgcSetRangePredication(nop_commands.data(), nop_commands.data() + nop_commands.size(), predication);
+    Agc::AgcSetRangePredication(nop_commands.data(), nop_commands.data() + nop_commands.size(), predication);
     Require(name, "NOP range predication", nop_commands[0] == (0xffff1000u | predication) &&
                 nop_commands.back() == (0xffff1000u | predication) &&
                 nop_commands[1] == (completion[0] | predication) && nop_commands[5] == 7,
@@ -55887,7 +55887,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   CommandBufferLayout payload_dcb{payload.data(), payload.data() + payload.size(),
       payload.data(), payload.data() + payload.size(), nullptr, nullptr, 0};
   Require(name, "NOP payload reservation",
-          Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
+          Agc::AgcCbNop(reinterpret_cast<Agc::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
               payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
           "NOP emitter overwrote the caller's reserved payload");
   // The PS4-era flip tags are payload too.
@@ -55910,24 +55910,24 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   disabled_commands[6] = 0x68750123u;
   CommandBufferLayout release_dcb{disabled_commands.data() + 7, disabled_commands.data() + 15,
       disabled_commands.data() + 7, disabled_commands.data() + 15, nullptr, nullptr, 0};
-  auto* release = Gen5::AgcCbReleaseMem(
-      reinterpret_cast<Gen5::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
-      reinterpret_cast<const volatile Gen5::Label*>(&released), 2, 77, 0, 0, 0, 0);
+  auto* release = Agc::AgcCbReleaseMem(
+      reinterpret_cast<Agc::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
+      reinterpret_cast<const volatile Agc::Label*>(&released), 2, 77, 0, 0, 0, 0);
   const auto enabled_write = write(&selected, 88);
   std::copy(enabled_write.begin(), enabled_write.end(), disabled_commands.begin() + 15);
   const auto unpatched_commands = disabled_commands;
   Require(name, "SetNop packets",
           release == disabled_commands.data() + 7 &&
-              Gen5::AgcSetNop(disabled_commands.data()) == 0 &&
-              Gen5::AgcSetNop(disabled_commands.data() + 5) == 0 && Gen5::AgcSetNop(release) == 0 &&
+              Agc::AgcSetNop(disabled_commands.data()) == 0 &&
+              Agc::AgcSetNop(disabled_commands.data() + 5) == 0 && Agc::AgcSetNop(release) == 0 &&
               disabled_commands[0] == ((disabled_write[0] & 0xffff00ffu) | (Pm4::IT_NOP << 8u)) &&
               disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
               disabled_commands[6] == 0x68750123u &&
               release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
               unpatched_commands[7] == 0xc0064900u &&
-              Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
-              Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
-              Gen5::AgcGetPacketSize(release) == 8 &&
+              Agc::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
+              Agc::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
+              Agc::AgcGetPacketSize(release) == 8 &&
               std::equal(disabled_commands.begin() + 1, disabled_commands.begin() + 5,
                          unpatched_commands.begin() + 1) &&
               std::equal(disabled_commands.begin() + 8, disabled_commands.end(),
@@ -55944,20 +55944,20 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   std::array<uint32_t, 8> patched{};
   std::copy_n(unpatched_commands.begin() + 7, patched.size(), patched.begin());
   patched[3] |= 1u;
-  const auto* label = reinterpret_cast<const volatile Gen5::Label*>(0x123456789abcdef7ull);
+  const auto* label = reinterpret_cast<const volatile Agc::Label*>(0x123456789abcdef7ull);
   bool patch_helpers_match =
-      Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) == 0 &&
+      Agc::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) == 0 &&
       patched[3] == 0x9abcdef5u && patched[4] == 0x12345678u &&
-      Gen5::AgcQueueEndOfPipeActionPatchData(patched.data(), 0x1122334455667788ull) == 0 &&
+      Agc::AgcQueueEndOfPipeActionPatchData(patched.data(), 0x1122334455667788ull) == 0 &&
       patched[5] == 0x55667788u && patched[6] == 0x11223344u;
   patched[2] |= 4u << 24u;
-  patch_helpers_match &= Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), nullptr) == 0 &&
+  patch_helpers_match &= Agc::AgcQueueEndOfPipeActionPatchAddress(patched.data(), nullptr) == 0 &&
                          patched[3] == 0x9abcdef5u && patched[4] == 0x12345678u;
   patched[0] = KYTY_PM4(8, Pm4::IT_NOP, 0x18);
   patch_helpers_match &=
-      Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) ==
+      Agc::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) ==
           static_cast<int>(0x8a6c000cu) &&
-      Gen5::AgcQueueEndOfPipeActionPatchData(patched.data(), 0) == static_cast<int>(0x8a6c000cu);
+      Agc::AgcQueueEndOfPipeActionPatchData(patched.data(), 0) == static_cast<int>(0x8a6c000cu);
   Require(name, "end-of-pipe patch helpers", patch_helpers_match,
           "RELEASE_MEM or its patch helpers diverged from the driver");
   const auto then_commands = write(&selected, 11);
@@ -56006,9 +56006,9 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                             nullptr, nullptr, 0};
   const ShaderRegister cx_register{Pm4::CB_TARGET_MASK, 0x76543210u};
   Require(name, "indirect context packet size",
-          Gen5::AgcDcbSetCxRegistersIndirectGetSize() == sizeof(cx_packet) &&
-              Gen5::AgcDcbSetCxRegistersIndirect(
-                  reinterpret_cast<Gen5::CommandBuffer *>(&cx_dcb), &cx_register, 1) ==
+          Agc::AgcDcbSetCxRegistersIndirectGetSize() == sizeof(cx_packet) &&
+              Agc::AgcDcbSetCxRegistersIndirect(
+                  reinterpret_cast<Agc::CommandBuffer *>(&cx_dcb), &cx_register, 1) ==
                   cx_packet.data() && cx_dcb.cursor_up == cx_dcb.top,
           "indirect Cx size did not match the emitted command buffer");
 
@@ -56018,8 +56018,8 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
       patched_branch.data(), patched_branch.data() + patched_branch.size(),
       nullptr, nullptr, 0};
   Require(name, "branch packet size",
-          Gen5::AgcCbBranchGetSize() == sizeof(patched_branch) &&
-              Gen5::AgcCbBranch(reinterpret_cast<Gen5::CommandBuffer *>(&branch_dcb),
+          Agc::AgcCbBranchGetSize() == sizeof(patched_branch) &&
+              Agc::AgcCbBranch(reinterpret_cast<Agc::CommandBuffer *>(&branch_dcb),
                                 1, 0, &condition, 0, 0, 0, nullptr, 0,
                                 3, else_commands.data(), else_commands.size()) ==
                   patched_branch.data() && branch_dcb.cursor_up == branch_dcb.top,
@@ -56028,7 +56028,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   patched_branch[10] = 0xc5a00000u;
   const auto unpatched = patched_branch;
   Require(name, "patched indirect context branch",
-          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 2,
+          Agc::AgcBranchPatchSetThenTarget(patched_branch.data(), 2,
                                             cx_packet.data(), cx_packet.size()) == 0 &&
               (patched_branch[8] & 3u) == 3u &&
               patched_branch[10] == 0xe5a00005u &&
@@ -56045,7 +56045,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   patched_branch[0] = KYTY_PM4(14, Pm4::IT_NOP, 0);
   const auto mismatched = patched_branch;
   Require(name, "branch packet mismatch",
-          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 0,
+          Agc::AgcBranchPatchSetThenTarget(patched_branch.data(), 0,
                                             then_commands.data(), then_commands.size()) ==
                   static_cast<int>(0x8a6c000cu) && patched_branch == mismatched,
           "branch patch accepted or changed a different packet type");
@@ -56274,16 +56274,16 @@ void CheckPm4Flip() {
   auto *begin = commands.data() + 8;
   auto *end = commands.data() + commands.size();
   CommandBufferLayout dcb{begin, end, begin, end, nullptr, nullptr, 0};
-  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+  auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&dcb);
   int bus = -1;
   const auto label = reinterpret_cast<uint64_t>(
       VideoOut::VideoOutGetBufferLabels(handle, &bus));
   const bool emitted =
-      Gen5::AgcDcbSetFlip(buffer, handle, 16, 1, 0) == nullptr &&
-      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -3) == nullptr &&
-      Gen5::AgcDcbSetFlip(buffer, handle, -1, 1, flip_arg) == begin &&
-      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, 0) == begin + 64 &&
-      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -1) ==
+      Agc::AgcDcbSetFlip(buffer, handle, 16, 1, 0) == nullptr &&
+      Agc::AgcDcbWaitUntilSafeForRendering(buffer, handle, -3) == nullptr &&
+      Agc::AgcDcbSetFlip(buffer, handle, -1, 1, flip_arg) == begin &&
+      Agc::AgcDcbWaitUntilSafeForRendering(buffer, handle, 0) == begin + 64 &&
+      Agc::AgcDcbWaitUntilSafeForRendering(buffer, handle, -1) ==
           begin + 96 &&
       dcb.cursor_up == end;
   const std::array<uint32_t, 19> flip{
@@ -56392,7 +56392,7 @@ void CheckPm4Flip() {
   compute_flip[8] = static_cast<uint32_t>(compute_arg);
   compute_flip[11] = 0x0620062fu;
   const bool compute_emitted =
-      Gen5::AgcAcbSetFlip(reinterpret_cast<Gen5::CommandBuffer *>(&acb_layout),
+      Agc::AgcAcbSetFlip(reinterpret_cast<Agc::CommandBuffer *>(&acb_layout),
                           handle, -1, 1, compute_arg) == acb.data() &&
       std::equal(compute_flip.begin(), compute_flip.end(), acb.begin());
   bool compute_complete = false;
@@ -56433,13 +56433,13 @@ void CheckPm4Flip() {
                                 shown.data(), shown.data() + shown.size(),
                                 nullptr,      nullptr,
                                 0};
-  auto *shown_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&shown_dcb);
+  auto *shown_buffer = reinterpret_cast<Agc::CommandBuffer *>(&shown_dcb);
   const auto headset_label = reinterpret_cast<uint64_t>(
       VideoOut::VideoOutGetBufferLabels(headset, &bus));
   Require(name, "shown flip packet",
-          Gen5::AgcDcbSetFlip(shown_buffer, headset, 0, 1, 0) ==
+          Agc::AgcDcbSetFlip(shown_buffer, headset, 0, 1, 0) ==
                   shown.data() &&
-              Gen5::AgcDcbWaitUntilSafeForRendering(shown_buffer, headset, 0) ==
+              Agc::AgcDcbWaitUntilSafeForRendering(shown_buffer, headset, 0) ==
                   shown.data() + 64 &&
               shown[2] == 0xc7010107u && shown[3] == 32u &&
               shown[12] == 0x42010000u &&
@@ -56705,7 +56705,7 @@ void CheckPm4LodStats(RenderContext &renderer) {
     CommandBufferLayout dcb{packet.data(), packet.data() + packet.size(), packet.data(),
                             packet.data() + packet.size(), nullptr, nullptr, 0};
     Pm4Execution execution;
-    return Gen5::AgcDcbGetLodStats(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0,
+    return Agc::AgcDcbGetLodStats(reinterpret_cast<Agc::CommandBuffer *>(&dcb), 0,
                                    report.data(), size, 0, 0, 0, 0) == packet.data() &&
            processor.Process(execution, packet) == Pm4ProcessResult::Complete && report[0] != 0;
   };
@@ -56768,7 +56768,7 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
       CommandBufferLayout dcb{packet.data(), packet.data() + packet.size(), packet.data(),
                               packet.data() + packet.size(), nullptr, nullptr, 0};
       Pm4Execution execution;
-      return Gen5::AgcDcbGetLodStats(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0,
+      return Agc::AgcDcbGetLodStats(reinterpret_cast<Agc::CommandBuffer *>(&dcb), 0,
                                      report.data(), sizeof(report), 0, force_reset,
                                      report_and_reset, 0) == packet.data() &&
              processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
@@ -56852,7 +56852,7 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   const auto *symbol = symbols.FindByNid("q4VuU-QsLOE", Loader::SymbolType::Func);
   Require(name, "async export",
           symbol != nullptr &&
-              symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
+              symbol->vaddr == reinterpret_cast<uint64_t>(&Agc::AgcAcbMemSemaphore),
           "async semaphore import did not resolve to the emitter");
 
   CommandProcessor processor(renderer, 0x20);
@@ -56873,7 +56873,7 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   const auto emit = [&](uint8_t signal_type, uint8_t op) {
     packet.fill(poison);
     acb.cursor_up = packet.data();
-    return Gen5::AgcAcbMemSemaphore(reinterpret_cast<Gen5::CommandBuffer *>(&acb), &counter, 1,
+    return Agc::AgcAcbMemSemaphore(reinterpret_cast<Agc::CommandBuffer *>(&acb), &counter, 1,
                                     signal_type, op) == packet.data() &&
            acb.cursor_up == end;
   };
@@ -56883,8 +56883,8 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
               packet == decltype(packet){0xc0027900u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
                                          0xc0023900u, low & ~0x7u, high, 0xe0010000u,
                                          0xc0017900u, 0x342u, 0xc9000000u} &&
-              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
-              Gen5::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
+              Agc::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
+              Agc::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
           "semaphore wait differs from the native stream");
   const auto wait = packet;
   Pm4Execution waiting;
@@ -56899,7 +56899,7 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
               packet == decltype(packet){0xc0027900u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
                                          0xc0011000u, poison, poison,
                                          0xc0023900u, low & ~0x7u, high, 0xc0010000u} &&
-              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
+              Agc::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
               execute(packet) && counter == 1 && execute(packet) && counter == 2,
           "semaphore increment differs from the native stream or count");
   Require(name, "resume",
@@ -56929,7 +56929,7 @@ void CheckPm4WriteDataGds(VulkanHarness &vulkan) {
     CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
                             packet.data(), packet.data() + packet.size(),
                             nullptr, nullptr, 0};
-    Gen5::AgcAcbWriteData(reinterpret_cast<Gen5::CommandBuffer *>(&acb), 3, 0,
+    Agc::AgcAcbWriteData(reinterpret_cast<Agc::CommandBuffer *>(&acb), 3, 0,
                           offset, data.data(), 3, increment, 0);
     Pm4Execution execution;
     return processor.Process(execution, packet) == Pm4ProcessResult::Complete;
@@ -56983,23 +56983,23 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   const auto *patch_symbol = symbols.FindByNid("eWaWyFegzgQ", Loader::SymbolType::Func);
   Require(name, "async exports",
           emit_symbol != nullptr && patch_symbol != nullptr &&
-              emit_symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbRewind) &&
+              emit_symbol->vaddr == reinterpret_cast<uint64_t>(&Agc::AgcAcbRewind) &&
               patch_symbol->vaddr ==
-                  reinterpret_cast<uint64_t>(&Gen5::AgcRewindPatchSetRewindState),
+                  reinterpret_cast<uint64_t>(&Agc::AgcRewindPatchSetRewindState),
           "async rewind imports did not resolve to the emitter and state patch");
-  const auto async_patch = reinterpret_cast<decltype(&Gen5::AgcRewindPatchSetRewindState)>(
+  const auto async_patch = reinterpret_cast<decltype(&Agc::AgcRewindPatchSetRewindState)>(
       patch_symbol->vaddr);
 
   constexpr uint32_t sentinel = 0x12345678u;
   std::array<uint32_t, 4> packet{sentinel, sentinel, sentinel, sentinel};
   CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
                           packet.data() + 1, packet.data() + 3, nullptr, nullptr, 0};
-  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&acb);
+  auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&acb);
   for (const uint8_t state : {0, 1}) {
     for (const uint8_t offload : {0, 1}) {
       acb.cursor_up = packet.data() + 1;
       Require(name, "async packet",
-              Gen5::AgcAcbRewind(buffer, state, offload) == packet.data() + 1 &&
+              Agc::AgcAcbRewind(buffer, state, offload) == packet.data() + 1 &&
                   acb.cursor_up == packet.data() + 3 &&
                   packet[0] == sentinel && packet[3] == sentinel &&
                   packet[1] == 0xc0005900u &&
@@ -57011,8 +57011,8 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   acb.cursor_up = packet.data() + 1;
   acb.reserved_dw = 1;
   Require(name, "bounded allocation",
-          Gen5::AgcAcbRewind(buffer, 1, 1) == nullptr &&
-              Gen5::AgcAcbRewind(nullptr, 1, 1) == nullptr &&
+          Agc::AgcAcbRewind(buffer, 1, 1) == nullptr &&
+              Agc::AgcAcbRewind(nullptr, 1, 1) == nullptr &&
               acb.cursor_up == packet.data() + 1 && packet == before,
           "failed rewind allocation changed the cursor or command storage");
 
@@ -57043,10 +57043,10 @@ void CheckPm4RewindResume(RenderContext &renderer) {
           static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), 33};
       CommandBufferLayout cb{commands.data(), commands.data() + 2,
                              commands.data(), commands.data() + 2, nullptr, nullptr, 0};
-      auto *command_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&cb);
-      const auto *emitted = async ? Gen5::AgcAcbRewind(command_buffer, 0, offload)
-                                 : Gen5::AgcDcbRewind(command_buffer, 0);
-      const auto patch = async ? async_patch : &Gen5::AgcRewindPatchSetRewindState;
+      auto *command_buffer = reinterpret_cast<Agc::CommandBuffer *>(&cb);
+      const auto *emitted = async ? Agc::AgcAcbRewind(command_buffer, 0, offload)
+                                 : Agc::AgcDcbRewind(command_buffer, 0);
+      const auto patch = async ? async_patch : &Agc::AgcRewindPatchSetRewindState;
       Pm4Execution execution;
       Require(name, "pending",
               emitted == commands.data() &&

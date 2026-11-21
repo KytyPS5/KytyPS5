@@ -14,7 +14,7 @@
 
 namespace Libs {
 
-LIB_VERSION("VrTracker2", 1, "VrTracker2", 1, 1);
+LIB_NAME("VrTracker2", "VrTracker2");
 
 namespace VrTracker2 {
 

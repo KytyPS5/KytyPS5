@@ -12,7 +12,7 @@
 
 namespace Libs {
 
-LIB_VERSION("UserService", 1, "UserService", 1, 1);
+LIB_NAME("UserService", "UserService");
 
 namespace UserService {
 
@@ -302,7 +302,8 @@ LIB_DEFINE(InitUserService_1) {
 	LIB_FUNC("-3Y5GO+-i78", UserService::UserServiceGetAccessibilityTriggerEffect);
 	LIB_FUNC("hD-H81EN9Vg", UserService::UserServiceGetAccessibilityZoomEnabled);
 	LIB_FUNC("O6IW1-Dwm-w", UserService::UserServiceGetAccessibilityZoomFollowFocus);
-	LIB_FUNC("D-CzAxQL0XI", UserService::UserServicePlatformPrivacyWs1Stub);
+	LIB_FUNC_IN("UserServicePlatformPrivacyWs1", "D-CzAxQL0XI",
+	            UserService::UserServicePlatformPrivacyWs1Stub);
 }
 
 } // namespace Libs

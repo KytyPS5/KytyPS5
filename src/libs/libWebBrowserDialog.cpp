@@ -4,7 +4,7 @@
 
 namespace Libs {
 
-LIB_VERSION("WebBrowserDialog", 1, "WebBrowserDialog", 1, 1);
+LIB_NAME("WebBrowserDialog", "WebBrowserDialog");
 
 namespace WebBrowserDialog {
 

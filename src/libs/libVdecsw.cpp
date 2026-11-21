@@ -15,7 +15,7 @@
 
 namespace Libs::Vdecsw {
 
-LIB_VERSION("Vdecsw", 1, "Vdecsw", 1, 1);
+LIB_NAME("Vdecsw", "Vdecsw");
 
 namespace Decoder = VideoDec2::Decoder;
 

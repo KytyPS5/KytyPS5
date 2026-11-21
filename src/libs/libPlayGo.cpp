@@ -13,7 +13,7 @@
 
 namespace Libs {
 
-LIB_VERSION("PlayGo", 1, "PlayGo", 1, 0);
+LIB_NAME("PlayGo", "PlayGo");
 
 namespace PlayGo {
 

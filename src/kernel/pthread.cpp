@@ -4381,13 +4381,6 @@ int KYTY_SYSV_ABI pthread_mutexattr_destroy(LibKernel::PthreadMutexattr* attr) {
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadMutexattrDestroy(attr));
 }
 
-int KYTY_SYSV_ABI pthread_getstack(const LibKernel::PthreadAttr* __restrict attr,
-                                   void** __restrict stack_addr, size_t* __restrict stack_size) {
-	PRINT_NAME();
-
-	return pthread_attr_getstack(attr, stack_addr, stack_size);
-}
-
 } // namespace Posix
 
 } // namespace Libs

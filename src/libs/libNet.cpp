@@ -45,7 +45,7 @@ struct NetEtherAddr;
 
 namespace LibNet {
 
-LIB_VERSION("Net", 1, "Net", 1, 1);
+LIB_NAME("Net", "Net");
 
 static thread_local int   g_net_errno = 0;
 static constexpr uint32_t g_in6addr_any[4] {};
@@ -293,7 +293,7 @@ LIB_DEFINE(InitNet_1_Net) {
 
 namespace LibSsl {
 
-LIB_VERSION("Ssl", 1, "Ssl", 1, 1);
+LIB_NAME("Ssl", "Ssl");
 
 namespace Ssl = Network::Ssl;
 
@@ -309,7 +309,7 @@ LIB_DEFINE(InitNet_1_Ssl) {
 
 namespace LibHttp {
 
-LIB_VERSION("Http", 1, "Http", 1, 1);
+LIB_NAME("Http", "Http");
 
 namespace Http = Network::Http;
 
@@ -782,7 +782,7 @@ LIB_DEFINE(InitNet_1_Http) {
 
 namespace LibHttp2 {
 
-LIB_VERSION("Http2", 1, "Http2", 1, 1);
+LIB_NAME("Http2", "Http2");
 
 namespace EventQueue = LibKernel::EventQueue;
 
@@ -1565,7 +1565,7 @@ LIB_DEFINE(InitNet_1_Http2) {
 
 namespace LibNetCtl {
 
-LIB_VERSION("NetCtl", 1, "NetCtl", 1, 1);
+LIB_NAME("NetCtl", "NetCtl");
 
 namespace NetCtl = Network::NetCtl;
 
@@ -1586,7 +1586,7 @@ LIB_DEFINE(InitNet_1_NetCtl) {
 
 namespace LibNpCommerce {
 
-LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
+LIB_NAME("NpCommerce", "NpCommerce");
 
 constexpr int COMMERCE_STATUS_NONE          = 0;
 constexpr int COMMERCE_STATUS_INITIALIZED   = 1;
@@ -1700,7 +1700,7 @@ LIB_DEFINE(InitNet_1_NpCommerce) {
 
 namespace LibNpManager {
 
-LIB_VERSION("NpManager", 1, "NpManager", 1, 1);
+LIB_NAME("NpManager", "NpManager");
 
 namespace NpManager = Network::NpManager;
 
@@ -1739,7 +1739,7 @@ LIB_DEFINE(InitNet_1_NpManager) {
 
 namespace LibNpPartner {
 
-LIB_VERSION("libSceNpPartner001", 1, "libSceNpPartner001", 1, 1);
+LIB_NAME("libSceNpPartner001", "libSceNpPartner001");
 
 namespace {
 bool g_np_partner_initialized = false;
@@ -1789,7 +1789,7 @@ LIB_DEFINE(InitNet_1_NpPartner) {
 
 namespace LibNpSessionSignaling {
 
-LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
+LIB_NAME("NpSessionSignaling", "NpSessionSignaling");
 
 static int KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
 	PRINT_NAME();
@@ -1807,7 +1807,7 @@ LIB_DEFINE(InitNet_1_NpSessionSignaling) {
 
 namespace LibNpAuth {
 
-LIB_VERSION("NpAuth", 1, "NpAuth", 1, 1);
+LIB_NAME("NpAuth", "NpAuth");
 
 constexpr int NP_AUTH_MAX_REQUEST_NUM         = 16;
 constexpr int NP_AUTH_REQUEST_ID_OFFSET       = 0x10000000;
@@ -2083,7 +2083,7 @@ LIB_DEFINE(InitNet_1_NpAuth) {
 
 namespace LibNpGameIntent {
 
-LIB_VERSION("NpGameIntent", 1, "NpGameIntent", 1, 1);
+LIB_NAME("NpGameIntent", "NpGameIntent");
 
 constexpr int    NP_GAME_INTENT_ERROR_INVALID_ARGUMENT    = -2141898748; /* 0x80553804 */
 constexpr int    NP_GAME_INTENT_ERROR_INSUFFICIENT_BUFFER = -2141898747; /* 0x80553805 */
@@ -2198,7 +2198,7 @@ LIB_DEFINE(InitNet_1_NpGameIntent) {
 
 namespace LibNpWebApi2 {
 
-LIB_VERSION("NpWebApi2", 1, "NpWebApi2", 1, 1);
+LIB_NAME("NpWebApi2", "NpWebApi2");
 
 constexpr int NP_WEBAPI2_ERROR_INVALID_ARGUMENT       = -2141899774; /* 0x80553402 */
 constexpr int NP_WEBAPI2_ERROR_INVALID_LIB_CONTEXT_ID = -2141899773; /* 0x80553403 */
@@ -2589,7 +2589,7 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 
 namespace LibGameUpdate {
 
-LIB_VERSION("GameUpdate", 1, "GameUpdate", 1, 1);
+LIB_NAME("GameUpdate", "GameUpdate");
 
 constexpr int GAME_UPDATE_ERROR_NOT_INITIALIZED   = static_cast<int>(0x80412801);
 constexpr int GAME_UPDATE_ERROR_INVALID_ARG       = static_cast<int>(0x80412803);
@@ -2758,7 +2758,7 @@ LIB_DEFINE(InitNet_1_GameUpdate) {
 
 namespace LibShare {
 
-LIB_VERSION("Share", 1, "Share", 1, 1);
+LIB_NAME("Share", "Share");
 
 static int KYTY_SYSV_ABI ShareInitialize(size_t heap_size, int thread_priority,
                                          uint64_t affinity_mask) {
@@ -2800,7 +2800,7 @@ LIB_DEFINE(InitNet_1_Json2);
 
 namespace LibRandom {
 
-LIB_VERSION("Random", 1, "Random", 1, 1);
+LIB_NAME("Random", "Random");
 
 constexpr int  RANDOM_ERROR_INVALID = 0x817c0016;
 constexpr auto RANDOM_MAX_SIZE      = 64u;
@@ -2830,7 +2830,7 @@ LIB_DEFINE(InitPlatform_1_Random) {
 
 namespace LibRemoteplay {
 
-LIB_VERSION("Remoteplay", 1, "Remoteplay", 1, 1);
+LIB_NAME("Remoteplay", "Remoteplay");
 
 static int KYTY_SYSV_ABI RemoteplayInitialize(void* heap, size_t heap_size) {
 	PRINT_NAME();
@@ -2872,7 +2872,7 @@ LIB_DEFINE(InitPlatform_1_Remoteplay) {
 
 namespace LibWebBrowserDialog {
 
-LIB_VERSION("WebBrowserDialog", 1, "WebBrowserDialog", 1, 1);
+LIB_NAME("WebBrowserDialog", "WebBrowserDialog");
 
 static int KYTY_SYSV_ABI WebBrowserDialogInitialize() {
 	PRINT_NAME();
@@ -2895,7 +2895,7 @@ LIB_DEFINE(InitPlatform_1_WebBrowserDialog) {
 
 namespace LibGameLiveStreaming {
 
-LIB_VERSION("GameLiveStreaming", 1, "GameLiveStreaming", 1, 1);
+LIB_NAME("GameLiveStreaming", "GameLiveStreaming");
 
 constexpr int GAME_LIVE_STREAMING_ERROR_INVALID_PARAM = -2136997886;
 
@@ -2960,7 +2960,7 @@ LIB_DEFINE(InitPlatform_1_GameLiveStreaming) {
 
 namespace LibSharePlay {
 
-LIB_VERSION("SharePlay", 1, "SharePlay", 1, 1);
+LIB_NAME("SharePlay", "SharePlay");
 
 constexpr int SHARE_PLAY_ERROR_INVALID_ARGS        = -2129788927;
 constexpr int SHARE_PLAY_ERROR_ALREADY_INITIALIZED = -2129788925;

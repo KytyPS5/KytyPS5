@@ -20,7 +20,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Hmd2", 1, "Hmd2", 1, 1);
+LIB_NAME("Hmd2", "Hmd2");
 
 namespace Hmd2 {
 

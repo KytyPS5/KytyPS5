@@ -340,7 +340,7 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 
 namespace LibKernelApr {
 
-LIB_VERSION("libkernel", 1, "libkernel", 1, 1);
+LIB_NAME("libkernel", "libkernel");
 
 namespace Apr {
 
@@ -522,7 +522,7 @@ LIB_DEFINE(InitLibKernel_1_Apr) {
 
 namespace LibAmpr {
 
-LIB_VERSION("Ampr", 1, "Ampr", 1, 1);
+LIB_NAME("Ampr", "Ampr");
 
 namespace Ampr {
 

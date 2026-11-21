@@ -4079,7 +4079,7 @@ void TestPixelAncillaryLayerInput() {
 void TestGraphicsCreateInterpolantMapping() {
   ShaderRegister regs[32] = {};
 
-  Check(Gen5::AgcCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
+  Check(Agc::AgcCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
         "null pixel shader interpolant mapping failed");
   for (uint32_t i = 0; i < 32u; i++) {
     Check(regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
@@ -4089,7 +4089,7 @@ void TestGraphicsCreateInterpolantMapping() {
   }
 
   ShaderRegister native_regs[32] = {};
-  Check(Gen5::AgcCreateInterpolantMapping2(native_regs, nullptr, nullptr) == 0,
+  Check(Agc::AgcCreateInterpolantMapping2(native_regs, nullptr, nullptr) == 0,
         "native interpolant mapping identity path failed");
   for (uint32_t i = 0; i < 32u; i++) {
     Check(native_regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
@@ -4135,7 +4135,7 @@ void TestGraphicsCreateInterpolantMapping() {
   ps.input_semantics = ps_semantics;
   ps.num_input_semantics = static_cast<uint32_t>(std::size(ps_semantics));
 
-  Check(Gen5::AgcCreateInterpolantMapping(regs, &gs, &ps) == 0,
+  Check(Agc::AgcCreateInterpolantMapping(regs, &gs, &ps) == 0,
         "shader interpolant mapping failed");
   Check(regs[0].value == 0x00000005u,
         "matched interpolant mapping did not use GS hardware mapping");
@@ -4148,7 +4148,7 @@ void TestGraphicsCreateInterpolantMapping() {
   Check(regs[6].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 6u && regs[6].value == 6u,
         "interpolant identity tail was not filled");
 
-  Check(Gen5::AgcCreateInterpolantMapping2(native_regs, &gs, &ps) == 0,
+  Check(Agc::AgcCreateInterpolantMapping2(native_regs, &gs, &ps) == 0,
         "native shader interpolant mapping failed");
   Check(native_regs[0].value == 0x00000005u &&
             native_regs[1].value == 0x00000220u &&

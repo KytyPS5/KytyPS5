@@ -38,7 +38,7 @@ namespace Libs::Graphics {
 
 static RenderContext* g_renderer = nullptr;
 
-namespace Gen5Driver {
+namespace AgcDriver {
 
 static constexpr uint64_t DriverDmemBase = 0x0fe0000000ull;
 static constexpr uint32_t DriverDmemSize = 0x200000;
@@ -52,7 +52,7 @@ struct DriverDmem {
 static DriverDmem g_driver_dmem;
 static void ReleaseDmem();
 
-} // namespace Gen5Driver
+} // namespace AgcDriver
 
 // Logs each call's arguments when true.
 static constexpr bool TraceCalls = false;
@@ -78,14 +78,14 @@ void Initialize() {
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
-	EXIT_IF(Gen5Driver::Initialize() != OK);
+	EXIT_IF(AgcDriver::Initialize() != OK);
 	ShaderInit();
 }
 
 void Shutdown() {
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->ShutdownGpu();
-	Gen5Driver::ReleaseDmem();
+	AgcDriver::ReleaseDmem();
 	VideoOut::VideoOutShutdown();
 	WindowShutdown();
 	g_renderer = nullptr;
@@ -113,9 +113,9 @@ void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_b
 	}
 }
 
-namespace Gen5 {
+namespace Agc {
 
-LIB_NAME("Graphics5", "Graphics5");
+LIB_NAME("Agc", "Agc");
 
 struct RegisterDefaults {
 	ShaderRegister** tbl0                = nullptr;
@@ -497,8 +497,8 @@ static void dbg_dump_shader(const Shader* h) {
 	         h->scratch_size_dw_per_thread, h->special_sizes_bytes, h->type);
 }
 
-static constexpr int GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM = static_cast<int>(0x8a6c0005u);
-static constexpr int GRAPHICS5_ERROR_INVALID_SHADER_HALVES  = static_cast<int>(0x8a6c0008u);
+static constexpr int AGC_ERROR_INVALID_SHADER_PROGRAM = static_cast<int>(0x8a6c0005u);
+static constexpr int AGC_ERROR_INVALID_SHADER_HALVES  = static_cast<int>(0x8a6c0008u);
 
 static bool get_shader_program_address_register(uint8_t type, uint32_t* lo_offset) {
 	if (lo_offset == nullptr) {
@@ -532,7 +532,7 @@ static int patch_program_address_register(ShaderRegister* regs, uint32_t num_reg
 	}
 
 	if (regs == nullptr || num_regs == 0) {
-		return GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM;
+		return AGC_ERROR_INVALID_SHADER_PROGRAM;
 	}
 
 	for (auto lo_index = 0u; lo_index < num_regs; lo_index++) {
@@ -543,7 +543,7 @@ static int patch_program_address_register(ShaderRegister* regs, uint32_t num_reg
 		const auto hi_index  = lo_index + 1u;
 		const auto hi_offset = lo_offset + 1u;
 		if (hi_index >= num_regs || regs[hi_index].offset != hi_offset) {
-			return GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM;
+			return AGC_ERROR_INVALID_SHADER_PROGRAM;
 		}
 
 		const auto shader_offset = (static_cast<uint64_t>(regs[lo_index].value) << 8u) |
@@ -556,7 +556,7 @@ static int patch_program_address_register(ShaderRegister* regs, uint32_t num_reg
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM;
+	return AGC_ERROR_INVALID_SHADER_PROGRAM;
 }
 
 static ShaderRegister* find_shader_register(ShaderRegister* regs, uint32_t num_regs,
@@ -681,7 +681,7 @@ int KYTY_SYSV_ABI AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
 	       back_type == Prospero::ShaderBinaryType::kGsBack) ||
 	      (front_type == Prospero::ShaderBinaryType::kHsFront &&
 	       back_type == Prospero::ShaderBinaryType::kHsBack))) {
-		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+		return AGC_ERROR_INVALID_SHADER_HALVES;
 	}
 
 	dst->m_size  = static_cast<uint64_t>(back->num_sh_registers) * sizeof(ShaderRegister);
@@ -720,7 +720,7 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	if ((!is_gs && !is_hs) ||
 	    (is_gs && back->type != static_cast<uint8_t>(Prospero::ShaderBinaryType::kGsBack)) ||
 	    (is_hs && back->type != static_cast<uint8_t>(Prospero::ShaderBinaryType::kHsBack))) {
-		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+		return AGC_ERROR_INVALID_SHADER_HALVES;
 	}
 
 	*fused_result      = *back;
@@ -731,7 +731,7 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	const auto front_stages = front->specials->vgt_shader_stages_en.value;
 	const auto mismatch_bit = is_gs ? (1u << 22u) : (1u << 21u);
 	if (((front_stages ^ back_stages) & mismatch_bit) != 0) {
-		return GRAPHICS5_ERROR_INVALID_SHADER_HALVES;
+		return AGC_ERROR_INVALID_SHADER_HALVES;
 	}
 
 	if (scratch_mem != nullptr) {
@@ -807,7 +807,7 @@ int KYTY_SYSV_ABI AgcFuseShaderHalves(Shader* fused_result, const Shader* front,
 	return fuse_shader_halves(fused_result, front, back, scratch_mem, false);
 }
 
-static constexpr int GRAPHICS5_ERROR_INVALID_PACKET = static_cast<int>(0x8a6c000cu);
+static constexpr int AGC_ERROR_INVALID_PACKET = static_cast<int>(0x8a6c000cu);
 
 enum class RegIndirectPacket : uint32_t {
 	Cx,
@@ -856,7 +856,7 @@ static int reg_indirect_patch_set_address(uint32_t* cmd, uint64_t vaddr, RegIndi
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_PACKET;
+	return AGC_ERROR_INVALID_PACKET;
 }
 
 static int reg_indirect_patch_set_num_registers(uint32_t* cmd, uint32_t num_regs,
@@ -868,7 +868,7 @@ static int reg_indirect_patch_set_num_registers(uint32_t* cmd, uint32_t num_regs
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_PACKET;
+	return AGC_ERROR_INVALID_PACKET;
 }
 
 static int reg_indirect_patch_add_registers(uint32_t* cmd, uint32_t num_regs,
@@ -881,7 +881,7 @@ static int reg_indirect_patch_add_registers(uint32_t* cmd, uint32_t num_regs,
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_PACKET;
+	return AGC_ERROR_INVALID_PACKET;
 }
 
 int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
@@ -1477,7 +1477,7 @@ int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t ad
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_PACKET;
+	return AGC_ERROR_INVALID_PACKET;
 }
 
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
@@ -1498,7 +1498,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 	         cmd_id, op, KYTY_PM4_LEN(cmd_id));
 
 	if (op != Pm4::IT_INDIRECT_BUFFER) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	auto vaddr = reinterpret_cast<uint64_t>(target);
@@ -1588,10 +1588,10 @@ void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
 	*result = is_trinity_mode();
 }
 
-static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);
-static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT = static_cast<int>(0x8a6c0035u);
-static constexpr int      GRAPHICS5_DRIVER_ERROR_FAILED           = static_cast<int>(0x8a6d0003u);
-static constexpr int      GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT     = static_cast<int>(0x8a6d0109u);
+static constexpr int      AGC_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);
+static constexpr int      AGC_DRIVER_ERROR_INVALID_ARGUMENT = static_cast<int>(0x8a6c0035u);
+static constexpr int      AGC_DRIVER_ERROR_FAILED           = static_cast<int>(0x8a6d0003u);
+static constexpr int      AGC_DRIVER_ERROR_EMPTY_SUBMIT     = static_cast<int>(0x8a6d0109u);
 static constexpr uint32_t WORKLOAD_ACTIVE_PACKET_SIZE_DW          = 18;
 static constexpr uint32_t WORKLOAD_COMPLETE_PACKET_SIZE_DW        = 12;
 static constexpr uint32_t WORKLOAD_STREAM_MIN_ID                  = 1;
@@ -1665,17 +1665,17 @@ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void
 	         stream_id, reinterpret_cast<uint64_t>(stream));
 
 	if (stream_id < WORKLOAD_STREAM_MIN_ID || stream_id > WORKLOAD_STREAM_MAX_ID) {
-		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+		return AGC_DRIVER_ERROR_INVALID_VALUE;
 	}
 
 	std::lock_guard lock(g_workload_stream_mutex);
 
 	const uint32_t stream_bit = 1u << stream_id;
 	if ((g_workload_stream_mask & stream_bit) != 0) {
-		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+		return AGC_DRIVER_ERROR_INVALID_VALUE;
 	}
 	if (stream == nullptr) {
-		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
+		return AGC_DRIVER_ERROR_INVALID_ARGUMENT;
 	}
 
 	g_workload_stream_mask |= stream_bit;
@@ -1754,7 +1754,7 @@ int KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_polic
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 	write_branch_target(cmd + 8, reinterpret_cast<uint64_t>(target), cache_policy, size_in_dwords);
 	return OK;
@@ -1927,7 +1927,7 @@ int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
 
 	AgcTrace("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
 
-	return GRAPHICS5_DRIVER_ERROR_FAILED;
+	return AGC_DRIVER_ERROR_FAILED;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,
@@ -2545,7 +2545,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
 
 	auto op = (cmd[0] >> 8u) & 0xffu;
 	if (op != Pm4::IT_INDIRECT_BUFFER) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	auto vaddr        = reinterpret_cast<uint64_t>(target);
@@ -3441,7 +3441,7 @@ int KYTY_SYSV_ABI AgcDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_PACKET;
+	return AGC_ERROR_INVALID_PACKET;
 }
 
 int KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
@@ -3455,7 +3455,7 @@ int KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
 		return OK;
 	}
 
-	return GRAPHICS5_ERROR_INVALID_PACKET;
+	return AGC_ERROR_INVALID_PACKET;
 }
 
 uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
@@ -3518,7 +3518,7 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 
 int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_REWIND) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(state) << 31u);
@@ -3533,7 +3533,7 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t*
 	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
 
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_COND_EXEC) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	auto bytes = reinterpret_cast<uintptr_t>(buffer) - reinterpret_cast<uintptr_t>(cmd);
@@ -3550,7 +3550,7 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd
 	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
 
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_COND_EXEC) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	auto addr = reinterpret_cast<uint64_t>(command);
@@ -3686,7 +3686,7 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	const auto vaddr = reinterpret_cast<uint64_t>(address);
@@ -3710,7 +3710,7 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference)
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	// The native patch helper changes only the low reference DWORD for both packet sizes.
@@ -3728,7 +3728,7 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchCompareFunction(uint32_t* cmd, uint8_t compa
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	// FUNCTION is bits [2:0] of the control DWORD in both packet sizes.
@@ -3748,7 +3748,7 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_RELEASE_MEM) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	// A kSendIntCtx release has no address.
@@ -3771,7 +3771,7 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data)
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_RELEASE_MEM) {
-		return GRAPHICS5_ERROR_INVALID_PACKET;
+		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	const auto interrupt = (cmd[2] >> 24u) & 0x7u;
@@ -4096,11 +4096,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
 	return cmd;
 }
 
-} // namespace Gen5
+} // namespace Agc
 
-namespace Gen5Driver {
+namespace AgcDriver {
 
-LIB_NAME("Graphics5Driver", "Graphics5Driver");
+LIB_NAME("AgcDriver", "AgcDriver");
 
 int Initialize() {
 	std::scoped_lock lock {g_driver_dmem.mutex};
@@ -4195,7 +4195,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 int KYTY_SYSV_ABI AgcDriverAgrSubmit() {
 	PRINT_NAME();
 
-	return Gen5::GRAPHICS5_DRIVER_ERROR_FAILED;
+	return Agc::AGC_DRIVER_ERROR_FAILED;
 }
 
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
@@ -4205,7 +4205,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 	AgcTrace("\t count = %" PRIu32 "\n", count);
 
 	if (count == 0) {
-		return Gen5::GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT;
+		return Agc::AGC_DRIVER_ERROR_EMPTY_SUBMIT;
 	}
 	if (dcb_gpu_addrs == nullptr || dcb_sizes_in_dwords == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4287,7 +4287,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
 	         reinterpret_cast<uint64_t>(queue_context), count);
 
 	if (count == 0) {
-		return Gen5::GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT;
+		return Agc::AGC_DRIVER_ERROR_EMPTY_SUBMIT;
 	}
 	if (queue_context == nullptr || command_buffers == nullptr || sizes_in_dwords == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4328,7 +4328,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
 	         queue, count);
 
 	if (count == 0) {
-		return Gen5::GRAPHICS5_DRIVER_ERROR_EMPTY_SUBMIT;
+		return Agc::AGC_DRIVER_ERROR_EMPTY_SUBMIT;
 	}
 	if (acbs == nullptr || sizes_in_dwords == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4413,6 +4413,6 @@ int KYTY_SYSV_ABI AgcDriverRegisterDefaultOwner() {
 	return static_cast<int>(0x8a6c9018u);
 }
 
-} // namespace Gen5Driver
+} // namespace AgcDriver
 
 } // namespace Libs::Graphics

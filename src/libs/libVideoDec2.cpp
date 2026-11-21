@@ -13,7 +13,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Videodec2", 1, "Videodec2", 1, 1);
+LIB_NAME("Videodec2", "Videodec2");
 
 namespace VideoDec2 {
 

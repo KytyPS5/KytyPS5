@@ -524,7 +524,7 @@ void TestFileDescriptorFlags() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"8nY19bKoiZk", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"8nY19bKoiZk", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fcntl export resolves");
   const auto fcntl = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int, int)>(symbol->vaddr);
   Check(fcntl(std::numeric_limits<int>::min(), 1, 0) == -1 &&
@@ -555,7 +555,7 @@ void TestSysmoduleReferences() {
   using ModuleCall = int (KYTY_SYSV_ABI *)(uint16_t);
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.Find(
-        {nid, "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+        {nid, "Sysmodule", "Sysmodule", Loader::SymbolType::Func});
     Check(symbol != nullptr, "Sysmodule export resolves");
     return reinterpret_cast<ModuleCall>(symbol->vaddr);
   };
@@ -580,7 +580,7 @@ void TestSysmoduleReferences() {
           "last unload restores unloaded status");
   }
   const auto* internal_symbol = symbols.Find(
-      {"hHrGoGoNf+s", "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+      {"hHrGoGoNf+s", "Sysmodule", "Sysmodule", Loader::SymbolType::Func});
   Check(internal_symbol != nullptr, "internal Sysmodule load export resolves");
   const auto internal_load =
       reinterpret_cast<int (KYTY_SYSV_ABI *)(uint16_t, int, int, int, int*)>(
@@ -600,7 +600,7 @@ void TestSystemServiceEntitlementEvents() {
   Libs::InitAppContent_1(&symbols);
   const auto resolve = [&](const char* nid, const char* library, const char* module) {
     const auto* symbol = symbols.Find(
-        {nid, library, 1, module, 1, 1, Loader::SymbolType::Func});
+        {nid, library, module, Loader::SymbolType::Func});
     Check(symbol != nullptr, "entitlement event export resolves");
     return symbol->vaddr;
   };
@@ -870,7 +870,7 @@ void TestFsync() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"juWbTNM+8hw", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"juWbTNM+8hw", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fsync export resolves");
   const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
   Check(fsync(std::numeric_limits<int>::min()) == -1 &&
@@ -899,7 +899,7 @@ void TestSaveTruncate() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"WlyEA-sLDf0", "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"WlyEA-sLDf0", "libkernel", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "sceKernelTruncate export resolves");
   const auto truncate =
       reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, int64_t)>(symbol->vaddr);
@@ -954,7 +954,7 @@ void TestSaveWritev() {
   Libs::InitLibKernel_1(&symbols);
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.Find(
-        {nid, "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+        {nid, "libkernel", "libkernel", Loader::SymbolType::Func});
     Check(symbol != nullptr, "vectored write export resolves");
     return symbol->vaddr;
   };
@@ -2660,25 +2660,25 @@ void CheckSocketWakeup() {
   Libs::LibNet::InitNet_1_Net(&symbols);
   Libs::InitLibKernel_1(&symbols);
   const auto *shutdown_symbol = symbols.Find(
-      {"TUuiYS2kE8s", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"TUuiYS2kE8s", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(shutdown_symbol != nullptr, "POSIX shutdown export resolves");
   const auto shutdown = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int)>(shutdown_symbol->vaddr);
   const auto *connect_symbol = symbols.Find(
-      {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"OXXX4mUk3uk", "Net", "Net", Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
-      {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"xphrZusl78E", "Net", "Net", Loader::SymbolType::Func});
   const auto *setsockopt_symbol = symbols.Find(
-      {"2mKX2Spso7I", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"2mKX2Spso7I", "Net", "Net", Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
-      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"beRjXBn-z+o", "Net", "Net", Loader::SymbolType::Func});
   const auto *sendto_symbol = symbols.Find(
-      {"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"gvD1greCu0A", "Net", "Net", Loader::SymbolType::Func});
   const auto *recv_symbol = symbols.Find(
-      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"9wO9XrMsNhc", "Net", "Net", Loader::SymbolType::Func});
   const auto *recvfrom_symbol = symbols.Find(
-      {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"304ooNZxWDY", "Net", "Net", Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
-      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"HQOwnfMGipQ", "Net", "Net", Loader::SymbolType::Func});
   Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
             recv_symbol && recvfrom_symbol && errno_symbol,
         "Net socket and errno exports resolve with the guest ABI versions");

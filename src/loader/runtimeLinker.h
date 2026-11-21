@@ -31,24 +31,12 @@ using application_heap_malloc_func_t         = KYTY_SYSV_ABI void* (*)(uint64_t)
 using application_heap_posix_memalign_func_t = KYTY_SYSV_ABI int (*)(void**, uint64_t, uint64_t);
 
 struct ModuleId {
-	bool operator==(const ModuleId& other) const {
-		return version_major == other.version_major && version_minor == other.version_minor &&
-		       name == other.name;
-	}
-
 	std::string id;
-	int         version_major;
-	int         version_minor;
 	std::string name;
 };
 
 struct LibraryId {
-	bool operator==(const LibraryId& other) const {
-		return version == other.version && name == other.name;
-	}
-
 	std::string id;
-	int         version;
 	std::string name;
 };
 

@@ -4059,12 +4059,13 @@ void KYTY_SYSV_ABI pthread_yield() {
 	LibKernel::PthreadYield();
 }
 
+// The numeric bounds of the priorities, which run from 256 (highest) to 767 (lowest).
 int KYTY_SYSV_ABI sched_get_priority_max(int policy) {
 	PRINT_NAME();
 
 	LOGF("\t policy = %d\n", policy);
 
-	return 256;
+	return 767;
 }
 
 int KYTY_SYSV_ABI sched_get_priority_min(int policy) {
@@ -4072,7 +4073,7 @@ int KYTY_SYSV_ABI sched_get_priority_min(int policy) {
 
 	LOGF("\t policy = %d\n", policy);
 
-	return 767;
+	return 256;
 }
 
 int KYTY_SYSV_ABI pthread_join(LibKernel::Pthread thread, void** value) {

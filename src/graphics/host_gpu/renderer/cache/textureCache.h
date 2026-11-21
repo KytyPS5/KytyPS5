@@ -81,6 +81,8 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	[[nodiscard]] vk::ImageAspectFlags TakeMetaClear(uint64_t address, uint32_t slice,
+	                                                 vk::ImageAspectFlags aspects);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -95,6 +97,7 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		std::bitset<8192> stencil_clear_mask;
 		// The depth image that last acquired this HTile range.
 		ImageId owner;
 	};
@@ -239,6 +242,7 @@ private:
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
+	void ReleaseHtileOwner(ImageId id, const ImageMetadataInfo& released);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);

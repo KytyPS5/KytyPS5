@@ -479,19 +479,20 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	if (depth.image_id) {
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		const bool meta_clear =
-		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+		const auto  attachment_aspects = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+		const auto  meta_clear =
+		    metadata.kind == ImageMetadataKind::Htile
+		        ? cache.TakeMetaClear(metadata.range.address, depth.desc.view_info.base_layer,
+		                              attachment_aspects)
+		        : vk::ImageAspectFlags {};
 		depth.load_clear_aspects = {};
-		if (depth.depth_clear_enable || meta_clear)
+		if (depth.depth_clear_enable || (meta_clear & vk::ImageAspectFlagBits::eDepth))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
 		// Apply pending clears to compressed stencil as well as depth.
-		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+		if (depth.stencil_clear_enable ||
+		    ((meta_clear & vk::ImageAspectFlagBits::eStencil) && metadata.stencil_compressed))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
-		if (meta_clear &&
-		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
-			EXIT("failed to consume HTile clear state\n");
-		}
+		depth.load_clear_aspects &= attachment_aspects;
 		auto& image = cache.GetImage(depth.image_id);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
 		const auto draw_writes = depth.AttachmentWriteAspects();

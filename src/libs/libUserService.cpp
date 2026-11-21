@@ -62,6 +62,24 @@ static KYTY_SYSV_ABI int UserServiceInitialize2() {
 	return OK;
 }
 
+static KYTY_SYSV_ABI int UserServiceTerminate() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+static KYTY_SYSV_ABI int UserServiceGetForegroundUser(int* user_id) {
+	PRINT_NAME();
+
+	if (user_id == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
+
+	*user_id = Config::GetUserId();
+
+	return OK;
+}
+
 static KYTY_SYSV_ABI int UserServiceGetInitialUser(int* user_id) {
 	PRINT_NAME();
 
@@ -102,6 +120,24 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 		if (IsPlayerLoggedIn(player)) {
 			user_id_list->user_id[count++] = Config::GetPlayerUserId(player);
 		}
+	}
+	while (count < Config::MAX_PLAYERS) {
+		user_id_list->user_id[count++] = -1;
+	}
+
+	return OK;
+}
+
+static KYTY_SYSV_ABI int UserServiceGetRegisteredUserIdList(UserServiceLoginUserIdList* user_id_list) {
+	PRINT_NAME();
+
+	if (user_id_list == nullptr) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
+
+	int count = 0;
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		user_id_list->user_id[count++] = Config::GetPlayerUserId(player);
 	}
 	while (count < Config::MAX_PLAYERS) {
 		user_id_list->user_id[count++] = -1;
@@ -289,10 +325,12 @@ LIB_DEFINE(InitUserService_1) {
 	LIB_FUNC("j3YMu1MVNNo", UserService::UserServiceInitialize);
 	LIB_FUNC("az-0R6eviZ0", UserService::UserServiceInitialize2);
 	LIB_FUNC("CdWp0oHWGr0", UserService::UserServiceGetInitialUser);
+	LIB_FUNC("eNb53LQJmIM", UserService::UserServiceGetForegroundUser);
 	LIB_FUNC("yH17Q6NWtVg", UserService::UserServiceGetEvent);
 	LIB_FUNC("fPhymKNvK-A", UserService::UserServiceGetLoginUserIdList);
+	LIB_FUNC("5EiQCnL2G1Y", UserService::UserServiceGetRegisteredUserIdList);
 	LIB_FUNC("1xxcMiGu2fo", UserService::UserServiceGetUserName);
-	LIB_FUNC("bwFjS+bX9mA", UserService::UserServiceGetUserNumber);
+	LIB_FUNC("bwFjS+bX9mA", UserService::UserServiceTerminate);
 	LIB_FUNC("qbwy0Ub8b3M", UserService::UserServiceGetUserNumber);
 	LIB_FUNC("-sD02mFDBh4", UserService::UserServiceGetGamePresets);
 	LIB_FUNC("woNpu+45RLk", UserService::UserServiceGetAgeLevel);

@@ -137,6 +137,19 @@ struct Videodec2FrameBuffer {
 using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
 using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
 
+// The HEVC picture information up to its bit depths.
+struct Videodec2HevcPictureInfoHead {
+	size_t   this_size;
+	bool     is_valid;
+	uint64_t pts_data;
+	uint64_t dts_data;
+	uint64_t attached_data;
+	uint32_t pic_width_in_luma_samples;
+	uint32_t pic_height_in_luma_samples;
+	uint8_t  bit_depth_luma_minus8;
+	uint8_t  bit_depth_chroma_minus8;
+};
+
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
 	size_t cpu_gpu_memory_size;
@@ -164,6 +177,7 @@ static_assert(sizeof(Videodec2InputData) == 48);
 static_assert(sizeof(Videodec2OutputInfo) == 56);
 static_assert(sizeof(Videodec2FrameBuffer) == 32);
 static_assert(sizeof(Videodec2AvcPictureInfo) == 120);
+static_assert(offsetof(Videodec2HevcPictureInfoHead, bit_depth_luma_minus8) == 48);
 
 static std::mutex                g_decoder_mutex;
 static std::unordered_set<void*> g_decoders;
@@ -226,7 +240,7 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	output_info->frame_buffer_size = decoded.buffer_size;
 	if (output_info->this_size == sizeof(Videodec2OutputInfo)) {
 		output_info->frame_format         = VIDEODEC2_FRAME_FORMAT_DEFAULT;
-		output_info->frame_pitch_in_bytes = decoded.pitch;
+		output_info->frame_pitch_in_bytes = decoded.pitch_in_bytes;
 	}
 }
 
@@ -602,6 +616,13 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {
 			return result;
+		}
+		auto* picture = static_cast<Videodec2HevcPictureInfoHead*>(first_picture_info);
+		if (picture->this_size >= sizeof(Videodec2HevcPictureInfoHead)) {
+			picture->pic_width_in_luma_samples  = decoded.width;
+			picture->pic_height_in_luma_samples = decoded.height;
+			picture->bit_depth_luma_minus8      = decoded.bit_depth - 8;
+			picture->bit_depth_chroma_minus8    = decoded.bit_depth - 8;
 		}
 	}
 

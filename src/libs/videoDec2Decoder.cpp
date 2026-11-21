@@ -268,6 +268,7 @@ private:
 			                                              : static_cast<uint64_t>(frame->pkt_dts);
 		}
 		result.codec_type  = m_config.codec_type;
+		result.bit_depth   = frame->format == AV_PIX_FMT_YUV420P10LE ? 10 : 8;
 		result.width       = static_cast<uint32_t>(frame->width);
 		result.height      = static_cast<uint32_t>(frame->height);
 		result.crop_left   = static_cast<uint32_t>(frame->crop_left);
@@ -302,9 +303,11 @@ private:
 			return Result::OversizeDecode;
 		}
 
+		// 10-bit samples take the low bits of 16-bit words.
+		const auto sample_size = picture.bit_depth > 8 ? 2u : 1u;
 		const auto width       = static_cast<uint32_t>(frame->width);
 		const auto height      = static_cast<uint32_t>(frame->height);
-		const auto pitch       = AlignUp(width, 256);
+		const auto pitch       = AlignUp(width * sample_size, 256);
 		const auto chroma_rows = (static_cast<uint64_t>(height) + 1u) / 2u;
 		const auto required =
 		    static_cast<uint64_t>(pitch) * height + static_cast<uint64_t>(pitch) * chroma_rows;
@@ -312,17 +315,34 @@ private:
 			return Result::FrameBufferSize;
 		}
 
-		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
+		auto* dst    = static_cast<uint8_t*>(frame_buffer.data);
+		auto* chroma = dst + static_cast<size_t>(pitch) * height;
 		std::memset(dst, 0, static_cast<size_t>(required));
 		if (frame->format == AV_PIX_FMT_NV12) {
 			for (uint32_t y = 0; y < height; y++) {
 				std::memcpy(dst + static_cast<size_t>(y) * pitch,
 				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0], width);
 			}
-			auto* chroma = dst + static_cast<size_t>(pitch) * height;
 			for (uint32_t y = 0; y < chroma_rows; y++) {
 				std::memcpy(chroma + static_cast<size_t>(y) * pitch,
 				            frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1], width);
+			}
+		} else if (frame->format == AV_PIX_FMT_YUV420P10LE) {
+			for (uint32_t y = 0; y < height; y++) {
+				std::memcpy(dst + static_cast<size_t>(y) * pitch,
+				            frame->data[0] + static_cast<ptrdiff_t>(y) * frame->linesize[0],
+				            width * 2);
+			}
+			for (uint32_t y = 0; y < chroma_rows; y++) {
+				const auto* u = reinterpret_cast<const uint16_t*>(
+				    frame->data[1] + static_cast<ptrdiff_t>(y) * frame->linesize[1]);
+				const auto* v = reinterpret_cast<const uint16_t*>(
+				    frame->data[2] + static_cast<ptrdiff_t>(y) * frame->linesize[2]);
+				auto* row = reinterpret_cast<uint16_t*>(chroma + static_cast<size_t>(y) * pitch);
+				for (uint32_t x = 0; x < (width + 1) / 2; x++) {
+					row[2 * x]     = u[x];
+					row[2 * x + 1] = v[x];
+				}
 			}
 		} else {
 			m_sws = sws_getCachedContext(m_sws, frame->width, frame->height,
@@ -332,8 +352,7 @@ private:
 			if (m_sws == nullptr) {
 				return Result::ApiFail;
 			}
-			uint8_t* output_planes[4]  = {dst, dst + static_cast<size_t>(pitch) * height, nullptr,
-			                              nullptr};
+			uint8_t* output_planes[4]  = {dst, chroma, nullptr, nullptr};
 			int      output_strides[4] = {static_cast<int>(pitch), static_cast<int>(pitch), 0, 0};
 			if (sws_scale(m_sws, frame->data, frame->linesize, 0, frame->height, output_planes,
 			              output_strides) != frame->height) {
@@ -346,7 +365,8 @@ private:
 		output->buffer_accepted = true;
 		output->codec_type      = m_config.codec_type;
 		output->width           = width;
-		output->pitch           = pitch;
+		output->pitch           = pitch / sample_size;
+		output->pitch_in_bytes  = pitch;
 		output->height          = height;
 		output->buffer          = frame_buffer.data;
 		output->buffer_size     = frame_buffer.size;
@@ -468,7 +488,6 @@ AvcPictureInfo MakeAvcPictureInfo(const PictureInfo& decoded, size_t size) {
 }
 
 Vp9PictureInfo MakeVp9PictureInfo(const PictureInfo& decoded) {
-	// CopyFrame always writes 8-bit NV12.
 	return {.this_size      = sizeof(Vp9PictureInfo),
 	        .is_valid       = true,
 	        .pts_data       = decoded.pts,
@@ -476,7 +495,7 @@ Vp9PictureInfo MakeVp9PictureInfo(const PictureInfo& decoded) {
 	        .attached_data  = decoded.attached_data,
 	        .profile        = decoded.profile,
 	        .key_frame_flag = decoded.key_frame,
-	        .bit_depth      = 8,
+	        .bit_depth      = decoded.bit_depth,
 	        .color_range    = decoded.color_range == 2,
 	        .frame_width    = decoded.width,
 	        .frame_height   = decoded.height,

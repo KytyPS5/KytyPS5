@@ -397,7 +397,7 @@ static int32_t KYTY_SYSV_ABI TrySyncDecodeOutput(State* handle, OutputInfo* outp
 	           decoded.buffer,
 	           decoded.buffer_size,
 	           0,
-	           decoded.pitch};
+	           decoded.pitch_in_bytes};
 	state->output_buffer.reset();
 	return 0;
 }

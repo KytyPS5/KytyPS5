@@ -142,6 +142,14 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Part of the range is guest memory that is reserved or mapped without CPU or GPU write access,
+// so a host store into it faults and nothing recovers the fault. Memory the guest map does not
+// describe is not known to fail, nor is a program image that SetProgramMemoryProtection left
+// host-writable whatever its guest protection.
+[[nodiscard]] bool     IsKnownUnwritable(uint64_t vaddr, uint64_t size);
+// The guest has the whole range committed with CPU or GPU write access. A host store into it
+// faults only on pages the GPU resource tracker protects, which HandleGpuFault recovers.
+[[nodiscard]] bool     IsGuestWritable(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

@@ -2900,10 +2900,10 @@ static void TestFftPhase2() {
 		Check(Ngs2FftProcess(fftHandle, intSpec.data(), invScaled.data(), nullptr, 0, 0xC) == OK,
 		      "FftProcess inverse (internal, scaled) should succeed");
 
-		// Verify round trip
+		// Verify round trip (the <= comparison also rejects NaN)
 		bool roundTrip = true;
 		for (size_t i = 0; i < N; ++i) {
-			if (std::abs(invScaled[i] - timeIn[i]) > 1e-3f) {
+			if (!(std::abs(invScaled[i] - timeIn[i]) <= 1e-3f)) {
 				roundTrip = false;
 				break;
 			}
@@ -2917,12 +2917,43 @@ static void TestFftPhase2() {
 		const float scaleF = 1.0f / static_cast<float>(N);
 		bool specScaleOk = true;
 		for (size_t i = 0; i < N; ++i) {
-			if (std::abs(intSpecScaled[i] - intSpec[i] * scaleF) > 1e-5f) {
+			if (!(std::abs(intSpecScaled[i] - intSpec[i] * scaleF) <= 1e-5f)) {
 				specScaleOk = false;
 				break;
 			}
 		}
 		Check(specScaleOk, "FftProcess: mode=0xD (forward+scale, internal) mismatch");
+	}
+
+	// --- Natural order round trip: 256 points, tone at bin 96 ---
+	// The forward natural layout writes four quarter-spectrum blocks; the
+	// inverse must unpack the same layout for the pair to round-trip.
+	{
+		constexpr int len = 8;
+		Ngs2FftQuerySize(static_cast<uint32_t>(len), 2, &sz);
+		std::vector<uint8_t> fftWork(sz);
+		void* fftHandle = nullptr;
+		Check(Ngs2FftInit(fftWork.data(), sz, len, 2, &fftHandle) == OK,
+		      "FftInit natural round-trip should succeed");
+		const size_t N = size_t{1} << len;
+		std::vector<float> timeIn(N);
+		for (size_t i = 0; i < N; ++i) {
+			timeIn[i] = static_cast<float>(std::sin(2.0 * std::numbers::pi * 96.0 * i / N));
+		}
+		std::vector<float> spectrum(N * 2, 0.0f);
+		Check(Ngs2FftProcess(fftHandle, timeIn.data(), spectrum.data(), nullptr, 0, 0x1) == OK,
+		      "FftProcess forward (natural) should succeed");
+		std::vector<float> restored(N, 0.0f);
+		Check(Ngs2FftProcess(fftHandle, spectrum.data(), restored.data(), nullptr, 0, 0x8) == OK,
+		      "FftProcess inverse (natural, scaled) should succeed");
+		bool naturalOk = true;
+		for (size_t i = 0; i < N; ++i) {
+			if (!(std::abs(restored[i] - timeIn[i]) <= 1e-3f)) {
+				naturalOk = false;
+				break;
+			}
+		}
+		Check(naturalOk, "FftProcess: natural-order round trip did not reproduce the tone");
 	}
 }
 

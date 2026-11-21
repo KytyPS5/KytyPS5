@@ -5124,6 +5124,22 @@ static void Ngs2FftPackNatural(const std::vector<std::pair<float, float>>& bins,
 	}
 }
 
+// Deserialize bins in “natural order”: the exact inverse of
+// Ngs2FftPackNatural, so a forward/inverse pair round-trips.
+static void Ngs2FftUnpackNatural(const std::vector<float>& in, size_t points,
+                                 std::vector<std::pair<float, float>>& bins) {
+	const size_t quarterBins = points / 8u;
+	const size_t blockStride = points / 2u;
+	bins.assign(points / 2u, {0.0f, 0.0f});
+	for (size_t q = 0; q < 4; ++q) {
+		const size_t blockBase = q * blockStride;
+		for (size_t d = 0; d < quarterBins; ++d) {
+			const size_t r            = ((q & 1u) != 0 && d > 0) ? (quarterBins - d) : d;
+			bins[q * quarterBins + r] = {in[blockBase + d * 2], in[blockBase + d * 2 + 1]};
+		}
+	}
+}
+
 // ---- Public FFT APIs ----
 
 int KYTY_SYSV_ABI Ngs2FftQuerySize(uint32_t length, uint32_t flags, uint64_t* out_size) {
@@ -5257,8 +5273,8 @@ int KYTY_SYSV_ABI Ngs2FftProcess(void* handle, const float* in, float* out, floa
 			// natural order
 			Ngs2FftPackNatural(bins, points, output);
 			if ((mode & 8u) != 0) {
-				for (size_t i = 0; i < points; ++i) {
-					output[i] *= scale;
+				for (float& v: output) {
+					v *= scale;
 				}
 			}
 		}
@@ -5267,18 +5283,17 @@ int KYTY_SYSV_ABI Ngs2FftProcess(void* handle, const float* in, float* out, floa
 	}
 
 	// ---- Inverse FFT: compressed spectrum -> real ----
-	std::vector<float> input(points);
-	std::memcpy(input.data(), in, points * sizeof(float));
+	// Internal order packs `points` floats; natural order packs `points * 2`
+	// (four quarter-spectrum blocks of complex pairs).
+	const bool         internal_order = (mode & 4u) != 0;
+	std::vector<float> input(points * (internal_order ? 1u : 2u));
+	std::memcpy(input.data(), in, input.size() * sizeof(float));
 
 	std::vector<std::pair<float, float>> bins;
-	if ((mode & 4u) != 0) {
+	if (internal_order) {
 		Ngs2FftUnpackInternal(input, points, bins);
 	} else {
-		const size_t half = points / 2u;
-		bins.resize(half);
-		for (size_t k = 0; k < half; ++k) {
-			bins[k] = {input[k * 2], input[k * 2 + 1]};
-		}
+		Ngs2FftUnpackNatural(input, points, bins);
 	}
 
 	const size_t                      half = points / 2u;

@@ -50583,8 +50583,60 @@ bool HasPatchInterface(const std::string &assembly, const std::string &storage, 
              std::string::npos;
 }
 
+struct MergedHull {
+  std::vector<u32> code;
+  size_t prologue_words = 0;
+};
+
+MergedHull MergedHullProgram(const std::vector<u32> &local, const std::vector<u32> &control) {
+  constexpr u32 ExecAll = 0xbefe04c1u;
+  constexpr u32 HandoffWords = 2;
+  constexpr u32 LaneIndexWords = 4;
+  MergedHull merged{{ExecAll}};
+  auto &code = merged.code;
+  code.insert(code.end(), control.begin(), control.begin() + LaneIndexWords);
+  AppendSMovLiteral(&code, 100, 0x4e6f7265u);
+  code.insert(code.end(), {0x9380ff03u, 0x00080000u, EncodeVopc(0xd4, 0, 0)});
+  merged.prologue_words = code.size();
+  code.push_back(0);
+  code.insert(code.end(), local.begin(), local.end() - HandoffWords);
+  code[merged.prologue_words] =
+      EncodeSopp(0x08, static_cast<u32>(code.size() - merged.prologue_words - 1));
+  code.push_back(ExecAll);
+  code.insert(code.end(), control.begin() + LaneIndexWords, control.end());
+  return merged;
+}
+
+std::array<std::vector<u32>, 2> PrepareMergedHullHalves(const std::vector<u32> &merged,
+                                                        const std::vector<u32> &evaluation,
+                                                        const std::vector<u32> &stale_back,
+                                                        u32 control_points, u32 tf_param) {
+  static ShaderUserData user_data{};
+  for (const auto &[code, type] : {std::pair{&merged, Prospero::ShaderBinaryType::kHs},
+                                   std::pair{&evaluation, Prospero::ShaderBinaryType::kGs},
+                                   std::pair{&stale_back, Prospero::ShaderBinaryType::kHsBack}}) {
+    if (!code->empty()) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+                        {.type = type, .user_data = &user_data,
+                         .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+    }
+  }
+  HW::VertexShaderInfo regs{};
+  regs.ls_regs.data_addr = reinterpret_cast<uint64_t>(merged.data());
+  regs.hs_regs.data_addr = reinterpret_cast<uint64_t>(stale_back.data());
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(evaluation.data());
+  HW::Context context;
+  context.SetLsHsConfig((control_points << 14u) | (control_points << 8u) | 1u);
+  context.SetTfParam(tf_param);
+  context.SetShaderStages(0x0200210du);
+  std::array<ShaderVertexInputInfo, 3> info;
+  const auto params = PrepareTessellationPrograms(regs, context, info);
+  return {std::vector<u32>(params[0].code.begin(), params[0].code.end()),
+          std::vector<u32>(params[1].code.begin(), params[1].code.end())};
+}
+
 void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u32 domain = 1,
-                              u32 output_topology = 2, u32 partitioning = 2) {
+                              u32 output_topology = 2, u32 partitioning = 2, bool merged = false) {
   using namespace ShaderRecompiler;
   const bool quad = domain == 2;
   const u32 control_points = quad ? 4 : 3;
@@ -50683,6 +50735,26 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
   evaluation.push_back(EncodeExp0(0x0c, 0xf));
   evaluation.push_back(EncodeExp1(5, 6, 10, 12));
   AppendEnd(&evaluation);
+
+  if (merged) {
+    const auto program = MergedHullProgram(local, control);
+    const auto halves = PrepareMergedHullHalves(
+        program.code, evaluation, quad ? control : std::vector<u32>{}, control_points,
+        domain | (partitioning << 2u) | (output_topology << 5u));
+    Require(name, "merged prologue in both halves",
+            std::ranges::all_of(halves,
+                                [&](const std::vector<u32> &half) {
+                                  return half.size() > program.prologue_words &&
+                                         std::equal(program.code.begin(),
+                                                    program.code.begin() +
+                                                        static_cast<std::ptrdiff_t>(
+                                                            program.prologue_words),
+                                                    half.begin());
+                                }),
+            "a half of the merged LS+HS program lost the prologue that both parts run after");
+    local = halves[0];
+    control = halves[1];
+  }
 
   ShaderTessellationInputInfo tess{.input_control_points = control_points,
                                   .output_control_points = control_points,
@@ -50984,6 +51056,8 @@ void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationCounterclockwiseQuads", 36, 128, 2, 3);
   CheckTessellationProgram("TessellationFractionalEvenQuads", 36, 128, 2, 2, 3);
   CheckTessellationProgram("TessellationMaskedControlPoint", 32, 256, 2);
+  CheckTessellationProgram("TessellationMergedHull", 124, 128, 1, 2, 2, true);
+  CheckTessellationProgram("TessellationMergedHullQuads", 36, 128, 2, 2, 2, true);
   CheckTessellationPatchConstants();
   CheckTessellationSingleControlPoint();
 }

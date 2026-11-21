@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -617,28 +618,60 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
+struct MergedHullSplit {
+	ShaderRecompiler::MergedHullHalves halves;
+	uint64_t                           local_hash   = 0;
+	uint64_t                           control_hash = 0;
+};
+
+static const MergedHullSplit& ShaderSplitMergedHull(std::span<const uint32_t> code, uint64_t hash) {
+	static std::mutex                                    mutex;
+	static std::unordered_map<uint64_t, MergedHullSplit> splits;
+	std::scoped_lock                                     lock(mutex);
+	const auto [entry, inserted] = splits.try_emplace(hash);
+	auto& split                  = entry->second;
+	if (inserted) {
+		split.halves = ShaderRecompiler::SplitMergedHullProgram(code);
+		split.local_hash =
+		    XXH3_64bits(split.halves.local.data(), split.halves.local.size() * sizeof(uint32_t));
+		split.control_hash = XXH3_64bits(split.halves.control.data(),
+		                                 split.halves.control.size() * sizeof(uint32_t));
+	}
+	return split;
+}
+
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
 	const auto& sh        = context.GetShaderRegisters();
 	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	const bool merged          = local.type == Prospero::ShaderBinaryType::kHs;
+	const auto control_address = merged ? regs.ls_regs.data_addr : regs.hs_regs.data_addr;
+	const auto [control, control_hash] =
+	    merged ? ShaderMapEntry {local, local_hash}
+		       : ShaderGetMappedData(control_address, "ShaderGetInputInfoHS():");
 	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
-	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
-	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
+	EXIT_NOT_IMPLEMENTED((!merged && (local.type != Prospero::ShaderBinaryType::kHsFront ||
+	                                  control.type != Prospero::ShaderBinaryType::kHsBack)) ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
 	const auto stages = context.GetShaderStages();
 	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
-	EXIT_IF(regs.hs_regs.user_data_addr == 0);
+	EXIT_IF(!merged && regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
 	std::array<ShaderParams, 3> params {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
-	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
-	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
-	                    evaluation),
+	    GetShaderParams(control_address, control_hash, local_users, control, 8u),
+	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users, evaluation),
 	};
+	if (merged) {
+		const auto& split = ShaderSplitMergedHull(params[0].code, local_hash);
+		params[0].code    = split.halves.local;
+		params[0].hash    = split.local_hash;
+		params[1].code    = split.halves.control;
+		params[1].hash    = split.control_hash;
+	}
 	// The fused HS back half receives its separate user-data address in s0:s1.
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);

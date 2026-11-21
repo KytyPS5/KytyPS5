@@ -275,6 +275,51 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 
 } // namespace
 
+MergedHullHalves SplitMergedHullProgram(std::span<const uint32_t> code) {
+	using Decoder::Opcode;
+	constexpr uint32_t MergedStageHandoff = 0xbe802006u;
+	constexpr uint32_t WordBytes          = sizeof(uint32_t);
+	Decoder::Program   program;
+	Decoder::DecodeProgram(code, program);
+	const auto& instructions = program.instructions;
+	const auto  guard = std::ranges::find_if(instructions, [](const Decoder::Instruction& inst) {
+		return Decoder::IsDirectBranch(inst.opcode) || inst.opcode == Opcode::S_ENDPGM;
+	});
+	if (guard == instructions.end() || guard->opcode != Opcode::S_CBRANCH_EXECZ ||
+	    guard->branch_target <= guard->pc) {
+		EXIT("merged LS+HS program has no EXEC guard before its LS part\n");
+	}
+	const auto  join         = guard->branch_target;
+	const auto& last         = instructions.back();
+	const auto  end          = last.pc + last.word_count * WordBytes;
+	const auto  crosses_join = [join](const Decoder::Instruction& inst) {
+		const bool local = inst.pc < join;
+		return inst.opcode == Opcode::S_GETPC_B64 || inst.opcode == Opcode::S_SETPC_B64 ||
+		       inst.opcode == Opcode::S_SWAPPC_B64 || (local && inst.opcode == Opcode::S_ENDPGM) ||
+		       (Decoder::IsDirectBranch(inst.opcode) &&
+		        (local ? inst.branch_target > join : inst.branch_target < join));
+	};
+	const auto resets_exec = [join](const Decoder::Instruction& inst) {
+		return inst.pc == join && inst.opcode == Opcode::S_MOV_B64 &&
+		       inst.dst.kind == Decoder::OperandKind::ExecLo &&
+		       inst.src0.kind == Decoder::OperandKind::IntegerInlineConstant &&
+		       inst.src0.signed_val == -1;
+	};
+	if (std::ranges::none_of(instructions, resets_exec) ||
+	    std::ranges::any_of(instructions, crosses_join)) {
+		EXIT("merged LS+HS program cannot be split at 0x%x\n", join);
+	}
+	const auto       prologue     = code.first(guard->pc / WordBytes);
+	const auto       local_part   = code.first(join / WordBytes);
+	const auto       control_part = code.subspan(join / WordBytes, (end - join) / WordBytes);
+	MergedHullHalves halves;
+	halves.local.assign(local_part.begin(), local_part.end());
+	halves.local.push_back(MergedStageHandoff);
+	halves.control.assign(prologue.begin(), prologue.end());
+	halves.control.insert(halves.control.end(), control_part.begin(), control_part.end());
+	return halves;
+}
+
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);

@@ -805,6 +805,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	if(WIN32)
+		add_test(NAME guest_tcb_slot_after_host_tls
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --tcb-slot-after-host-tls-only)
+	endif()
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher

@@ -22,6 +22,10 @@ struct UserServiceLoginUserIdList {
 	int user_id[4];
 };
 
+struct UserServiceRegisteredUserIdList {
+	int user_id[16];
+};
+
 class UserService: public testing::Test {
 protected:
 	static void SetUpTestSuite() {
@@ -72,18 +76,24 @@ TEST_F(UserService, ForegroundUserMatchesInitialUser) {
 
 TEST_F(UserService, RegisteredAndLoginUserIdListsIncludePrimaryUser) {
 	const auto get_login_users      = Find<int(KYTY_SYSV_ABI*)(UserServiceLoginUserIdList*)>("fPhymKNvK-A");
-	const auto get_registered_users = Find<int(KYTY_SYSV_ABI*)(UserServiceLoginUserIdList*)>("5EiQCnL2G1Y");
+	const auto get_registered_users = Find<int(KYTY_SYSV_ABI*)(UserServiceRegisteredUserIdList*)>("5EiQCnL2G1Y");
 
 	EXPECT_EQ(get_registered_users(nullptr), USER_SERVICE_ERROR_INVALID_ARGUMENT);
 
-	UserServiceLoginUserIdList login_users {};
-	UserServiceLoginUserIdList registered_users {};
+	UserServiceLoginUserIdList      login_users {};
+	UserServiceRegisteredUserIdList registered_users {};
 
 	EXPECT_EQ(get_login_users(&login_users), OK);
 	EXPECT_EQ(get_registered_users(&registered_users), OK);
 
 	EXPECT_EQ(login_users.user_id[0], Config::GetUserId());
 	EXPECT_EQ(registered_users.user_id[0], Config::GetUserId());
+	for (int i = 1; i < 4; i++) {
+		EXPECT_EQ(registered_users.user_id[i], Config::GetPlayerUserId(i));
+	}
+	for (int i = 4; i < 16; i++) {
+		EXPECT_EQ(registered_users.user_id[i], -1);
+	}
 }
 
 TEST_F(UserService, UserNumberAndNameReturnValidDataForPrimaryUser) {

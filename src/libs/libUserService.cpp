@@ -20,6 +20,10 @@ struct UserServiceLoginUserIdList {
 	int user_id[4];
 };
 
+struct UserServiceRegisteredUserIdList {
+	int user_id[16];
+};
+
 enum UserServiceEventType { UserServiceEventTypeLogin, UserServiceEventTypeLogout };
 
 struct SceUserServiceEvent {
@@ -128,7 +132,7 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 	return OK;
 }
 
-static KYTY_SYSV_ABI int UserServiceGetRegisteredUserIdList(UserServiceLoginUserIdList* user_id_list) {
+static KYTY_SYSV_ABI int UserServiceGetRegisteredUserIdList(UserServiceRegisteredUserIdList* user_id_list) {
 	PRINT_NAME();
 
 	if (user_id_list == nullptr) {
@@ -139,7 +143,7 @@ static KYTY_SYSV_ABI int UserServiceGetRegisteredUserIdList(UserServiceLoginUser
 	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
 		user_id_list->user_id[count++] = Config::GetPlayerUserId(player);
 	}
-	while (count < Config::MAX_PLAYERS) {
+	while (count < 16) {
 		user_id_list->user_id[count++] = -1;
 	}
 

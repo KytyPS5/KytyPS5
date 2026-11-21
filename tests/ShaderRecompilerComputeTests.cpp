@@ -2772,6 +2772,33 @@ public:
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
 
+    // An empty queue queries no timeline; a tick finished unobserved still releases its operation.
+    {
+      static uint32_t counter_queries = 0;
+      static PFN_vkGetSemaphoreCounterValue get_counter = nullptr;
+      auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+      get_counter = std::exchange(dispatcher.vkGetSemaphoreCounterValue, [](auto... args) {
+        ++counter_queries;
+        return get_counter(args...);
+      });
+      scheduler.PopPendingOperations();
+      const auto empty_queries = counter_queries;
+      const auto unobserved_tick = scheduler.CurrentTick();
+      scheduler.DeferOperation([&completed] { completed = 4; });
+      scheduler.Flush();
+      const auto timeline = scheduler.GetMasterSemaphore().Handle();
+      const vk::SemaphoreWaitInfo unobserved_wait{
+          .semaphoreCount = 1, .pSemaphores = &timeline, .pValues = &unobserved_tick};
+      const bool signaled =
+          m_runtime_context.device.waitSemaphores(&unobserved_wait, UINT64_MAX) ==
+          vk::Result::eSuccess;
+      scheduler.PopPendingOperations();
+      dispatcher.vkGetSemaphoreCounterValue = get_counter;
+      Require("SchedulerTimeline", "pending operation refresh",
+              empty_queries == 0 && signaled && completed == 4,
+              "an empty queue queried the timeline, or a finished tick stayed pending");
+    }
+
     vk::SemaphoreTypeCreateInfo timeline_type{};
     timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
     timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;

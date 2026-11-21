@@ -4303,6 +4303,273 @@ static void TestRegistryLifetimeAndLocking() {
 	Ngs2SystemDestroy(sys2, nullptr);
 }
 
+// --- Phase 4: filters, pitch shift, WAVE ---
+
+// RBJ low-pass biquad coefficient b0 for the given design rate.
+static double ExpectedBiquadB0(float frequency, float q, float level, uint32_t rate) {
+	const double omega      = (2.0 * std::numbers::pi) * frequency / rate;
+	const double alpha      = std::sin(omega) / (2.0 * q);
+	const double inverse_a0 = 1.0 / (1.0 + alpha);
+	return (1.0 - std::cos(omega)) * 0.5 * inverse_a0 * level;
+}
+
+static void TestCustomFilterDesignRatePhase4() {
+	Ngs2SystemOption opt {};
+	Ngs2SystemResetOption(&opt);
+	opt.num_grain_samples = 64;
+	opt.max_grain_samples = 64;
+	opt.sample_rate       = 48000;
+	opt.max_voice_channels = 2;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	uintptr_t sysHandle = 0;
+	Check(Ngs2SystemCreate(&opt, &sbi, &sysHandle) == OK, "SystemCreate failed");
+
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_FILTER;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t rack = 0;
+	Check(Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &rack) == OK,
+	      "CustomSubmixer rack create failed");
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(rack, 0, &voice);
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+
+	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	Ngs2VoiceControl(voice, &vsetup.header);
+
+	// The module filter runs on system-rate audio: the coefficients must be
+	// designed for the system rate, not the (unset) source rate.
+	Ngs2CustomVoiceFilterParam fparam {};
+	fparam.header = {sizeof(Ngs2CustomVoiceFilterParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER};
+	fparam.channel_mask = 0;
+	fparam.type = 1;
+	fparam.param.fcq.frequency = 15000.0f;
+	fparam.param.fcq.q         = 0.707f;
+	fparam.param.fcq.level     = 1.0f;
+	Check(Ngs2VoiceControl(voice, &fparam.header) == OK, "custom filter control failed");
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+	Check(vInt->modules[0].filter.design_rate == 48000 &&
+	          std::abs(vInt->modules[0].filter.b0 -
+	                   ExpectedBiquadB0(15000.0f, 0.707f, 1.0f, 48000)) < 1e-10,
+	      "custom module filter was not designed at the system rate");
+
+	// A system rate change must redesign the coefficients at the next render.
+	Check(Ngs2SystemSetSampleRate(sysHandle, 44100) == OK, "SystemSetSampleRate failed");
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	const int16_t pcm[64 * 2] = {};
+	src.Queue(pcm, 64, 0);
+	std::vector<Ngs2VoiceInternal*> voices {&src.voice};
+	Ngs2RenderVoice(*vInt, voices, 64);
+	Check(vInt->modules[0].filter.design_rate == 44100 &&
+	          std::abs(vInt->modules[0].filter.b0 -
+	                   ExpectedBiquadB0(15000.0f, 0.707f, 1.0f, 44100)) < 1e-10,
+	      "custom module filter was not redesigned after a rate change");
+
+	Ngs2RackDestroy(rack, nullptr);
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+static void TestMasteringLfeCutoffPhase4() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 4;
+	Ngs2RackInternal rack {};
+	rack.ngs  = &system;
+	rack.type = Ngs2RackType::Mastering;
+	Ngs2VoiceInternal voice {};
+	voice.rack     = &rack;
+	voice.channels = 4;
+	voice.state    = Ngs2VoicePlayState::Playing;
+	const std::vector<Ngs2VoiceInternal*> voices;
+
+	Ngs2MasteringVoiceEffectParam lfe {};
+	lfe.header = {sizeof(lfe), 0, SCE_NGS2_MASTERING_VOICE_PARAM_LFE};
+	lfe.enable_flag = 1;
+	lfe.value       = 80;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &lfe.header) == OK,
+	      "mastering LFE control failed");
+	Ngs2RenderVoice(voice, voices, 4);
+	const float a1_80 = voice.mastering_lfe.sections[0].a1;
+
+	// Same design rate but a different cutoff must redesign the filter.
+	lfe.value = 120;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &lfe.header) == OK,
+	      "mastering LFE reconfigure failed");
+	voice.rendered = false;
+	Ngs2RenderVoice(voice, voices, 4);
+	Check(voice.mastering_lfe.design_cutoff == 120 &&
+	          voice.mastering_lfe.sections[0].a1 != a1_80,
+	      "LFE cutoff change did not redesign the filter coefficients");
+}
+
+static void TestPitchShiftDrainPhase4() {
+	Ngs2SystemOption sysOpt = Ngs2DefaultSystemOption();
+	sysOpt.num_grain_samples = 64;
+	sysOpt.max_grain_samples = 64;
+	sysOpt.sample_rate       = 48000;
+	sysOpt.max_voice_channels = 2;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	uintptr_t sysHandle = 0;
+	Check(Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle) == OK, "SystemCreate failed");
+
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_PITCH_SHIFT;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t rack = 0;
+	Check(Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &rack) == OK,
+	      "CustomSubmixer rack create failed");
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(rack, 0, &voice);
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+
+	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	Ngs2VoiceControl(voice, &vsetup.header);
+	Ngs2CustomVoicePitchShiftParam pparam {};
+	pparam.header = {sizeof(Ngs2CustomVoicePitchShiftParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_PITCH_SHIFT};
+	pparam.cents  = 700;
+	Check(Ngs2VoiceControl(voice, &pparam.header) == OK, "pitch shift control failed");
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+
+	// A clip shorter than the pitch-shift latency must still emit its tail.
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	std::vector<int16_t> pcm(512 * 2, 16384);
+	src.Queue(pcm.data(), 512, 0);
+	std::vector<Ngs2VoiceInternal*> voices {&src.voice};
+
+	float tail_peak = 0.0f;
+	bool  input_done = false;
+	for (uint32_t grain = 0; grain < 96; ++grain) {
+		vInt->rendered       = false;
+		src.voice.rendered   = false;
+		Ngs2RenderVoice(*vInt, voices, 64);
+		if (!input_done && src.voice.blocks.empty() && !src.voice.has_samples) {
+			input_done = true;
+		}
+		if (input_done) {
+			const float* b = vInt->Buffer(0, 64);
+			for (uint32_t i = 0; i < 64; ++i) {
+				tail_peak = std::max(tail_peak, std::abs(b[i]));
+			}
+		}
+	}
+	Check(input_done, "pitch drain fixture never reached end of input");
+	Check(tail_peak > 0.01f, "pitch shift tail stayed silent after the input ended");
+
+	Ngs2RackDestroy(rack, nullptr);
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+static void TestExtensibleFloatWaveformPhase4() {
+	auto appendLE16 = [](std::vector<uint8_t>& v, uint16_t x) {
+		v.push_back(static_cast<uint8_t>(x));
+		v.push_back(static_cast<uint8_t>(x >> 8));
+	};
+	auto appendLE32 = [](std::vector<uint8_t>& v, uint32_t x) {
+		v.push_back(static_cast<uint8_t>(x));
+		v.push_back(static_cast<uint8_t>(x >> 8));
+		v.push_back(static_cast<uint8_t>(x >> 16));
+		v.push_back(static_cast<uint8_t>(x >> 24));
+	};
+	auto appendFourCC = [](std::vector<uint8_t>& v, const char* cc) {
+		v.insert(v.end(), {static_cast<uint8_t>(cc[0]), static_cast<uint8_t>(cc[1]),
+		                   static_cast<uint8_t>(cc[2]), static_cast<uint8_t>(cc[3])});
+	};
+
+	// WAVE_FORMAT_EXTENSIBLE, mono 32-bit IEEE float: fmt chunk is 40 bytes
+	// with cbSize=22, valid bits, channel mask and the float SubFormat GUID.
+	std::vector<uint8_t> riff;
+	appendFourCC(riff, "RIFF");
+	appendLE32(riff, 4 + 8 + 40 + 8 + 8);
+	appendFourCC(riff, "WAVE");
+	appendFourCC(riff, "fmt ");
+	appendLE32(riff, 40);
+	appendLE16(riff, 0xfffe);
+	appendLE16(riff, 1);
+	appendLE32(riff, 48000);
+	appendLE32(riff, 192000);
+	appendLE16(riff, 4);
+	appendLE16(riff, 32);
+	appendLE16(riff, 22);
+	appendLE16(riff, 32);
+	appendLE32(riff, 0x4);
+	appendLE16(riff, 0x0003); // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+	appendLE16(riff, 0x0000); // rest of Data1
+	appendLE16(riff, 0x0000); // Data2
+	appendLE16(riff, 0x0010); // Data3
+	riff.insert(riff.end(), {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}); // Data4
+	appendFourCC(riff, "data");
+	appendLE32(riff, 8);
+	appendLE32(riff, 0x3f800000);
+	appendLE32(riff, 0xbf800000);
+
+	Ngs2WaveformInfo info {};
+	Check(Ngs2ParseWaveformData(riff.data(), riff.size(), &info) == OK,
+	      "extensible IEEE float WAVE was rejected");
+	Check(info.format.waveform_type == 0x18 && info.format.num_channels == 1 &&
+	          info.format.sample_rate == 48000 && info.num_samples == 2,
+	      "extensible IEEE float geometry is wrong");
+}
+
+static void TestAtrac9GeometryChannelsPhase4() {
+	// Discrete 12-channel ATRAC9 @ 48 kHz (same config the codec tests use).
+	const Ngs2WaveformFormat format {NGS2_WAVEFORM_TYPE_ATRAC9, 12, 48000, 0x3072c0fe};
+	Ngs2WaveformBlock      block {};
+	Check(Ngs2CalcWaveformBlock(&format, 0, 256, &block) == OK,
+	      "CalcWaveformBlock rejected a valid 12-channel ATRAC9 format");
+	Check(block.data_size == 3072 && block.num_samples == 256,
+	      "CalcWaveformBlock returned wrong ATRAC9 geometry");
+
+	uint32_t frame_size = 0, frame_samples = 0, units = 0, delay = 0;
+	Check(Ngs2GetWaveformFrameInfo(&format, &frame_size, &frame_samples, &units, &delay) == OK &&
+	          frame_size == 3072 && frame_samples == 1024 && units == 4,
+	      "GetWaveformFrameInfo rejected a valid 12-channel ATRAC9 format");
+
+	// Channel counts must still match the codec, and non-ATRAC9 formats keep
+	// the eight-channel limit.
+	const Ngs2WaveformFormat bad_channels {NGS2_WAVEFORM_TYPE_ATRAC9, 13, 48000, 0x3072c0fe};
+	Check(Ngs2CalcWaveformBlock(&bad_channels, 0, 256, &block) == NGS2_ERROR_INVALID_WAVEFORM_FORMAT &&
+	          Ngs2GetWaveformFrameInfo(&bad_channels, &frame_size, &frame_samples, &units,
+	                                   &delay) == NGS2_ERROR_INVALID_WAVEFORM_FORMAT,
+	      "ATRAC9 geometry accepted a channel count the codec does not provide");
+	const Ngs2WaveformFormat pcm_wide {0x12, 9, 48000, 0};
+	Check(Ngs2CalcWaveformBlock(&pcm_wide, 0, 256, &block) == NGS2_ERROR_INVALID_WAVEFORM_FORMAT,
+	      "PCM geometry accepted more than eight channels");
+}
+
 } // namespace
 
 int main() {
@@ -4388,5 +4655,10 @@ int main() {
 	RUN_TEST(TestCustomPitchShiftPhase3);
 	RUN_TEST(TestStreamAndModulesPhase4);
 	RUN_TEST(TestRegistryLifetimeAndLocking);
+	RUN_TEST(TestCustomFilterDesignRatePhase4);
+	RUN_TEST(TestMasteringLfeCutoffPhase4);
+	RUN_TEST(TestPitchShiftDrainPhase4);
+	RUN_TEST(TestExtensibleFloatWaveformPhase4);
+	RUN_TEST(TestAtrac9GeometryChannelsPhase4);
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

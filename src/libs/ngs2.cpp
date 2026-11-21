@@ -486,13 +486,17 @@ struct Ngs2SamplerFilter {
 	struct History {
 		double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
 	};
-	bool                 enabled      = false;
-	bool                 warned       = false;
-	uint64_t             channel_mask = 0;
-	double               b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
-	std::vector<History> history;
+	bool                   enabled      = false;
+	bool                   warned       = false;
+	uint64_t               channel_mask = 0;
+	double                 b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+	Ngs2SamplerFilterParam param {};
+	uint32_t               design_rate = 0;
+	std::vector<History>   history;
 
-	void Configure(const Ngs2SamplerFilterParam& param, uint32_t rate, uint32_t channels) {
+	void Configure(const Ngs2SamplerFilterParam& filter_param, uint32_t rate, uint32_t channels) {
+		param       = filter_param;
+		design_rate = rate;
 		if (param.type == 0) {
 			enabled = false;
 			history.clear();
@@ -529,6 +533,14 @@ struct Ngs2SamplerFilter {
 		b2                      = b0;
 		a1                      = -2.0 * cosine * inverse_a0;
 		a2                      = (1.0 - alpha) * inverse_a0;
+	}
+
+	// The coefficients are designed for the rate the samples are rendered at;
+	// redesign them when the system rate changes after configuration.
+	void EnsureRate(uint32_t rate, uint32_t channels) {
+		if (param.type != 0 && design_rate != rate) {
+			Configure(param, rate, channels);
+		}
 	}
 
 	bool Bypasses(size_t channel) const {
@@ -815,13 +827,14 @@ struct Ngs2PitchShiftChannel {
 	std::array<float, 142>  filterHistory {};
 	std::array<float, 3008> input {};
 	std::array<float, 1088> output {};
-	uint32_t                filterCursor  = 0;
-	uint32_t                copyRemaining = 0;
-	uint32_t                inputCount    = 0;
-	uint32_t                outputCount   = 0;
-	uint32_t                inputTime     = 0;
-	uint32_t                outputTime    = 0;
-	bool                    started       = false;
+	uint32_t                filterCursor    = 0;
+	uint32_t                copyRemaining   = 0;
+	uint32_t                inputCount      = 0;
+	uint32_t                outputCount     = 0;
+	uint32_t                inputTime       = 0;
+	uint32_t                outputTime      = 0;
+	uint32_t                drain_remaining = 0;
+	bool                    started         = false;
 
 	static float TableSin(float angle) {
 		constexpr float PI     = std::numbers::pi_v<float>;
@@ -997,10 +1010,48 @@ struct Ngs2PitchShiftChannel {
 		}
 	}
 
-	void Process(const float* source, float* dest, float ratio) {
+	// True while stretched audio is still buffered inside the channel; the
+	// tail must be flushed with silence once the input stream ends.
+	bool HasPending() const { return inputCount != 0 || outputCount != 0; }
+
+	// Feeds real input while the stream plays; with a null source it feeds
+	// silence until the buffered tail is exhausted, then drops the remaining
+	// silent pipeline state so the channel returns to idle.
+	void ProcessOrDrain(const float* source, float* dest, float ratio) {
+		if (source != nullptr) {
+			drain_remaining = 0;
+			ProcessBlock(source, dest, ratio);
+			return;
+		}
+		if (drain_remaining == 0) {
+			if (!HasPending()) {
+				std::fill_n(dest, 64, 0.0f);
+				return;
+			}
+			drain_remaining = inputCount + outputCount + 2048;
+		}
+		ProcessBlock(nullptr, dest, ratio);
+		if (drain_remaining > 64) {
+			drain_remaining -= 64;
+		} else {
+			drain_remaining = 0;
+			inputCount = outputCount = inputTime = outputTime = 0;
+		}
+	}
+
+	// Processes one 64-sample block; a null source feeds silence so a finished
+	// stream can still drain the delayed tail.
+	void ProcessBlock(const float* source, float* dest, float ratio) {
+		std::array<float, 64> silence {};
+		const float*          in = source != nullptr ? source : silence.data();
 		for (uint32_t i = 0; i < 64; ++i) {
-			filterHistory[filterCursor] = source[i];
+			filterHistory[filterCursor] = in[i];
 			filterCursor                = (filterCursor + 1) % 142;
+		}
+		if (inputCount + 64 > input.size()) {
+			// Silenzio durante lo svuotamento: scarta i campioni piu' vecchi.
+			std::move(input.begin() + 64, input.end(), input.begin());
+			inputCount -= 64;
 		}
 		for (uint32_t i = 0; i < 64; ++i) {
 			input[inputCount + i] = FilterSample(*this, (filterCursor + 64 + i) % 142);
@@ -1140,9 +1191,10 @@ struct Ngs2VoiceInternal {
 	bool                            has_samples = false;
 
 	struct MasteringLfe {
-		bool     enabled     = false;
-		uint32_t cutoff      = 120;
-		uint32_t design_rate = 0;
+		bool     enabled       = false;
+		uint32_t cutoff        = 120;
+		uint32_t design_rate   = 0;
+		uint32_t design_cutoff = 0;
 		struct Section {
 			float a1 = 0, a2 = 0, gain = 1.0f;
 			struct History {
@@ -2638,6 +2690,7 @@ static void ConfigureMasteringLfe(Ngs2VoiceInternal::MasteringLfe& filter, uint3
 	filter.sections[0].gain = static_cast<float>(gain);
 	filter.sections[1].gain = 1.0f;
 	filter.design_rate      = design_rate;
+	filter.design_cutoff    = filter.cutoff;
 }
 
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
@@ -2661,6 +2714,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 			// A playing stream can have no source data but still have a filter tail.
 			for (auto& filter: voice.filters) {
 				if (voice.has_samples || filter.HasHistory()) {
+					filter.EnsureRate(voice.rack->ngs->option.sample_rate, voice.channels);
 					filter.Process(voice.samples, voice.channels, grain);
 					voice.has_samples = true;
 				}
@@ -2721,7 +2775,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 			if (voice.mastering_lfe.enabled && voice.channels >= 4) {
 				auto&      filter      = voice.mastering_lfe;
 				const auto design_rate = rate == 96000 ? 88200u : rate;
-				if (filter.design_rate != design_rate) {
+				if (filter.design_rate != design_rate || filter.design_cutoff != filter.cutoff) {
 					ConfigureMasteringLfe(filter, design_rate);
 				}
 				float* samples = voice.samples.data() + 3 * grain;
@@ -2760,7 +2814,34 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				                        : 0.0f;
 			}
 		}
-		if (voice.has_samples) {
+		const bool had_samples = voice.has_samples;
+		// Pitch-shift channels buffer a delayed tail that must keep rendering
+		// after the input ends; bypassed channels and paused/stopped voices
+		// stay on the direct path.
+		bool pitch_pending = false;
+		if (grain % 64 == 0 && voice.channels < 32 && voice.state != Ngs2VoicePlayState::Paused &&
+		    voice.state != Ngs2VoicePlayState::Stopped) {
+			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
+			for (size_t m = 0; m < voice.modules.size(); ++m) {
+				if (custom.module[m].module_id != SCE_NGS2_CUSTOM_MODULE_ID_PITCH_SHIFT) {
+					continue;
+				}
+				const auto& module = voice.modules[m];
+				const auto  count =
+				    std::min<size_t>(voice.channels, module.pitch_shift_channels.size());
+				for (size_t c = 0; c < count; ++c) {
+					if (module.pitch_shift_channels[c].HasPending() &&
+					    (module.pitch_shift_bypass_mask & (1u << c)) == 0) {
+						pitch_pending = true;
+						break;
+					}
+				}
+				if (pitch_pending) {
+					break;
+				}
+			}
+		}
+		if (voice.has_samples || pitch_pending) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
 			for (size_t m = 0; m < voice.modules.size(); ++m) {
@@ -2821,8 +2902,8 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 								auto* samples = voice.Buffer(info.source_buffer_id, grain) +
 								                static_cast<size_t>(c) * grain;
 								for (uint32_t i = 0; i < grain; i += 64) {
-									channel.Process(samples + i, samples + i,
-									                module.pitch_shift_ratio);
+									channel.ProcessOrDrain(had_samples ? samples + i : nullptr,
+									                       samples + i, module.pitch_shift_ratio);
 								}
 							}
 							module.pitch_shift_reset   = false;
@@ -2838,9 +2919,12 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					if (source != dest) {
 						std::copy_n(source, size_t(voice.channels) * grain, dest);
 					}
-					if (module.filter_configured && module.filter.enabled) {
-						module.filter.Process(dest, voice.channels, grain);
-						voice.has_samples = true;
+					if (module.filter_configured) {
+						module.filter.EnsureRate(rate, voice.channels);
+						if (module.filter.enabled) {
+							module.filter.Process(dest, voice.channels, grain);
+							voice.has_samples = true;
+						}
 					}
 					continue;
 				}
@@ -3074,7 +3158,7 @@ static int Ngs2ParseRiffWaveform(const void* data, size_t data_size, Ngs2Wavefor
 		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 	}
 
-	const uint16_t tag = Ngs2ReadLe16(format);
+	uint16_t tag = Ngs2ReadLe16(format);
 	if (tag == 0xfffe) {
 		// WAVE_FORMAT_EXTENSIBLE
 		if (format_size < 40) {
@@ -3121,13 +3205,19 @@ static int Ngs2ParseRiffWaveform(const void* data, size_t data_size, Ngs2Wavefor
 			info->blocks[0].num_samples      = info->num_samples;
 			return OK;
 		}
-		if (std::memcmp(format + 24, PCM_GUID, sizeof(PCM_GUID)) != 0) {
+		// The SubFormat GUID selects the real codec: KSDATAFORMAT_SUBTYPE_PCM
+		// (tag 1) or KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (tag 3); the remaining
+		// GUID bytes are identical for both.
+		const uint16_t sub_tag = Ngs2ReadLe16(format + 24);
+		if ((sub_tag != 1 && sub_tag != 3) ||
+		    std::memcmp(format + 26, PCM_GUID + 2, sizeof(PCM_GUID) - 2) != 0) {
 			return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
 		}
+		tag = sub_tag;
 	}
 
 	// PCM or IEEE Float
-	if (tag == 1 || tag == 3 || tag == 0xfffe) {
+	if (tag == 1 || tag == 3) {
 		const bool     is_float  = (tag == 3);
 		const uint16_t bits      = Ngs2ReadLe16(format + 14);
 		uint32_t       wave_type = 0;
@@ -3416,8 +3506,11 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	EXIT_NOT_IMPLEMENTED(block == nullptr);
 
 	std::memset(block, 0, sizeof(Ngs2WaveformBlock));
-	if (format == nullptr || format->num_channels == 0 || format->num_channels > 8 ||
-	    format->sample_rate == 0 || format->sample_rate > 192000) {
+	// ATRAC9 channel counts are validated against the codec below; the other
+	// formats are limited to the eight channels the RIFF parser accepts.
+	if (format == nullptr || format->num_channels == 0 || format->sample_rate == 0 ||
+	    format->sample_rate > 192000 ||
+	    (format->waveform_type != NGS2_WAVEFORM_TYPE_ATRAC9 && format->num_channels > 8)) {
 		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 	}
 	if (format->waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
@@ -3427,8 +3520,9 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 		    static_cast<uint8_t>(format->config_data >> 8u),
 		    static_cast<uint8_t>(format->config_data)};
 		Atrac9CodecInfo codec {};
-		if (!Ngs2GetAtrac9CodecInfo(config, codec) || codec.channels != format->num_channels ||
-		    codec.samplingRate != format->sample_rate) {
+		if (!Ngs2GetAtrac9CodecInfo(config, codec) ||
+		    codec.channels != static_cast<int>(format->num_channels) ||
+		    codec.samplingRate != static_cast<int>(format->sample_rate)) {
 			return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 		}
 		const uint64_t frame_samples = uint64_t(codec.frameSamples) * codec.framesInSuperframe;
@@ -4088,8 +4182,10 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					sfp.q            = fp->param.fcq.q;
 					sfp.level        = fp->param.fcq.level;
 					sfp.location     = 1;
-					module.filter.Configure(
-					    sfp, voice->sample_rate != 0 ? voice->sample_rate : 48000, voice->channels);
+					// Custom modules run on audio already resampled to the system
+					// rate, so the filter must be designed for that rate.
+					module.filter.Configure(sfp, voice->rack->ngs->option.sample_rate,
+					                        voice->channels);
 					module.filter_configured = true;
 					break;
 				}
@@ -5224,9 +5320,11 @@ int KYTY_SYSV_ABI Ngs2GetWaveformFrameInfo(const Ngs2WaveformFormat* format,
 	    out_units_per_frame == nullptr || out_num_delay_samples == nullptr) {
 		return NGS2_ERROR_INVALID_OUT_ADDRESS;
 	}
-	// If the format itself is null or invalid
-	if (format == nullptr || format->num_channels == 0 || format->num_channels > 8 ||
-	    format->sample_rate == 0 || format->sample_rate > 192000) {
+	// If the format itself is null or invalid; ATRAC9 channel counts are
+	// validated against the codec below.
+	if (format == nullptr || format->num_channels == 0 || format->sample_rate == 0 ||
+	    format->sample_rate > 192000 ||
+	    (format->waveform_type != NGS2_WAVEFORM_TYPE_ATRAC9 && format->num_channels > 8)) {
 		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 	}
 
@@ -5243,7 +5341,9 @@ int KYTY_SYSV_ABI Ngs2GetWaveformFrameInfo(const Ngs2WaveformFormat* format,
 		    static_cast<uint8_t>(format->config_data >> 8u),
 		    static_cast<uint8_t>(format->config_data)};
 		Atrac9CodecInfo codec {};
-		if (!Ngs2GetAtrac9CodecInfo(config, codec)) {
+		if (!Ngs2GetAtrac9CodecInfo(config, codec) ||
+		    codec.channels != static_cast<int>(format->num_channels) ||
+		    codec.samplingRate != static_cast<int>(format->sample_rate)) {
 			return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 		}
 		frameSize     = static_cast<uint32_t>(codec.superframeSize);

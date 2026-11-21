@@ -31839,6 +31839,27 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
+// V_MOVRELS reads v[12 + M0] from forty-one live candidates, so the selection
+// spans several levels of the multiplexer, including an unpaired last register.
+TestCase Vop1MoveRelSourceIndex(const char *name, u32 m0) {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 reg = 12; reg <= 52; reg++)
+    AppendVMovLiteral(&code, reg, 0x51000000u + reg);
+  code.push_back(EncodeSMovB32(124, InlineU32(m0)));
+  code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
+  AppendStoreVgpr(&code, 55, 0);
+  AppendEnd(&code);
+
+  return {name,
+          code,
+          {},
+          {0x51000000u + 12u + m0},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -49459,6 +49480,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex0", 0));
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex5", 5));
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex31", 31));
+  cases.push_back(Vop1MoveRelSourceIndex("Vop1MoveRelSourceIndex40", 40));
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -57076,6 +57101,15 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
     RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--movrels-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1MoveRelSource());
+    for (const auto &[name, m0] :
+         {std::pair{"Vop1MoveRelSourceIndex0", 0u}, std::pair{"Vop1MoveRelSourceIndex5", 5u},
+          std::pair{"Vop1MoveRelSourceIndex31", 31u}, std::pair{"Vop1MoveRelSourceIndex40", 40u}})
+      RunCase(&vulkan, Vop1MoveRelSourceIndex(name, m0));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--relaxed-float-only") == 0) {

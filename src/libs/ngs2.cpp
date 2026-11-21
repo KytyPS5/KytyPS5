@@ -1242,6 +1242,16 @@ struct Ngs2VoiceInternal {
 			matrix.clear();
 		}
 		filters.clear();
+		ResetModuleFilters();
+	}
+
+	// A channel layout change invalidates per-channel filter history kept by
+	// custom modules; the guest must reconfigure them for the new layout.
+	void ResetModuleFilters() {
+		for (auto& module: modules) {
+			module.filter            = {};
+			module.filter_configured = false;
+		}
 	}
 
 	void ClearWaveformBlocks() {
@@ -3258,13 +3268,14 @@ static int Ngs2ParseVag(const void* data, size_t data_size, Ngs2WaveformInfo* in
 	}
 
 	const auto make_vag_block = [&](uint32_t pos, uint32_t count, uint32_t repeats) {
-		const uint32_t first  = pos / VAG_FRAME_SAMPLES;
-		const uint32_t past   = (pos + count + VAG_FRAME_SAMPLES - 1u) / VAG_FRAME_SAMPLES;
-		const auto     offset = static_cast<uint32_t>(static_cast<uint64_t>(first) * frame_bytes);
+		const uint64_t first = pos / VAG_FRAME_SAMPLES;
+		const uint64_t past  = (uint64_t(pos) + count + VAG_FRAME_SAMPLES - 1u) / VAG_FRAME_SAMPLES;
+		const uint64_t offset = first * frame_bytes;
 		Ngs2WaveformBlock b {};
 		b.data_offset      = VAG_HEADER_SIZE + offset;
-		b.data_size        = static_cast<uint32_t>(past * frame_bytes - offset);
-		b.num_samples      = (past - first) * VAG_FRAME_SAMPLES;
+		b.data_size        = past * frame_bytes - offset;
+		b.num_samples      = static_cast<uint32_t>(std::min<uint64_t>(
+		    (past - first) * VAG_FRAME_SAMPLES, std::numeric_limits<uint32_t>::max()));
 		b.num_skip_samples = 0;
 		b.num_repeats      = repeats;
 		return b;
@@ -3325,7 +3336,45 @@ int KYTY_SYSV_ABI Ngs2ParseWaveformFile(const char* path, uint32_t offset, Ngs2W
 	if (static_cast<uint64_t>(offset) > file_size) {
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
-	const auto           length = static_cast<size_t>(file_size - static_cast<uint64_t>(offset));
+
+	// Read the leading header first and bound the payload read to the extent
+	// declared by the container instead of copying the whole remaining file.
+	uint8_t header[0x30] {};
+	file.seekg(static_cast<std::streamoff>(offset));
+	file.read(reinterpret_cast<char*>(header), sizeof(header));
+	const auto header_size = static_cast<size_t>(file.gcount());
+
+	uint64_t extent_end = file_size;
+	if (header_size >= 12 && std::memcmp(header, "RIFF", 4) == 0 &&
+	    std::memcmp(header + 8, "WAVE", 4) == 0) {
+		const uint64_t riff_size =
+		    (static_cast<uint64_t>(header[4]) << 0) | (static_cast<uint64_t>(header[5]) << 8) |
+		    (static_cast<uint64_t>(header[6]) << 16) | (static_cast<uint64_t>(header[7]) << 24);
+		const uint64_t end = static_cast<uint64_t>(offset) + 8 + riff_size;
+		if (end < static_cast<uint64_t>(offset) + 12 || end > file_size) {
+			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+		}
+		extent_end = end;
+	} else if (header_size >= 0x1f && std::memcmp(header, "VAGp", 4) == 0) {
+		const uint64_t vag_size    = (static_cast<uint64_t>(header[0x0c]) << 24) |
+		                             (static_cast<uint64_t>(header[0x0d]) << 16) |
+		                             (static_cast<uint64_t>(header[0x0e]) << 8) |
+		                             static_cast<uint64_t>(header[0x0f]);
+		const uint32_t channels    = header[0x1e] != 0 ? header[0x1e] : 1u;
+		const uint64_t frame_bytes = 16ull * channels;
+		// The parser needs the declared payload plus one frame of slack.
+		const uint64_t payload = std::max<uint64_t>(vag_size, frame_bytes + 16);
+		const uint64_t end     = static_cast<uint64_t>(offset) + 0x30 + payload;
+		if (end > file_size) {
+			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+		}
+		extent_end = end;
+	} else {
+		// Unknown container: the parser only inspects the leading bytes.
+		extent_end = std::min<uint64_t>(file_size, static_cast<uint64_t>(offset) + 16);
+	}
+
+	const auto           length = static_cast<size_t>(extent_end - static_cast<uint64_t>(offset));
 	std::vector<uint8_t> buffer(length);
 	file.seekg(static_cast<std::streamoff>(offset));
 	if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(length))) {
@@ -3377,15 +3426,21 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	} else if (format->waveform_type == SCE_NGS2_WAVEFORM_TYPE_VAG) {
 		constexpr uint32_t VAG_FRAME_SAMPLES = 28;
 		constexpr uint32_t VAG_FRAME_BYTES   = 16;
-		const uint32_t     frame_bytes       = VAG_FRAME_BYTES * format->num_channels;
-		const uint32_t     first             = sample_pos / VAG_FRAME_SAMPLES;
-		const uint32_t     past =
-		    (sample_pos + num_samples + VAG_FRAME_SAMPLES - 1u) / VAG_FRAME_SAMPLES;
-		const auto offset  = static_cast<uint64_t>(first) * frame_bytes;
+		const uint64_t     frame_bytes       = uint64_t(VAG_FRAME_BYTES) * format->num_channels;
+		const uint64_t     first             = sample_pos / VAG_FRAME_SAMPLES;
+		const uint64_t     past =
+		    (uint64_t(sample_pos) + num_samples + VAG_FRAME_SAMPLES - 1u) / VAG_FRAME_SAMPLES;
+		const uint64_t offset = first * frame_bytes;
+		const uint64_t end    = past * frame_bytes;
+		if (end > std::numeric_limits<uintptr_t>::max() ||
+		    end - offset > std::numeric_limits<size_t>::max() ||
+		    (past - first) * VAG_FRAME_SAMPLES > std::numeric_limits<uint32_t>::max()) {
+			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+		}
 		block->data_offset = offset;
-		block->data_size =
-		    num_samples == 0 ? 0 : static_cast<uint64_t>(past * frame_bytes - offset);
-		block->num_samples      = num_samples == 0 ? 0 : (past - first) * VAG_FRAME_SAMPLES;
+		block->data_size   = num_samples == 0 ? 0 : end - offset;
+		block->num_samples =
+		    num_samples == 0 ? 0 : static_cast<uint32_t>((past - first) * VAG_FRAME_SAMPLES);
 		block->num_skip_samples = num_samples == 0 ? 0 : (sample_pos % VAG_FRAME_SAMPLES);
 	} else if (format->waveform_type == 0x11 || format->waveform_type == 0x12 ||
 	           format->waveform_type == 0x14 || format->waveform_type == 0x16 ||
@@ -4152,7 +4207,10 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				                     (param->id & 0xffffu) != 0);
 				const auto* channels = reinterpret_cast<const uint32_t*>(param + 1);
 				EXIT_NOT_IMPLEMENTED(channels[0] != channels[1]);
-				voice->channels = channels[0];
+				if (voice->channels != channels[0]) {
+					voice->channels = channels[0];
+					voice->ResetModuleFilters();
+				}
 				break;
 			}
 			case 0x4003: {
@@ -4167,7 +4225,10 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						                     values[0] >
 						                         voice->rack->option.common.max_voice_channels ||
 						                     values[1] != 0);
-						voice->channels = values[0];
+						if (voice->channels != values[0]) {
+							voice->channels = values[0];
+							voice->ResetModuleFilters();
+						}
 						break;
 					case 1: voice->output_id = values[0]; break;
 					default:
@@ -4852,7 +4913,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetMatrixInfo(uintptr_t voice_handle, uint32_t matrix
 static constexpr uint32_t kFftSamples[5] = {64u, 128u, 256u, 512u, 1024u};
 
 static bool Ngs2FftLengthValid(int length) {
-	return static_cast<uint32_t>(length - 8) <= 4u;
+	return length >= 8 && length <= 12;
 }
 
 // Radix-2 Cooley-Tukey in-place FFT on complex data (double).
@@ -5495,11 +5556,16 @@ int KYTY_SYSV_ABI Ngs2StreamCreateWithAllocator(uintptr_t system_handle, const v
 
 	const uint64_t req_size              = ComputeStreamBufferSize(checked);
 	stream->buffer_info.host_buffer_size = req_size;
+	stream->buffer_info.user_data        = localAllocator.user_data;
 	int32_t alloc_res                    = localAllocator.alloc_handler(&stream->buffer_info);
 	if (alloc_res < 0 || stream->buffer_info.host_buffer == nullptr) {
+		if (stream->buffer_info.host_buffer != nullptr && localAllocator.free_handler != nullptr) {
+			localAllocator.free_handler(&stream->buffer_info);
+		}
 		stream->has_allocator = false;
 		stream->managed_buffer.resize(req_size, 0);
 		stream->buffer_info.host_buffer = stream->managed_buffer.data();
+		stream->buffer_info.user_data   = localAllocator.user_data;
 	}
 	stream->handle = reinterpret_cast<uintptr_t>(stream.get());
 

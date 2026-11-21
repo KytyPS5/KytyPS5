@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <numbers>
 
 using namespace Libs::Audio::Ngs2;
@@ -2713,13 +2714,13 @@ void TestVoiceOwnerAndMatrixInfo() {
 	system.option                   = Ngs2DefaultSystemOption();
 	system.option.sample_rate = 48000;
 	system.option.num_grain_samples = 256;
-	Ngs2SamplerRackOption option {};
-	Ngs2FillDefaultRackOption(0x1000, reinterpret_cast<Ngs2RackOptionUnion*>(&option));
-	option.rack_option.max_voices = 1;
-	option.rack_option.max_matrices = 2;
-	option.rack_option.max_ports = 8;
-	option.max_waveform_blocks = 4;
-	RenderRack renderRack(system, 0x1000, option.rack_option);
+	Ngs2RackOptionUnion option {};
+	Ngs2FillDefaultRackOption(0x1000, &option);
+	option.sampler.rack_option.max_voices = 1;
+	option.sampler.rack_option.max_matrices = 2;
+	option.sampler.rack_option.max_ports = 8;
+	option.sampler.max_waveform_blocks = 4;
+	RenderRack renderRack(system, 0x1000, option.sampler.rack_option);
 	uintptr_t voice_handle = 0;
 	Check(Ngs2RackGetVoiceHandle(renderRack.handle, 0, &voice_handle) == OK, "get voice handle failed");
 	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
@@ -2759,6 +2760,21 @@ void TestVoiceOwnerAndMatrixInfo() {
 	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 0, &minfo, sizeof(minfo)) == OK, "voice get matrix info after set failed");
 	Check(minfo.num_levels == 4, "matrix levels count mismatch");
 	Check(std::abs(minfo.levels[0] - 0.1f) < 1e-6f && std::abs(minfo.levels[3] - 0.4f) < 1e-6f, "matrix levels values mismatch");
+
+	// A matrix larger than the ABI capacity must report the number of levels
+	// actually copied, not the stored count.
+	std::vector<float> bigLevels(1370);
+	for (size_t i = 0; i < bigLevels.size(); ++i) {
+		bigLevels[i] = static_cast<float>(i);
+	}
+	cmd.count       = 1370;
+	cmd.value.levels = bigLevels.data();
+	Check(Ngs2VoiceRunCommands(voice_handle, &cmd, 1) == OK, "voice run commands oversized matrix failed");
+	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 0, &minfo, sizeof(minfo)) == OK,
+	      "voice get matrix info after oversized set failed");
+	Check(minfo.num_levels == 37 * 37, "oversized matrix must report the copied level count");
+	Check(minfo.levels[37 * 37 - 1] == static_cast<float>(37 * 37 - 1),
+	      "oversized matrix copied the wrong levels");
 
 	// Error handling
 	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 999, &minfo, sizeof(minfo)) == NGS2_ERROR_INVALID_PARAM_ID, "out of range matrix accepted");
@@ -2804,6 +2820,8 @@ static void TestFftPhase2() {
 	      "FftInit: out_handle null should fail");
 	Check(Ngs2FftInit(tooSmall.data(), 1088, 7, 2, &handle) != OK,
 	      "FftInit: length 7 should fail");
+	Check(Ngs2FftInit(tooSmall.data(), 1088, std::numeric_limits<int>::min(), 2, &handle) != OK,
+	      "FftInit: INT_MIN length must fail without signed overflow");
 
 	// Correct init (flags=2, length=8)
 	Ngs2FftQuerySize(8, 2, &sz);
@@ -3103,6 +3121,125 @@ static void TestParseWaveformUserPhase2() {
 		Check(r == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT,
 		      "ParseWaveformUser: Non-WAVE data should return UNKNOWN_WAVEFORM_FORMAT");
 	}
+}
+
+static std::vector<uint8_t> MakeVagFile(uint32_t channelByte, uint32_t frames, uint32_t rate);
+
+static void TestWaveformFileExtentLimits() {
+	auto appendLE16 = [](std::vector<uint8_t>& v, uint16_t x) {
+		v.push_back(static_cast<uint8_t>(x));
+		v.push_back(static_cast<uint8_t>(x >> 8));
+	};
+	auto appendLE32 = [](std::vector<uint8_t>& v, uint32_t x) {
+		v.push_back(static_cast<uint8_t>(x));
+		v.push_back(static_cast<uint8_t>(x >> 8));
+		v.push_back(static_cast<uint8_t>(x >> 16));
+		v.push_back(static_cast<uint8_t>(x >> 24));
+	};
+	auto appendFourCC = [](std::vector<uint8_t>& v, const char* cc) {
+		v.insert(v.end(), {static_cast<uint8_t>(cc[0]), static_cast<uint8_t>(cc[1]),
+		                   static_cast<uint8_t>(cc[2]), static_cast<uint8_t>(cc[3])});
+	};
+
+	// Minimal PCM16 mono 8 kHz RIFF with a 4-byte data payload.
+	std::vector<uint8_t> riff;
+	appendFourCC(riff, "RIFF");
+	appendLE32(riff, 4 + 8 + 16 + 8 + 4);
+	appendFourCC(riff, "WAVE");
+	appendFourCC(riff, "fmt ");
+	appendLE32(riff, 16);
+	appendLE16(riff, 1);
+	appendLE16(riff, 1);
+	appendLE32(riff, 8000);
+	appendLE32(riff, 16000);
+	appendLE16(riff, 2);
+	appendLE16(riff, 16);
+	appendFourCC(riff, "data");
+	appendLE32(riff, 4);
+	appendLE16(riff, 100);
+	appendLE16(riff, 200);
+
+	const auto dir = std::filesystem::temp_directory_path();
+	const auto wavPath = (dir / "ngs2_extent_test.wav").string();
+	const auto vagPath = (dir / "ngs2_extent_test.vag").string();
+
+	// A small RIFF followed by trailing garbage must parse using only the
+	// declared extent.
+	{
+		std::vector<uint8_t> file = riff;
+		file.insert(file.end(), 4096, 0xAB);
+		{
+			std::ofstream out(wavPath, std::ios::binary);
+			out.write(reinterpret_cast<const char*>(file.data()), file.size());
+		}
+		Ngs2WaveformInfo info {};
+		Check(Ngs2ParseWaveformFile(wavPath.c_str(), 0, &info) == OK,
+		      "ParseWaveformFile rejected a RIFF with trailing data");
+		Check(info.num_samples == 2 && info.data_offset == riff.size() - 4,
+		      "ParseWaveformFile returned wrong geometry for trailing-data RIFF");
+	}
+
+	// A RIFF whose declared extent runs past the end of the file must fail
+	// before the payload is read.
+	{
+		std::vector<uint8_t> file = riff;
+		appendLE32(file, 0); // placeholder overwritten below
+		file[4]  = 0xFF;
+		file[5]  = 0xFF;
+		file[6]  = 0xFF;
+		file[7]  = 0x7F; // riff size ~2 GiB, far beyond the file
+		{
+			std::ofstream out(wavPath, std::ios::binary);
+			out.write(reinterpret_cast<const char*>(file.data()), file.size());
+		}
+		Ngs2WaveformInfo info {};
+		Check(Ngs2ParseWaveformFile(wavPath.c_str(), 0, &info) == NGS2_ERROR_INVALID_WAVEFORM_DATA,
+		      "ParseWaveformFile accepted a RIFF extent beyond the file size");
+	}
+
+	// A VAG file must be bounded by its declared payload as well.
+	{
+		auto vag = MakeVagFile(1, 2, 48000);
+		vag[0x30 + 16 + 1] = 2; // mark the last frame so it is not dropped
+		vag.insert(vag.end(), 2048, 0xCD);
+		{
+			std::ofstream out(vagPath, std::ios::binary);
+			out.write(reinterpret_cast<const char*>(vag.data()), vag.size());
+		}
+		Ngs2WaveformInfo info {};
+		Check(Ngs2ParseWaveformFile(vagPath.c_str(), 0, &info) == OK,
+		      "ParseWaveformFile rejected a valid VAG file");
+		Check(info.format.waveform_type == SCE_NGS2_WAVEFORM_TYPE_VAG && info.num_samples == 56,
+		      "ParseWaveformFile returned wrong VAG geometry");
+	}
+
+	std::remove(wavPath.c_str());
+	std::remove(vagPath.c_str());
+}
+
+static void TestWaveformBlockLimits() {
+	// VAG block math must stay in 64 bits: a sample position near the 32-bit
+	// wrap used to produce a wrapped frame index and a huge data_size.
+	Ngs2WaveformFormat vag8 {};
+	vag8.waveform_type = SCE_NGS2_WAVEFORM_TYPE_VAG;
+	vag8.num_channels  = 8;
+	vag8.sample_rate   = 48000;
+	Ngs2WaveformBlock block {};
+	Check(Ngs2CalcWaveformBlock(&vag8, 0xFFFFFFF0u, 0x20u, &block) == OK,
+	      "VAG CalcWaveformBlock failed near the 32-bit boundary");
+	const uint64_t first_frame = 0xFFFFFFF0ull / 28;
+	const uint64_t past_frame  = (0xFFFFFFF0ull + 0x20u + 27) / 28;
+	Check(block.data_offset == first_frame * (16ull * 8) &&
+	          block.data_size == (past_frame - first_frame) * (16ull * 8) &&
+	          block.num_samples == static_cast<uint32_t>((past_frame - first_frame) * 28) &&
+	          block.num_skip_samples == 0xFFFFFFF0u % 28,
+	      "VAG CalcWaveformBlock wrapped block arithmetic");
+
+	// A span whose frame-rounded sample count cannot fit the u32 field is
+	// rejected instead of truncated.
+	Check(Ngs2CalcWaveformBlock(&vag8, 0, 0xFFFFFFFFu, &block) ==
+	          NGS2_ERROR_INVALID_WAVEFORM_DATA,
+	      "VAG CalcWaveformBlock accepted an overflowing sample span");
 }
 
 // Phase 3 Test: VAG Codec, Custom Gain, Channel Mixer, Pitch Shift DSP
@@ -3600,6 +3737,93 @@ void TestCustomFilterModule() {
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
+void TestCustomFilterChannelRelayout() {
+	Ngs2SystemOption opt {};
+	Ngs2SystemResetOption(&opt);
+	opt.num_grain_samples = 64;
+	opt.sample_rate       = 48000;
+
+	Ngs2ContextBufferInfo sysBufInfo {};
+	Ngs2SystemQueryBufferSize(&opt, &sysBufInfo);
+	std::vector<uint8_t> sysBuf(sysBufInfo.host_buffer_size);
+	sysBufInfo.host_buffer = sysBuf.data();
+
+	uintptr_t sysHandle = 0;
+	int res = Ngs2SystemCreate(&opt, &sysBufInfo, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate failed for FilterRelayout test");
+
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_FILTER;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t filterRack = 0;
+	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &filterRack);
+	Check(res == OK && filterRack != 0, "RackCreate CustomSubmixer failed for FilterRelayout");
+
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(filterRack, 0, &voice);
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+
+	// Configure the module filter while the voice runs on one channel.
+	Ngs2SubmixerVoiceSetupParam vsetup1 {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 1, 0};
+	Ngs2VoiceControl(voice, &vsetup1.header);
+
+	Ngs2CustomVoiceFilterParam fparam {};
+	fparam.header = {sizeof(Ngs2CustomVoiceFilterParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER};
+	fparam.channel_mask = 0;
+	fparam.type = 1;
+	fparam.param.fcq.frequency = 1000.0f;
+	fparam.param.fcq.q         = 0.707f;
+	fparam.param.fcq.level     = 1.0f;
+	res = Ngs2VoiceControl(voice, &fparam.header);
+	Check(res == OK, "VoiceControl CustomFilter relayout failed");
+	Check(vInt->modules[0].filter.enabled && vInt->modules[0].filter.history.size() == 1,
+	      "module filter was not configured for one channel");
+
+	// Reconfigure the voice for two channels: the module filter state must be
+	// reset so no stale per-channel history survives the layout change.
+	Ngs2SubmixerVoiceSetupParam vsetup2 {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	res = Ngs2VoiceControl(voice, &vsetup2.header);
+	Check(res == OK, "VoiceControl CustomFilter relayout to two channels failed");
+	Check(!vInt->modules[0].filter.enabled && !vInt->modules[0].filter_configured,
+	      "module filter state survived a channel layout change");
+
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	int16_t fInput[64 * 2];
+	for (int i = 0; i < 64; ++i) {
+		fInput[2 * i]     = 16384;
+		fInput[2 * i + 1] = 16384;
+	}
+	src.Queue(fInput, 64, 0);
+
+	std::vector<Ngs2VoiceInternal*> voicesList {&src.voice};
+	Ngs2RenderVoice(*vInt, voicesList, 64);
+
+	float* b = vInt->Buffer(0, 64);
+	// With the filter reset the module passes audio through untouched.
+	Check(b[0] == 0.5f && b[64] == 0.5f, "Custom Filter relayout did not reset the module filter");
+
+	Ngs2RackDestroy(filterRack, nullptr);
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
 // --- Tests for Stream API, Scheduler, Modules, and Reporting ---
 struct TestStreamCommandRecord {
 	uint32_t id;
@@ -3637,6 +3861,37 @@ static int32_t KYTY_SYSV_ABI TestStreamBufferAlloc(Ngs2ContextBufferInfo* info) 
 	if (info != nullptr) {
 		static std::vector<uint8_t> s_alloc_buf(131072);
 		info->host_buffer = s_alloc_buf.data();
+	}
+	return 0;
+}
+
+static int         g_streamAllocCalls       = 0;
+static int         g_streamFreeCalls        = 0;
+static int32_t     g_streamAllocResult      = 0;
+static bool        g_streamAllocGaveBuffer  = true;
+static bool        g_streamSawUserData      = false;
+static uintptr_t   g_streamExpectedUserData = 0;
+static void*       g_streamLastAllocBuffer  = nullptr;
+static std::vector<uint8_t> g_streamAllocStorage(0x106c0);
+
+static int32_t KYTY_SYSV_ABI TestStreamAllocCounting(Ngs2ContextBufferInfo* info) {
+	++g_streamAllocCalls;
+	if (info->user_data == g_streamExpectedUserData) {
+		g_streamSawUserData = true;
+	}
+	if (g_streamAllocResult < 0 || !g_streamAllocGaveBuffer) {
+		info->host_buffer = nullptr;
+	} else {
+		info->host_buffer = g_streamAllocStorage.data();
+	}
+	g_streamLastAllocBuffer = info->host_buffer;
+	return g_streamAllocResult;
+}
+
+static int32_t KYTY_SYSV_ABI TestStreamFreeCounting(Ngs2ContextBufferInfo* info) {
+	++g_streamFreeCalls;
+	if (info->host_buffer != g_streamLastAllocBuffer) {
+		Check(false, "stream free handler received a different buffer than alloc produced");
 	}
 	return 0;
 }
@@ -3750,6 +4005,42 @@ static void TestStreamAndModulesPhase4() {
 	res = Ngs2StreamCreateWithAllocator(sysHandle, &opt, &alloc, &streamAllocHandle);
 	Check(res == OK && streamAllocHandle != 0, "StreamCreateWithAllocator failed with a valid allocator");
 
+	// Allocator failure must fall back to internally owned storage: the caller's
+	// free handler must never run for it (no double free).
+	g_streamAllocCalls      = 0;
+	g_streamFreeCalls       = 0;
+	g_streamAllocResult     = -1;
+	g_streamAllocGaveBuffer = false;
+	g_streamExpectedUserData = 0xBEEF;
+	Ngs2BufferAllocator failAlloc {};
+	failAlloc.alloc_handler = &TestStreamAllocCounting;
+	failAlloc.free_handler  = &TestStreamFreeCounting;
+	failAlloc.user_data     = g_streamExpectedUserData;
+	uintptr_t failHandle = 0;
+	res = Ngs2StreamCreateWithAllocator(sysHandle, &opt, &failAlloc, &failHandle);
+	Check(res == OK && failHandle != 0, "StreamCreateWithAllocator must succeed with internal fallback");
+	Check(g_streamAllocCalls == 1 && g_streamSawUserData,
+	      "alloc handler was not invoked exactly once with the allocator user_data");
+	res = Ngs2StreamDestroy(failHandle, nullptr);
+	Check(res == OK, "StreamDestroy of fallback stream failed");
+	Check(g_streamFreeCalls == 0, "free handler ran for internally owned fallback storage");
+
+	// Successful caller allocation: free handler runs exactly once with the
+	// buffer produced by the alloc callback.
+	g_streamAllocCalls       = 0;
+	g_streamFreeCalls        = 0;
+	g_streamAllocResult      = 0;
+	g_streamAllocGaveBuffer  = true;
+	g_streamSawUserData      = false;
+	uintptr_t okHandle = 0;
+	res = Ngs2StreamCreateWithAllocator(sysHandle, &opt, &failAlloc, &okHandle);
+	Check(res == OK && okHandle != 0, "StreamCreateWithAllocator failed on second attempt");
+	Check(g_streamAllocCalls == 1 && g_streamSawUserData,
+	      "alloc handler did not receive the allocator user_data");
+	res = Ngs2StreamDestroy(okHandle, nullptr);
+	Check(res == OK, "StreamDestroy of allocated stream failed");
+	Check(g_streamFreeCalls == 1, "free handler must run exactly once for caller storage");
+
 	// 5. sceNgs2StreamRunCommands
 	Check(Ngs2StreamDestroy(0, nullptr) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
 	      "StreamDestroy on 0 must return INVALID_STREAM_HANDLE");
@@ -3856,6 +4147,7 @@ int main() {
 	TestMasteringUnknownControl();
 	TestPcmWaveformFormats();
 	TestCustomFilterModule();
+	TestCustomFilterChannelRelayout();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();
@@ -3916,6 +4208,8 @@ int main() {
 	RUN_TEST(TestWaveformFrameInfoPhase2);
 	RUN_TEST(TestParseWaveformUserPhase2);
 	RUN_TEST(TestVagPhase3);
+	RUN_TEST(TestWaveformFileExtentLimits);
+	RUN_TEST(TestWaveformBlockLimits);
 	RUN_TEST(TestCustomGainPhase3);
 	RUN_TEST(TestCustomChannelMixerPhase3);
 	RUN_TEST(TestCustomPitchShiftPhase3);

@@ -15,7 +15,6 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -163,75 +162,6 @@ void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
 	     shader_hash, messages.c_str());
 }
 
-// Formats with a narrower host variant drop the components the shader does not read.
-vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
-	switch (format) {
-		case vk::Format::eR32G32B32A32Sfloat:
-			switch (used_components) {
-				case 1: return vk::Format::eR32Sfloat;
-				case 2: return vk::Format::eR32G32Sfloat;
-				case 3: return vk::Format::eR32G32B32Sfloat;
-				default: return format;
-			}
-		case vk::Format::eR32G32B32Sfloat:
-			switch (used_components) {
-				case 1: return vk::Format::eR32Sfloat;
-				case 2: return vk::Format::eR32G32Sfloat;
-				default: return format;
-			}
-		case vk::Format::eR16G16B16A16Sfloat:
-			switch (used_components) {
-				case 1: return vk::Format::eR16Sfloat;
-				case 2: return vk::Format::eR16G16Sfloat;
-				default: return format;
-			}
-		case vk::Format::eR8G8B8A8Unorm:
-			switch (used_components) {
-				case 1: return vk::Format::eR8Unorm;
-				case 2: return vk::Format::eR8G8Unorm;
-				default: return format;
-			}
-		case vk::Format::eR8G8B8A8Snorm:
-			return used_components == 2 ? vk::Format::eR8G8Snorm : format;
-		case vk::Format::eR8G8B8A8Uint:
-			switch (used_components) {
-				case 1: return vk::Format::eR8Uint;
-				case 2: return vk::Format::eR8G8Uint;
-				default: return format;
-			}
-		default: return format;
-	}
-}
-
-vk::Format InputFormat(const ShaderBufferResource& resource, uint32_t used_components) {
-	switch (resource.RawFormat()) {
-		// Temporary: invalid PS5 buffer format 113 (VertexAttribFormat::k16_16SInt).
-		case 113: return NarrowInputFormat(vk::Format::eR32G32B32A32Sfloat, used_components);
-		case 121: return vk::Format::eR16G16Sfloat;
-		default: break;
-	}
-	const auto format = VulkanFormat(resource.Format());
-	if (format == vk::Format::eUndefined ||
-	    ShaderRecompiler::Format::GetFormatInfo(resource.Format()).component_count == 0) {
-		EXIT("unknown vertex format: fmt = %u\n", resource.RawFormat());
-	}
-	return NarrowInputFormat(format, used_components);
-}
-
-// The host format of each vertex input attribute, narrowed to the components the stage reads.
-std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
-                                           const ShaderRecompiler::IR::CompiledShaderInfo& program) {
-	std::vector<vk::Format> formats(input_info.resources_num);
-	for (int index = 0; index < input_info.resources_num; index++) {
-		const auto registers_num = input_info.resources_dst[index].registers_num;
-		EXIT_IF(registers_num < 1 || registers_num > 4);
-		const auto fetched = program.info.vertex_fetch_components[index];
-		formats[index] = InputFormat(input_info.resources[index],
-		                             fetched > 0 ? fetched : static_cast<uint32_t>(registers_num));
-	}
-	return formats;
-}
-
 } // namespace
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
@@ -342,10 +272,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 	// The inputs of these come from the stage's static key.
-	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
-		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
-	} else if (key.stage == ShaderType::Pixel &&
-	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
+	if (key.stage == ShaderType::Pixel &&
+	    options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
 	} else if (key.stage == ShaderType::Mesh) {
 		module.mesh_task = options.input_info.vertex->indirect_draw;
@@ -1059,6 +987,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
 			                                    vs_input_info.buffers[binding].addr),
 			    .binding = static_cast<uint8_t>(binding),
+			    .format  = vs_input_info.resources[attribute].RawFormat(),
 			};
 		}
 	}

@@ -20638,9 +20638,6 @@ public:
     vertex_shader.info.stage = ShaderType::Vertex;
     vertex_shader.info.info.vertex_fetch_components[0] = 2;
     vertex_shader.info.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
-    // No narrower host format covers the components the stage reads from either attribute.
-    vertex_shader.vertex_formats = {VulkanFormat(Prospero::BufferFormat::k32_32Float),
-                                    VulkanFormat(color_format)};
     ShaderModule pixel_shader{.id = 2, .module = CreateShaderModule(name, fragment.spirv)};
     pixel_shader.info.stage = ShaderType::Pixel;
     pixel_shader.info.info = fragment.program.info;
@@ -50148,6 +50145,54 @@ void CheckGraphicsPushDataModules(VulkanHarness &vulkan) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+// Vertex formats with the same channel count and type class (Uint, Sint, or any other as
+// Float) share a vertex module; each draw's pipeline holds its own format.
+void CheckVertexFormatModules(VulkanHarness &vulkan) {
+  using F = Prospero::BufferFormat;
+  constexpr const char *name = "VertexFormatModules";
+  // s_mov_b32 s0, 0; s_load_dwordx4 s[20:23], s[8:9]; v_cndmask_b32 v0, v8, v5;
+  // buffer_load_format_xyzw v[9:12], v0, s[20:23] idxen; exp pos0 v9..v12
+  const std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
+                              EncodeSmem1(0), EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                              EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                              EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
+  const ShaderParams params{.code = code, .user_data_count = 2, .hash = 3};
+  RenderContext context(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = context.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  auto &cache = context.GetPipelineCache();
+  // The vertex module and pipeline of a draw fetching attribute 0 in `format`.
+  const auto draw = [&](F format) {
+    DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+    auto &input = state.vertex_info[0];
+    input.has_dynamic_vertex_fetch = true;
+    input.resources_num = input.buffers_num = 1;
+    input.buffers[0].stride = 16;
+    input.resources[0].fields[3] = DstSel(4, 5, 6, 7) | BufferFormat(format) << 12u;
+    input.resources_dst[0] = {.registers_num = 4, .attr_id = 0};
+    const auto *module = PipelineCacheTestAccess::GetProgram(cache, params, input);
+    return std::pair{module, cache.GetGraphicsPipeline(scheduler.Current(), state, {}).pipeline};
+  };
+  const auto uint8 = draw(F::k8_8_8_8UInt);
+  const auto uint16 = draw(F::k16_16_16_16UInt);
+  const auto unorm8 = draw(F::k8_8_8_8UNorm);
+  const auto float32 = draw(F::k32_32_32_32Float);
+  Require(name, "shared module",
+          uint16.first == uint8.first && float32.first == unorm8.first &&
+              uint16.second != uint8.second,
+          "formats differing only in channel widths compiled separate vertex modules or shared "
+          "a pipeline");
+  Require(name, "distinct modules",
+          unorm8.first != uint8.first && draw(F::k8_8_8_8SInt).first != uint8.first &&
+              draw(F::k8_8UInt).first != uint8.first,
+          "a vertex module was shared across integer signedness or channel counts");
+  scheduler.Finish();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 // Graphics and async dispatches share a compute module; an async dispatch of one that reads HW_ID2 exits.
 void CheckComputeQueueModules(VulkanHarness &vulkan) {
   constexpr const char *name = "ComputeQueueModules";
@@ -58392,6 +58437,7 @@ int main(int argc, char **argv) {
   CheckStableProgramIds(vulkan);
   CheckComputeQueueModules(vulkan);
   CheckGraphicsPushDataModules(vulkan);
+  CheckVertexFormatModules(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();

@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -18,6 +19,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -409,6 +411,24 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
+// The part of each raw buffer format a vertex module depends on: its channel count and, for
+// integer formats, its component type (Float otherwise).
+constexpr auto kVertexFetchFormats = [] {
+	std::array<uint8_t, 128> formats {};
+	for (uint32_t raw = 0; raw < formats.size(); raw++) {
+		const auto format =
+		    ShaderRecompiler::Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(raw));
+		auto type = ShaderRecompiler::Format::ComponentType::Float;
+		if (format.type == ShaderRecompiler::Format::ComponentType::Uint ||
+		    format.type == ShaderRecompiler::Format::ComponentType::Sint) {
+			type = format.type;
+		}
+		formats[raw] =
+		    static_cast<uint8_t>(format.component_count | static_cast<uint32_t>(type) << 3u);
+	}
+	return formats;
+}();
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
@@ -458,7 +478,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& destination = info.resources_dst[i];
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		// Swizzle, channel count and type class; the pipeline key holds the format itself.
+		key.push_back(resource.DstSelXYZW() |
+		              static_cast<uint32_t>(kVertexFetchFormats[resource.RawFormat()]) << 12u);
 	}
 }
 

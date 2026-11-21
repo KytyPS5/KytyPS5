@@ -47167,7 +47167,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   address.SetArg(0, Value(&query_lod));
   const auto access_position = std::ranges::find_if(*block, [&](const Inst &inst) { return &inst == access; });
   auto &query = *block->PrependNewInst(access_position, ValueOpcode::ImageQueryDimensions,
-      {Value(&image), Value(&address)}, memory_flag_bits);
+      {Value(&image), Value(&address), access->Arg(access->NumArgs() - 1u)}, memory_flag_bits);
   access->ReplaceUsesWith(Value(&query), false);
   store.Invalidate();
   auto &query_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&key), Value(16u)});

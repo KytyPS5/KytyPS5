@@ -91,6 +91,13 @@ TEST(Agc, CondExecPatchesWrapWithoutArgumentChecks) {
 	EXPECT_EQ(cmd, (std::array<uint32_t, 5> {0xc0031000u, 0x34561003u, 0x12u, 0u, 0xffffc001u}));
 }
 
+TEST(Agc, EqAccessorsDecodeEventData) {
+	const Libs::LibKernel::EventQueue::KernelEvent ev {
+	    .filter = Libs::LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS, .data = 0x7654321ll << 16 | 0x21};
+	EXPECT_EQ(Gen5Driver::AgcDriverGetEqEventType(&ev), 0x43210021);
+	EXPECT_EQ(Gen5Driver::AgcDriverGetEqContextId(&ev), 0x7654321u);
+}
+
 TEST(Agc, BranchLeavesNullTargetSlotsZero) {
 	const auto* then_target = reinterpret_cast<const volatile uint32_t*>(0x1234567898ull);
 	Packet<14> dcb;

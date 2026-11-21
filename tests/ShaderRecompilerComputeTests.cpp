@@ -3722,7 +3722,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     const bool compute_interrupt_matches =
         compute_interrupt_wait == 0 && interrupt_count == 1 &&
-        interrupt_event.ident == 0x20 && interrupt_event.data == 0x456u &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == (0x456 << 16 | 0x20) &&
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_interrupt_label == 0x55667788u;
 
@@ -3738,7 +3738,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     const bool compute_clock_matches =
         compute_clock_wait == 0 && interrupt_count == 1 &&
-        interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == (0x567 << 16 | 0x20) &&
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_clock_label != 0;
 
@@ -3756,12 +3756,12 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
             compute_done_wait == 0 && interrupt_count == 1 &&
-                interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
+                interrupt_event.ident == 0x20 && interrupt_event.data == (0x678 << 16 | 0x20) &&
                 interrupt_event.udata == &compute_interrupt_udata &&
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
-    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x789u);
+    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x7654789u);
     gpu.SubmitCompute(0x20, send_context_commands);
     gpu.WaitForIdle();
     finish_gpu();
@@ -3771,7 +3771,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     Require("GpuCommandLane", "kSendIntCtx interrupt",
             send_context_wait == 0 && interrupt_count == 1 &&
-                interrupt_event.ident == 0x20 && interrupt_event.data == 0x789u,
+                interrupt_event.ident == 0x20 && interrupt_event.data == (0x7654789ll << 16 | 0x20),
             "kSendIntCtx lost its interrupt or context id");
 
     // A GDS release interrupt follows the interrupts queued before it, so
@@ -3802,8 +3802,8 @@ public:
     const auto second_wait = wait_for_interrupt(second_event, second_count);
     Require("GpuCommandLane", "GDS interrupt order",
             parked_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT && first_wait == 0 &&
-                interrupt_count == 1 && interrupt_event.data == 0xa1u &&
-                second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
+                interrupt_count == 1 && interrupt_event.data == (0xa1 << 16 | 0x20) &&
+                second_wait == 0 && second_count == 1 && second_event.data == (0xa2 << 16 | 0x20),
             "a GDS release interrupt overtook an earlier interrupt");
 
     // Repeats of the newest undelivered data count in its event instead of queuing.
@@ -3812,8 +3812,8 @@ public:
     }
     const bool coalesced =
         wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.fflags == 2 &&
-        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 &&
-        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3;
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 << 16 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3 << 16;
     Require("GpuCommandLane", "interrupt coalescing", coalesced,
             "undelivered interrupts with the same data were not counted in one event");
 

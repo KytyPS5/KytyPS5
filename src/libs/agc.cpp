@@ -4364,29 +4364,13 @@ int KYTY_SYSV_ABI AgcDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq,
 int KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEvent* ev) {
 	PRINT_NAME();
 
-	if (ev == nullptr) {
-		return 0;
-	}
-
-	if (ev->filter == LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS) {
-		return static_cast<int>(ev->ident);
-	}
-
 	return static_cast<int>(ev->data);
 }
 
 uint32_t KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::KernelEvent* ev) {
 	PRINT_NAME();
 
-	if (ev == nullptr) {
-		return 0;
-	}
-
-	if (ev->filter == LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS) {
-		return static_cast<uint32_t>(ev->data);
-	}
-
-	return static_cast<uint32_t>(ev->ident);
+	return static_cast<uint32_t>(ev->data >> 16u);
 }
 
 int KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {

@@ -3231,15 +3231,16 @@ static void TestWaveformBlockLimits() {
 	const uint64_t past_frame  = (0xFFFFFFF0ull + 0x20u + 27) / 28;
 	Check(block.data_offset == first_frame * (16ull * 8) &&
 	          block.data_size == (past_frame - first_frame) * (16ull * 8) &&
-	          block.num_samples == static_cast<uint32_t>((past_frame - first_frame) * 28) &&
-	          block.num_skip_samples == 0xFFFFFFF0u % 28,
+	          block.num_samples == 0x20 && block.num_skip_samples == 0xFFFFFFF0u % 28,
 	      "VAG CalcWaveformBlock wrapped block arithmetic");
 
-	// A span whose frame-rounded sample count cannot fit the u32 field is
-	// rejected instead of truncated.
-	Check(Ngs2CalcWaveformBlock(&vag8, 0, 0xFFFFFFFFu, &block) ==
-	          NGS2_ERROR_INVALID_WAVEFORM_DATA,
-	      "VAG CalcWaveformBlock accepted an overflowing sample span");
+	// The requested sample count is reported even when it exceeds one frame;
+	// data_size stays aligned to whole VAG frames.
+	Check(Ngs2CalcWaveformBlock(&vag8, 0, 0xFFFFFFFFu, &block) == OK,
+	      "VAG CalcWaveformBlock rejected a maximal sample span");
+	Check(block.num_samples == 0xFFFFFFFFu &&
+	          block.data_size == ((0xFFFFFFFFull + 27) / 28) * (16ull * 8),
+	      "VAG CalcWaveformBlock did not report the requested sample count");
 }
 
 // Phase 3 Test: VAG Codec, Custom Gain, Channel Mixer, Pitch Shift DSP
@@ -3312,7 +3313,7 @@ static void TestVagPhase3() {
 	Check(calcBlock.data_offset == 0, "VAG CalcBlock offset is wrong");
 	Check(calcBlock.data_size == 48, "VAG CalcBlock data_size is wrong (3 frames * 16 bytes)");
 	Check(calcBlock.num_skip_samples == 10, "VAG CalcBlock skip samples are wrong");
-	Check(calcBlock.num_samples == 84, "VAG CalcBlock num_samples is wrong (3 frames * 28)");
+	Check(calcBlock.num_samples == 50, "VAG CalcBlock num_samples is wrong (requested count)");
 
 	// 4. Ngs2GetWaveformFrameInfo for VAG
 	uint32_t frameSize = 0, frameSamples = 0, unitsPerFrame = 0, delaySamples = 0;
@@ -3423,6 +3424,79 @@ static void TestVagPhase3() {
 	Ngs2RackDestroy(samplerRack, nullptr);
 	Ngs2RackDestroy(masterRack, nullptr);
 	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+static void TestVagSetup(Fixture& f, uint32_t rate) {
+	struct {
+		Ngs2VoiceParamHeader h;
+		Ngs2WaveformFormat   fmt;
+	} setup {{sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2WaveformFormat), 0, 0x10000000},
+	         {SCE_NGS2_WAVEFORM_TYPE_VAG, 1, rate, 0, 0, 0}};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &setup.h) == OK,
+	      "VAG sampler setup failed");
+	f.voice.state = Ngs2VoicePlayState::Playing;
+}
+
+static void TestVagPhase3Fixes() {
+	// 3.2: predictor history must persist across frames of the same block.
+	{
+		Fixture f(48000);
+		TestVagSetup(f, 48000);
+		auto vag = MakeVagFile(1, 2, 48000);
+		SetVagUnit(vag, 1, 0, 0, 0x0c, 0, 0x77); // pred 0 -> constant 7
+		SetVagUnit(vag, 1, 1, 0, 0x1c, 0, 0x00); // pred 1 -> ADPCM decay from history
+		Ngs2WaveformBlock block {48, 32, 0, 0, 56, 0, 0};
+		Check(f.QueueBlocks(vag.data(), &block, 1, 0) == OK, "VAG history queue failed");
+		f.Render(56);
+		const float seven = 7.0f / 32768.0f;
+		for (uint32_t i = 0; i < 28; ++i) {
+			Check(std::abs(f.voice.samples[i] - seven) < 1e-4f,
+			      "VAG frame 0 did not decode to constant 7");
+		}
+		constexpr int32_t decay[8] = {6, 5, 4, 3, 2, 1, 0, 0};
+		for (uint32_t i = 0; i < 8; ++i) {
+			Check(std::abs(f.voice.samples[28 + i] - decay[i] / 32768.0f) < 1e-4f,
+			      "VAG predictor history was lost inside the block");
+		}
+	}
+
+	// 3.1: at 24 kHz on a 48 kHz system the lookahead decode must not rewind
+	// the cursor of the frame still being played.
+	{
+		Fixture f(48000);
+		TestVagSetup(f, 24000);
+		auto vag = MakeVagFile(1, 2, 24000);
+		SetVagUnit(vag, 1, 0, 0, 0x0c, 0, 0x77); // frame 0: constant 7
+		SetVagUnit(vag, 1, 1, 0, 0x0c, 0, 0x00); // frame 1: constant 0
+		Ngs2WaveformBlock block {48, 32, 0, 0, 56, 0, 0};
+		Check(f.QueueBlocks(vag.data(), &block, 1, 0) == OK, "VAG lookahead queue failed");
+		f.Render(128);
+		const float seven = 7.0f / 32768.0f;
+		Check(std::abs(f.voice.samples[10] - seven) < 1e-4f &&
+		          std::abs(f.voice.samples[50] - seven) < 1e-4f,
+		      "VAG resampled frame 0 did not play constant 7");
+		for (uint32_t i = 70; i < 110; ++i) {
+			Check(std::abs(f.voice.samples[i]) < 1e-4f,
+			      "VAG lookahead replayed the previous frame at the boundary");
+		}
+	}
+
+	// 3.3: CLEAR with a replacement block must keep the VAG decoder selected.
+	{
+		Fixture f(48000);
+		TestVagSetup(f, 48000);
+		auto vag = MakeVagFile(1, 1, 48000);
+		SetVagUnit(vag, 1, 0, 0, 0x0c, 0, 0x77);
+		Ngs2WaveformBlock block {48, 16, 0, 0, 28, 0, 0};
+		Check(f.QueueBlocks(vag.data(), &block, 1, 0) == OK, "VAG clear queue failed");
+		Check(f.voice.is_vag, "VAG setup did not select the VAG decoder");
+		Check(f.QueueBlocks(vag.data(), &block, 1, 4) == OK,
+		      "VAG CLEAR queue failed");
+		Check(f.voice.is_vag, "CLEAR dropped the replacement block onto the PCM decoder");
+		f.Render(28);
+		Check(std::abs(f.voice.samples[0] - 7.0f / 32768.0f) < 1e-4f,
+		      "VAG block after CLEAR did not decode as VAG");
+	}
 }
 
 static void TestCustomGainPhase3() {
@@ -4306,6 +4380,7 @@ int main() {
 	RUN_TEST(TestWaveformFrameInfoPhase2);
 	RUN_TEST(TestParseWaveformUserPhase2);
 	RUN_TEST(TestVagPhase3);
+	RUN_TEST(TestVagPhase3Fixes);
 	RUN_TEST(TestWaveformFileExtentLimits);
 	RUN_TEST(TestWaveformBlockLimits);
 	RUN_TEST(TestCustomGainPhase3);

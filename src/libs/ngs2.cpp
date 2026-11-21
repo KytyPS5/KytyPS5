@@ -1176,6 +1176,7 @@ struct Ngs2VoiceInternal {
 	uint32_t                            frame_cursor       = 0;
 	uint32_t                            frame_samples      = 0;
 	uint32_t                            next_frame_samples = 0;
+	uint32_t                            next_frame_cursor  = 0;
 	bool                                accepts_blocks     = true;
 	uint32_t                            sample_rate        = 0;
 	uint64_t                            sample_phase       = 0;
@@ -1264,8 +1265,8 @@ struct Ngs2VoiceInternal {
 		frame_cursor       = 0;
 		frame_samples      = 0;
 		next_frame_samples = 0;
+		next_frame_cursor  = 0;
 		waveform_end       = nullptr;
-		is_vag             = false;
 		vag_history        = {};
 		vag_next_data      = nullptr;
 	}
@@ -1278,6 +1279,7 @@ struct Ngs2VoiceInternal {
 		                                   format.sample_rate == 0 || format.num_channels == 0));
 		ResetSetupState();
 		ClearWaveformBlocks();
+		is_vag          = false;
 		channels        = format.num_channels;
 		sample_rate     = format.sample_rate;
 		sample_step     = uint64_t(sample_rate) << 32u;
@@ -2348,7 +2350,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 				}
 				continue;
 			}
-			if (block.data != voice.vag_next_data) {
+			if (voice.vag_next_data != block.data + block.data_cursor) {
 				voice.vag_history = {};
 			}
 			static constexpr int32_t VAG_COEFF[5][2] = {
@@ -2517,6 +2519,8 @@ static bool Ngs2CurrentFrame(Ngs2VoiceInternal& voice) {
 		voice.frame_samples = 0;
 		if (voice.next_frame_samples != 0) {
 			std::swap(voice.decoded_frame, voice.next_decoded_frame);
+			voice.frame_cursor       = voice.next_frame_cursor;
+			voice.next_frame_cursor  = 0;
 			voice.frame_samples      = voice.next_frame_samples;
 			voice.next_frame_samples = 0;
 		} else if (!Ngs2DecodeFrame(voice, voice.decoded_frame, voice.frame_samples)) {
@@ -2559,7 +2563,19 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 				if (voice.next_decoded_frame.empty()) {
 					voice.next_decoded_frame.resize(voice.decoded_frame.size());
 				}
+				// The decode reports the staged frame's start cursor through
+				// frame_cursor/frame_samples; keep them with the staged frame
+				// and restore the cursor of the frame still being played.
+				const auto saved_cursor  = voice.frame_cursor;
+				const auto saved_samples = voice.frame_samples;
+				voice.frame_cursor       = 0;
+				voice.frame_samples      = 0;
 				Ngs2DecodeFrame(voice, voice.next_decoded_frame, voice.next_frame_samples);
+				if (voice.source_generation == generation) {
+					voice.next_frame_cursor = voice.frame_cursor;
+					voice.frame_cursor      = saved_cursor;
+					voice.frame_samples     = saved_samples;
+				}
 			}
 			if (voice.source_generation != generation ||
 			    voice.state != Ngs2VoicePlayState::Playing ||
@@ -3433,14 +3449,11 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 		const uint64_t offset = first * frame_bytes;
 		const uint64_t end    = past * frame_bytes;
 		if (end > std::numeric_limits<uintptr_t>::max() ||
-		    end - offset > std::numeric_limits<size_t>::max() ||
-		    (past - first) * VAG_FRAME_SAMPLES > std::numeric_limits<uint32_t>::max()) {
+		    end - offset > std::numeric_limits<size_t>::max()) {
 			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 		}
-		block->data_offset = offset;
-		block->data_size   = num_samples == 0 ? 0 : end - offset;
-		block->num_samples =
-		    num_samples == 0 ? 0 : static_cast<uint32_t>((past - first) * VAG_FRAME_SAMPLES);
+		block->data_offset      = offset;
+		block->data_size        = num_samples == 0 ? 0 : end - offset;
 		block->num_skip_samples = num_samples == 0 ? 0 : (sample_pos % VAG_FRAME_SAMPLES);
 	} else if (format->waveform_type == 0x11 || format->waveform_type == 0x12 ||
 	           format->waveform_type == 0x14 || format->waveform_type == 0x16 ||
@@ -3453,9 +3466,7 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	} else {
 		return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
 	}
-	if (format->waveform_type != SCE_NGS2_WAVEFORM_TYPE_VAG) {
-		block->num_samples = num_samples;
-	}
+	block->num_samples = num_samples;
 	return OK;
 }
 

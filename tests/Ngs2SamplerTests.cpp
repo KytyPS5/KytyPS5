@@ -961,13 +961,16 @@ void TestMasteringUnknownControl() {
 	mastering_option.common.max_voices = 1;
 	RenderRack master(system, 0x3000, mastering_option.common);
 	auto& mastering = master.Voice();
-	// Trackmania sends control 2 with an 8-byte payload; it is accepted and ignored.
+	// Trackmania sends controls 2 and 3; they are accepted and ignored.
 	struct {
 		Ngs2VoiceParamHeader header {16, 0, 0x30000002};
 		uint32_t             values[2] = {};
 	} unknown;
 	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &unknown.header) == OK,
 	      "unknown mastering control 2 was not accepted");
+	unknown.header.id = 0x30000003;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &unknown.header) == OK,
+	      "unknown mastering control 3 was not accepted");
 }
 
 void TestMasteringDownmix() {

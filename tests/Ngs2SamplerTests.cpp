@@ -13,6 +13,7 @@ namespace {
 void Check(bool condition, const char* message) {
 	if (!condition) {
 		std::fprintf(stderr, "Ngs2SamplerTests: %s\n", message);
+		std::fflush(stderr);
 		std::abort();
 	}
 }
@@ -951,6 +952,75 @@ void TestMasteringGain() {
 	          Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
 	          std::ranges::equal(pcm, expected),
 	      "mastering gain was not clamped or applied per full band and LFE channel");
+}
+
+void TestMasteringUnknownControl() {
+	Ngs2Internal system;
+	system.option = Ngs2DefaultSystemOption();
+	Ngs2RackOptionUnion mastering_option {};
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	mastering_option.common.max_voices = 1;
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& mastering = master.Voice();
+
+	// Test 0x30000002: LFE Filter
+	Ngs2MasteringVoiceEffectParam lfeParam {};
+	lfeParam.header      = {sizeof(Ngs2MasteringVoiceEffectParam), 0, SCE_NGS2_MASTERING_VOICE_PARAM_LFE};
+	lfeParam.enable_flag = 1;
+	lfeParam.value       = 80; // 80 Hz cutoff
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &lfeParam.header) == OK,
+	      "mastering LFE control was not accepted");
+	Check(mastering.mastering_lfe.enabled && mastering.mastering_lfe.cutoff == 80,
+	      "mastering LFE not configured correctly");
+
+	// Test 0x30000003: Limiter
+	Ngs2MasteringVoiceEffectParam limiterParam {};
+	limiterParam.header      = {sizeof(Ngs2MasteringVoiceEffectParam), 0, SCE_NGS2_MASTERING_VOICE_PARAM_LIMITER};
+	limiterParam.enable_flag = 1;
+	float threshold = 0.75f;
+	std::memcpy(&limiterParam.value, &threshold, sizeof(threshold));
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &limiterParam.header) == OK,
+	      "mastering Limiter control was not accepted");
+	Check(mastering.mastering_limiter.enabled && std::abs(mastering.mastering_limiter.threshold - 0.75f) < 1e-4f,
+	      "mastering Limiter not configured correctly");
+
+	// Test 0x30000006: Peak Meter
+	Ngs2MasteringVoiceEffectParam peakParam {};
+	peakParam.header      = {sizeof(Ngs2MasteringVoiceEffectParam), 0, SCE_NGS2_MASTERING_VOICE_PARAM_PEAK_METER};
+	peakParam.enable_flag = 1; // Peak mode
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &peakParam.header) == OK,
+	      "mastering Peak Meter control was not accepted");
+	Check(mastering.peak_meter_mode == 1, "mastering Peak Meter mode not configured correctly");
+}
+
+void TestPcmWaveformFormats() {
+	Ngs2Internal system;
+	system.option = Ngs2DefaultSystemOption();
+	Ngs2RackOptionUnion sampler_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	auto& voice = sampler.Voice();
+
+	// Test formati PCM: 0x11 (8-bit), 0x12 (16-bit), 0x14 (24-bit), 0x16 (32-bit int), 0x18 (32-bit float), 0x1a (64-bit double)
+	const uint32_t formats[] = {0x11, 0x12, 0x14, 0x16, 0x18, 0x1a};
+	for (uint32_t fmt : formats) {
+		struct {
+			Ngs2VoiceParamHeader header {40, 0, 0x10000000};
+			Ngs2WaveformFormat   format {};
+			uint32_t             flags = 0, reserved = 0;
+		} setup;
+		setup.format.waveform_type = fmt;
+		setup.format.num_channels  = 2;
+		setup.format.sample_rate   = 48000;
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
+		      "PCM waveform_type setup was not accepted");
+
+		Ngs2WaveformBlock block {};
+		Check(Ngs2CalcWaveformBlock(&setup.format, 100, 200, &block) == OK,
+		      "PCM CalcWaveformBlock failed");
+		Check(block.num_samples == 200, "PCM CalcWaveformBlock wrong num_samples");
+	}
 }
 
 void TestMasteringDownmix() {
@@ -2437,6 +2507,1320 @@ void TestFiniteFilterTail() {
 	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
 }
 
+void TestSystemRunCommandsAndQueries() {
+	Ngs2SystemOption opt {};
+	Ngs2SystemResetOption(&opt);
+	Check(opt.sample_rate == 48000, "reset option failed");
+
+	Ngs2Internal system;
+	system.option = opt;
+	const auto sys_handle = reinterpret_cast<uintptr_t>(&system);
+
+	// User data
+	uintptr_t ud = 0;
+	Check(Ngs2SystemSetUserData(sys_handle, 0x12345678) == OK, "set user data failed");
+	Check(Ngs2SystemGetUserData(sys_handle, &ud) == OK && ud == 0x12345678, "get user data failed");
+
+	// Sample rate
+	Check(Ngs2SystemSetSampleRate(sys_handle, 44100) == OK && system.option.sample_rate == 44100, "set sample rate failed");
+	Check(Ngs2SystemSetSampleRate(sys_handle, 12345) == NGS2_ERROR_INVALID_SAMPLE_RATE, "invalid sample rate accepted");
+
+	// Lock & Unlock
+	Check(Ngs2SystemLock(sys_handle) == OK, "system lock failed");
+	Check(Ngs2SystemUnlock(sys_handle) == OK, "system unlock failed");
+
+	// Commands
+	struct Cmd {
+		uint32_t id;
+		uint8_t  flags, type;
+		uint16_t count;
+		union {
+			uint64_t    u64;
+			uint32_t    u32;
+			int32_t     i32;
+			float       f;
+			const void* ptr;
+		} value;
+	};
+
+	Cmd cmds[6] = {};
+	cmds[0].id = 0xf00000; // lock
+	cmds[1].id = 0xf00001; // unlock
+	cmds[2].id = 0xf00002; // userdata
+	cmds[2].value.u64 = 0x8888;
+	cmds[3].id = 0xf00004; // samplerate
+	cmds[3].value.u32 = 96000;
+	cmds[4].id = 0xf00005; // grain
+	cmds[4].value.u32 = 128;
+	cmds[5].id = 0xf00006; // unnamed float
+	cmds[5].value.f = 0.75f;
+
+	Check(Ngs2SystemRunCommands(sys_handle, cmds, 6) == OK, "system run commands failed");
+	Check(system.user_data == 0x8888, "system userdata cmd failed");
+	Check(system.option.sample_rate == 96000, "system samplerate cmd failed");
+	Check(system.option.num_grain_samples == 128, "system grain cmd failed");
+	Check(std::abs(system.unnamed_param - 0.75f) < 1e-6f, "system unnamed param failed");
+
+	// Slot command
+	uint8_t slot_bytes[24] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+	Cmd slot_cmd {};
+	slot_cmd.id = 0xf00003 | (2u << 24); // slot 2
+	slot_cmd.value.ptr = slot_bytes;
+	Check(Ngs2SystemRunCommands(sys_handle, &slot_cmd, 1) == OK, "slot cmd failed");
+	Check(system.slot_set[2], "slot 2 not set");
+	Check(std::memcmp(system.slot_data[2].data(), slot_bytes, 24) == 0, "slot data mismatch");
+
+	// Clear slot
+	slot_cmd.value.ptr = nullptr;
+	Check(Ngs2SystemRunCommands(sys_handle, &slot_cmd, 1) == OK, "clear slot failed");
+	Check(!system.slot_set[2], "slot 2 not cleared");
+
+	// QueryInfo tests
+	uint64_t query_ud = 0;
+	Check(Ngs2SystemQueryInfo(sys_handle, 0xf04001, &query_ud, sizeof(query_ud)) == OK, "query userdata failed");
+	Check(query_ud == 0x8888, "queried userdata mismatch");
+
+	// Reset slot for query
+	slot_cmd.value.ptr = slot_bytes;
+	Check(Ngs2SystemRunCommands(sys_handle, &slot_cmd, 1) == OK, "re-set slot failed");
+	uint8_t query_slot[24] = {};
+	Check(Ngs2SystemQueryInfo(sys_handle, 0xf04002 | (2u << 24), query_slot, 24) == OK, "query slot failed");
+	Check(std::memcmp(query_slot, slot_bytes, 24) == 0, "queried slot mismatch");
+
+	// Error handling
+	Cmd bad_cmd {};
+	bad_cmd.id = 0xdeadbeef;
+	Check(Ngs2SystemRunCommands(sys_handle, &bad_cmd, 1) == NGS2_ERROR_INVALID_PARAM_ID, "bad cmd allowed");
+	Check(Ngs2SystemQueryInfo(sys_handle, 0xdeadbeef, &query_ud, sizeof(query_ud)) == NGS2_ERROR_INVALID_SYSTEM_QUERY_ID, "bad query allowed");
+}
+
+void TestRackRunCommandsAndQueries() {
+	Fixture fixture(48000, 2, Ngs2RackType::CustomSampler);
+	auto& rack = fixture.rack;
+	const auto rack_handle = reinterpret_cast<uintptr_t>(&rack);
+	std::memcpy(rack.name, "CustomTestRack", 15);
+	rack.rack_id = 0x4001;
+	rack.uid = 42;
+	rack.option.custom_sampler.custom_rack_option.num_modules = 2;
+	auto& mod0 = rack.option.custom_sampler.custom_rack_option.module[0];
+	mod0.module_id = 0x15;
+	mod0.source_buffer_id = 0;
+	mod0.dest_buffer_id = 0;
+	mod0.state_size = 64;
+
+	// User data
+	uintptr_t ud = 0;
+	Check(Ngs2RackSetUserData(rack_handle, 0x9999) == OK, "rack set user data failed");
+	Check(Ngs2RackGetUserData(rack_handle, &ud) == OK && ud == 0x9999, "rack get user data failed");
+
+	// Lock & Unlock
+	Check(Ngs2RackLock(rack_handle) == OK, "rack lock failed");
+	Check(rack.lock_depth == 1, "rack lock depth mismatch");
+	Check(Ngs2RackUnlock(rack_handle) == OK, "rack unlock failed");
+	Check(rack.lock_depth == 0, "rack lock depth after unlock mismatch");
+
+	// RackRunCommands
+	struct Cmd {
+		uint32_t id;
+		uint8_t  flags, type;
+		uint16_t count;
+		union {
+			uint64_t    u64;
+			uint32_t    u32;
+			int32_t     i32;
+			float       f;
+			const void* ptr;
+		} value;
+	};
+	Cmd cmds[3] = {};
+	cmds[0].id = 0xf10000; // lock
+	cmds[1].id = 0xf10001; // unlock
+	cmds[2].id = 0xf10002; // user data
+	cmds[2].value.u64 = 0x7777;
+	Check(Ngs2RackRunCommands(rack_handle, cmds, 3) == OK, "rack run commands failed");
+	Check(rack.user_data == 0x7777, "rack run commands user data failed");
+
+	// RackGetInfo
+	Ngs2RackInfo info {};
+	Check(Ngs2RackGetInfo(rack_handle, &info, sizeof(info)) == OK, "rack get info failed");
+	Check(std::strcmp(info.name, "CustomTestRack") == 0, "rack get info name mismatch");
+	Check(info.rack_id == 0x4001, "rack get info rack_id mismatch");
+	Check(info.uid == 42, "rack get info uid mismatch");
+	Check(info.type == 0, "rack get info type mismatch"); // sampler/custom_sampler is 0
+	Check(info.num_modules == 2, "rack get info num_modules mismatch");
+	Check(info.active_voice_count == 0, "rack get info active voices mismatch");
+
+	// Test created rack with active voice
+	Ngs2Internal sys {};
+	sys.option.max_grain_samples = 512;
+	sys.option.num_grain_samples = 256;
+	sys.option.sample_rate = 48000;
+	Ngs2RackOptionUnion r_opt {};
+	r_opt.sampler.rack_option.size = sizeof(Ngs2SamplerRackOption);
+	r_opt.sampler.rack_option.max_grain_samples = 512;
+	r_opt.sampler.rack_option.max_voices = 2;
+	r_opt.sampler.rack_option.max_ports = 8;
+	r_opt.sampler.rack_option.max_matrices = 1;
+	r_opt.sampler.max_waveform_blocks = 4;
+	std::vector<uint8_t> r_buf(sizeof(Ngs2RackInternal) + 2 * sizeof(Ngs2VoiceInternal) + 16384);
+	Ngs2ContextBufferInfo c_buf {};
+	c_buf.host_buffer = r_buf.data();
+	c_buf.host_buffer_size = r_buf.size();
+	uintptr_t cr_handle = 0;
+	Check(Ngs2RackCreate(reinterpret_cast<uintptr_t>(&sys), 0x1000, &r_opt.common, &c_buf, &cr_handle) == OK, "create rack failed");
+	auto* cr_voices = reinterpret_cast<Ngs2VoiceInternal*>(reinterpret_cast<Ngs2RackInternal*>(cr_handle) + 1);
+	cr_voices[0].state = Ngs2VoicePlayState::Playing;
+	cr_voices[0].channels = 2;
+	Ngs2RackInfo cr_info {};
+	Check(Ngs2RackGetInfo(cr_handle, &cr_info, sizeof(cr_info)) == OK, "get info for created rack failed");
+	Check(cr_info.active_voice_count == 1, "created rack active voice count mismatch");
+	Check(cr_info.active_channel_work_count == 2, "created rack active channel count mismatch");
+	Check(Ngs2RackDestroy(cr_handle, nullptr) == OK, "destroy created rack failed");
+
+	// RackQueryInfo
+	Ngs2RackInfo qinfo {};
+	Check(Ngs2RackQueryInfo(rack_handle, 0xf14000, &qinfo, sizeof(qinfo)) == OK, "rack query info failed");
+	Check(qinfo.rack_id == 0x4001, "queried rack info mismatch");
+
+	uint64_t q_ud = 0;
+	Check(Ngs2RackQueryInfo(rack_handle, 0xf14001, &q_ud, sizeof(q_ud)) == OK && q_ud == 0x7777, "rack query ud failed");
+
+	Ngs2CustomModuleInfo q_mod {};
+	Check(Ngs2RackQueryInfo(rack_handle, 0xf14002 | (0u << 24), &q_mod, sizeof(q_mod)) == OK, "rack query mod failed");
+	Check(q_mod.module_id == 0x15 && q_mod.state_size == 64, "queried mod mismatch");
+
+	// CustomRackGetModuleInfo
+	Ngs2CustomModuleInfo mod_info {};
+	Check(Ngs2CustomRackGetModuleInfo(rack_handle, 0, &mod_info, sizeof(mod_info)) == OK, "custom rack get module info failed");
+	Check(mod_info.module_id == 0x15 && mod_info.state_size == 64, "module info mismatch");
+	Check(Ngs2CustomRackGetModuleInfo(rack_handle, 99, &mod_info, sizeof(mod_info)) == NGS2_ERROR_INVALID_RACK_MODULE_INDEX, "out of range module allowed");
+}
+
+void TestVoiceOwnerAndMatrixInfo() {
+	Fixture fixture(48000, 2);
+	fixture.voice.matrices.resize(2);
+	fixture.voice.ports.resize(8);
+	const auto voice_handle = reinterpret_cast<uintptr_t>(&fixture.voice);
+	const auto rack_handle = reinterpret_cast<uintptr_t>(&fixture.rack);
+
+	uintptr_t owner = 0;
+	uint32_t voice_index = 999;
+	Check(Ngs2VoiceGetOwner(voice_handle, &owner, &voice_index) == OK, "voice get owner failed");
+	Check(owner == rack_handle, "voice get owner rack mismatch");
+	Check(voice_index == 0, "voice get owner index mismatch");
+
+	// Matrix info
+	Ngs2VoiceMatrixInfo minfo {};
+	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 0, &minfo, sizeof(minfo)) == OK, "voice get matrix info failed");
+	Check(minfo.num_levels == 0, "initial matrix info should be empty");
+
+	// Set matrix levels
+	float levels[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+	struct Cmd {
+		uint32_t id;
+		uint8_t  flags, type;
+		uint16_t count;
+		union {
+			uint32_t     u;
+			int32_t      i;
+			float        f;
+			const float* levels;
+		} value;
+	} cmd {};
+	cmd.id = 5 | (0u << 24); // matrix 0, id 5
+	cmd.type = 0x11;
+	cmd.count = 4;
+	cmd.value.levels = levels;
+	Check(Ngs2VoiceRunCommands(voice_handle, &cmd, 1) == OK, "voice run commands matrix levels failed");
+
+	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 0, &minfo, sizeof(minfo)) == OK, "voice get matrix info after set failed");
+	Check(minfo.num_levels == 4, "matrix levels count mismatch");
+	Check(std::abs(minfo.levels[0] - 0.1f) < 1e-6f && std::abs(minfo.levels[3] - 0.4f) < 1e-6f, "matrix levels values mismatch");
+
+	// Error handling
+	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 999, &minfo, sizeof(minfo)) == NGS2_ERROR_INVALID_PARAM_ID, "out of range matrix accepted");
+	Check(Ngs2VoiceGetMatrixInfo(0, 0, &minfo, sizeof(minfo)) == NGS2_ERROR_INVALID_VOICE_HANDLE, "null voice handle accepted");
+	Check(Ngs2VoiceGetOwner(0, &owner, &voice_index) == NGS2_ERROR_INVALID_VOICE_HANDLE, "null voice handle for owner accepted");
+	Check(Ngs2VoiceGetOwner(voice_handle, nullptr, &voice_index) == NGS2_ERROR_INVALID_OUT_ADDRESS, "null output pointer accepted");
+}
+
+// ================================================================
+// FASE 2 â€” Test FFT
+// Verifica: FftQuerySize, FftInit, FftProcess (forward/inverse).
+// ================================================================
+static void TestFftPhase2() {
+	// --- FftQuerySize: boundary e casi validi ---
+	uint64_t sz = 0;
+	Check(Ngs2FftQuerySize(7, 2, &sz) != OK,  "FftQuerySize: length 7 dovrebbe fallire");
+	Check(Ngs2FftQuerySize(13, 2, &sz) != OK, "FftQuerySize: length 13 dovrebbe fallire");
+	Check(Ngs2FftQuerySize(8, 2, nullptr) != OK, "FftQuerySize: out_size null dovrebbe fallire");
+
+	// length=8, flags=2 â†’ count=64/2=32 â†’ size = 32*32+64 = 1088
+	Check(Ngs2FftQuerySize(8, 2, &sz) == OK, "FftQuerySize(8,2) dovrebbe riuscire");
+	Check(sz == 1088, "FftQuerySize(8,2): dimensione attesa 1088");
+
+	// length=8, flags=0 â†’ count=64 â†’ size = 64*32+64 = 2112
+	Check(Ngs2FftQuerySize(8, 0, &sz) == OK, "FftQuerySize(8,0) dovrebbe riuscire");
+	Check(sz == 2112, "FftQuerySize(8,0): dimensione attesa 2112");
+
+	// Verifica per tutti i length validi (8..12) con flags=2
+	const uint32_t expectedSamples[5] = {64u, 128u, 256u, 512u, 1024u};
+	for (int len = 8; len <= 12; ++len) {
+		Check(Ngs2FftQuerySize(static_cast<uint32_t>(len), 2, &sz) == OK,
+		      "FftQuerySize loop length 8-12 fallita");
+		const uint64_t expectedSz =
+		    static_cast<uint64_t>(expectedSamples[len - 8] / 2u) * 32u + 64u;
+		Check(sz == expectedSz, "FftQuerySize: dimensione loop mismatch");
+	}
+
+	// --- FftInit: validazione parametri ---
+	void* handle = nullptr;
+	std::vector<uint8_t> tooSmall(64);
+	Check(Ngs2FftInit(tooSmall.data(), tooSmall.size(), 8, 2, &handle) != OK,
+	      "FftInit: buffer troppo piccolo dovrebbe fallire");
+	Check(Ngs2FftInit(nullptr, 1088, 8, 2, &handle) != OK,
+	      "FftInit: work null dovrebbe fallire");
+	Check(Ngs2FftInit(tooSmall.data(), 1088, 8, 2, nullptr) != OK,
+	      "FftInit: out_handle null dovrebbe fallire");
+	Check(Ngs2FftInit(tooSmall.data(), 1088, 7, 2, &handle) != OK,
+	      "FftInit: length 7 dovrebbe fallire");
+
+	// Init corretto (flags=2, length=8)
+	Ngs2FftQuerySize(8, 2, &sz);
+	std::vector<uint8_t> workBuf(sz);
+	handle = nullptr;
+	Check(Ngs2FftInit(workBuf.data(), sz, 8, 2, &handle) == OK,
+	      "FftInit flags=2 dovrebbe riuscire");
+	Check(handle == workBuf.data(), "FftInit: handle deve puntare al buffer");
+
+	// Verifica header scritto correttamente
+	int32_t  readLen  = 0;
+	uint32_t readFlgs = 0xdead;
+	std::memcpy(&readLen,  workBuf.data() + 0x10, sizeof(readLen));
+	std::memcpy(&readFlgs, workBuf.data() + 0x14, sizeof(readFlgs));
+	Check(readLen == 8, "FftInit: length in header mismatch");
+	Check(readFlgs == 2, "FftInit: flags in header mismatch");
+
+	// Indirizzo tabella seno/coseno deve essere allineato a 64 byte
+	uint64_t tablePtr = 0;
+	std::memcpy(&tablePtr, workBuf.data() + 0x00, sizeof(tablePtr));
+	Check((tablePtr & 0x3fu) == 0, "FftInit: indirizzo tabella non allineato a 64 byte");
+	Check(tablePtr >= reinterpret_cast<uintptr_t>(workBuf.data()),
+	      "FftInit: indirizzo tabella fuori dal buffer");
+
+	// --- FftProcess: null guard ---
+	Check(Ngs2FftProcess(nullptr, nullptr, nullptr, nullptr, 0, 0) != OK,
+	      "FftProcess: handle null dovrebbe fallire");
+	{
+		float dummyIn[256]  = {};
+		float dummyOut[256] = {};
+		Check(Ngs2FftProcess(nullptr, dummyIn, dummyOut, nullptr, 0, 0) != OK,
+		      "FftProcess: handle null dovrebbe fallire (2)");
+	}
+
+	// --- FftProcess flags=0: pass-through (copia work_buf in out) ---
+	Ngs2FftQuerySize(8, 0, &sz);
+	std::vector<uint8_t> workF0(sz);
+	void* handleF0 = nullptr;
+	Check(Ngs2FftInit(workF0.data(), sz, 8, 0, &handleF0) == OK, "FftInit flags=0 dovrebbe riuscire");
+	const size_t points0 = 256; // 1<<8
+	std::vector<float> dummyIn(points0 * 2, 1.0f);
+	std::vector<float> scratchF0(points0 * 2);
+	for (size_t i = 0; i < scratchF0.size(); ++i) {
+		scratchF0[i] = static_cast<float>(i) * 0.25f - 10.0f;
+	}
+	std::vector<float> outF0(points0 * 2, -1.0f);
+	Check(Ngs2FftProcess(handleF0, dummyIn.data(), outF0.data(), scratchF0.data(), 0, 0) == OK,
+	      "FftProcess flags=0 dovrebbe riuscire");
+	Check(outF0 == scratchF0, "FftProcess flags=0: output deve essere uguale a scratchF0");
+
+	// --- FftProcess flags=2: forward + inverse (round-trip identity) ---
+	for (int len = 8; len <= 10; ++len) { // test su 64, 128, 256 campioni (veloce)
+		Ngs2FftQuerySize(static_cast<uint32_t>(len), 2, &sz);
+		std::vector<uint8_t> fftWork(sz);
+		void* fftHandle = nullptr;
+		Check(Ngs2FftInit(fftWork.data(), sz, len, 2, &fftHandle) == OK,
+		      "FftInit loop dovrebbe riuscire");
+
+		const size_t N = size_t{1} << len;
+		// Segnale di test: seno + coseno per garantire spettro non banale
+		std::vector<float> timeIn(N);
+		for (size_t i = 0; i < N; ++i) {
+			timeIn[i] = static_cast<float>(
+			    std::sin(0.13 * static_cast<double>(i)) +
+			    0.5 * std::cos(0.37 * static_cast<double>(i)));
+		}
+
+		// Forward: mode=0x5 (forward, internal order, no scaling)
+		// Output: N float (layout internal order per input IFFT)
+		std::vector<float> intSpec(N, 0.0f);
+		Check(Ngs2FftProcess(fftHandle, timeIn.data(), intSpec.data(), nullptr, 0, 0x5) == OK,
+		      "FftProcess forward (internal) dovrebbe riuscire");
+
+		// Inverse: mode=0xC (inverse, internal order, scaling 1/N) -> round-trip identity
+		std::vector<float> invScaled(N, 0.0f);
+		Check(Ngs2FftProcess(fftHandle, intSpec.data(), invScaled.data(), nullptr, 0, 0xC) == OK,
+		      "FftProcess inverse (internal, scaled) dovrebbe riuscire");
+
+		// Verifica round-trip
+		bool roundTrip = true;
+		for (size_t i = 0; i < N; ++i) {
+			if (std::abs(invScaled[i] - timeIn[i]) > 1e-3f) {
+				roundTrip = false;
+				break;
+			}
+		}
+		Check(roundTrip, "FftProcess: round-trip FFT->IFFT non ha riprodotto il segnale originale");
+
+		// Forward mode=0xD (forward + scale 1/N, internal order) deve essere intSpec / N
+		std::vector<float> intSpecScaled(N, 0.0f);
+		Check(Ngs2FftProcess(fftHandle, timeIn.data(), intSpecScaled.data(), nullptr, 0, 0xD) == OK,
+		      "FftProcess forward (internal, scaled) dovrebbe riuscire");
+		const float scaleF = 1.0f / static_cast<float>(N);
+		bool specScaleOk = true;
+		for (size_t i = 0; i < N; ++i) {
+			if (std::abs(intSpecScaled[i] - intSpec[i] * scaleF) > 1e-5f) {
+				specScaleOk = false;
+				break;
+			}
+		}
+		Check(specScaleOk, "FftProcess: mode=0xD (forward+scale, internal) mismatch");
+	}
+}
+
+// ================================================================
+// FASE 2 â€” Test GetWaveformFrameInfo
+// Verifica per PCM I16, PCM float32, format null, out null.
+// ================================================================
+static void TestWaveformFrameInfoPhase2() {
+	uint32_t frameSize = 0, numSamples = 0, unitsPerFrame = 0, delaySamples = 0;
+
+	// --- Null guard ---
+	{
+		Ngs2WaveformFormat fmt{};
+		fmt.waveform_type = 0x12u; // PCM I16L
+		fmt.num_channels  = 2;
+		fmt.sample_rate   = 48000;
+		Check(Ngs2GetWaveformFrameInfo(nullptr, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: format null dovrebbe ritornare INVALID_WAVEFORM_FORMAT");
+		Check(Ngs2GetWaveformFrameInfo(&fmt, nullptr, &numSamples, &unitsPerFrame, &delaySamples)
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: frame_size null dovrebbe fallire");
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, nullptr, &unitsPerFrame, &delaySamples)
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: num_samples null dovrebbe fallire");
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, nullptr, &delaySamples)
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: units_per_frame null dovrebbe fallire");
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, nullptr)
+		      == NGS2_ERROR_INVALID_OUT_ADDRESS, "GetWaveformFrameInfo: delay_samples null dovrebbe fallire");
+	}
+
+	// --- Formato non valido ---
+	{
+		Ngs2WaveformFormat bad{};
+		bad.waveform_type = 0x12u;
+		bad.num_channels  = 0;   // invalido
+		bad.sample_rate   = 48000;
+		Check(Ngs2GetWaveformFrameInfo(&bad, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: num_channels=0 dovrebbe fallire");
+
+		bad.num_channels  = 2;
+		bad.sample_rate   = 0;   // invalido
+		Check(Ngs2GetWaveformFrameInfo(&bad, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == NGS2_ERROR_INVALID_WAVEFORM_FORMAT, "GetWaveformFrameInfo: sample_rate=0 dovrebbe fallire");
+	}
+
+	// --- PCM 16-bit stereo (tipo 0x12) ---
+	{
+		Ngs2WaveformFormat fmt{};
+		fmt.waveform_type = 0x12u;
+		fmt.num_channels  = 2;
+		fmt.sample_rate   = 48000;
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == OK, "GetWaveformFrameInfo PCM16 stereo dovrebbe riuscire");
+		// frame = 2 canali * 2 byte = 4 byte
+		Check(frameSize     == 4,  "GetWaveformFrameInfo PCM16 stereo: frame_size atteso 4");
+		Check(numSamples    == 1,  "GetWaveformFrameInfo PCM16: num_frame_samples atteso 1");
+		Check(unitsPerFrame == 1,  "GetWaveformFrameInfo PCM16: units_per_frame atteso 1");
+		Check(delaySamples  == 0,  "GetWaveformFrameInfo PCM16: delay_samples atteso 0");
+	}
+
+	// --- PCM 32-bit float mono (tipo 0x18) ---
+	{
+		Ngs2WaveformFormat fmt{};
+		fmt.waveform_type = 0x18u;
+		fmt.num_channels  = 1;
+		fmt.sample_rate   = 44100;
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == OK, "GetWaveformFrameInfo PCM32F mono dovrebbe riuscire");
+		// frame = 1 canale * 4 byte = 4 byte
+		Check(frameSize     == 4,  "GetWaveformFrameInfo PCM32F mono: frame_size atteso 4");
+		Check(numSamples    == 1,  "GetWaveformFrameInfo PCM32F: num_frame_samples atteso 1");
+		Check(unitsPerFrame == 1,  "GetWaveformFrameInfo PCM32F: units_per_frame atteso 1");
+		Check(delaySamples  == 0,  "GetWaveformFrameInfo PCM32F: delay_samples atteso 0");
+	}
+
+	// --- PCM 24-bit 6-canali (tipo 0x14) ---
+	{
+		Ngs2WaveformFormat fmt{};
+		fmt.waveform_type = 0x14u;
+		fmt.num_channels  = 6;
+		fmt.sample_rate   = 48000;
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == OK, "GetWaveformFrameInfo PCM24 6ch dovrebbe riuscire");
+		// frame = 6 * 3 = 18 byte
+		Check(frameSize == 18, "GetWaveformFrameInfo PCM24 6ch: frame_size atteso 18");
+	}
+
+	// --- Tipo waveform non riconosciuto ---
+	{
+		Ngs2WaveformFormat fmt{};
+		fmt.waveform_type = 0x99u; // sconosciuto
+		fmt.num_channels  = 2;
+		fmt.sample_rate   = 48000;
+		Check(Ngs2GetWaveformFrameInfo(&fmt, &frameSize, &numSamples, &unitsPerFrame, &delaySamples)
+		      == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT, "GetWaveformFrameInfo: tipo sconosciuto dovrebbe fallire");
+	}
+}
+
+// ================================================================
+// FASE 2 — Test ParseWaveformUser
+// Verifica tramite un handler in-memory che legge da un buffer.
+// ================================================================
+struct ParseWaveformUserTestCtx {
+	const std::vector<uint8_t>* data;
+};
+
+static int32_t KYTY_SYSV_ABI TestParseReadHandler(uintptr_t ud, uint32_t offset, void* buf, size_t sz) {
+	const auto* ctx = reinterpret_cast<const ParseWaveformUserTestCtx*>(ud);
+	if (ctx == nullptr || ctx->data == nullptr) {
+		return -1;
+	}
+	if (offset + sz > ctx->data->size()) {
+		return -1;
+	}
+	std::memcpy(buf, ctx->data->data() + offset, sz);
+	return 0;
+}
+
+static void TestParseWaveformUserPhase2() {
+	// --- Null guard ---
+	{
+		Ngs2WaveformInfo info{};
+		Check(Ngs2ParseWaveformUser(0, 0, &info) != OK,
+		      "ParseWaveformUser: handler=0 dovrebbe fallire");
+		Check(Ngs2ParseWaveformUser(1, 0, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+		      "ParseWaveformUser: out_info=null dovrebbe ritornare INVALID_OUT_ADDRESS");
+	}
+
+	// Costruiamo un buffer RIFF/WAVE PCM I16 stereo in-memory
+	// Struttura: RIFF <size> WAVE | fmt <16> <pcm_hdr> | data <size> <samples>
+	// Allineiamo a un WAV stereo 16-bit 48kHz con 4 campioni
+	const uint16_t numChannels     = 2;
+	const uint32_t sampleRate      = 48000;
+	const uint16_t bitsPerSample   = 16;
+	const uint16_t blockAlign      = numChannels * (bitsPerSample / 8);
+	const uint32_t byteRate        = sampleRate * blockAlign;
+	const uint32_t numFrames       = 4; // 4 campioni interleaved stereo
+	const uint32_t dataSize        = numFrames * blockAlign;
+
+	// fmt chunk: 16 byte
+	std::vector<uint8_t> riff;
+	auto appendU8  = [&](uint8_t v)  { riff.push_back(v); };
+	auto appendLE16 = [&](uint16_t v) {
+		riff.push_back(static_cast<uint8_t>(v));
+		riff.push_back(static_cast<uint8_t>(v >> 8));
+	};
+	auto appendLE32 = [&](uint32_t v) {
+		riff.push_back(static_cast<uint8_t>(v));
+		riff.push_back(static_cast<uint8_t>(v >>  8));
+		riff.push_back(static_cast<uint8_t>(v >> 16));
+		riff.push_back(static_cast<uint8_t>(v >> 24));
+	};
+	auto appendFourCC = [&](const char* cc) {
+		riff.push_back(static_cast<uint8_t>(cc[0]));
+		riff.push_back(static_cast<uint8_t>(cc[1]));
+		riff.push_back(static_cast<uint8_t>(cc[2]));
+		riff.push_back(static_cast<uint8_t>(cc[3]));
+	};
+	(void)appendU8;
+
+	// RIFF header (12 byte)
+	const uint32_t riffBodySize = 4 + 8 + 16 + 8 + dataSize; // "WAVE" + fmt chunk + data chunk
+	appendFourCC("RIFF");
+	appendLE32(riffBodySize);
+	appendFourCC("WAVE");
+	// fmt chunk (8+16 = 24 byte)
+	appendFourCC("fmt ");
+	appendLE32(16);
+	appendLE16(1);                   // PCM
+	appendLE16(numChannels);
+	appendLE32(sampleRate);
+	appendLE32(byteRate);
+	appendLE16(blockAlign);
+	appendLE16(bitsPerSample);
+	// data chunk
+	appendFourCC("data");
+	appendLE32(dataSize);
+	for (uint32_t i = 0; i < numFrames * numChannels; ++i) {
+		appendLE16(static_cast<uint16_t>(i * 100));
+	}
+
+	ParseWaveformUserTestCtx ctx{&riff};
+	Ngs2WaveformInfo winfo{};
+	const int parseResult = Ngs2ParseWaveformUser(
+	    reinterpret_cast<uintptr_t>(&TestParseReadHandler),
+	    reinterpret_cast<uintptr_t>(&ctx),
+	    &winfo);
+	Check(parseResult == OK, "ParseWaveformUser: parsing RIFF PCM valido dovrebbe riuscire");
+	Check(winfo.format.waveform_type == 0x12u, "ParseWaveformUser: waveform_type dovrebbe essere PCM I16");
+	Check(winfo.format.num_channels  == numChannels, "ParseWaveformUser: num_channels mismatch");
+	Check(winfo.format.sample_rate   == sampleRate,  "ParseWaveformUser: sample_rate mismatch");
+	Check(winfo.num_samples          == numFrames,   "ParseWaveformUser: num_samples mismatch");
+
+	// --- Handler che restituisce un file non WAVE (formato sconosciuto) ---
+	{
+		const std::vector<uint8_t> junk(32, 0x00);
+		ParseWaveformUserTestCtx bctx{&junk};
+		Ngs2WaveformInfo bad{};
+		const int r = Ngs2ParseWaveformUser(
+		    reinterpret_cast<uintptr_t>(&TestParseReadHandler),
+		    reinterpret_cast<uintptr_t>(&bctx),
+		    &bad);
+		Check(r == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT,
+		      "ParseWaveformUser: dati non WAVE dovrebbero ritornare UNKNOWN_WAVEFORM_FORMAT");
+	}
+}
+
+// ============================================================================
+// Test Fase 3: VAG Codec, Custom Gain, Channel Mixer, Pitch Shift DSP
+// ============================================================================
+
+static void PutBe32(std::vector<uint8_t>& data, size_t offset, uint32_t val) {
+	for (size_t i = 0; i < 4; ++i) {
+		data[offset + i] = static_cast<uint8_t>(val >> (24 - 8 * i));
+	}
+}
+
+static std::vector<uint8_t> MakeVagFile(uint32_t channelByte, uint32_t frames, uint32_t rate = 48000) {
+	const uint32_t channels = channelByte == 0 ? 1 : channelByte;
+	std::vector<uint8_t> data(48 + frames * channels * 16u, 0);
+	std::memcpy(data.data(), "VAGp", 4);
+	PutBe32(data, 4, 0x20001);
+	PutBe32(data, 0x0c, frames * channels * 16u);
+	PutBe32(data, 0x10, rate);
+	data[0x1e] = static_cast<uint8_t>(channelByte);
+	return data;
+}
+
+static void SetVagUnit(std::vector<uint8_t>& data, uint32_t channels, uint32_t frame, uint32_t ch,
+                       uint8_t predictorShift, uint8_t flags, uint8_t nibbles) {
+	uint8_t* unit = data.data() + 48 + (frame * channels + ch) * 16u;
+	unit[0] = predictorShift;
+	unit[1] = flags;
+	std::memset(unit + 2, nibbles, 14);
+}
+
+static void TestVagPhase3() {
+	// 1. Parsing Header VAG
+	auto vagData = MakeVagFile(2, 3, 44100); // 2 canali, 3 frame (ciascun blocco frame: 2*16 = 32 byte)
+	// Imposta flag di fine frame sul secondo frame per non farlo considerare come dropped frame
+	SetVagUnit(vagData, 2, 1, 0, 0, 2, 0);
+
+	Ngs2WaveformInfo info {};
+	int res = Ngs2ParseWaveformData(vagData.data(), vagData.size(), &info);
+	Check(res == OK, "VAG Parse: parsing fallito per file VAG valido");
+	Check(info.format.waveform_type == SCE_NGS2_WAVEFORM_TYPE_VAG, "VAG Parse: waveform_type errato");
+	Check(info.format.num_channels == 2, "VAG Parse: channels errati");
+	Check(info.format.sample_rate == 44100, "VAG Parse: sample_rate errato");
+	Check(info.audio_unit_size == 32, "VAG Parse: audio_unit_size errato");
+	Check(info.num_audio_unit_samples == 28, "VAG Parse: num_audio_unit_samples errato");
+	Check(info.num_samples == 84, "VAG Parse: num_samples errato per 3 frame");
+	Check(info.num_blocks == 1, "VAG Parse: num_blocks errato");
+
+	// 2. Loop Parsing VAG
+	auto loopVag = MakeVagFile(1, 4, 48000); // 1 canale, 4 frame
+	// Frame 1: loop start (flag 6) -> sample 28
+	SetVagUnit(loopVag, 1, 1, 0, 0, 6, 0);
+	// Frame 2: loop end (flag 3) -> sample 84
+	SetVagUnit(loopVag, 1, 2, 0, 0, 3, 0);
+	Ngs2WaveformInfo loopInfo {};
+	res = Ngs2ParseWaveformData(loopVag.data(), loopVag.size(), &loopInfo);
+	Check(res == OK, "VAG Parse Loop: parsing fallito");
+	Check(loopInfo.loop_begin_position == 28, "VAG Parse Loop: loop_begin errato");
+	Check(loopInfo.loop_end_position == 84, "VAG Parse Loop: loop_end errato");
+	Check(loopInfo.num_blocks == 3, "VAG Parse Loop: num_blocks dovrebbe essere 3");
+	Check(loopInfo.blocks[0].num_repeats == 0, "VAG Parse Loop: blocco 0 non deve ripetere");
+	Check(loopInfo.blocks[1].num_repeats == UINT32_MAX, "VAG Parse Loop: blocco 1 deve ripetere all'infinito");
+
+	// 3. Ngs2CalcWaveformBlock per VAG
+	Ngs2WaveformFormat vagFmt {};
+	vagFmt.waveform_type = SCE_NGS2_WAVEFORM_TYPE_VAG;
+	vagFmt.num_channels  = 1;
+	vagFmt.sample_rate   = 48000;
+	Ngs2WaveformBlock calcBlock {};
+	res = Ngs2CalcWaveformBlock(&vagFmt, 10, 50, &calcBlock);
+	Check(res == OK, "VAG CalcBlock fallito");
+	Check(calcBlock.data_offset == 0, "VAG CalcBlock offset errato");
+	Check(calcBlock.data_size == 48, "VAG CalcBlock data_size errato (3 frame * 16 byte)");
+	Check(calcBlock.num_skip_samples == 10, "VAG CalcBlock skip samples errato");
+	Check(calcBlock.num_samples == 84, "VAG CalcBlock num_samples errato (3 frame * 28)");
+
+	// 4. Ngs2GetWaveformFrameInfo per VAG
+	uint32_t frameSize = 0, frameSamples = 0, unitsPerFrame = 0, delaySamples = 0;
+	res = Ngs2GetWaveformFrameInfo(&vagFmt, &frameSize, &frameSamples, &unitsPerFrame, &delaySamples);
+	Check(res == OK, "VAG GetWaveformFrameInfo fallito");
+	Check(frameSize == 16, "VAG GetWaveformFrameInfo frameSize errato");
+	Check(frameSamples == 28, "VAG GetWaveformFrameInfo frameSamples errato");
+	Check(delaySamples == 0, "VAG GetWaveformFrameInfo delaySamples errato");
+
+	// 5. Test Decoding ADPCM VAG con Render reale
+	// Costruiamo un file VAG con frame 0 = nibble 7 (shift 12, pred 0) e frame 1 = nibble 0 (shift 12, pred 1: coeff 60)
+	auto decData = MakeVagFile(1, 2, 48000);
+	SetVagUnit(decData, 1, 0, 0, 0x0c, 0, 0x77); // Frame 0: shift 12, pred 0 -> campioni = 7
+	SetVagUnit(decData, 1, 1, 0, 0x1c, 0, 0x00); // Frame 1: shift 12, pred 1 -> decadimento ADPCM
+
+	Ngs2WaveformBlock testBlocks[2] = {
+		{48, 16, 0, 0, 28, 0, 0},
+		{64, 16, 0, 0, 28, 0, 0}
+	};
+
+	uintptr_t sysHandle = 0;
+	Ngs2SystemOption sysOpt = Ngs2DefaultSystemOption();
+	sysOpt.num_grain_samples = 64;
+	sysOpt.max_grain_samples = 64;
+	sysOpt.sample_rate       = 48000;
+	sysOpt.max_voice_channels = 2;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test VAG");
+
+	uintptr_t samplerRack = 0;
+	Ngs2RackOptionUnion sOption {};
+	Ngs2FillDefaultRackOption(0x1000, &sOption);
+	sOption.sampler.rack_option.max_voices = 1;
+	sOption.sampler.rack_option.max_grain_samples = 64;
+	std::vector<uint8_t> rackBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rackBuf.data(), rackBuf.size(), {0}};
+	res = Ngs2RackCreate(sysHandle, 0x1000, &sOption.sampler.rack_option, &rbi, &samplerRack);
+	Check(res == OK && samplerRack != 0, "RackCreate Sampler fallito per test VAG");
+
+	uintptr_t masterRack = 0;
+	Ngs2RackOptionUnion mOption {};
+	Ngs2FillDefaultRackOption(0x3000, &mOption);
+	mOption.mastering.rack_option.max_voices = 1;
+	mOption.mastering.rack_option.max_grain_samples = 64;
+	std::vector<uint8_t> mBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo mbi {mBuf.data(), mBuf.size(), {0}};
+	res = Ngs2RackCreate(sysHandle, 0x3000, &mOption.mastering.rack_option, &mbi, &masterRack);
+	Check(res == OK && masterRack != 0, "RackCreate Mastering fallito per test VAG");
+
+	uintptr_t sVoice = 0, mVoice = 0;
+	Ngs2RackGetVoiceHandle(samplerRack, 0, &sVoice);
+	Ngs2RackGetVoiceHandle(masterRack, 0, &mVoice);
+
+	// Setup master: 1 canale
+	struct { Ngs2VoiceParamHeader h; uint32_t ch; } mSetup {{sizeof(Ngs2VoiceParamHeader) + 4, 0, 0x30000000}, 1};
+	Ngs2VoiceControl(mVoice, &mSetup.h);
+	struct { Ngs2VoiceParamHeader h; uint32_t outId; uint32_t r; } mOut {{sizeof(Ngs2VoiceParamHeader) + 8, 0, 0x30000005}, 0, 0};
+	Ngs2VoiceControl(mVoice, &mOut.h);
+	Ngs2VoiceEventParam mPlay {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(mVoice, &mPlay.header);
+
+	// Setup sampler per VAG
+	struct { Ngs2VoiceParamHeader h; Ngs2WaveformFormat fmt; } sSetup {
+		{sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2WaveformFormat), 0, 0x10000000},
+		{SCE_NGS2_WAVEFORM_TYPE_VAG, 1, 48000, 0, 0, 0}
+	};
+	Ngs2VoiceControl(sVoice, &sSetup.h);
+
+	// Patch sampler -> master
+	Ngs2VoicePatchParam patch {{sizeof(Ngs2VoicePatchParam), 0, 0x00000005}, 0, 0, masterRack};
+	Ngs2VoiceControl(sVoice, &patch.header);
+
+	// Aggiunta blocchi VAG
+	struct {
+		Ngs2VoiceParamHeader h;
+		const uint8_t* data;
+		uint32_t flags, count;
+		const Ngs2WaveformBlock* blocks;
+	} addBlocks {
+		{sizeof(Ngs2VoiceParamHeader) + 24, 0, 0x10000001},
+		decData.data(), 0, 2, testBlocks
+	};
+	Ngs2VoiceControl(sVoice, &addBlocks.h);
+
+	// Play
+	Ngs2VoiceControl(sVoice, &mPlay.header);
+
+	// Render
+	std::vector<float> renderOut(64, 0.0f);
+	Ngs2RenderBufferInfo rinfo {renderOut.data(), renderOut.size() * sizeof(float), 0x18, 1};
+	res = Ngs2SystemRender(sysHandle, &rinfo, 1);
+	Check(res == OK, "SystemRender fallito per test VAG");
+
+	// Verifica: i primi 28 campioni devono essere ~ 7 / 32768.0f
+	const float expected7 = 7.0f / 32768.0f;
+	for (size_t i = 0; i < 28; ++i) {
+		Check(std::abs(renderOut[i] - expected7) < 1e-4f, "VAG decode sample != 7 nel frame 0");
+	}
+	// E i campioni successivi del frame 1 devono seguire il decadimento {6, 5, 4, 3, 2, 1, 0, 0}
+	constexpr int32_t decay[8] = {6, 5, 4, 3, 2, 1, 0, 0};
+	for (size_t i = 0; i < 8; ++i) {
+		const float expDecay = decay[i] / 32768.0f;
+		Check(std::abs(renderOut[28 + i] - expDecay) < 1e-4f, "VAG ADPCM decadimento errato");
+	}
+
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+static void TestCustomGainPhase3() {
+	uintptr_t sysHandle = 0;
+	Ngs2SystemOption sysOpt = Ngs2DefaultSystemOption();
+	sysOpt.num_grain_samples  = 64;
+	sysOpt.max_grain_samples  = 64;
+	sysOpt.sample_rate        = 48000;
+	sysOpt.max_voice_channels = 2;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	int res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test Gain");
+
+	// Custom Submixer Rack con modulo Gain (ID 0x15)
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_GAIN;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t gainRack = 0;
+	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &gainRack);
+	Check(res == OK && gainRack != 0, "RackCreate CustomSubmixer fallito per test Gain");
+
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(gainRack, 0, &voice);
+
+	// Setup custom submixer: 2 canali
+	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	Ngs2VoiceControl(voice, &vsetup.header);
+
+	// Imposta guadagno iniziale tramite SCE_NGS2_CUSTOM_VOICE_PARAM_GAIN (0x40001500)
+	Ngs2CustomVoiceGainParam gparam {};
+	gparam.header = {sizeof(Ngs2CustomVoiceGainParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_GAIN};
+	gparam.gain[0] = 2.0f;
+	gparam.gain[1] = 0.5f;
+	res = Ngs2VoiceControl(voice, &gparam.header);
+	Check(res == OK, "VoiceControl Gain fallito");
+
+	// Avvia la voce
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+
+	// Simula campioni in input tramite sorgente collegata
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	int16_t ones[64 * 2];
+	for (int i = 0; i < 64 * 2; ++i) ones[i] = 32767;
+	src.Queue(ones, 64, 0);
+
+	// Imposta target gain per testare la rampa
+	gparam.gain[0] = 4.0f;
+	gparam.gain[1] = 0.0f;
+	Ngs2VoiceControl(voice, &gparam.header);
+
+	// Elaborazione modulo Gain
+	std::vector<Ngs2VoiceInternal*> voicesList {&src.voice};
+	Ngs2RenderVoice(*vInt, voicesList, 64);
+
+	float* b = vInt->Buffer(0, 64);
+
+	// Verifica: il primo campione deve partire dal valore precedente (2.0f e 0.5f)
+	// e l'ultimo campione della rampa deve tendere al nuovo target (4.0f e 0.0f)
+	Check(std::abs(b[0] - 2.0f) < 0.01f, "Gain rampa ch0 start errato");
+	Check(std::abs(b[64] - 0.5f) < 0.01f, "Gain rampa ch1 start errato");
+	Check(b[63] > 3.8f, "Gain rampa ch0 end non raggiunge il target");
+	Check(b[64 + 63] < 0.1f, "Gain rampa ch1 end non raggiunge il target");
+
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+static void TestCustomChannelMixerPhase3() {
+	uintptr_t sysHandle = 0;
+	Ngs2SystemOption sysOpt = Ngs2DefaultSystemOption();
+	sysOpt.num_grain_samples  = 64;
+	sysOpt.max_grain_samples  = 64;
+	sysOpt.sample_rate        = 48000;
+	sysOpt.max_voice_channels = 2;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	int res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test Mixer");
+
+	// Custom Submixer con modulo Channel Mixer (ID 0x17)
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_CHANNEL_MIXER;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t mixerRack = 0;
+	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &mixerRack);
+	Check(res == OK && mixerRack != 0, "RackCreate CustomSubmixer fallito per test Mixer");
+
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(mixerRack, 0, &voice);
+
+	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	Ngs2VoiceControl(voice, &vsetup.header);
+
+	// Configura matrice channel mixer: swap canali (L -> R, R -> L)
+	Ngs2CustomVoiceChannelMixerParam mparam {};
+	mparam.header = {sizeof(Ngs2CustomVoiceChannelMixerParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_CHANNEL_MIXER};
+	mparam.level[0][1] = 1.0f; // Dst 0 (L) riceve Src 1 (R)
+	mparam.level[1][0] = 1.0f; // Dst 1 (R) riceve Src 0 (L)
+	res = Ngs2VoiceControl(voice, &mparam.header);
+	Check(res == OK, "VoiceControl ChannelMixer fallito");
+
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	int16_t mixInput[64 * 2];
+	for (int i = 0; i < 64; ++i) {
+		mixInput[2 * i]     = 24576; // Ch 0 = 0.75f
+		mixInput[2 * i + 1] = 8192;  // Ch 1 = 0.25f
+	}
+	src.Queue(mixInput, 64, 0);
+
+	std::vector<Ngs2VoiceInternal*> voicesList {&src.voice};
+	Ngs2RenderVoice(*vInt, voicesList, 64);
+
+	float* b = vInt->Buffer(0, 64);
+
+	// Dopo il mix i canali devono essere invertiti: Ch 0 riceve 0.25f, Ch 1 riceve 0.75f
+	for (size_t i = 0; i < 64; ++i) {
+		Check(std::abs(b[i] - 0.25f) < 0.01f, "ChannelMixer Ch0 swap errato");
+		Check(std::abs(b[64 + i] - 0.75f) < 0.01f, "ChannelMixer Ch1 swap errato");
+	}
+
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+static void TestCustomPitchShiftPhase3() {
+	uintptr_t sysHandle = 0;
+	Ngs2SystemOption sysOpt = Ngs2DefaultSystemOption();
+	sysOpt.num_grain_samples  = 64;
+	sysOpt.max_grain_samples  = 64;
+	sysOpt.sample_rate        = 48000;
+	sysOpt.max_voice_channels = 2;
+	std::vector<uint8_t> sysBuf(sizeof(Ngs2Internal));
+	Ngs2ContextBufferInfo sbi {sysBuf.data(), sysBuf.size(), {0}};
+	int res = Ngs2SystemCreate(&sysOpt, &sbi, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test PitchShift");
+
+	// Custom Submixer con modulo Pitch Shift (ID 0x20)
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_PITCH_SHIFT;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t pitchRack = 0;
+	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &pitchRack);
+	Check(res == OK && pitchRack != 0, "RackCreate CustomSubmixer fallito per test PitchShift");
+
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(pitchRack, 0, &voice);
+
+	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	Ngs2VoiceControl(voice, &vsetup.header);
+
+	// Imposta pitch shift: +700 cents, canale 1 in bypass (bypass_mask = 2: bit 1 attivo)
+	Ngs2CustomVoicePitchShiftParam pparam {};
+	pparam.header = {sizeof(Ngs2CustomVoicePitchShiftParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_PITCH_SHIFT};
+	pparam.cents  = 700;
+	pparam.bypass_mask = 2; // bypass Ch 1
+	res = Ngs2VoiceControl(voice, &pparam.header);
+	Check(res == OK, "VoiceControl PitchShift fallito");
+
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	int16_t psInput[64 * 2];
+	for (int i = 0; i < 64; ++i) {
+		psInput[2 * i]     = 16384; // Ch 0 = 0.5f
+		psInput[2 * i + 1] = 10922; // Ch 1 = ~0.333f
+	}
+	src.Queue(psInput, 64, 0);
+
+	std::vector<Ngs2VoiceInternal*> voicesList {&src.voice};
+	Ngs2RenderVoice(*vInt, voicesList, 64);
+
+	float* b = vInt->Buffer(0, 64);
+
+	// Canale 1 è in bypass, quindi i suoi campioni non devono essere modificati dal processore
+	for (size_t i = 0; i < 64; ++i) {
+		Check(std::abs(b[64 + i] - (10922.0f / 32768.0f)) < 0.01f, "PitchShift Ch1 bypass errato, valore modificato");
+	}
+
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+void TestCustomFilterModule() {
+	Ngs2SystemOption opt {};
+	Ngs2SystemResetOption(&opt);
+	opt.num_grain_samples = 64;
+	opt.sample_rate = 48000;
+
+	Ngs2ContextBufferInfo sysBufInfo {};
+	Ngs2SystemQueryBufferSize(&opt, &sysBufInfo);
+	std::vector<uint8_t> sysBuf(sysBufInfo.host_buffer_size);
+	sysBufInfo.host_buffer = sysBuf.data();
+
+	uintptr_t sysHandle = 0;
+	int res = Ngs2SystemCreate(&opt, &sysBufInfo, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test CustomFilter");
+
+	Ngs2CustomSubmixerRackOption subOpt {};
+	auto& custom = subOpt.custom_rack_option;
+	custom.rack_option.size              = sizeof(subOpt);
+	custom.rack_option.max_grain_samples = 64;
+	custom.rack_option.max_voices        = 1;
+	custom.rack_option.max_matrices      = 1;
+	custom.rack_option.max_ports         = 1;
+	custom.num_buffers                   = 1;
+	custom.num_modules                   = 1;
+	custom.module[0].module_id           = SCE_NGS2_CUSTOM_MODULE_ID_FILTER;
+	custom.module[0].source_buffer_id    = 0;
+	custom.module[0].dest_buffer_id      = 0;
+	subOpt.max_channels                  = 2;
+	subOpt.max_inputs                    = 1;
+
+	std::vector<uint8_t> rBuf(sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal));
+	Ngs2ContextBufferInfo rbi {rBuf.data(), rBuf.size(), {0}};
+	uintptr_t filterRack = 0;
+	res = Ngs2RackCreate(sysHandle, 0x4002, &custom.rack_option, &rbi, &filterRack);
+	Check(res == OK && filterRack != 0, "RackCreate CustomSubmixer fallito per test Filter");
+
+	uintptr_t voice = 0;
+	Ngs2RackGetVoiceHandle(filterRack, 0, &voice);
+
+	Ngs2SubmixerVoiceSetupParam vsetup {{sizeof(Ngs2SubmixerVoiceSetupParam), 0, 0x20000000}, 2, 0};
+	Ngs2VoiceControl(voice, &vsetup.header);
+
+	// Imposta filtro biquad passa-basso a 1000 Hz, Q=0.707, Level=1.0
+	Ngs2CustomVoiceFilterParam fparam {};
+	fparam.header = {sizeof(Ngs2CustomVoiceFilterParam), 0, SCE_NGS2_CUSTOM_VOICE_PARAM_FILTER};
+	fparam.channel_mask = 0; // entrambi i canali filtrati
+	fparam.type = 1;         // Low-pass
+	fparam.param.fcq.frequency = 1000.0f;
+	fparam.param.fcq.q         = 0.707f;
+	fparam.param.fcq.level     = 1.0f;
+	res = Ngs2VoiceControl(voice, &fparam.header);
+	Check(res == OK, "VoiceControl CustomFilter 0x40001300 fallito");
+
+	Ngs2VoiceEventParam playEv {{sizeof(Ngs2VoiceEventParam), 0, 0x00000006}, 1};
+	Ngs2VoiceControl(voice, &playEv.header);
+
+	auto* vInt = reinterpret_cast<Ngs2VoiceInternal*>(voice);
+	Fixture src(48000, 2);
+	src.voice.ports.push_back({vInt, 0, 1.0f, -1});
+	int16_t fInput[64 * 2];
+	for (int i = 0; i < 64; ++i) {
+		fInput[2 * i]     = 16384; // Ch 0 = 0.5f (DC step)
+		fInput[2 * i + 1] = 16384; // Ch 1 = 0.5f
+	}
+	src.Queue(fInput, 64, 0);
+
+	std::vector<Ngs2VoiceInternal*> voicesList {&src.voice};
+	Ngs2RenderVoice(*vInt, voicesList, 64);
+
+	float* b = vInt->Buffer(0, 64);
+	// Il filtro passa-basso a 1000 Hz ammorbidisce il gradino DC: all'inizio b[0] è minore del valore a regime
+	Check(b[0] > 0.0f && b[0] < 0.5f, "Custom Filter Ch0 output inatteso");
+	Check(b[64] > 0.0f && b[64] < 0.5f, "Custom Filter Ch1 output inatteso");
+
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
+// --- Fase 4: Test per Stream API, Scheduler, Moduli e Reporting ---
+struct TestStreamCommandRecord {
+	uint32_t id;
+	uint8_t  flags;
+	uint8_t  type;
+	uint16_t count;
+	union {
+		uint64_t    u64;
+		uint32_t    u32;
+		int32_t     i32;
+		float       f;
+		const void* ptr;
+	} value;
+};
+
+struct TestModuleQueueRing {
+	const void* buffer;
+	uint32_t    reserved;
+	uint32_t    reserved2;
+	uint64_t    count;
+	uint64_t    first;
+};
+
+struct TestModuleQueue {
+	uint64_t            reserved;
+	TestModuleQueueRing rings[2];
+	uint32_t            lock;
+	uint8_t             currentRing;
+	uint8_t             reservedByte[3];
+	uint32_t            itemSize;
+	uint32_t            ringLength;
+};
+
+static int32_t KYTY_SYSV_ABI TestStreamBufferAlloc(Ngs2ContextBufferInfo* info) {
+	if (info != nullptr) {
+		static std::vector<uint8_t> s_alloc_buf(131072);
+		info->host_buffer = s_alloc_buf.data();
+	}
+	return 0;
+}
+
+static void TestStreamAndModulesPhase4() {
+	// 1. sceNgs2StreamResetOption
+	Check(Ngs2StreamResetOption(nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "StreamResetOption su nullptr deve restituire INVALID_OUT_ADDRESS");
+	Check(Ngs2StreamResetOption(reinterpret_cast<void*>(0x10)) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "StreamResetOption su puntatore guest invalido deve restituire INVALID_OUT_ADDRESS");
+
+	Ngs2StreamOption opt {};
+	int res = Ngs2StreamResetOption(&opt);
+	Check(res == OK, "StreamResetOption fallito");
+	Check(opt.size == sizeof(Ngs2StreamOption), "StreamOption.size non conforme");
+	Check(opt.num_blocks == 4, "StreamOption.num_blocks default errato");
+	Check(opt.buffer_size_1 == 0x100, "StreamOption.buffer_size_1 errato");
+	Check(opt.buffer_size_2 == 0x10, "StreamOption.buffer_size_2 errato");
+	Check(opt.buffer_size_3 == 0x10000, "StreamOption.buffer_size_3 errato");
+	Check(std::abs(opt.default_param - 0.5f) < 1e-6f, "StreamOption.default_param errato");
+
+	// 2. sceNgs2StreamQueryBufferSize
+	Check(Ngs2StreamQueryBufferSize(&opt, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "StreamQueryBufferSize su buffer_info nullptr deve restituire INVALID_OUT_ADDRESS");
+	Check(Ngs2StreamQueryBufferSize(&opt, reinterpret_cast<void*>(0x10)) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "StreamQueryBufferSize su out invalido deve restituire INVALID_OUT_ADDRESS");
+
+	Ngs2ContextBufferInfo bufInfo {};
+	res = Ngs2StreamQueryBufferSize(nullptr, &bufInfo);
+	Check(res == OK, "StreamQueryBufferSize con opt nullptr fallito");
+	Check(bufInfo.host_buffer_size == 0x106c0ULL, "StreamQueryBufferSize default size deve essere 0x106c0");
+
+	Check(Ngs2StreamQueryBufferSize(reinterpret_cast<const void*>(0x10), &bufInfo) == SCE_NGS2_ERROR_INVALID_OPTION_SIZE,
+	      "StreamQueryBufferSize con opt invalido deve restituire INVALID_OPTION_SIZE");
+
+	Ngs2StreamOption badOpt = opt;
+	badOpt.num_blocks = 0;
+	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_INVALID_NUM_BLOCKS,
+	      "num_blocks == 0 deve restituire INVALID_NUM_BLOCKS");
+	badOpt.num_blocks = 33;
+	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_INVALID_NUM_BLOCKS,
+	      "num_blocks > 32 deve restituire INVALID_NUM_BLOCKS");
+
+	badOpt = opt;
+	badOpt.buffer_size_3 = 0;
+	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_3_ZERO,
+	      "buffer_size_3 == 0 deve restituire STREAM_BUFFER_SIZE_3_ZERO");
+
+	badOpt = opt;
+	badOpt.buffer_size_1 = 0;
+	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_1_ZERO,
+	      "buffer_size_1 == 0 deve restituire STREAM_BUFFER_SIZE_1_ZERO");
+
+	badOpt = opt;
+	badOpt.buffer_size_2 = 0;
+	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_2_ZERO,
+	      "buffer_size_2 == 0 deve restituire STREAM_BUFFER_SIZE_2_ZERO");
+
+	badOpt = opt;
+	badOpt.size = 0x80;
+	Check(Ngs2StreamQueryBufferSize(&badOpt, &bufInfo) == SCE_NGS2_ERROR_INVALID_OPTION_SIZE,
+	      "size errata deve restituire INVALID_OPTION_SIZE");
+
+	// 3. Creazione e distruzione Stream
+	Ngs2SystemOption sysOpt {};
+	Ngs2SystemResetOption(&sysOpt);
+	sysOpt.max_grain_samples = 256;
+	sysOpt.num_grain_samples = 256;
+	sysOpt.sample_rate       = 48000;
+	std::vector<uint8_t> sysBuf(1024 * 1024, 0);
+	Ngs2ContextBufferInfo sysBufInfo {sysBuf.data(), sysBuf.size(), {0}};
+	uintptr_t sysHandle = 0;
+	res = Ngs2SystemCreate(&sysOpt, &sysBufInfo, &sysHandle);
+	Check(res == OK && sysHandle != 0, "SystemCreate fallito per test Stream");
+
+	uintptr_t streamHandle = 0;
+	Check(Ngs2StreamCreate(sysHandle, &opt, nullptr, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_INFO,
+	      "StreamCreate su buffer_info nullptr deve restituire INVALID_BUFFER_INFO");
+	Check(Ngs2StreamCreate(sysHandle, &opt, reinterpret_cast<const void*>(0x10), &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_INFO,
+	      "StreamCreate su buffer_info invalido deve restituire INVALID_BUFFER_INFO");
+
+	Ngs2ContextBufferInfo emptyHost {};
+	Check(Ngs2StreamCreate(sysHandle, &opt, &emptyHost, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_INFO,
+	      "StreamCreate con host_buffer nullo deve restituire INVALID_BUFFER_INFO");
+
+	bufInfo.host_buffer = reinterpret_cast<void*>(0x100000);
+	Check(Ngs2StreamCreate(sysHandle, reinterpret_cast<const void*>(0x10), &bufInfo, &streamHandle) == SCE_NGS2_ERROR_INVALID_OPTION_SIZE,
+	      "StreamCreate con opt invalido deve restituire INVALID_OPTION_SIZE");
+	Check(Ngs2StreamCreate(sysHandle, &opt, &bufInfo, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "StreamCreate con out handle nullo deve restituire INVALID_OUT_ADDRESS");
+	Check(Ngs2StreamCreate(0xdead, &opt, &bufInfo, &streamHandle) == NGS2_ERROR_INVALID_SYSTEM_HANDLE,
+	      "StreamCreate con system nullo/invalido deve restituire INVALID_SYSTEM_HANDLE");
+
+	std::vector<uint8_t> streamMem(0x106c0);
+	bufInfo.host_buffer = streamMem.data();
+	bufInfo.host_buffer_size = streamMem.size();
+	res = Ngs2StreamCreate(sysHandle, &opt, &bufInfo, &streamHandle);
+	Check(res == OK && streamHandle != 0, "StreamCreate fallito con parametri validi");
+
+	// 4. StreamCreateWithAllocator
+	Ngs2BufferAllocator alloc {};
+	Check(Ngs2StreamCreateWithAllocator(sysHandle, &opt, nullptr, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR,
+	      "StreamCreateWithAllocator su nullptr deve restituire INVALID_BUFFER_ALLOCATOR");
+	Check(Ngs2StreamCreateWithAllocator(sysHandle, &opt, reinterpret_cast<const void*>(0x10), &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR,
+	      "StreamCreateWithAllocator su puntatore non valido deve restituire INVALID_BUFFER_ALLOCATOR");
+	Check(Ngs2StreamCreateWithAllocator(sysHandle, &opt, &alloc, &streamHandle) == SCE_NGS2_ERROR_INVALID_BUFFER_ALLOCATOR,
+	      "StreamCreateWithAllocator con alloc_handler nullo deve restituire INVALID_BUFFER_ALLOCATOR");
+
+	alloc.alloc_handler = &TestStreamBufferAlloc;
+	uintptr_t streamAllocHandle = 0;
+	res = Ngs2StreamCreateWithAllocator(sysHandle, &opt, &alloc, &streamAllocHandle);
+	Check(res == OK && streamAllocHandle != 0, "StreamCreateWithAllocator con allocatore valido fallito");
+
+	// 5. sceNgs2StreamRunCommands
+	Check(Ngs2StreamDestroy(0, nullptr) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
+	      "StreamDestroy su 0 deve restituire INVALID_STREAM_HANDLE");
+	Check(Ngs2StreamRunCommands(0, nullptr, 0) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
+	      "StreamRunCommands su stream 0 deve restituire INVALID_STREAM_HANDLE");
+	Check(Ngs2StreamRunCommands(0x100, reinterpret_cast<const void*>(0x10), 1) == SCE_NGS2_ERROR_INVALID_STREAM_COMMANDS,
+	      "StreamRunCommands con commands invalido deve restituire INVALID_STREAM_COMMANDS");
+
+	TestStreamCommandRecord recs[2] {};
+	recs[0].id = 0xf20000; // nop/lock
+	recs[1].id = 0xf20002; // state
+	recs[1].value.u32 = 16;
+	res = Ngs2StreamRunCommands(streamHandle, recs, 2);
+	Check(res == OK, "StreamRunCommands con comandi validi fallito");
+
+	recs[1].value.u32 = 99; // Stato non valido
+	Check(Ngs2StreamRunCommands(streamHandle, recs, 2) == SCE_NGS2_ERROR_INVALID_STREAM_STATE_COMMAND,
+	      "StreamRunCommands con stato errato deve restituire INVALID_STREAM_STATE_COMMAND");
+
+	// 6. sceNgs2StreamQueryInfo
+	Check(Ngs2StreamQueryInfo(0, 0xf24001, nullptr, 0) == SCE_NGS2_ERROR_INVALID_STREAM_HANDLE,
+	      "StreamQueryInfo su stream 0 deve restituire INVALID_STREAM_HANDLE");
+	uint64_t qinfo = 0;
+	Check(Ngs2StreamQueryInfo(streamHandle, 0xf24001, &qinfo, 4) == NGS2_ERROR_INVALID_OUT_SIZE,
+	      "StreamQueryInfo 0xf24001 con size < 8 deve restituire INVALID_OUT_SIZE");
+	Check(Ngs2StreamQueryInfo(streamHandle, 0xf24099, &qinfo, 8) == SCE_NGS2_ERROR_INVALID_STREAM_QUERY_ID,
+	      "StreamQueryInfo con query id non valido deve restituire INVALID_STREAM_QUERY_ID");
+	res = Ngs2StreamQueryInfo(streamHandle, 0xf24001, &qinfo, sizeof(qinfo));
+	Check(res == OK, "StreamQueryInfo 0xf24001 fallito");
+
+	// 7. Distruzione stream
+	res = Ngs2StreamDestroy(streamHandle, nullptr);
+	Check(res == OK, "StreamDestroy streamHandle fallito");
+	res = Ngs2StreamDestroy(streamAllocHandle, nullptr);
+	Check(res == OK, "StreamDestroy streamAllocHandle fallito");
+
+	// 8. Scheduler & Module Enums & Reports
+	Check(Ngs2JobSchedulerResetOption(nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "JobSchedulerResetOption con nullptr deve restituire INVALID_OUT_ADDRESS");
+	Ngs2JobSchedulerOption jsOpt {};
+	res = Ngs2JobSchedulerResetOption(&jsOpt);
+	Check(res == OK, "JobSchedulerResetOption fallito");
+	Check(jsOpt.num_threads == 1, "JobSchedulerOption default errato");
+
+	void* cfgTable[4] = {};
+	Check(Ngs2ModuleEnumConfigs(cfgTable, 4) == 0, "ModuleEnumConfigs deve restituire 0");
+	Check(Ngs2ModuleArrayEnumItems(nullptr, nullptr, 0) == 0, "ModuleArrayEnumItems con nullptr deve restituire 0");
+	Check(Ngs2ModuleQueueEnumItems(nullptr, nullptr, 0) == 0, "ModuleQueueEnumItems con nullptr deve restituire 0");
+
+	// Test array enum
+	alignas(8) uint8_t arrayData[64] = {};
+	const uint32_t itemSize = 4;
+	const uint32_t count = 3;
+	const uint8_t flag = 1;
+	arrayData[8] = flag;
+	std::memcpy(arrayData + 0xc, &itemSize, sizeof(itemSize));
+	std::memcpy(arrayData + 0x14 + 4 * flag, &count, sizeof(count));
+	const uint32_t sampleVal1 = 0x11111111;
+	const uint32_t sampleVal2 = 0x22222222;
+	const uint32_t sampleVal3 = 0x33333333;
+	std::memcpy(arrayData + 0x20, &sampleVal1, 4);
+	std::memcpy(arrayData + 0x24, &sampleVal2, 4);
+	std::memcpy(arrayData + 0x28, &sampleVal3, 4);
+	uint32_t outItems[4] = {};
+	const int enumCount = Ngs2ModuleArrayEnumItems(arrayData, outItems, 2);
+	Check(enumCount == 3, "ModuleArrayEnumItems count errato");
+	Check(outItems[0] == sampleVal1 && outItems[1] == sampleVal2 && outItems[2] == 0,
+	      "ModuleArrayEnumItems copia elementi errata");
+
+	// Test queue enum
+	TestModuleQueue q {};
+	const uint32_t qItems[] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
+	q.rings[0].buffer = qItems;
+	q.rings[0].count  = 3;
+	q.rings[0].first  = 3;
+	q.itemSize        = sizeof(qItems[0]);
+	q.ringLength      = 4;
+	uint32_t qOut[4] = {};
+	const int qEnumCount = Ngs2ModuleQueueEnumItems(&q, qOut, 3);
+	Check(qEnumCount == 3, "ModuleQueueEnumItems count errato");
+	Check(qOut[0] == qItems[3] && qOut[1] == qItems[0] && qOut[2] == qItems[1] && qOut[3] == 0,
+	      "ModuleQueueEnumItems copia ring errata");
+
+	// Test report register/unregister
+	Check(Ngs2ReportRegisterHandler(nullptr, nullptr) == 0, "ReportRegisterHandler fallito");
+	Check(Ngs2ReportUnregisterHandler(nullptr) == 0, "ReportUnregisterHandler fallito");
+
+	Ngs2SystemDestroy(sysHandle, nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -2450,6 +3834,9 @@ int main() {
 	TestPatchToRackHandle();
 	TestMasteringGain();
 	TestMasteringDownmix();
+	TestMasteringUnknownControl();
+	TestPcmWaveformFormats();
+	TestCustomFilterModule();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();
@@ -2502,5 +3889,16 @@ int main() {
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();
+	TestSystemRunCommandsAndQueries();
+	TestRackRunCommandsAndQueries();
+	TestVoiceOwnerAndMatrixInfo();
+	TestFftPhase2();
+	TestWaveformFrameInfoPhase2();
+	TestParseWaveformUserPhase2();
+	TestVagPhase3();
+	TestCustomGainPhase3();
+	TestCustomChannelMixerPhase3();
+	TestCustomPitchShiftPhase3();
+	TestStreamAndModulesPhase4();
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

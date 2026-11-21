@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/alignment.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
@@ -42,6 +43,9 @@ constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_HEVC       = 974921;
+constexpr uint32_t VIDEODEC2_HEVC_PROFILE_MAIN10   = 2;
+constexpr uint32_t VIDEODEC2_VP9_PROFILE_2         = 2;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
@@ -66,6 +70,23 @@ struct Videodec2DecoderConfigInfo {
 	uint8_t               reserved0;
 	uint8_t               reserved1;
 	void*                 extra_config_info;
+};
+
+struct Videodec2HevcExtraConfigInfo {
+	size_t   this_size;
+	int32_t  tier_type;
+	int8_t   max_bit_depth_luma;
+	int8_t   max_bit_depth_chroma;
+	uint16_t reserved0;
+	int32_t  max_temporal_id_to_decode;
+	uint32_t hdr_frame_format;
+	uint32_t gpu_load_level;
+};
+
+struct Videodec2Vp9ExtraConfigInfo {
+	size_t   this_size;
+	int8_t   max_bit_depth;
+	uint32_t hdr_frame_format;
 };
 
 struct Videodec2DecoderMemoryInfo {
@@ -136,6 +157,8 @@ using DecoderState = Decoder::Instance;
 static_assert(sizeof(Videodec2ComputeMemoryInfo) == 24);
 static_assert(sizeof(Videodec2ComputeConfigInfo) == 16);
 static_assert(sizeof(Videodec2DecoderConfigInfo) == 72);
+static_assert(sizeof(Videodec2HevcExtraConfigInfo) == 32);
+static_assert(sizeof(Videodec2Vp9ExtraConfigInfo) == 16);
 static_assert(sizeof(Videodec2DecoderMemoryInfo) == 72);
 static_assert(sizeof(Videodec2InputData) == 48);
 static_assert(sizeof(Videodec2OutputInfo) == 56);
@@ -304,15 +327,29 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
+// Without extra configuration, the 10-bit profiles decode at 10 bits.
+static bool HasTenBitOutput(const Videodec2DecoderConfigInfo& config) {
+	if (config.codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
+		const auto* vp9 = static_cast<const Videodec2Vp9ExtraConfigInfo*>(config.extra_config_info);
+		return vp9 != nullptr ? vp9->max_bit_depth > 8 : config.profile == VIDEODEC2_VP9_PROFILE_2;
+	}
+	const auto* hevc = static_cast<const Videodec2HevcExtraConfigInfo*>(config.extra_config_info);
+	return config.codec_type == VIDEODEC2_CODEC_TYPE_HEVC &&
+	       config.profile == VIDEODEC2_HEVC_PROFILE_MAIN10 &&
+	       (hevc == nullptr || hevc->max_bit_depth_luma != 8 || hevc->max_bit_depth_chroma != 8);
+}
+
 static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
-	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
-	    config.max_frame_height <= 0) {
+	if (config.max_frame_width <= 0 || config.max_frame_height <= 0) {
 		return VIDEODEC2_MIN_MEMORY_SIZE;
 	}
-	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
-	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
-	const auto height = (static_cast<size_t>(config.max_frame_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
+	// Semi-planar output with a 256-byte pitch, 2 bytes per 10-bit sample and the height aligned
+	// to 16 lines (64 for VP9), then 4096 bytes of picture information (8192 for VP9).
+	const auto width  = static_cast<size_t>(config.max_frame_width);
+	const auto height = static_cast<size_t>(config.max_frame_height);
+	const bool vp9    = config.codec_type == VIDEODEC2_CODEC_TYPE_VP9;
+	const auto pitch  = Common::AlignUp(HasTenBitOutput(config) ? 2 * width : width, 256);
+	return pitch * Common::AlignUp(height, vp9 ? 64 : 16) * 3 / 2 + (vp9 ? 8192 : 4096);
 }
 
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,

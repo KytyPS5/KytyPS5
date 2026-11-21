@@ -2595,18 +2595,30 @@ void TestSystemRunCommandsAndQueries() {
 }
 
 void TestRackRunCommandsAndQueries() {
-	Fixture fixture(48000, 2, Ngs2RackType::CustomSampler);
-	auto& rack = fixture.rack;
-	const auto rack_handle = reinterpret_cast<uintptr_t>(&rack);
-	std::memcpy(rack.name, "CustomTestRack", 15);
-	rack.rack_id = 0x4001;
-	rack.uid = 42;
-	rack.option.custom_sampler.custom_rack_option.num_modules = 2;
-	auto& mod0 = rack.option.custom_sampler.custom_rack_option.module[0];
-	mod0.module_id = 0x15;
-	mod0.source_buffer_id = 0;
-	mod0.dest_buffer_id = 0;
-	mod0.state_size = 64;
+	Ngs2Internal system;
+	system.option.sample_rate = 48000;
+	system.option.num_grain_samples = 256;
+	Ngs2CustomSamplerRackOption c_opt {};
+	c_opt.custom_rack_option.rack_option.size = sizeof(c_opt);
+	c_opt.custom_rack_option.rack_option.max_grain_samples = 512;
+	c_opt.custom_rack_option.rack_option.max_voices = 1;
+	c_opt.custom_rack_option.rack_option.max_ports = 1;
+	c_opt.custom_rack_option.rack_option.max_matrices = 1;
+	c_opt.custom_rack_option.num_buffers = 1;
+	c_opt.custom_rack_option.num_modules = 2;
+	c_opt.custom_rack_option.module[0].module_id = 0x15;
+	c_opt.custom_rack_option.module[0].source_buffer_id = 0;
+	c_opt.custom_rack_option.module[0].dest_buffer_id = 0;
+	c_opt.custom_rack_option.module[0].state_size = 64;
+	c_opt.custom_rack_option.state_size = sizeof(Ngs2CustomSamplerVoiceState);
+	c_opt.max_waveform_blocks = 4;
+
+	RenderRack renderRack(system, 0x4001, c_opt.custom_rack_option.rack_option);
+	const auto rack_handle = renderRack.handle;
+	auto* rack_ptr = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
+	std::memcpy(rack_ptr->name, "CustomTestRack", 15);
+	rack_ptr->uid = 42;
+	auto& rack = *rack_ptr;
 
 	// User data
 	uintptr_t ud = 0;
@@ -2697,11 +2709,23 @@ void TestRackRunCommandsAndQueries() {
 }
 
 void TestVoiceOwnerAndMatrixInfo() {
-	Fixture fixture(48000, 2);
-	fixture.voice.matrices.resize(2);
-	fixture.voice.ports.resize(8);
-	const auto voice_handle = reinterpret_cast<uintptr_t>(&fixture.voice);
-	const auto rack_handle = reinterpret_cast<uintptr_t>(&fixture.rack);
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.sample_rate = 48000;
+	system.option.num_grain_samples = 256;
+	Ngs2SamplerRackOption option {};
+	Ngs2FillDefaultRackOption(0x1000, reinterpret_cast<Ngs2RackOptionUnion*>(&option));
+	option.rack_option.max_voices = 1;
+	option.rack_option.max_matrices = 2;
+	option.rack_option.max_ports = 8;
+	option.max_waveform_blocks = 4;
+	RenderRack renderRack(system, 0x1000, option.rack_option);
+	uintptr_t voice_handle = 0;
+	Check(Ngs2RackGetVoiceHandle(renderRack.handle, 0, &voice_handle) == OK, "get voice handle failed");
+	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
+	voice->matrices.resize(2);
+	voice->ports.resize(8);
+	const auto rack_handle = renderRack.handle;
 
 	uintptr_t owner = 0;
 	uint32_t voice_index = 999;
@@ -2713,7 +2737,6 @@ void TestVoiceOwnerAndMatrixInfo() {
 	Ngs2VoiceMatrixInfo minfo {};
 	Check(Ngs2VoiceGetMatrixInfo(voice_handle, 0, &minfo, sizeof(minfo)) == OK, "voice get matrix info failed");
 	Check(minfo.num_levels == 0, "initial matrix info should be empty");
-
 	// Set matrix levels
 	float levels[4] = {0.1f, 0.2f, 0.3f, 0.4f};
 	struct Cmd {
@@ -3260,6 +3283,8 @@ static void TestVagPhase3() {
 		Check(std::abs(renderOut[28 + i] - expDecay) < 1e-4f, "VAG ADPCM decay is wrong");
 	}
 
+	Ngs2RackDestroy(samplerRack, nullptr);
+	Ngs2RackDestroy(masterRack, nullptr);
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
@@ -3342,6 +3367,7 @@ static void TestCustomGainPhase3() {
 	Check(b[63] > 3.8f, "Gain ramp ch0 end does not reach the target");
 	Check(b[64 + 63] < 0.1f, "Gain ramp ch1 end does not reach the target");
 
+	Ngs2RackDestroy(gainRack, nullptr);
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
@@ -3417,6 +3443,7 @@ static void TestCustomChannelMixerPhase3() {
 		Check(std::abs(b[64 + i] - 0.75f) < 0.01f, "ChannelMixer Ch1 swap is wrong");
 	}
 
+	Ngs2RackDestroy(mixerRack, nullptr);
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
@@ -3491,6 +3518,7 @@ static void TestCustomPitchShiftPhase3() {
 		Check(std::abs(b[64 + i] - (10922.0f / 32768.0f)) < 0.01f, "PitchShift Ch1 bypass is wrong, value was modified");
 	}
 
+	Ngs2RackDestroy(pitchRack, nullptr);
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
@@ -3568,6 +3596,7 @@ void TestCustomFilterModule() {
 	Check(b[0] > 0.0f && b[0] < 0.5f, "Custom Filter Ch0 output unexpected");
 	Check(b[64] > 0.0f && b[64] < 0.5f, "Custom Filter Ch1 output unexpected");
 
+	Ngs2RackDestroy(filterRack, nullptr);
 	Ngs2SystemDestroy(sysHandle, nullptr);
 }
 
@@ -3878,17 +3907,18 @@ int main() {
 	TestPortInfo();
 	TestPlayStateBeforeRender();
 	TestStatePublication();
-	TestStopThenPlayBeforeRender();
-	TestSystemRunCommandsAndQueries();
-	TestRackRunCommandsAndQueries();
-	TestVoiceOwnerAndMatrixInfo();
-	TestFftPhase2();
-	TestWaveformFrameInfoPhase2();
-	TestParseWaveformUserPhase2();
-	TestVagPhase3();
-	TestCustomGainPhase3();
-	TestCustomChannelMixerPhase3();
-	TestCustomPitchShiftPhase3();
-	TestStreamAndModulesPhase4();
+#define RUN_TEST(fn) do { std::printf("Running %s...\n", #fn); std::fflush(stdout); fn(); } while(0)
+	RUN_TEST(TestStopThenPlayBeforeRender);
+	RUN_TEST(TestSystemRunCommandsAndQueries);
+	RUN_TEST(TestRackRunCommandsAndQueries);
+	RUN_TEST(TestVoiceOwnerAndMatrixInfo);
+	RUN_TEST(TestFftPhase2);
+	RUN_TEST(TestWaveformFrameInfoPhase2);
+	RUN_TEST(TestParseWaveformUserPhase2);
+	RUN_TEST(TestVagPhase3);
+	RUN_TEST(TestCustomGainPhase3);
+	RUN_TEST(TestCustomChannelMixerPhase3);
+	RUN_TEST(TestCustomPitchShiftPhase3);
+	RUN_TEST(TestStreamAndModulesPhase4);
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

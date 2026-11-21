@@ -555,6 +555,9 @@ struct Ngs2SamplerFilter {
 		if (!enabled) {
 			return;
 		}
+		if (history.size() != channels) {
+			history.assign(channels, {});
+		}
 		for (uint32_t c = 0; c < channels; ++c) {
 			if (Bypasses(c)) {
 				continue;
@@ -1507,6 +1510,7 @@ static Ngs2Internal*        g_ngs_list     = nullptr;
 static Ngs2RackInternal*    g_racks_list   = nullptr;
 static std::atomic_uint32_t g_next_ngs_uid = 1;
 static Common::Mutex        g_racks_mutex;
+static Common::Mutex        g_ngs_mutex;
 
 static_assert(sizeof(Ngs2UserFxProcessContext) == 48);
 static_assert(sizeof(Ngs2UserFx2Context) == 72);
@@ -1555,8 +1559,11 @@ static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption*      optio
 	ngs->option      = *option;
 	ngs->buffer_info = *buffer_info;
 	ngs->uid         = g_next_ngs_uid.fetch_add(1, std::memory_order_relaxed);
-	ngs->next        = g_ngs_list;
-	g_ngs_list       = ngs;
+	{
+		Common::LockGuard lock(g_ngs_mutex);
+		ngs->next  = g_ngs_list;
+		g_ngs_list = ngs;
+	}
 
 	return ngs;
 }
@@ -1565,12 +1572,26 @@ static Ngs2Internal* Ngs2FindSystem(uintptr_t system_handle) {
 	if (system_handle < 0x10000) {
 		return nullptr;
 	}
+	Common::LockGuard lock(g_ngs_mutex);
 	for (auto* ngs = g_ngs_list; ngs != nullptr; ngs = ngs->next) {
 		if (reinterpret_cast<uintptr_t>(ngs) == system_handle) {
 			return ngs;
 		}
 	}
 	return reinterpret_cast<Ngs2Internal*>(system_handle);
+}
+
+static Ngs2Internal* Ngs2FindRegisteredSystem(uintptr_t system_handle) {
+	if (system_handle < 0x10000) {
+		return nullptr;
+	}
+	Common::LockGuard lock(g_ngs_mutex);
+	for (auto* ngs = g_ngs_list; ngs != nullptr; ngs = ngs->next) {
+		if (reinterpret_cast<uintptr_t>(ngs) == system_handle) {
+			return ngs;
+		}
+	}
+	return nullptr;
 }
 
 static Ngs2RackInternal* Ngs2FindRack(uintptr_t handle) {
@@ -1582,10 +1603,6 @@ static Ngs2RackInternal* Ngs2FindRack(uintptr_t handle) {
 		if (reinterpret_cast<uintptr_t>(rack) == handle) {
 			return rack;
 		}
-	}
-	auto* direct = reinterpret_cast<Ngs2RackInternal*>(handle);
-	if (direct != nullptr && direct->ngs != nullptr) {
-		return direct;
 	}
 	return nullptr;
 }
@@ -1882,6 +1899,22 @@ int KYTY_SYSV_ABI Ngs2SystemDestroy(uintptr_t system_handle, Ngs2ContextBufferIn
 
 	if (buffer_info != nullptr) {
 		std::memset(buffer_info, 0, sizeof(Ngs2ContextBufferInfo));
+	}
+
+	if (system_handle == 0) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
+
+	auto* target = reinterpret_cast<Ngs2Internal*>(system_handle);
+	{
+		Common::LockGuard lock(g_ngs_mutex);
+		auto**            link = &g_ngs_list;
+		while (*link != nullptr && *link != target) {
+			link = &(*link)->next;
+		}
+		if (*link != nullptr) {
+			*link = (*link)->next;
+		}
 	}
 
 	return OK;
@@ -2217,11 +2250,13 @@ int KYTY_SYSV_ABI Ngs2RackUnlock(uintptr_t rack_handle) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
 
-	if (rack->lock_depth > 0) {
-		rack->lock_depth--;
-		if (rack->lock_depth == 0) {
-			rack->lock_owner = {};
-		}
+	if (rack->lock_depth == 0 || rack->lock_owner != std::this_thread::get_id()) {
+		return NGS2_ERROR_INVALID_RACK_HANDLE;
+	}
+
+	rack->lock_depth--;
+	if (rack->lock_depth == 0) {
+		rack->lock_owner = {};
 	}
 	rack->ngs->mutex.Unlock();
 
@@ -4455,16 +4490,21 @@ int KYTY_SYSV_ABI Ngs2SystemRunCommands(uintptr_t system_handle, const void* com
 		} else if (cmd == 0xf00001) {
 			ngs->mutex.Unlock();
 		} else if (cmd == 0xf00002) {
+			Common::LockGuard lock(ngs->mutex);
 			ngs->user_data = rec.value.u64;
 		} else if (cmd == 0xf00004) {
+			Common::LockGuard lock(ngs->mutex);
 			ngs->option.sample_rate = rec.value.u32;
 		} else if (cmd == 0xf00005) {
+			Common::LockGuard lock(ngs->mutex);
 			ngs->option.num_grain_samples = rec.value.u32;
 		} else if (cmd == 0xf00006) {
+			Common::LockGuard lock(ngs->mutex);
 			ngs->unnamed_param = rec.value.f;
 		} else if (cmd == 0xf00003) {
 			const uint32_t slot = rec.id >> 24;
 			if (slot < ngs->slot_data.size()) {
+				Common::LockGuard lock(ngs->mutex);
 				if (rec.value.ptr == nullptr) {
 					ngs->slot_set[slot] = false;
 					ngs->slot_data[slot].fill(0);
@@ -4546,7 +4586,8 @@ int KYTY_SYSV_ABI Ngs2SystemEnumHandles(uintptr_t* out_handles, uint32_t max_han
 	PRINT_NAME();
 	constexpr int32_t invalid_argument = static_cast<int32_t>(0x804a0053u);
 	if (max_handles != 0 && out_handles == nullptr) return invalid_argument;
-	uint32_t count = 0;
+	uint32_t          count = 0;
+	Common::LockGuard lock(g_ngs_mutex);
 	for (auto* ngs = g_ngs_list; ngs != nullptr; ngs = ngs->next) {
 		if (out_handles != nullptr && count < max_handles) {
 			out_handles[count] = reinterpret_cast<uintptr_t>(ngs);
@@ -4798,8 +4839,8 @@ int KYTY_SYSV_ABI Ngs2VoiceGetMatrixInfo(uintptr_t voice_handle, uint32_t matrix
 	const auto& m = voice->matrices[matrix_id];
 	*info         = {};
 	if (!m.empty()) {
-		info->num_levels = static_cast<uint32_t>(m.size());
 		const auto count = std::min(m.size(), size_t(37 * 37));
+		info->num_levels = static_cast<uint32_t>(count);
 		std::memcpy(info->levels, m.data(), count * sizeof(float));
 	}
 	return OK;
@@ -5403,7 +5444,7 @@ int KYTY_SYSV_ABI Ngs2StreamCreate(uintptr_t system_handle, const void* option,
 	if (optError != 0) {
 		return optError;
 	}
-	auto* system = Ngs2FindSystem(system_handle);
+	auto* system = Ngs2FindRegisteredSystem(system_handle);
 	if (system == nullptr) {
 		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
 	}
@@ -5441,7 +5482,7 @@ int KYTY_SYSV_ABI Ngs2StreamCreateWithAllocator(uintptr_t system_handle, const v
 	if (optError != 0) {
 		return optError;
 	}
-	auto* system = Ngs2FindSystem(system_handle);
+	auto* system = Ngs2FindRegisteredSystem(system_handle);
 	if (system == nullptr) {
 		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
 	}
@@ -5456,6 +5497,7 @@ int KYTY_SYSV_ABI Ngs2StreamCreateWithAllocator(uintptr_t system_handle, const v
 	stream->buffer_info.host_buffer_size = req_size;
 	int32_t alloc_res                    = localAllocator.alloc_handler(&stream->buffer_info);
 	if (alloc_res < 0 || stream->buffer_info.host_buffer == nullptr) {
+		stream->has_allocator = false;
 		stream->managed_buffer.resize(req_size, 0);
 		stream->buffer_info.host_buffer = stream->managed_buffer.data();
 	}
@@ -5474,21 +5516,27 @@ int KYTY_SYSV_ABI Ngs2StreamDestroy(uintptr_t stream_handle, void* buffer_info) 
 	if (stream_handle == 0) {
 		return SCE_NGS2_ERROR_INVALID_STREAM_HANDLE;
 	}
-	Common::LockGuard lock(g_ngs2_streams_mutex);
-	for (auto it = g_ngs2_streams.begin(); it != g_ngs2_streams.end(); ++it) {
-		if ((*it) && (*it)->handle == stream_handle) {
-			if (buffer_info != nullptr &&
-			    IsValidPointer(buffer_info, sizeof(Ngs2ContextBufferInfo))) {
-				WriteGuest(static_cast<Ngs2ContextBufferInfo*>(buffer_info), (*it)->buffer_info);
+	std::unique_ptr<Ngs2StreamInternal> detached_stream;
+	{
+		Common::LockGuard lock(g_ngs2_streams_mutex);
+		for (auto it = g_ngs2_streams.begin(); it != g_ngs2_streams.end(); ++it) {
+			if ((*it) && (*it)->handle == stream_handle) {
+				detached_stream = std::move(*it);
+				g_ngs2_streams.erase(it);
+				break;
 			}
-			if ((*it)->has_allocator && (*it)->allocator.free_handler != nullptr) {
-				(*it)->allocator.free_handler(&(*it)->buffer_info);
-			}
-			g_ngs2_streams.erase(it);
-			return OK;
 		}
 	}
-	return SCE_NGS2_ERROR_INVALID_STREAM_HANDLE;
+	if (!detached_stream) {
+		return SCE_NGS2_ERROR_INVALID_STREAM_HANDLE;
+	}
+	if (buffer_info != nullptr && IsValidPointer(buffer_info, sizeof(Ngs2ContextBufferInfo))) {
+		WriteGuest(static_cast<Ngs2ContextBufferInfo*>(buffer_info), detached_stream->buffer_info);
+	}
+	if (detached_stream->has_allocator && detached_stream->allocator.free_handler != nullptr) {
+		detached_stream->allocator.free_handler(&detached_stream->buffer_info);
+	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI Ngs2StreamRunCommands(uintptr_t stream_handle, const void* commands,
@@ -5633,13 +5681,13 @@ int KYTY_SYSV_ABI Ngs2ModuleArrayEnumItems(const void* array, void* out, uint32_
 int KYTY_SYSV_ABI Ngs2ModuleQueueEnumItems(const void* queue, void* out, uint32_t max) {
 	PRINT_NAME();
 	if (queue == nullptr) return 0;
-	constexpr size_t               QueueSize  = 0x58;
-	constexpr size_t               LockOffset = 0x48;
-	std::array<uint8_t, QueueSize> queueHeader {};
-	if (!ReadGuestBytes(queueHeader.data(), queue, queueHeader.size())) return 0;
+	constexpr size_t QueueSize  = 0x58;
+	constexpr size_t LockOffset = 0x48;
 
 	const auto queueAddress = reinterpret_cast<uintptr_t>(queue);
 	if (queueAddress > UINTPTR_MAX - LockOffset) return 0;
+	if (!IsValidPointer(queue, QueueSize)) return 0;
+
 	auto*                     lockAddress = reinterpret_cast<uint32_t*>(queueAddress + LockOffset);
 	std::atomic_ref<uint32_t> queueLock(*lockAddress);
 	uint32_t                  retries = 0;
@@ -5660,6 +5708,7 @@ int KYTY_SYSV_ABI Ngs2ModuleQueueEnumItems(const void* queue, void* out, uint32_
 		~QueueUnlock() { lock.store(0, std::memory_order_release); }
 	} unlock {queueLock};
 
+	std::array<uint8_t, QueueSize> queueHeader {};
 	if (!ReadGuestBytes(queueHeader.data(), queue, queueHeader.size())) return 0;
 	const uint8_t ring = queueHeader[0x4c];
 	if (ring > 1) return 0;

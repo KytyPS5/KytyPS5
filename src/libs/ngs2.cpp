@@ -447,8 +447,8 @@ struct Ngs2RackInternal {
 	uint32_t                             uid          = 0;
 	char                                 name[64]     = {};
 	uintptr_t                            user_data    = 0;
-	uint32_t                             lock_depth   = 0;
-	std::thread::id                      lock_owner   = {};
+	std::atomic<uint32_t>                   lock_depth   = 0;
+	std::atomic<std::thread::id>            lock_owner   = {};
 	uint64_t                             render_count = 0;
 	Ngs2RackOptionUnion                  option;
 	Ngs2ContextBufferInfo                buffer_info;
@@ -1659,17 +1659,22 @@ static Ngs2Internal* Ngs2FindRegisteredSystem(uintptr_t system_handle) {
 	return nullptr;
 }
 
-static Ngs2RackInternal* Ngs2FindRack(uintptr_t handle) {
-	if (handle < 0x10000) {
-		return nullptr;
-	}
-	Common::LockGuard racks_lock(g_racks_mutex);
+// Lookup variant for callers that already hold g_racks_mutex.
+static Ngs2RackInternal* Ngs2FindRackLocked(uintptr_t handle) {
 	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
 		if (reinterpret_cast<uintptr_t>(rack) == handle) {
 			return rack;
 		}
 	}
 	return nullptr;
+}
+
+static Ngs2RackInternal* Ngs2FindRack(uintptr_t handle) {
+	if (handle < 0x10000) {
+		return nullptr;
+	}
+	Common::LockGuard racks_lock(g_racks_mutex);
+	return Ngs2FindRackLocked(handle);
 }
 
 static Ngs2VoiceInternal* Ngs2VoiceFromHandle(uintptr_t handle) {
@@ -2295,14 +2300,29 @@ int KYTY_SYSV_ABI Ngs2RackLock(uintptr_t rack_handle) {
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
 
-	auto* rack = Ngs2FindRack(rack_handle);
-	if (rack == nullptr || rack->ngs == nullptr) {
-		return NGS2_ERROR_INVALID_RACK_HANDLE;
+	Ngs2Internal* ngs = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		auto*           rack = Ngs2FindRackLocked(rack_handle);
+		if (rack == nullptr || rack->ngs == nullptr) {
+			return NGS2_ERROR_INVALID_RACK_HANDLE;
+		}
+		ngs = rack->ngs;
 	}
 
-	rack->ngs->mutex.Lock();
-	rack->lock_depth++;
-	rack->lock_owner = std::this_thread::get_id();
+	ngs->mutex.Lock();
+	{
+		// The rack may have been destroyed while waiting for the system lock;
+		// the registry order is system mutex first, racks mutex second.
+		Common::LockGuard racks_lock(g_racks_mutex);
+		auto*           rack = Ngs2FindRackLocked(rack_handle);
+		if (rack == nullptr || rack->ngs != ngs) {
+			ngs->mutex.Unlock();
+			return NGS2_ERROR_INVALID_RACK_HANDLE;
+		}
+		rack->lock_depth.fetch_add(1, std::memory_order_relaxed);
+		rack->lock_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+	}
 
 	return OK;
 }
@@ -2311,18 +2331,22 @@ int KYTY_SYSV_ABI Ngs2RackUnlock(uintptr_t rack_handle) {
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
 
-	auto* rack = Ngs2FindRack(rack_handle);
+	// The owner already holds ngs->mutex, so the depth and owner are read
+	// atomically instead of taking the system mutex again.
+	Common::LockGuard racks_lock(g_racks_mutex);
+	auto*           rack = Ngs2FindRackLocked(rack_handle);
 	if (rack == nullptr || rack->ngs == nullptr) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
 
-	if (rack->lock_depth == 0 || rack->lock_owner != std::this_thread::get_id()) {
+	if (rack->lock_depth.load(std::memory_order_relaxed) == 0 ||
+	    rack->lock_owner.load(std::memory_order_relaxed) != std::this_thread::get_id()) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
 
-	rack->lock_depth--;
-	if (rack->lock_depth == 0) {
-		rack->lock_owner = {};
+	const bool last = rack->lock_depth.fetch_sub(1, std::memory_order_relaxed) == 1;
+	if (last) {
+		rack->lock_owner.store({}, std::memory_order_relaxed);
 	}
 	rack->ngs->mutex.Unlock();
 
@@ -2578,6 +2602,10 @@ static bool Ngs2CurrentFrame(Ngs2VoiceInternal& voice) {
 			voice.frame_samples      = voice.next_frame_samples;
 			voice.next_frame_samples = 0;
 		} else if (!Ngs2DecodeFrame(voice, voice.decoded_frame, voice.frame_samples)) {
+			// No playable input: drop the staging state so the boundary sample
+			// keeps its current value until decodable input arrives.
+			voice.next_frame_samples = 0;
+			voice.next_frame_cursor  = 0;
 			return false;
 		}
 	}
@@ -2624,11 +2652,20 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 				const auto saved_samples = voice.frame_samples;
 				voice.frame_cursor       = 0;
 				voice.frame_samples      = 0;
-				Ngs2DecodeFrame(voice, voice.next_decoded_frame, voice.next_frame_samples);
+				const bool staged =
+				    Ngs2DecodeFrame(voice, voice.next_decoded_frame, voice.next_frame_samples);
 				if (voice.source_generation == generation) {
-					voice.next_frame_cursor = voice.frame_cursor;
-					voice.frame_cursor      = saved_cursor;
-					voice.frame_samples     = saved_samples;
+					if (staged) {
+						voice.next_frame_cursor = voice.frame_cursor;
+					} else {
+						voice.next_frame_samples = 0;
+						voice.next_frame_cursor  = 0;
+					}
+					voice.frame_cursor  = saved_cursor;
+					voice.frame_samples = saved_samples;
+				} else {
+					voice.next_frame_samples = 0;
+					voice.next_frame_cursor  = 0;
 				}
 			}
 			if (voice.source_generation != generation ||
@@ -2638,9 +2675,17 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 			}
 		}
 		const float* current = voice.decoded_frame.data() + voice.frame_cursor * voice.channels;
-		const float* next = voice.frame_cursor + 1 < voice.frame_samples ? current + voice.channels
-		                    : voice.next_frame_samples != 0 ? voice.next_decoded_frame.data()
-		                                                    : current;
+		const float* next    = current;
+		if (voice.frame_cursor + 1 < voice.frame_samples) {
+			next = current + voice.channels;
+		} else if (voice.next_frame_samples != 0 && !voice.next_decoded_frame.empty()) {
+			// A staged frame may start past skipped samples; interpolate toward
+			// its first playable sample, not the skipped prefix.
+			const auto next_index = std::min(voice.next_frame_cursor, voice.next_frame_samples - 1);
+			if (size_t(next_index) * voice.channels < voice.next_decoded_frame.size()) {
+				next = voice.next_decoded_frame.data() + next_index * voice.channels;
+			}
+		}
 		const float  fraction =
 		    static_cast<float>(voice.sample_phase) / static_cast<float>(output_rate);
 		for (uint32_t c = 0; c < voice.channels; ++c) {
@@ -3455,10 +3500,18 @@ int KYTY_SYSV_ABI Ngs2ParseWaveformFile(const char* path, uint32_t offset, Ngs2W
 
 	// Read the leading header first and bound the payload read to the extent
 	// declared by the container instead of copying the whole remaining file.
+	// The probe itself is bounded by the remaining file size: a short file
+	// must not leave the stream in a failed state for the payload read.
 	uint8_t header[0x30] {};
 	file.seekg(static_cast<std::streamoff>(offset));
-	file.read(reinterpret_cast<char*>(header), sizeof(header));
+	const auto probe_size = static_cast<std::streamsize>(
+	    std::min<uint64_t>(sizeof(header), file_size - static_cast<uint64_t>(offset)));
+	file.read(reinterpret_cast<char*>(header), probe_size);
 	const auto header_size = static_cast<size_t>(file.gcount());
+	if (header_size != static_cast<size_t>(probe_size)) {
+		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+	}
+	file.clear();
 
 	uint64_t extent_end = file_size;
 	if (header_size >= 12 && std::memcmp(header, "RIFF", 4) == 0 &&
@@ -3499,9 +3552,21 @@ int KYTY_SYSV_ABI Ngs2ParseWaveformFile(const char* path, uint32_t offset, Ngs2W
 
 	const int result = Ngs2ParseWaveformData(buffer.data(), length, info);
 	if (result == 0) {
-		info->data_offset += offset;
+		// Absolute offsets are computed in 64 bits: the file offset may push
+		// the payload past what the 32-bit ABI field can represent.
+		const uint64_t absolute_data_offset =
+		    static_cast<uint64_t>(offset) + info->data_offset;
+		if (absolute_data_offset > std::numeric_limits<uint32_t>::max()) {
+			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+		}
+		info->data_offset = static_cast<uint32_t>(absolute_data_offset);
 		for (uint32_t i = 0; i < info->num_blocks; i++) {
-			info->blocks[i].data_offset += offset;
+			const uint64_t absolute_block_offset =
+			    static_cast<uint64_t>(offset) + info->blocks[i].data_offset;
+			if (absolute_block_offset > std::numeric_limits<uintptr_t>::max()) {
+				return NGS2_ERROR_INVALID_WAVEFORM_DATA;
+			}
+			info->blocks[i].data_offset = static_cast<uintptr_t>(absolute_block_offset);
 		}
 	}
 	return result;
@@ -3915,7 +3980,10 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
 
 	LOGF("\t voice_id = %u\n", voice_id);
 
-	auto* rack = Ngs2FindRack(rack_handle);
+	// Lookup and all rack/voice reads happen under g_racks_mutex so a rack
+	// cannot be destroyed between the lookup and the handle computation.
+	Common::LockGuard racks_lock(g_racks_mutex);
+	auto*           rack = Ngs2FindRackLocked(rack_handle);
 	if (rack == nullptr) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
@@ -4801,7 +4869,8 @@ int KYTY_SYSV_ABI Ngs2SystemEnumRackHandles(uintptr_t system_handle, uintptr_t* 
 
 int KYTY_SYSV_ABI Ngs2RackSetUserData(uintptr_t rack_handle, uintptr_t user_data) {
 	PRINT_NAME();
-	auto* rack = Ngs2FindRack(rack_handle);
+	Common::LockGuard racks_lock(g_racks_mutex);
+	auto*           rack = Ngs2FindRackLocked(rack_handle);
 	if (rack == nullptr) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
@@ -4814,7 +4883,8 @@ int KYTY_SYSV_ABI Ngs2RackGetUserData(uintptr_t rack_handle, uintptr_t* user_dat
 	if (user_data == nullptr) {
 		return NGS2_ERROR_INVALID_OUT_ADDRESS;
 	}
-	auto* rack = Ngs2FindRack(rack_handle);
+	Common::LockGuard racks_lock(g_racks_mutex);
+	auto*           rack = Ngs2FindRackLocked(rack_handle);
 	if (rack == nullptr) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
@@ -4824,8 +4894,7 @@ int KYTY_SYSV_ABI Ngs2RackGetUserData(uintptr_t rack_handle, uintptr_t* user_dat
 
 int KYTY_SYSV_ABI Ngs2RackRunCommands(uintptr_t rack_handle, const void* commands, size_t count) {
 	PRINT_NAME();
-	auto* rack = Ngs2FindRack(rack_handle);
-	if (rack == nullptr) {
+	if (Ngs2FindRack(rack_handle) == nullptr) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
 	if (count == 0) {
@@ -4851,7 +4920,12 @@ int KYTY_SYSV_ABI Ngs2RackRunCommands(uintptr_t rack_handle, const void* command
 			int unlock_res = Ngs2RackUnlock(rack_handle);
 			if (unlock_res != OK) return unlock_res;
 		} else if (cmd == 0xf10002) {
-			rack->user_data = rec.value.u64;
+			Common::LockGuard racks_lock(g_racks_mutex);
+			auto*           target = Ngs2FindRackLocked(rack_handle);
+			if (target == nullptr) {
+				return NGS2_ERROR_INVALID_RACK_HANDLE;
+			}
+			target->user_data = rec.value.u64;
 		}
 	}
 	return OK;
@@ -4865,11 +4939,21 @@ int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, siz
 	if (info_size < sizeof(Ngs2RackInfo)) {
 		return NGS2_ERROR_INVALID_OUT_SIZE;
 	}
-	auto* rack = Ngs2FindRack(rack_handle);
-	if (rack == nullptr || rack->ngs == nullptr) {
+	Ngs2Internal* ngs = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		auto*           rack = Ngs2FindRackLocked(rack_handle);
+		if (rack == nullptr || rack->ngs == nullptr) {
+			return NGS2_ERROR_INVALID_RACK_HANDLE;
+		}
+		ngs = rack->ngs;
+	}
+	Common::LockGuard lock(ngs->mutex);
+	Common::LockGuard racks_lock(g_racks_mutex);
+	auto*           rack = Ngs2FindRackLocked(rack_handle);
+	if (rack == nullptr || rack->ngs != ngs) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
-	Common::LockGuard lock(rack->ngs->mutex);
 
 	*info = {};
 	std::memcpy(info->name, rack->name, sizeof(info->name));
@@ -4904,7 +4988,7 @@ int KYTY_SYSV_ABI Ngs2RackGetInfo(uintptr_t rack_handle, Ngs2RackInfo* info, siz
 	                                ? rack->option.custom_sampler.custom_rack_option.num_modules
 	                                : 0;
 	info->num_buffers         = rack->NumBuffers();
-	info->state_flags         = (rack->lock_depth == 0) ? 1 : 5;
+	info->state_flags         = (rack->lock_depth.load(std::memory_order_relaxed) == 0) ? 1 : 5;
 	info->last_process_ratio  = 0.0f;
 	info->last_processed_tick = 0;
 	info->render_count        = rack->render_count;
@@ -4938,18 +5022,28 @@ int KYTY_SYSV_ABI Ngs2RackQueryInfo(uintptr_t rack_handle, uint32_t info_id, voi
 		case 0xf14001: {
 			if (info_size < sizeof(uint64_t)) return NGS2_ERROR_INVALID_OUT_SIZE;
 			if (info == nullptr) return NGS2_ERROR_INVALID_OUT_ADDRESS;
-			std::memcpy(info, &rack->user_data, sizeof(uint64_t));
+			Common::LockGuard racks_lock(g_racks_mutex);
+			auto*           target = Ngs2FindRackLocked(rack_handle);
+			if (target == nullptr) {
+				return NGS2_ERROR_INVALID_RACK_HANDLE;
+			}
+			std::memcpy(info, &target->user_data, sizeof(uint64_t));
 			return OK;
 		}
 		case 0xf14002: {
 			if (info_size < sizeof(Ngs2CustomModuleInfo)) return NGS2_ERROR_INVALID_OUT_SIZE;
 			if (info == nullptr) return NGS2_ERROR_INVALID_OUT_ADDRESS;
 			const uint32_t module_idx = info_id >> 24;
-			if (!Ngs2RackIsCustom(rack->type) ||
-			    module_idx >= rack->option.custom_sampler.custom_rack_option.num_modules) {
+			Common::LockGuard racks_lock(g_racks_mutex);
+			auto*           target = Ngs2FindRackLocked(rack_handle);
+			if (target == nullptr) {
+				return NGS2_ERROR_INVALID_RACK_HANDLE;
+			}
+			if (!Ngs2RackIsCustom(target->type) ||
+			    module_idx >= target->option.custom_sampler.custom_rack_option.num_modules) {
 				return NGS2_ERROR_INVALID_RACK_MODULE_INDEX;
 			}
-			const auto& mod = rack->option.custom_sampler.custom_rack_option.module[module_idx];
+			const auto& mod = target->option.custom_sampler.custom_rack_option.module[module_idx];
 			auto*       out = static_cast<Ngs2CustomModuleInfo*>(info);
 			out->module_id  = mod.module_id;
 			out->source_buffer_id = mod.source_buffer_id;
@@ -4970,7 +5064,8 @@ int KYTY_SYSV_ABI Ngs2CustomRackGetModuleInfo(uintptr_t rack_handle, uint32_t mo
 	PRINT_NAME();
 	if (info == nullptr) return NGS2_ERROR_INVALID_OUT_ADDRESS;
 	if (info_size < sizeof(Ngs2CustomModuleInfo)) return NGS2_ERROR_INVALID_OUT_SIZE;
-	auto* rack = Ngs2FindRack(rack_handle);
+	Common::LockGuard racks_lock(g_racks_mutex);
+	auto*           rack = Ngs2FindRackLocked(rack_handle);
 	if (rack == nullptr) return NGS2_ERROR_INVALID_RACK_HANDLE;
 	if (!Ngs2RackIsCustom(rack->type) ||
 	    module_index >= rack->option.custom_sampler.custom_rack_option.num_modules) {
@@ -5518,6 +5613,14 @@ static int CheckStreamOption(const void* option, Ngs2StreamOption& checked) {
 		checked.default_param = 0.5f;
 		return 0;
 	}
+	// The record size is validated before the rest of the struct: a wrong
+	// size must report INVALID_OPTION_SIZE even when the other fields are
+	// out of range too.
+	uint64_t opt_size = 0;
+	if (!ReadGuestBytes(&opt_size, option, sizeof(opt_size)) ||
+	    opt_size != sizeof(Ngs2StreamOption)) {
+		return SCE_NGS2_ERROR_INVALID_OPTION_SIZE;
+	}
 	Ngs2StreamOption opt {};
 	if (!ReadGuest(static_cast<const Ngs2StreamOption*>(option), opt)) {
 		return SCE_NGS2_ERROR_INVALID_OPTION_SIZE;
@@ -5533,9 +5636,6 @@ static int CheckStreamOption(const void* option, Ngs2StreamOption& checked) {
 	}
 	if (opt.buffer_size_2 == 0) {
 		return SCE_NGS2_ERROR_STREAM_BUFFER_SIZE_2_ZERO;
-	}
-	if (opt.size != sizeof(Ngs2StreamOption)) {
-		return SCE_NGS2_ERROR_INVALID_OPTION_SIZE;
 	}
 	checked = opt;
 	return 0;
@@ -5703,8 +5803,11 @@ int KYTY_SYSV_ABI Ngs2StreamCreateWithAllocator(uintptr_t system_handle, const v
 		}
 		stream->has_allocator = false;
 		stream->managed_buffer.resize(req_size, 0);
-		stream->buffer_info.host_buffer = stream->managed_buffer.data();
-		stream->buffer_info.user_data   = localAllocator.user_data;
+		// Rebuild the buffer info from the managed storage: the allocator
+		// callback may have left stale size metadata behind.
+		stream->buffer_info.host_buffer      = stream->managed_buffer.data();
+		stream->buffer_info.host_buffer_size = req_size;
+		stream->buffer_info.user_data        = localAllocator.user_data;
 	}
 	stream->handle = reinterpret_cast<uintptr_t>(stream.get());
 

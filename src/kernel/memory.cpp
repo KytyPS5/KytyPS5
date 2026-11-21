@@ -25,6 +25,15 @@
 #include <shared_mutex>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#endif
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #ifndef MEM_RESERVE_PLACEHOLDER
@@ -975,6 +984,17 @@ void Initialize() {
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
+	// Defer the self-tests until all guest regions are reserved; SelfTest can fall back
+	// to the user region when the system-managed region has no free page.
+}
+
+void ReserveGuestAddressSpace() {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	std::unique_lock state(g_memory_state_mutex);
+	EXIT_IF(g_guest_address_space == nullptr);
+	if (!g_guest_address_space->ReserveRemainingGuestRegions()) {
+		return;
+	}
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 }
@@ -2610,10 +2630,20 @@ bool TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size) {
 }
 
 bool TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size) {
+	std::shared_lock state(g_memory_state_mutex);
 	return g_guest_address_space->Owns(vaddr, size);
 }
 
+uint64_t TestGuestRegionFreePage(size_t region) {
+	std::shared_lock state(g_memory_state_mutex);
+	const auto regions = GuestAddressRegions();
+	if (region >= regions.size()) return 0;
+	const auto [start, end] = regions[region];
+	return g_guest_address_space->FindFreeAligned(start, end, 0x4000, 0x4000);
+}
+
 bool TestGuestBackingOutsideAddressSpace() {
+	std::shared_lock state(g_memory_state_mutex);
 	return !g_guest_address_space->OverlapsOwned(g_guest_address_space->GetBackingBase(),
 	                                             g_guest_address_space->GetBackingSize());
 }
@@ -2682,6 +2712,13 @@ bool TestWindowsBackingViewModes() {
 bool TestGuestFreeRangeBounds() {
 	return GuestFreeRangeContains(0x10000, 0x20000, 0x18000, 0x4000) &&
 	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000);
+}
+
+std::vector<std::pair<uint64_t, uint64_t>>
+TestAlignedFreeRangesInRegion(uint64_t region_start, uint64_t region_end,
+                              const std::vector<std::pair<uint64_t, uint64_t>>& occupied,
+                              uint64_t                                          alignment) {
+	return AlignedFreeRangesInRegion(region_start, region_end, occupied, alignment);
 }
 #endif
 
@@ -2976,6 +3013,7 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 
 	VirtualMemory::Mode mode     = VirtualMemory::Mode::NoAccess;
 
+	std::lock_guard state(g_memory_state_mutex);
 	if (!DecodeMemoryProtection(prot, &mode) ||
 	    !g_guest_address_space->Owns(aligned_addr, aligned_len)) {
 		return KERNEL_ERROR_EINVAL;
@@ -2983,7 +3021,6 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	// Reserved ranges and holes have nothing to protect.
 	std::vector<VirtualRanges::Range> ranges;
 	g_virtual_ranges->QueryFragments(aligned_addr, aligned_len, &ranges);
-	std::lock_guard state(g_memory_state_mutex);
 	for (const auto& range: ranges) {
 		if (!IsCommittedRangeType(range.type)) continue;
 		if (!g_guest_address_space->Protect(range.start, range.size, mode)) {

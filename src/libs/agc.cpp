@@ -77,6 +77,9 @@ void Initialize() {
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
+	// The Vulkan device is initialized; reserve Regions 1 and 2 and run the memory
+	// self-tests before driver startup and guest mappings. Fixed DMEM is in Region 0.
+	Libs::LibKernel::Memory::ReserveGuestAddressSpace();
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();

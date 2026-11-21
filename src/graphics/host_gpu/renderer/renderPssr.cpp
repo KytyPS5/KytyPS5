@@ -134,6 +134,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		std::copy_n(words, 8, value.dwords.begin());
 		value.dword_count = 8;
 		auto binding = ResolveTexture(resource, value);
+		EXIT_IF(!binding.image_id);
 		binding.desc.view_info.level_count = 1;
 		binding.desc.view_info.min_lod = 0;
 		return binding;

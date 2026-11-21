@@ -367,9 +367,15 @@ list(APPEND check_headers
 	${KYTY_SOURCE_DIR}
 )
 
+add_library(kyty_emulator_core OBJECT ${kyty_emulator_src})
+target_include_directories(kyty_emulator_core PRIVATE ${inc_headers})
+target_link_libraries(kyty_emulator_core PRIVATE ${kyty_emulator_link_libraries})
+target_compile_definitions(kyty_emulator_core PUBLIC KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
+target_precompile_headers(kyty_emulator_core PRIVATE "${KYTY_SOURCE_DIR}/pch.h")
+
 function(add_kyty_full_emulator_test target source)
-	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
-	target_link_libraries(${target} ${kyty_emulator_link_libraries})
+	add_executable(${target} EXCLUDE_FROM_ALL ${source})
+	target_link_libraries(${target} kyty_emulator_core ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
 		target_link_libraries(${target} iphlpapi dxgi)
@@ -712,8 +718,6 @@ add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
 target_link_libraries(psml_tests common kyty_test_gtest)
 target_include_directories(psml_tests PRIVATE ${inc_headers})
-target_compile_definitions(virtual_memory_allocation_tests PRIVATE
-	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
@@ -921,7 +925,9 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
-add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp")
+target_link_libraries(kyty_emulator kyty_emulator_core)
+target_precompile_headers(kyty_emulator REUSE_FROM kyty_emulator_core)
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")

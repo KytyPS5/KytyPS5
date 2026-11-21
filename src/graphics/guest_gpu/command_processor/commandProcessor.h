@@ -6,7 +6,6 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
 #include <optional>
@@ -14,6 +13,9 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+class CommandScheduler;
+class RenderContext;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
@@ -123,8 +125,8 @@ private:
 	void                CountDraw();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
-	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	CommandScheduler&   GetScheduler() const;
+	CommandBuffer&      CurrentBuffer();
 
 	RenderContext& m_renderer;
 	HW::Context    m_ctx;

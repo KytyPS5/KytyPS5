@@ -48,6 +48,21 @@ if(APPLE)
 	target_link_libraries(common PRIVATE "-framework CoreFoundation" "-framework IOKit")
 endif()
 
+target_precompile_headers(common PRIVATE
+	<algorithm>
+	<chrono>
+	<cstdint>
+	<functional>
+	<memory>
+	<string>
+	<string_view>
+	<utility>
+	<vector>
+	<fmt/format.h>
+	"${KYTY_SOURCE_DIR}/common/common.h"
+	"${KYTY_SOURCE_DIR}/common/assert.h"
+)
+
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)
 set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -31,6 +31,8 @@ LIB_NAME("Ngs2", "Ngs2");
 
 constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE =
     static_cast<int32_t>(0x804a8201u);
+constexpr int32_t NGS2_ERROR_INVALID_RACK_HANDLE =
+    static_cast<int32_t>(0x804a8202u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_SIZE =
@@ -43,6 +45,8 @@ constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8054u);
 constexpr int32_t NGS2_ERROR_INVALID_MATRIX_TYPE =
     static_cast<int32_t>(0x804a809au);
+constexpr int32_t NGS2_ERROR_INVALID_VOICE_INDEX =
+    static_cast<int32_t>(0x804a8305u);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE =
     static_cast<int32_t>(0x804a8361u);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_ID =
@@ -1821,33 +1825,30 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 	return result;
 }
 
-int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* buffer_info) {
-	constexpr int32_t ERROR_INVALID_RACK_HANDLE = static_cast<int32_t>(0x804a8202u);
+// The created rack with this handle, or nullptr.
+static Ngs2RackInternal* Ngs2FindRack(uintptr_t handle) {
+	Common::LockGuard racks_lock(g_racks_mutex);
+	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+		if (reinterpret_cast<uintptr_t>(rack) == handle) {
+			return rack;
+		}
+	}
+	return nullptr;
+}
 
+int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* buffer_info) {
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
 
 	if (buffer_info != nullptr) {
 		*buffer_info = {};
 	}
-	if (rack_handle == 0) {
-		return ERROR_INVALID_RACK_HANDLE;
-	}
 
-	auto*         rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
-	Ngs2Internal* ngs  = nullptr;
-	{
-		Common::LockGuard racks_lock(g_racks_mutex);
-		for (auto* current = g_racks_list; current != nullptr; current = current->next) {
-			if (current == rack) {
-				ngs = current->ngs;
-				break;
-			}
-		}
+	auto* rack = Ngs2FindRack(rack_handle);
+	if (rack == nullptr) {
+		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
-	if (ngs == nullptr) {
-		return ERROR_INVALID_RACK_HANDLE;
-	}
+	auto*                 ngs = rack->ngs;
 	Ngs2ContextBufferInfo context_buffer;
 	Ngs2BufferAllocator   allocator;
 	{
@@ -1859,7 +1860,7 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 				link = &(*link)->next;
 			}
 			if (*link == nullptr) {
-				return ERROR_INVALID_RACK_HANDLE;
+				return NGS2_ERROR_INVALID_RACK_HANDLE;
 			}
 			*link = rack->next;
 		}
@@ -2995,39 +2996,30 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
                                          uintptr_t* handle) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(handle == nullptr);
-	EXIT_NOT_IMPLEMENTED(rack_handle == 0);
-
 	LOGF("\t voice_id = %u\n", voice_id);
 
-	auto* rack   = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
-	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack_handle + sizeof(Ngs2RackInternal));
-
+	auto* rack = Ngs2FindRack(rack_handle);
+	if (rack == nullptr) {
+		return NGS2_ERROR_INVALID_RACK_HANDLE;
+	}
+	if (handle == nullptr) {
+		return NGS2_ERROR_INVALID_OUT_ADDRESS;
+	}
 	if (voice_id >= rack->option.common.max_voices) {
-		LOGF("\t warning: voice_id %u >= max_voices %u, using last available stub voice\n",
-		     voice_id, rack->option.common.max_voices);
-		if (rack->option.common.max_voices == 0) {
-			return -1;
-		}
-		voice_id = rack->option.common.max_voices - 1;
+		return NGS2_ERROR_INVALID_VOICE_INDEX;
 	}
 
-	EXIT_IF(voices[voice_id].rack != rack);
-
-	*handle = reinterpret_cast<uintptr_t>(voices + voice_id);
+	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+	*handle      = reinterpret_cast<uintptr_t>(voices + voice_id);
 
 	return OK;
 }
 
 // A patch to a rack handle connects to voice #0 of that rack.
 static Ngs2VoiceInternal* Ngs2FindPatchDestination(uintptr_t handle) {
-	Common::LockGuard racks_lock(g_racks_mutex);
-	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
-		if (reinterpret_cast<uintptr_t>(rack) == handle) {
-			return reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
-		}
-	}
-	return reinterpret_cast<Ngs2VoiceInternal*>(handle);
+	auto* rack = Ngs2FindRack(handle);
+	return rack != nullptr ? reinterpret_cast<Ngs2VoiceInternal*>(rack + 1)
+	                       : reinterpret_cast<Ngs2VoiceInternal*>(handle);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

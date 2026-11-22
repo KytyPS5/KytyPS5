@@ -1192,6 +1192,35 @@ void TestMasteringRackChannelRange() {
 	RenderRack rack(system, 0x3000, option.common);
 }
 
+void TestRackGetVoiceHandleErrors() {
+	Ngs2Internal system;
+	auto         option = SingleVoiceRackOption(0x1000);
+	option.common.max_voices = 3;
+	RenderRack rack(system, 0x1000, option.common);
+	// The handle of a destroyed rack, whose buffer is still allocated.
+	std::unique_ptr<std::byte[]> storage;
+	uintptr_t                    destroyed = 0;
+	{
+		RenderRack dead(system, 0x1000, option.common);
+		destroyed = dead.handle;
+		storage   = std::move(dead.storage);
+	}
+	Check(Ngs2RackDestroy(destroyed, nullptr) == NGS2_ERROR_INVALID_RACK_HANDLE,
+	      "a destroyed rack was destroyed again");
+	constexpr uintptr_t sentinel = 0x5a5a;
+	uintptr_t           handle   = sentinel;
+	Check(Ngs2RackGetVoiceHandle(destroyed, 0, &handle) == NGS2_ERROR_INVALID_RACK_HANDLE &&
+	          Ngs2RackGetVoiceHandle(0, 0, &handle) == NGS2_ERROR_INVALID_RACK_HANDLE &&
+	          Ngs2RackGetVoiceHandle(destroyed, 0, nullptr) == NGS2_ERROR_INVALID_RACK_HANDLE &&
+	          Ngs2RackGetVoiceHandle(rack.handle, 3, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS &&
+	          Ngs2RackGetVoiceHandle(rack.handle, 3, &handle) == NGS2_ERROR_INVALID_VOICE_INDEX &&
+	          handle == sentinel,
+	      "voice handle lookup did not reject the rack, the out address and the index in order");
+	Check(Ngs2RackGetVoiceHandle(rack.handle, 2, &handle) == OK &&
+	          handle == reinterpret_cast<uintptr_t>(&rack.Voice() + 2),
+	      "voice handle lookup did not return the last voice");
+}
+
 void TestMasteringVoiceState() {
 	MasteringRender m;
 	alignas(Ngs2MasteringVoiceState) std::array<uint8_t, 0x140> storage;
@@ -2680,6 +2709,7 @@ int main() {
 	TestMasteringControlErrors();
 	TestMasteringRackChannelRange();
 	TestMasteringVoiceState();
+	TestRackGetVoiceHandleErrors();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();

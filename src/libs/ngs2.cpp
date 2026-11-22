@@ -3426,7 +3426,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 
 		auto rack_id = param->id >> 16u;
 
-		EXIT_NOT_IMPLEMENTED(rack_id != 0x3000 && ((param->id >> 15u) & 0x1u) != 0);
+		// Bit 15 of a custom rack id is bit 7 of its module id.
+		EXIT_NOT_IMPLEMENTED(rack_id != 0x3000 && rack_id != 0x4000 &&
+		                     ((param->id >> 15u) & 0x1u) != 0);
 
 		switch (rack_id) {
 			case 0x0000: {
@@ -3646,13 +3648,16 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			}
 			case 0x4000: {
 				EXIT_NOT_IMPLEMENTED(!Ngs2RackIsCustom(voice->rack->type));
-				const auto index = param->id & 0x1fu;
-				EXIT_NOT_IMPLEMENTED(index >= voice->modules.size());
-				const auto module_id =
-				    voice->rack->option.custom_sampler.custom_rack_option.module[index].module_id;
-				auto& module = voice->modules[index];
-				if ((param->id & 0xffffffe0u) != (0x40000000u | module_id << 8u) ||
-				    (module_id != 0x17 && module_id != 0x19 && module_id != 0x1f)) {
+				// The id names module `index` and its module id; bits 5-7 are not read.
+				const auto  index   = param->id & 0x1fu;
+				const auto& modules = voice->rack->option.custom_sampler.custom_rack_option.module;
+				if (index >= voice->modules.size() ||
+				    (param->id >> 8u & 0xffu) != modules[index].module_id) {
+					return NGS2_ERROR_INVALID_VOICE_PARAM_ID;
+				}
+				const auto module_id = modules[index].module_id;
+				auto&      module    = voice->modules[index];
+				if (module_id != 0x17 && module_id != 0x19 && module_id != 0x1f) {
 					if (!module.control_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom control 0x%08" PRIx32 " is ignored\n",

@@ -838,6 +838,7 @@ void TestCustomSideChainUserFx() {
 	custom.num_buffers      = 2;
 	custom.num_modules      = 1;
 	custom.module[0]        = {nullptr, 0x19, 0, 1, 0};
+	custom.module[1]        = custom.module[0];
 	Ngs2VoiceInternal voice;
 	voice.rack = &custom_rack;
 	voice.ports.resize(1);
@@ -850,10 +851,22 @@ void TestCustomSideChainUserFx() {
 		Ngs2VoiceParamHeader header;
 		void                 KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*);
 		uintptr_t            user_data[3];
-	} fx {{40, 0, 0x40001900}, MultiplyBySideChain, {7, 0, 0}};
+	} fx {{40, 0, 0x40001920}, MultiplyBySideChain, {7, 0, 0}};
+	// The control's bits 5-7 are not read.
 	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK &&
 	          Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &fx.header) == OK,
 	      "custom submixer user FX setup failed");
+	// Another module id, or an index past the modules even where the option holds the id, is
+	// rejected and applies nothing.
+	auto rejected    = fx;
+	rejected.handler = nullptr;
+	for (uint32_t id: {0x40009900u, 0x40001901u}) {
+		rejected.header.id = id;
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &rejected.header) ==
+		              NGS2_ERROR_INVALID_VOICE_PARAM_ID &&
+		          voice.modules[0].handler == MultiplyBySideChain,
+		      "a custom control for another module was applied");
+	}
 	voice.state = Ngs2VoicePlayState::Playing;
 	main.voice.ports.push_back({&voice, 0, 1.0f, -1});
 	side.voice.ports.push_back({&voice, 1, 1.0f, -1});

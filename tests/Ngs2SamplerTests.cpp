@@ -451,10 +451,10 @@ void TestAtrac9Vibration() {
 		          config == original,
 		      "ATRAC9 vibration config returned incorrect geometry or changed input");
 		Atrac9CodecInfo parsed {};
-		Check(Ngs2GetAtrac9CodecInfo(config, parsed) && parsed.channels == channels &&
+		Check(AjmAt9GetCodecInfo(config.data(), parsed) && parsed.channels == channels &&
 		          parsed.samplingRate == 48000 && parsed.frameSamples == 256 &&
 		          parsed.framesInSuperframe == 4 && parsed.superframeSize == 128,
-		      "NGS2 vibration metadata differs from decoder metadata");
+		      "vibration codec info differs from decoder metadata");
 
 		// Enlarge the superframe for the synthetic blocks and compare ordinary mono/dual mono.
 		config[2] = 0x0b;
@@ -499,12 +499,12 @@ void TestAtrac9Vibration() {
 			auto invalid = original;
 			invalid[0] = 0;
 			Check(decoder.Initialize(invalid.data(), invalid.size()).result != OK &&
-			          !Ngs2GetAtrac9CodecInfo(invalid, parsed),
+			          !AjmAt9GetCodecInfo(invalid.data(), parsed),
 			      "ATRAC9 vibration accepted an invalid header");
 			invalid = original;
 			invalid[1] |= 1;
 			Check(decoder.Initialize(invalid.data(), invalid.size()).result != OK &&
-			          !Ngs2GetAtrac9CodecInfo(invalid, parsed),
+			          !AjmAt9GetCodecInfo(invalid.data(), parsed),
 			      "ATRAC9 vibration accepted an unsupported extension");
 		}
 	}
@@ -530,7 +530,7 @@ void TestAtrac9Discrete() {
 		Check(initialized.result == OK && initialized.format.channel_num == channels &&
 		          initialized.format.sampling_frequency == rate && info.frame_samples == samples &&
 		          info.frames_in_super_frame == frames && info.super_frame_size == bytes * frames * channels &&
-		          Ngs2GetAtrac9CodecInfo(config, parsed) && parsed.channels == channels &&
+		          AjmAt9GetCodecInfo(config.data(), parsed) && parsed.channels == channels &&
 		          parsed.samplingRate == rate && parsed.frameSamples == samples &&
 		          parsed.framesInSuperframe == frames && parsed.superframeSize == bytes * frames * channels &&
 		          config == original && (channels != 12 || config == captured),
@@ -684,7 +684,7 @@ void TestAtrac9Discrete() {
 	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc0, 0xff}}) {
 		Atrac9CodecInfo info {};
 		AjmAt9Decoder decoder(12, 48000, AjmSampleEncoding::S16, 0);
-		Check(!Ngs2GetAtrac9CodecInfo(invalid, info) &&
+		Check(!AjmAt9GetCodecInfo(invalid.data(), info) &&
 		          decoder.Initialize(invalid.data(), invalid.size()).result != OK,
 		      "ATRAC9 discrete accepted unsupported configuration fields");
 	}
@@ -2621,6 +2621,163 @@ void TestPcmWaveformTypes() {
 	}
 }
 
+// RIFF ATRAC9 headers up to the data chunk body, which no parse reads: 6 channels with a 60-byte
+// smpl chunk before data, and 2 and 4 channels in 768-byte superframes with data right after fact.
+constexpr std::string_view SIX_CHANNEL_ATRAC9 =
+    "524946464019880057415645666d742034000000feff060080bb00007c92000020030000220000040f060000"
+    "d242e147ba368d4d88fc61654f8c836c01000000fe7618f000000000666163740c0000009531ae0000010000"
+    "00010000736d706c3c0000000000000000000000000000003c00000000000000000000000000000001000000"
+    "1800000000000000000000005440040028b28f00000000000000000064617461a0188800";
+constexpr std::string_view STEREO_ATRAC9 =
+    "524946465c0e220057415645666d742034000000feff020080bb0000a08c0000000300002200000403000000"
+    "d242e147ba368d4d88fc61654f8c836c01000000fe7417f000000000666163740c00000080662d0000010000"
+    "0001000064617461000e2200";
+constexpr std::string_view FOUR_CHANNEL_ATRAC9 =
+    "524946465cf55e0057415645666d742034000000feff040080bb0000a08c0000000300002200000433000000"
+    "d242e147ba368d4d88fc61654f8c836c01000000fe7a17f000000000666163740c000000b79a7e0000010000"
+    "000100006461746100f55e00";
+
+// The 6-channel header with an unknown chunk in place of smpl, which the walk skips.
+std::vector<uint8_t> SixChannelAtrac9() {
+	auto bytes = HexBytes(SIX_CHANNEL_ATRAC9);
+	std::memcpy(bytes.data() + 92, "junk", 4);
+	return bytes;
+}
+
+// Parses the first `size` bytes into an info whose bytes all start as 0xab.
+int32_t ParseWaveform(const std::vector<uint8_t>& bytes, size_t size, Ngs2WaveformInfo& info) {
+	std::memset(&info, 0xab, sizeof(info));
+	return Ngs2ParseWaveformData(bytes.data(), size, &info);
+}
+
+// Whether every byte of the info from `from` on is still 0xab.
+bool Untouched(const Ngs2WaveformInfo& info, size_t from) {
+	const auto* bytes = reinterpret_cast<const uint8_t*>(&info);
+	return std::all_of(bytes + from, bytes + sizeof(info), [](uint8_t b) { return b == 0xab; });
+}
+
+// The format and geometry come from fmt, the sample count from fact[0] and the data extent from
+// the data chunk; one block holds every sample behind the one-frame delay, and the blocks after
+// it are not written.
+void TestParseAtrac9Headers() {
+	struct Header {
+		std::vector<uint8_t> bytes;
+		Ngs2WaveformFormat   format;
+		uint32_t             data_offset, data_size, num_samples, unit_size;
+	};
+	const Header headers[] = {
+	    {SixChannelAtrac9(), {0x40, 6, 48000, 0xfe7618f0}, 168, 8919200, 11415957, 200},
+	    {HexBytes(STEREO_ATRAC9), {0x40, 2, 48000, 0xfe7417f0}, 100, 2231808, 2975360, 192},
+	    {HexBytes(FOUR_CHANNEL_ATRAC9), {0x40, 4, 48000, 0xfe7a17f0}, 100, 6223104, 8297143, 192},
+	};
+	for (const auto& [bytes, format, data_offset, data_size, num_samples, unit_size]: headers) {
+		Ngs2WaveformInfo info;
+		const auto&      block = info.blocks[0];
+		Check(ParseWaveform(bytes, bytes.size(), info) == OK &&
+		          std::memcmp(&info.format, &format, sizeof(format)) == 0 &&
+		          info.data_offset == data_offset && info.data_size == data_size &&
+		          info.loop_begin_position == 0 && info.loop_end_position == 0 &&
+		          info.num_samples == num_samples && info.audio_unit_size == unit_size &&
+		          info.num_audio_unit_samples == 256 && info.num_audio_unit_per_frame == 4 &&
+		          info.audio_frame_size == unit_size * 4 && info.num_audio_frame_samples == 1024 &&
+		          info.num_delay_samples == 256 && info.num_blocks == 1,
+		      "an ATRAC9 header parsed to the wrong waveform info");
+		Check(block.data_offset == data_offset && block.data_size == data_size &&
+		          block.num_repeats == 0 && block.num_skip_samples == 256 &&
+		          block.num_samples == num_samples && block.reserved == 0 && block.user_data == 0 &&
+		          Untouched(info, offsetof(Ngs2WaveformInfo, blocks) + sizeof(Ngs2WaveformBlock)),
+		      "an ATRAC9 header parsed to the wrong block");
+	}
+}
+
+// Each chunk is the first of its id, found by a walk from offset 12. A missing chunk or a read past
+// the data fails with 0x804A8430, a format other than ATRAC9 with 0x804A8432, and a failed parse
+// clears only the waveform type and channel count.
+void TestParseWaveformErrors() {
+	constexpr int32_t DATA    = NGS2_ERROR_INVALID_WAVEFORM_DATA;
+	constexpr int32_t UNKNOWN = NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+	struct Case {
+		std::vector<std::pair<uint32_t, uint32_t>> words; // little-endian words at byte offsets
+		int32_t                                    result;
+		size_t                                     size        = 168; // bytes parsed
+		uint32_t                                   num_samples = 11415957;
+		uint32_t                                   data_size   = 8919200;
+		uint32_t                                   delay       = 256;
+		size_t                                     block_size  = 8919200;
+	};
+	const Case cases[] = {
+	    // Every read lies inside the data; the data chunk body is never read.
+	    {{}, DATA, 3},
+	    {{}, DATA, 11},
+	    {{}, DATA, 167},
+	    // The magic is RIFF; the form type is not checked.
+	    {{{0, 0x58464952}}, DATA},
+	    {{{8, 0x58585858}}, OK},
+	    // A list size below 4 bounds nothing, one of 4 to 16 fails before the format is checked,
+	    // and the list size minus 4 must lie past each next chunk header.
+	    {{{4, 0}}, OK},
+	    {{{4, 16}, {20, 0x00060002}}, DATA},
+	    {{{4, 17}, {20, 0x00060002}}, UNKNOWN},
+	    {{{4, 164}}, DATA},
+	    {{{4, 165}}, OK},
+	    {{{12, 0x20746d78}}, DATA},
+	    {{{72, 0x74636178}}, DATA},
+	    {{{160, 0x61746178}}, DATA},
+	    // Odd sizes are padded and the first match wins, also with size 0. A zero-size chunk before
+	    // the match fails the walk, also with a data header right behind it, as does a walk past
+	    // 4 GiB.
+	    {{{76, 11}}, OK},
+	    {{{96, 59}}, OK},
+	    {{{92, 0x74636166}}, OK},
+	    {{{164, 0}}, OK, 168, 11415957, 0},
+	    {{{96, 0}, {100, 0x61746164}}, DATA},
+	    {{{96, 0xfffffff8}}, DATA},
+	    // An extensible format of 40 bytes or more with a subformat other than PCM is ATRAC9 at
+	    // 52 bytes or with the ATRAC9 subformat.
+	    {{{20, 0x00060002}}, UNKNOWN},
+	    {{{16, 39}}, UNKNOWN},
+	    {{{16, 40}, {44, 0}}, UNKNOWN},
+	    {{{44, 0x12345678}}, OK},
+	    {{{44, 0x00000001}, {48, 0x00100000}, {52, 0xaa000080}, {56, 0x719b3800}}, UNKNOWN},
+	    // The geometry follows the config: 12 streams of 64-byte frames, 128-sample frames at
+	    // 24 kHz, and no superframe samples, which fails.
+	    {{{64, 0xfec07230}}, OK, 168, 11415957, 8919200, 256, 34249728},
+	    {{{64, 0xf01846fe}}, OK, 168, 11415957, 8919200, 128, 17838400},
+	    {{{64, 0xf01866fe}}, UNKNOWN},
+	    {{{64, 0xf0187600}}, UNKNOWN},
+	    // The sample count is fact[0]; the delay and the skip are one frame whatever fact holds.
+	    {{{80, 1000}, {84, 1000}, {88, 7}}, OK, 168, 1000, 8919200, 256, 1600},
+	};
+	const auto six = SixChannelAtrac9();
+	for (const auto& [words, result, size, num_samples, data_size, delay, block_size]: cases) {
+		auto bytes = six;
+		for (const auto& [offset, word]: words) {
+			std::memcpy(bytes.data() + offset, &word, sizeof(word));
+		}
+		Ngs2WaveformInfo info;
+		const auto       code = ParseWaveform(bytes, size, info);
+		if (result != OK) {
+			Check(code == result && info.format.waveform_type == 0 &&
+			          info.format.num_channels == 0 && Untouched(info, 8),
+			      "a malformed header did not fail");
+			continue;
+		}
+		const auto& block = info.blocks[0];
+		Check(code == OK && info.num_samples == num_samples && info.data_size == data_size &&
+		          info.num_delay_samples == delay && block.data_offset == 168 &&
+		          block.data_size == block_size && block.num_skip_samples == delay &&
+		          block.num_samples == num_samples,
+		      "a header variant parsed to the wrong waveform info");
+	}
+	Ngs2WaveformInfo info;
+	std::memset(&info, 0xab, sizeof(info));
+	Check(Ngs2ParseWaveformData(six.data(), six.size(), nullptr) ==
+	              NGS2_ERROR_INVALID_OUT_ADDRESS &&
+	          Ngs2ParseWaveformData(nullptr, six.size(), &info) == DATA &&
+	          info.format.waveform_type == 0 && info.format.num_channels == 0 && Untouched(info, 8),
+	      "a parse without info or data did not fail");
+}
+
 // A 24-bit stereo frame that straddles its block's end is gathered from the following data-only
 // blocks, waits for them while they are missing and silences the voice if one has samples.
 void TestPcmFrameGather() {
@@ -4090,6 +4247,8 @@ int main() {
 	TestPcmSkipPlaysAndDataOnlyBlocks();
 	TestPcmBlocksEndWithTheirData();
 	TestPcmWaveformTypes();
+	TestParseAtrac9Headers();
+	TestParseWaveformErrors();
 	TestPcmFrameGather();
 	TestDecodedDataSizeAndEmptyBlockCallbacks();
 	TestMonoRateAndRouting();

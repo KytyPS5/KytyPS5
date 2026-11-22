@@ -1064,6 +1064,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	// what it wrote.
 	const bool mesh_fallback = mesh_active && !m_context.GetGraphics().mesh_shader_enabled;
 	ShaderRecompiler::IR::MeshFallbackLayout fallback_layout;
+	uint64_t fallback_bytes = 0; // this draw's region of the fallback buffer, 256-byte aligned
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.indexed || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
@@ -1103,15 +1104,18 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			                       fallback_layout.slot_stride * 16u;
 			const uint64_t vertices =
 			    static_cast<uint64_t>(mesh_groups) * mesh.max_primitives * 3u;
+			fallback_bytes = (bytes + 255u) & ~uint64_t {255u};
 			if (mesh_groups > compute_limits.maxComputeWorkGroupCount[0] ||
 			    draw.instance_count > compute_limits.maxComputeWorkGroupCount[1] ||
-			    bytes > MeshFallbackBufferSize || vertices > UINT32_MAX) {
-				static std::atomic_bool warned = false;
-				if (!warned.exchange(true, std::memory_order_relaxed)) {
-					std::printf("Warning: dropping a mesh draw too large for the compute fallback "
-					            "(%u groups x %u instances, %llu bytes)\n",
-					            mesh_groups, draw.instance_count,
-					            static_cast<unsigned long long>(bytes));
+			    fallback_bytes > MeshFallbackBufferSize || vertices > UINT32_MAX) {
+				static std::atomic_uint64_t dropped = 0;
+				const auto n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 3 || n % 1000 == 0) {
+					std::printf("Warning: dropped mesh draw #%llu, too large for the compute fallback "
+					            "(%u groups x %u instances, %llu bytes of %llu)\n",
+					            static_cast<unsigned long long>(n), mesh_groups, draw.instance_count,
+					            static_cast<unsigned long long>(bytes),
+					            static_cast<unsigned long long>(MeshFallbackBufferSize));
 				}
 				return;
 			}
@@ -1227,16 +1231,22 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		// Run the mesh program as a compute shader that writes each group's vertices and
 		// triangles to the fallback buffer; the draw below reads them back. A mesh draw has a
 		// single vertex stage, which is stage 0.
-		fallback_address = m_mesh_fallback_buffer->BufferDeviceAddress();
 		buffer.EndRendering();
-		// The previous fallback draw's vertex shader may still be reading the buffer.
-		const vk::MemoryBarrier before {
-		    .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
-		    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader |
-		                              vk::PipelineStageFlagBits::eComputeShader,
-		                          vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags {},
-		                          1, &before, 0, nullptr, 0, nullptr);
+		// Each draw gets its own region of the buffer (a ring), so this draw's compute pass can
+		// overlap the previous draws' vertex and pixel work. Only when the ring wraps around can
+		// an earlier draw's vertex shader still be reading the bytes this draw is about to write.
+		if (m_mesh_fallback_offset + fallback_bytes > MeshFallbackBufferSize) {
+			m_mesh_fallback_offset = 0;
+			const vk::MemoryBarrier before {
+			    .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
+			    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader |
+			                              vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::DependencyFlags {}, 1, &before, 0, nullptr, 0, nullptr);
+		}
+		fallback_address = m_mesh_fallback_buffer->BufferDeviceAddress() + m_mesh_fallback_offset;
+		m_mesh_fallback_offset += fallback_bytes;
 		PreparedBindings* compute_stage = &bindings.vertex[0];
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, *mesh_compute_pipeline,
 		               std::span<PreparedBindings* const> {&compute_stage, 1});

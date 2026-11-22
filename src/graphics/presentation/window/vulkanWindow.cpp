@@ -277,7 +277,12 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.shaderImageGatherExtended,
 		              "shaderImageGatherExtended");
-		check_feature(device_features2.features.shaderResourceMinLod, "shaderResourceMinLod");
+		if (device_features2.features.shaderResourceMinLod != VK_TRUE) {
+			// Drivers without it (Adreno on Windows ARM64, see #2434) lose the sampler LOD
+			// clamp on implicit-LOD samples; explicit-LOD samples still clamp through FMax.
+			LOGF("shaderResourceMinLod is not supported; games using sampler clamps may sample "
+			     "blurrier mips\n");
+		}
 
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
@@ -533,6 +538,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
 	graphics.ray_query_enabled                = ray_query_enabled;
+	graphics.shader_resource_min_lod_enabled  = supported2.features.shaderResourceMinLod == VK_TRUE;
 	// A coarser alignment rounds the range up past the guest's last byte.
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&
@@ -577,7 +583,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.shaderStorageImageMultisample =
 	    supported2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
-	device_features.shaderResourceMinLod                 = VK_TRUE;
+	// Selection no longer requires it; request only what the device supports (#2434).
+	device_features.shaderResourceMinLod                 = supported2.features.shaderResourceMinLod;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;

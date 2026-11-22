@@ -63,6 +63,7 @@ if(WIN32)
 	)
 	target_link_libraries(launcher_cmd_command_tests Qt6::Core)
 	target_include_directories(launcher_cmd_command_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+	add_test(NAME launcher_cmd_command COMMAND $<TARGET_FILE:launcher_cmd_command_tests>)
 endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)

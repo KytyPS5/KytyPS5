@@ -144,6 +144,13 @@ jobs:
           path: _Build/windows/install/**
           if-no-files-found: error
 
+      - name: Upload Windows symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64-symbols
+          path: _Build/windows/kyty_emulator.pdb
+          if-no-files-found: error
+
   macos:
     name: Build KytyPS5 (macOS)
     needs: metadata
@@ -468,6 +475,13 @@ jobs:
           name: KytyPS5-Windows-x64
           path: artifacts/KytyPS5-Windows-x64
 
+      - name: Download Windows symbols
+        if: needs.windows.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64-symbols
+          path: artifacts/KytyPS5-Windows-x64-symbols
+
       - name: Download macOS build
         if: needs.macos.result == 'success'
         uses: actions/download-artifact@v4
@@ -492,6 +506,7 @@ jobs:
             cd "$windows_dir"
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
           )
+          zip -j "$RELEASE_NAME-Windows-x64-symbols.zip" artifacts/KytyPS5-Windows-x64-symbols/kyty_emulator.pdb
 
       - name: Package macOS build
         if: needs.macos.result == 'success'
@@ -522,6 +537,7 @@ jobs:
           assets=()
           for artifact in \
             "$RELEASE_NAME-Windows-x64.zip" \
+            "$RELEASE_NAME-Windows-x64-symbols.zip" \
             "$RELEASE_NAME-macOS-x86_64.zip" \
             "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
             if [[ -f "$artifact" ]]; then

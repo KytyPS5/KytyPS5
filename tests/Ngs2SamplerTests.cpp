@@ -193,7 +193,6 @@ void TestStereoPan() {
 
 void TestWaveformQueueCapacity() {
 	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
-	constexpr int32_t invalid_count = static_cast<int32_t>(0x804a8053u);
 	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
 		for (uint32_t capacity: {1u, 4u, 16u}) {
 			Fixture f(24000, 1, rack);
@@ -211,8 +210,8 @@ void TestWaveformQueueCapacity() {
 			const auto phase = f.voice.sample_phase;
 			Check(f.QueueBlocks(replacement, blocks.data(), 1, 0) == full,
 			      "full waveform queue accepted another guest buffer");
-			Check(f.QueueBlocks(replacement, blocks.data(), capacity + 1, 4) == invalid_count,
-			      "oversized waveform request did not reject before CLEAR");
+			Check(f.QueueBlocks(replacement, blocks.data(), capacity + 1, 4) == full,
+			      "a CLEAR of more blocks than the capacity was not rejected as full");
 			Check(f.voice.blocks.size() == capacity && f.voice.accepts_blocks &&
 			          f.voice.sample_phase == phase && f.voice.decoded_samples == 1 &&
 			          f.voice.decoded_bytes == sizeof(int16_t),
@@ -2336,7 +2335,7 @@ void TestPcmSkipAcrossBlocks() {
 }
 
 void TestPcmSkipPlaysAndDataOnlyBlocks() {
-	const int16_t pcm[] = {4096, 8192, 12288, 16384};
+	const int16_t pcm[] = {4096, 8192, 12288, 16384, 20480, 24576, 28672, -4096};
 	// A block of skip samples alone plays them.
 	Fixture                 skip(48000);
 	const Ngs2WaveformBlock skip_only {0, 6, 0, 3, 0, 0, 0};
@@ -2356,7 +2355,9 @@ void TestPcmSkipPlaysAndDataOnlyBlocks() {
 	          join.voice.blocks.front().info.data_size == 4,
 	      "data-only blocks did not join by samples, user data and repeats");
 	// A data-only block after a finished extent is dropped.
-	Fixture                 drop(48000);
+	Fixture drop(48000);
+	// One sample per grain keeps the playing block at the front until its last sample.
+	drop.system.option.num_grain_samples = 1;
 	const Ngs2WaveformBlock ended[] = {
 	    {0, 4, 0, 0, 1, 0, 0}, {6, 2, 0, 0, 0, 0, 0}, {4, 2, 0, 0, 1, 0, 0}};
 	Check(drop.QueueBlocks(pcm, ended, 3, 1) == OK, "blocks after an extent were rejected");
@@ -2365,12 +2366,13 @@ void TestPcmSkipPlaysAndDataOnlyBlocks() {
 	          drop.voice.decoded_samples == 2,
 	      "a data-only block after its extent played");
 	// A canceled block of skip samples behind the playing block plays nothing.
-	const Ngs2WaveformBlock queued[] = {{0, 4, 0, 0, 2, 0, 0}, {0, 4, 0, 2, 0, 0, 0}};
+	const Ngs2WaveformBlock queued[] = {{0, 16, 0, 0, 8, 0, 0}, {0, 4, 0, 2, 0, 0, 0}};
 	Check(drop.QueueBlocks(pcm, queued, 2, 1) == OK, "blocks before a cancel were rejected");
 	drop.Render(1);
 	Check(drop.QueueBlocks(pcm, ended + 2, 1, 8) == OK, "a canceling addition was rejected");
-	drop.Render(3);
-	Check(drop.voice.samples == std::vector<float> {0.25f, 0.375f, 0},
+	drop.Render(9);
+	Check(drop.voice.samples ==
+	          std::vector<float> {0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f, -0.125f, 0.375f, 0},
 	      "a canceled block played its skip");
 }
 
@@ -2546,22 +2548,86 @@ void KYTY_SYSV_ABI RecordBlockAttributes(const Ngs2VoiceCallbackInfo* info) {
 	g_block_attributes.push_back(info->attributes);
 }
 
-void TestCancelSkipsBlocksNotStarted() {
+void TestCancelKeepsOnlyTheFrontBlock() {
 	Fixture f(48000);
 	f.system.option.num_grain_samples = 1;
 	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordBlockAttributes);
 	f.voice.callback_flags = 1;
 	const int16_t pcm[] = {8192, 16384, -8192, -16384};
-	f.Queue(pcm, 2, 1, 1);
+	// The front block holds more than the samples a reader fetches ahead of the output.
+	const int16_t front[] = {2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384};
+	f.Queue(front, 8, 1, 1);
 	f.Queue(pcm + 2, 1, 1);
 	f.Render(1);
 	// Cancel during the first pass of the looping block.
 	f.Queue(pcm + 3, 1, 9);
-	f.Render(4);
-	Check(f.voice.samples == std::vector<float> {0.5f, 0.25f, 0.5f, -0.5f},
-	      "CANCEL did not keep the playing block and skip the queued one");
-	Check(g_block_attributes == std::vector<uint32_t> {1, 1, 0},
-	      "block callbacks did not report the canceled blocks");
+	f.Render(16);
+	std::vector<float> expected;
+	for (uint32_t i = 1; i < 16; ++i) {
+		expected.push_back(front[i % 8] / 32768.0f);
+	}
+	expected.push_back(-0.5f);
+	Check(f.voice.samples == expected,
+	      "CANCEL did not keep the playing block and drop the queued one");
+	Check(g_block_attributes == std::vector<uint32_t> {0, 0},
+	      "a dropped block reported a callback or a block reported an attribute");
+
+	// The front block stays even before it starts.
+	Fixture idle(48000);
+	idle.system.option.num_grain_samples = 1;
+	idle.Queue(pcm, 1, 1);
+	idle.Queue(pcm + 1, 1, 1);
+	idle.Queue(pcm + 2, 1, 8);
+	idle.Render(3);
+	Check(idle.voice.samples == std::vector<float> {0.25f, -0.25f, 0.0f},
+	      "CANCEL dropped a front block that had not started");
+
+	// Only the front block takes capacity, even in an empty list, and added data joins it.
+	Fixture                 join(48000);
+	const Ngs2WaveformBlock queued[] = {{0, 2, 0, 0, 1, 0, 7}, {4, 2, 0, 0, 1, 0, 7}};
+	const Ngs2WaveformBlock tail {2, 2, 0, 0, 0, 0, 7};
+	join.SetCapacity(2);
+	Check(join.QueueBlocks(pcm, queued, 2, 9) == static_cast<int32_t>(0x804a8054u) &&
+	          join.QueueBlocks(pcm, queued, 2, 1) == OK &&
+	          join.QueueBlocks(pcm, &tail, 1, 9) == OK && join.voice.blocks.size() == 1 &&
+	          join.voice.blocks.front().info.data_size == 4,
+	      "CANCEL did not reserve the front slot of an empty list or join added data to it");
+	Check(join.QueueBlocks(pcm, queued, 2, 9) == static_cast<int32_t>(0x804a8054u) &&
+	          join.QueueBlocks(pcm, queued + 1, 1, 9) == OK && join.voice.blocks.size() == 2,
+	      "CANCEL did not reserve exactly the front block's slot");
+	Check(join.QueueBlocks(pcm, nullptr, 0, 9) == OK && join.voice.blocks.size() == 1,
+	      "an empty CANCEL did not drop the blocks behind the front one");
+}
+
+void TestWaveformBlockAdditionErrors() {
+	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
+	Fixture           f(48000);
+	const int16_t     pcm[] = {8192, 16384};
+	struct Blocks {
+		Ngs2VoiceParamHeader     header {31, 0, 0x10000001};
+		const void*              data  = nullptr;
+		uint32_t                 flags = 1, count = 1;
+		const Ngs2WaveformBlock* blocks = nullptr;
+	} param;
+	const Ngs2WaveformBlock block {0, 2, 0, 0, 1, 0, 0};
+	param.blocks = &block;
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &param.header) ==
+	              static_cast<int32_t>(0x804a8361u) &&
+	          f.voice.blocks.empty(),
+	      "a short waveform block param was accepted");
+	Check(f.QueueBlocks(pcm, nullptr, 1, 1) == static_cast<int32_t>(0x804a8058u) &&
+	          f.voice.blocks.empty(),
+	      "a missing waveform block array was accepted");
+	// Bits above NOJOINT are ignored.
+	Check(f.QueueBlocks(pcm, &block, 1, 0x21) == OK && f.voice.blocks.size() == 1 &&
+	          f.voice.accepts_blocks,
+	      "unknown waveform block flags changed the addition");
+	// An addition without CONTINUE closes the list until CLEAR or SETUP; CANCEL does not reopen it.
+	Check(f.QueueBlocks(pcm, nullptr, 0, 0) == OK && !f.voice.accepts_blocks &&
+	          f.QueueBlocks(pcm, &block, 1, 1) == full && f.QueueBlocks(pcm, &block, 1, 9) == full,
+	      "a closed waveform list accepted blocks");
+	f.voice.SetupSampler({0x12, 1, 48000});
+	Check(f.QueueBlocks(pcm, &block, 1, 1) == OK, "SETUP did not reopen a closed waveform list");
 }
 
 void TestSetupQuery() {
@@ -3088,14 +3154,13 @@ void TestAtrac9WaveformJoining() {
 			Check(f.QueueBlocks(encoded.data(), &first, 1, 1) == OK,
 			      "compressed stream start could not be queued");
 			const uint32_t flags = nojoin ? 0x12 : 2;
-			if (nojoin) {
-				Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) ==
-				          static_cast<int32_t>(0x804a8054u) &&
-				          f.voice.blocks.size() == 1 && f.voice.blocks.front().info.data_size == 36 &&
-				          f.voice.accepts_blocks,
-				      "NOJOINT bypassed capacity or changed the full stream");
-				f.SetCapacity(2);
-			}
+			// The capacity counts the added blocks before any of them joins.
+			Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) ==
+			              static_cast<int32_t>(0x804a8054u) &&
+			          f.voice.blocks.size() == 1 && f.voice.blocks.front().info.data_size == 36 &&
+			          f.voice.accepts_blocks,
+			      "a block added to a full stream was accepted or changed the stream");
+			f.SetCapacity(2);
 			Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) == OK &&
 			          f.voice.blocks.size() == (nojoin ? 2u : 1u),
 			      "consecutive ONLY_DATA blocks did not follow the joining flag");
@@ -3115,7 +3180,7 @@ void TestAtrac9WaveformJoining() {
 		              static_cast<int32_t>(0x804a8054u) &&
 		          full.voice.blocks.size() == 2 && full.voice.blocks.back().info.data_size == 36 &&
 		          full.voice.accepts_blocks,
-		      "overflow after a tentative join partially extended or closed the stream");
+		      "an addition beyond the free capacity extended or closed the stream");
 	}
 }
 
@@ -3468,7 +3533,8 @@ int main() {
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestClearReopensClosedList();
-	TestCancelSkipsBlocksNotStarted();
+	TestCancelKeepsOnlyTheFrontBlock();
+	TestWaveformBlockAdditionErrors();
 	TestSetupQuery();
 	TestPortInfo();
 	TestPlayStateBeforeRender();

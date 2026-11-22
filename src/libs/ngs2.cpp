@@ -41,10 +41,10 @@ constexpr int32_t NGS2_ERROR_INVALID_OUT_SIZE =
     static_cast<int32_t>(0x804a8011u);
 constexpr int32_t NGS2_ERROR_INVALID_NUM_CHANNELS =
     static_cast<int32_t>(0x804a8052u);
-constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
-    static_cast<int32_t>(0x804a8053u);
 constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8054u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_BLOCK_ADDRESS =
+    static_cast<int32_t>(0x804a8058u);
 constexpr int32_t NGS2_ERROR_INVALID_FILTER_TYPE =
     static_cast<int32_t>(0x804a8060u);
 constexpr int32_t NGS2_ERROR_INVALID_PEAK_METER_NUM_BLOCKS =
@@ -954,7 +954,6 @@ struct Ngs2VoiceInternal {
 		Ngs2WaveformBlock info;
 		size_t            data_cursor    = 0;
 		uint32_t          repeated_count = 0;
-		bool              canceled       = false;
 	};
 	struct Module {
 		std::vector<uint8_t>     param, work, state;
@@ -1173,18 +1172,28 @@ struct Ngs2VoiceInternal {
 		const auto capacity = rack->type == Ngs2RackType::Sampler
 		                          ? rack->option.sampler.max_waveform_blocks
 		                          : rack->option.custom_sampler.max_waveform_blocks;
-		if (count > capacity) {
-			return NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS;
+		const bool clear    = (flags & 4u) != 0;
+		const bool cancel   = (flags & 8u) != 0;
+		// Only CLEAR reopens a list that the previous addition closed.
+		if (!clear && !accepts_blocks) {
+			return NGS2_ERROR_FULL_WAVEFORM_BLOCKS;
 		}
-		const bool clear     = (flags & 4u) != 0;
+		// The capacity counts added blocks before they join; CANCEL keeps room for the front block.
+		size_t kept = cancel ? 1 : blocks.size();
+		if (clear) {
+			kept = 0;
+		}
+		if (kept + count > capacity) {
+			return NGS2_ERROR_FULL_WAVEFORM_BLOCKS;
+		}
+		if (clear) {
+			ClearWaveformBlocks();
+		} else if (cancel) {
+			// CANCEL drops every block behind the front one, started or not, without a callback.
+			blocks.resize(std::min<size_t>(blocks.size(), 1));
+		}
 		const bool only_data = (flags & 2u) != 0;
 		const bool join      = (flags & 0x10u) == 0;
-		// CLEAR reopens a list that the previous addition closed.
-		EXIT_NOT_IMPLEMENTED((!accepts_blocks && !clear) || (flags & ~0x1fu) != 0);
-		const auto retained = clear ? 0 : blocks.size();
-		Block      tail     = retained == 0 ? Block {} : blocks.back();
-		std::vector<Block> pending;
-		pending.reserve(count);
 		for (uint32_t i = 0; i < count; ++i) {
 			auto info = waveform_blocks[i];
 			if (only_data) {
@@ -1192,35 +1201,17 @@ struct Ngs2VoiceInternal {
 				info.num_skip_samples = 0;
 				info.num_samples      = 0;
 			}
-			Block block {data + info.data_offset, info};
-			auto* previous = pending.empty() ? (retained == 0 ? nullptr : &tail)
-			                                 : &pending.back();
-			// A data-only block that does not repeat extends a contiguous previous block of the
-			// same user data.
-			if (join && previous != nullptr && Ngs2IsDataOnly(info) && info.num_repeats == 0 &&
-			    previous->data + previous->info.data_size == block.data &&
-			    previous->info.user_data == info.user_data) {
-				previous->info.data_size += block.info.data_size;
+			const auto* block_data = data + info.data_offset;
+			// A data-only block that does not repeat extends a contiguous last block of the same
+			// user data.
+			if (join && !blocks.empty() && Ngs2IsDataOnly(info) && info.num_repeats == 0 &&
+			    blocks.back().data + blocks.back().info.data_size == block_data &&
+			    blocks.back().info.user_data == info.user_data) {
+				blocks.back().info.data_size += info.data_size;
 			} else {
-				pending.push_back(block);
+				blocks.push_back({block_data, info});
 			}
 		}
-		// Validate the complete addition before clearing, extending, or closing the stream.
-		if (retained + pending.size() > capacity) {
-			return NGS2_ERROR_FULL_WAVEFORM_BLOCKS;
-		}
-		if (clear) {
-			ClearWaveformBlocks();
-		} else if (retained != 0) {
-			blocks.back().info.data_size = tail.info.data_size;
-		}
-		// CANCEL marks the outstanding blocks; a marked block that has not started decodes as data only.
-		if ((flags & 8u) != 0) {
-			for (auto& block: blocks) {
-				block.canceled = true;
-			}
-		}
-		blocks.insert(blocks.end(), pending.begin(), pending.end());
 		accepts_blocks = (flags & 1u) != 0;
 		return OK;
 	}
@@ -2163,7 +2154,7 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	                                  block.data,
 	                                  static_cast<uint32_t>(block.info.data_size),
 	                                  block.repeated_count,
-	                                  static_cast<uint32_t>(block.canceled),
+	                                  0,
 	                                  0};
 	if (!repeat) {
 		voice.blocks.pop_front();
@@ -2180,11 +2171,6 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 	frame_samples = 0;
 	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
 		auto& block = voice.blocks.front();
-		if (block.canceled && block.data_cursor == 0 && block.repeated_count == 0) {
-			block.info.num_skip_samples = 0;
-			block.info.num_samples      = 0;
-			block.info.num_repeats      = 0;
-		}
 		if (!Ngs2IsDataOnly(block.info) && block.data_cursor == 0) {
 			// PCM plays the skip prefix; the decoder drops it.
 			voice.duration_remaining = block.info.num_samples +
@@ -3717,7 +3703,13 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							uint32_t                 flags, count;
 							const Ngs2WaveformBlock* blocks;
 						};
+						if (param->size < sizeof(BlocksParam)) {
+							return NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE;
+						}
 						const auto& blocks = *reinterpret_cast<const BlocksParam*>(param);
+						if (blocks.count != 0 && blocks.blocks == nullptr) {
+							return NGS2_ERROR_INVALID_WAVEFORM_BLOCK_ADDRESS;
+						}
 						const auto result = voice->AddWaveformBlocks(
 						    blocks.data, blocks.flags, blocks.count, blocks.blocks);
 						if (result != OK) {

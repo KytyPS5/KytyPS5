@@ -1575,6 +1575,97 @@ void TestRackGetVoiceHandleErrors() {
 	      "voice handle lookup did not return the last voice");
 }
 
+// The context buffers the test allocator freed.
+std::vector<Ngs2ContextBufferInfo> g_freed_buffers;
+
+int32_t KYTY_SYSV_ABI AllocContextBuffer(Ngs2ContextBufferInfo* buffer) {
+	buffer->host_buffer = std::malloc(buffer->host_buffer_size);
+	return OK;
+}
+
+// Frees the buffer, overwrites its argument and fails.
+int32_t KYTY_SYSV_ABI FreeContextBuffer(Ngs2ContextBufferInfo* buffer) {
+	g_freed_buffers.push_back(*buffer);
+	std::free(buffer->host_buffer);
+	*buffer = {};
+	return -1;
+}
+
+bool SameBuffer(const Ngs2ContextBufferInfo& a, const Ngs2ContextBufferInfo& b) {
+	return std::memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+void TestSystemDestroy() {
+	const Ngs2BufferAllocator allocator {AllocContextBuffer, FreeContextBuffer, 0x77};
+	auto                      sampler_option = SingleVoiceRackOption(0x1000);
+	auto                      master_option  = SingleVoiceRackOption(0x3000);
+	uintptr_t                 system = 0, sampler = 0, master = 0, kept = 0;
+	Check(Ngs2SystemCreateWithAllocator(nullptr, &allocator, &system) == OK &&
+	          Ngs2RackCreateWithAllocator(system, 0x1000, &sampler_option.common, &allocator,
+	                                      &sampler) == OK &&
+	          Ngs2RackCreateWithAllocator(system, 0x3000, &master_option.common, &allocator,
+	                                      &master) == OK &&
+	          Ngs2RackCreateWithAllocator(system, 0x3000, &master_option.common, &allocator,
+	                                      &kept) == OK,
+	      "allocator system or rack creation failed");
+	auto*                 rack         = reinterpret_cast<Ngs2RackInternal*>(sampler);
+	auto&                 voice        = *reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+	const auto            voice_handle = reinterpret_cast<uintptr_t>(&voice);
+	Ngs2ContextBufferInfo sentinel;
+	std::memset(&sentinel, 0x5a, sizeof(sentinel));
+
+	// Destroying a rack disconnects the voices patched into it and ignores the free result.
+	Ngs2VoicePatchParam patch {{24, 0, 5}, 0, 0, master};
+	Check(Ngs2VoiceControl(voice_handle, &patch.header) == OK && voice.ports[0].dest != nullptr,
+	      "patch to the mastering rack failed");
+	const auto master_buffer = reinterpret_cast<const Ngs2RackInternal*>(master)->buffer_info;
+	auto       out           = sentinel;
+	Check(Ngs2RackDestroy(master, &out) == OK && SameBuffer(out, master_buffer) &&
+	          g_freed_buffers.size() == 1 && SameBuffer(g_freed_buffers[0], master_buffer) &&
+	          voice.ports[0].dest == nullptr,
+	      "rack destroy did not copy and free its buffer or kept a patch into the rack");
+	out = sentinel;
+	Check(Ngs2RackDestroy(master, &out) == NGS2_ERROR_INVALID_RACK_HANDLE &&
+	          SameBuffer(out, sentinel) && g_freed_buffers.size() == 1,
+	      "a destroyed rack was destroyed again or its out-info was written");
+
+	// Destroying the system frees its buffer and detaches its racks, not another system's.
+	uintptr_t other = 0, other_rack = 0;
+	Check(Ngs2SystemCreateWithAllocator(nullptr, &allocator, &other) == OK &&
+	          Ngs2RackCreateWithAllocator(other, 0x1000, &sampler_option.common, &allocator,
+	                                      &other_rack) == OK,
+	      "second allocator system or rack creation failed");
+	patch.dest_handle = kept;
+	Check(Ngs2VoiceControl(voice_handle, &patch.header) == OK && voice.ports[0].dest != nullptr,
+	      "patch to the kept mastering rack failed");
+	const auto system_buffer = reinterpret_cast<const Ngs2Internal*>(system)->buffer_info;
+	out                      = sentinel;
+	Check(Ngs2SystemDestroy(system, &out) == OK && SameBuffer(out, system_buffer) &&
+	          g_freed_buffers.size() == 2 && SameBuffer(g_freed_buffers[1], system_buffer),
+	      "system destroy did not copy and free its buffer");
+	out = sentinel;
+	Check(Ngs2SystemDestroy(system, &out) == NGS2_ERROR_INVALID_SYSTEM_HANDLE &&
+	          SameBuffer(out, sentinel) && g_freed_buffers.size() == 2,
+	      "a destroyed system was destroyed again or its out-info was written");
+	Ngs2SystemInfo info {};
+	Check(Ngs2SystemGetInfo(other, &info, sizeof(info)) == OK && info.rack_count == 1,
+	      "destroying a system detached another system's rack");
+
+	// The racks stay valid handles on a placeholder system, disconnected from their patches, and
+	// their voice calls apply.
+	Ngs2VoiceEventParam   play {{sizeof(Ngs2VoiceEventParam), 0, 6}, 1};
+	Ngs2SamplerVoiceState state {};
+	Check(rack->ngs == &g_detached_system && voice.ports[0].dest == nullptr &&
+	          Ngs2VoiceControl(voice_handle, &play.header) == OK &&
+	          Ngs2VoiceGetState(voice_handle, &state.voice_state, sizeof(state)) == OK &&
+	          (state.voice_state.state_flags & 1) != 0,
+	      "a rack of a destroyed system was not detached, kept its patch or ignored a voice call");
+	Check(Ngs2RackDestroy(kept, nullptr) == OK && Ngs2RackDestroy(sampler, nullptr) == OK &&
+	          Ngs2RackDestroy(other_rack, nullptr) == OK &&
+	          Ngs2SystemDestroy(other, nullptr) == OK && g_freed_buffers.size() == 6,
+	      "a rack of a destroyed system was not destroyed with its buffer");
+}
+
 void TestMasteringVoiceState() {
 	MasteringRender m;
 	alignas(Ngs2MasteringVoiceState) std::array<uint8_t, 0x140> storage;
@@ -3070,6 +3161,7 @@ int main() {
 	TestMasteringRackOptionRanges();
 	TestMasteringVoiceState();
 	TestRackGetVoiceHandleErrors();
+	TestSystemDestroy();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();

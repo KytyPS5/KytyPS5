@@ -1305,6 +1305,8 @@ static Ngs2Internal*        g_ngs_list     = nullptr;
 static Ngs2RackInternal*    g_racks_list   = nullptr;
 static std::atomic_uint32_t g_next_ngs_uid = 1;
 static Common::Mutex        g_racks_mutex;
+// Guards g_ngs_list; no other lock is taken while it is held.
+static Common::Mutex g_ngs_mutex;
 
 static_assert(sizeof(Ngs2UserFxProcessContext) == 48);
 static_assert(sizeof(Ngs2UserFx2Context) == 72);
@@ -1338,6 +1340,24 @@ static Ngs2SystemOption Ngs2DefaultSystemOption() {
 	return option;
 }
 
+// The system of racks whose system was destroyed. The racks stay valid handles that never render;
+// their voice calls apply as usual, at the default sample rate.
+static Ngs2Internal g_detached_system {.option = Ngs2DefaultSystemOption()};
+
+// Unlinks and returns the list entry with this handle, or nullptr.
+template <typename T>
+static T* Ngs2Unlink(T*& list, uintptr_t handle) {
+	auto** link = &list;
+	while (*link != nullptr && reinterpret_cast<uintptr_t>(*link) != handle) {
+		link = &(*link)->next;
+	}
+	auto* entry = *link;
+	if (entry != nullptr) {
+		*link = entry->next;
+	}
+	return entry;
+}
+
 int KYTY_SYSV_ABI Ngs2SystemResetOption(Ngs2SystemOption* option) {
 	PRINT_NAME();
 
@@ -1354,13 +1374,16 @@ static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption*      optio
 	ngs->option      = *option;
 	ngs->buffer_info = *buffer_info;
 	ngs->uid         = g_next_ngs_uid.fetch_add(1, std::memory_order_relaxed);
-	ngs->next        = g_ngs_list;
-	g_ngs_list       = ngs;
+
+	Common::LockGuard lock(g_ngs_mutex);
+	ngs->next  = g_ngs_list;
+	g_ngs_list = ngs;
 
 	return ngs;
 }
 
 static Ngs2Internal* Ngs2FindSystem(uintptr_t system_handle) {
+	Common::LockGuard lock(g_ngs_mutex);
 	for (auto* ngs = g_ngs_list; ngs != nullptr; ngs = ngs->next) {
 		if (reinterpret_cast<uintptr_t>(ngs) == system_handle) {
 			return ngs;
@@ -1651,12 +1674,56 @@ int KYTY_SYSV_ABI Ngs2SystemSetGrainSamples(uintptr_t system_handle, uint32_t nu
 	return OK;
 }
 
+// Disconnects the ports of the racks of `ngs` whose destination lies in [first, first + size).
+// The caller holds g_racks_mutex.
+static void Ngs2DisconnectPorts(const Ngs2Internal* ngs, uintptr_t first, uintptr_t size) {
+	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+		if (rack->ngs != ngs) {
+			continue;
+		}
+		auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+		for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
+			for (auto& port: voices[i].ports) {
+				if (reinterpret_cast<uintptr_t>(port.dest) - first < size) {
+					port.dest = nullptr;
+				}
+			}
+		}
+	}
+}
+
 int KYTY_SYSV_ABI Ngs2SystemDestroy(uintptr_t system_handle, Ngs2ContextBufferInfo* buffer_info) {
 	PRINT_NAME();
 	LOGF("\t system_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(system_handle));
 
+	Ngs2Internal* ngs = nullptr;
+	{
+		Common::LockGuard lock(g_ngs_mutex);
+		ngs = Ngs2Unlink(g_ngs_list, system_handle);
+	}
+	if (ngs == nullptr) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
+	{
+		// Waits for a render in progress. The racks are disconnected from every patch.
+		Common::LockGuard lock(ngs->mutex);
+		Common::LockGuard racks_lock(g_racks_mutex);
+		Ngs2DisconnectPorts(ngs, 0, UINTPTR_MAX);
+		for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+			if (rack->ngs == ngs) {
+				rack->ngs = &g_detached_system;
+			}
+		}
+	}
+	auto       context_buffer = ngs->buffer_info;
+	const auto free_handler   = ngs->allocator.free_handler;
+	std::destroy_at(ngs);
 	if (buffer_info != nullptr) {
-		std::memset(buffer_info, 0, sizeof(Ngs2ContextBufferInfo));
+		*buffer_info = context_buffer;
+	}
+	// The result of the free handler is ignored.
+	if (free_handler != nullptr) {
+		free_handler(&context_buffer);
 	}
 
 	return OK;
@@ -1896,57 +1963,48 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 	PRINT_NAME();
 	LOGF("\t rack_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(rack_handle));
 
-	if (buffer_info != nullptr) {
-		*buffer_info = {};
+	Ngs2RackInternal* rack = nullptr;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		rack = Ngs2Unlink(g_racks_list, rack_handle);
 	}
-
-	auto* rack = Ngs2FindRack(rack_handle);
 	if (rack == nullptr) {
 		return NGS2_ERROR_INVALID_RACK_HANDLE;
 	}
-	auto*                 ngs = rack->ngs;
-	Ngs2ContextBufferInfo context_buffer;
-	Ngs2BufferAllocator   allocator;
+	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
 	{
-		Common::LockGuard lock(ngs->mutex);
-		{
-			Common::LockGuard racks_lock(g_racks_mutex);
-			auto**            link = &g_racks_list;
-			while (*link != nullptr && *link != rack) {
-				link = &(*link)->next;
-			}
-			if (*link == nullptr) {
-				return NGS2_ERROR_INVALID_RACK_HANDLE;
-			}
-			*link = rack->next;
-		}
-		auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
-		for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
-			for (size_t m = 0; m < voices[i].modules.size(); ++m) {
-				const auto& fx = rack->fx[m];
-				if (fx.cleanup != nullptr) {
-					auto&             module = voices[i].modules[m];
-					Ngs2UserFx2Context context {rack->common[m].data(),
-					                            module.param.data(),
-					                            module.work.data(),
-					                            fx.user_data,
-					                            rack->option.common.max_voices,
-					                            i};
-					EXIT_NOT_IMPLEMENTED(fx.cleanup(&context) != OK);
-				}
-			}
-			std::destroy_at(voices + i);
-		}
-		context_buffer = rack->buffer_info;
-		allocator      = rack->allocator;
-		std::destroy_at(rack);
+		// Waits for a render in progress, which collected the rack before it was unlinked, and
+		// disconnects the ports whose destination is a voice of the rack.
+		Common::LockGuard lock(rack->ngs->mutex);
+		Common::LockGuard racks_lock(g_racks_mutex);
+		Ngs2DisconnectPorts(rack->ngs, reinterpret_cast<uintptr_t>(voices),
+		                    sizeof(Ngs2VoiceInternal) * rack->option.common.max_voices);
 	}
-
-	if (allocator.free_handler != nullptr) {
-		return allocator.free_handler(&context_buffer);
+	for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
+		for (size_t m = 0; m < voices[i].modules.size(); ++m) {
+			const auto& fx = rack->fx[m];
+			if (fx.cleanup != nullptr) {
+				auto&              module = voices[i].modules[m];
+				Ngs2UserFx2Context context {rack->common[m].data(),
+				                            module.param.data(),
+				                            module.work.data(),
+				                            fx.user_data,
+				                            rack->option.common.max_voices,
+				                            i};
+				EXIT_NOT_IMPLEMENTED(fx.cleanup(&context) != OK);
+			}
+		}
+		std::destroy_at(voices + i);
 	}
+	auto       context_buffer = rack->buffer_info;
+	const auto free_handler   = rack->allocator.free_handler;
+	std::destroy_at(rack);
 	if (buffer_info != nullptr) {
 		*buffer_info = context_buffer;
+	}
+	// The result of the free handler is ignored.
+	if (free_handler != nullptr) {
+		free_handler(&context_buffer);
 	}
 
 	return OK;
@@ -1960,8 +2018,6 @@ int KYTY_SYSV_ABI Ngs2RackLock(uintptr_t rack_handle) {
 
 	auto* rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
 
-	EXIT_NOT_IMPLEMENTED(rack->ngs == nullptr);
-
 	rack->ngs->mutex.Lock();
 
 	return OK;
@@ -1974,8 +2030,6 @@ int KYTY_SYSV_ABI Ngs2RackUnlock(uintptr_t rack_handle) {
 	EXIT_NOT_IMPLEMENTED(rack_handle == 0);
 
 	auto* rack = reinterpret_cast<Ngs2RackInternal*>(rack_handle);
-
-	EXIT_NOT_IMPLEMENTED(rack->ngs == nullptr);
 
 	rack->ngs->mutex.Unlock();
 

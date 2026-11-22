@@ -48508,20 +48508,22 @@ constexpr std::array kWaveReductions{kWaveMinimum,
         ShaderOpcode::V_XOR_B32, ShaderOpcode::S_XOR_B32, 0x1du, 0x12u, 0u}};
 
 // Reduces v13 into v0.
-void AppendWave64Reduction(std::vector<u32> &code, const WaveReduction &op) {
+void AppendWave64Reduction(std::vector<u32> &code, const WaveReduction &op,
+                           bool butterfly = false) {
   code.insert(code.end(), {EncodeSop1(0x04, 24, 126), // Save contributing lanes.
                           EncodeSop1(0x28, 106, 126)});
   AppendSMovLiteral(&code, 26, op.identity);
   AppendVop3(&code, 0x101, 13, 26, Vgpr(13), 24);
   for (u32 shift : {1u, 2u, 4u, 8u}) {
     code.push_back(EncodeVop2(op.vector_op, 13, 250, 13));
-    code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
+    code.push_back(EncodeVop2Dpp(13, (butterfly ? 0x160u : 0x110u) + shift));
   }
   // RDNA2 wave64 reduction from PS 964747887d898821, PCs 0x224..0x244.
   code.insert(code.end(), {0xd778100cu, 0x0305830du,
-      EncodeVop2(op.vector_op, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
-      0xd7600006u, 0x00013f0du, 0xd7600007u, 0x00017f0du,
-      EncodeSop2(op.scalar_op, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+      EncodeVop2(op.vector_op, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106)});
+  AppendVop3(&code, 0x360, 6, Vgpr(13), InlineU32(butterfly ? 0u : 31u));
+  AppendVop3(&code, 0x360, 7, Vgpr(13), InlineU32(butterfly ? 32u : 63u));
+  code.insert(code.end(), {EncodeSop2(op.scalar_op, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
 }
 
 std::vector<ShaderOpcode> Wave64ReductionOpcodes(const WaveReduction &op) {
@@ -48542,10 +48544,14 @@ GraphicsCase GraphicsSparseWaveReduction(const WaveReduction &op) {
   return test;
 }
 
-TestCase ComputeWave64Reduction(const WaveReduction &op, bool masked = false) {
+TestCase ComputeWave64Reduction(const WaveReduction &op, bool masked = false,
+                                bool butterfly = false) {
   using O = ShaderOpcode;
+  static std::set<std::string> butterfly_names;
   TestCase test;
   test.name = masked ? "ComputeWave64MinimumMasked" : op.compute_name;
+  if (butterfly)
+    test.name = butterfly_names.insert(std::string(test.name) + "Butterfly").first->c_str();
   auto &code = test.code;
   code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
   u32 expected = 0;
@@ -48579,7 +48585,7 @@ TestCase ComputeWave64Reduction(const WaveReduction &op, bool masked = false) {
     AppendSMovLiteral(&code, 126, 0xfffffffeu);
     AppendSMovLiteral(&code, 127, 0x7fffffffu);
   }
-  AppendWave64Reduction(code, op);
+  AppendWave64Reduction(code, op, butterfly);
   AppendBufferStoreDword(&code, 0, 20);
   AppendEnd(&code);
   test.initial.assign(64, 0xa5a5a5a5u);
@@ -49476,8 +49482,11 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(VectorDppMirrorAndRotate(64));
   cases.push_back(VectorReadFirstLaneExecMasks(32));
   cases.push_back(VectorReadFirstLaneExecMasks(64));
-  for (const auto &op : kWaveReductions) cases.push_back(ComputeWave64Reduction(op));
-  cases.push_back(ComputeWave64Reduction(kWaveMinimum, true));
+  for (const bool butterfly : {false, true}) {
+    for (const auto &op : kWaveReductions)
+      cases.push_back(ComputeWave64Reduction(op, false, butterfly));
+    cases.push_back(ComputeWave64Reduction(kWaveMinimum, true, butterfly));
+  }
   AddCase(VectorDppBankMaskPreservesDestination);
   for (const bool row_shift : {false, true})
     for (const bool bound_ctrl : {false, true})
@@ -57280,8 +57289,10 @@ int main(int argc, char **argv) {
     for (const auto &op : kWaveReductions) {
       if (op.graphics_name != nullptr) RunGraphicsCase(&vulkan, GraphicsSparseWaveReduction(op));
       RunCase(&vulkan, ComputeWave64Reduction(op));
+      RunCase(&vulkan, ComputeWave64Reduction(op, false, true));
     }
     RunCase(&vulkan, ComputeWave64Reduction(kWaveMinimum, true));
+    RunCase(&vulkan, ComputeWave64Reduction(kWaveMinimum, true, true));
     RunCase(&vulkan, VectorDpp8Captured(false));
     for (const u32 wave_size : {32u, 64u})
       for (const bool fi : {false, true})

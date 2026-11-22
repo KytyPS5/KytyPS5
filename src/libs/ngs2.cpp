@@ -2422,7 +2422,9 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	LOGF("\t format = 0x%016" PRIx64 ", sample_pos = %" PRIu32 ", num_samples = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(format), sample_pos, num_samples);
 
-	EXIT_NOT_IMPLEMENTED(block == nullptr);
+	if (block == nullptr) {
+		return NGS2_ERROR_INVALID_OUT_ADDRESS;
+	}
 
 	std::memset(block, 0, sizeof(Ngs2WaveformBlock));
 	if (format == nullptr || format->num_channels == 0 || format->num_channels > 8 ||

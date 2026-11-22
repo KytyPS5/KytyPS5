@@ -744,6 +744,8 @@ void TestWaveformBlockGeometry() {
 	Check(Ngs2CalcWaveformBlock(&format, 0, 0, &block) == OK && block.data_size == 0 &&
 	          block.num_samples == 0,
 	      "empty ATRAC9 block acquired encoded data");
+	Check(Ngs2CalcWaveformBlock(&format, 0, 1, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "block calculation without an output block did not fail");
 	const Ngs2WaveformFormat pcm {0x12, 2, 48000};
 	Check(Ngs2CalcWaveformBlock(&pcm, 4096, 4096, &block) == OK &&
 	          block.data_offset == 16384 && block.data_size == 16384 &&

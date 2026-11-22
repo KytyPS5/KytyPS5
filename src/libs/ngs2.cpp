@@ -879,6 +879,19 @@ struct Ngs2VoiceInternal {
 		std::array<float, 64> previous_levels {};
 		uint32_t              previous_inputs  = 0;
 		uint32_t              previous_outputs = 0;
+		// LFE filter on channel 3: two sections y = b0 * x + b1 * x1 + b2 * x2 + a1 * y1 + a2 * y2,
+		// (b0, b1, b2) = gain * (1, 2, 1). An LFE control enables the stage until Setup; the first
+		// grain after a grain without it, or after PLAY, starts from zero history. A cleared enable
+		// flag leaves channel 3 and the history as they are.
+		struct LfeSection {
+			float gain = 0.0f, a1 = 0.0f, a2 = 0.0f;
+			struct History {
+				float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+			} history;
+		};
+		std::array<LfeSection, 2> lfe {};
+		bool                      lfe_enable_flag = false;
+		bool                      lfe_enabled     = false;
 		// Full band and LFE gains. A gain control enables the gain until Setup; the first grain
 		// after a grain without it, or after PLAY, starts at the new gains.
 		std::array<float, 2> gain {};
@@ -1114,9 +1127,11 @@ struct Ngs2VoiceInternal {
 					// Reserve the voice immediately; publish playback flags after rendering.
 					state_flags |= 1;
 				}
-				// Every PLAY restarts the mastering modules without a ramp.
+				// Every PLAY restarts the mastering modules without a ramp or filter history.
 				if (mastering != nullptr) {
 					mastering->previous_inputs = 0;
+					mastering->lfe[0].history  = {};
+					mastering->lfe[1].history  = {};
 					mastering->gain_rendered   = false;
 				}
 				break;
@@ -2361,8 +2376,45 @@ static void Ngs2MixOutput(const Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 	}
 }
 
-// Runs a playing mastering voice's channel converter, gain and output in place on its N input
-// channels.
+// The rate the LFE filter is designed at for a system rate: the next listed rate, the 88200 design
+// up to 96000, and the 11025 design above 192000.
+static uint32_t Ngs2MasteringLfeDesignRate(uint32_t rate) {
+	constexpr std::array<uint32_t, 9> limits = {11025, 12000, 22050,  24000, 44100,
+	                                            48000, 96000, 176400, 192000};
+	const auto                        limit  = std::ranges::lower_bound(limits, rate);
+	if (limit == limits.end()) {
+		return 11025;
+	}
+	return *limit == 96000 ? 88200 : *limit;
+}
+
+// Sets the LFE sections to the 4th-order 0.1 dB Chebyshev low pass at `cutoff` Hz, designed at the
+// system rate's design rate.
+static void Ngs2SetMasteringLfe(Ngs2VoiceInternal::Mastering& mastering, uint32_t cutoff,
+                                uint32_t system_rate) {
+	constexpr double ripple_db = 0.1;
+	const double     epsilon   = std::sqrt(std::pow(10.0, ripple_db / 10.0) - 1.0);
+	const double     mu        = std::asinh(1.0 / epsilon) / 4.0;
+	const double     warped =
+	    std::tan(std::numbers::pi * cutoff / Ngs2MasteringLfeDesignRate(system_rate));
+	double gain = std::pow(10.0, -ripple_db / 20.0);
+	for (size_t i = 0; i < mastering.lfe.size(); ++i) {
+		// The bilinear transform of the prewarped analog pole re + j im.
+		const double angle  = (i == 0 ? 3.0 : 1.0) * std::numbers::pi / 8.0;
+		const double re     = -warped * std::sinh(mu) * std::sin(angle);
+		const double im     = warped * std::cosh(mu) * std::cos(angle);
+		const double d      = (1.0 - re) * (1.0 - re) + im * im;
+		mastering.lfe[i].a1 = static_cast<float>(2.0 * (1.0 - re * re - im * im) / d);
+		mastering.lfe[i].a2 = static_cast<float>(-((1.0 + re) * (1.0 + re) + im * im) / d);
+		gain *= (re * re + im * im) / d;
+	}
+	// The first section carries the gain of both.
+	mastering.lfe[0].gain = static_cast<float>(gain);
+	mastering.lfe[1].gain = 1.0f;
+}
+
+// Runs a playing mastering voice's channel converter, LFE filter, gain and output in place on its
+// N input channels.
 static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
                                 uint32_t                         num_buffer_info,
                                 std::vector<std::vector<float>>& output_mix, uint32_t grain) {
@@ -2401,6 +2453,24 @@ static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 	std::copy_n(levels, size_t(inputs) * outputs, mastering.previous_levels.begin());
 	mastering.previous_inputs  = inputs;
 	mastering.previous_outputs = outputs;
+
+	// The LFE filter runs in place on channel 3, which voices of fewer than 4 channels lack; a
+	// grain without the filter zeroes its history.
+	if (!mastering.lfe_enabled) {
+		mastering.lfe[0].history = mastering.lfe[1].history = {};
+	} else if (mastering.lfe_enable_flag && inputs >= 4) {
+		auto* samples = voice.samples.data() + size_t(3) * grain;
+		for (auto& section: mastering.lfe) {
+			auto [gain, a1, a2, h] = section;
+			for (uint32_t i = 0; i < grain; ++i) {
+				const float x = samples[i];
+				const float y = gain * x + 2.0f * gain * h.x1 + gain * h.x2 + a1 * h.y1 + a2 * h.y2;
+				h             = {x, h.x1, y, h.y1};
+				samples[i]    = y;
+			}
+			section.history = h;
+		}
+	}
 
 	// Channel 3 is LFE, every other channel full band; a changed gain ramps over one grain.
 	if (mastering.gain_enabled) {
@@ -3192,8 +3262,10 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							return NGS2_ERROR_INVALID_NUM_CHANNELS;
 						}
 						EXIT_NOT_IMPLEMENTED(values[0] > 8);
-						// Setup restores the default levels and disables the gain; ramps go on.
+						// Setup restores the default levels and disables the LFE filter and the
+						// gain; ramps and filter history go on.
 						mastering.levels       = NGS2_MASTERING_DEFAULT_LEVELS;
+						mastering.lfe_enabled  = false;
 						mastering.gain_enabled = false;
 						voice->channels        = values[0];
 						voice->output_id       = 0;
@@ -3217,6 +3289,14 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						            mastering.levels.begin() + offset);
 						break;
 					}
+					case 2:
+						// The enable flag is clamped to 1 and fc to 80..120 Hz; up to 80 Hz selects
+						// the 80 Hz filter, above it the 120 Hz one.
+						mastering.lfe_enable_flag = values[0] != 0;
+						Ngs2SetMasteringLfe(mastering, values[1] <= 80 ? 80u : 120u,
+						                    voice->rack->ngs->option.sample_rate);
+						mastering.lfe_enabled = true;
+						break;
 					case 4: {
 						const auto* levels = reinterpret_cast<const float*>(values);
 						mastering.gain         = {std::clamp(levels[0], -32.0f, 32.0f),

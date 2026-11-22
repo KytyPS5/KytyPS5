@@ -1031,6 +1031,112 @@ void TestMasteringGainRamp() {
 	      "the first gain after PLAY on a playing voice ramped");
 }
 
+void TestMasteringLfeDesignRate() {
+	constexpr std::array<std::array<uint32_t, 2>, 12> rates = {{{11025, 11025},
+	                                                            {11026, 12000},
+	                                                            {12001, 22050},
+	                                                            {22051, 24000},
+	                                                            {24001, 44100},
+	                                                            {44101, 48000},
+	                                                            {48001, 88200},
+	                                                            {96000, 88200},
+	                                                            {96001, 176400},
+	                                                            {176401, 192000},
+	                                                            {192000, 192000},
+	                                                            {192001, 11025}}};
+	for (const auto& [rate, design_rate]: rates) {
+		Check(Ngs2MasteringLfeDesignRate(rate) == design_rate,
+		      "a system rate selected the wrong LFE filter design rate");
+	}
+	// A 96 kHz system uses the 88200 Hz design of the 120 Hz filter.
+	Ngs2VoiceInternal::Mastering mastering;
+	Ngs2SetMasteringLfe(mastering, 120, 96000);
+	const auto& [first, second] = mastering.lfe;
+	Check(std::abs(first.gain / 2.71270006e-10f - 1.0f) < 1e-6f &&
+	          std::abs(first.a1 - 1.98911059f) < 1e-6f &&
+	          std::abs(first.a2 + 0.989155829f) < 1e-6f && second.gain == 1.0f &&
+	          std::abs(second.a1 - 1.99539697f) < 1e-6f &&
+	          std::abs(second.a2 + 0.995493948f) < 1e-6f,
+	      "a 96 kHz system did not use the 88200 Hz LFE filter design");
+}
+
+// The coefficients {gain, a1, a2} of both LFE sections.
+using LfeCoefficients = std::array<std::array<float, 3>, 2>;
+
+// Two LFE sections filtering one sample at a time.
+struct LfeReference {
+	std::array<std::array<float, 4>, 2> history {};
+
+	float Filter(const LfeCoefficients& k, float x) {
+		for (size_t s = 0; s < 2; ++s) {
+			auto& h                = history[s];
+			const auto [g, a1, a2] = k[s];
+			const float y          = g * x + 2.0f * g * h[0] + g * h[1] + a1 * h[2] + a2 * h[3];
+			h                      = {x, h[0], y, h[2]};
+			x                      = y;
+		}
+		return x;
+	}
+};
+
+void TestMasteringLfeFilter() {
+	// The 48 kHz filters of 80 Hz and 120 Hz.
+	constexpr LfeCoefficients lfe_80 = {
+	    {{6.09809425e-10f, 1.9866643f, -0.986732125f}, {1.0f, 1.99433744f, -0.994482934f}}};
+	constexpr LfeCoefficients lfe_120 = {
+	    {{3.07265147e-09f, 1.98001206f, -0.98016417f}, {1.0f, 1.9914093f, -0.991736054f}}};
+	MasteringRender m;
+	// 5.1ch: L 0.25 throughout, LFE impulses of 0.5 at frames 0 and 20.
+	m.Play({8192, 0, 0, 0, 0, 0}, 32);
+	m.input[0 * 6 + 3] = m.input[20 * 6 + 3] = 16384;
+	float        pcm[24];
+	LfeReference reference;
+	// Checks a grain whose LFE starts with `first`, filtered by `k` unless it is null.
+	auto check = [&](const LfeCoefficients* k, float first, const char* message) {
+		for (uint32_t i = 0; i < 4; ++i) {
+			const float x        = i == 0 ? first : 0.0f;
+			const float expected = k == nullptr ? x : reference.Filter(*k, x);
+			Check(pcm[i * 6] == 0.25f &&
+			          std::abs(pcm[i * 6 + 3] - expected) <= 1e-5f * std::abs(expected),
+			      message);
+		}
+	};
+	// The enable flag is clamped to 1 and fc to 80..120 Hz, up to 80 Hz selecting 80 Hz.
+	Check(m.Setup(6) == OK && m.Control(2, 7, 0) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render with the LFE filter");
+	check(&lfe_80, 0.5f, "the LFE filter did not run the clamped 80 Hz filter on channel 3");
+	// A changed cutoff keeps the history; fc above 80 Hz selects 120 Hz.
+	Check(m.Control(2, 1, 100) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render an LFE change");
+	check(&lfe_120, 0.0f, "an LFE cutoff change did not keep the history with the 120 Hz filter");
+	// A cleared enable flag leaves channel 3 and freezes the history.
+	Check(m.Control(2, 0, 100) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render a disabled LFE filter");
+	check(nullptr, 0.0f, "a disabled LFE filter changed channel 3");
+	Check(m.Control(2, 1, 1000) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render a re-enabled LFE filter");
+	check(&lfe_120, 0.0f, "a re-enabled LFE filter did not go on from the frozen history");
+	// A voice without channel 3 leaves the history.
+	const auto history = m.voice.mastering->lfe;
+	Check(m.Control(0, 3) == OK && m.Control(2, 1, 120) == OK && m.Render(pcm, 3) == OK &&
+	          std::memcmp(&history, &m.voice.mastering->lfe, sizeof(history)) == 0,
+	      "the LFE filter ran on a voice without channel 3");
+	// PLAY zeroes the history.
+	reference = {};
+	Check(m.Setup(6) == OK && m.Control(2, 1, 120) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render after PLAY");
+	check(&lfe_120, 0.5f, "PLAY did not zero the LFE filter history");
+	// Setup turns the filter off.
+	Check(m.Control(0, 6) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render");
+	check(nullptr, 0.0f, "Setup did not turn the LFE filter off");
+	// After a grain without the filter, its control zeroes the history.
+	reference = {};
+	Check(m.Control(2, 1, 120) == OK && m.Render(pcm, 6) == OK,
+	      "5.1ch mastering voice failed to render a restarted LFE filter");
+	check(&lfe_120, 0.0f, "an LFE filter after a grain without it kept its history");
+}
+
 void TestMasteringDownmix() {
 	MasteringRender m;
 	constexpr float h = std::numbers::sqrt2_v<float> / 2;
@@ -1142,6 +1248,7 @@ void TestMasteringControlErrors() {
 	const float     levels[64] = {};
 	Check(m.Control(0, 8) == OK &&
 	          m.Control(0, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+	          m.Control(2, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(4, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(5, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Matrix(5, levels, 4, 23) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
@@ -2701,6 +2808,8 @@ int main() {
 	TestPcm16RenderOutput();
 	TestPatchToRackHandle();
 	TestMasteringGainRamp();
+	TestMasteringLfeDesignRate();
+	TestMasteringLfeFilter();
 	TestMasteringDownmix();
 	TestMasteringMonoStereoConversion();
 	TestMasteringUntypedConversions();

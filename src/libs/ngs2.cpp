@@ -1059,18 +1059,21 @@ struct Ngs2VoiceInternal {
 
 	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
 	std::vector<float>                  decoded_frame;
-	std::vector<float>                  next_decoded_frame;
 	std::vector<uint8_t>                compressed_input;
 	uint32_t                            frame_cursor       = 0;
 	uint32_t                            frame_samples      = 0;
-	uint32_t                            next_frame_samples = 0;
 	bool                                accepts_blocks     = true;
 	// Set when a straddling frame continues into a block with samples, which silences the grain.
 	bool                                incomplete_frame   = false;
 	uint32_t                            waveform_type      = 0;
 	uint32_t                            sample_rate        = 0;
-	uint64_t                            sample_phase       = 0;
-	uint64_t                            sample_step        = 0;
+	// The resampler's pitch ratio, its phase in 1/16384 source samples and up to 4 source samples
+	// per channel kept for the next grain.
+	float                               pitch_ratio        = 1.0f;
+	uint16_t                            resample_phase     = 0;
+	uint32_t                            history_samples    = 0;
+	std::vector<float>                  history;
+	std::vector<float>                  resample_input;
 	uint64_t                            decoded_samples    = 0;
 	uint64_t                            decoded_bytes      = 0;
 	uint64_t                            source_generation  = 0;
@@ -1134,14 +1137,19 @@ struct Ngs2VoiceInternal {
 	void ClearWaveformBlocks() {
 		++source_generation;
 		blocks.clear();
-		sample_phase       = 0;
 		duration_remaining = 0;
 		skip_remaining     = 0;
 		compressed_input.clear();
 		frame_cursor       = 0;
 		frame_samples      = 0;
-		next_frame_samples = 0;
 		waveform_end       = nullptr;
+	}
+
+	// Setup and every PLAY start the resampler at phase 0 with 4 zero samples of history.
+	void ResetResampler() {
+		history.assign(size_t(channels) * 4, 0.0f);
+		history_samples = 4;
+		resample_phase  = 0;
 	}
 
 	void SetupSampler(const Ngs2WaveformFormat& format) {
@@ -1156,12 +1164,12 @@ struct Ngs2VoiceInternal {
 		channels        = format.num_channels;
 		waveform_type   = format.waveform_type;
 		sample_rate     = format.sample_rate;
-		sample_step     = uint64_t(sample_rate) << 32u;
+		pitch_ratio     = 1.0f;
+		ResetResampler();
 		decoded_samples = 0;
 		decoded_bytes   = 0;
 		decoder.reset();
 		decoded_frame.clear();
-		next_decoded_frame.clear();
 		accepts_blocks = true;
 		if (deferred) {
 			return;
@@ -1223,8 +1231,8 @@ struct Ngs2VoiceInternal {
 				info.num_samples      = 0;
 			}
 			const auto* block_data = data + info.data_offset;
-			// A data-only block with a repeat count of 0 extends a contiguous last block of the same
-			// user data.
+			// A data-only block with a repeat count of 0 extends a contiguous last block of the
+			// same user data.
 			if (join && !blocks.empty() && Ngs2IsDataOnly(info) && info.num_repeats == 0 &&
 			    blocks.back().data + blocks.back().info.data_size == block_data &&
 			    blocks.back().info.user_data == info.user_data) {
@@ -1257,7 +1265,9 @@ struct Ngs2VoiceInternal {
 					// Reserve the voice immediately; publish playback flags after rendering.
 					state_flags |= 1;
 				}
-				// Every PLAY restarts the filters and mastering modules without a ramp or history.
+				// Every PLAY restarts the resampler, filters and mastering modules without a ramp or
+				// history.
+				ResetResampler();
 				for (auto& filter: filters) {
 					std::ranges::fill(filter.history, std::array<float, 4> {});
 				}
@@ -2297,9 +2307,10 @@ static void Ngs2EnterBlock(Ngs2VoiceInternal& voice) {
 	}
 }
 
-static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
-                            uint32_t& frame_samples) {
-	frame_samples = 0;
+// Decodes the next frame of the front blocks into decoded_frame and frame_samples, which the
+// caller has emptied.
+static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice) {
+	auto& frame = voice.decoded_frame;
 	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
 		Ngs2EnterBlock(voice);
 		if (voice.duration_remaining == 0) {
@@ -2337,7 +2348,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			voice.duration_remaining -= count;
 			voice.decoded_bytes += count * frame_bytes;
 			voice.decoded_samples += count - skipped;
-			frame_samples = static_cast<uint32_t>(count);
+			voice.frame_samples = static_cast<uint32_t>(count);
 			// The frames' bytes are consumed across the blocks they came from.
 			for (auto consumed = count * frame_bytes;;) {
 				auto&      front = voice.blocks.front();
@@ -2417,7 +2428,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 		    static_cast<uint32_t>(result.output_written / (sizeof(float) * voice.channels));
 		if (decoded_samples != 0) {
 			EXIT_NOT_IMPLEMENTED(decoded_samples > voice.duration_remaining);
-			frame_samples = decoded_samples;
+			voice.frame_samples = decoded_samples;
 			voice.duration_remaining -= decoded_samples;
 			voice.decoded_samples += decoded_samples;
 		}
@@ -2441,11 +2452,7 @@ static bool Ngs2CurrentFrame(Ngs2VoiceInternal& voice) {
 	if (voice.frame_cursor == voice.frame_samples) {
 		voice.frame_cursor  = 0;
 		voice.frame_samples = 0;
-		if (voice.next_frame_samples != 0) {
-			std::swap(voice.decoded_frame, voice.next_decoded_frame);
-			voice.frame_samples      = voice.next_frame_samples;
-			voice.next_frame_samples = 0;
-		} else if (!Ngs2DecodeFrame(voice, voice.decoded_frame, voice.frame_samples)) {
+		if (!Ngs2DecodeFrame(voice)) {
 			return false;
 		}
 	}
@@ -2453,71 +2460,346 @@ static bool Ngs2CurrentFrame(Ngs2VoiceInternal& voice) {
 	       voice.frame_cursor < voice.frame_samples;
 }
 
-static void Ngs2AdvanceSamples(Ngs2VoiceInternal& voice) {
-	const auto output_rate = uint64_t(voice.rack->ngs->option.sample_rate) << 32u;
-	while (voice.state == Ngs2VoicePlayState::Playing && voice.sample_phase >= output_rate) {
-		if (!Ngs2CurrentFrame(voice)) {
-			break;
-		}
-		const auto advance = std::min(voice.sample_phase / output_rate,
-		                              uint64_t(voice.frame_samples - voice.frame_cursor));
-		voice.frame_cursor += static_cast<uint32_t>(advance);
-		voice.sample_phase -= advance * output_rate;
-	}
-	if (voice.blocks.empty() && voice.frame_cursor == voice.frame_samples &&
-	    voice.next_frame_samples == 0 && !voice.accepts_blocks) {
-		voice.sample_phase = 0;
-	}
-}
+// Phases 0 to 256 of the 512 phases of 4 taps, a Hann-windowed sinc normalized to unit gain.
+// Phase 512 - p holds the taps of phase p in reverse order.
+static constexpr float NGS2_RESAMPLER_HALF_TAPS[257][4] = {
+    {0x0p+0f, 0x1p+0f, 0x0p+0f, -0x0p+0f},
+    {-0x1.fd6e3p-11f, 0x1.fffeb8p-1f, 0x1.014938p-10f, -0x1.3c1c0ep-29f},
+    {-0x1.fadd04p-10f, 0x1.fffadcp-1f, 0x1.0292bcp-9f, -0x1.3c1c0ep-26f},
+    {-0x1.7a395ep-9f, 0x1.fff47p-1f, 0x1.85cacep-9f, -0x1.0b25ap-24f},
+    {-0x1.f5bca6p-9f, 0x1.ffeb74p-1f, 0x1.0526ap-8f, -0x1.3cf7f6p-23f},
+    {-0x1.37fc7p-8f, 0x1.ffdfe8p-1f, 0x1.480d3ep-8f, -0x1.35e1c4p-22f},
+    {-0x1.74774ep-8f, 0x1.ffd1ccp-1f, 0x1.8b9972p-8f, -0x1.0bf3c8p-21f},
+    {-0x1.b04f34p-8f, 0x1.ffc122p-1f, 0x1.cfcb6ap-8f, -0x1.a9e652p-21f},
+    {-0x1.eb847p-8f, 0x1.ffadeap-1f, 0x1.0a51aap-7f, -0x1.3e2652p-20f},
+    {-0x1.130ba6p-7f, 0x1.ff9824p-1f, 0x1.2d10bp-7f, -0x1.c55c54p-20f},
+    {-0x1.30040ep-7f, 0x1.ff7fd2p-1f, 0x1.5022d8p-7f, -0x1.3735ecp-19f},
+    {-0x1.4cab9ap-7f, 0x1.ff64f6p-1f, 0x1.738838p-7f, -0x1.9e8eecp-19f},
+    {-0x1.690272p-7f, 0x1.ff478cp-1f, 0x1.9740e2p-7f, -0x1.0d524p-18f},
+    {-0x1.8508c4p-7f, 0x1.ff279ap-1f, 0x1.bb4ce8p-7f, -0x1.56af48p-18f},
+    {-0x1.a0bebcp-7f, 0x1.ff052p-1f, 0x1.dfac5ap-7f, -0x1.ac55f4p-18f},
+    {-0x1.bc2488p-7f, 0x1.fee01cp-1f, 0x1.022fa4p-6f, -0x1.079d1ap-17f},
+    {-0x1.d73a58p-7f, 0x1.feb892p-1f, 0x1.14b2dep-6f, -0x1.402a94p-17f},
+    {-0x1.f2005cp-7f, 0x1.fe8e82p-1f, 0x1.275fe6p-6f, -0x1.804e3ep-17f},
+    {-0x1.063b62p-6f, 0x1.fe61eep-1f, 0x1.3a36bep-6f, -0x1.c883c8p-17f},
+    {-0x1.134ee4p-6f, 0x1.fe32d4p-1f, 0x1.4d376ep-6f, -0x1.0ca3ep-16f},
+    {-0x1.203acap-6f, 0x1.fe013ap-1f, 0x1.6061fap-6f, -0x1.398a12p-16f},
+    {-0x1.2cff32p-6f, 0x1.fdcd1cp-1f, 0x1.73b668p-6f, -0x1.6b339ap-16f},
+    {-0x1.399c36p-6f, 0x1.fd968p-1f, 0x1.8734bap-6f, -0x1.a1de52p-16f},
+    {-0x1.4611fp-6f, 0x1.fd5d64p-1f, 0x1.9adcf4p-6f, -0x1.ddc814p-16f},
+    {-0x1.52607ep-6f, 0x1.fd21cap-1f, 0x1.aeaf1ap-6f, -0x1.0f975cp-15f},
+    {-0x1.5e87fcp-6f, 0x1.fce3b4p-1f, 0x1.c2ab2cp-6f, -0x1.3328bp-15f},
+    {-0x1.6a8888p-6f, 0x1.fca322p-1f, 0x1.d6d13p-6f, -0x1.59b6f4p-15f},
+    {-0x1.76623ep-6f, 0x1.fc6016p-1f, 0x1.eb2124p-6f, -0x1.83614ap-15f},
+    {-0x1.82153cp-6f, 0x1.fc1a92p-1f, 0x1.ff9b0ap-6f, -0x1.b046ap-15f},
+    {-0x1.8da1a4p-6f, 0x1.fbd298p-1f, 0x1.0a1f7p-5f, -0x1.e0864ep-15f},
+    {-0x1.990794p-6f, 0x1.fb8828p-1f, 0x1.148656p-5f, -0x1.0a1fbcp-14f},
+    {-0x1.a44728p-6f, 0x1.fb3b44p-1f, 0x1.1f0234p-5f, -0x1.25c888p-14f},
+    {-0x1.af6086p-6f, 0x1.faebeep-1f, 0x1.29930ap-5f, -0x1.434cfcp-14f},
+    {-0x1.ba53cap-6f, 0x1.fa9a26p-1f, 0x1.3438d8p-5f, -0x1.62bce6p-14f},
+    {-0x1.c5211ap-6f, 0x1.fa45fp-1f, 0x1.3ef39ap-5f, -0x1.842782p-14f},
+    {-0x1.cfc894p-6f, 0x1.f9ef4cp-1f, 0x1.49c352p-5f, -0x1.a79c62p-14f},
+    {-0x1.da4a5ap-6f, 0x1.f9963cp-1f, 0x1.54a7fep-5f, -0x1.cd2b34p-14f},
+    {-0x1.e4a692p-6f, 0x1.f93ac2p-1f, 0x1.5fa19ap-5f, -0x1.f4e31cp-14f},
+    {-0x1.eedd5cp-6f, 0x1.f8dcep-1f, 0x1.6ab026p-5f, -0x1.0f69e4p-13f},
+    {-0x1.f8eedcp-6f, 0x1.f87c96p-1f, 0x1.75d39ep-5f, -0x1.25863ap-13f},
+    {-0x1.016d9cp-5f, 0x1.f819e6p-1f, 0x1.810cp-5f, -0x1.3cce5ap-13f},
+    {-0x1.06514ap-5f, 0x1.f7b4d4p-1f, 0x1.8c594ap-5f, -0x1.5549d6p-13f},
+    {-0x1.0b228ap-5f, 0x1.f74d62p-1f, 0x1.97bb76p-5f, -0x1.6f0068p-13f},
+    {-0x1.0fe17p-5f, 0x1.f6e38ep-1f, 0x1.a33284p-5f, -0x1.89f9b2p-13f},
+    {-0x1.148e0ep-5f, 0x1.f6775ep-1f, 0x1.aebe6ep-5f, -0x1.a63d6p-13f},
+    {-0x1.192876p-5f, 0x1.f608d2p-1f, 0x1.ba5f3p-5f, -0x1.c3d2f6p-13f},
+    {-0x1.1db0bcp-5f, 0x1.f597ecp-1f, 0x1.c614c8p-5f, -0x1.e2c212p-13f},
+    {-0x1.2226f4p-5f, 0x1.f524aep-1f, 0x1.d1df3p-5f, -0x1.018924p-12f},
+    {-0x1.268b32p-5f, 0x1.f4af1ap-1f, 0x1.ddbe64p-5f, -0x1.126596p-12f},
+    {-0x1.2add8cp-5f, 0x1.f43732p-1f, 0x1.e9b25ep-5f, -0x1.23fa18p-12f},
+    {-0x1.2f1e12p-5f, 0x1.f3bcf8p-1f, 0x1.f5bb18p-5f, -0x1.364a74p-12f},
+    {-0x1.334cdap-5f, 0x1.f3407p-1f, 0x1.00ec48p-4f, -0x1.495a5ep-12f},
+    {-0x1.3769fap-5f, 0x1.f2c19ap-1f, 0x1.07055ep-4f, -0x1.5d2d92p-12f},
+    {-0x1.3b7584p-5f, 0x1.f24078p-1f, 0x1.0d28cep-4f, -0x1.71c7c4p-12f},
+    {-0x1.3f6f9p-5f, 0x1.f1bd0cp-1f, 0x1.135692p-4f, -0x1.872cap-12f},
+    {-0x1.43583p-5f, 0x1.f1375ap-1f, 0x1.198ea8p-4f, -0x1.9d5fe4p-12f},
+    {-0x1.472f7ep-5f, 0x1.f0af64p-1f, 0x1.1fd10cp-4f, -0x1.b46526p-12f},
+    {-0x1.4af58ap-5f, 0x1.f0252ap-1f, 0x1.261dbcp-4f, -0x1.cc4014p-12f},
+    {-0x1.4eaa6cp-5f, 0x1.ef98bp-1f, 0x1.2c74b2p-4f, -0x1.e4f456p-12f},
+    {-0x1.524e3cp-5f, 0x1.ef09f6p-1f, 0x1.32d5ecp-4f, -0x1.fe857ep-12f},
+    {-0x1.55e10cp-5f, 0x1.ee7902p-1f, 0x1.394168p-4f, -0x1.0c7b96p-11f},
+    {-0x1.5962f6p-5f, 0x1.ede5d6p-1f, 0x1.3fb71ep-4f, -0x1.1a2674p-11f},
+    {-0x1.5cd40ep-5f, 0x1.ed507p-1f, 0x1.46370ep-4f, -0x1.284526p-11f},
+    {-0x1.60346ap-5f, 0x1.ecb8d8p-1f, 0x1.4cc13p-4f, -0x1.36d97p-11f},
+    {-0x1.638424p-5f, 0x1.ec1f0cp-1f, 0x1.535582p-4f, -0x1.45e516p-11f},
+    {-0x1.66c34ep-5f, 0x1.eb831p-1f, 0x1.59f4p-4f, -0x1.5569d2p-11f},
+    {-0x1.69f204p-5f, 0x1.eae4e6p-1f, 0x1.609ca4p-4f, -0x1.656964p-11f},
+    {-0x1.6d1058p-5f, 0x1.ea4492p-1f, 0x1.674f6ap-4f, -0x1.75e588p-11f},
+    {-0x1.701e66p-5f, 0x1.e9a214p-1f, 0x1.6e0c4ep-4f, -0x1.86dffap-11f},
+    {-0x1.731c42p-5f, 0x1.e8fd72p-1f, 0x1.74d348p-4f, -0x1.985a64p-11f},
+    {-0x1.760a04p-5f, 0x1.e856aap-1f, 0x1.7ba458p-4f, -0x1.aa567cp-11f},
+    {-0x1.78e7c6p-5f, 0x1.e7adc4p-1f, 0x1.827f74p-4f, -0x1.bcd5f6p-11f},
+    {-0x1.7bb59ep-5f, 0x1.e702bep-1f, 0x1.89649ap-4f, -0x1.cfda76p-11f},
+    {-0x1.7e73a4p-5f, 0x1.e6559cp-1f, 0x1.9053c4p-4f, -0x1.e365acp-11f},
+    {-0x1.8121fp-5f, 0x1.e5a66p-1f, 0x1.974cecp-4f, -0x1.f7793cp-11f},
+    {-0x1.83c09cp-5f, 0x1.e4f50ep-1f, 0x1.9e500ep-4f, -0x1.060b62p-10f},
+    {-0x1.864fbep-5f, 0x1.e441a8p-1f, 0x1.a55d2p-4f, -0x1.109ff2p-10f},
+    {-0x1.88cf6ep-5f, 0x1.e38c3p-1f, 0x1.ac7422p-4f, -0x1.1b7b1ep-10f},
+    {-0x1.8b3fc8p-5f, 0x1.e2d4aap-1f, 0x1.b3950ap-4f, -0x1.269daep-10f},
+    {-0x1.8da0ep-5f, 0x1.e21b18p-1f, 0x1.babfd4p-4f, -0x1.320872p-10f},
+    {-0x1.8ff2d4p-5f, 0x1.e15f7cp-1f, 0x1.c1f478p-4f, -0x1.3dbc2ep-10f},
+    {-0x1.9235b8p-5f, 0x1.e0a1dap-1f, 0x1.c932f2p-4f, -0x1.49b9aap-10f},
+    {-0x1.9469a8p-5f, 0x1.dfe234p-1f, 0x1.d07b3ap-4f, -0x1.5601aap-10f},
+    {-0x1.968ebcp-5f, 0x1.df208ep-1f, 0x1.d7cd4ap-4f, -0x1.6294f4p-10f},
+    {-0x1.98a50ep-5f, 0x1.de5ce8p-1f, 0x1.df291cp-4f, -0x1.6f7446p-10f},
+    {-0x1.9aacb6p-5f, 0x1.dd9746p-1f, 0x1.e68ea8p-4f, -0x1.7ca062p-10f},
+    {-0x1.9ca5cep-5f, 0x1.dccfacp-1f, 0x1.edfde8p-4f, -0x1.8a1a02p-10f},
+    {-0x1.9e907p-5f, 0x1.dc061ep-1f, 0x1.f576d6p-4f, -0x1.97e1e4p-10f},
+    {-0x1.a06cb6p-5f, 0x1.db3a9ap-1f, 0x1.fcf96ap-4f, -0x1.a5f8cp-10f},
+    {-0x1.a23ab8p-5f, 0x1.da6d28p-1f, 0x1.0242dp-3f, -0x1.b45f4cp-10f},
+    {-0x1.a3fa9p-5f, 0x1.d99dc6p-1f, 0x1.060db6p-3f, -0x1.c31642p-10f},
+    {-0x1.a5ac58p-5f, 0x1.d8cc7cp-1f, 0x1.09dd64p-3f, -0x1.d21e4ep-10f},
+    {-0x1.a7502cp-5f, 0x1.d7f94ap-1f, 0x1.0db1d6p-3f, -0x1.e17828p-10f},
+    {-0x1.a8e622p-5f, 0x1.d72432p-1f, 0x1.118b0ap-3f, -0x1.f12478p-10f},
+    {-0x1.aa6e56p-5f, 0x1.d64d38p-1f, 0x1.1568fap-3f, -0x1.0091f8p-9f},
+    {-0x1.abe8e4p-5f, 0x1.d5746p-1f, 0x1.194ba4p-3f, -0x1.08bb9cp-9f},
+    {-0x1.ad55e2p-5f, 0x1.d499acp-1f, 0x1.1d3304p-3f, -0x1.110f7cp-9f},
+    {-0x1.aeb56ep-5f, 0x1.d3bd2p-1f, 0x1.211f14p-3f, -0x1.198deap-9f},
+    {-0x1.b007ap-5f, 0x1.d2debcp-1f, 0x1.250fd2p-3f, -0x1.22373ap-9f},
+    {-0x1.b14c94p-5f, 0x1.d1fe86p-1f, 0x1.290538p-3f, -0x1.2b0bbap-9f},
+    {-0x1.b28464p-5f, 0x1.d11c8p-1f, 0x1.2cff44p-3f, -0x1.340bbcp-9f},
+    {-0x1.b3af28p-5f, 0x1.d038aep-1f, 0x1.30fdf2p-3f, -0x1.3d378cp-9f},
+    {-0x1.b4ccfep-5f, 0x1.cf531p-1f, 0x1.35013cp-3f, -0x1.468f78p-9f},
+    {-0x1.b5ddfep-5f, 0x1.ce6bacp-1f, 0x1.39091ep-3f, -0x1.5013ccp-9f},
+    {-0x1.b6e244p-5f, 0x1.cd8284p-1f, 0x1.3d1596p-3f, -0x1.59c4d4p-9f},
+    {-0x1.b7d9eap-5f, 0x1.cc979ap-1f, 0x1.41269cp-3f, -0x1.63a2d6p-9f},
+    {-0x1.b8c50ap-5f, 0x1.cbaaf4p-1f, 0x1.453c2ep-3f, -0x1.6dae1cp-9f},
+    {-0x1.b9a3cp-5f, 0x1.cabc9p-1f, 0x1.495648p-3f, -0x1.77e6ecp-9f},
+    {-0x1.ba7624p-5f, 0x1.c9cc78p-1f, 0x1.4d74e4p-3f, -0x1.824d8ep-9f},
+    {-0x1.bb3c56p-5f, 0x1.c8daa8p-1f, 0x1.5197fcp-3f, -0x1.8ce242p-9f},
+    {-0x1.bbf66cp-5f, 0x1.c7e728p-1f, 0x1.55bf9p-3f, -0x1.97a55p-9f},
+    {-0x1.bca482p-5f, 0x1.c6f1fap-1f, 0x1.59eb98p-3f, -0x1.a296f4p-9f},
+    {-0x1.bd46b4p-5f, 0x1.c5fb1ep-1f, 0x1.5e1c0ep-3f, -0x1.adb774p-9f},
+    {-0x1.bddd1ap-5f, 0x1.c5029cp-1f, 0x1.6250f2p-3f, -0x1.b9070ap-9f},
+    {-0x1.be67d4p-5f, 0x1.c40874p-1f, 0x1.668a3ap-3f, -0x1.c485f6p-9f},
+    {-0x1.bee6f8p-5f, 0x1.c30caap-1f, 0x1.6ac7e6p-3f, -0x1.d03474p-9f},
+    {-0x1.bf5aa2p-5f, 0x1.c20f42p-1f, 0x1.6f09eep-3f, -0x1.dc12bep-9f},
+    {-0x1.bfc2eep-5f, 0x1.c1103cp-1f, 0x1.73504ep-3f, -0x1.e8210ep-9f},
+    {-0x1.c01ff6p-5f, 0x1.c00fap-1f, 0x1.779bp-3f, -0x1.f45f9ep-9f},
+    {-0x1.c071d4p-5f, 0x1.bf0d6cp-1f, 0x1.7beap-3f, -0x1.00675p-8f},
+    {-0x1.c0b8a6p-5f, 0x1.be09a6p-1f, 0x1.803d48p-3f, -0x1.06b726p-8f},
+    {-0x1.c0f484p-5f, 0x1.bd0452p-1f, 0x1.8494d6p-3f, -0x1.0d1f6cp-8f},
+    {-0x1.c1258ap-5f, 0x1.bbfd7p-1f, 0x1.88f0ap-3f, -0x1.13a03ap-8f},
+    {-0x1.c14bd4p-5f, 0x1.baf508p-1f, 0x1.8d50a6p-3f, -0x1.1a39a8p-8f},
+    {-0x1.c1677ap-5f, 0x1.b9eb18p-1f, 0x1.91b4dep-3f, -0x1.20ebcep-8f},
+    {-0x1.c1789ap-5f, 0x1.b8dfa6p-1f, 0x1.961d46p-3f, -0x1.27b6c2p-8f},
+    {-0x1.c17f4cp-5f, 0x1.b7d2b4p-1f, 0x1.9a89d6p-3f, -0x1.2e9a9cp-8f},
+    {-0x1.c17bacp-5f, 0x1.b6c446p-1f, 0x1.9efa8cp-3f, -0x1.35977p-8f},
+    {-0x1.c16dd6p-5f, 0x1.b5b46p-1f, 0x1.a36f6p-3f, -0x1.3cad54p-8f},
+    {-0x1.c155e4p-5f, 0x1.b4a304p-1f, 0x1.a7e84cp-3f, -0x1.43dc5ap-8f},
+    {-0x1.c133fp-5f, 0x1.b39034p-1f, 0x1.ac654ep-3f, -0x1.4b2498p-8f},
+    {-0x1.c10814p-5f, 0x1.b27bf6p-1f, 0x1.b0e65cp-3f, -0x1.52861ep-8f},
+    {-0x1.c0d26ep-5f, 0x1.b1664cp-1f, 0x1.b56b74p-3f, -0x1.5a00fep-8f},
+    {-0x1.c09316p-5f, 0x1.b04f38p-1f, 0x1.b9f48ep-3f, -0x1.61954ap-8f},
+    {-0x1.c04a28p-5f, 0x1.af36bep-1f, 0x1.be81a6p-3f, -0x1.69431p-8f},
+    {-0x1.bff7bep-5f, 0x1.ae1ce4p-1f, 0x1.c312b6p-3f, -0x1.710a6p-8f},
+    {-0x1.bf9bf4p-5f, 0x1.ad01a8p-1f, 0x1.c7a7b8p-3f, -0x1.78eb4ap-8f},
+    {-0x1.bf36e2p-5f, 0x1.abe51p-1f, 0x1.cc40a6p-3f, -0x1.80e5dap-8f},
+    {-0x1.bec8a4p-5f, 0x1.aac72p-1f, 0x1.d0dd78p-3f, -0x1.88fa1cp-8f},
+    {-0x1.be5154p-5f, 0x1.a9a7dap-1f, 0x1.d57e2cp-3f, -0x1.91281ep-8f},
+    {-0x1.bdd10ep-5f, 0x1.a88742p-1f, 0x1.da22bap-3f, -0x1.996feap-8f},
+    {-0x1.bd47ecp-5f, 0x1.a7655ap-1f, 0x1.decb1ep-3f, -0x1.a1d18ap-8f},
+    {-0x1.bcb606p-5f, 0x1.a64226p-1f, 0x1.e3774ep-3f, -0x1.aa4d0ap-8f},
+    {-0x1.bc1b7ap-5f, 0x1.a51daap-1f, 0x1.e82748p-3f, -0x1.b2e26ep-8f},
+    {-0x1.bb785ep-5f, 0x1.a3f7e8p-1f, 0x1.ecdb04p-3f, -0x1.bb91c2p-8f},
+    {-0x1.baccdp-5f, 0x1.a2d0e4p-1f, 0x1.f1927cp-3f, -0x1.c45b0cp-8f},
+    {-0x1.ba18e8p-5f, 0x1.a1a8ap-1f, 0x1.f64daap-3f, -0x1.cd3e52p-8f},
+    {-0x1.b95cc2p-5f, 0x1.a07f22p-1f, 0x1.fb0c88p-3f, -0x1.d63b98p-8f},
+    {-0x1.b89876p-5f, 0x1.9f546ap-1f, 0x1.ffcf1p-3f, -0x1.df52e4p-8f},
+    {-0x1.b7cc2p-5f, 0x1.9e287cp-1f, 0x1.024a9ep-2f, -0x1.e8843ap-8f},
+    {-0x1.b6f7d8p-5f, 0x1.9cfb5cp-1f, 0x1.04af82p-2f, -0x1.f1cf9ap-8f},
+    {-0x1.b61bbap-5f, 0x1.9bcd0ep-1f, 0x1.07163p-2f, -0x1.fb3508p-8f},
+    {-0x1.b537dep-5f, 0x1.9a9d92p-1f, 0x1.097ea8p-2f, -0x1.025a42p-7f},
+    {-0x1.b44c5ep-5f, 0x1.996cfp-1f, 0x1.0be8e4p-2f, -0x1.072708p-7f},
+    {-0x1.b35956p-5f, 0x1.983b28p-1f, 0x1.0e54e2p-2f, -0x1.0c00d4p-7f},
+    {-0x1.b25edcp-5f, 0x1.97083cp-1f, 0x1.10c29ep-2f, -0x1.10e7a6p-7f},
+    {-0x1.b15d0cp-5f, 0x1.95d434p-1f, 0x1.133216p-2f, -0x1.15db7ep-7f},
+    {-0x1.b054p-5f, 0x1.949f0ep-1f, 0x1.15a346p-2f, -0x1.1adc58p-7f},
+    {-0x1.af43dp-5f, 0x1.9368d2p-1f, 0x1.18162ap-2f, -0x1.1fea32p-7f},
+    {-0x1.ae2c94p-5f, 0x1.92317ep-1f, 0x1.1a8abep-2f, -0x1.25050cp-7f},
+    {-0x1.ad0e68p-5f, 0x1.90f91ap-1f, 0x1.1d01p-2f, -0x1.2a2cep-7f},
+    {-0x1.abe964p-5f, 0x1.8fbfa6p-1f, 0x1.1f78eep-2f, -0x1.2f61aap-7f},
+    {-0x1.aabda2p-5f, 0x1.8e8526p-1f, 0x1.21f282p-2f, -0x1.34a36ap-7f},
+    {-0x1.a98b3ap-5f, 0x1.8d499ep-1f, 0x1.246dbap-2f, -0x1.39f216p-7f},
+    {-0x1.a85246p-5f, 0x1.8c0d12p-1f, 0x1.26ea92p-2f, -0x1.3f4daep-7f},
+    {-0x1.a712dcp-5f, 0x1.8acf82p-1f, 0x1.296908p-2f, -0x1.44b62ap-7f},
+    {-0x1.a5cd1ap-5f, 0x1.8990f6p-1f, 0x1.2be916p-2f, -0x1.4a2b86p-7f},
+    {-0x1.a48114p-5f, 0x1.88516cp-1f, 0x1.2e6abap-2f, -0x1.4fadb8p-7f},
+    {-0x1.a32ee4p-5f, 0x1.8710eap-1f, 0x1.30edfp-2f, -0x1.553cbep-7f},
+    {-0x1.a1d6a4p-5f, 0x1.85cf72p-1f, 0x1.3372b4p-2f, -0x1.5ad88cp-7f},
+    {-0x1.a0786ap-5f, 0x1.848d08p-1f, 0x1.35f904p-2f, -0x1.60811ep-7f},
+    {-0x1.9f145p-5f, 0x1.8349bp-1f, 0x1.3880dcp-2f, -0x1.66366ap-7f},
+    {-0x1.9daa6ep-5f, 0x1.82056cp-1f, 0x1.3b0a38p-2f, -0x1.6bf866p-7f},
+    {-0x1.9c3adcp-5f, 0x1.80c04p-1f, 0x1.3d9516p-2f, -0x1.71c70cp-7f},
+    {-0x1.9ac5b2p-5f, 0x1.7f7a2ep-1f, 0x1.40216ep-2f, -0x1.77a25p-7f},
+    {-0x1.994b0ap-5f, 0x1.7e3338p-1f, 0x1.42af42p-2f, -0x1.7d8a28p-7f},
+    {-0x1.97caf8p-5f, 0x1.7ceb64p-1f, 0x1.453e8ap-2f, -0x1.837e8ap-7f},
+    {-0x1.964596p-5f, 0x1.7ba2b6p-1f, 0x1.47cf44p-2f, -0x1.897f6ap-7f},
+    {-0x1.94bafcp-5f, 0x1.7a592cp-1f, 0x1.4a616cp-2f, -0x1.8f8cbep-7f},
+    {-0x1.932b42p-5f, 0x1.790ecep-1f, 0x1.4cf5p-2f, -0x1.95a67ap-7f},
+    {-0x1.91967cp-5f, 0x1.77c39ep-1f, 0x1.4f89fap-2f, -0x1.9bcc8ep-7f},
+    {-0x1.8ffcc6p-5f, 0x1.76779ep-1f, 0x1.522056p-2f, -0x1.a1fefp-7f},
+    {-0x1.8e5e36p-5f, 0x1.752adp-1f, 0x1.54b812p-2f, -0x1.a83d92p-7f},
+    {-0x1.8cbaep-5f, 0x1.73dd3ap-1f, 0x1.57512ap-2f, -0x1.ae8866p-7f},
+    {-0x1.8b12dep-5f, 0x1.728edep-1f, 0x1.59eb9ap-2f, -0x1.b4df5cp-7f},
+    {-0x1.896648p-5f, 0x1.713fcp-1f, 0x1.5c875ep-2f, -0x1.bb4266p-7f},
+    {-0x1.87b532p-5f, 0x1.6fefep-1f, 0x1.5f2472p-2f, -0x1.c1b174p-7f},
+    {-0x1.85ffb4p-5f, 0x1.6e9f44p-1f, 0x1.61c2dp-2f, -0x1.c82c76p-7f},
+    {-0x1.8445e4p-5f, 0x1.6d4dfp-1f, 0x1.64627ap-2f, -0x1.ceb35cp-7f},
+    {-0x1.8287dcp-5f, 0x1.6bfbe4p-1f, 0x1.670366p-2f, -0x1.d54614p-7f},
+    {-0x1.80c5acp-5f, 0x1.6aa924p-1f, 0x1.69a594p-2f, -0x1.dbe48ep-7f},
+    {-0x1.7eff7p-5f, 0x1.6955b4p-1f, 0x1.6c48fep-2f, -0x1.e28eb6p-7f},
+    {-0x1.7d353cp-5f, 0x1.680196p-1f, 0x1.6eedap-2f, -0x1.e9447ap-7f},
+    {-0x1.7b6726p-5f, 0x1.66accep-1f, 0x1.719378p-2f, -0x1.f005c6p-7f},
+    {-0x1.799544p-5f, 0x1.65575ep-1f, 0x1.743a8p-2f, -0x1.f6d288p-7f},
+    {-0x1.77bfaap-5f, 0x1.64014ap-1f, 0x1.76e2b6p-2f, -0x1.fdaaaap-7f},
+    {-0x1.75e672p-5f, 0x1.62aa96p-1f, 0x1.798c14p-2f, -0x1.02470ep-6f},
+    {-0x1.7409aep-5f, 0x1.615342p-1f, 0x1.7c3696p-2f, -0x1.05be6p-6f},
+    {-0x1.722976p-5f, 0x1.5ffb54p-1f, 0x1.7ee23ap-2f, -0x1.093b44p-6f},
+    {-0x1.7045dep-5f, 0x1.5ea2cep-1f, 0x1.818efap-2f, -0x1.0cbdaep-6f},
+    {-0x1.6e5efap-5f, 0x1.5d49b2p-1f, 0x1.843cd2p-2f, -0x1.104592p-6f},
+    {-0x1.6c74e2p-5f, 0x1.5bf006p-1f, 0x1.86ebcp-2f, -0x1.13d2e4p-6f},
+    {-0x1.6a87a8p-5f, 0x1.5a95c8p-1f, 0x1.899bbep-2f, -0x1.17659ap-6f},
+    {-0x1.689764p-5f, 0x1.593bp-1f, 0x1.8c4cc8p-2f, -0x1.1afda4p-6f},
+    {-0x1.66a428p-5f, 0x1.57dfaep-1f, 0x1.8efedap-2f, -0x1.1e9afap-6f},
+    {-0x1.64ae0ap-5f, 0x1.5683d4p-1f, 0x1.91b1fp-2f, -0x1.223d8cp-6f},
+    {-0x1.62b51ep-5f, 0x1.55277ap-1f, 0x1.946606p-2f, -0x1.25e55p-6f},
+    {-0x1.60b978p-5f, 0x1.53ca9ep-1f, 0x1.971b18p-2f, -0x1.299236p-6f},
+    {-0x1.5ebb2ep-5f, 0x1.526d44p-1f, 0x1.99d12p-2f, -0x1.2d4432p-6f},
+    {-0x1.5cba54p-5f, 0x1.510f7p-1f, 0x1.9c881cp-2f, -0x1.30fb36p-6f},
+    {-0x1.5ab6fcp-5f, 0x1.4fb126p-1f, 0x1.9f4008p-2f, -0x1.34b734p-6f},
+    {-0x1.58b13ap-5f, 0x1.4e5266p-1f, 0x1.a1f8dcp-2f, -0x1.38781ep-6f},
+    {-0x1.56a924p-5f, 0x1.4cf336p-1f, 0x1.a4b298p-2f, -0x1.3c3de4p-6f},
+    {-0x1.549eccp-5f, 0x1.4b9396p-1f, 0x1.a76d36p-2f, -0x1.400878p-6f},
+    {-0x1.529246p-5f, 0x1.4a338ap-1f, 0x1.aa28bp-2f, -0x1.43d7ccp-6f},
+    {-0x1.5083a4p-5f, 0x1.48d316p-1f, 0x1.ace506p-2f, -0x1.47abdp-6f},
+    {-0x1.4e72fcp-5f, 0x1.47723cp-1f, 0x1.afa22ep-2f, -0x1.4b8474p-6f},
+    {-0x1.4c605ep-5f, 0x1.4610fep-1f, 0x1.b2602ap-2f, -0x1.4f61a8p-6f},
+    {-0x1.4a4bep-5f, 0x1.44af62p-1f, 0x1.b51efp-2f, -0x1.53435ap-6f},
+    {-0x1.483592p-5f, 0x1.434d66p-1f, 0x1.b7de7ep-2f, -0x1.57297ep-6f},
+    {-0x1.461d8ap-5f, 0x1.41eb12p-1f, 0x1.ba9ecep-2f, -0x1.5b14p-6f},
+    {-0x1.4403d8p-5f, 0x1.408864p-1f, 0x1.bd5fep-2f, -0x1.5f02dp-6f},
+    {-0x1.41e88ep-5f, 0x1.3f2562p-1f, 0x1.c021aap-2f, -0x1.62f5dcp-6f},
+    {-0x1.3fcbcp-5f, 0x1.3dc21p-1f, 0x1.c2e42ap-2f, -0x1.66ed14p-6f},
+    {-0x1.3dad8p-5f, 0x1.3c5e6cp-1f, 0x1.c5a75cp-2f, -0x1.6ae864p-6f},
+    {-0x1.3b8ddep-5f, 0x1.3afa7ep-1f, 0x1.c86b3cp-2f, -0x1.6ee7bcp-6f},
+    {-0x1.396cfp-5f, 0x1.399646p-1f, 0x1.cb2fc4p-2f, -0x1.72eb08p-6f},
+    {-0x1.374ac4p-5f, 0x1.3831c6p-1f, 0x1.cdf4eep-2f, -0x1.76f238p-6f},
+    {-0x1.35276ep-5f, 0x1.36cd04p-1f, 0x1.d0babap-2f, -0x1.7afd36p-6f},
+    {-0x1.3302fep-5f, 0x1.3568p-1f, 0x1.d3811ep-2f, -0x1.7f0bfp-6f},
+    {-0x1.30dd84p-5f, 0x1.3402bep-1f, 0x1.d6481ap-2f, -0x1.831e52p-6f},
+    {-0x1.2eb716p-5f, 0x1.329d4p-1f, 0x1.d90fa6p-2f, -0x1.873448p-6f},
+    {-0x1.2c8fcp-5f, 0x1.31378ap-1f, 0x1.dbd7cp-2f, -0x1.8b4dcp-6f},
+    {-0x1.2a6796p-5f, 0x1.2fd19ep-1f, 0x1.dea062p-2f, -0x1.8f6aa6p-6f},
+    {-0x1.283ea8p-5f, 0x1.2e6b7ep-1f, 0x1.e16988p-2f, -0x1.938ae2p-6f},
+    {-0x1.261508p-5f, 0x1.2d052ep-1f, 0x1.e4332cp-2f, -0x1.97ae62p-6f},
+    {-0x1.23eac4p-5f, 0x1.2b9ebp-1f, 0x1.e6fd4ap-2f, -0x1.9bd51p-6f},
+    {-0x1.21bfeep-5f, 0x1.2a3808p-1f, 0x1.e9c7dcp-2f, -0x1.9ffed6p-6f},
+    {-0x1.1f9496p-5f, 0x1.28d136p-1f, 0x1.ec92e2p-2f, -0x1.a42b9ep-6f},
+    {-0x1.1d68ccp-5f, 0x1.276a3ep-1f, 0x1.ef5e52p-2f, -0x1.a85b54p-6f},
+    {-0x1.1b3cap-5f, 0x1.260324p-1f, 0x1.f22a28p-2f, -0x1.ac8dep-6f},
+    {-0x1.191022p-5f, 0x1.249beap-1f, 0x1.f4f662p-2f, -0x1.b0c32ep-6f},
+    {-0x1.16e362p-5f, 0x1.233494p-1f, 0x1.f7c2f8p-2f, -0x1.b4fb24p-6f},
+    {-0x1.14b67p-5f, 0x1.21cd2p-1f, 0x1.fa8fe8p-2f, -0x1.b935acp-6f},
+    {-0x1.128958p-5f, 0x1.206596p-1f, 0x1.fd5d2ap-2f, -0x1.bd72bp-6f},
+    {-0x1.105c2ep-5f, 0x1.1efdf6p-1f, 0x1.00155ep-1f, -0x1.c1b216p-6f},
+    {-0x1.0e2fp-5f, 0x1.1d9642p-1f, 0x1.017c4cp-1f, -0x1.c5f3c8p-6f},
+    {-0x1.0c01dcp-5f, 0x1.1c2e7ep-1f, 0x1.02e35ep-1f, -0x1.ca37acp-6f},
+    {-0x1.09d4dp-5f, 0x1.1ac6acp-1f, 0x1.044a8ep-1f, -0x1.ce7dacp-6f},
+    {-0x1.07a7ecp-5f, 0x1.195edp-1f, 0x1.05b1dcp-1f, -0x1.d2c5aep-6f},
+    {-0x1.057b4p-5f, 0x1.17f6ecp-1f, 0x1.071946p-1f, -0x1.d70f9ap-6f},
+    {-0x1.034ed8p-5f, 0x1.168fp-1f, 0x1.0880c8p-1f, -0x1.db5b54p-6f},
+    {-0x1.0122c4p-5f, 0x1.152712p-1f, 0x1.09e86p-1f, -0x1.dfa8c4p-6f},
+    {-0x1.fdee22p-6f, 0x1.13bf24p-1f, 0x1.0b500cp-1f, -0x1.e3f7d2p-6f},
+    {-0x1.f9979ap-6f, 0x1.125736p-1f, 0x1.0cb7cap-1f, -0x1.e8486p-6f},
+    {-0x1.f5420ep-6f, 0x1.10ef4ep-1f, 0x1.0e1f94p-1f, -0x1.ec9a56p-6f},
+    {-0x1.f0ed9ap-6f, 0x1.0f876cp-1f, 0x1.0f876cp-1f, -0x1.f0ed9ap-6f},
+};
 
-static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
-	const auto generation = voice.source_generation;
-	uint32_t   output     = 0;
-	const auto output_rate = uint64_t(voice.rack->ngs->option.sample_rate) << 32u;
-	voice.incomplete_frame = false;
-	while (voice.state == Ngs2VoicePlayState::Playing && output < grain &&
-	       (!voice.blocks.empty() || voice.frame_cursor < voice.frame_samples ||
-	        voice.next_frame_samples != 0)) {
-		Ngs2AdvanceSamples(voice);
-		if (voice.source_generation != generation || !Ngs2CurrentFrame(voice)) {
-			break;
+static constexpr auto NGS2_RESAMPLER_TAPS = [] {
+	std::array<std::array<float, 4>, 512> taps {};
+	for (size_t p = 0; p < taps.size(); ++p) {
+		for (size_t k = 0; k < 4; ++k) {
+			taps[p][k] = p <= 256 ? NGS2_RESAMPLER_HALF_TAPS[p][k]
+			                      : NGS2_RESAMPLER_HALF_TAPS[512 - p][3 - k];
 		}
-		if (voice.frame_cursor + 1 == voice.frame_samples && voice.sample_phase != 0) {
-			if (voice.next_frame_samples == 0 && !voice.blocks.empty()) {
-				if (voice.next_decoded_frame.empty()) {
-					voice.next_decoded_frame.resize(voice.decoded_frame.size());
-				}
-				Ngs2DecodeFrame(voice, voice.next_decoded_frame, voice.next_frame_samples);
-			}
-			if (voice.source_generation != generation ||
-			    voice.state != Ngs2VoicePlayState::Playing ||
-			    voice.frame_cursor >= voice.frame_samples) {
-				break;
-			}
-		}
-		const float* current = voice.decoded_frame.data() + voice.frame_cursor * voice.channels;
-		const float* next = voice.frame_cursor + 1 < voice.frame_samples
-		                        ? current + voice.channels
-		                        : voice.next_frame_samples != 0 ? voice.next_decoded_frame.data()
-		                                                        : current;
-		const float fraction = static_cast<float>(voice.sample_phase) /
-		                       static_cast<float>(output_rate);
-		for (uint32_t c = 0; c < voice.channels; ++c) {
-			voice.samples[c * grain + output] = std::lerp(current[c], next[c], fraction);
-		}
-		voice.sample_phase += voice.sample_step;
-		++output;
 	}
-	if (voice.source_generation == generation) {
-		Ngs2AdvanceSamples(voice);
+	return taps;
+}();
+
+// Fills a window of `advance + 4` samples per channel, the kept history first, and interpolates
+// each output between the middle two of 4 window samples, in steps of 1/16384 sample: the output
+// lags the source by 3 samples. Returns whether the source ran short of the window.
+static bool Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
+	const auto generation = voice.source_generation;
+	const auto channels   = voice.channels;
+	const auto phase      = voice.resample_phase;
+	// The pitch truncates to 1/16384 below 4.0; NaN and negative ratios give 0.
+	const float q14 = static_cast<float>(voice.sample_rate) /
+	                  static_cast<float>(voice.rack->ngs->option.sample_rate) * voice.pitch_ratio *
+	                  16384.0f;
+	const uint32_t pitch   = q14 >= 0.0f ? static_cast<uint32_t>(std::min(q14, 65535.0f)) : 0;
+	const uint32_t advance = (pitch * grain + phase) >> 14u;
+	const uint32_t needed  = advance + 4;
+	voice.resample_input.resize(size_t(needed) * channels);
+	float*   input = voice.resample_input.data();
+	uint32_t got   = voice.history_samples;
+	for (uint32_t c = 0; c < channels; ++c) {
+		std::copy_n(voice.history.data() + size_t(c) * 4, got, input + size_t(c) * needed);
+	}
+	voice.incomplete_frame = false;
+	while (got < needed && Ngs2CurrentFrame(voice) && voice.source_generation == generation) {
+		const auto   count = std::min(needed - got, voice.frame_samples - voice.frame_cursor);
+		const float* frame = voice.decoded_frame.data() + size_t(voice.frame_cursor) * channels;
+		for (uint32_t c = 0; c < channels; ++c) {
+			for (uint32_t i = 0; i < count; ++i) {
+				input[size_t(c) * needed + got + i] = frame[size_t(i) * channels + c];
+			}
+		}
+		voice.frame_cursor += count;
+		got += count;
 	}
 	if (voice.source_generation != generation || voice.incomplete_frame) {
 		// A callback replaced the source, possibly changing its channel layout, or a straddling
-		// frame ran into a block with samples.
+		// frame ran into a block with samples, which drops the history.
+		if (voice.source_generation == generation) {
+			voice.history_samples = 0;
+		}
 		voice.ClearSamples(grain);
-		output = 0;
+		return false;
 	}
-	voice.has_samples = output != 0;
+	const bool copy = pitch == 0x4000 && phase == 0;
+	for (uint32_t c = 0; c < channels; ++c) {
+		float* x = input + size_t(c) * needed;
+		// A shortfall plays as zeros.
+		std::fill(x + got, x + needed, 0.0f);
+		float* out = voice.samples.data() + size_t(c) * grain;
+		if (copy) {
+			std::copy_n(x + 1, grain, out);
+			continue;
+		}
+		uint32_t position = phase;
+		for (uint32_t n = 0; n < grain; ++n, position += pitch) {
+			const float* s = x + (position >> 14u);
+			const auto&  t = NGS2_RESAMPLER_TAPS[(position >> 5u) & 511u];
+			// Every product and sum rounds to float: the result depends on no FMA contraction.
+			out[n] = (s[0] * t[0] + s[1] * t[1]) + (s[2] * t[2] + s[3] * t[3]);
+		}
+	}
+	voice.resample_phase  = static_cast<uint16_t>((phase + pitch * grain) & 0x3fffu);
+	voice.history_samples = got > advance ? got - advance : 0;
+	for (uint32_t c = 0; c < channels; ++c) {
+		std::copy_n(input + size_t(c) * needed + advance, voice.history_samples,
+		            voice.history.data() + size_t(c) * 4);
+	}
+	voice.has_samples = got != 0;
+	return got < needed;
 }
 
 // Mono and stereo convert at -3 dB, mono feeds the surround front center, others map 1:1.
@@ -2549,7 +2831,7 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	if (voice.state == Ngs2VoicePlayState::Playing) {
 		if (voice.rack->type == Ngs2RackType::Sampler ||
 		    voice.rack->type == Ngs2RackType::CustomSampler) {
-			Ngs2ConsumeSamples(voice, grain);
+			const bool short_read = Ngs2ConsumeSamples(voice, grain);
 			// A playing stream can have no source data but still have a filter tail, at any
 			// location. The front filters run before the rear ones, each in index order.
 			if (voice.has_samples ||
@@ -2558,9 +2840,9 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.RunFilters(1, voice.samples.data(), grain);
 				voice.has_samples = true;
 			}
-			// The voice ends in the grain its data runs out; the filter tails end with it.
-			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
-			    voice.frame_cursor == voice.frame_samples && voice.next_frame_samples == 0 &&
+			// The voice ends in the grain its reader runs short of a closed, empty list; the filter
+			// tails end with it.
+			if (short_read && voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
 			    !voice.accepts_blocks) {
 				voice.state = Ngs2VoicePlayState::Empty;
 			}
@@ -3938,12 +4220,9 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						}
 						break;
 					}
-						case 5: {
-							const float ratio = *reinterpret_cast<const float*>(param + 1);
-						EXIT_NOT_IMPLEMENTED(!std::isfinite(ratio));
-						const float clamped_ratio = std::clamp(ratio, 0.0f, 4.0f);
-						voice->sample_step = static_cast<uint64_t>(std::llround(
-							    static_cast<double>(voice->sample_rate) * clamped_ratio * 4294967296.0));
+					case 5: {
+						voice->pitch_ratio =
+						    std::clamp(*reinterpret_cast<const float*>(param + 1), 0.0f, 4.0f);
 						break;
 					}
 					case 0xa: {

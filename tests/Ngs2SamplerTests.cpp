@@ -2,6 +2,7 @@
 #include "libs/ngs2.cpp"
 
 #include <bit>
+#include <complex>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
@@ -2609,46 +2610,23 @@ void TestStopThenPlayBeforeRender() {
 	      "restarted voice produced no audio");
 }
 
-void SetLowPass(Fixture& f, float frequency = 1000.0f, uint64_t mask = 0) {
+int SetFilter(Fixture& f, uint32_t index, uint32_t location, const Ngs2FilterParam& filter,
+              uint16_t size = 56) {
 	struct Param {
-		Ngs2VoiceParamHeader   header {56, 0, 0x1000000a};
-		Ngs2SamplerFilterParam filter {0, 1, 1, 0, 1000.0f, 0.70710678f, 1.0f, {}};
-	} param;
-	param.filter.frequency            = frequency;
-	param.filter.channel_mask         = mask;
+		Ngs2VoiceParamHeader   header;
+		Ngs2SamplerFilterParam filter;
+	} param {{size, 0, 0x1000000a}, {index, location, filter, 0}};
 	f.rack.option.sampler.max_filters = 8;
-	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &param.header) == OK,
-	      "filter ABI command failed");
+	return Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &param.header);
 }
 
-void TestLowPassResponse() {
-	// A second-order Butterworth LPF has unity DC gain and -3 dB at cutoff.
-	for (double frequency: {100.0, 1000.0, 10000.0}) {
-		Fixture f(48000);
-		SetLowPass(f);
-		std::vector<int16_t> pcm(48000);
-		for (size_t i = 0; i < pcm.size(); ++i) {
-			pcm[i] =
-			    static_cast<int16_t>(8192 * std::sin((2.0 * std::numbers::pi) * frequency * i / 48000));
-		}
-		f.Queue(pcm.data(), static_cast<uint32_t>(pcm.size()), 0);
-		f.Render(static_cast<uint32_t>(pcm.size()));
-		double input = 0, output = 0;
-		for (size_t i = 24000; i < pcm.size(); ++i) {
-			input += std::pow(pcm[i] / 32768.0, 2);
-			output += std::pow(f.voice.samples[i], 2);
-		}
-		const double ratio = std::sqrt(output / input);
-		if (frequency == 100) {
-			Check(std::abs(ratio - 1.0) < 0.002, "low-pass lost bass");
-		}
-		if (frequency == 1000) {
-			Check(std::abs(ratio - std::sqrt(0.5)) < 0.002, "cutoff gain incorrect");
-		}
-		if (frequency == 10000) {
-			Check(ratio < 0.01, "low-pass did not reject high frequencies");
-		}
-	}
+Ngs2FilterParam Direct(float i0, float i1, float i2, float o1, float o2, uint64_t mask = 0) {
+	return {mask, 11, {.direct = {i0, i1, i2, o1, o2}}};
+}
+
+void SetLowPass(Fixture& f, float frequency = 1000.0f, uint64_t mask = 0) {
+	Check(SetFilter(f, 0, 1, {mask, 1, {.fcq = {frequency, 0.70710678f, 1.0f, 0, 0}}}) == OK,
+	      "filter ABI command failed");
 }
 
 void TestFilterHistoryAndChannels() {
@@ -2688,39 +2666,24 @@ void TestFilterHistoryAndChannels() {
 	Check(stereo.voice.filters.empty(), "reused voice retained old filters");
 }
 
-void TestFilterUsesOutputRate() {
-	Fixture f(22050);
-	SetLowPass(f, 6833.0f);
-	const auto& filter = f.voice.filters[0];
-	// Rear filtering operates at the 48 kHz system rate, not the PCM source rate.
-	const double w        = (2.0 * std::numbers::pi) * 6833 / 48000;
-	const double expected = (1 - std::cos(w)) / (2 * (1 + std::sin(w) / (2 * double(0.70710678f))));
-	Check(std::abs(filter.b0 - expected) < 1e-10, "rear filter used source sample rate");
-	SetLowPass(f, 48000);
-	const int16_t pcm[] = {16384, 16384};
-	f.Queue(pcm, 2, 0);
-	f.Render(2);
-	Check(f.voice.samples[0] == 0.5f && f.voice.samples[1] == 0.5f,
-	      "above-Nyquist cutoff was unstable");
-}
-
 void TestFilterControlLayout() {
-	Fixture f(48000, 2);
+	// The filter is designed at the 48 kHz system rate, not the source rate.
+	Fixture f(22050, 2);
 	f.rack.option.sampler.max_filters = 8;
-	// A 56-byte control command with nonzero trailing padding.
-	alignas(8) uint32_t words[] = {56, 0x1000000a, 0, 1, 1, 0, 0,
-	                               0,  0x45d58800, 0x3fd55555, 0x3f800000, 0, 0, 0x13f};
-	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice),
-	                 reinterpret_cast<const Ngs2VoiceParamHeader*>(words));
-	Check(f.voice.filters.size() == 1 && f.voice.filters[0].enabled,
+	// A 56-byte control command with nonzero reserved words and trailing padding.
+	alignas(8) uint32_t words[] = {56,         0x1000000a, 0,          1, 0, 0, 1,
+	                               0x45d58800, 0x3fd55555, 0x3f800000, 7, 7, 7, 7};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice),
+	                       reinterpret_cast<const Ngs2VoiceParamHeader*>(words)) == OK &&
+	          f.voice.filters.size() == 1 && f.voice.filters[0].location == 1,
 	      "FCQ filter command was not recognized");
 	const double omega    = (2.0 * std::numbers::pi) * 6833.0 / 48000.0;
 	const double q        = static_cast<double>(std::bit_cast<float>(0x3fd55555u));
 	const double expected = (1 - std::cos(omega)) / (2 * (1 + std::sin(omega) / (2 * q)));
-	Check(std::abs(f.voice.filters[0].b0 - expected) < 1e-10,
+	Check(std::abs(f.voice.filters[0].i0 - expected) < 1e-6,
 	      "FCQ fields were read at the wrong offsets");
-	words[6] = 1; // Bypass channel 0 in the low half of the 64-bit mask.
-	words[7] = 1; // Bypass channel 32 in the high half.
+	words[4] = 2; // Bypass channel 1 in the low half of the 64-bit mask.
+	words[5] = 1; // Bypass channel 32 in the high half.
 	Fixture wide(48000, 33);
 	wide.rack.option.sampler.max_filters = 8;
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&wide.voice),
@@ -2728,23 +2691,152 @@ void TestFilterControlLayout() {
 	const std::vector<int16_t> pcm(33, 16384);
 	wide.Queue(pcm.data(), 1, 1);
 	wide.Render(1);
-	Check(wide.voice.samples[0] == 0.5f && wide.voice.samples[32] == 0.5f &&
-	          std::abs(wide.voice.samples[1] - expected * 0.5) < 1e-7,
+	Check(wide.voice.samples[1] == 0.5f && wide.voice.samples[32] == 0.5f &&
+	          std::abs(wide.voice.samples[0] - expected * 0.5) < 1e-6,
 	      "channel mask was not decoded as a 64-bit bypass mask");
-	words[4] = 0; // OFF ignores unused FCQ values and clears the old delay line.
-	words[8] = 0x7fc00000;
-	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&wide.voice),
-	                 reinterpret_cast<const Ngs2VoiceParamHeader*>(words));
-	Check(!wide.voice.filters[0].enabled && wide.voice.filters[0].history.empty() &&
-	          !wide.voice.filters[0].warned,
-	      "filter OFF was treated as an unsupported FCQ configuration");
-	wide.Queue(pcm.data(), 1, 1);
-	wide.Render(1);
-	Check(wide.voice.samples[1] == 0.5f, "filter OFF did not bypass audio");
-	SetLowPass(wide, 0);
-	wide.Queue(pcm.data(), 1, 1);
-	wide.Render(1);
-	Check(wide.voice.samples[1] == 0.0f, "zero-Hz low-pass leaked source audio");
+}
+
+// The magnitude of the response of `filter` at `hz` of a 48 kHz rate.
+double FilterResponse(const Ngs2SamplerFilter& filter, double hz) {
+	const auto z = std::polar(1.0, -2 * std::numbers::pi * hz / 48000);
+	return std::abs((double(filter.i0) + double(filter.i1) * z + double(filter.i2) * z * z) /
+	                (1.0 - double(filter.o1) * z - double(filter.o2) * z * z));
+}
+
+void TestFilterDesigns() {
+	Fixture     f(48000);
+	const auto& filters = f.voice.filters;
+	auto        design  = [&](uint32_t type, float fc, float q, float level) {
+		Check(SetFilter(f, 0, 0, {0, type, {.fcq = {fc, q, level, 0, 0}}}) == OK,
+		      "filter design control failed");
+		return std::array {filters[0].i0, filters[0].i1, filters[0].i2, filters[0].o1,
+		                   filters[0].o2};
+	};
+	struct Case {
+		uint32_t type;
+		double   hz, expected;
+	};
+	// At a 1 kHz cutoff with Q 2 and level 4.
+	constexpr double half_power = std::numbers::sqrt2 / 2;
+	const Case       cases[]    = {{1, 1000, 2},  {2, 1000, 2}, {3, 1000, 2},          {4, 1000, 1},
+	                               {5, 1000, 0},  {6, 0, 4},    {6, 500, 5.826},       {7, 1000, 2},
+	                               {7, 24000, 4}, {8, 1000, 4}, {10, 1000, half_power}};
+	for (const auto& c: cases) {
+		design(c.type, 1000, 2, 4);
+		Check(std::abs(FilterResponse(filters[0], c.hz) - c.expected) <
+		          1e-3 * std::max(1.0, c.expected),
+		      "a filter type had the wrong response");
+	}
+	// The cutoff, Q and level are clamped.
+	Check(design(1, 0, 2, 1) == design(1, 1, 2, 1) &&
+	          design(1, 1000, 0, 1) == design(1, 1000, 1e-5f, 1) &&
+	          design(1, 1000, 100, 1) == design(1, 1000, 32, 1) &&
+	          design(6, 1000, 2, -1) == design(6, 1000, 2, 0),
+	      "a filter design was not clamped");
+	design(1, 30000, 2, 1);
+	Check(std::abs(FilterResponse(filters[0], 0.499 * 48000) - 2) < 1e-3,
+	      "a cutoff above half the rate was not clamped");
+	// The one-pole low-pass sums its denominator terms in this order.
+	const float w = 500.0f / 48000 * 2 * std::numbers::pi_v<float>;
+	const float s = std::sin(w), c = std::cos(w), inverse = 1 / ((s + c) + 1);
+	Check(design(9, 500, 2, 4) ==
+	          std::array {s * inverse, s * inverse, 0.0f, -((s - c) - 1) * inverse, 0.0f},
+	      "the one-pole low-pass rounded differently");
+	// A rejected control changes no filter; a longer one is accepted.
+	for (uint32_t index: {0u, 1u}) {
+		Check(SetFilter(f, index, 0, {0, 1, {}}, 0x37) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+		          SetFilter(f, index, 0, {0, 12, {}}) == NGS2_ERROR_INVALID_FILTER_TYPE &&
+		          SetFilter(f, index, 2, {0, 1, {}}) == NGS2_ERROR_INVALID_MODULE_LOCATION &&
+		          filters.size() == 1 && filters[0].type == 9 && filters[0].location == 0,
+		      "an invalid filter size, type or location was applied");
+	}
+	Check(SetFilter(f, 8, 0, {0, 1, {}}) == NGS2_ERROR_INVALID_VOICE_PARAM_ID &&
+	          SetFilter(f, 1, 1, {0, 1, {}}, 0x40) == OK && filters.size() == 2,
+	      "a filter index past the maximum was applied or a longer control was rejected");
+}
+
+void TestFilterRecurrence() {
+	Fixture       f(48000, 2);
+	const int16_t pcm[] = {8192, 16384, 16384, -8192, 0, 0, 0, 0, 0, 0};
+	// The input history of OFF is no tail.
+	Check(SetFilter(f, 1, 0, {0, 0, {}}) == OK, "filter OFF control failed");
+	f.Queue(pcm, 1, 0);
+	f.Render(1);
+	Check(f.voice.state == Ngs2VoicePlayState::Empty, "filter OFF kept a finished voice playing");
+	f.voice.SetupSampler({0x12, 2, 48000});
+	f.voice.state = Ngs2VoicePlayState::Playing;
+	f.Queue(pcm, 5, 0);
+	// OFF passes both channels through, its history following them.
+	Check(SetFilter(f, 0, 0, {0, 0, {}}) == OK, "filter OFF control failed");
+	f.Render(2);
+	Check(f.voice.samples == std::vector<float> {0.25f, 0.5f, 0.5f, -0.25f},
+	      "filter OFF changed the audio");
+	// y = x1 + 2 * x2 + 4 * y1 + 8 * y2 with channel 1 masked, then unmasked.
+	Check(SetFilter(f, 0, 0, Direct(0, 1, 2, 4, 8, 2)) == OK, "masked DIRECT control failed");
+	f.Render(1);
+	Check(f.voice.samples == std::vector<float> {5.0f, 0.0f},
+	      "a filter did not go on from the input history of OFF");
+	Check(SetFilter(f, 0, 0, Direct(0, 1, 2, 4, 8)) == OK, "DIRECT control failed");
+	f.Render(1);
+	Check(f.voice.samples == std::vector<float> {25.0f, -2.5f},
+	      "a filter did not run y = i0 * x + i1 * x1 + i2 * x2 + o1 * y1 + o2 * y2 or unmasked "
+	      "a channel without its input history");
+	f.voice.SetEvent(1);
+	f.Render(1);
+	Check(f.voice.samples == std::vector<float> {0.0f, 0.0f},
+	      "PLAY did not zero the filter history");
+}
+
+void TestFilterLocations() {
+	Fixture f(48000);
+	// The front filter runs first even at a higher index.
+	const int16_t pcm[] = {16384, 0};
+	f.Queue(pcm, 2, 0);
+	Check(SetFilter(f, 0, 1, {0, 0, {}}) == OK &&
+	          SetFilter(f, 1, 0, Direct(0.5f, 0, 0, 0, 0)) == OK,
+	      "front and rear filter controls failed");
+	f.Render(1);
+	Check(SetFilter(f, 0, 1, Direct(0, 1, 0, 0, 0)) == OK &&
+	          SetFilter(f, 1, 0, Direct(1, 0, 0, 0, 0)) == OK,
+	      "front and rear filter changes failed");
+	f.Render(1);
+	Check(f.voice.samples[0] == 0.25f, "the rear filter did not run after the front one");
+	// Location 2 + N filters the send of port N alone.
+	Fixture          source(48000);
+	Ngs2RackInternal rack {};
+	rack.ngs  = &source.system;
+	rack.type = Ngs2RackType::Mastering;
+	Ngs2VoiceInternal sends[2];
+	for (auto& send: sends) {
+		send.rack     = &rack;
+		send.channels = 1;
+		send.state    = Ngs2VoicePlayState::Playing;
+	}
+	source.voice.ports = {{&sends[0], 0, 1.0f, -1}, {&sends[1], 0, 1.0f, -1}};
+	Check(SetFilter(source, 0, 3, Direct(0.5f, 0, 0, 0, 0)) == OK &&
+	          SetFilter(source, 1, 4, {0, 0, {}}) == NGS2_ERROR_INVALID_MODULE_LOCATION,
+	      "the pre-send locations were not those of the ports");
+	source.Queue(pcm, 1, 0);
+	const std::vector<Ngs2VoiceInternal*> voices {&source.voice, &sends[0], &sends[1]};
+	Ngs2RenderVoice(sends[0], voices, 1);
+	Ngs2RenderVoice(sends[1], voices, 1);
+	Check(source.voice.samples[0] == 0.5f && sends[0].samples[0] == 0.5f &&
+	          sends[1].samples[0] == 0.25f,
+	      "a pre-send filter did not filter only its port's send");
+	// y = x + 0.5 * y1 before a send muted after one grain: it runs on, and the voice still ends.
+	Fixture muted(48000);
+	muted.voice.ports = {{&sends[0], 0, 1.0f, -1}};
+	Check(SetFilter(muted, 0, 2, Direct(1, 0, 0, 0.5f, 0)) == OK, "pre-send filter control failed");
+	const std::vector<int16_t> steps(8, 16384);
+	muted.Queue(steps.data(), 8, 0);
+	for (float volume: {1.0f, 0.0f}) {
+		muted.voice.ports[0].volume = volume;
+		muted.voice.rendered = sends[0].rendered = false;
+		Ngs2RenderVoice(sends[0], {&muted.voice, &sends[0]}, 4);
+	}
+	Check(muted.voice.filters[0].history[0][2] == 0.99609375f &&
+	          muted.voice.state == Ngs2VoicePlayState::Empty,
+	      "a muted send froze its pre-send filter or its tail kept the voice playing");
 }
 
 struct LoopCallbacks {
@@ -3195,7 +3287,7 @@ void TestFilterTailDuringStarvation() {
 	}
 	stream.Render(8192);
 	stream.Render(32);
-	Check(!stream.voice.has_samples && !stream.voice.filters[0].HasHistory(),
+	Check(!stream.voice.has_samples && !stream.voice.filters[0].HasTail(),
 	      "fully decayed filter kept a silent stream active");
 }
 
@@ -3303,10 +3395,11 @@ int main() {
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();
-	TestLowPassResponse();
 	TestFilterHistoryAndChannels();
-	TestFilterUsesOutputRate();
 	TestFilterControlLayout();
+	TestFilterDesigns();
+	TestFilterRecurrence();
+	TestFilterLocations();
 	TestUpstreamCustomSamplerControls();
 	TestCallbackStopsConsumption();
 	TestCallbackPauseDuringLargeStep();

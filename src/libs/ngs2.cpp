@@ -20,6 +20,7 @@
 #include <numbers>
 #include <numeric>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "libatrac9.h"
@@ -44,6 +45,8 @@ constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8053u);
 constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8054u);
+constexpr int32_t NGS2_ERROR_INVALID_FILTER_TYPE =
+    static_cast<int32_t>(0x804a8060u);
 constexpr int32_t NGS2_ERROR_INVALID_PEAK_METER_NUM_BLOCKS =
     static_cast<int32_t>(0x804a8092u);
 constexpr int32_t NGS2_ERROR_INVALID_PEAK_METER_DETECT_TYPE =
@@ -52,6 +55,10 @@ constexpr int32_t NGS2_ERROR_INVALID_MATRIX_TYPE =
     static_cast<int32_t>(0x804a809au);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_INDEX =
     static_cast<int32_t>(0x804a8305u);
+constexpr int32_t NGS2_ERROR_INVALID_MODULE_LOCATION =
+    static_cast<int32_t>(0x804a8308u);
+constexpr int32_t NGS2_ERROR_INVALID_VOICE_PARAM_ID =
+    static_cast<int32_t>(0x804a835au);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE =
     static_cast<int32_t>(0x804a8361u);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_ID =
@@ -474,110 +481,162 @@ struct Ngs2RackInternal {
 
 enum class Ngs2VoicePlayState : uint32_t { Empty = 0, Playing = 3, Paused = 5, Stopped = 0xb };
 
-struct Ngs2SamplerFilterParam {
-	uint32_t index;
-	uint32_t location;
-	uint32_t type;
+// A filter: channel_mask bits mark the channels that pass unfiltered; DIRECT (type 11) takes its
+// coefficients verbatim, the other types design them from fc, q and level.
+struct Ngs2FilterParam {
 	uint64_t channel_mask;
-	float    frequency;
-	float    q;
-	float    level;
-	uint32_t reserved[3];
+	uint32_t type;
+	union {
+		struct {
+			float i0, i1, i2, o1, o2;
+		} direct;
+		struct {
+			float    fc, q, level;
+			uint32_t reserved, reserved2;
+		} fcq;
+	} param;
+};
+static_assert(sizeof(Ngs2FilterParam) == 32);
+
+struct Ngs2SamplerFilterParam {
+	uint32_t        index;
+	uint32_t        location;
+	Ngs2FilterParam filter;
+	uint32_t        reserved3;
 };
 static_assert(sizeof(Ngs2SamplerFilterParam) == 48);
-static_assert(offsetof(Ngs2SamplerFilterParam, type) == 8 &&
-              offsetof(Ngs2SamplerFilterParam, channel_mask) == 16 &&
-              offsetof(Ngs2SamplerFilterParam, frequency) == 24);
 
+// A biquad in direct form I: y = i0 * x + i1 * x1 + i2 * x2 + o1 * y1 + o2 * y2, in float.
 struct Ngs2SamplerFilter {
-	struct History {
-		double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
-	};
-	bool                 enabled      = false;
-	bool                 warned       = false;
-	uint64_t             channel_mask = 0;
-	double               b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
-	std::vector<History> history;
+	uint32_t location     = 0;
+	uint32_t type         = 0;
+	uint64_t channel_mask = 0;
+	float    i0 = 1, i1 = 0, i2 = 0, o1 = 0, o2 = 0;
+	// Per channel {x1, x2, y1, y2}; empty until the filter is set.
+	std::vector<std::array<float, 4>> history;
 
-	void Configure(const Ngs2SamplerFilterParam& param, uint32_t rate, uint32_t channels) {
-		if (param.type == 0) {
-			enabled = false;
-			history.clear();
-			return;
-		}
-		if (param.location != 1 || param.type != 1 || !std::isfinite(param.frequency) ||
-		    param.frequency < 0 || !std::isfinite(param.q) || param.q <= 0 ||
-		    !std::isfinite(param.level) || param.level < 0 || rate == 0) {
-			enabled = false;
-			history.clear();
-			if (!warned) {
-				Log::WriteToConsoleAndLog(fmt::sprintf(
-				    "warning: unsupported NGS2 sampler filter (location=%u, type=%u)\n",
-				    param.location, param.type));
-				warned = true;
-			}
-			return;
-		}
+	// Designs the filter at `rate`. The cutoff is clamped to 0.0001..0.499 of the rate and Q to
+	// 0.0001..32; only the shelves and peaking read the level, a linear gain.
+	void Design(const Ngs2FilterParam& param, uint32_t rate) {
+		type         = param.type;
 		channel_mask = param.channel_mask;
-		history.resize(channels);
-		enabled = true;
-		if (param.frequency == 0 || param.frequency >= rate * 0.5) {
-			b0 = param.frequency == 0 ? 0 : param.level;
-			b1 = b2 = a1 = a2 = 0;
+		if (type == 11) {
+			const auto& direct = param.param.direct;
+			std::tie(i0, i1, i2, o1, o2) =
+			    std::tie(direct.i0, direct.i1, direct.i2, direct.o1, direct.o2);
 			return;
 		}
-		// RBJ low-pass biquad, normalized by a0 (Audio EQ Cookbook).
-		const double omega      = (2.0 * std::numbers::pi) * param.frequency / rate;
-		const double cosine     = std::cos(omega);
-		const double alpha      = std::sin(omega) / (2.0 * param.q);
-		const double inverse_a0 = 1.0 / (1.0 + alpha);
-		b0                      = (1.0 - cosine) * 0.5 * inverse_a0 * param.level;
-		b1                      = 2.0 * b0;
-		b2                      = b0;
-		a1                      = -2.0 * cosine * inverse_a0;
-		a2                      = (1.0 - alpha) * inverse_a0;
+		const auto& fcq   = param.param.fcq;
+		const float w     = std::clamp(fcq.fc / static_cast<float>(rate), 1e-4f, 0.499f) * 2 *
+		                    std::numbers::pi_v<float>;
+		const float q     = std::clamp(fcq.q, 1e-4f, 32.0f);
+		const float s     = std::sin(w);
+		const float c     = std::cos(w);
+		const float alpha = s / (2 * q);
+		const float gain  = std::sqrt(std::max(1e-4f, fcq.level));
+		float       b0 = 0, b1 = 0, b2 = 0, a0 = 1 + alpha, a1 = -2 * c, a2 = 1 - alpha;
+		switch (type) {
+			case 1: // Low-pass.
+				b0 = b2 = (1 - c) * 0.5f;
+				b1      = 1 - c;
+				break;
+			case 2: // High-pass.
+				b0 = b2 = (1 + c) * 0.5f;
+				b1      = -(1 + c);
+				break;
+			case 3: // Band-pass with a peak gain of Q.
+				b0 = s * 0.5f;
+				b2 = -b0;
+				break;
+			case 4: // Band-pass with a unity peak.
+				b0 = alpha;
+				b2 = -alpha;
+				break;
+			case 5: // Notch.
+				b0 = b2 = 1;
+				b1      = a1;
+				break;
+			case 6:
+			case 7: {
+				// The high shelf is the low shelf mirrored around half the rate.
+				const float sign = type == 6 ? 1.0f : -1.0f;
+				const float e    = sign * c;
+				const float k    = std::sqrt(gain) / q * s;
+				b0               = gain * ((gain + 1) - (gain - 1) * e + k);
+				b1               = sign * 2 * gain * ((gain - 1) - (gain + 1) * e);
+				b2               = gain * ((gain + 1) - (gain - 1) * e - k);
+				a0               = (gain + 1) + (gain - 1) * e + k;
+				a1               = -sign * 2 * ((gain - 1) + (gain + 1) * e);
+				a2               = (gain + 1) + (gain - 1) * e - k;
+				break;
+			}
+			case 8: // Peaking.
+				b0 = 1 + alpha * gain;
+				b1 = a1;
+				b2 = 1 - alpha * gain;
+				a0 = 1 + alpha / gain;
+				a2 = 1 - alpha / gain;
+				break;
+			case 9: // One-pole low-pass.
+				b0 = b1 = s;
+				a0      = (s + c) + 1;
+				a1      = (s - c) - 1;
+				a2      = 0;
+				break;
+			default: // One-pole high-pass (10); OFF (0) bypasses every channel.
+				b0 = 1 + c;
+				b1 = -b0;
+				a0 = s + (1 + c);
+				a1 = s - (1 + c);
+				a2 = 0;
+		}
+		const float inverse = 1 / a0;
+		i0                  = b0 * inverse;
+		i1                  = b1 * inverse;
+		i2                  = b2 * inverse;
+		o1                  = -a1 * inverse;
+		o2                  = -a2 * inverse;
 	}
 
 	bool Bypasses(size_t channel) const {
-		return channel < 64 && (channel_mask & (uint64_t {1} << channel)) != 0;
+		return type == 0 || (channel < 64 && (channel_mask & (uint64_t {1} << channel)) != 0);
 	}
 
-	bool HasHistory() const {
-		if (!enabled) {
+	// Whether a front or rear filter still rings; a pre-send tail does not keep its voice playing.
+	bool HasTail() const {
+		if (location > 1) {
 			return false;
 		}
 		for (size_t c = 0; c < history.size(); ++c) {
-			if (Bypasses(c)) {
-				continue;
-			}
-			const auto& h = history[c];
-			if (h.x1 != 0 || h.x2 != 0 || h.y1 != 0 || h.y2 != 0) {
+			if (!Bypasses(c) && history[c] != std::array<float, 4> {}) {
 				return true;
 			}
 		}
 		return false;
 	}
 
-	void Process(std::vector<float>& samples, uint32_t channels, uint32_t grain) {
-		if (!enabled) {
-			return;
-		}
-		for (uint32_t c = 0; c < channels; ++c) {
+	// Filters channel-major samples in place. A bypassed channel, every one for OFF, passes
+	// through, its history following the input.
+	void Process(float* samples, uint32_t grain) {
+		for (size_t c = 0; c < history.size(); ++c) {
+			auto* x                = samples + c * grain;
+			auto& [x1, x2, y1, y2] = history[c];
 			if (Bypasses(c)) {
+				x2 = y2 = grain > 1 ? x[grain - 2] : x1;
+				x1 = y1 = x[grain - 1];
 				continue;
 			}
-			auto& h = history[c];
 			for (uint32_t i = 0; i < grain; ++i) {
-				const double x = samples[c * grain + i];
-				double       y = b0 * x + b1 * h.x1 + b2 * h.x2 - a1 * h.y1 - a2 * h.y2;
-				if (std::abs(y) < 1e-20) {
+				float y = i0 * x[i] + i1 * x1 + i2 * x2 + o1 * y1 + o2 * y2;
+				// A decayed tail ends at zero.
+				if (std::abs(y) < 1e-20f) {
 					y = 0;
 				}
-				h.x2                   = h.x1;
-				h.x1                   = x;
-				h.y2                   = h.y1;
-				h.y1                   = y;
-				samples[c * grain + i] = static_cast<float>(y);
+				x2   = x1;
+				x1   = x[i];
+				y2   = y1;
+				y1   = y;
+				x[i] = y;
 			}
 		}
 	}
@@ -1049,6 +1108,15 @@ struct Ngs2VoiceInternal {
 		std::copy(mix_samples.begin(), mix_samples.end(), input);
 	}
 
+	// Runs the filters at `location`, in index order, on channel-major samples.
+	void RunFilters(uint32_t location, float* data, uint32_t grain) {
+		for (auto& filter: filters) {
+			if (filter.location == location) {
+				filter.Process(data, grain);
+			}
+		}
+	}
+
 	void ResetSetupState() {
 		SetEvent(4);
 		std::ranges::fill(ports, Port {});
@@ -1192,7 +1260,10 @@ struct Ngs2VoiceInternal {
 					// Reserve the voice immediately; publish playback flags after rendering.
 					state_flags |= 1;
 				}
-				// Every PLAY restarts the mastering modules without a ramp or filter history.
+				// Every PLAY restarts the filters and mastering modules without a ramp or history.
+				for (auto& filter: filters) {
+					std::ranges::fill(filter.history, std::array<float, 4> {});
+				}
 				if (mastering != nullptr) {
 					mastering->previous_inputs = 0;
 					mastering->lfe[0].history  = {};
@@ -2359,36 +2430,47 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 		if (voice.rack->type == Ngs2RackType::Sampler ||
 		    voice.rack->type == Ngs2RackType::CustomSampler) {
 			Ngs2ConsumeSamples(voice, grain);
-			// A playing stream can have no source data but still have a filter tail.
-			for (auto& filter: voice.filters) {
-				if (voice.has_samples || filter.HasHistory()) {
-					filter.Process(voice.samples, voice.channels, grain);
-					voice.has_samples = true;
-				}
+			// A playing stream can have no source data but still have a filter tail. The front
+			// filters run before the rear ones, each in index order.
+			if (voice.has_samples ||
+			    std::ranges::any_of(voice.filters, &Ngs2SamplerFilter::HasTail)) {
+				voice.RunFilters(0, voice.samples.data(), grain);
+				voice.RunFilters(1, voice.samples.data(), grain);
+				voice.has_samples = true;
 			}
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
-			    voice.frame_cursor == voice.frame_samples &&
-			    voice.next_frame_samples == 0 &&
+			    voice.frame_cursor == voice.frame_samples && voice.next_frame_samples == 0 &&
 			    !voice.accepts_blocks &&
-			    std::ranges::none_of(voice.filters,
-			                         [](const auto& filter) { return filter.HasHistory(); })) {
+			    std::ranges::none_of(voice.filters, &Ngs2SamplerFilter::HasTail)) {
 				voice.state = Ngs2VoicePlayState::Empty;
 			}
 		}
 		for (auto* source: voices) {
 			for (size_t p = 0; p < source->ports.size(); ++p) {
 				const auto& port = source->ports[p];
-				if (port.dest != &voice || port.volume == 0.0f) {
+				if (port.dest != &voice) {
 					continue;
 				}
 				Ngs2RenderVoice(*source, voices, grain);
 				if (!source->has_samples) {
 					continue;
 				}
+				const auto* input = source->Buffer(source->rack->PortBufferId(p), grain);
+				// The pre-send filters of port N (location 2 + N) run on a copy of its send, also
+				// when the port is muted.
+				const auto location = static_cast<uint32_t>(p + 2);
+				if (std::ranges::find(source->filters, location, &Ngs2SamplerFilter::location) !=
+				    source->filters.end()) {
+					source->mix_samples.assign(input, input + size_t(source->channels) * grain);
+					source->RunFilters(location, source->mix_samples.data(), grain);
+					input = source->mix_samples.data();
+				}
+				if (port.volume == 0.0f) {
+					continue;
+				}
 				// Input N of a custom rack voice feeds its buffer N.
 				EXIT_NOT_IMPLEMENTED(port.input >= voice.rack->NumBuffers());
-				const auto* input  = source->Buffer(source->rack->PortBufferId(p), grain);
-				auto*       output = voice.Buffer(port.input, grain);
+				auto* output = voice.Buffer(port.input, grain);
 				// A port without a matrix, or whose matrix has no levels, uses the default mix.
 				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
 				if (matrix != nullptr && matrix->empty()) {
@@ -3668,17 +3750,29 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					}
 					case 0xa: {
 						EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler);
-						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceParamHeader) +
-						                                        sizeof(Ngs2SamplerFilterParam));
+						if (param->size <
+						    sizeof(Ngs2VoiceParamHeader) + sizeof(Ngs2SamplerFilterParam)) {
+							return NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE;
+						}
 						const auto& filter =
 						    *reinterpret_cast<const Ngs2SamplerFilterParam*>(param + 1);
-						EXIT_NOT_IMPLEMENTED(filter.index >=
-						                     voice->rack->option.sampler.max_filters);
+						if (filter.index >= voice->rack->option.sampler.max_filters) {
+							return NGS2_ERROR_INVALID_VOICE_PARAM_ID;
+						}
+						if (filter.filter.type > 11) {
+							return NGS2_ERROR_INVALID_FILTER_TYPE;
+						}
+						if (filter.location >= voice->ports.size() + 2) {
+							return NGS2_ERROR_INVALID_MODULE_LOCATION;
+						}
 						if (voice->filters.size() <= filter.index) {
 							voice->filters.resize(filter.index + 1);
 						}
-						voice->filters[filter.index].Configure(
-						    filter, voice->rack->ngs->option.sample_rate, voice->channels);
+						// A change keeps the history.
+						auto& target    = voice->filters[filter.index];
+						target.location = filter.location;
+						target.history.resize(voice->channels);
+						target.Design(filter.filter, voice->rack->ngs->option.sample_rate);
 						break;
 					}
 					default: EXIT("unsupported sampler control: 0x%08" PRIx32 "\n", param->id);

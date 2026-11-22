@@ -43,6 +43,14 @@ jobs:
         with:
           submodules: recursive
 
+      # The windows-2025 image now ships Visual Studio 18, whose STL requires Clang 22 or newer,
+      # but the image's LLVM is older (error STL1000). Upgrade LLVM in place before configuring.
+      - name: Upgrade LLVM
+        shell: pwsh
+        run: |
+          choco upgrade llvm -y --no-progress
+          & "C:\Program Files\LLVM\bin\clang-cl.exe" --version
+
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 

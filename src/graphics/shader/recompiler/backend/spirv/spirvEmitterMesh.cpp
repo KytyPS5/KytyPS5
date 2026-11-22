@@ -182,13 +182,16 @@ void EmitMeshComputeEntryPoint(EmitterState& state) {
 		                     Unary(state, spv::OpUConvert, TypeU64(state), dword),
 		                     ConstantU64(state, 4)));
 	};
+	// One 16-byte store instead of four dword stores: every slot, vertex and record is 16-byte
+	// aligned (the buffer address is 256-byte aligned and the layout counts in vec4 units).
+	const auto vec4_pointer_type =
+	    TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32Vector(state, 4));
 	const auto store_vec4 = [&](uint32_t v4, uint32_t value) {
-		const auto bits = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
-		for (uint32_t component = 0; component < 4; component++) {
-			const auto word = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, bits, component);
-			MeshStoreDword(state, address(v4, component), word);
-		}
+		const auto bits    = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, vec4_pointer_type, pointer,
+		                          address(v4, 0));
+		state.builder.AddFunction(spv::OpStore, pointer, bits, spv::MemoryAccessAlignedMask, 16u);
 	};
 	const auto first = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first, EmitLocalInvocationIndex(state),
@@ -249,10 +252,14 @@ void EmitMeshComputeEntryPoint(EmitterState& state) {
 			}
 			const auto record = EmitAddU32(
 			    state, EmitAddU32(state, slot_v4, ConstantU32(state, layout.prim_offset)), index);
-			for (uint32_t component = 0; component < 3; component++) {
-				MeshStoreDword(state, address(record, component), vertex[component]);
-			}
-			MeshStoreDword(state, address(record, 3), flags);
+			const auto packed_record = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4),
+			                          packed_record, vertex[0], vertex[1], vertex[2], flags);
+			const auto record_pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, vec4_pointer_type, record_pointer,
+			                          address(record, 0));
+			state.builder.AddFunction(spv::OpStore, record_pointer, packed_record,
+			                          spv::MemoryAccessAlignedMask, 16u);
 		});
 	}
 	state.lane_half = 0;

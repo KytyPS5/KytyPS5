@@ -224,6 +224,9 @@ private:
 	// Output of mesh programs that run as compute shaders (IR::MeshFallbackLayout); created on the
 	// first such draw, and reused by each next one after a barrier.
 	std::unique_ptr<Buffer>               m_mesh_fallback_buffer;
+	// Next free byte of the buffer above. Each fallback draw takes its own region, so a draw's
+	// compute pass never waits for an earlier draw's vertex pass; only a wrap-around does.
+	uint64_t                              m_mesh_fallback_offset = 0;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

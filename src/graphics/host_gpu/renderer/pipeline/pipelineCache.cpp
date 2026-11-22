@@ -33,9 +33,11 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -737,11 +739,25 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		              mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		              mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize;
 		if (unsupported) {
-			static std::atomic_bool warned = false;
-			if (!warned.exchange(true, std::memory_order_relaxed)) {
+			// Report each distinct shader once, with the numbers that tripped the limits, so a
+			// log shows which geometry is missing and why.
+			static std::mutex                      warned_mutex;
+			static std::unordered_set<uint64_t>    warned_shaders;
+			bool                                   first_time = false;
+			{
+				std::lock_guard lock(warned_mutex);
+				first_time = warned_shaders.insert(vertex_params[0].hash).second;
+			}
+			if (first_time) {
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
-				    vertex_params[0].hash));
+				    "Warning: dropping draws of mesh shader 0x{:016x}: host threads {} (max {}), "
+				    "shared memory {} bytes (max {}), max_vertices {}, max_primitives {}, "
+				    "lds {} dwords, compute fallback {}.\n",
+				    vertex_params[0].hash, host_threads,
+				    compute_limits.maxComputeWorkGroupInvocations,
+				    (mesh.lds_size_dwords + 2u + mesh.max_vertices) * sizeof(uint32_t),
+				    compute_limits.maxComputeSharedMemorySize, mesh.max_vertices,
+				    mesh.max_primitives, mesh.lds_size_dwords, compute_fallback));
 			}
 			return;
 		}

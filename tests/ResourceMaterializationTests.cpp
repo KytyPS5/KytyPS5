@@ -157,8 +157,8 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   program.descriptor_sources[image1].dwords[0] = Value(1u);
   program.descriptor_sources[image1].dwords[1] = Value(static_cast<uint32_t>(
       Libs::Graphics::Prospero::BufferFormat::k11_11_10UInt) << 20u);
-  program.descriptor_sources[image1].dwords[3] = Value(static_cast<uint32_t>(
-      Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  program.descriptor_sources[image1].dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+      uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   for (uint32_t index = 0; index < 2; ++index) {
     auto &value = block.AppendNewInst(
         ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
@@ -1235,6 +1235,81 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// A storage table with filtered accesses materializes when its candidates share one swizzle,
+// whatever their formats.
+void TestIndirectStorageSwizzles() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  const auto x001 = Libs::Graphics::DstSel(4, 0, 0, 1);
+  for (const auto format : {F::k8UNorm, F::k8_8UNorm}) {
+    DescriptorSource source;
+    source.dword_count = 8u;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(0x100u);
+    source.dwords[1] = Value(uint32_t(format) << 20u);
+    source.dwords[3] =
+        Value(x001 | (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource root;
+  root.dword_count = 8u;
+  root.dwords.fill(Value(0u));
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(root);
+  program.info.images.push_back({.source = 2u, .resource_class = ImageResourceClass::Storage,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+      .written = true, .unfiltered_access_only = false});
+  auto plan = Extract(program);
+  const SrtRuntime runtime{};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "indirect storage candidates sharing one swizzle were incompatible");
+}
+
+// A storage swizzle that fills only the channels an unconverted format lacks becomes the identity.
+void TestStorageFillSwizzle() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::DstSel;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 2u;
+  auto &block = AddValueBlock(program);
+  DescriptorSource source;
+  source.dword_count = 8u;
+  source.dwords.fill(Value(0u));
+  source.dwords[0] = Value(0x100u);
+  source.dwords[1] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+  source.dwords[3] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(1))}));
+  program.descriptor_sources.push_back(source);
+  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Storage,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D, .written = true});
+  auto plan = Extract(program);
+  std::array<uint32_t, 2> data{};
+  const SrtRuntime runtime{.user_data = data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto x001 = DstSel(4, 0, 0, 1), xyz1 = DstSel(4, 5, 6, 1);
+  struct Case { F format; uint32_t swizzle; uint32_t expected; };
+  for (const auto test : {Case{F::k8UNorm, x001, ShaderImageIdentitySwizzle},
+                          Case{F::k8_8UNorm, DstSel(4, 5, 0, 1), ShaderImageIdentitySwizzle},
+                          Case{F::k8_8UNorm, x001, x001},
+                          Case{F::k11_11_10Float, xyz1, ShaderImageIdentitySwizzle},
+                          Case{F::k8_8_8_8UNorm, xyz1, xyz1},
+                          Case{F::k16SInt, x001, x001}}) {
+    data[0] = uint32_t(test.format) << 20u;
+    data[1] = test.swizzle | (uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization.images[0].shader_swizzle == test.expected,
+          "a storage swizzle was dropped where it stores a channel, or kept where it only fills");
+  }
+}
+
 void TestSignedStorageSpecialization() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using F = Libs::Graphics::Prospero::BufferFormat;
@@ -1499,6 +1574,8 @@ int main() {
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestIndirectStorageSwizzles();
+  TestStorageFillSwizzle();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);

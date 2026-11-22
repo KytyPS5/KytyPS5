@@ -14,6 +14,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <memory>
@@ -52,10 +54,6 @@ namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
 
-namespace Libs::LibKernel {
-void KernelDispatchPendingSignalForCurrentThread();
-}
-
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
 void InitSysmodule_1(Loader::SymbolDatabase *symbols);
@@ -73,6 +71,10 @@ void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 
 namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNpSessionSignaling {
+void InitNet_1_NpSessionSignaling(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::LibNpCommerce {
@@ -107,6 +109,38 @@ void WaitForMutexTest(Predicate ready) {
   }
 }
 
+struct SignalExports {
+  int(KYTY_SYSV_ABI *install)(int, void *);
+  int(KYTY_SYSV_ABI *remove)(int);
+  int(KYTY_SYSV_ABI *raise)(Libs::LibKernel::Pthread, int);
+};
+
+SignalExports ResolveSignalExports() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "signal exports resolve");
+    return symbol->vaddr;
+  };
+  return {reinterpret_cast<decltype(SignalExports::install)>(find("WkwEd3N7w0Y")),
+          reinterpret_cast<decltype(SignalExports::remove)>(find("Qhv5ARAoOEc")),
+          reinterpret_cast<decltype(SignalExports::raise)>(find("il03nluKfMk"))};
+}
+
+// Waits until a guest thread's host thread sleeps in a blocking call.
+void WaitUntilSleeping(Libs::LibKernel::Pthread thread) {
+  const auto path = "/proc/self/task/" +
+                    std::to_string(Libs::LibKernel::PthreadGetHostThreadId(thread)) + "/stat";
+  WaitForMutexTest([&] {
+    std::ifstream stat(path);
+    std::string line;
+    std::getline(stat, line);
+    const auto state = line.rfind(") ");
+    return state != std::string::npos && line[state + 2] == 'S';
+  });
+}
+
 void TestStaticRwlockDestroy() {
   using namespace Libs::LibKernel;
   PthreadRwlock rwlock = nullptr;
@@ -125,7 +159,7 @@ struct MutexWaiter {
   Libs::LibKernel::Pthread thread = nullptr;
   std::vector<uint8_t> stack = std::vector<uint8_t>(1024 * 1024);
   std::atomic<unsigned> parked{0}, resume{0};
-  std::atomic<bool> acquired{false}, release{false}, finished{false};
+  std::atomic<bool> locking{false}, acquired{false}, release{false}, finished{false};
   int result = 0;
 };
 
@@ -141,6 +175,7 @@ void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
   using namespace Libs::LibKernel;
   auto &waiter = *static_cast<MutexWaiter *>(arg);
   current_mutex_waiter = &waiter;
+  waiter.locking = true;
   waiter.result = waiter.timeout == 0 ? PthreadMutexLock(waiter.mutex)
                                       : PthreadMutexTimedlock(waiter.mutex, waiter.timeout);
   if (waiter.result == OK) {
@@ -156,7 +191,15 @@ void *KYTY_SYSV_ABI RunMutexWaiter(void *arg) {
   return nullptr;
 }
 
-void QueueMutexWaiter(MutexWaiter &waiter) {
+// Parks a waiter that sleeps in the contended lock, after it enqueued itself.
+void ParkInLockWait(const SignalExports &signals, MutexWaiter &waiter) {
+  WaitUntilSleeping(waiter.thread);
+  const auto ticket = waiter.parked.load() + 1;
+  Check(signals.raise(waiter.thread, 30) == OK, "raise a signal on the mutex waiter");
+  WaitForMutexTest([&] { return waiter.parked.load() == ticket; });
+}
+
+void QueueMutexWaiter(const SignalExports &signals, MutexWaiter &waiter) {
   using namespace Libs::LibKernel;
   PthreadAttr attr = nullptr;
   Check(PthreadAttrInit(&attr) == OK &&
@@ -164,10 +207,9 @@ void QueueMutexWaiter(MutexWaiter &waiter) {
             PthreadCreate(&waiter.thread, &attr, RunMutexWaiter, &waiter, "MutexTest") == OK &&
             PthreadAttrDestroy(&attr) == OK,
         "create guest mutex waiter");
-  // Pending guest signals are dispatched inside the contended lock, after enqueueing.
-  // Holding that callback proves queue order without letting the waiter acquire.
-  PthreadQueuePendingSignal(waiter.thread, 30);
-  WaitForMutexTest([&] { return waiter.parked.load() == 1; });
+  WaitForMutexTest([&] { return waiter.locking.load(); });
+  // Holding the handler proves queue order without letting the waiter acquire.
+  ParkInLockWait(signals, waiter);
 }
 
 void TestMutexHandoff() {
@@ -175,14 +217,9 @@ void TestMutexHandoff() {
   Common::Singleton<Loader::RuntimeLinker>::Instance();
   Initialize();
   PthreadInitSelfForMainThread();
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
-  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
-  Check(install_symbol != nullptr && remove_symbol != nullptr, "mutex signal exports resolve");
-  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
-  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
-  Check(install(30, reinterpret_cast<void *>(ParkMutexWaiter)) == OK, "install mutex test signal");
+  const auto signals = ResolveSignalExports();
+  Check(signals.install(30, reinterpret_cast<void *>(ParkMutexWaiter)) == OK,
+        "install mutex test signal");
 
   PthreadMutexattr attr = nullptr;
   Check(PthreadMutexattrInit(&attr) == OK && PthreadMutexattrSettype(&attr, 2) == OK,
@@ -193,9 +230,10 @@ void TestMutexHandoff() {
               PthreadMutexLock(&mutex) == OK && PthreadMutexLock(&mutex) == OK,
           "lock recursive mutex twice");
     std::array<MutexWaiter, 3> waiters{{{&mutex}, {&mutex}, {&mutex}}};
-    waiters[timed].timeout = 5000;
+    // Long enough for the timed waiter to park before it expires.
+    waiters[timed].timeout = 200000;
     for (auto &waiter : waiters) {
-      QueueMutexWaiter(waiter);
+      QueueMutexWaiter(signals, waiter);
     }
     waiters[timed].resume = 1;
     Check(PthreadJoin(waiters[timed].thread, nullptr) == OK &&
@@ -232,11 +270,10 @@ void TestMutexHandoff() {
         "nonrecursive self timed lock reports deadlock");
   MutexWaiter waiter{&mutex};
   waiter.cancel = true;
-  QueueMutexWaiter(waiter);
+  QueueMutexWaiter(signals, waiter);
   Check(PthreadCancel(waiter.thread) == OK, "cancel queued mutex waiter");
-  PthreadQueuePendingSignal(waiter.thread, 30);
   waiter.resume = 1;
-  WaitForMutexTest([&] { return waiter.parked.load() == 2; });
+  ParkInLockWait(signals, waiter);
   Check(PthreadMutexUnlock(&mutex) == OK &&
             PthreadMutexTrylock(&mutex) == KERNEL_ERROR_EBUSY,
         "canceled waiter retains its queue position");
@@ -247,35 +284,125 @@ void TestMutexHandoff() {
             result == reinterpret_cast<void *>(-1) && waiter.acquired && waiter.finished,
         "mutex lock defers cancellation until explicit cancellation point");
   Check(PthreadMutexLock(&mutex) == OK && PthreadMutexUnlock(&mutex) == OK &&
-            PthreadMutexDestroy(&mutex) == OK && remove(30) == OK,
+            PthreadMutexDestroy(&mutex) == OK && signals.remove(30) == OK,
         "mutex remains usable after waiter cancellation");
 }
 
-int dispatched_signals = 0;
+std::atomic<int> dispatched_signals{0}, sleepers_started{0};
+std::atomic<bool> release_signal{false}, stop_sleepers{false};
+std::atomic<Libs::LibKernel::Pthread> handler_child{nullptr};
 
 void KYTY_SYSV_ABI CountDispatchedSignal(int, void *) { dispatched_signals++; }
 
-void TestPendingSignalDispatch() {
-  using namespace Libs::LibKernel;
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
-  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
-  Check(install_symbol != nullptr && remove_symbol != nullptr, "signal handler exports resolve");
-  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
-  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
-  Check(install(30, reinterpret_cast<void *>(CountDispatchedSignal)) == OK,
-        "install signal handler");
-
-  PthreadQueuePendingSignal(PthreadSelf(), 30);
-  const auto start = std::chrono::steady_clock::now();
-  for (int call = 0; call < 1000000; ++call) {
-    KernelDispatchPendingSignalForCurrentThread();
+// Sleeps in guest waits until released.
+void KYTY_SYSV_ABI HoldSignal(int, void *) {
+  dispatched_signals++;
+  while (!release_signal) {
+    Libs::LibKernel::KernelUsleep(1000);
   }
-  Check(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50) &&
-            dispatched_signals == 1,
-        "a pending signal dispatches once and idle dispatches skip the signal scan");
-  Check(remove(30) == OK, "remove signal handler");
+}
+
+// Raises again on a thread whose HoldSignal runs and checks the raise waits for it to return.
+void CheckRaiseWaitsForHeldHandler(const SignalExports &signals, Libs::LibKernel::Pthread thread) {
+  WaitForMutexTest([] { return dispatched_signals.load() == 1; });
+  Check(signals.raise(thread, 30) == OK, "raise a signal during its handler");
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  Check(dispatched_signals.load() == 1, "a raise during the handler waits until it returns");
+  release_signal = true;
+  WaitForMutexTest([] { return dispatched_signals.load() == 2; });
+}
+
+void *KYTY_SYSV_ABI SleepUntilStopped(void *) {
+  sleepers_started++;
+  while (!stop_sleepers) {
+    Libs::LibKernel::KernelUsleep(1000);
+  }
+  return nullptr;
+}
+
+Libs::LibKernel::Pthread StartSleeper() {
+  Libs::LibKernel::Pthread sleeper = nullptr;
+  const auto started = sleepers_started.load();
+  Check(Libs::LibKernel::PthreadCreate(&sleeper, nullptr, SleepUntilStopped, nullptr,
+                                       "Sleeper") == OK,
+        "create a sleeping guest thread");
+  WaitForMutexTest([&] { return sleepers_started.load() > started; });
+  return sleeper;
+}
+
+void KYTY_SYSV_ABI CreateSleeperInHandler(int, void *) { handler_child = StartSleeper(); }
+
+void TestSignalWaitsForRunningHandler() {
+  using namespace Libs::LibKernel;
+  const auto signals = ResolveSignalExports();
+  Check(signals.install(30, reinterpret_cast<void *>(HoldSignal)) == OK,
+        "install holding signal handler");
+  auto *sleeper = StartSleeper();
+  Check(signals.raise(sleeper, 30) == OK, "raise a signal on a sleeping thread");
+  CheckRaiseWaitsForHeldHandler(signals, sleeper);
+  stop_sleepers = true;
+  Check(PthreadJoin(sleeper, nullptr) == OK && signals.remove(30) == OK,
+        "stop the signaled thread");
+}
+
+void *KYTY_SYSV_ABI RaiseOnSelf(void *arg) {
+  const auto &signals = *static_cast<const SignalExports *>(arg);
+  Check(signals.raise(Libs::LibKernel::PthreadSelf(), 30) == OK,
+        "raise a signal on the current thread");
+  return nullptr;
+}
+
+void TestSelfRaiseHoldsOtherRaises() {
+  using namespace Libs::LibKernel;
+  auto signals = ResolveSignalExports();
+  dispatched_signals = 0;
+  release_signal = false;
+  Check(signals.install(30, reinterpret_cast<void *>(HoldSignal)) == OK,
+        "install holding signal handler");
+  Pthread raiser = nullptr;
+  Check(PthreadCreate(&raiser, nullptr, RaiseOnSelf, &signals, "SelfRaiser") == OK,
+        "create a self-raising thread");
+  CheckRaiseWaitsForHeldHandler(signals, raiser);
+  Check(PthreadJoin(raiser, nullptr) == OK && signals.remove(30) == OK,
+        "stop the self-raising thread");
+}
+
+void TestThreadCreatedInHandlerTakesSignals() {
+  using namespace Libs::LibKernel;
+  const auto signals = ResolveSignalExports();
+  dispatched_signals = 0;
+  stop_sleepers = false;
+  Check(signals.install(30, reinterpret_cast<void *>(CreateSleeperInHandler)) == OK,
+        "install thread-creating signal handler");
+  auto *parent = StartSleeper();
+  Check(signals.raise(parent, 30) == OK, "raise a signal that creates a thread");
+  WaitForMutexTest([] { return handler_child.load() != nullptr; });
+  Check(signals.remove(30) == OK &&
+            signals.install(30, reinterpret_cast<void *>(CountDispatchedSignal)) == OK,
+        "install counting signal handler");
+  // The child starts with the dispatch signal its creator blocked inside the handler.
+  Check(signals.raise(handler_child, 30) == OK, "raise a signal on the child");
+  WaitForMutexTest([] { return dispatched_signals.load() == 1; });
+  stop_sleepers = true;
+  Check(PthreadJoin(parent, nullptr) == OK && PthreadJoin(handler_child, nullptr) == OK &&
+            signals.remove(30) == OK,
+        "stop the parent and child threads");
+}
+
+void *KYTY_SYSV_ABI ReturnFromGuestThread(void *) { return nullptr; }
+
+// An exiting thread stops taking guest signals before it frees its TLS.
+void TestExitingThreadStopsTakingSignals() {
+  using namespace Libs::LibKernel;
+  Pthread exiting = nullptr;
+  Check(PthreadCreate(&exiting, nullptr, ReturnFromGuestThread, nullptr, "Exiting") == OK,
+        "create exiting guest thread");
+  WaitForMutexTest([&] {
+    PthreadQueuePendingSignal(exiting, 30);
+    return !PthreadTakePendingSignal(exiting, 30);
+  });
+  Check(PthreadJoin(exiting, nullptr) == OK && !PthreadHasPendingSignal(exiting, 30),
+        "joining clears signals the exiting thread did not take");
 }
 
 class TempDirectory {
@@ -401,7 +528,7 @@ void TestFileDescriptorFlags() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"8nY19bKoiZk", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"8nY19bKoiZk", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fcntl export resolves");
   const auto fcntl = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int, int)>(symbol->vaddr);
   Check(fcntl(std::numeric_limits<int>::min(), 1, 0) == -1 &&
@@ -426,13 +553,71 @@ void TestFileDescriptorFlags() {
   }
 }
 
+void TestSharedDescriptorTable() {
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  namespace Net = Libs::Network::Net;
+  const int file = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  Check(EventQueue::KernelCreateEqueue(&queue, "descriptors") == OK, "create an event queue");
+  const int epoll = Net::EpollCreate("descriptors", 0);
+  const int socket = Net::Socket(2, 2, 0);
+  Check(static_cast<int>(static_cast<uint32_t>(queue)) == file + 1 && (queue >> 32) > 0 &&
+            epoll == file + 2 && socket == file + 3,
+        "files, event queues, epolls and sockets take consecutive descriptors of one table");
+  Check(FileSystem::KernelClose(file) == OK && Net::Socket(2, 2, 0) == file,
+        "a socket takes the lowest descriptor a file freed");
+  Check(Net::SocketClose(file) == OK && EventQueue::KernelDeleteEqueue(queue) == OK &&
+            Net::EpollDestroy(epoll) == 0 && Net::SocketClose(socket) == OK,
+        "release the shared descriptors");
+  for (int d = file; d <= socket; d++) {
+    Check(FileSystem::KernelOpen("/dev/urandom", 0, 0) == d, "files reuse every released descriptor");
+  }
+  for (int d = file; d <= socket; d++) {
+    Check(FileSystem::KernelClose(d) == OK, "close the reopened files");
+  }
+}
+
+void TestSessionSignalingDescriptors() {
+  Loader::SymbolDatabase symbols;
+  Libs::LibNpSessionSignaling::InitNet_1_NpSessionSignaling(&symbols);
+  const auto *initialize_symbol = symbols.Find(
+      {"ysmw6J-P8Ak", "NpSessionSignaling", "NpSessionSignaling", Loader::SymbolType::Func});
+  const auto *terminate_symbol = symbols.Find(
+      {"CqJuNXo5yiM", "NpSessionSignaling", "NpSessionSignaling", Loader::SymbolType::Func});
+  Check(initialize_symbol != nullptr && terminate_symbol != nullptr,
+        "NpSessionSignaling initialize and terminate exports resolve");
+  const auto initialize =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const void *)>(initialize_symbol->vaddr);
+  const auto terminate = reinterpret_cast<int (KYTY_SYSV_ABI *)()>(terminate_symbol->vaddr);
+  constexpr int NotInitialized = static_cast<int>(0x80553301u);
+  constexpr int AlreadyInitialized = static_cast<int>(0x80553302u);
+  const int file = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(FileSystem::KernelClose(file) == OK, "find the lowest free descriptor");
+  struct InitParam {
+    int http2_context = 0;
+    size_t pool_size = 0x80000;
+    uint64_t cpu_affinity_mask = 0;
+    int32_t thread_priority = 700;
+    size_t thread_stack_size = 0x8000;
+  } param;
+  Check(initialize(&param) == OK && initialize(&param) == AlreadyInitialized,
+        "NpSessionSignaling initializes once");
+  const int after_initialize = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(after_initialize == file + 3 && FileSystem::KernelClose(after_initialize) == OK,
+        "the initialized library holds three descriptors");
+  Check(terminate() == OK && terminate() == NotInitialized, "NpSessionSignaling terminates once");
+  const int after_terminate = FileSystem::KernelOpen("/dev/urandom", 0, 0);
+  Check(after_terminate == file && FileSystem::KernelClose(after_terminate) == OK,
+        "terminate releases the library's descriptors");
+}
+
 void TestSysmoduleReferences() {
   Loader::SymbolDatabase symbols;
   Libs::InitSysmodule_1(&symbols);
   using ModuleCall = int (KYTY_SYSV_ABI *)(uint16_t);
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.Find(
-        {nid, "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+        {nid, "Sysmodule", "Sysmodule", Loader::SymbolType::Func});
     Check(symbol != nullptr, "Sysmodule export resolves");
     return reinterpret_cast<ModuleCall>(symbol->vaddr);
   };
@@ -457,7 +642,7 @@ void TestSysmoduleReferences() {
           "last unload restores unloaded status");
   }
   const auto* internal_symbol = symbols.Find(
-      {"hHrGoGoNf+s", "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
+      {"hHrGoGoNf+s", "Sysmodule", "Sysmodule", Loader::SymbolType::Func});
   Check(internal_symbol != nullptr, "internal Sysmodule load export resolves");
   const auto internal_load =
       reinterpret_cast<int (KYTY_SYSV_ABI *)(uint16_t, int, int, int, int*)>(
@@ -477,7 +662,7 @@ void TestSystemServiceEntitlementEvents() {
   Libs::InitAppContent_1(&symbols);
   const auto resolve = [&](const char* nid, const char* library, const char* module) {
     const auto* symbol = symbols.Find(
-        {nid, library, 1, module, 1, 1, Loader::SymbolType::Func});
+        {nid, library, module, Loader::SymbolType::Func});
     Check(symbol != nullptr, "entitlement event export resolves");
     return symbol->vaddr;
   };
@@ -602,7 +787,7 @@ void TestAddContent(const std::filesystem::path& root) {
               info[i].package_type == 3 && info[i].download_status == 4 &&
               get(1, &info[i].label, &single) == OK &&
               std::memcmp(&single, &info[i], sizeof(single)) == 0,
-          "GTA V entitlements retain their order, metadata, and individual lookups");
+          "existing entitlements retain their order, metadata, and individual lookups");
   }
   Check(std::strcmp(info[3].label.data, label(0).c_str()) == 0 &&
             info[3].package_type == 2 && info[3].download_status == 4 &&
@@ -684,11 +869,11 @@ void TestAddContent(const std::filesystem::path& root) {
 
   Loader::AddContentLoad(folder / "missing", {}, "PPSA11111");
   Check(list(0, info.data(), 4, &count) == OK && count == 3,
-        "missing add-ons folder retains GTA V entitlements");
+        "missing add-ons folder retains existing entitlements");
   for (size_t i = 0; i < existing.size(); ++i) {
     Check(std::strcmp(info[i].label.data, existing[i]) == 0 &&
               get(0, &info[i].label, &single) == OK,
-          "GTA V entitlement lookup works without detected add-ons");
+          "existing entitlement lookup works without detected add-ons");
   }
 }
 
@@ -747,7 +932,7 @@ void TestFsync() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"juWbTNM+8hw", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"juWbTNM+8hw", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fsync export resolves");
   const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
   Check(fsync(std::numeric_limits<int>::min()) == -1 &&
@@ -776,7 +961,7 @@ void TestSaveTruncate() {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
-      {"WlyEA-sLDf0", "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"WlyEA-sLDf0", "libkernel", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "sceKernelTruncate export resolves");
   const auto truncate =
       reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, int64_t)>(symbol->vaddr);
@@ -831,7 +1016,7 @@ void TestSaveWritev() {
   Libs::InitLibKernel_1(&symbols);
   const auto resolve = [&](const char* nid) {
     const auto* symbol = symbols.Find(
-        {nid, "libkernel", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+        {nid, "libkernel", "libkernel", Loader::SymbolType::Func});
     Check(symbol != nullptr, "vectored write export resolves");
     return symbol->vaddr;
   };
@@ -1216,6 +1401,60 @@ void CheckUnmappedPaths(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+// A folder mounted read-only at /app0 rejects mutations; /hostapp of the same folder stays writable.
+void CheckReadOnlyAppFolder(const std::filesystem::path &root) {
+  constexpr int ReadOnly = Libs::LibKernel::KERNEL_ERROR_EROFS;
+  const auto folder = root / "app0-folder";
+  std::filesystem::create_directories(folder / "dir");
+  Common::File fixture;
+  Check(fixture.Create(folder / "data.bin"), "create /app0 folder fixture");
+  fixture.Close();
+  FileSystem::Mount(folder, "/app0", true);
+  FileSystem::Mount(folder, "/hostapp");
+
+  for (const int flags : {1, 2, 0x0400}) {
+    Check(FileSystem::KernelOpen("/app0/data.bin", flags, 0777) == ReadOnly &&
+              FileSystem::KernelOpen("/app0/new.bin", flags, 0777) ==
+                  Libs::LibKernel::KERNEL_ERROR_ENOENT,
+          "/app0 rejects write and truncate opens after the existence check");
+  }
+  Check(FileSystem::KernelOpen("/app0/new.bin", 0x0200, 0777) == ReadOnly &&
+            FileSystem::KernelOpen("/app0/data.bin", 0x0601, 0777) == ReadOnly &&
+            FileSystem::KernelOpen("/app0/data.bin", 0x0a01, 0777) ==
+                Libs::LibKernel::KERNEL_ERROR_EEXIST &&
+            FileSystem::KernelOpen("/app0/dir", 0x0a00, 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST,
+        "/app0 rejects creating files after the exclusive check");
+  Check(FileSystem::KernelTruncate("/app0/data.bin", 0) == ReadOnly &&
+            FileSystem::KernelTruncate("/app0/new.bin", 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelTruncate("/app0/dir", 0) == Libs::LibKernel::KERNEL_ERROR_EISDIR &&
+            FileSystem::KernelUnlink("/app0/data.bin") == ReadOnly &&
+            FileSystem::KernelMkdir("/app0/dir", 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST &&
+            FileSystem::KernelMkdir("/app0/new-dir", 0777) == ReadOnly &&
+            FileSystem::KernelRmdir("/app0/dir") == ReadOnly &&
+            FileSystem::KernelRename("/app0/data.bin", "/hostapp/renamed.bin") == ReadOnly &&
+            FileSystem::KernelRename("/hostapp/data.bin", "/app0/renamed.bin") == ReadOnly,
+        "/app0 rejects path mutations");
+  Check(std::filesystem::exists(folder / "data.bin") && std::filesystem::exists(folder / "dir") &&
+            !std::filesystem::exists(folder / "new.bin") &&
+            !std::filesystem::exists(folder / "new-dir") &&
+            !std::filesystem::exists(folder / "renamed.bin"),
+        "/app0 mutations leave the host folder unchanged");
+
+  const int read = FileSystem::KernelOpen("/app0/data.bin", 0, 0);
+  const int create_existing = FileSystem::KernelOpen("/app0/data.bin", 0x0200, 0777);
+  const int create_directory = FileSystem::KernelOpen("/app0/dir", 0x0200, 0777);
+  Check(read >= 3 && create_existing >= 3 && create_directory >= 3 &&
+            FileSystem::KernelClose(read) == OK && FileSystem::KernelClose(create_existing) == OK &&
+            FileSystem::KernelClose(create_directory) == OK,
+        "/app0 opens existing files and directories for reading, also with O_CREAT");
+  const int write = FileSystem::KernelOpen("/hostapp/written.bin", 0x0601, 0666);
+  Check(write >= 3 && FileSystem::KernelClose(write) == OK &&
+            std::filesystem::exists(folder / "written.bin"),
+        "the folder stays writable through another mount");
+  FileSystem::Umount("/hostapp");
+  FileSystem::Umount("/app0");
+}
+
 void CheckArchiveMount(const std::filesystem::path &root) {
   const auto archive = root / u8"game-日本語.zar";
   std::vector<uint8_t> payload(2 * 64 * 1024 + 33);
@@ -1317,11 +1556,17 @@ void CheckArchiveMount(const std::filesystem::path &root) {
   Check(entries_seen == expected_entries.size(), "guest enumerates every archive directory entry");
   Check(FileSystem::KernelClose(directory) == OK, "close archive directory");
 
-  for (const int flags : {1, 2, 0x0200, 0x0400}) {
+  for (const int flags : {1, 2, 0x0400}) {
     Check(FileSystem::KernelOpen(GuestMember, flags, 0777) ==
               Libs::LibKernel::KERNEL_ERROR_EROFS,
-          "archive rejects write, create and truncate open flags");
+          "archive rejects write and truncate open flags");
   }
+  const int existing = FileSystem::KernelOpen(GuestMember, 0x0200, 0777);
+  Check(existing >= 3 && FileSystem::KernelClose(existing) == OK &&
+            FileSystem::KernelOpen("/app0/new.bin", 0x0200, 0777) ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelMkdir("/app0/assets", 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST,
+        "archive opens members with O_CREAT and rejects creating new ones");
   Check(FileSystem::KernelUnlink(GuestMember) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
             FileSystem::KernelMkdir("/app0/new-dir", 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
             FileSystem::KernelRmdir("/app0/assets") == Libs::LibKernel::KERNEL_ERROR_EROFS &&
@@ -2477,11 +2722,11 @@ void CheckSocketPeerName() {
   Libs::LibNet::InitNet_1_Net(&symbols);
   Libs::InitLibKernel_1(&symbols);
   const auto *posix_symbol = symbols.Find(
-      {"TXFFFiNldU8", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"TXFFFiNldU8", "Posix", "libkernel", Loader::SymbolType::Func});
   const auto *net_symbol = symbols.Find(
-      {"TCkRD0DWNLg", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"TCkRD0DWNLg", "Net", "Net", Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
-      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"HQOwnfMGipQ", "Net", "Net", Loader::SymbolType::Func});
   Check(posix_symbol && net_symbol && errno_symbol,
         "POSIX and Net getpeername exports resolve");
   using Getpeername = int(KYTY_SYSV_ABI *)(int, void *, uint32_t *);
@@ -2552,25 +2797,25 @@ void CheckSocketWakeup() {
   Libs::LibNet::InitNet_1_Net(&symbols);
   Libs::InitLibKernel_1(&symbols);
   const auto *shutdown_symbol = symbols.Find(
-      {"TUuiYS2kE8s", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+      {"TUuiYS2kE8s", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(shutdown_symbol != nullptr, "POSIX shutdown export resolves");
   const auto shutdown = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int)>(shutdown_symbol->vaddr);
   const auto *connect_symbol = symbols.Find(
-      {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"OXXX4mUk3uk", "Net", "Net", Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
-      {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"xphrZusl78E", "Net", "Net", Loader::SymbolType::Func});
   const auto *setsockopt_symbol = symbols.Find(
-      {"2mKX2Spso7I", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"2mKX2Spso7I", "Net", "Net", Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
-      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"beRjXBn-z+o", "Net", "Net", Loader::SymbolType::Func});
   const auto *sendto_symbol = symbols.Find(
-      {"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"gvD1greCu0A", "Net", "Net", Loader::SymbolType::Func});
   const auto *recv_symbol = symbols.Find(
-      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"9wO9XrMsNhc", "Net", "Net", Loader::SymbolType::Func});
   const auto *recvfrom_symbol = symbols.Find(
-      {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"304ooNZxWDY", "Net", "Net", Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
-      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+      {"HQOwnfMGipQ", "Net", "Net", Loader::SymbolType::Func});
   Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
             recv_symbol && recvfrom_symbol && errno_symbol,
         "Net socket and errno exports resolve with the guest ABI versions");
@@ -2889,6 +3134,8 @@ int main(int argc, char** argv) {
   options.printf_direction = Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+  // Guest threads allocate their TLS in guest memory.
+  subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
   if (argc == 2 && std::string_view(argv[1]) == "--network-only") {
 #if defined(__linux__)
@@ -2904,7 +3151,10 @@ int main(int argc, char** argv) {
 
   TestMutexHandoff();
   TestStaticRwlockDestroy();
-  TestPendingSignalDispatch();
+  TestSignalWaitsForRunningHandler();
+  TestSelfRaiseHoldsOtherRaises();
+  TestThreadCreatedInHandlerTakesSignals();
+  TestExitingThreadStopsTakingSignals();
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
@@ -2928,9 +3178,12 @@ int main(int argc, char** argv) {
   TestAddContent(temporary.Path());
   TestRandomDevices();
   TestFileDescriptorFlags();
+  TestSharedDescriptorTable();
+  TestSessionSignalingDescriptors();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());
+  CheckReadOnlyAppFolder(temporary.Path());
   CheckUnicodePaths(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());

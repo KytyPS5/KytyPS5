@@ -8,7 +8,7 @@ namespace Libs {
 
 namespace LibRazorCpu {
 
-LIB_VERSION("RazorCpu", 1, "RazorCpu", 1, 1);
+LIB_NAME("RazorCpu", "RazorCpu");
 
 static KYTY_SYSV_ABI uint32_t RazorCpuIsCapturing() {
 	PRINT_NAME();

@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -60,6 +61,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void ResetQueue(uint32_t op);
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
@@ -92,7 +94,7 @@ public:
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
-	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	void WaitFlipDone(const uint64_t* label);
 	void ProcessPssr(const Pssr::Request& request);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
@@ -101,7 +103,7 @@ public:
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
-	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
+	void WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
 	void DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
@@ -118,6 +120,7 @@ public:
 private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void                CountDraw();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
@@ -138,9 +141,11 @@ private:
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
 
-	const int m_interrupt_event_id;
-	uint64_t  m_synthetic_occlusion_counter = 0;
-	bool      m_predicate_skip              = false;
+	const int      m_interrupt_event_id;
+	const uint32_t m_flush_draws                 = Config::GetFlushDraws();
+	uint32_t       m_draws                       = 0; // Since the buffer start or CountDraw's flush
+	uint64_t       m_synthetic_occlusion_counter = 0;
+	bool           m_predicate_skip              = false;
 };
 
 } // namespace Libs::Graphics

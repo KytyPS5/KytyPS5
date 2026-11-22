@@ -71,7 +71,7 @@ public:
 
 	void Update();
 	void FindInterpreter();
-	void Run();
+	void Run(const QString& activity);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
 
@@ -272,15 +272,20 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
 	AddFlag(args, info.readback_storage_images, "--readback-storage-images");
 	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
+	args << "--flush-draws" << QString::number(info.flush_draws);
 	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
 	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
 	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
+	if (!info.launch_activity.isEmpty()) {
+		args << "--launch-activity" << info.launch_activity;
+	}
 	AddFlag(args, info.network_connected, "--network-connected");
 	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
 	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
 	AddFlag(args, info.relaxed_shader_float, "--relaxed-shader-float");
+	AddFlag(args, info.native_rt, "--native-rt");
 	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
@@ -294,8 +299,13 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.pro_enabled, "--trinity");
-	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
-		args << "--dlss" << info.dlss_folder;
+	if (info.pro_enabled) {
+		args << "--pssr-upscaler" << EnumToText(info.pssr_upscaler);
+		if (info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
+			args << "--dlss-folder" << info.dlss_folder;
+		} else if (info.pssr_upscaler == Configuration::PssrUpscaler::FSR) {
+			args << "--fsr-folder" << info.fsr_folder;
+		}
 	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
@@ -507,7 +517,7 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 	s.endGroup();
 }
 
-void MainDialogPrivate::Run() {
+void MainDialogPrivate::Run(const QString& activity) {
 	if (m_update_checker->IsInstalling()) {
 		return;
 	}
@@ -533,7 +543,8 @@ void MainDialogPrivate::Run() {
 			        Update();
 		        }
 	        });
-	auto info = m_ui->widget->CreateConfiguration(*item);
+	auto info             = m_ui->widget->CreateConfiguration(*item);
+	info->launch_activity = activity;
 	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
 
 	Update();

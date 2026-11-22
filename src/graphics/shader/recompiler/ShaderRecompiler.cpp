@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -629,7 +630,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
-                             uint32_t push_data_start_dword) {
+                             IR::PushData::Window push_data) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
@@ -674,6 +675,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (options.profile->ray_query) {
+		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
+			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
+			     stage, ir.shader_hash, traced);
+		}
+	}
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;
@@ -684,7 +691,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data, *options.profile,
 	                                options.emit_debug_info);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",

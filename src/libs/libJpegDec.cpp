@@ -19,7 +19,7 @@
 
 namespace Libs {
 
-LIB_VERSION("JpegDec", 1, "JpegDec", 1, 1);
+LIB_NAME("JpegDec", "JpegDec");
 
 namespace JpegDec {
 

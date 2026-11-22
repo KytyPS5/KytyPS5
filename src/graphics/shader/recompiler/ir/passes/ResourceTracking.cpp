@@ -28,6 +28,23 @@ namespace {
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
+// value and every value reaching it through Phi arms, each once, in depth-first order.
+std::vector<Value> PhiWeb(Value value) {
+	std::vector<Value> web;
+	std::vector<Value> pending {value};
+	while (!pending.empty()) {
+		const auto current = pending.back().Resolve();
+		pending.pop_back();
+		if (std::ranges::find(web, current) != web.end()) continue;
+		web.push_back(current);
+		const auto* phi = current.TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) continue;
+		for (size_t arm = 0; arm < phi->NumArgs(); ++arm)
+			pending.push_back(phi->Arg(arm));
+	}
+	return web;
+}
+
 uint32_t PossibleU32Bits(Value value, const auto& normalize) {
 	std::unordered_map<const Inst*, uint32_t> known;
 	const auto visit = [&](auto&& self, Value at) -> uint32_t {
@@ -82,15 +99,31 @@ uint32_t PossibleU32Bits(Value value) {
 	return PossibleU32Bits(value, [](Value at) { return at.Resolve(); });
 }
 
-bool IsNoncanonicalFlatAddress(Value high, Value active) {
-	high = high.Resolve();
+// A predicated VGPR write supplies its new value on exactly the lanes which
+// execute an access under `active`. Do not discard a selection under a different mask.
+Value ActiveValue(Value value, Value active) {
+	value  = value.Resolve();
 	active = active.Resolve();
-	// A predicated VGPR write supplies its new value on exactly the lanes which
-	// execute this access. Do not discard a selection under a different mask.
-	while (const auto* select = high.TryInstruction()) {
+	while (const auto* select = value.TryInstruction()) {
 		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) break;
-		high = select->Arg(1).Resolve();
+		value = select->Arg(1).Resolve();
 	}
+	return value;
+}
+
+// The scalar read a global base dword comes from; FLAT adds its VGPR offset to it.
+const Inst* AddressBaseRead(Value word, Value active) {
+	const auto* inst = ActiveValue(word, active).TryInstruction();
+	if (inst != nullptr && inst->GetOpcode() == ValueOpcode::IAdd32) {
+		inst = inst->Arg(0).Resolve().TryInstruction();
+	}
+	const bool scalar = inst != nullptr && (inst->GetOpcode() == ValueOpcode::ReadConst ||
+	                                        inst->GetOpcode() == ValueOpcode::GetUserData);
+	return scalar ? inst : nullptr;
+}
+
+bool IsNoncanonicalFlatAddress(Value high, Value active) {
+	high = ActiveValue(high, active);
 	uint32_t lower = 0, upper = UINT32_MAX;
 	if (high.IsImmediate() && high.GetType() == Type::U32) {
 		lower = upper = high.U32();
@@ -386,6 +419,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
+		m_info.user_address_bases.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -416,14 +450,6 @@ public:
 		std::vector<std::pair<const IndirectDescriptorPlan*, Value>> buffer_selections;
 		for (const auto& plan: m_indirect_descriptors) {
 			auto key = plan.key;
-			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
-			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
-				auto* block = plan.handle->Parent();
-				const auto where = std::ranges::find_if(block->Instructions(),
-				    [&](const Inst& inst) { return &inst == plan.handle; });
-				key = Value(&*block->PrependNewInst(
-				    where, ValueOpcode::ShiftLeftLogical32, {key, Value(2u)}));
-			}
 			if (plan.table_read != nullptr) {
 				const auto* anchor = plan.table_indexed ? plan.handle : plan.table_read;
 				auto* block = anchor->Parent();
@@ -448,9 +474,16 @@ public:
 					    {emit(ValueOpcode::ULessThan32, {read.Arg(1), table->Arg(2)}),
 					     emit(ValueOpcode::INotEqual32, {format, Value(0u)})});
 				} else {
+					const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 					const auto dynamic = emit(ValueOpcode::BitwiseAnd32, {read.Arg(1), Value(~3u)});
-					offset = emit(ValueOpcode::IAdd32, {dynamic, Value(memory.offset & ~3u)});
-					valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
+					if (m_sources[indirect.table_source].dword_count == 2u) {
+						// An address table's heap starts at key 0's slot.
+						offset = emit(ValueOpcode::ISub32, {dynamic, Value(indirect.table_offset)});
+						valid = emit(ValueOpcode::ULessThanEqual32, {Value(indirect.table_offset), dynamic});
+					} else {
+						offset = emit(ValueOpcode::IAdd32, {dynamic, Value(memory.offset & ~3u)});
+						valid = emit(ValueOpcode::ULessThanEqual32, {dynamic, offset});
+					}
 				}
 				key = emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
 				if (!plan.table_indexed) {
@@ -479,6 +512,14 @@ public:
 				for (uint32_t word = 1; word < plan.handle->NumArgs(); ++word)
 					plan.handle->SetArg(word, Value(0u));
 				continue;
+			}
+			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
+			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
+				auto* block = plan.handle->Parent();
+				const auto where = std::ranges::find_if(block->Instructions(),
+				    [&](const Inst& inst) { return &inst == plan.handle; });
+				key = Value(&*block->PrependNewInst(
+				    where, ValueOpcode::ShiftLeftLogical32, {key, Value(2u)}));
 			}
 			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
 				Value selected;
@@ -612,24 +653,13 @@ private:
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
 		std::vector<const Inst*> candidates;
-		std::vector<const Inst*> visited;
-		std::vector<const Inst*> pending {phi};
-		while (!pending.empty()) {
-			const auto* inst = pending.back();
-			pending.pop_back();
-			if (std::ranges::find(visited, inst) != visited.end()) continue;
-			visited.push_back(inst);
-			if (inst->GetOpcode() == ValueOpcode::Phi) {
-				for (size_t i = 0; i < inst->NumArgs(); ++i) {
-					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
-					if (arg != nullptr) pending.push_back(arg);
-				}
-			} else if (inst->GetOpcode() == ValueOpcode::ReadConst ||
-			           inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-			           inst->GetOpcode() == ValueOpcode::ReadConstBuffer ||
-			           inst->GetOpcode() == ValueOpcode::GetUserData) {
+		for (const auto node: PhiWeb(value)) {
+			const auto* inst = node.TryInstruction();
+			if (inst != nullptr && (inst->GetOpcode() == ValueOpcode::ReadConst ||
+			                        inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			                        inst->GetOpcode() == ValueOpcode::ReadConstBuffer ||
+			                        inst->GetOpcode() == ValueOpcode::GetUserData))
 				candidates.push_back(inst);
-			}
 		}
 		const auto source_at = [&](uint32_t pc) {
 			Value source;
@@ -3338,7 +3368,17 @@ private:
 				}
 				if (maximum >= MaxIndirectDescriptorProbes)
 					maximum = ClampedTableMaximum(key, table_source, indirect);
-				if (maximum < MaxIndirectDescriptorProbes)
+				// A static key range can cover other operations' slots, so samples keep their GPU key
+				// over an image heap, which reads slots of another type or invalid T#s as null.
+				if (maximum < MaxIndirectDescriptorProbes && !sampler &&
+				    std::ranges::all_of(handle.Uses(), [](const Use& use) {
+					    return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw;
+				    })) {
+					indirect.table_maximum = maximum;
+					indirect.table_scalar = true;
+					plan.table_read = plan.reads[0];
+					plan.retain_reads = true;
+				} else if (maximum < MaxIndirectDescriptorProbes)
 					indirect.key_count = Value(maximum + 1u);
 				else if (!ProgramLoopCount(key, indirect))
 					return false;
@@ -3421,19 +3461,10 @@ private:
 		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
 		    (PossibleU32Bits(shift->Arg(1)) & ~24u) != 0u) return false;
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
-		std::vector<const Inst*> pending {shift->Arg(0).Resolve().TryInstruction()};
-		std::vector<const Inst*> visited;
-		while (!pending.empty()) {
-			const auto* read = pending.back();
-			pending.pop_back();
+		for (const auto node: PhiWeb(shift->Arg(0))) {
+			const auto* read = node.TryInstruction();
 			if (read == nullptr) return false;
-			if (std::ranges::find(visited, read) != visited.end()) continue;
-			visited.push_back(read);
-			if (read->GetOpcode() == ValueOpcode::Phi) {
-				for (size_t arm = 0; arm < read->NumArgs(); ++arm)
-					pending.push_back(read->Arg(arm).Resolve().TryInstruction());
-				continue;
-			}
+			if (read->GetOpcode() == ValueOpcode::Phi) continue;
 			uint32_t index = 0;
 			const auto* memory = ScalarReadMemory(*read, index);
 			DescriptorSource source;
@@ -4067,6 +4098,30 @@ private:
 		}
 	}
 
+	// Returns the source of the one bound buffer with a fixed V# that a write's Phi web carries
+	// word by word, else UINT32_MAX. The web's other definitions are taken to reach the write only
+	// with EXEC zero, as in a loop-exit undo of an in-loop atomic.
+	uint32_t CarriedBufferSource(const Inst& handle) const {
+		std::array<std::vector<Value>, 4> webs;
+		for (uint32_t word = 0; word < 4u; ++word)
+			webs[word] = PhiWeb(handle.Arg(word));
+		const auto carries = [&](const BufferResource& buffer) {
+			if (m_sources[buffer.source].indirect_descriptor) return false;
+			for (uint32_t word = 0; word < 4u; ++word) {
+				const auto carried = [&](Value node) {
+					return EquivalentValue(m_program, node, m_sources[buffer.source].dwords[word]);
+				};
+				if (std::ranges::none_of(webs[word], carried)) return false;
+			}
+			return true;
+		};
+		const auto bound = std::ranges::find_if(m_info.buffers, carries);
+		if (bound == m_info.buffers.end() ||
+		    std::ranges::any_of(std::next(bound), m_info.buffers.end(), carries))
+			return UINT32_MAX;
+		return bound->source;
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -4148,6 +4203,7 @@ private:
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
 		image.unfiltered_access_only &= op == ValueOpcode::ImageRead || op == ValueOpcode::ImageWrite;
+		image.sample_access_only &= op == ValueOpcode::ImageSampleRaw;
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {
@@ -4250,15 +4306,18 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
-				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
+				if (memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+				                                                       : ResourceKind::Buffer) &&
+				    memory.SupportsIndirectBufferLoad(op)) {
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					return;
+				}
+				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
+				if (source == UINT32_MAX) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
@@ -4272,8 +4331,9 @@ private:
 			if (!IsAddressResourceKind(memory.kind)) {
 				Fail(flags.pc, "address operation has invalid resource kind");
 			}
+			const auto active = inst.Arg(inst.NumArgs() - 1);
 			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
-			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
+			    IsNoncanonicalFlatAddress(inst.Arg(2), active)) {
 				ValidateAddressHandle(inst.Arg(0), flags.pc);
 				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
 					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
@@ -4296,18 +4356,18 @@ private:
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 			}
-			handle = inst.Arg(0).Resolve().TryInstruction();
-			std::array<uint32_t, 2> base {};
-			for (uint32_t word = 0; word < base.size(); ++word) {
-				const auto* read = handle->Arg(word).Resolve().TryInstruction();
-				base[word]       = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst
-				                       ? read->Arg(1).Resolve().U32()
-				                       : UINT32_MAX;
-			}
-			auto& bases = m_info.address_bases;
-			if (std::ranges::max(base) != UINT32_MAX &&
-			    std::ranges::find(bases, base) == bases.end())
-				bases.push_back(base);
+			handle           = inst.Arg(0).Resolve().TryInstruction();
+			const auto* low  = AddressBaseRead(handle->Arg(0), active);
+			const auto* high = AddressBaseRead(handle->Arg(1), active);
+			if (low == nullptr || high == nullptr || low->GetOpcode() != high->GetOpcode()) return;
+			const bool user = low->GetOpcode() == ValueOpcode::GetUserData;
+			const auto slot = [&](const Inst* read) {
+				return user ? RegIndex(read->Arg(0).ScalarRegister()) - m_program.user_data_base
+				            : read->Arg(1).Resolve().U32();
+			};
+			const std::array base {slot(low), slot(high)};
+			auto&            bases = user ? m_info.user_address_bases : m_info.address_bases;
+			if (std::ranges::find(bases, base) == bases.end()) bases.push_back(base);
 			return;
 		}
 

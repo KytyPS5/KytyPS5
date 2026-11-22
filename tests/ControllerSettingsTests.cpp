@@ -101,13 +101,14 @@ bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
 #undef SDL_GetGamepadProperties
 #undef SDL_GetBooleanProperty
 
-namespace Libs::Controller {
-// No virtual headset in these tests (padVr.cpp is not linked here).
-int PadVrPortHand(int) { return -1; }
-int PadVrPort(int, int, int, bool) { return PAD_ERROR_INVALID_ARG; }
-int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
-int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
-} // namespace Libs::Controller
+#include "graphics/presentation/vrInput.h"
+
+namespace Libs::Vr {
+// No headset runtime: each Sense controller reads the first player.
+VrControllerInput OpenXrGetController(int) {
+	return {};
+}
+} // namespace Libs::Vr
 
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
@@ -763,6 +764,76 @@ void TestTouchWithoutClick() {
 	      "a host input touch did not press the touch pad button");
 }
 
+void TestVrControllerInformation() {
+	constexpr int                    left  = PAD_HANDLE_VR_LEFT;
+	constexpr int                    right = PAD_HANDLE_VR_LEFT + 1;
+	PadVrControllerDeviceInformation info {};
+	PadTriggerEffectStateInformation triggers {};
+	Check(PadVrControllerGetDeviceInformation(left, nullptr) == PAD_ERROR_NOT_INITIALIZED &&
+	          PadVrControllerGetTriggerEffectStates(left, right, nullptr) ==
+	              PAD_ERROR_NOT_INITIALIZED &&
+	          PadVrControllerSetVibrationMode(left, 0) == PAD_ERROR_NOT_INITIALIZED,
+	      "an uninitialized library checked a Sense controller call's argument first");
+	Config::ConfigOptions options;
+	options.vr_enabled      = true;
+	options.keyboard_player = 2; // Only host pad 1 connects the first player.
+	Config::Load(options);
+	{
+		Controller controller;
+		const int  user = Config::GetUserId();
+		Check(PadOpen(user, 3, 0, nullptr) == left && PadOpen(user, 4, 0, nullptr) == right,
+		      "the Sense controller ports did not open");
+		// The output starts filled, so every byte, reserve included, must be written.
+		const auto info_is = [&](int handle, uint32_t hand_type, uint8_t dead_zone) {
+			PadVrControllerDeviceInformation expected {};
+			expected.hand_type       = hand_type;
+			expected.stick_dead_zone = dead_zone;
+			expected.connected_count = 1;
+			expected.connected       = hand_type != 0;
+			std::memset(&info, 0xff, sizeof(info));
+			return PadVrControllerGetDeviceInformation(handle, &info) == OK &&
+			       std::memcmp(&info, &expected, sizeof(info)) == 0;
+		};
+		// A rejected handle leaves the output untouched.
+		const auto info_rejected = [&](int handle) {
+			std::memset(&info, 0xff, sizeof(info));
+			const auto filled = info;
+			return PadVrControllerGetDeviceInformation(handle, &info) == PAD_ERROR_INVALID_HANDLE &&
+			       std::memcmp(&info, &filled, sizeof(info)) == 0;
+		};
+		const auto triggers_off = [&] {
+			triggers = {{-1, -1}};
+			return PadVrControllerGetTriggerEffectStates(left, right, &triggers) == OK &&
+			       triggers.state[0] == 0 && triggers.state[1] == 0;
+		};
+		Check(info_is(left, 1, 30) && info_is(right, 2, 30) && triggers_off(),
+		      "connected Sense controllers reported the wrong information");
+		Check(PadVrControllerGetDeviceInformation(1, nullptr) == PAD_ERROR_INVALID_ARG &&
+		          info_rejected(1) &&
+		          PadVrControllerGetTriggerEffectStates(right, left, nullptr) ==
+		              PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerGetTriggerEffectStates(right, left, &triggers) ==
+		              PAD_ERROR_INVALID_HANDLE,
+		      "a Sense controller query accepted a null output or a wrong handle");
+		Check(PadVrControllerSetVibrationMode(left, 1) == OK &&
+		          PadVrControllerSetVibrationMode(right, 5) == OK &&
+		          PadVrControllerSetVibrationMode(1, 0) == PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerSetVibrationMode(1, 6) == PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerSetVibrationMode(1, 1) == PAD_ERROR_INVALID_HANDLE,
+		      "a Sense controller vibration mode or handle was checked wrongly");
+		Disconnect(1);
+		Check(info_is(left, 0, 0) && info_is(right, 0, 0) && triggers_off(),
+		      "disconnected Sense controllers reported the wrong information");
+		Check(PadClose(right) == OK && info_rejected(right) &&
+		          PadVrControllerSetVibrationMode(right, 1) == PAD_ERROR_INVALID_HANDLE &&
+		          PadVrControllerGetTriggerEffectStates(left, right, &triggers) ==
+		              PAD_ERROR_INVALID_HANDLE &&
+		          PadClose(left) == OK,
+		      "a closed Sense controller port kept a usable handle");
+	}
+	Config::Load(Config::ConfigOptions {});
+}
+
 } // namespace
 
 int main() {
@@ -782,6 +853,7 @@ int main() {
 	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
+	TestVrControllerInformation();
 	Config::Shutdown();
 	return 0;
 }

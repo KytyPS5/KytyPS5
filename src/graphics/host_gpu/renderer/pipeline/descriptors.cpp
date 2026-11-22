@@ -435,12 +435,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	physical.UpdateSize();
 	info.UpdateSize();
 	const auto same_mip = [&](uint32_t target, uint32_t source) {
-		const auto& left  = physical.mip_layout[target];
-		const auto& right = info.mip_layout[source];
-		return left.offset == right.offset && left.size == right.size &&
-		       left.pitch == right.pitch && left.height == right.height &&
-		       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-		       left.surface_z == right.surface_z &&
+		return physical.mip_layout[target] == info.mip_layout[source] &&
 		       physical.MipExtent(target) == info.MipExtent(source);
 	};
 	if (physical.first_tail_level == info.first_tail_level &&
@@ -520,9 +515,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
-	const auto view_levels = multisampled || single_storage_mip
-	                             ? 1u
-	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
+	auto view_levels = multisampled || single_storage_mip
+	                       ? 1u
+	                       : static_cast<uint32_t>(last_level - base_level) + 1u;
 	auto levels =
 	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
 	const auto tile       = descriptor.TileMode();
@@ -601,21 +596,31 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
 		                           view_base)) {
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
+			// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
+			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
+			if (base_level >= physical_levels ||
+			    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u "
+				     "max=%u extent=%ux%ux%u tile=%u\n",
+				     base_level, last_level, max_mip, width, height, depth,
+				     static_cast<uint32_t>(tile));
+			}
+			view_levels                = physical_levels - base_level;
+			desc.info.resources.levels = physical_levels;
+			desc.info.data.size        = 0;
+			desc.info.UpdateSize();
 		}
 	} else {
 		desc.info.UpdateSize();
 	}
-	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
+	// their layout.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
+	const auto alignment = desc.info.DataAlignment();
+	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
+	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -798,11 +803,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				const auto  limit =
 				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 				    (graphics.StorageMinAlignment() - 1);
-				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
-			}
-			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
-			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+				size = Libs::LibKernel::Memory::ClampRangeSize(
+				    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
+			} else if (size >= (uint64_t {1} << 30u)) {
+				//  PPSA18026
+				// Finite descriptors can span sparse PRT holes; oversized pool windows are mapped
+				// in pieces, so they end at their last committed range.
+				size = Libs::LibKernel::Memory::ClampRangeSize(address, size, true);
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
@@ -881,7 +888,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-                                             std::span<RenderColorInfo> colors) {
+                                             DrawTargets&                       targets) {
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
 	FindBuffers(stages);
@@ -899,7 +906,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
+	for (auto& target: std::span {targets.colors, targets.color_count}) {
 		EXIT_IF(!target.image_id);
 		auto& old_image = cache.m_slot_images[target.image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
@@ -908,6 +915,25 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			target.desc.view_info.base_layer = target.guest_array_layer;
 			target.image_id = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
+		}
+	}
+	// A sampled view can grow the depth image into a larger one at the same address.
+	if (auto& depth = targets.depth; depth.image_id) {
+		auto& old_image = cache.m_slot_images[depth.image_id];
+		if (!old_image.registered || old_image.binding.needs_rebind) {
+			old_image.binding = {};
+			depth.image_id    = cache.FindImage(depth.desc);
+			BindRenderTarget(depth.image_id);
+			// Depth found again from a color copy frees the image a binding of this draw holds.
+			for (auto* stage: stages) {
+				for (const auto& binding: stage->images) {
+					const auto* bound = cache.m_slot_images.try_get(binding.image_id);
+					if (binding.image_id &&
+					    (bound == nullptr || !bound->registered || bound->binding.needs_rebind)) {
+						EXIT("TextureCache: depth target rediscovery replaced a bound image\n");
+					}
+				}
+			}
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only

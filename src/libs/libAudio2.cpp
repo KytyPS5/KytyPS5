@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Audio {
@@ -198,6 +199,7 @@ struct AudioOut2ContextState {
 	AudioOut2ContextHandle handle              = 0;
 	uint32_t               queue_depth         = 4;
 	uint32_t               queued              = 0;
+	uint32_t               reserved            = 0;
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
 	int                    object_audio_handle = 0;
@@ -612,82 +614,89 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 	return OK;
 }
 
+// Advance reserves a grain. A full queue changes nothing and keeps the port attributes locked.
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
-	g_audioout2_state_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
-		for (auto& port: state->ports) {
-			port.attributes_locked = false;
-		}
+	Common::LockGuard lock(g_audioout2_state_mutex);
+	auto*             state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
-	g_audioout2_state_mutex.Unlock();
-
+	audioout2_update_context_locked(state);
+	if (state->queued + state->reserved >= state->queue_depth) {
+		return AUDIO_OUT2_ERROR_NOT_READY;
+	}
+	state->reserved++;
+	for (auto& port: state->ports) {
+		port.attributes_locked = false;
+	}
 	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
-	uint32_t sleep_micros = audioout2_grain_micros(512);
-
-	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
-		g_audioout2_state_mutex.Lock();
-		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
-			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
-				auto& submission = audioout2_submission(*state);
-				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
-				return OK;
-			}
-		}
+	if (blocking > 1) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	g_audioout2_state_mutex.Lock();
+	auto* state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
 		g_audioout2_state_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	audioout2_update_context_locked(state);
+	// A push commits the reserved grains with the ports' PCM; without a reservation the PCM waits
+	// for the next grain. A synchronous push returns with a free queue entry. The SDL queue paces
+	// one carrying PCM to a real device, so the model keeps an entry free for it.
+	const auto reserved = std::exchange(state->reserved, 0u);
+	if (reserved != 0) {
+		const bool device_paced = blocking != 0 && audioout2_context_has_queueable_device(*state);
+		state->queued =
+		    std::min(state->queued + reserved, state->queue_depth - (device_paced ? 1u : 0u));
+	}
+	auto&      submission   = audioout2_submission(*state);
+	const auto sleep_micros = audioout2_grain_micros(state->num_grains);
+	g_audioout2_state_mutex.Unlock();
+	if (reserved != 0) {
+		audioout2_queue_context_audio(ctx, submission, blocking != 0);
+	}
 
-		if (blocking == 0) {
-			return AUDIO_OUT2_ERROR_NOT_READY;
+	while (blocking != 0) {
+		g_audioout2_state_mutex.Lock();
+		state = audioout2_find_context_locked(ctx);
+		audioout2_update_context_locked(state);
+		const bool full = state != nullptr && state->queued >= state->queue_depth;
+		g_audioout2_state_mutex.Unlock();
+		if (!full) {
+			break;
 		}
-
 		Common::Thread::SleepMicro(sleep_micros);
 	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	if (queue_level == nullptr && available_queues == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	Common::LockGuard lock(g_audioout2_state_mutex);
+	auto*             state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	audioout2_update_context_locked(state);
+	const auto level = state->queued + state->reserved;
 	if (queue_level != nullptr) {
-		*queue_level = 0;
+		*queue_level = level;
 	}
 	if (available_queues != nullptr) {
-		*available_queues = 4;
+		*available_queues = state->queue_depth - level;
 	}
-
-	g_audioout2_state_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
-		if (queue_level != nullptr) {
-			*queue_level = state->queued;
-		}
-		if (available_queues != nullptr) {
-			*available_queues =
-			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
-		}
-	}
-	g_audioout2_state_mutex.Unlock();
-
-	return OK;
+	return level < state->queue_depth ? OK : AUDIO_OUT2_ERROR_NOT_READY;
 }
 
-int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,
-                                      AudioOut2PortHandle* port) {
+// PPSA28180 calls this with rsp off the 16-byte alignment; the host device open needs it.
+[[gnu::force_align_arg_pointer]] int KYTY_SYSV_ABI AudioOut2PortCreate(
+    AudioOut2ContextHandle ctx, const AudioOut2PortParam* params, AudioOut2PortHandle* port) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 

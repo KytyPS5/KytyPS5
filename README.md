@@ -33,7 +33,7 @@ Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been 
 on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
 
 Community game test results are available in the
-[KytyPS5 Compatibility List](https://kytyps5.github.io/).
+[KytyPS5 Compatibility List](https://kytyps5.github.io/compatibility).
 
 ## Bugs and Issues
 

@@ -152,7 +152,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const uint32_t width  = rt.attrib2.width + 1;
 	const uint32_t height = rt.attrib2.height + 1;
 	const auto target_format =
-	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
+	    TextureGetRenderTargetFormat(m_context.GetGraphics(), rt.info.format, rt.info.channel_type,
+	                                 rt.info.channel_order);
 	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
 	// mip 0's padded pitch aliases mip 0's top-left texels.
 	uint32_t mip = rt.view.current_mip_level;

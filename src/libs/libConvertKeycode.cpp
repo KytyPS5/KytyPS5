@@ -6,7 +6,7 @@
 
 namespace Libs {
 
-LIB_VERSION("ConvertKeycode", 1, "ConvertKeycode", 1, 0);
+LIB_NAME("ConvertKeycode", "ConvertKeycode");
 
 namespace ConvertKeycode {
 

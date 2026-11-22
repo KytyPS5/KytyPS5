@@ -283,6 +283,22 @@ void TestEventExtraction(const std::filesystem::path &directory) {
         "missing UDS package has no rules");
 }
 
+void TestActivityIds(const std::filesystem::path &directory) {
+  const auto path = directory / "uds00.ucp";
+  WritePackage(path, {{"enum_definition.json", R"({"enumArray":[
+			{"sourceId":"activity_pattern1","enumValueArray":[{"name":"story"},{"name":"bonus"}]},
+			{"sourceId":"difficulty","enumValueArray":[{"name":"hard"}]},
+			{"sourceId":"activity","enumValueArray":[{"name":"finale"},{"name":"story"},{"id":3}]},
+			{"sourceId":1,"enumValueArray":[{"name":"numeric"}]}
+		]})"}});
+  Check(Trophies::LoadActivityIds(path) ==
+            std::set<std::string>{"bonus", "finale", "story"},
+        "activity IDs come from activity enums only, without duplicates");
+  WritePackage(path, {{"stats_extraction.json", "{}"}});
+  Check(Trophies::LoadActivityIds(path).empty(),
+        "package without enum definitions has no activities");
+}
+
 void TestProgress(const std::filesystem::path &directory) {
   const auto package = MakePackage(directory);
   Trophies::UnlockData unlocks;
@@ -656,6 +672,7 @@ int main() {
   TestLocalization();
   TempDirectory directory;
   TestEventExtraction(directory.Path());
+  TestActivityIds(directory.Path());
   TestProgress(directory.Path());
   TestUnlockPersistence(directory.Path());
   TestMaximumEventHle(directory.Path(), TestMaximumStats(directory.Path()));

@@ -137,7 +137,6 @@ void TestRegistrationAndErrors() {
 	for (size_t i = 0; i < nids.size(); ++i) {
 		const auto& symbol = registrations[i];
 		CHECK(symbol.name == nids[i] && symbol.library == "Vdecsw" && symbol.module == "Vdecsw");
-		CHECK(symbol.library_version == 1 && symbol.module_version_major == 1 && symbol.module_version_minor == 1);
 	}
 	CHECK(uint32_t(Fail(Error::StructSize)) == 0x81510101u);
 	CHECK(QueryComputeMemoryInfo(nullptr) == Fail(Error::ArgumentPointer));

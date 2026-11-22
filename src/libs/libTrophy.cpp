@@ -23,7 +23,7 @@ namespace Libs {
 
 namespace LibNpTrophy2 {
 
-LIB_VERSION("NpTrophy2", 1, "NpTrophy2", 1, 1);
+LIB_NAME("NpTrophy2", "NpTrophy2");
 
 constexpr int NP_TROPHY2_ERROR_ICON_FILE_NOT_FOUND = -2141898479; /* 0x80553911 */
 
@@ -571,7 +571,7 @@ LIB_DEFINE(InitNet_1_NpTrophy2) {
 
 namespace LibNpUniversalDataSystem {
 
-LIB_VERSION("NpUniversalDataSystem", 1, "NpUniversalDataSystem", 1, 1);
+LIB_NAME("NpUniversalDataSystem", "NpUniversalDataSystem");
 
 constexpr int NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT = -2141900542; /* 0x80553102 */
 

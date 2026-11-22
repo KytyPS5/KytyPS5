@@ -107,9 +107,8 @@ static const char* RenderColorTypeName(const RenderColorInfo& color) {
 	return color.image_id ? "RenderTexture" : "NoColorOutput";
 }
 
-static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& color,
-                               const RenderDepthInfo& depth, const CommandBuffer& buffer,
-                               uint32_t index_count, uint32_t flags) {
+static void LogFramebufferSkip(const char* draw_name, const RenderDepthInfo& depth,
+                               const CommandBuffer& buffer, uint32_t index_count, uint32_t flags) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
 	if (!graphics_debug_dump_enabled()) {
@@ -121,16 +120,13 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 		return;
 	}
 
-	LOGF(
-	    "DrawFramebufferSkip[%u]: %s color=%s color_addr=0x%010" PRIx64 " color_size=0x%016" PRIx64
-	    " color_image=%s depth_format=%s depth_image=%s depth_vaddr_num=%d target_mask=0x%08" PRIx32
-	    " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
-	    log_id, draw_name, RenderColorTypeName(color), color.desc.info.data.address,
-	    color.desc.info.data.size, color.image_id ? "yes" : "no",
-	    vk::to_string(depth.desc.view_info.format).c_str(), depth.image_id ? "yes" : "no",
-	    static_cast<int>(!depth.desc.info.data.Empty()) +
-	        static_cast<int>(depth.desc.info.HasStencil()),
-	    ctx.GetRenderTargetMask(), static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
+	LOGF("DrawFramebufferSkip[%u]: %s depth_format=%s depth_image=%s depth_vaddr_num=%d "
+	     "target_mask=0x%08" PRIx32 " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
+	     log_id, draw_name, vk::to_string(depth.desc.view_info.format).c_str(),
+	     depth.image_id ? "yes" : "no",
+	     static_cast<int>(!depth.desc.info.data.Empty()) +
+	         static_cast<int>(depth.desc.info.HasStencil()),
+	     ctx.GetRenderTargetMask(), static_cast<uint32_t>(ucfg.GetPrimType()), index_count, flags);
 }
 
 static void LogMrtState(const char* draw_name, const CommandBuffer& buffer,
@@ -646,10 +642,11 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 }
 
 struct VertexBufferRange {
-	uint64_t                     base_address  = 0;
-	uint64_t                     requested_end = 0;
-	uint64_t                     acquired_end  = 0;
-	std::pair<Buffer*, uint64_t> binding;
+	uint64_t base_address;
+	uint64_t requested_end;
+	uint64_t acquired_end;
+	Buffer*  buffer;
+	uint64_t offset;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
@@ -657,20 +654,21 @@ struct VertexBufferRange {
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
 
-	std::array<vk::Buffer, MaxBuffers>     buffers {};
-	std::array<vk::DeviceSize, MaxBuffers> offsets {};
-	std::array<vk::DeviceSize, MaxBuffers> sizes {};
+	// Filled only up to count.
+	std::array<vk::Buffer, MaxBuffers>     buffers;
+	std::array<vk::DeviceSize, MaxBuffers> offsets;
+	std::array<vk::DeviceSize, MaxBuffers> sizes;
 	uint32_t                               count = 0;
 };
 
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
+static void AcquireVertexBuffers(CommandBuffer& buffer, const ShaderVertexInputInfo& vs_input_info,
+                                 PreparedVertexBuffers& prepared) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	// Collect the non-empty guest vertex ranges.
-	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes;
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges;
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
@@ -683,7 +681,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     vertex.addr, size);
 		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size};
+		ranges[range_count++] = {.base_address = vertex.addr, .requested_end = vertex.addr + size};
 	}
 
 	std::sort(ranges.begin(), ranges.begin() + range_count,
@@ -691,32 +689,29 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		          return left.base_address < right.base_address;
 	          });
 
-	// Merge overlapping or touching ranges before acquiring host buffers.
-	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
-	uint32_t                                                      merged_count = 0;
+	// Merge overlapping or touching ranges in place before acquiring host buffers.
+	uint32_t merged_count = 0;
 	for (uint32_t i = 0; i < range_count; i++) {
 		const auto& range = ranges[i];
-		if (merged_count != 0 &&
-		    merged_ranges[merged_count - 1].requested_end >= range.base_address) {
-			merged_ranges[merged_count - 1].requested_end =
-			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
+		if (merged_count != 0 && ranges[merged_count - 1].requested_end >= range.base_address) {
+			auto& merged         = ranges[merged_count - 1];
+			merged.requested_end = std::max(merged.requested_end, range.requested_end);
 			continue;
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
+		ranges[merged_count++] = range;
 	}
+	const auto merged_ranges = std::span(ranges).first(merged_count);
 
 	auto& cache = buffer.GetContext().GetBufferCache();
-	for (uint32_t i = 0; i < merged_count; i++) {
-		auto& range = merged_ranges[i];
+	for (auto& range: merged_ranges) {
 		// PPSA20298
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+		std::tie(range.buffer, range.offset) = cache.ObtainBuffer(range.base_address, size, false);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
-	PreparedVertexBuffers prepared;
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
@@ -728,25 +723,22 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			}
 			prepared.buffers[i] = null_buffer;
 			prepared.offsets[i] = 0;
+			prepared.sizes[i]   = 0;
 			continue;
 		}
 
-		const auto range = std::find_if(merged_ranges.begin(), merged_ranges.begin() + merged_count,
-		                                [&](const VertexBufferRange& value) {
-			                                return vertex.addr >= value.base_address &&
-			                                       vertex.addr < value.acquired_end;
-		                                });
-		if (range == merged_ranges.begin() + merged_count) {
+		const auto range = std::ranges::find_if(merged_ranges, [&](const VertexBufferRange& value) {
+			return vertex.addr >= value.base_address && vertex.addr < value.acquired_end;
+		});
+		if (range == merged_ranges.end()) {
 			EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
 			     vertex.addr);
 		}
 
-		prepared.buffers[i] = range->binding.first->Handle();
-		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
+		prepared.buffers[i] = range->buffer->Handle();
+		prepared.offsets[i] = range->offset + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
 	}
-
-	return prepared;
 }
 
 static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
@@ -838,8 +830,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
-	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
-	// compiled.
+	// Vertex programs the host cannot run are not compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
@@ -852,20 +843,22 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                         &ShaderVertexInputInfo::stage)) {
 		return false;
 	}
+	auto& targets       = m_targets;
+	targets.color_count = 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+			ResolveRenderColorTarget(buffer, targets.colors[targets.color_count], slot);
+			if (targets.colors[targets.color_count].image_id) {
+				targets.color_count++;
 			}
 		}
 	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
+	ResolveRenderDepthTarget(buffer, targets.depth);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
-	const auto colors       = std::span {state.color_info, state.color_count};
-	const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
-	                                                    : state.color_info[0].desc.info.samples;
+	const auto colors       = std::span {targets.colors, targets.color_count};
+	const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
+	                                                 : targets.colors[0].desc.info.samples;
 	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
 		    return color.desc.info.samples != pass_samples;
 	    })) {
@@ -874,9 +867,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
 			return color.desc.info.samples != raster;
 		});
-		state.color_count -= static_cast<uint32_t>(dropped.size());
-		if (state.depth_info.image_id && state.depth_info.desc.info.samples != raster) {
-			state.depth_info = {};
+		targets.color_count -= static_cast<uint32_t>(dropped.size());
+		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
+			targets.depth = {};
 		}
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -885,9 +878,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 
-	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
-		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
-		                   draw.index_count, 0);
+	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
+		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
 		return false;
 	}
 
@@ -932,8 +924,8 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
-	                             const DrawRenderState& state, uint32_t index_type_and_size,
-                                 const void* index_addr) {
+                                 const DrawRenderState& state, const DrawTargets& targets,
+                                 uint32_t index_type_and_size, const void* index_addr) {
 	if (!graphics_debug_dump_enabled()) {
 		return;
 	}
@@ -942,12 +934,15 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 		return;
 	}
 
+	static const RenderColorInfo none {};
+
+	const auto& color = targets.color_count != 0 ? targets.colors[0] : none;
 	if (state.ps_active) {
-		LogDrawTargetState(draw.Name(), state.color_info[0], state.depth_info, buffer,
-		                   state.ps_input_info, draw.index_count, 0);
+		LogDrawTargetState(draw.Name(), color, targets.depth, buffer, state.ps_input_info,
+		                   draw.index_count, 0);
 	}
-	LogDrawInputState(buffer, state.color_info[0], state.vertex_info[0], index_type_and_size,
-	                  draw.index_count, index_addr);
+	LogDrawInputState(buffer, color, state.vertex_info[0], index_type_and_size, draw.index_count,
+	                  index_addr);
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
@@ -989,19 +984,19 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 }
 
 bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                       const DrawEmitInfo& emit, DrawRenderState& state) {
+                                      const DrawEmitInfo& emit, const DrawRenderState& state) {
 	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
 		return false;
 	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto& hw = buffer.GetRegisters();
-	auto& depth = state.depth_info;
-	auto& color = state.color_info[0];
+	auto&       depth = m_targets.depth;
+	auto&       color = m_targets.colors[0];
 	EXIT_NOT_IMPLEMENTED(
 	    !m_context.GetGraphics().maintenance8_enabled ||
 	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
-	    state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	    m_targets.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
 	    color.desc.info.samples != 1 || depth.desc.info.extent.width != color.Extent().width ||
 	    depth.desc.info.extent.height != color.Extent().height ||
 	    depth.desc.view_info.layer_count != 1 || color.desc.view_info.layer_count != 1 ||
@@ -1043,7 +1038,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 }
 
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                         DrawRenderState& state, const DrawEmitInfo& emit,
+                                         const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
@@ -1109,13 +1104,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	PrepareGraphicsBindings(stages, m_targets);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	vk::DeviceAddress     mesh_indices = 0;
 	if (!mesh_active) {
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		AcquireVertexBuffers(buffer, state.vertex_info[0], vertex_bindings);
+		index_binding = PrepareIndexBuffer(buffer, index_source);
 	} else if (draw.indexed) {
 		const auto [indices, offset] =
 		    m_context.GetBufferCache().ObtainBuffer(index_begin, index_end - index_begin, false);
@@ -1129,11 +1124,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state);
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
+	                                            m_targets.depth, feedback_aspects, stages);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
@@ -1191,7 +1185,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
@@ -1351,8 +1345,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 		return true;
 	}
 
-	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
-	                     args.index_addr);
+	LogDrawStateIfNeeded(buffer, draw, state, m_targets, args.index_type_and_size, args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
 	if (emit) {
@@ -1430,7 +1423,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		return true;
 	}
 
-	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
+	LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
 	                                  args.indirect);

@@ -17,7 +17,7 @@ namespace Libs {
 
 namespace LibUlt {
 
-LIB_VERSION("Ult", 1, "Ult", 1, 1);
+LIB_NAME("Ult", "Ult");
 
 constexpr int ULT_ERROR_NULL      = -2139029503; // 0x80810001
 constexpr int ULT_ERROR_ALIGNMENT = -2139029502; // 0x80810002

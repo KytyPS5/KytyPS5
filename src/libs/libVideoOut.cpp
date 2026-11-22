@@ -8,7 +8,7 @@ namespace Libs {
 
 namespace LibGen5 {
 
-LIB_VERSION("VideoOut", 1, "VideoOut", 1, 1);
+LIB_NAME("VideoOut", "VideoOut");
 
 LIB_DEFINE(InitVideoOut_1) {
 	PRINT_NAME_ENABLE(true);

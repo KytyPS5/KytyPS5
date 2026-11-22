@@ -173,7 +173,8 @@ void Run(const RunOptions& options) {
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
-	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
+	// /hostapp mounts the same folder writable.
+	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0", true);
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	MountSandboxDirs();

@@ -117,12 +117,20 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
+PssrUpscaler GetPssrUpscaler() {
+	return g_config->pssr_upscaler;
+}
+
 const std::filesystem::path& GetDlssFolder() {
 	return g_config->dlss_folder;
 }
 
 uint32_t GetDlssPreset() {
 	return g_config->dlss_preset;
+}
+
+const std::filesystem::path& GetFsrFolder() {
+	return g_config->fsr_folder;
 }
 
 bool AmdCpuEnabled() {
@@ -221,6 +229,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+uint32_t GetFlushDraws() {
+	return g_config->flush_draws;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -231,6 +243,10 @@ bool OcclusionQueriesEnabled() {
 
 bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
+}
+
+bool NativeRtEnabled() {
+	return g_config->native_rt;
 }
 
 bool LodStatsEnabled() {
@@ -251,6 +267,10 @@ bool PlayGoHackEnabled() {
 
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
+}
+
+const std::string& GetLaunchActivity() {
+	return g_config->launch_activity;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

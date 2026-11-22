@@ -10,7 +10,7 @@
 
 namespace Libs {
 
-LIB_VERSION("PngDec", 1, "PngDec", 1, 1);
+LIB_NAME("PngDec", "PngDec");
 
 namespace PngDec {
 

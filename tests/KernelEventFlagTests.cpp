@@ -129,9 +129,13 @@ TEST(KernelEventFlag, DeleteReleasesWaitersWithAccessDenied) {
 
 TEST(KernelEventFlag, RejectsInvalidWaits) {
 	auto* ef = Create(0, 0);
-	for (uint32_t mode: {0x00u, 0x03u, 0x31u}) {
+	for (uint32_t mode: {0x00u, 0x03u, 0x04u, 0x08u, 0x30u, 0x31u, 0x40u, 0x80u}) {
 		EXPECT_EQ(KernelWaitEventFlag(ef, 1, mode, nullptr, nullptr), KERNEL_ERROR_EINVAL);
 		EXPECT_EQ(KernelPollEventFlag(ef, 1, mode, nullptr), KERNEL_ERROR_EINVAL);
+	}
+	// Valid modes pass validation; an empty flag just reports EBUSY for a wait.
+	for (uint32_t mode: {0x01u, 0x02u, 0x11u, 0x21u, 0x12u, 0x22u}) {
+		EXPECT_EQ(KernelPollEventFlag(ef, 1, mode, nullptr), KERNEL_ERROR_EBUSY);
 	}
 	EXPECT_EQ(KernelPollEventFlag(ef, 0, OR, nullptr), KERNEL_ERROR_EINVAL);
 	EXPECT_EQ(KernelPollEventFlag(nullptr, 1, 0, nullptr), KERNEL_ERROR_EINVAL);

@@ -77,9 +77,14 @@ uint64_t Cleared(uint64_t pattern, uint64_t bits, uint32_t mode) {
 	return (mode & CLEAR_PAT) != 0 ? pattern & ~bits : pattern;
 }
 
-// Exactly one of AND and OR, at most one clear mode and a non-empty pattern.
+// A non-empty pattern, a supported wait mode (0x01/0x02) and a supported clear mode
+// (0x00/0x10/0x20); other nibble values are rejected instead of read as OR/no-clear (#2495).
 bool ValidWait(uint64_t bits, uint32_t mode) {
-	return bits != 0 && (mode & 0x03u) != 0 && (mode & 0x03u) != 0x03u && (mode & 0x30u) != 0x30u;
+	const uint32_t wait  = mode & 0x0fu;
+	const uint32_t clear = mode & 0xf0u;
+
+	return bits != 0 && (wait == 0x01u || wait == 0x02u) &&
+	       (clear == 0x00u || clear == 0x10u || clear == 0x20u);
 }
 
 // A timed wait sleeps ceil(timeout / tick) + 1 ticks of 1 ms from the last tick: at least the

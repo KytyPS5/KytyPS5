@@ -319,6 +319,8 @@ static uint8_t Scale(uint8_t value, float scale) {
 	return static_cast<uint8_t>(std::max(1L, std::lround(value * scale)));
 }
 
+constexpr uint8_t DUALSENSE_TRIGGER_OFF = 0x05;
+
 static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, float scale,
                                  uint8_t type, uint8_t frequency = 0) {
 	uint16_t active = 0;
@@ -334,7 +336,7 @@ static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, floa
 		}
 	}
 
-	effect[0] = active != 0 && (type != 0x26 || frequency != 0) ? type : 0x05;
+	effect[0] = active != 0 && (type != 0x26 || frequency != 0) ? type : DUALSENSE_TRIGGER_OFF;
 	effect[1] = static_cast<uint8_t>(active);
 	effect[2] = static_cast<uint8_t>(active >> 8u);
 	effect[3] = static_cast<uint8_t>(packed);
@@ -348,7 +350,7 @@ static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, floa
 static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, uint8_t* effect,
                                         float scale) {
 	std::memset(effect, 0, 11);
-	effect[0] = 0x05;
+	effect[0] = DUALSENSE_TRIGGER_OFF;
 
 	uint8_t strengths[10] = {};
 	switch (command.mode) {
@@ -421,12 +423,16 @@ enum TriggerState : int32_t {
 
 static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value,
                                   int32_t previous) {
+	uint8_t effect[11];
+	if (trigger_effect_to_dualsense(command, effect, 1.0f) && effect[0] == DUALSENSE_TRIGGER_OFF) {
+		return TRIGGER_STATE_OFF;
+	}
 	// Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.
 	const int pos = value == 0 ? 0 : value == 255 ? 9 : 1 + value / 32;
 	switch (command.mode) {
 		case 1: // feedback: resistance from position data[0], strength data[1]
-			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
-			                                                      : TRIGGER_STATE_FEEDBACK_STANDBY;
+			return pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
+			                              : TRIGGER_STATE_FEEDBACK_STANDBY;
 		case 2: // weapon: resistance from data[0], released at data[1]
 			if (value < command.data[0] * 32) {
 				return TRIGGER_STATE_WEAPON_STANDBY;
@@ -436,9 +442,8 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 			           ? TRIGGER_STATE_WEAPON_FIRED
 			           : TRIGGER_STATE_WEAPON_PULLING;
 		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
-			return command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
-			           ? TRIGGER_STATE_VIBRATION_ACTIVE
-			           : TRIGGER_STATE_VIBRATION_STANDBY;
+			return pos >= command.data[0] ? TRIGGER_STATE_VIBRATION_ACTIVE
+			                              : TRIGGER_STATE_VIBRATION_STANDBY;
 		case 4: // multiple-position feedback: strength per position
 			return command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_ACTIVE
 			                              : TRIGGER_STATE_FEEDBACK_STANDBY;
@@ -446,9 +451,8 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 			return pos >= command.data[0] && pos < command.data[1] ? TRIGGER_STATE_FEEDBACK_ACTIVE
 			                                                       : TRIGGER_STATE_FEEDBACK_STANDBY;
 		case 6: // multiple-position vibration: frequency data[0], amplitude per position
-			return command.data[0] != 0 && command.data[1 + pos] != 0
-			           ? TRIGGER_STATE_VIBRATION_ACTIVE
-			           : TRIGGER_STATE_VIBRATION_STANDBY;
+			return command.data[1 + pos] != 0 ? TRIGGER_STATE_VIBRATION_ACTIVE
+			                                  : TRIGGER_STATE_VIBRATION_STANDBY;
 		default: return TRIGGER_STATE_OFF;
 	}
 }
@@ -852,8 +856,8 @@ static void StopHostPad(SDL_Gamepad* pad) {
 	if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 		DualSenseEffects effect {};
 		effect.enable_bits     = 0x0c;
-		effect.right_trigger[0] = 0x05;
-		effect.left_trigger[0]  = 0x05;
+		effect.right_trigger[0] = DUALSENSE_TRIGGER_OFF;
+		effect.left_trigger[0]  = DUALSENSE_TRIGGER_OFF;
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
 	(void)SDL_RumbleGamepad(pad, 0, 0, 0);

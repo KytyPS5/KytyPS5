@@ -25,6 +25,7 @@
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QStyleHints>
 #include <QVariant>
@@ -337,6 +338,29 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	return args;
 }
 
+#ifdef __APPLE__
+// The emulator keeps its data (_SaveData, caches, the log) next to its working directory. Inside
+// the bundle that data dies with every app replacement and the folder is read-only for standard
+// accounts in /Applications, so run it from a per-user data directory instead (#2491) and move
+// what an older launcher left in the bundle there once. A rename that fails (for example across
+// volumes or without write access) leaves the old copy in place rather than dropping anything.
+static QString EmulatorDataDirectory(const QString& bundle_dir) {
+	QString data_dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+	if (!data_dir.endsWith("/KytyPS5")) data_dir += "/KytyPS5";
+	if (!QDir().mkpath(data_dir)) return bundle_dir;
+	static const char* const data_names[] = {"_SaveData", "_PipelineCache", "_TempData",
+	                                         "_DownloadData"};
+	for (const char* name: data_names) {
+		const QString from = QDir(bundle_dir).absoluteFilePath(QString::fromLatin1(name));
+		const QString to   = data_dir + '/' + name;
+		if (QFile::exists(from) && !QFile::exists(to)) {
+			QDir().rename(from, to);
+		}
+	}
+	return data_dir;
+}
+#endif
+
 #ifdef __linux__
 // Runs the command in bash, then waits for a key (with close_on_clean_exit, only after an error).
 // The command goes in as positional parameters ("$@"), so it needs no quoting.
@@ -450,7 +474,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	process->setNativeArguments(
 	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
+#if defined(__APPLE__)
+	process->setWorkingDirectory(EmulatorDataDirectory(QFileInfo(interpreter).absolutePath()));
+#else
 	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+#endif
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

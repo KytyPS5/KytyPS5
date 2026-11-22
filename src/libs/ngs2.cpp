@@ -1223,7 +1223,7 @@ struct Ngs2VoiceInternal {
 				info.num_samples      = 0;
 			}
 			const auto* block_data = data + info.data_offset;
-			// A data-only block that does not repeat extends a contiguous last block of the same
+			// A data-only block with a repeat count of 0 extends a contiguous last block of the same
 			// user data.
 			if (join && !blocks.empty() && Ngs2IsDataOnly(info) && info.num_repeats == 0 &&
 			    blocks.back().data + blocks.back().info.data_size == block_data &&
@@ -2152,17 +2152,20 @@ static_assert(offsetof(Ngs2VoiceCallbackInfo, size) == 0x28 &&
               offsetof(Ngs2VoiceCallbackInfo, repeats) == 0x30 &&
               offsetof(Ngs2VoiceCallbackInfo, attributes) == 0x34);
 
+// A block plays max(1, num_repeats) passes; UINT32_MAX repeats it endlessly.
+static bool Ngs2LoopsAgain(const Ngs2VoiceInternal::Block& block) {
+	return block.info.num_repeats == UINT32_MAX ||
+	       block.repeated_count + 1 < block.info.num_repeats;
+}
+
 static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	const auto generation = voice.source_generation;
 	auto&      block      = voice.blocks.front();
-	const bool repeat     = block.info.num_repeats != 0;
+	const bool repeat     = Ngs2LoopsAgain(block);
 	// Every pass and every dropped block counts its whole data as decoded.
 	voice.decoded_bytes += block.info.data_size - block.data_cursor;
 	voice.waveform_end = voice.WaveformData();
 	if (repeat) {
-		if (block.info.num_repeats != UINT32_MAX) {
-			--block.info.num_repeats;
-		}
 		++block.repeated_count;
 		block.data_cursor = 0;
 		if (voice.decoder != nullptr) {
@@ -2317,7 +2320,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			if (left != 0 && left < frame_bytes) {
 				// A frame that straddles the block's end continues in the following blocks; the
 				// voice starves until they are queued.
-				EXIT_NOT_IMPLEMENTED(block.info.num_repeats != 0 || frame_bytes > straddle.size());
+				EXIT_NOT_IMPLEMENTED(Ngs2LoopsAgain(block) || frame_bytes > straddle.size());
 				const int gathered = Ngs2GatherFrame(voice, frame_bytes, straddle.data());
 				voice.incomplete_frame |= gathered == NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA;
 				if (gathered != static_cast<int>(frame_bytes)) {
@@ -2343,8 +2346,7 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 				consumed -= bytes;
 				if (voice.duration_remaining == 0 || front.data_cursor == front.info.data_size) {
 					// A repeating block restarts its duration, so it must hold all of it.
-					EXIT_NOT_IMPLEMENTED(voice.duration_remaining != 0 &&
-					                     front.info.num_repeats != 0);
+					EXIT_NOT_IMPLEMENTED(voice.duration_remaining != 0 && Ngs2LoopsAgain(front));
 					if (!Ngs2FinishBlock(voice)) {
 						return false;
 					}
@@ -3929,7 +3931,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					}
 					case 4: {
 						for (auto& block: voice->blocks) {
-							if (block.info.num_repeats != 0) {
+							if (Ngs2LoopsAgain(block)) {
 								block.info.num_repeats = 0;
 								break;
 							}

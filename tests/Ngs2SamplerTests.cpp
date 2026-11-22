@@ -2432,7 +2432,7 @@ void TestCustomVoiceStateCapacity() {
 void TestPitchLoopAndSkip() {
 	Fixture       f(24000);
 	const int16_t pcm[] = {-30000, 8192, 16384};
-	f.Queue(pcm, 2, 0, 1, 1);
+	f.Queue(pcm, 2, 0, 2, 1);
 	struct Pitch {
 		Ngs2VoiceParamHeader header {16, 0, 0x10000005};
 		float                ratio    = 2.0f;
@@ -2647,13 +2647,14 @@ void TestPcmFrameGather() {
 	                                       bits(0xbf800000), bits(0xbf800000), bits(0x34000000),
 	                                       bits(0x3f7ffffe), bits(0x34000000)};
 	// The blocks lie apart, so they do not join: 14 bytes of the first two frames and two bytes
-	// of frame 2, one byte, then the rest of frame 2 and frame 3.
+	// of frame 2, one byte, then the rest of frame 2 and frame 3. One repeat plays once, so the
+	// extent continues past the first block.
 	std::array<uint8_t, 44> data {};
 	std::copy_n(pcm.begin(), 14, data.begin());
 	data[20] = pcm[14];
 	std::copy_n(pcm.begin() + 15, 9, data.begin() + 24);
 	const Ngs2WaveformBlock split[] = {
-	    {0, 14, 0, 0, 4, 0, 0}, {20, 1, 0, 0, 0, 0, 0}, {24, 9, 0, 0, 0, 0, 0}};
+	    {0, 14, 1, 0, 4, 0, 0}, {20, 1, 0, 0, 0, 0, 0}, {24, 9, 0, 0, 0, 0, 0}};
 	Fixture gather(48000, 2, Ngs2RackType::Sampler, 0x14);
 	Check(gather.QueueBlocks(data.data(), split, 3, 0) == OK, "split blocks were rejected");
 	gather.Render(4);
@@ -2681,7 +2682,7 @@ void TestPcmFrameGather() {
 
 	// A data-only block that the extent ends in is dropped, whatever its repeats.
 	Fixture                 drop(48000, 2, Ngs2RackType::Sampler, 0x14);
-	const Ngs2WaveformBlock looped[] = {{0, 14, 0, 0, 3, 0, 0}, {20, 4, 1, 0, 0, 0, 0}};
+	const Ngs2WaveformBlock looped[] = {{0, 14, 0, 0, 3, 0, 0}, {20, 4, 2, 0, 0, 0, 0}};
 	Check(drop.QueueBlocks(tail.data(), looped, 2, 0) == OK, "a repeating block was rejected");
 	drop.Render(4);
 	Check(drop.voice.samples == std::vector<float> {expected[0], expected[1], expected[2], 0,
@@ -2736,7 +2737,7 @@ void TestDecodedDataSizeAndEmptyBlockCallbacks() {
 	const int16_t pcm[] = {4096, 8192, 12288, 16384, 20480};
 	// Each pass counts the data its extent leaves unread.
 	Fixture                 rest(48000);
-	const Ngs2WaveformBlock looped {0, 8, 1, 0, 2, 0, 0};
+	const Ngs2WaveformBlock looped {0, 8, 2, 0, 2, 0, 0};
 	// A callback mask without a handler calls nothing.
 	Ngs2VoiceCallbackParam callback {{sizeof(Ngs2VoiceCallbackParam), 0, 7}, 0, 0, 3};
 	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&rest.voice), &callback.header) == OK &&
@@ -2930,7 +2931,7 @@ void TestBlockCallbackLayout() {
 	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordCallbackTail);
 	f.voice.callback_flags = 2;
 	const int16_t pcm[]    = {8192, 16384};
-	f.Queue(pcm, 2, 0, 1);
+	f.Queue(pcm, 2, 0, 2);
 	f.Render(2);
 	Check(g_callback_size == sizeof(pcm) && g_callback_repeats == 1,
 	      "the loop callback did not report its data size or repeat count at their offsets");
@@ -2944,7 +2945,7 @@ void TestCancelKeepsOnlyTheFrontBlock() {
 	const int16_t pcm[] = {8192, 16384, -8192, -16384};
 	// The front block holds more than the samples a reader fetches ahead of the output.
 	const int16_t front[] = {2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384};
-	f.Queue(front, 8, 1, 1);
+	f.Queue(front, 8, 1, 2);
 	f.Queue(pcm + 2, 1, 1);
 	f.Render(1);
 	// Cancel during the first pass of the looping block.
@@ -3374,7 +3375,7 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	f.Queue(pcm, 2, 0, 2);
 	f.Render(6);
 	// The end reports no repeat count; each loop reports the passes so far.
-	Check(log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {2, 2}, {1, 0}},
+	Check(log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {1, 0}},
 	      "loop and completion callbacks reported the wrong repeat counts");
 	Check(f.voice.blocks.empty(), "finite loop did not complete");
 
@@ -3386,6 +3387,8 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	active.voice.callback_flags = 2;
 	active.Queue(pcm, 2, 1, UINT32_MAX);
 	active.Queue(pcm + 2, 1, 0);
+	// An endless block loops on past 2^32 - 1 passes.
+	active.voice.blocks.front().repeated_count = UINT32_MAX - 1;
 	active.Render(6);
 	Check(log.events.size() == 1 && active.voice.decoded_samples == 2 &&
 	          active.voice.blocks.front().data_cursor == 0 && active.voice.samples[2] == 0,
@@ -3399,15 +3402,16 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	          active.voice.blocks.empty() && log.events.size() == 1,
 	      "exiting infinite loop lost its final iteration or ignored callback flags");
 
+	// Exit loop passes over a block of one repeat, which does not loop.
 	Fixture pending(48000, 1, type);
-	pending.Queue(pcm, 1, 1);
+	pending.Queue(pcm, 1, 1, 1);
 	pending.Queue(pcm + 1, 1, 1, UINT32_MAX);
 	pending.Queue(pcm + 2, 1, 0);
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&pending.voice), &exit_loop);
 	pending.Render(3);
 	Check(pending.voice.samples == std::vector<float> {0.25f, 0.5f, 0.75f} &&
 	          pending.voice.blocks.empty(),
-	      "exiting a pending loop skipped its first iteration");
+	      "exiting a pending loop skipped its first iteration or chose a one-pass block");
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&pending.voice), &exit_loop);
 }
 
@@ -3444,7 +3448,7 @@ void TestAtrac9Looping() {
 	const auto reference = baseline->voice.samples;
 	Check(std::ranges::any_of(reference, [](float sample) { return std::abs(sample) > 0.00001f; }),
 	      "synthetic compressed fixture produced no decoded signal");
-	auto finite = make_voice(2, finite_log);
+	auto finite = make_voice(3, finite_log);
 	finite->Render(822);
 	Check(finite->voice.state == Ngs2VoicePlayState::Empty &&
 	          finite->voice.decoded_samples == 411 && finite->voice.decoded_bytes == 576 &&
@@ -3458,7 +3462,7 @@ void TestAtrac9Looping() {
 		Check(finite->voice.samples[i * 274 + 273] == tail,
 		      "compressed loop dropped the final frame or broke boundary interpolation");
 	}
-	auto split = make_voice(2, split_log);
+	auto split = make_voice(3, split_log);
 	split->Render(273);
 	auto joined = split->voice.samples;
 	split->Render(549);
@@ -3575,7 +3579,7 @@ void TestWaveformReadAddress() {
 	Fixture       f(48000, 2);
 	f.system.option.num_grain_samples = 1;
 	const int16_t pcm[] = {-100, -100, 8192, 4096, 16384, 8192};
-	f.Queue(pcm, 2, 1, 1, 1);
+	f.Queue(pcm, 2, 1, 2, 1);
 	const auto next_data = [&]() {
 		Ngs2SamplerVoiceState state {};
 		Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&f.voice), &state.voice_state, sizeof(state));

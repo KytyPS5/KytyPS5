@@ -39,6 +39,8 @@ constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_SIZE =
     static_cast<int32_t>(0x804a8011u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_TYPE =
+    static_cast<int32_t>(0x804a8050u);
 constexpr int32_t NGS2_ERROR_INVALID_NUM_CHANNELS =
     static_cast<int32_t>(0x804a8052u);
 constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
@@ -53,10 +55,16 @@ constexpr int32_t NGS2_ERROR_INVALID_PEAK_METER_DETECT_TYPE =
     static_cast<int32_t>(0x804a8093u);
 constexpr int32_t NGS2_ERROR_INVALID_MATRIX_TYPE =
     static_cast<int32_t>(0x804a809au);
+constexpr int32_t NGS2_ERROR_INVALID_RENDER_BUFFER_ADDRESS =
+    static_cast<int32_t>(0x804a8251u);
+constexpr int32_t NGS2_ERROR_INVALID_RENDER_BUFFER_SIZE =
+    static_cast<int32_t>(0x804a8252u);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_INDEX =
     static_cast<int32_t>(0x804a8305u);
 constexpr int32_t NGS2_ERROR_INVALID_MODULE_LOCATION =
     static_cast<int32_t>(0x804a8308u);
+constexpr int32_t NGS2_ERROR_INVALID_NUM_BUFFERS =
+    static_cast<int32_t>(0x804a830bu);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_PARAM_ID =
     static_cast<int32_t>(0x804a835au);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE =
@@ -2488,7 +2496,10 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					continue;
 				}
 				if (info.module_id != 0x19 && info.module_id != 0x1f) {
-					if (!module.render_warned) {
+					// A custom mastering voice's Output module is written after its chain.
+					const bool output = info.module_id == 0x1a &&
+					                    voice.rack->type == Ngs2RackType::CustomMastering;
+					if (!output && !module.render_warned) {
 						Log::WriteToConsoleAndLog(fmt::sprintf(
 						    "warning: NGS2 custom module 0x%02x at index %zu is ignored during render\n",
 						    info.module_id, m));
@@ -2541,20 +2552,27 @@ static int16_t Ngs2ToInt16(float sample) {
 	                          : static_cast<int16_t>(std::clamp(sample, -1.0f, 1.0f) * 32767.0f);
 }
 
-// Writes the voice's first channels, as many as both have, into render buffer output_id. An int16
-// buffer takes this voice's grain alone, zero in its other channels; a float buffer adds it. An
-// output_id past the render buffers writes nothing.
-static void Ngs2MixOutput(const Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
-                          uint32_t num_buffer_info, uint32_t grain) {
-	if (voice.output_id >= num_buffer_info) {
+// The render buffers of one render; bit i of `written` is set once a voice wrote buffer i.
+struct Ngs2RenderBuffers {
+	const Ngs2RenderBufferInfo* info    = nullptr;
+	uint32_t                    count   = 0;
+	uint32_t                    written = 0;
+};
+
+// Writes the voice's first channels of `samples`, as many as both have, into render buffer
+// output_id, zero in its other channels, over one grain of frames. An int16 buffer takes this
+// voice's grain alone; a float buffer takes the first writer's and adds the later ones. A
+// big-endian buffer counts as written but keeps its bytes. An output_id past the render buffers
+// writes nothing.
+static void Ngs2MixOutput(const Ngs2VoiceInternal& voice, const float* samples,
+                          Ngs2RenderBuffers& buffers, uint32_t grain) {
+	if (voice.output_id >= buffers.count) {
 		return;
 	}
-	const auto& output = buffer_info[voice.output_id];
-	EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
-	EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x18);
-	EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
-	                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
-	                                                                             : sizeof(float)));
+	const auto&    output = buffers.info[voice.output_id];
+	const uint32_t bit    = 1u << voice.output_id;
+	const bool     first  = (buffers.written & bit) == 0;
+	buffers.written |= bit;
 	const uint32_t frame    = output.num_channels;
 	const uint32_t channels = std::min(voice.channels, frame);
 	if (output.waveform_type == 0x12) {
@@ -2562,15 +2580,22 @@ static void Ngs2MixOutput(const Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 		std::fill_n(pcm, size_t(grain) * frame, int16_t {0});
 		for (uint32_t c = 0; c < channels; ++c) {
 			for (uint32_t i = 0; i < grain; ++i) {
-				pcm[i * frame + c] = Ngs2ToInt16(voice.samples[c * grain + i]);
+				pcm[i * frame + c] = Ngs2ToInt16(samples[c * grain + i]);
 			}
 		}
 		return;
 	}
+	if (output.waveform_type != 0x18) {
+		return;
+	}
 	auto* pcm = static_cast<float*>(output.buffer);
+	if (first) {
+		std::fill_n(pcm, size_t(grain) * frame, 0.0f);
+	}
 	for (uint32_t c = 0; c < channels; ++c) {
 		for (uint32_t i = 0; i < grain; ++i) {
-			pcm[i * frame + c] += voice.samples[c * grain + i];
+			auto& out = pcm[i * frame + c];
+			out       = first ? samples[c * grain + i] : out + samples[c * grain + i];
 		}
 	}
 }
@@ -2692,8 +2717,8 @@ static void Ngs2MeterPeaks(Ngs2VoiceInternal::Mastering& mastering, size_t meter
 
 // Runs a playing mastering voice's input peak meter, channel converter, LFE filter, limiter, gain,
 // output peak meter and output in place on its N input channels.
-static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
-                                uint32_t num_buffer_info, uint32_t grain) {
+static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, Ngs2RenderBuffers& buffers,
+                                uint32_t grain) {
 	auto&          mastering = *voice.mastering;
 	const uint32_t inputs    = voice.channels;
 	const uint32_t blocks    = voice.rack->option.mastering.num_peak_meter_blocks;
@@ -2708,8 +2733,8 @@ static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 		Ngs2MeterPeaks(mastering, 0, voice.samples.data(), inputs, grain, blocks);
 	}
 	// The converter writes the output buffer's channels, at most N, and zeroes the rest.
-	const uint32_t outputs = std::min(inputs, voice.output_id < num_buffer_info
-	                                              ? buffer_info[voice.output_id].num_channels
+	const uint32_t outputs = std::min(inputs, voice.output_id < buffers.count
+	                                              ? buffers.info[voice.output_id].num_channels
 	                                              : inputs);
 	const float*   levels  = mastering.levels.data() + Ngs2MasteringLevelsOffset(inputs, outputs);
 	// Levels ramp from the previous grain's unless the shape changed or the voice was played.
@@ -2790,14 +2815,53 @@ static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 	}
 	mastering.meter_channels = metering ? inputs : 0;
 
-	Ngs2MixOutput(voice, buffer_info, num_buffer_info, grain);
+	Ngs2MixOutput(voice, voice.samples.data(), buffers, grain);
+}
+
+// Checks every buffer, in index order, before anything renders and returns the first failure.
+static int Ngs2CheckRenderBuffers(const Ngs2RenderBufferInfo* buffers, uint32_t count,
+                                  uint32_t grain) {
+	if (buffers == nullptr && count != 0) {
+		return NGS2_ERROR_INVALID_RENDER_BUFFER_ADDRESS;
+	}
+	if (count > 32) {
+		return NGS2_ERROR_INVALID_NUM_BUFFERS;
+	}
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto& buffer = buffers[i];
+		size_t      bytes  = 0;
+		switch (buffer.waveform_type) {
+			case 0x12:
+			case 0x13: bytes = sizeof(int16_t); break;
+			case 0x18:
+			case 0x19: bytes = sizeof(float); break;
+			default: return NGS2_ERROR_INVALID_WAVEFORM_TYPE;
+		}
+		if (buffer.num_channels == 0) {
+			return NGS2_ERROR_INVALID_NUM_CHANNELS;
+		}
+		if (buffer.buffer == nullptr) {
+			return NGS2_ERROR_INVALID_RENDER_BUFFER_ADDRESS;
+		}
+		if (buffer.buffer_size < bytes * buffer.num_channels * grain) {
+			return NGS2_ERROR_INVALID_RENDER_BUFFER_SIZE;
+		}
+	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
-	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
-	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	auto* ngs = Ngs2FindSystem(system_handle);
+	if (ngs == nullptr) {
+		return NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+	}
 	Common::LockGuard lock(ngs->mutex);
+	const auto        grain  = ngs->option.num_grain_samples;
+	const auto        result = Ngs2CheckRenderBuffers(buffer_info, num_buffer_info, grain);
+	if (result != OK) {
+		return result;
+	}
 	std::vector<Ngs2VoiceInternal*> voices;
 	{
 		Common::LockGuard racks_lock(g_racks_mutex);
@@ -2812,21 +2876,31 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 			}
 		}
 	}
-	// A buffer no voice writes stays silent, and float voices add onto silence.
-	for (uint32_t i = 0; i < num_buffer_info; ++i) {
-		if (buffer_info[i].buffer != nullptr && buffer_info[i].buffer_size != 0) {
-			std::memset(buffer_info[i].buffer, 0, buffer_info[i].buffer_size);
-		}
-	}
-	const auto grain = ngs->option.num_grain_samples;
+	Ngs2RenderBuffers buffers {buffer_info, num_buffer_info};
 	for (auto* voice: voices) {
 		Ngs2RenderVoice(*voice, voices, grain);
-		// A playing mastering voice renders its modules even without input.
-		if (voice->rack->type == Ngs2RackType::Mastering &&
-		    voice->state == Ngs2VoicePlayState::Playing && voice->channels != 0) {
-			Ngs2RenderMastering(*voice, buffer_info, num_buffer_info, grain);
-		} else if (voice->rack->type == Ngs2RackType::CustomMastering && voice->has_samples) {
-			Ngs2MixOutput(*voice, buffer_info, num_buffer_info, grain);
+		// A playing mastering voice renders its modules and writes its output even without input.
+		if (voice->state != Ngs2VoicePlayState::Playing || voice->channels == 0) {
+			continue;
+		}
+		if (voice->rack->type == Ngs2RackType::Mastering) {
+			Ngs2RenderMastering(*voice, buffers, grain);
+		} else if (voice->rack->type == Ngs2RackType::CustomMastering) {
+			// A custom mastering voice writes through the first Output module of its chain.
+			const auto* modules = voice->rack->option.custom_mastering.custom_rack_option.module;
+			const auto* end     = modules + voice->modules.size();
+			const auto* output =
+			    std::ranges::find(modules, end, 0x1au, &Ngs2CustomRackModuleInfo::module_id);
+			if (output != end) {
+				Ngs2MixOutput(*voice, voice->Buffer(output->source_buffer_id, grain), buffers,
+				              grain);
+			}
+		}
+	}
+	// A buffer no voice wrote is zeroed over its whole size.
+	for (uint32_t i = 0; i < num_buffer_info; ++i) {
+		if ((buffers.written >> i & 1u) == 0) {
+			std::memset(buffer_info[i].buffer, 0, buffer_info[i].buffer_size);
 		}
 	}
 	for (auto* voice: voices) {

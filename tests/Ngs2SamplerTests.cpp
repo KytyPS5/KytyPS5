@@ -878,6 +878,28 @@ void TestCustomSideChainUserFx() {
 	      "user FX did not receive the side-chain buffer after the source channels");
 }
 
+// A system created through the API, so that render finds its handle, with `grain`-sample grains.
+struct RenderSystem {
+	std::unique_ptr<std::byte[]> storage;
+	uintptr_t                    handle = 0;
+
+	explicit RenderSystem(uint32_t grain) {
+		auto option              = Ngs2DefaultSystemOption();
+		option.num_grain_samples = grain;
+		Ngs2ContextBufferInfo buffer {};
+		Check(Ngs2SystemQueryBufferSize(&option, &buffer) == OK, "system size query failed");
+		storage            = std::make_unique<std::byte[]>(buffer.host_buffer_size);
+		buffer.host_buffer = storage.get();
+		Check(Ngs2SystemCreate(&option, &buffer, &handle) == OK, "render system creation failed");
+	}
+
+	~RenderSystem() {
+		Check(Ngs2SystemDestroy(handle, nullptr) == OK, "render system cleanup failed");
+	}
+
+	Ngs2Internal& Internal() { return *reinterpret_cast<Ngs2Internal*>(handle); }
+};
+
 struct RenderRack {
 	std::unique_ptr<std::byte[]> storage;
 	uintptr_t handle = 0;
@@ -899,9 +921,8 @@ struct RenderRack {
 };
 
 void TestPcm16RenderOutput() {
-	Ngs2Internal system;
-	system.option                   = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 4;
+	RenderSystem render(4);
+	auto&        system = render.Internal();
 	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
 	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
 	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
@@ -949,9 +970,8 @@ void TestInt16Conversion() {
 // Two mastering voices into one render buffer: an int16 buffer holds one voice's grain, a float
 // buffer their sum.
 void TestMasteringVoicesShareOutput() {
-	Ngs2Internal system;
-	system.option                   = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 4;
+	RenderSystem render(4);
+	auto&        system = render.Internal();
 	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
 	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
 	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
@@ -1029,7 +1049,8 @@ Ngs2RackOptionUnion SingleVoiceRackOption(uint32_t rack_id) {
 
 // A sampler voice feeding a mastering voice, rendered in grains of 4 samples.
 struct MasteringRender {
-	Ngs2Internal         system;
+	RenderSystem         render_system;
+	Ngs2Internal&        system;
 	RenderRack           sampler;
 	RenderRack           master;
 	Ngs2VoiceInternal&   source;
@@ -1037,12 +1058,10 @@ struct MasteringRender {
 	std::vector<int16_t> input;
 
 	MasteringRender()
-	    : sampler(system, 0x1000, SingleVoiceRackOption(0x1000).common),
+	    : render_system(4), system(render_system.Internal()),
+	      sampler(system, 0x1000, SingleVoiceRackOption(0x1000).common),
 	      master(system, 0x3000, SingleVoiceRackOption(0x3000).common), source(sampler.Voice()),
-	      voice(master.Voice()) {
-		system.option                   = Ngs2DefaultSystemOption();
-		system.option.num_grain_samples = 4;
-	}
+	      voice(master.Voice()) {}
 
 	int Control(uint32_t cid, uint32_t first, uint32_t second = 0, uint16_t size = 16) {
 		struct {
@@ -1500,6 +1519,108 @@ void TestMasteringOutputRange() {
 	Check(m.Control(5, 99) == OK && m.voice.output_id == 32, "output id was not clamped to 32");
 	Check(m.Control(5, 0) == OK && m.Render(pcm, 2) == OK && pcm[0] == 0.25f && pcm[1] == -0.25f,
 	      "mastering voice did not play into render buffer 0");
+}
+
+// A render checks the system handle, then the buffer array, then each buffer in index order, and
+// returns the first failure.
+void TestRenderBufferChecks() {
+	Ngs2Internal unregistered;
+	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&unregistered), nullptr, 33) ==
+	          NGS2_ERROR_INVALID_SYSTEM_HANDLE,
+	      "a render of an unknown system handle did not fail first");
+
+	RenderSystem system(4);
+	const auto   handle = system.handle;
+	// Room for 38 channels of one 4-sample grain.
+	std::array<float, 38 * 4> pcm {};
+	auto*                     data   = pcm.data();
+	auto                      render = [&](std::initializer_list<Ngs2RenderBufferInfo> buffers) {
+		return Ngs2SystemRender(handle, std::data(buffers), static_cast<uint32_t>(buffers.size()));
+	};
+	std::array<Ngs2RenderBufferInfo, 33> many;
+	many.fill({data, 32, 0x18, 2});
+	Check(Ngs2SystemRender(handle, nullptr, 33) == NGS2_ERROR_INVALID_RENDER_BUFFER_ADDRESS &&
+	          Ngs2SystemRender(handle, many.data(), 33) == NGS2_ERROR_INVALID_NUM_BUFFERS &&
+	          Ngs2SystemRender(handle, many.data(), 32) == OK,
+	      "render did not take up to 32 buffers from a non-null array");
+	for (const uint32_t type: {0x14u, 0x1au}) {
+		Check(render({{data, 32, type, 2}}) == NGS2_ERROR_INVALID_WAVEFORM_TYPE,
+		      "a render buffer type other than int16 or float was accepted");
+	}
+	Check(render({{data, 32, 0x18, 0}}) == NGS2_ERROR_INVALID_NUM_CHANNELS &&
+	          render({{data, sizeof(pcm), 0x18, 38}}) == OK,
+	      "a render buffer without channels was accepted or one of 38 channels was rejected");
+	// Two channels of one grain of 2- or 4-byte samples; a larger buffer passes.
+	for (const uint32_t type: {0x12u, 0x13u, 0x18u, 0x19u}) {
+		const size_t need = type < 0x18 ? 16 : 32;
+		Check(render({{data, need - 1, type, 2}}) == NGS2_ERROR_INVALID_RENDER_BUFFER_SIZE &&
+		          render({{data, need, type, 2}}) == OK && render({{data, need + 1, type, 2}}) == OK,
+		      "a render buffer was not checked to hold one grain");
+	}
+	Check(render({{data, 31, 0x18, 2}, {data, 32, 0x10, 2}}) ==
+	              NGS2_ERROR_INVALID_RENDER_BUFFER_SIZE &&
+	          render({{nullptr, 32, 0x10, 0}}) == NGS2_ERROR_INVALID_WAVEFORM_TYPE &&
+	          render({{nullptr, 32, 0x18, 0}}) == NGS2_ERROR_INVALID_NUM_CHANNELS &&
+	          render({{nullptr, 0, 0x18, 2}}) == NGS2_ERROR_INVALID_RENDER_BUFFER_ADDRESS,
+	      "render buffers were not checked in index order, by type, channels, address and size");
+}
+
+// A failed render renders and writes nothing.
+void TestFailedRender() {
+	MasteringRender m;
+	m.Play({8192}, 12);
+	std::array<int16_t, 4> pcm;
+	pcm.fill(0x7f7f);
+	const Ngs2RenderBufferInfo buffers[2] = {{pcm.data(), sizeof(pcm), 0x12, 1},
+	                                         {pcm.data(), sizeof(pcm), 0x10, 1}};
+	Check(m.Setup(1) == OK &&
+	          Ngs2SystemRender(m.render_system.handle, buffers, 2) ==
+	              NGS2_ERROR_INVALID_WAVEFORM_TYPE &&
+	          m.source.decoded_samples == 0 &&
+	          std::ranges::all_of(pcm, [](int16_t s) { return s == 0x7f7f; }),
+	      "a failed render rendered its voices or wrote a buffer");
+}
+
+// A voice writes one grain of frames and keeps the rest of its buffer, a buffer no voice wrote is
+// zeroed over its whole size, and a big-endian buffer keeps its bytes.
+void TestRenderBufferWrites() {
+	MasteringRender m;
+	m.Play({8192}, 8);
+	const auto handle = m.render_system.handle;
+	auto       fill   = [](auto& data) { std::memset(data.data(), 0x7f, sizeof(data)); };
+	// Whether bytes `from` on of `data` all equal `value`.
+	auto bytes_are = [](const auto& data, size_t from, uint8_t value) {
+		const auto* bytes = reinterpret_cast<const uint8_t*>(data.data());
+		return std::all_of(bytes + from, bytes + sizeof(data),
+		                   [&](uint8_t byte) { return byte == value; });
+	};
+	// The mono voice into 2-channel buffers 16 bytes longer than one grain.
+	std::array<int16_t, 16> pcm16;
+	std::array<float, 12>   pcm;
+	std::array<float, 8>    unused;
+	fill(pcm16);
+	fill(unused);
+	const Ngs2RenderBufferInfo buffers[2] = {{pcm16.data(), sizeof(pcm16), 0x12, 2},
+	                                         {unused.data(), sizeof(unused), 0x18, 1}};
+	Check(m.Setup(1) == OK && Ngs2SystemRender(handle, buffers, 2) == OK &&
+	          bytes_are(pcm16, 16, 0x7f) && bytes_are(unused, 0, 0),
+	      "an int16 buffer lost its tail or a buffer no voice wrote was not zeroed in full");
+	fill(pcm);
+	Ngs2RenderBufferInfo output {pcm.data(), sizeof(pcm), 0x18, 2};
+	Check(Ngs2SystemRender(handle, &output, 1) == OK && bytes_are(pcm, 32, 0x7f),
+	      "a float buffer lost its tail");
+	fill(pcm);
+	output.waveform_type = 0x19;
+	Check(Ngs2SystemRender(handle, &output, 1) == OK && bytes_are(pcm, 0, 0x7f),
+	      "a big-endian buffer was written");
+	// The first writer copies: silence at a negative gain stays -0.
+	output.waveform_type = 0x18;
+	Check(m.Gain(-1.0f, -1.0f) == OK && Ngs2SystemRender(handle, &output, 1) == OK,
+	      "silent mastering voice failed to render");
+	for (uint32_t i = 0; i < 4; ++i) {
+		Check(pcm[i * 2] == 0.0f && std::signbit(pcm[i * 2]),
+		      "the first float writer added its samples instead of copying them");
+	}
 }
 
 void TestMasteringControlErrors() {
@@ -2154,9 +2275,8 @@ void TestReverbTail() {
 }
 
 void TestCustomMasteringChannelMixer() {
-	Ngs2Internal system;
-	system.option = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 6;
+	RenderSystem render(6);
+	auto&        system = render.Internal();
 	Ngs2RackOptionUnion sampler_option {};
 	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
 	sampler_option.common.max_voices = 1;
@@ -2167,8 +2287,10 @@ void TestCustomMasteringChannelMixer() {
 	custom.rack_option.max_voices = 1;
 	custom.rack_option.max_voice_channels = 6;
 	custom.num_buffers = 1;
-	custom.num_modules = 1;
+	custom.num_modules = 2;
 	custom.module[0].module_id = 0x17;
+	// The voice writes its render buffer through the Output module.
+	custom.module[1].module_id = 0x1a;
 	RenderRack sampler(system, 0x1000, sampler_option.common);
 	RenderRack master(system, 0x4003, custom.rack_option);
 	auto& source = sampler.Voice();
@@ -2211,6 +2333,61 @@ void TestCustomMasteringChannelMixer() {
 		          std::equal(expected.begin(), expected.end(), pcm.begin() + 1),
 		      "custom mixer lost channel routing, in-place input, clamping or output bounds");
 	}
+}
+
+// A custom mastering voice writes only through an Output module, from that module's buffer, also
+// without input.
+void TestCustomMasteringOutputModule() {
+	RenderSystem render(4);
+	auto&        system         = render.Internal();
+	auto         sampler_option = SingleVoiceRackOption(0x1000);
+	sampler_option.common.max_ports = 2;
+	Ngs2CustomMasteringRackOption option {};
+	auto&                         custom  = option.custom_rack_option;
+	custom.rack_option.size               = sizeof(option);
+	custom.rack_option.max_voices         = 1;
+	custom.rack_option.max_voice_channels = 1;
+	custom.num_buffers                    = 2;
+	custom.num_modules                    = 1;
+	custom.module[0]                      = {nullptr, 0x1a, 1, 0, 1};
+	RenderRack with_output(system, 0x4003, custom.rack_option);
+	custom.module[0] = {nullptr, 0x17, 0, 0, 0};
+	RenderRack without_output(system, 0x4003, custom.rack_option);
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	auto&      writer = with_output.Voice();
+	auto&      mixer  = without_output.Voice();
+	auto&      source = sampler.Voice();
+	for (auto* voice: {&writer, &mixer}) {
+		voice->channels = 1;
+		voice->SetEvent(1);
+	}
+	mixer.output_id         = 1;
+	const int16_t frames[4] = {8192, 8192, 8192, 8192};
+	source.SetupSampler({0x12, 1, 48000});
+	source.blocks.push_back(
+	    {reinterpret_cast<const uint8_t*>(frames), {0, sizeof(frames), 0, 0, 4}});
+	// The writer takes the source into buffer 1, the one its Output module writes.
+	source.ports[0] = {&writer, 1, 1.0f, -1};
+	source.ports[1] = {&mixer, 0, 1.0f, -1};
+	source.SetEvent(1);
+	std::array<float, 4> written, mixed;
+	std::memset(written.data(), 0x7f, sizeof(written));
+	std::memset(mixed.data(), 0x7f, sizeof(mixed));
+	const Ngs2RenderBufferInfo buffers[2] = {{written.data(), sizeof(written), 0x18, 1},
+	                                         {mixed.data(), sizeof(mixed), 0x18, 1}};
+	Check(Ngs2SystemRender(render.handle, buffers, 2) == OK &&
+	          std::ranges::all_of(written, [](float sample) { return sample == 0.25f; }) &&
+	          std::ranges::all_of(mixed, [](float sample) { return sample == 0.0f; }),
+	      "a custom mastering voice did not write its Output module's buffer, or one without an "
+	      "Output module wrote");
+	// The source has ended; the writer overwrites one grain of the int16 buffer with silence.
+	std::array<int16_t, 12> pcm16;
+	pcm16.fill(0x7f7f);
+	const Ngs2RenderBufferInfo output {pcm16.data(), sizeof(pcm16), 0x12, 1};
+	Check(Ngs2SystemRender(render.handle, &output, 1) == OK &&
+	          std::all_of(pcm16.begin(), pcm16.begin() + 4, [](int16_t s) { return s == 0; }) &&
+	          std::all_of(pcm16.begin() + 4, pcm16.end(), [](int16_t s) { return s == 0x7f7f; }),
+	      "a silent custom mastering voice with an Output module did not write its grain");
 }
 
 void TestCustomVoiceStateCapacity() {
@@ -2726,8 +2903,7 @@ void TestPlayStateBeforeRender() {
 }
 
 void TestStatePublication() {
-	Ngs2Internal system;
-	system.option = Ngs2DefaultSystemOption();
+	RenderSystem render(256);
 	Ngs2RackOptionUnion option {};
 	Ngs2FillDefaultRackOption(0x1000, &option);
 	option.common.max_voices = 1;
@@ -2735,7 +2911,7 @@ void TestStatePublication() {
 	    std::byte         storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
 	Ngs2ContextBufferInfo buffer {storage, sizeof(storage)};
 	uintptr_t             rack_handle   = 0;
-	const auto            system_handle = reinterpret_cast<uintptr_t>(&system);
+	const auto            system_handle = render.handle;
 	Check(Ngs2RackCreate(system_handle, 0x1000, &option.common, &buffer, &rack_handle) == OK,
 	      "state publication rack creation failed");
 	auto& voice =
@@ -2756,12 +2932,11 @@ void TestStatePublication() {
 	const Transition     transitions[] = {{1, 1, 3}, {16, 3, 5}, {32, 5, 3}, {2, 3, 0},
 	                                      {1, 1, 3}, {16, 3, 5}, {2, 5, 0},  {1, 1, 3},
 	                                      {4, 3, 0}, {1, 1, 3},  {8, 3, 0}};
-	Ngs2RenderBufferInfo output {};
 	for (const auto& transition: transitions) {
 		Ngs2VoiceEventParam event {{sizeof(Ngs2VoiceEventParam), 0, 6}, transition.event};
 		Ngs2VoiceControl(handle, &event.header);
 		check_flags(transition.before_render);
-		Ngs2SystemRender(system_handle, &output, 1);
+		Ngs2SystemRender(system_handle, nullptr, 0);
 		check_flags(transition.after_render);
 	}
 	Check(Ngs2RackDestroy(rack_handle, nullptr) == OK, "state publication rack cleanup failed");
@@ -3531,6 +3706,9 @@ int main() {
 	TestMasteringUntypedConversions();
 	TestMasteringMatrixSpill();
 	TestMasteringOutputRange();
+	TestRenderBufferChecks();
+	TestFailedRender();
+	TestRenderBufferWrites();
 	TestMasteringControlErrors();
 	TestMasteringRackOptionRanges();
 	TestMasteringVoiceState();
@@ -3546,6 +3724,7 @@ int main() {
 	TestGeomDoppler();
 	TestGeomRolloffAndFlags();
 	TestCustomMasteringChannelMixer();
+	TestCustomMasteringOutputModule();
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
 	TestCustomSideChainUserFx();

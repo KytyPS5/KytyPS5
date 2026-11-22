@@ -18,6 +18,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <numbers>
+#include <string_view>
 #include <vector>
 
 #include "libatrac9.h"
@@ -32,10 +33,20 @@ constexpr int32_t NGS2_ERROR_INVALID_SYSTEM_HANDLE =
     static_cast<int32_t>(0x804a8201u);
 constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
     static_cast<int32_t>(0x804a8010u);
+constexpr int32_t NGS2_ERROR_INVALID_OUT_SIZE =
+    static_cast<int32_t>(0x804a8011u);
+constexpr int32_t NGS2_ERROR_INVALID_NUM_CHANNELS =
+    static_cast<int32_t>(0x804a8052u);
 constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8053u);
 constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8054u);
+constexpr int32_t NGS2_ERROR_INVALID_MATRIX_TYPE =
+    static_cast<int32_t>(0x804a809au);
+constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE =
+    static_cast<int32_t>(0x804a8361u);
+constexpr int32_t NGS2_ERROR_INVALID_VOICE_CONTROL_ID =
+    static_cast<int32_t>(0x804a8362u);
 constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA =
     static_cast<int32_t>(0x804a8430u);
 constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT =
@@ -748,6 +759,91 @@ struct Ngs2ReverbState {
 	}
 };
 
+// The channel converter keeps one level field per input count and field output count (1, 2, 4, 6
+// or 8), in this order; an output count reads the first rows of the smallest field with at least
+// as many channels. Levels are dst-major rows of one level per input: 0, 1, h = 0.70710677,
+// q = 0.5, e = 0.35355339.
+struct Ngs2MasteringField {
+	uint32_t         inputs;
+	uint32_t         outputs;
+	std::string_view levels;
+};
+// clang-format off
+constexpr std::array<Ngs2MasteringField, 40> NGS2_MASTERING_FIELDS = {{
+    {1, 1, "1"},
+    {1, 2, "hh"},
+    {1, 4, "hh00"},
+    {1, 6, "001000"},
+    {1, 8, "00100000"},
+    {2, 1, "hh"},
+    {2, 2, "10" "01"},
+    {2, 4, "10" "01" "00" "00"},
+    {2, 6, "10" "01" "00" "00" "00" "00"},
+    {2, 8, "10" "01" "00" "00" "00" "00" "00" "00"},
+    {3, 1, "hh1"},
+    {3, 2, "10h" "01h"},
+    {3, 4, "10h" "01h" "000" "000"},
+    {3, 6, "100" "010" "001" "000" "000" "000"},
+    {3, 8, "100" "010" "001" "000" "000" "000" "000" "000"},
+    {4, 1, "hhqq"},
+    {4, 2, "10h0" "010h"},
+    {4, 4, "1000" "0100" "0010" "0001"},
+    {4, 6, "1000" "0100" "0000" "0000" "0010" "0001"},
+    {4, 8, "1000" "0100" "0000" "0000" "0010" "0001" "0000" "0000"},
+    {5, 1, "hh1qq"},
+    {5, 2, "10hh0" "01h0h"},
+    {5, 4, "10h00" "01h00" "00010" "00001"},
+    {5, 6, "10000" "01000" "00100" "00000" "00010" "00001"},
+    {5, 8, "10000" "01000" "00100" "00000" "00010" "00001" "00000" "00000"},
+    {6, 1, "hh10qq"},
+    {6, 2, "10h0h0" "01h00h"},
+    {6, 4, "10h000" "01h000" "000010" "000001"},
+    {6, 6, "100000" "010000" "001000" "000100" "000010" "000001"},
+    {6, 8, "100000" "010000" "001000" "000100" "000010" "000001" "000000" "000000"},
+    {7, 1, "hh10qqe"},
+    {7, 2, "10h0h0q" "01h00hq"},
+    {7, 4, "10h0000" "01h0000" "000010h" "000001h"},
+    {7, 6, "1000000" "0100000" "0010000" "0001000" "000010h" "000001h"},
+    {7, 8, "1000000" "0100000" "0010000" "0001000" "0000100" "0000010" "000000h" "000000h"},
+    {8, 1, "hh10hhhh"},
+    {8, 2, "10h0h0h0" "01h00h0h"},
+    {8, 4, "10000000" "01000000" "00001010" "00000101"},
+    {8, 6, "10000000" "01000000" "00100000" "00010000" "00001010" "00000101"},
+    {8, 8, "10000000" "01000000" "00100000" "00010000" "00001000" "00000100" "00000010" "00000001"},
+}};
+// clang-format on
+
+// Offset of the levels that convert `inputs` into `outputs` channels.
+static constexpr size_t Ngs2MasteringLevelsOffset(uint32_t inputs, uint32_t outputs) {
+	size_t offset = 0;
+	for (const auto& field: NGS2_MASTERING_FIELDS) {
+		if (field.inputs == inputs && field.outputs >= outputs) {
+			break;
+		}
+		offset += field.levels.size();
+	}
+	return offset;
+}
+
+constexpr auto NGS2_MASTERING_DEFAULT_LEVELS = [] {
+	constexpr float h = std::numbers::sqrt2_v<float> / 2;
+
+	std::array<float, Ngs2MasteringLevelsOffset(8, 8) + 8 * 8> levels {};
+	for (size_t n = 0; const auto& field: NGS2_MASTERING_FIELDS) {
+		for (const char level: field.levels) {
+			switch (level) {
+				case '1': levels[n] = 1.0f; break;
+				case 'h': levels[n] = h; break;
+				case 'q': levels[n] = 0.5f; break;
+				case 'e': levels[n] = h / 2; break;
+				default: break;
+			}
+			++n;
+		}
+	}
+	return levels;
+}();
+
 struct Ngs2VoiceInternal {
 	struct Port {
 		Ngs2VoiceInternal* dest   = nullptr;
@@ -771,6 +867,21 @@ struct Ngs2VoiceInternal {
 		bool                     control_warned = false;
 		bool                     render_warned  = false;
 	};
+	// Mastering voice module state.
+	struct Mastering {
+		std::array<float, NGS2_MASTERING_DEFAULT_LEVELS.size()> levels =
+		    NGS2_MASTERING_DEFAULT_LEVELS;
+		// The converter levels of the previous grain and their shape; inputs 0 skips the ramp.
+		std::array<float, 64> previous_levels {};
+		uint32_t              previous_inputs  = 0;
+		uint32_t              previous_outputs = 0;
+		// Full band and LFE gains. A gain control enables the gain until Setup; the first grain
+		// after a grain without it, or after PLAY, starts at the new gains.
+		std::array<float, 2> gain {};
+		std::array<float, 2> previous_gain {};
+		bool                 gain_enabled  = false;
+		bool                 gain_rendered = false;
+	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
 	Ngs2RackInternal*               rack           = nullptr;
@@ -783,11 +894,9 @@ struct Ngs2VoiceInternal {
 	std::vector<Module>             modules;
 	std::vector<float>              samples;
 	std::vector<float>              mix_samples;
-	std::vector<float>              output_matrix;
 	uint32_t                        channels        = 0;
 	uint32_t                        output_id       = 0;
-	float                           fbw_level       = 1.0f;
-	float                           lfe_level       = 1.0f;
+	std::unique_ptr<Mastering>      mastering;
 	Ngs2ReverbState                 reverb;
 	bool                            rendering       = false;
 	bool                            rendered        = false;
@@ -1001,6 +1110,11 @@ struct Ngs2VoiceInternal {
 					// Reserve the voice immediately; publish playback flags after rendering.
 					state_flags |= 1;
 				}
+				// Every PLAY restarts the mastering modules without a ramp.
+				if (mastering != nullptr) {
+					mastering->previous_inputs = 0;
+					mastering->gain_rendered   = false;
+				}
 				break;
 			case 2:
 				if (state == Ngs2VoicePlayState::Playing || state == Ngs2VoicePlayState::Paused) {
@@ -1098,6 +1212,14 @@ struct Ngs2SubmixerVoiceState {
 	float          compressor_height;
 };
 
+struct Ngs2MasteringVoiceState {
+	Ngs2VoiceState voice_state;
+	float          limiter_peak_level;
+	float          limiter_press_level;
+	float          input_peak_height[37];
+	float          output_peak_height[37];
+};
+
 struct Ngs2CustomMasteringVoiceState {
 	Ngs2VoiceState voice_state;
 	uint32_t       reserved;
@@ -1139,6 +1261,7 @@ static_assert(sizeof(Ngs2SystemInfo) == 184);
 static_assert(sizeof(Ngs2RackOption) == 176);
 static_assert(sizeof(Ngs2VoiceState) == 8);
 static_assert(sizeof(Ngs2SubmixerVoiceState) == 20);
+static_assert(sizeof(Ngs2MasteringVoiceState) == 0x138);
 static_assert(sizeof(Ngs2CustomMasteringVoiceState) == 16);
 static_assert(sizeof(Ngs2SamplerVoiceState) == 56);
 static_assert(sizeof(Ngs2CustomSamplerVoiceState) == 48);
@@ -1326,6 +1449,16 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 	}
 }
 
+// Checks the rack options that sizing and creating a rack both reject.
+static int Ngs2CheckRackOption(uint32_t rack_id, const Ngs2RackOption& option) {
+	if (rack_id != 0x3000) {
+		return OK;
+	}
+	EXIT_NOT_IMPLEMENTED(option.size != sizeof(Ngs2MasteringRackOption));
+	const auto& mastering = reinterpret_cast<const Ngs2MasteringRackOption&>(option);
+	return mastering.max_channels - 1 >= 37 ? NGS2_ERROR_INVALID_NUM_CHANNELS : OK;
+}
+
 int KYTY_SYSV_ABI Ngs2RackQueryBufferSize(uint32_t rack_id, const Ngs2RackOption* option,
                                           Ngs2ContextBufferInfo* buffer_info) {
 	PRINT_NAME();
@@ -1342,6 +1475,11 @@ int KYTY_SYSV_ABI Ngs2RackQueryBufferSize(uint32_t rack_id, const Ngs2RackOption
 	LOGF("\t rack_id    = 0x%" PRIx32 "\n"
 	     "\t max_voices = %u\n",
 	     rack_id, option->max_voices);
+
+	const auto result = Ngs2CheckRackOption(rack_id, *option);
+	if (result != OK) {
+		return result;
+	}
 
 	buffer_info->host_buffer_size =
 	    sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal) * option->max_voices;
@@ -1525,6 +1663,10 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 	}
 
 	EXIT_NOT_IMPLEMENTED(option->size < sizeof(Ngs2RackOption));
+	const auto result = Ngs2CheckRackOption(rack_id, *option);
+	if (result != OK) {
+		return result;
+	}
 
 	LOGF("\t rack_id                = 0x%" PRIx32 "\n"
 	     "\t name                   = %.64s\n"
@@ -1567,7 +1709,6 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 			rack->type          = Ngs2RackType::Reverb;
 			break;
 		case 0x3000:
-			EXIT_NOT_IMPLEMENTED(option->size != sizeof(Ngs2MasteringRackOption));
 			rack->option.mastering = *reinterpret_cast<const Ngs2MasteringRackOption*>(option);
 			rack->type             = Ngs2RackType::Mastering;
 			break;
@@ -1609,6 +1750,9 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 		voice.rack  = rack;
 		voice.ports.resize(option->max_ports);
 		voice.matrices.resize(option->max_matrices);
+		if (rack->type == Ngs2RackType::Mastering) {
+			voice.mastering = std::make_unique<Ngs2VoiceInternal::Mastering>();
+		}
 		if (Ngs2RackIsCustom(rack->type)) {
 			voice.modules.resize(rack->option.custom_sampler.custom_rack_option.num_modules);
 		}
@@ -1655,11 +1799,14 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 	buf.host_buffer_size = 0;
 	buf.user_data        = allocator->user_data;
 
-	Ngs2RackQueryBufferSize(rack_id, option, &buf);
+	int result = Ngs2RackQueryBufferSize(rack_id, option, &buf);
+	if (result != OK) {
+		return result;
+	}
 
 	EXIT_NOT_IMPLEMENTED(buf.host_buffer_size == 0);
 
-	int result = allocator->alloc_handler(&buf);
+	result = allocator->alloc_handler(&buf);
 
 	EXIT_NOT_IMPLEMENTED(result != OK);
 	EXIT_NOT_IMPLEMENTED(buf.host_buffer == nullptr);
@@ -2182,6 +2329,96 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	voice.rendered  = true;
 }
 
+// Mixes the voice's first channels into render buffer output_id, as many as both have; an
+// output_id past the render buffers writes nothing.
+static void Ngs2MixOutput(const Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
+                          uint32_t num_buffer_info, std::vector<std::vector<float>>& output_mix,
+                          uint32_t grain) {
+	if (voice.output_id >= num_buffer_info) {
+		return;
+	}
+	const auto& output = buffer_info[voice.output_id];
+	EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
+	EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x18);
+	EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
+	                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
+	                                                                             : sizeof(float)));
+	float* pcm = nullptr;
+	if (output.waveform_type == 0x12) {
+		auto& mix = output_mix[voice.output_id];
+		if (mix.empty()) {
+			mix.resize(grain * output.num_channels);
+		}
+		pcm = mix.data();
+	} else {
+		pcm = static_cast<float*>(output.buffer);
+	}
+	for (uint32_t c = 0; c < std::min(voice.channels, output.num_channels); ++c) {
+		for (uint32_t i = 0; i < grain; ++i) {
+			pcm[i * output.num_channels + c] += voice.samples[c * grain + i];
+		}
+	}
+}
+
+// Runs a playing mastering voice's channel converter, gain and output in place on its N input
+// channels.
+static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
+                                uint32_t                         num_buffer_info,
+                                std::vector<std::vector<float>>& output_mix, uint32_t grain) {
+	auto&          mastering = *voice.mastering;
+	const uint32_t inputs    = voice.channels;
+	// The converter writes the output buffer's channels, at most N, and zeroes the rest.
+	const uint32_t outputs = std::min(inputs, voice.output_id < num_buffer_info
+	                                              ? buffer_info[voice.output_id].num_channels
+	                                              : inputs);
+	const float*   levels  = mastering.levels.data() + Ngs2MasteringLevelsOffset(inputs, outputs);
+	// Levels ramp from the previous grain's unless the shape changed or the voice was played.
+	const float* start =
+	    mastering.previous_inputs == inputs && mastering.previous_outputs == outputs
+	        ? mastering.previous_levels.data()
+	        : levels;
+	// Every output reads all inputs, so the converter mixes from the inputs swapped into
+	// mix_samples.
+	std::swap(voice.samples, voice.mix_samples);
+	voice.samples.assign(voice.mix_samples.size(), 0.0f);
+	for (uint32_t d = 0; d < outputs; ++d) {
+		auto* out = voice.samples.data() + size_t(d) * grain;
+		for (uint32_t s = 0; s < inputs; ++s) {
+			const float from = start[d * inputs + s];
+			const float to   = levels[d * inputs + s];
+			// A level that is not positive at either end contributes nothing.
+			if (!(from > 0.0f || to > 0.0f)) {
+				continue;
+			}
+			const auto* in   = voice.mix_samples.data() + size_t(s) * grain;
+			const float step = (to - from) / static_cast<float>(grain);
+			for (uint32_t i = 0; i < grain; ++i) {
+				out[i] += in[i] * (from + static_cast<float>(i) * step);
+			}
+		}
+	}
+	std::copy_n(levels, size_t(inputs) * outputs, mastering.previous_levels.begin());
+	mastering.previous_inputs  = inputs;
+	mastering.previous_outputs = outputs;
+
+	// Channel 3 is LFE, every other channel full band; a changed gain ramps over one grain.
+	if (mastering.gain_enabled) {
+		const auto& from = mastering.gain_rendered ? mastering.previous_gain : mastering.gain;
+		for (uint32_t c = 0; c < inputs; ++c) {
+			auto*        data = voice.samples.data() + size_t(c) * grain;
+			const size_t k    = c == 3 ? 1 : 0;
+			const float  step = (mastering.gain[k] - from[k]) / static_cast<float>(grain);
+			for (uint32_t i = 0; i < grain; ++i) {
+				data[i] *= from[k] + static_cast<float>(i) * step;
+			}
+		}
+		mastering.previous_gain = mastering.gain;
+	}
+	mastering.gain_rendered = mastering.gain_enabled;
+
+	Ngs2MixOutput(voice, buffer_info, num_buffer_info, output_mix, grain);
+}
+
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
@@ -2210,52 +2447,12 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 	const auto grain = ngs->option.num_grain_samples;
 	for (auto* voice: voices) {
 		Ngs2RenderVoice(*voice, voices, grain);
-		const bool mastering = voice->rack->type == Ngs2RackType::Mastering ||
-		                       voice->rack->type == Ngs2RackType::CustomMastering;
-		if (!mastering || !voice->has_samples) {
-			continue;
-		}
-		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
-		const auto& output = buffer_info[voice->output_id];
-		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
-		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x18);
-		// Surround inputs mixed into fewer output channels use their own downmix levels.
-		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering && voice->channels > 2 &&
-		                     output.num_channels < voice->channels);
-		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
-		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
-		                                                                             : sizeof(float)));
-		float* pcm = nullptr;
-		if (output.waveform_type == 0x12) {
-			auto& mix = output_mix[voice->output_id];
-			if (mix.empty()) {
-				mix.resize(grain * output.num_channels);
-			}
-			pcm = mix.data();
-		} else {
-			pcm = static_cast<float*>(output.buffer);
-		}
-		// The stored matrix mixes 2.0ch into 2.0ch; other mastering layouts use the default levels.
-		const bool stored_matrix =
-		    !voice->output_matrix.empty() && voice->channels == 2 && output.num_channels == 2;
-		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
-			// Output channel 3 is LFE; every other channel is full band.
-			const float gain = dst == 3 ? voice->lfe_level : voice->fbw_level;
-			for (uint32_t src = 0; src < voice->channels; ++src) {
-				float level = static_cast<float>(src == dst);
-				if (stored_matrix) {
-					level = voice->output_matrix.at(src * output.num_channels + dst);
-				} else if (voice->rack->type == Ngs2RackType::Mastering) {
-					level = Ngs2DefaultMatrixLevel(voice->channels, src, output.num_channels, dst);
-				}
-				level *= gain;
-				if (level == 0.0f) {
-					continue;
-				}
-				for (uint32_t i = 0; i < grain; ++i) {
-					pcm[i * output.num_channels + dst] += voice->samples[src * grain + i] * level;
-				}
-			}
+		// A playing mastering voice renders its modules even without input.
+		if (voice->rack->type == Ngs2RackType::Mastering &&
+		    voice->state == Ngs2VoicePlayState::Playing && voice->channels != 0) {
+			Ngs2RenderMastering(*voice, buffer_info, num_buffer_info, output_mix, grain);
+		} else if (voice->rack->type == Ngs2RackType::CustomMastering && voice->has_samples) {
+			Ngs2MixOutput(*voice, buffer_info, num_buffer_info, output_mix, grain);
 		}
 	}
 	for (uint32_t i = 0; i < num_buffer_info; ++i) {
@@ -2854,7 +3051,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 
 		auto rack_id = param->id >> 16u;
 
-		EXIT_NOT_IMPLEMENTED(((param->id >> 15u) & 0x1u) != 0);
+		EXIT_NOT_IMPLEMENTED(rack_id != 0x3000 && ((param->id >> 15u) & 0x1u) != 0);
 
 		switch (rack_id) {
 			case 0x0000: {
@@ -2987,24 +3184,55 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			}
 			case 0x3000: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Mastering);
-				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
-				switch (param->id & 0xffffu) {
-					case 0: voice->channels = values[0]; break;
+				const auto  cid       = param->id & 0xffffu;
+				const auto* values    = reinterpret_cast<const uint32_t*>(param + 1);
+				auto&       mastering = *voice->mastering;
+				if (cid > 6) {
+					return NGS2_ERROR_INVALID_VOICE_CONTROL_ID;
+				}
+				if (param->size < (cid == 1 ? sizeof(Ngs2VoiceMatrixLevelsParam)
+				                            : sizeof(Ngs2VoiceParamHeader) + 8)) {
+					return NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE;
+				}
+				switch (cid) {
+					case 0:
+						if (values[0] - 1 >= voice->rack->option.mastering.max_channels) {
+							return NGS2_ERROR_INVALID_NUM_CHANNELS;
+						}
+						EXIT_NOT_IMPLEMENTED(values[0] > 8);
+						// Setup restores the default levels and disables the gain; ramps go on.
+						mastering.levels       = NGS2_MASTERING_DEFAULT_LEVELS;
+						mastering.gain_enabled = false;
+						voice->channels        = values[0];
+						voice->output_id       = 0;
+						break;
 					case 1: {
 						const auto* matrix =
 						    reinterpret_cast<const Ngs2VoiceMatrixLevelsParam*>(param);
-						EXIT_NOT_IMPLEMENTED(matrix->matrix_id != 5);
-						voice->output_matrix.assign(matrix->levels,
-						                            matrix->levels + matrix->num_levels);
+						const auto type = matrix->matrix_id;
+						if (type >= 16) {
+							return NGS2_ERROR_INVALID_MATRIX_TYPE;
+						}
+						// Levels are copied unclamped from the type's field on, so extra levels
+						// overwrite the following fields.
+						// Type t converts channels[t / 4] into channels[t % 4] channels.
+						constexpr std::array<uint32_t, 4> channels = {1, 2, 6, 8};
+						const auto                        offset =
+						    Ngs2MasteringLevelsOffset(channels[type / 4], channels[type % 4]);
+						const size_t count = static_cast<uint16_t>(matrix->num_levels);
+						std::copy_n(matrix->levels,
+						            std::min(count, mastering.levels.size() - offset),
+						            mastering.levels.begin() + offset);
 						break;
 					}
 					case 4: {
 						const auto* levels = reinterpret_cast<const float*>(values);
-						voice->fbw_level   = std::clamp(levels[0], 0.0f, 4.0f);
-						voice->lfe_level   = std::clamp(levels[1], 0.0f, 4.0f);
+						mastering.gain         = {std::clamp(levels[0], -32.0f, 32.0f),
+						                          std::clamp(levels[1], -32.0f, 32.0f)};
+						mastering.gain_enabled = true;
 						break;
 					}
-					case 5: voice->output_id = values[0]; break;
+					case 5: voice->output_id = std::min(values[0], 32u); break;
 					default: EXIT("unsupported mastering control: 0x%08" PRIx32 "\n", param->id);
 				}
 				break;
@@ -3235,6 +3463,15 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
 			break;
 		}
+		case Ngs2RackType::Mastering: {
+			if (state_size < sizeof(Ngs2MasteringVoiceState)) {
+				return NGS2_ERROR_INVALID_OUT_SIZE;
+			}
+			auto* mastering                    = reinterpret_cast<Ngs2MasteringVoiceState*>(state);
+			*mastering                         = {};
+			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
+			break;
+		}
 		case Ngs2RackType::CustomMastering:
 		case Ngs2RackType::CustomSampler: {
 			const bool sampler = voice->rack->type == Ngs2RackType::CustomSampler;
@@ -3243,7 +3480,7 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			EXIT_NOT_IMPLEMENTED(configured_size < (sampler ? sizeof(Ngs2CustomSamplerVoiceState)
 			                                                : sizeof(Ngs2CustomMasteringVoiceState)));
 			if (state_size < configured_size) {
-				return static_cast<int32_t>(0x804a8011u);
+				return NGS2_ERROR_INVALID_OUT_SIZE;
 			}
 			std::memset(state, 0, configured_size);
 			if (sampler) {

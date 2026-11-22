@@ -923,71 +923,292 @@ void TestPatchToRackHandle() {
 	      "patch to a rack handle did not connect to its voice #0");
 }
 
-void TestMasteringGain() {
-	Ngs2Internal system;
-	system.option                   = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 1;
-	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
-	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
-	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
-	sampler_option.common.max_voices = 1;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x3000, mastering_option.common);
-	auto& source = sampler.Voice();
-	auto& mastering = master.Voice();
-	mastering.channels = 8;
-	mastering.state = Ngs2VoicePlayState::Playing;
-	const int16_t frame[8] = {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192};
-	source.SetupSampler({0x12, 8, 48000});
-	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
-	source.ports[0].dest = &mastering;
-	source.SetEvent(1);
-	struct {
-		Ngs2VoiceParamHeader header {16, 0, 0x30000004};
-		float fbw = 5.0f, lfe = 0.5f;
-	} gain;
-	float pcm[8] = {};
-	Ngs2RenderBufferInfo output {pcm, sizeof(pcm), 0x18, 8};
-	const float expected[8] = {1.0f, 1.0f, 1.0f, 0.125f, 1.0f, 1.0f, 1.0f, 1.0f};
-	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &gain.header) == OK &&
-	          Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
-	          std::ranges::equal(pcm, expected),
-	      "mastering gain was not clamped or applied per full band and LFE channel");
+Ngs2RackOptionUnion SingleVoiceRackOption(uint32_t rack_id) {
+	Ngs2RackOptionUnion option {};
+	Ngs2FillDefaultRackOption(rack_id, &option);
+	option.common.max_voices = 1;
+	return option;
+}
+
+// A sampler voice feeding a mastering voice, rendered in grains of 4 samples.
+struct MasteringRender {
+	Ngs2Internal         system;
+	RenderRack           sampler;
+	RenderRack           master;
+	Ngs2VoiceInternal&   source;
+	Ngs2VoiceInternal&   voice;
+	std::vector<int16_t> input;
+
+	MasteringRender()
+	    : sampler(system, 0x1000, SingleVoiceRackOption(0x1000).common),
+	      master(system, 0x3000, SingleVoiceRackOption(0x3000).common), source(sampler.Voice()),
+	      voice(master.Voice()) {
+		system.option                   = Ngs2DefaultSystemOption();
+		system.option.num_grain_samples = 4;
+	}
+
+	int Control(uint32_t cid, uint32_t first, uint32_t second = 0, uint16_t size = 16) {
+		struct {
+			Ngs2VoiceParamHeader header;
+			uint32_t             values[2];
+		} param {{size, 0, 0x30000000u | cid}, {first, second}};
+		return Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header);
+	}
+
+	// Sets the mastering voice up for `channels` inputs and plays it.
+	int Setup(uint32_t channels) {
+		const int result = Control(0, channels);
+		voice.SetEvent(1);
+		return result;
+	}
+
+	int Gain(float fbw, float lfe) {
+		return Control(4, std::bit_cast<uint32_t>(fbw), std::bit_cast<uint32_t>(lfe));
+	}
+
+	int Matrix(uint32_t type, const float* levels, uint32_t count, uint16_t size = 24) {
+		Ngs2VoiceMatrixLevelsParam param {{size, 0, 0x30000001}, type, count, levels};
+		return Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header);
+	}
+
+	// Plays `frames` copies of `frame` into the mastering voice.
+	void Play(const std::vector<int16_t>& frame, uint32_t frames) {
+		source.SetupSampler({0x12, static_cast<uint32_t>(frame.size()), 48000});
+		input.clear();
+		for (uint32_t i = 0; i < frames; ++i) {
+			input.insert(input.end(), frame.begin(), frame.end());
+		}
+		source.blocks.push_back({reinterpret_cast<const uint8_t*>(input.data()),
+		                         {0, input.size() * sizeof(int16_t), 0, 0, frames}});
+		source.ports[0].dest = &voice;
+		source.SetEvent(1);
+	}
+
+	// Renders one grain into a float buffer of `channels` interleaved channels.
+	int Render(float* pcm, uint32_t channels) {
+		Ngs2RenderBufferInfo output {pcm, 4 * channels * sizeof(float), 0x18, channels};
+		return Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1);
+	}
+};
+
+void TestMasteringGainRamp() {
+	MasteringRender m;
+	float           pcm[32];
+	auto check = [&](const std::array<float, 4>& fbw, const std::array<float, 4>& lfe,
+	                 const char* message) {
+		for (uint32_t i = 0; i < 4; ++i) {
+			for (uint32_t c = 0; c < 8; ++c) {
+				Check(pcm[i * 8 + c] == (c == 3 ? lfe[i] : fbw[i]), message);
+			}
+		}
+	};
+	// The first grain of a gain starts at the clamped gains, even without input.
+	Check(m.Setup(8) == OK && m.Gain(40.0f, -0.5f) == OK && m.Render(pcm, 8) == OK &&
+	          std::ranges::all_of(pcm, [](float sample) { return sample == 0.0f; }),
+	      "silent 7.1ch mastering voice failed to render");
+	m.Play(std::vector<int16_t>(8, 8192), 20);
+	Check(m.Gain(-40.0f, 1.5f) == OK && m.Render(pcm, 8) == OK,
+	      "7.1ch mastering voice failed to render a gain change");
+	check({8.0f, 4.0f, 0.0f, -4.0f}, {-0.125f, 0.0f, 0.125f, 0.25f},
+	      "mastering gain did not ramp from the previous grain's clamped full band and LFE levels");
+	// Setup disables the gain, but a gain set before the next grain ramps from the previous one.
+	Check(m.Control(0, 8) == OK && m.Gain(3.0f, 3.0f) == OK && m.Render(pcm, 8) == OK,
+	      "7.1ch mastering voice failed to render after Setup");
+	check({-8.0f, -5.8125f, -3.625f, -1.4375f}, {0.375f, 0.46875f, 0.5625f, 0.65625f},
+	      "a gain set right after Setup did not ramp from the gain before Setup");
+	// A grain without the gain plays at unity, and the next gain starts without a ramp.
+	Check(m.Setup(8) == OK && m.Render(pcm, 8) == OK, "7.1ch mastering voice failed to render");
+	check({0.25f, 0.25f, 0.25f, 0.25f}, {0.25f, 0.25f, 0.25f, 0.25f},
+	      "Setup did not disable the gain");
+	Check(m.Gain(2.0f, 2.0f) == OK && m.Render(pcm, 8) == OK,
+	      "7.1ch mastering voice failed to render");
+	check({0.5f, 0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f, 0.5f},
+	      "a gain after a grain without gain ramped");
+	// Every PLAY, also on a playing voice, restarts the gain without a ramp.
+	Check(m.Setup(8) == OK && m.Gain(3.0f, 3.0f) == OK && m.Render(pcm, 8) == OK,
+	      "7.1ch mastering voice failed to render after a repeated PLAY");
+	check({0.75f, 0.75f, 0.75f, 0.75f}, {0.75f, 0.75f, 0.75f, 0.75f},
+	      "the first gain after PLAY on a playing voice ramped");
 }
 
 void TestMasteringDownmix() {
-	Ngs2Internal system;
-	system.option                   = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 1;
-	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
-	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
-	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
-	sampler_option.common.max_voices = 1;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x3000, mastering_option.common);
-	auto& source = sampler.Voice();
-	auto& mastering = master.Voice();
-	mastering.channels = 2;
-	mastering.state = Ngs2VoicePlayState::Playing;
-	const int16_t frame[2] = {8192, 16384};
-	source.SetupSampler({0x12, 2, 48000});
-	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
-	source.ports[0].dest = &mastering;
-	source.SetEvent(1);
-	// The stored 2.0ch -> 2.0ch matrix applies to neither a mono output nor a mono voice.
-	mastering.output_matrix.assign(4, 0.0f);
-	float pcm = 0.0f;
-	Ngs2RenderBufferInfo output {&pcm, sizeof(pcm), 0x18, 1};
-	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
-	          pcm == 0.75f * std::numbers::sqrt2_v<float> / 2,
+	MasteringRender m;
+	constexpr float h = std::numbers::sqrt2_v<float> / 2;
+	// 5.1ch: L 0.25, R 0.125, C 0.0625, LFE 0.5, SL 0.03125, SR 0.015625.
+	m.Play({8192, 4096, 2048, 16384, 1024, 512}, 16);
+	float pcm[8];
+	auto  check = [&](const std::array<float, 4>& left, const std::array<float, 4>& right,
+	                  const char* message) {
+		for (uint32_t i = 0; i < 4; ++i) {
+			Check(pcm[i * 2] == left[i] && pcm[i * 2 + 1] == right[i], message);
+		}
+	};
+	// Game levels are dst-major: R feeds L twice, SL feeds R four times.
+	float levels[12] = {};
+	levels[0 * 6 + 1] = 2.0f;
+	levels[1 * 6 + 4] = 4.0f;
+	Check(m.Setup(6) == OK && m.Matrix(9, levels, 12) == OK && m.Render(pcm, 2) == OK,
+	      "5.1ch mastering voice failed to render into stereo");
+	check({0.25f, 0.25f, 0.25f, 0.25f}, {0.125f, 0.125f, 0.125f, 0.125f},
+	      "5.1ch -> 2.0ch matrix levels were not read dst-major");
+	// A changed level ramps over one grain; a level that is never positive is skipped.
+	levels[0 * 6 + 1] = 0.0f;
+	levels[1 * 6 + 0] = -1.0f;
+	Check(m.Matrix(9, levels, 12) == OK && m.Render(pcm, 2) == OK,
+	      "5.1ch mastering voice failed to render a matrix change");
+	check({0.25f, 0.1875f, 0.125f, 0.0625f}, {0.125f, 0.125f, 0.125f, 0.125f},
+	      "5.1ch -> 2.0ch matrix change did not ramp or mixed a negative level");
+	// Setup restores the default levels, ramping from the previous grain's.
+	Check(m.Control(0, 6) == OK && m.Render(pcm, 2) == OK && pcm[0] == 0.0f && pcm[1] == 0.125f,
+	      "Setup did not ramp from the previous matrix levels");
+	Check(m.Render(pcm, 2) == OK, "5.1ch mastering voice failed to render after Setup");
+	const float left  = 0.25f + h * 0.0625f + h * 0.03125f;
+	const float right = 0.125f + h * 0.0625f + h * 0.015625f;
+	check({left, left, left, left}, {right, right, right, right},
+	      "5.1ch -> 2.0ch default levels were wrong");
+	Check(std::all_of(m.voice.samples.begin() + 2 * 4, m.voice.samples.end(),
+	                  [](float sample) { return sample == 0.0f; }),
+	      "the converter did not zero the channels past the output");
+}
+
+void TestMasteringMonoStereoConversion() {
+	MasteringRender m;
+	m.Play({8192}, 4);
+	float pcm[8];
+	Check(m.Setup(1) == OK && m.Render(pcm, 2) == OK, "mono mastering voice failed to render");
+	for (uint32_t i = 0; i < 4; ++i) {
+		Check(pcm[i * 2] == 0.25f && pcm[i * 2 + 1] == 0.0f,
+		      "mono mastering voice did not play in the first output channel only");
+	}
+	const float downmix = 0.75f * std::numbers::sqrt2_v<float> / 2;
+	m.Play({8192, 16384}, 4);
+	Check(m.Setup(2) == OK && m.Render(pcm, 1) == OK &&
+	          std::all_of(pcm, pcm + 4, [&](float sample) { return sample == downmix; }),
 	      "stereo mastering voice did not downmix into a mono output");
-	mastering.channels = 1;
-	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
-	float stereo[2] = {};
-	output = {stereo, sizeof(stereo), 0x18, 2};
-	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
-	          stereo[0] == pcm * (std::numbers::sqrt2_v<float> / 2) && stereo[1] == stereo[0],
-	      "mono mastering voice did not upmix into a stereo output");
+}
+
+void TestMasteringUntypedConversions() {
+	MasteringRender m;
+	constexpr float h = std::numbers::sqrt2_v<float> / 2;
+	// 3ch L 0.25, R 0.125, C 0.0625: the centre folds into L and R and channel 2 stays silent.
+	m.Play({8192, 4096, 2048}, 4);
+	float pcm[32];
+	Check(m.Setup(3) == OK && m.Render(pcm, 8) == OK, "3ch mastering voice failed to render");
+	for (uint32_t i = 0; i < 4; ++i) {
+		Check(pcm[i * 8] == 0.25f + h * 0.0625f && pcm[i * 8 + 1] == 0.125f + h * 0.0625f &&
+		          std::all_of(pcm + i * 8 + 2, pcm + i * 8 + 8,
+		                      [](float sample) { return sample == 0.0f; }),
+		      "3ch -> 3ch default levels were wrong");
+	}
+	// 4ch L, R, SL 0.0625, SR 0.03125 into stereo: each surround joins its side at -3 dB.
+	m.Play({8192, 4096, 2048, 1024}, 4);
+	Check(m.Setup(4) == OK && m.Render(pcm, 2) == OK, "4ch mastering voice failed to render");
+	for (uint32_t i = 0; i < 4; ++i) {
+		Check(pcm[i * 2] == 0.25f + h * 0.0625f && pcm[i * 2 + 1] == 0.125f + h * 0.03125f,
+		      "4ch -> 2ch default levels were wrong");
+	}
+}
+
+void TestMasteringMatrixSpill() {
+	MasteringRender m;
+	m.Play({8192, 4096}, 12);
+	// The 2.0ch -> 1.0ch levels are followed by the 2.0ch -> 2.0ch ones, here swapping L and R.
+	// The array holds as many levels as the converter, so an uncut count reads only from it.
+	std::array<float, NGS2_MASTERING_DEFAULT_LEVELS.size()> levels {};
+	levels[3] = levels[4] = 1.0f;
+	float pcm[8];
+	Check(m.Setup(2) == OK && m.Matrix(4, levels.data(), 0x10002) == OK &&
+	          m.Render(pcm, 2) == OK && pcm[0] == 0.25f && pcm[1] == 0.125f,
+	      "a level count was not cut to 16 bits");
+	Check(m.Matrix(4, levels.data(), 6) == OK && m.Render(pcm, 2) == OK &&
+	          m.Render(pcm, 2) == OK && pcm[0] == 0.125f && pcm[1] == 0.25f,
+	      "extra 2.0ch -> 1.0ch levels did not overwrite the 2.0ch -> 2.0ch levels");
+}
+
+void TestMasteringOutputRange() {
+	MasteringRender m;
+	m.Play({8192, -8192}, 8);
+	float pcm[8];
+	Check(m.Setup(2) == OK && m.Control(5, 1) == OK && m.Render(pcm, 2) == OK &&
+	          std::ranges::all_of(pcm, [](float sample) { return sample == 0.0f; }),
+	      "an output id past the render buffers failed or produced output");
+	Check(m.Control(5, 99) == OK && m.voice.output_id == 32, "output id was not clamped to 32");
+	Check(m.Control(5, 0) == OK && m.Render(pcm, 2) == OK && pcm[0] == 0.25f && pcm[1] == -0.25f,
+	      "mastering voice did not play into render buffer 0");
+}
+
+void TestMasteringControlErrors() {
+	MasteringRender m;
+	const float     levels[64] = {};
+	Check(m.Control(0, 8) == OK &&
+	          m.Control(0, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+	          m.Control(4, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+	          m.Control(5, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+	          m.Matrix(5, levels, 4, 23) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
+	      "undersized mastering controls were accepted or checked after their values");
+	Check(m.Control(0, 0) == NGS2_ERROR_INVALID_NUM_CHANNELS &&
+	          m.Control(0, 9) == NGS2_ERROR_INVALID_NUM_CHANNELS && m.voice.channels == 8,
+	      "mastering setup accepted a channel count outside 1..maxChannels");
+	Check(m.Matrix(16, levels, 4) == NGS2_ERROR_INVALID_MATRIX_TYPE &&
+	          m.Matrix(15, levels, 64) == OK && m.Matrix(3, levels, 8) == OK,
+	      "mastering matrix type range was wrong");
+	Check(m.Control(7, 0) == NGS2_ERROR_INVALID_VOICE_CONTROL_ID &&
+	          m.Control(7, 0, 0, 8) == NGS2_ERROR_INVALID_VOICE_CONTROL_ID &&
+	          m.Control(0x8000, 0) == NGS2_ERROR_INVALID_VOICE_CONTROL_ID &&
+	          m.Control(0xffff, 0, 0, 8) == NGS2_ERROR_INVALID_VOICE_CONTROL_ID,
+	      "unknown mastering control was not rejected by id");
+}
+
+int32_t KYTY_SYSV_ABI RejectRackBuffer(Ngs2ContextBufferInfo* /*buffer*/) {
+	Check(false, "a rack buffer was allocated or freed for a rejected option");
+	return -1;
+}
+
+void TestMasteringRackChannelRange() {
+	Ngs2Internal              system;
+	const auto                system_handle = reinterpret_cast<uintptr_t>(&system);
+	const Ngs2BufferAllocator allocator {RejectRackBuffer, RejectRackBuffer, 0};
+	// The rack buffer is sized for a valid option.
+	auto                  option = SingleVoiceRackOption(0x3000);
+	Ngs2ContextBufferInfo buffer {};
+	Check(Ngs2RackQueryBufferSize(0x3000, &option.common, &buffer) == OK,
+	      "mastering rack size query failed");
+	const auto storage = std::make_unique<std::byte[]>(buffer.host_buffer_size);
+	buffer.host_buffer = storage.get();
+	for (uint32_t max_channels: {0u, 38u}) {
+		option.mastering.max_channels = max_channels;
+		Ngs2ContextBufferInfo query {};
+		uintptr_t             handle = 0;
+		Check(Ngs2RackQueryBufferSize(0x3000, &option.common, &query) ==
+		              NGS2_ERROR_INVALID_NUM_CHANNELS &&
+		          Ngs2RackCreate(system_handle, 0x3000, &option.common, &buffer, &handle) ==
+		              NGS2_ERROR_INVALID_NUM_CHANNELS &&
+		          Ngs2RackCreateWithAllocator(system_handle, 0x3000, &option.common, &allocator,
+		                                      &handle) == NGS2_ERROR_INVALID_NUM_CHANNELS &&
+		          handle == 0,
+		      "mastering rack accepted a channel count outside 1..37");
+	}
+	option.mastering.max_channels = 37;
+	RenderRack rack(system, 0x3000, option.common);
+}
+
+void TestMasteringVoiceState() {
+	MasteringRender m;
+	alignas(Ngs2MasteringVoiceState) std::array<uint8_t, 0x140> storage;
+	storage.fill(0xa5);
+	auto*      state  = reinterpret_cast<Ngs2VoiceState*>(storage.data());
+	const auto handle = reinterpret_cast<uintptr_t>(&m.voice);
+	Check(m.Setup(2) == OK &&
+	          Ngs2VoiceGetState(handle, state, 0x137) == NGS2_ERROR_INVALID_OUT_SIZE &&
+	          std::ranges::all_of(storage, [](uint8_t v) { return v == 0xa5; }),
+	      "undersized mastering state buffer was accepted or modified");
+	Check(Ngs2VoiceGetState(handle, state, storage.size()) == OK && state->state_flags == 1 &&
+	          state->error_code == 0 &&
+	          std::all_of(storage.begin() + 8, storage.begin() + 0x138,
+	                      [](uint8_t v) { return v == 0; }) &&
+	          std::all_of(storage.begin() + 0x138, storage.end(),
+	                      [](uint8_t v) { return v == 0xa5; }),
+	      "mastering state was not filled or was written past its size");
 }
 
 struct ReverbControl {
@@ -2450,8 +2671,15 @@ int main() {
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestPatchToRackHandle();
-	TestMasteringGain();
+	TestMasteringGainRamp();
 	TestMasteringDownmix();
+	TestMasteringMonoStereoConversion();
+	TestMasteringUntypedConversions();
+	TestMasteringMatrixSpill();
+	TestMasteringOutputRange();
+	TestMasteringControlErrors();
+	TestMasteringRackChannelRange();
+	TestMasteringVoiceState();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();

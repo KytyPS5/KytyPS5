@@ -4,7 +4,9 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <numbers>
+#include <thread>
 
 using namespace Libs::Audio::Ngs2;
 
@@ -1666,6 +1668,74 @@ void TestSystemDestroy() {
 	      "a rack of a destroyed system was not destroyed with its buffer");
 }
 
+// Runs `call` on another thread and `meanwhile` on this one, then fails unless `call` returned
+// within 5 s.
+template <typename Call, typename Meanwhile>
+void RunOnOtherThread(Call call, Meanwhile meanwhile, const char* message) {
+	std::packaged_task<void()> task(call);
+	auto                       done = task.get_future();
+	std::thread                thread(std::move(task));
+	meanwhile();
+	Check(done.wait_for(std::chrono::seconds(5)) == std::future_status::ready, message);
+	thread.join();
+}
+
+void TestUserLocks() {
+	const Ngs2BufferAllocator allocator {AllocContextBuffer, FreeContextBuffer, 0};
+	auto                      option = SingleVoiceRackOption(0x1000);
+	uintptr_t                 system = 0, rack = 0;
+	Check(Ngs2SystemCreateWithAllocator(nullptr, &allocator, &system) == OK &&
+	          Ngs2RackCreateWithAllocator(system, 0x1000, &option.common, &allocator, &rack) == OK,
+	      "allocator system or rack creation failed");
+	auto*                      internal    = reinterpret_cast<Ngs2RackInternal*>(rack);
+	const auto&                system_lock = reinterpret_cast<Ngs2Internal*>(system)->user_lock;
+	const auto&                rack_lock   = internal->user_lock;
+	float                      pcm[512];
+	const Ngs2RenderBufferInfo output {pcm, sizeof(pcm), 0x18, 2};
+
+	// Held locks do not block rendering on other threads, which cannot release them.
+	Check(Ngs2SystemLock(system) == OK &&
+	          system_lock.owner == Common::Thread::GetThreadIdUnique() &&
+	          Ngs2SystemLock(system) == OK && Ngs2RackLock(rack) == OK,
+	      "user lock failed or did not record its owner");
+	auto render = [&] {
+		Check(Ngs2SystemRender(system, &output, 1) == OK && Ngs2SystemUnlock(system) == OK &&
+		          Ngs2RackUnlock(rack) == OK,
+		      "a render failed under a user lock");
+	};
+	RunOnOtherThread(render, [] {}, "a held user lock blocked rendering");
+	Check(system_lock.depth == 2 && rack_lock.depth == 1, "another thread released a user lock");
+	Check(Ngs2SystemUnlock(system) == OK && system_lock.depth == 1 &&
+	          Ngs2SystemUnlock(system) == OK && system_lock.depth == 0 &&
+	          Ngs2SystemUnlock(system) == OK && system_lock.depth == 0,
+	      "user lock depth was not counted");
+
+	// Another thread takes a held lock only once it is released.
+	std::atomic_bool released = false;
+	Check(Ngs2SystemLock(system) == OK, "user lock failed");
+	auto lock = [&] {
+		Check(Ngs2SystemLock(system) == OK && released, "a held user lock was taken");
+		Ngs2SystemUnlock(system);
+	};
+	auto release = [&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		released = true;
+		Ngs2SystemUnlock(system);
+	};
+	RunOnOtherThread(lock, release, "a released user lock was not taken");
+
+	// Locks held across destroys are released through valid handles only.
+	Check(Ngs2SystemLock(system) == OK && Ngs2SystemDestroy(system, nullptr) == OK,
+	      "a locked system was not destroyed");
+	Check(Ngs2RackUnlock(rack) == OK && rack_lock.depth == 0 && Ngs2RackLock(rack) == OK &&
+	          Ngs2RackDestroy(rack, nullptr) == OK &&
+	          Ngs2RackUnlock(rack) == NGS2_ERROR_INVALID_RACK_HANDLE &&
+	          Ngs2RackLock(rack) == NGS2_ERROR_INVALID_RACK_HANDLE &&
+	          Ngs2RackLock(0) == NGS2_ERROR_INVALID_RACK_HANDLE,
+	      "a rack lock held across its system's destroy was not released, or a destroyed rack was "
+	      "locked");
+}
+
 void TestMasteringVoiceState() {
 	MasteringRender m;
 	alignas(Ngs2MasteringVoiceState) std::array<uint8_t, 0x140> storage;
@@ -3162,6 +3232,7 @@ int main() {
 	TestMasteringVoiceState();
 	TestRackGetVoiceHandleErrors();
 	TestSystemDestroy();
+	TestUserLocks();
 	TestReverbDryLevel();
 	TestReverbMaskAndLevels();
 	TestReverbRoomFilter();

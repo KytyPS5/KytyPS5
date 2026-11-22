@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -45,6 +46,8 @@ constexpr int32_t NGS2_ERROR_INVALID_NUM_CHANNELS =
     static_cast<int32_t>(0x804a8052u);
 constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8054u);
+constexpr int32_t NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA =
+    static_cast<int32_t>(0x804a8056u);
 constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_BLOCK_ADDRESS =
     static_cast<int32_t>(0x804a8058u);
 constexpr int32_t NGS2_ERROR_INVALID_FILTER_TYPE =
@@ -256,6 +259,12 @@ struct Ngs2WaveformBlock {
 // A block without skip or samples only carries data for the samples of the blocks before it.
 static bool Ngs2IsDataOnly(const Ngs2WaveformBlock& block) {
 	return block.num_skip_samples == 0 && block.num_samples == 0;
+}
+
+// Bytes per sample of the PCM waveform types 0x10..0x1b, 0 for other types.
+static uint32_t Ngs2PcmSampleBytes(uint32_t type) {
+	constexpr std::array<uint8_t, 12> BYTES = {1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 8, 8};
+	return type - 0x10 < BYTES.size() ? BYTES[type - 0x10] : 0;
 }
 
 struct Ngs2WaveformInfo {
@@ -1056,6 +1065,9 @@ struct Ngs2VoiceInternal {
 	uint32_t                            frame_samples      = 0;
 	uint32_t                            next_frame_samples = 0;
 	bool                                accepts_blocks     = true;
+	// Set when a straddling frame continues into a block with samples, which silences the grain.
+	bool                                incomplete_frame   = false;
+	uint32_t                            waveform_type      = 0;
 	uint32_t                            sample_rate        = 0;
 	uint64_t                            sample_phase       = 0;
 	uint64_t                            sample_step        = 0;
@@ -1142,6 +1154,7 @@ struct Ngs2VoiceInternal {
 		ResetSetupState();
 		ClearWaveformBlocks();
 		channels        = format.num_channels;
+		waveform_type   = format.waveform_type;
 		sample_rate     = format.sample_rate;
 		sample_step     = uint64_t(sample_rate) << 32u;
 		decoded_samples = 0;
@@ -1171,7 +1184,7 @@ struct Ngs2VoiceInternal {
 			decoded_frame.resize(info.frame_samples * channels);
 			compressed_input.reserve(info.super_frame_size);
 		} else {
-			EXIT_NOT_IMPLEMENTED(format.waveform_type != 0x12);
+			EXIT_NOT_IMPLEMENTED(Ngs2PcmSampleBytes(format.waveform_type) == 0);
 		}
 	}
 
@@ -2177,53 +2190,170 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	return voice.source_generation == generation;
 }
 
+template <typename T>
+static T Ngs2Load(const uint8_t* data) {
+	T value;
+	std::memcpy(&value, data, sizeof(T));
+	return value;
+}
+
+template <typename T>
+static T Ngs2LoadBigEndian(const uint8_t* data) {
+	T value = 0;
+	for (size_t i = 0; i < sizeof(T); ++i) {
+		value = static_cast<T>(value << 8u | data[i]);
+	}
+	return value;
+}
+
+// Converts `count` interleaved samples of PCM waveform `type` to floats without clamping:
+// integers scale by a power of two, floats are copied bit for bit and doubles rounded once.
+static void Ngs2ConvertPcm(uint32_t type, const uint8_t* data, size_t count, float* out) {
+	const auto convert = [&](size_t bytes, auto sample) {
+		for (size_t i = 0; i < count; ++i) {
+			out[i] = sample(data + i * bytes);
+		}
+	};
+	switch (type) {
+		case 0x10: convert(1, [](auto p) { return float(int8_t(p[0])) * 0x1p-7f; }); break;
+		case 0x11: convert(1, [](auto p) { return (float(p[0]) - 128.0f) * 0x1p-7f; }); break;
+		case 0x12: convert(2, [](auto p) { return float(Ngs2Load<int16_t>(p)) * 0x1p-15f; }); break;
+		case 0x13:
+			convert(2, [](auto p) {
+				return float(int16_t(Ngs2LoadBigEndian<uint16_t>(p))) * 0x1p-15f;
+			});
+			break;
+		case 0x14:
+			convert(3, [](auto p) {
+				return float(int32_t(uint32_t(p[0]) << 8u | uint32_t(p[1]) << 16u |
+				                     uint32_t(p[2]) << 24u)) *
+				       0x1p-31f;
+			});
+			break;
+		case 0x15:
+			convert(3, [](auto p) {
+				return float(int32_t(uint32_t(p[2]) << 8u | uint32_t(p[1]) << 16u |
+				                     uint32_t(p[0]) << 24u)) *
+				       0x1p-31f;
+			});
+			break;
+		case 0x16: convert(4, [](auto p) { return float(Ngs2Load<int32_t>(p)) * 0x1p-31f; }); break;
+		case 0x17:
+			convert(4, [](auto p) {
+				return float(int32_t(Ngs2LoadBigEndian<uint32_t>(p))) * 0x1p-31f;
+			});
+			break;
+		case 0x18: std::memcpy(out, data, count * sizeof(float)); break;
+		case 0x19:
+			convert(4, [](auto p) { return std::bit_cast<float>(Ngs2LoadBigEndian<uint32_t>(p)); });
+			break;
+		case 0x1a: convert(8, [](auto p) { return float(Ngs2Load<double>(p)); }); break;
+		case 0x1b:
+			convert(8, [](auto p) {
+				return float(std::bit_cast<double>(Ngs2LoadBigEndian<uint64_t>(p)));
+			});
+			break;
+	}
+}
+
+// Gathers one frame of `size` bytes that starts in the front block's tail and continues from the
+// start of the following blocks; a block without bytes for it is passed over. Returns the bytes
+// gathered, fewer than `size` until enough blocks are queued, or INCOMPLETE_WAVEFORM_DATA when a
+// block that would contribute has samples of its own.
+static int Ngs2GatherFrame(const Ngs2VoiceInternal& voice, uint32_t size, uint8_t* out) {
+	uint32_t gathered = 0;
+	for (size_t i = 0; i < voice.blocks.size() && gathered < size; ++i) {
+		const auto&  block = voice.blocks[i];
+		const size_t start = i == 0 ? block.data_cursor : 0;
+		const auto   bytes =
+		    static_cast<uint32_t>(std::min<size_t>(size - gathered, block.info.data_size - start));
+		if (bytes == 0) {
+			continue;
+		}
+		if (i != 0 && !Ngs2IsDataOnly(block.info)) {
+			return NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA;
+		}
+		std::memcpy(out + gathered, block.data + start, bytes);
+		gathered += bytes;
+	}
+	return static_cast<int>(gathered);
+}
+
+// The front block becoming current starts the extent of its samples; outside any extent it is
+// dropped, whatever its repeats.
+static void Ngs2EnterBlock(Ngs2VoiceInternal& voice) {
+	auto& block = voice.blocks.front();
+	if (!Ngs2IsDataOnly(block.info) && block.data_cursor == 0) {
+		// PCM plays the skip prefix; the decoder drops it.
+		voice.duration_remaining =
+		    block.info.num_samples + (voice.decoder == nullptr ? block.info.num_skip_samples : 0);
+		voice.skip_remaining = block.info.num_skip_samples;
+	}
+	if (voice.duration_remaining == 0) {
+		block.info.num_repeats = 0;
+	}
+}
+
 static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
                             uint32_t& frame_samples) {
 	frame_samples = 0;
 	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
-		auto& block = voice.blocks.front();
-		if (!Ngs2IsDataOnly(block.info) && block.data_cursor == 0) {
-			// PCM plays the skip prefix; the decoder drops it.
-			voice.duration_remaining = block.info.num_samples +
-			                           (voice.decoder == nullptr ? block.info.num_skip_samples : 0);
-			voice.skip_remaining     = block.info.num_skip_samples;
-		}
+		Ngs2EnterBlock(voice);
 		if (voice.duration_remaining == 0) {
-			// A block outside any samples' extent is dropped, whatever its repeats.
-			block.info.num_repeats = 0;
 			if (!Ngs2FinishBlock(voice)) {
 				return false;
 			}
 			continue;
 		}
+		auto& block = voice.blocks.front();
 		if (voice.decoder == nullptr) {
 			// PCM has no encoded frame size, so stage at most one system grain.
-			const auto quantum     = std::max(voice.rack->ngs->option.num_grain_samples, 1u);
-			const auto frame_bytes = voice.channels * sizeof(int16_t);
-			const auto available   = (block.info.data_size - block.data_cursor) / frame_bytes;
-			const auto count = std::min<size_t>({available, voice.duration_remaining, quantum});
-			frame.resize(size_t(quantum) * voice.channels);
-			const auto* pcm = reinterpret_cast<const int16_t*>(block.data + block.data_cursor);
-			for (size_t i = 0; i < count * voice.channels; ++i) {
-				frame[i] = pcm[i] / 32768.0f;
+			const auto  quantum     = std::max(voice.rack->ngs->option.num_grain_samples, 1u);
+			const auto  frame_bytes = voice.channels * Ngs2PcmSampleBytes(voice.waveform_type);
+			const auto  left        = block.info.data_size - block.data_cursor;
+			const auto* data        = block.data + block.data_cursor;
+			auto count = std::min<size_t>({left / frame_bytes, voice.duration_remaining, quantum});
+			std::array<uint8_t, 8 * sizeof(double)> straddle;
+			if (left != 0 && left < frame_bytes) {
+				// A frame that straddles the block's end continues in the following blocks; the
+				// voice starves until they are queued.
+				EXIT_NOT_IMPLEMENTED(block.info.num_repeats != 0 || frame_bytes > straddle.size());
+				const int gathered = Ngs2GatherFrame(voice, frame_bytes, straddle.data());
+				voice.incomplete_frame |= gathered == NGS2_ERROR_INCOMPLETE_WAVEFORM_DATA;
+				if (gathered != static_cast<int>(frame_bytes)) {
+					return false;
+				}
+				data  = straddle.data();
+				count = 1;
 			}
+			frame.resize(size_t(quantum) * voice.channels);
+			Ngs2ConvertPcm(voice.waveform_type, data, count * voice.channels, frame.data());
 			// The skip prefix does not count as decoded.
 			const auto skipped = std::min<size_t>(voice.skip_remaining, count);
 			voice.skip_remaining -= skipped;
 			voice.duration_remaining -= count;
-			block.data_cursor += count * frame_bytes;
 			voice.decoded_bytes += count * frame_bytes;
 			voice.decoded_samples += count - skipped;
 			frame_samples = static_cast<uint32_t>(count);
-			if (voice.duration_remaining == 0 ||
-			    block.info.data_size - block.data_cursor < frame_bytes) {
-				// A repeating block restarts its duration, so it must hold all of it.
-				EXIT_NOT_IMPLEMENTED(voice.duration_remaining != 0 &&
-				                     (block.data_cursor != block.info.data_size ||
-				                      block.info.num_repeats != 0));
-				if (!Ngs2FinishBlock(voice)) {
-					return false;
+			// The frames' bytes are consumed across the blocks they came from.
+			for (auto consumed = count * frame_bytes;;) {
+				auto&      front = voice.blocks.front();
+				const auto bytes = std::min(consumed, front.info.data_size - front.data_cursor);
+				front.data_cursor += bytes;
+				consumed -= bytes;
+				if (voice.duration_remaining == 0 || front.data_cursor == front.info.data_size) {
+					// A repeating block restarts its duration, so it must hold all of it.
+					EXIT_NOT_IMPLEMENTED(voice.duration_remaining != 0 &&
+					                     front.info.num_repeats != 0);
+					if (!Ngs2FinishBlock(voice)) {
+						return false;
+					}
 				}
+				if (consumed == 0 || voice.blocks.empty()) {
+					break;
+				}
+				// The finished block's successor holds the frame's other bytes.
+				Ngs2EnterBlock(voice);
 			}
 			if (count != 0) {
 				return true;
@@ -2342,6 +2472,7 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	const auto generation = voice.source_generation;
 	uint32_t   output     = 0;
 	const auto output_rate = uint64_t(voice.rack->ngs->option.sample_rate) << 32u;
+	voice.incomplete_frame = false;
 	while (voice.state == Ngs2VoicePlayState::Playing && output < grain &&
 	       (!voice.blocks.empty() || voice.frame_cursor < voice.frame_samples ||
 	        voice.next_frame_samples != 0)) {
@@ -2378,8 +2509,9 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	if (voice.source_generation == generation) {
 		Ngs2AdvanceSamples(voice);
 	}
-	if (voice.source_generation != generation) {
-		// A callback replaced the source, possibly changing its channel layout.
+	if (voice.source_generation != generation || voice.incomplete_frame) {
+		// A callback replaced the source, possibly changing its channel layout, or a straddling
+		// frame ran into a block with samples.
 		voice.ClearSamples(grain);
 		output = 0;
 	}
@@ -3090,11 +3222,12 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 		block->data_offset      = first * superframe_size;
 		block->data_size        = (last / superframe_samples - first) * superframe_size;
 		block->num_skip_samples = sample_pos + frame_samples - first * superframe_samples;
-	} else if (format->waveform_type == 0x12) {
-		// 16-bit PCM has fixed-size frames, so the block starts exactly at the sample.
-		const uint64_t frame_size = uint64_t(format->num_channels) * sizeof(int16_t);
-		block->data_offset        = uint64_t(sample_pos) * frame_size;
-		block->data_size          = uint64_t(num_samples) * frame_size;
+	} else if (const uint32_t bytes = Ngs2PcmSampleBytes(format->waveform_type); bytes != 0) {
+		// PCM has fixed-size frames, so the block starts exactly at the sample; the math wraps at
+		// 32 bits.
+		const uint32_t frame_size = format->num_channels * bytes;
+		block->data_offset        = sample_pos * frame_size;
+		block->data_size          = num_samples * frame_size;
 	} else {
 		return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
 	}

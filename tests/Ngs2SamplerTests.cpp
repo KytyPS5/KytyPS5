@@ -25,7 +25,8 @@ struct Fixture {
 	Ngs2RackInternal  rack {};
 	Ngs2VoiceInternal voice;
 
-	Fixture(uint32_t rate, uint32_t channels = 1, Ngs2RackType type = Ngs2RackType::Sampler) {
+	Fixture(uint32_t rate, uint32_t channels = 1, Ngs2RackType type = Ngs2RackType::Sampler,
+	        uint32_t waveform_type = 0x12) {
 		system.option.sample_rate = 48000;
 		system.option.num_grain_samples = 256;
 		rack.ngs                  = &system;
@@ -38,7 +39,7 @@ struct Fixture {
 			uint32_t             flags = 0, reserved = 0;
 		} setup;
 		setup.header.id = type == Ngs2RackType::Sampler ? 0x10000000 : 0x40010000;
-		setup.format    = {0x12, channels, rate};
+		setup.format    = {waveform_type, channels, rate};
 		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
 		      "sampler setup failed");
 		voice.state = Ngs2VoicePlayState::Playing;
@@ -2567,6 +2568,164 @@ void TestPcmBlocksEndWithTheirData() {
 	      "partially filled blocks did not play their data back to back");
 }
 
+std::vector<uint8_t> HexBytes(std::string_view hex) {
+	auto                 nibble = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+	std::vector<uint8_t> bytes;
+	for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+		bytes.push_back(static_cast<uint8_t>(nibble(hex[i]) << 4 | nibble(hex[i + 1])));
+	}
+	return bytes;
+}
+
+// Every PCM type plays two interleaved stereo frames of its sample size as they convert.
+void TestPcmWaveformTypes() {
+	struct Frames {
+		uint32_t                type;
+		const char*             bytes;
+		std::array<uint32_t, 4> bits;
+	};
+	const Frames frames[] = {
+	    {0x10, "7f80ff01", {0x3f7e0000, 0xbf800000, 0xbc000000, 0x3c000000}},
+	    {0x11, "ff000180", {0x3f7e0000, 0xbf800000, 0xbf7e0000, 0x00000000}},
+	    {0x12, "ff7f0080ffff0100", {0x3f7ffe00, 0xbf800000, 0xb8000000, 0x38000000}},
+	    {0x13, "7fff8000ffff0001", {0x3f7ffe00, 0xbf800000, 0xb8000000, 0x38000000}},
+	    {0x14, "ffff7f000080ffffff010000", {0x3f7ffffe, 0xbf800000, 0xb4000000, 0x34000000}},
+	    {0x15, "7fffff800000ffffff000001", {0x3f7ffffe, 0xbf800000, 0xb4000000, 0x34000000}},
+	    {0x16,
+		 "ffffff7f00000080bfffff7f03000001",
+		 {0x3f800000, 0xbf800000, 0x3f7fffff, 0x3c000002}},
+	    {0x17,
+		 "7fffffff800000007fffffbf01000003",
+		 {0x3f800000, 0xbf800000, 0x3f7fffff, 0x3c000002}},
+	    {0x18,
+		 "0000c03f0100807f000000800000c0ff",
+		 {0x3fc00000, 0x7f800001, 0x80000000, 0xffc00000}},
+	    {0x19,
+		 "3fc000007f800001800000007fc00000",
+		 {0x3fc00000, 0x7f800001, 0x80000000, 0x7fc00000}},
+	    {0x1a,
+		 "0100000000009036000000f0ffffef47000000200000f47f0000000000000080",
+		 {0x00000001, 0x7f800000, 0x7fe00001, 0x80000000}},
+	    {0x1b,
+		 "3690000000000001c7effffff00000007ff40000200000008000000000000000",
+		 {0x00000001, 0xff800000, 0x7fe00001, 0x80000000}}};
+	for (const auto& [type, hex, bits]: frames) {
+		Fixture                 f(48000, 2, Ngs2RackType::Sampler, type);
+		const auto              data = HexBytes(hex);
+		const Ngs2WaveformBlock block {0, data.size(), 0, 0, 2, 0, 0};
+		std::vector<float>      frame;
+		uint32_t                decoded = 0;
+		Check(f.QueueBlocks(data.data(), &block, 1, 0) == OK &&
+		          Ngs2DecodeFrame(f.voice, frame, decoded) && decoded == 2 &&
+		          f.voice.blocks.empty() && f.voice.decoded_bytes == data.size(),
+		      "a PCM type did not play two stereo frames of its sample size");
+		for (size_t i = 0; i < bits.size(); ++i) {
+			Check(std::bit_cast<uint32_t>(frame[i]) == bits[i],
+			      "a PCM type decoded its frames to the wrong floats");
+		}
+	}
+	// 8-channel doubles take 64 bytes a frame: offset and size wrap at 2^32.
+	const Ngs2WaveformFormat wide {0x1a, 8, 48000};
+	Ngs2WaveformBlock        block {};
+	Check(Ngs2CalcWaveformBlock(&wide, (1u << 26u) + 1, (1u << 26u) + 2, &block) == OK &&
+	          block.data_offset == 64 && block.data_size == 128,
+	      "PCM block offsets and sizes did not wrap at 32 bits");
+	for (const uint32_t type: {0x0fu, 0x20u}) {
+		const Ngs2WaveformFormat other {type, 2, 48000};
+		Check(Ngs2CalcWaveformBlock(&other, 0, 1, &block) == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT,
+		      "a block was calculated for a type that is not PCM");
+	}
+}
+
+// A 24-bit stereo frame that straddles its block's end is gathered from the following data-only
+// blocks, waits for them while they are missing and silences the voice if one has samples.
+void TestPcmFrameGather() {
+	// Frames 0-3: (+max, -1), (-1 lsb, +1 lsb), (0x123456, +max), (-1, +1 lsb).
+	const auto                 pcm  = HexBytes("ffff7f000080ffffff010000563412ffff7f000080010000");
+	auto                       bits = [](uint32_t value) { return std::bit_cast<float>(value); };
+	const std::array<float, 8> expected = {bits(0x3f7ffffe), bits(0xb4000000), bits(0x3e11a2b0),
+	                                       bits(0xbf800000), bits(0xbf800000), bits(0x34000000),
+	                                       bits(0x3f7ffffe), bits(0x34000000)};
+	// The blocks lie apart, so they do not join: 14 bytes of the first two frames and two bytes
+	// of frame 2, one byte, then the rest of frame 2 and frame 3.
+	std::array<uint8_t, 44> data {};
+	std::copy_n(pcm.begin(), 14, data.begin());
+	data[20] = pcm[14];
+	std::copy_n(pcm.begin() + 15, 9, data.begin() + 24);
+	const Ngs2WaveformBlock split[] = {
+	    {0, 14, 0, 0, 4, 0, 0}, {20, 1, 0, 0, 0, 0, 0}, {24, 9, 0, 0, 0, 0, 0}};
+	Fixture gather(48000, 2, Ngs2RackType::Sampler, 0x14);
+	Check(gather.QueueBlocks(data.data(), split, 3, 0) == OK, "split blocks were rejected");
+	gather.Render(4);
+	Check(std::ranges::equal(gather.voice.samples, expected) && gather.voice.blocks.empty() &&
+	          gather.voice.decoded_samples == 4 && gather.voice.decoded_bytes == 24,
+	      "a frame across data-only blocks was not gathered or the next frame lost its place");
+
+	// A block without bytes for the frame is passed over, even with samples, and then starts
+	// their extent. Bytes 20-23 of `tail` hold the rest of frame 2, bytes 32-43 the frames
+	// (0.5, 0.25) and (0.125, 0.0625).
+	std::array<uint8_t, 44> tail = data;
+	std::copy_n(pcm.begin() + 14, 4, tail.begin() + 20);
+	std::ranges::copy(HexBytes("000040000020000010000008"), tail.begin() + 32);
+	const Ngs2WaveformBlock after {20, 4, 0, 0, 0, 0, 0};
+	const Ngs2WaveformBlock passed[] = {
+	    {0, 14, 0, 0, 3, 0, 0}, {16, 0, 0, 0, 5, 0, 0}, after, {32, 12, 0, 0, 0, 0, 0}};
+	Fixture pass(48000, 2, Ngs2RackType::Sampler, 0x14);
+	Check(pass.QueueBlocks(tail.data(), passed, 4, 0) == OK,
+	      "blocks around an empty block were rejected");
+	pass.Render(7);
+	Check(pass.voice.samples == std::vector<float> {expected[0], expected[1], expected[2], 0.5f,
+	                                                0.125f, 0, 0, expected[4], expected[5],
+	                                                expected[6], 0.25f, 0.0625f, 0, 0},
+	      "an empty block with samples stopped the gather or did not start their extent");
+
+	// A data-only block that the extent ends in is dropped, whatever its repeats.
+	Fixture                 drop(48000, 2, Ngs2RackType::Sampler, 0x14);
+	const Ngs2WaveformBlock looped[] = {{0, 14, 0, 0, 3, 0, 0}, {20, 4, 1, 0, 0, 0, 0}};
+	Check(drop.QueueBlocks(tail.data(), looped, 2, 0) == OK, "a repeating block was rejected");
+	drop.Render(4);
+	Check(drop.voice.samples == std::vector<float> {expected[0], expected[1], expected[2], 0,
+	                                                expected[4], expected[5], expected[6], 0} &&
+	          drop.voice.decoded_bytes == 18,
+	      "a data-only block after the extent's end played its repeats");
+
+	// Until the rest of frame 2 is queued the voice starves; then it plays it.
+	Fixture wait(48000, 2, Ngs2RackType::Sampler, 0x14);
+	Check(wait.QueueBlocks(data.data(), split, 1, 1) == OK, "the first block was rejected");
+	wait.Render(3);
+	Check(wait.voice.samples ==
+	          std::vector<float> {expected[0], expected[1], 0, expected[4], expected[5], 0},
+	      "the frames before a straddling frame did not play");
+	wait.Render(2);
+	Check(std::ranges::all_of(wait.voice.samples, [](float s) { return s == 0.0f; }) &&
+	          wait.voice.state == Ngs2VoicePlayState::Playing && wait.voice.blocks.size() == 1,
+	      "a voice waiting for the rest of a frame did not starve");
+	Check(wait.QueueBlocks(tail.data(), &after, 1, 0) == OK, "the frame's rest was rejected");
+	wait.Render(1);
+	Check(wait.voice.samples == std::vector<float> {expected[2], expected[6]},
+	      "the frame completed by a later block did not play");
+
+	// A block with samples cannot complete the frame: the grain is silent, frames 0 and 1
+	// included, and the cursor stays, so later grains are too. No error is reported.
+	Fixture                 broken(48000, 2, Ngs2RackType::Sampler, 0x14);
+	const Ngs2WaveformBlock extent[] = {{0, 14, 0, 0, 3, 0, 0}, {20, 6, 0, 0, 1, 0, 0}};
+	Check(broken.QueueBlocks(tail.data(), extent, 2, 1) == OK, "blocks were rejected");
+	for (uint32_t grain = 0; grain < 2; ++grain) {
+		broken.Render(4);
+		Check(std::ranges::all_of(broken.voice.samples, [](float s) { return s == 0.0f; }) &&
+		          !broken.voice.has_samples && broken.voice.blocks.size() == 2 &&
+		          broken.voice.blocks.front().data_cursor == 12 &&
+		          broken.voice.state == Ngs2VoicePlayState::Playing &&
+		          broken.State().voice_state.error_code == 0,
+		      "a frame continued into a block with samples played or moved on");
+	}
+	// CANCEL drops the block with samples; the rest of frame 2 then completes it.
+	Check(broken.QueueBlocks(tail.data(), &after, 1, 8) == OK, "the frame's rest was rejected");
+	broken.Render(1);
+	Check(broken.voice.samples == std::vector<float> {expected[2], expected[6]},
+	      "a voice silenced by a broken frame stayed silent after the frame was completed");
+}
+
 std::vector<uintptr_t> g_block_end_users;
 
 void KYTY_SYSV_ABI RecordBlockEndUser(const Ngs2VoiceCallbackInfo* info) {
@@ -3760,6 +3919,8 @@ int main() {
 	TestPcmSkipAcrossBlocks();
 	TestPcmSkipPlaysAndDataOnlyBlocks();
 	TestPcmBlocksEndWithTheirData();
+	TestPcmWaveformTypes();
+	TestPcmFrameGather();
 	TestDecodedDataSizeAndEmptyBlockCallbacks();
 	TestMonoRateAndRouting();
 	TestDefaultMatrix();

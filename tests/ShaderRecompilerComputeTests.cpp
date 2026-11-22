@@ -31872,6 +31872,32 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
+// V_MOVRELS reads v[12 + M0] from the 44 candidates v12..v55 with a runtime M0; only M0's
+// low byte counts, and an M0 past the candidates reads v12.
+TestCase Vop1MoveRelSourceRuntimeIndex() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Vop1MoveRelSourceRuntimeIndex";
+  test.initial = {0, 5, 31, 40, 44, 0x105};
+  auto &code = test.code;
+  for (u32 reg = 12; reg <= 52; reg++) AppendVMovLiteral(&code, reg, 0x51000000u + reg);
+  for (u32 slot = 0; slot < test.initial.size(); slot++) {
+    AppendVMovU32(&code, 30, slot * 4u);
+    AppendBufferLoadDword(&code, 54, 30);
+    code.push_back(EncodeVop1(0x02, 8, Vgpr(54)));
+    code.push_back(EncodeSMovB32(124, 8));
+    code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
+    AppendStoreVgpr(&code, 55, slot);
+    const u32 index = test.initial[slot] & 0xffu;
+    test.expected.push_back(0x51000000u + 12u + (index < 44u ? index : 0u));
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
+                  O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{" = IEqual32 ", 0}};
+  return test;
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -49492,6 +49518,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  AddCase(Vop1MoveRelSourceRuntimeIndex);
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);

@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
@@ -399,15 +401,29 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
-	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
-	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+	const auto base  = inst.src0.reg;
+	const auto count = current_vector_limit - base;
+	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
+	                                 IR::U32(IR::Value(0xffu)));
+	// Halve the candidates once per M0 bit, low bit first; an M0 past the last register reads
+	// the base.
+	std::vector<IR::U32> level;
+	for (uint32_t index = base; index < current_vector_limit; index++) {
+		level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(index)));
 	}
-	WriteOperand(DestinationOperand(inst), selected);
+	const auto first = level[0];
+	for (uint32_t bit = 1u; level.size() > 1u; bit <<= 1u) {
+		const auto set =
+		    ir.INotEqual(ir.BitwiseAnd(m0, IR::U32(IR::Value(bit))), IR::U32(IR::Value(0u)));
+		for (size_t i = 0; i < level.size(); i += 2) {
+			level[i / 2] = i + 1 < level.size() ? ir.Select(set, level[i + 1], level[i]) : level[i];
+		}
+		level.resize((level.size() + 1) / 2);
+	}
+	if (count <= 0xffu) {
+		level[0] = ir.Select(ir.ULessThan(m0, IR::U32(IR::Value(count))), level[0], first);
+	}
+	WriteOperand(DestinationOperand(inst), level[0]);
 }
 
 void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {

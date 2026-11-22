@@ -7,7 +7,9 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cstring>
+#include <span>
 #include <string>
 
 namespace Libs {
@@ -21,7 +23,7 @@ struct UserServiceLoginUserIdList {
 };
 
 struct UserServiceRegisteredUserIdList {
-	int user_id[16];
+	int user_id[20];
 };
 
 enum UserServiceEventType { UserServiceEventTypeLogin, UserServiceEventTypeLogout };
@@ -52,6 +54,16 @@ static bool IsPlayerLoggedIn(int player) {
 static int GetLoggedInPlayer(int user_id) {
 	const int player = Config::GetPlayerFromUserId(user_id);
 	return IsPlayerLoggedIn(player) ? player : -1;
+}
+
+static void ListLoggedInUsers(std::span<int> user_ids) {
+	size_t count = 0;
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		if (IsPlayerLoggedIn(player)) {
+			user_ids[count++] = Config::GetPlayerUserId(player);
+		}
+	}
+	std::ranges::fill(user_ids.subspan(count), -1);
 }
 
 static KYTY_SYSV_ABI int UserServiceInitialize(const void* /*params*/) {
@@ -119,33 +131,20 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 
 	EXIT_NOT_IMPLEMENTED(user_id_list == nullptr);
 
-	int count = 0;
-	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
-		if (IsPlayerLoggedIn(player)) {
-			user_id_list->user_id[count++] = Config::GetPlayerUserId(player);
-		}
-	}
-	while (count < Config::MAX_PLAYERS) {
-		user_id_list->user_id[count++] = -1;
-	}
+	ListLoggedInUsers(user_id_list->user_id);
 
 	return OK;
 }
 
-static KYTY_SYSV_ABI int UserServiceGetRegisteredUserIdList(UserServiceRegisteredUserIdList* user_id_list) {
+static KYTY_SYSV_ABI int
+UserServiceGetRegisteredUserIdList(UserServiceRegisteredUserIdList* user_id_list) {
 	PRINT_NAME();
 
 	if (user_id_list == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
 
-	int count = 0;
-	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
-		user_id_list->user_id[count++] = Config::GetPlayerUserId(player);
-	}
-	while (count < 16) {
-		user_id_list->user_id[count++] = -1;
-	}
+	ListLoggedInUsers(user_id_list->user_id);
 
 	return OK;
 }

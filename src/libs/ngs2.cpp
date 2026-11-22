@@ -1040,6 +1040,9 @@ struct Ngs2VoiceInternal {
 	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
+	// Set by PLAY until the next render publishes the state flags; meanwhile the voice's modules
+	// report nothing.
+	bool                            play_pending   = false;
 	Ngs2RackInternal*               rack           = nullptr;
 	uintptr_t                       callback       = 0;
 	uintptr_t                       callback_data  = 0;
@@ -1263,9 +1266,10 @@ struct Ngs2VoiceInternal {
 			case 1:
 				if (state == Ngs2VoicePlayState::Empty || state == Ngs2VoicePlayState::Stopped) {
 					state = Ngs2VoicePlayState::Playing;
-					// Reserve the voice immediately; publish playback flags after rendering.
-					state_flags |= 1;
 				}
+				// Every PLAY reads as in use alone until the next render publishes the voice.
+				state_flags  = 1;
+				play_pending = true;
 				// Every PLAY restarts the resampler, filters and mastering modules without a ramp or
 				// history.
 				ResetResampler();
@@ -1437,10 +1441,6 @@ static_assert(offsetof(Ngs2WaveformFormat, frame_margin) == 16 &&
               offsetof(Ngs2WaveformFormat, frame_offset) == 20);
 static_assert(sizeof(Ngs2WaveformBlock) == 40);
 static_assert(sizeof(Ngs2WaveformInfo) == 232);
-
-static uint32_t Ngs2GetStateFlags(const Ngs2VoiceInternal* voice) {
-	return voice->state_flags;
-}
 
 static Ngs2SystemOption Ngs2DefaultSystemOption() {
 	Ngs2SystemOption option {};
@@ -3267,6 +3267,16 @@ static int Ngs2CheckRenderBuffers(const Ngs2RenderBufferInfo* buffers, uint32_t 
 	return OK;
 }
 
+// Publishes the voice's state flags after a render, which ends a pending PLAY.
+static void Ngs2PublishVoiceState(Ngs2VoiceInternal& voice) {
+	// No envelope is configured, so a release stop finishes in this render.
+	if (voice.state == Ngs2VoicePlayState::Stopped) {
+		voice.state = Ngs2VoicePlayState::Empty;
+	}
+	voice.state_flags  = static_cast<uint32_t>(voice.state);
+	voice.play_pending = false;
+}
+
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	auto* ngs = Ngs2FindSystem(system_handle);
@@ -3321,11 +3331,7 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		}
 	}
 	for (auto* voice: voices) {
-		// No envelope is configured, so a release stop finishes in this render.
-		if (voice->state == Ngs2VoicePlayState::Stopped) {
-			voice->state = Ngs2VoicePlayState::Empty;
-		}
-		voice->state_flags = static_cast<uint32_t>(voice->state);
+		Ngs2PublishVoiceState(*voice);
 	}
 	++ngs->render_count;
 	return OK;
@@ -4356,44 +4362,64 @@ int KYTY_SYSV_ABI Ngs2VoiceRunCommands(uintptr_t voice_handle, const void* comma
 	return OK;
 }
 
+// The player's part of a sampler voice state reads as zero between PLAY and the next render.
 template <typename State>
 static void Ngs2FillSamplerState(const Ngs2VoiceInternal& voice, State& state) {
-	state.voice_state.state_flags = Ngs2GetStateFlags(&voice);
-	state.num_decoded_samples     = voice.decoded_samples;
-	state.decoded_data_size       = voice.decoded_bytes;
-	state.waveform_data           = voice.WaveformData();
-	state.user_data               = voice.blocks.empty() ? 0 : voice.blocks.front().info.user_data;
+	if (voice.play_pending) {
+		return;
+	}
+	state.num_decoded_samples = voice.decoded_samples;
+	state.decoded_data_size   = voice.decoded_bytes;
+	state.waveform_data       = voice.WaveformData();
+	state.user_data           = voice.blocks.empty() ? 0 : voice.blocks.front().info.user_data;
 }
 
 int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* state,
                                     size_t state_size) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(state == nullptr);
 	EXIT_NOT_IMPLEMENTED(voice_handle == 0);
+	if (state_size < sizeof(Ngs2VoiceState)) {
+		return NGS2_ERROR_INVALID_OUT_SIZE;
+	}
+	if (state == nullptr) {
+		return NGS2_ERROR_INVALID_OUT_ADDRESS;
+	}
 
 	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
 
 	Common::LockGuard lock(voice->rack->ngs->mutex);
 
+	// A voice not in use reads as zeros. Otherwise the header is written first and stays written
+	// when the rack's part is too small.
+	const Ngs2VoiceState header {voice->state_flags, 0};
+	if (header.state_flags == 0) {
+		std::memset(state, 0, state_size);
+		return OK;
+	}
+	*state = header;
+	if (state_size == sizeof(header)) {
+		return OK;
+	}
+
 	switch (voice->rack->type) {
-		case Ngs2RackType::Submixer: {
+		case Ngs2RackType::Submixer:
 			EXIT_NOT_IMPLEMENTED(state_size != sizeof(Ngs2SubmixerVoiceState));
-			auto* submixer                    = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
-			*submixer                         = {};
-			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
+			*reinterpret_cast<Ngs2SubmixerVoiceState*>(state) = {header};
 			break;
-		}
 		case Ngs2RackType::Mastering: {
 			if (state_size < sizeof(Ngs2MasteringVoiceState)) {
 				return NGS2_ERROR_INVALID_OUT_SIZE;
 			}
-			const auto& modules                = *voice->mastering;
-			auto*       mastering              = reinterpret_cast<Ngs2MasteringVoiceState*>(state);
-			*mastering                         = {};
-			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
-			mastering->limiter_peak_level      = modules.limiter_state[0];
-			mastering->limiter_press_level     = modules.limiter_state[1];
+			const auto& modules   = *voice->mastering;
+			auto*       mastering = reinterpret_cast<Ngs2MasteringVoiceState*>(state);
+			*mastering            = {header};
+			// Between PLAY and the next render the limiter and the peak meters report nothing.
+			if (voice->play_pending) {
+				break;
+			}
+			mastering->limiter_peak_level  = modules.limiter_state[0];
+			mastering->limiter_press_level = modules.limiter_state[1];
 			std::copy_n(modules.meter_peaks[0].begin(), modules.meter_channels,
 			            mastering->input_peak_height);
 			std::copy_n(modules.meter_peaks[1].begin(), modules.meter_channels,
@@ -4402,41 +4428,36 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 		}
 		case Ngs2RackType::CustomMastering:
 		case Ngs2RackType::CustomSampler: {
-			const bool sampler = voice->rack->type == Ngs2RackType::CustomSampler;
-			const auto configured_size =
-			    voice->rack->option.custom_sampler.custom_rack_option.state_size;
-			EXIT_NOT_IMPLEMENTED(configured_size < (sampler ? sizeof(Ngs2CustomSamplerVoiceState)
-			                                                : sizeof(Ngs2CustomMasteringVoiceState)));
-			if (state_size < configured_size) {
+			// The fixed part is written before the configured size is checked; the custom module
+			// states after it read as zero.
+			const bool   sampler = voice->rack->type == Ngs2RackType::CustomSampler;
+			const size_t base    = sampler ? sizeof(Ngs2CustomSamplerVoiceState)
+			                               : sizeof(Ngs2CustomMasteringVoiceState);
+			if (state_size < base) {
 				return NGS2_ERROR_INVALID_OUT_SIZE;
 			}
-			std::memset(state, 0, configured_size);
+			std::memset(state + 1, 0, base - sizeof(header));
 			if (sampler) {
 				Ngs2FillSamplerState(*voice, *reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state));
-			} else {
-				state->state_flags = Ngs2GetStateFlags(voice);
+			}
+			const size_t configured =
+			    voice->rack->option.custom_sampler.custom_rack_option.state_size;
+			if (state_size < configured) {
+				return NGS2_ERROR_INVALID_OUT_SIZE;
+			}
+			if (configured > base) {
+				std::memset(reinterpret_cast<uint8_t*>(state) + base, 0, configured - base);
 			}
 			break;
 		}
 		case Ngs2RackType::Sampler: {
-			if (state_size != sizeof(Ngs2SamplerVoiceState)) {
-				LOGF("\t warning: sampler state_size = 0x%016" PRIx64 ", expected 0x%016" PRIx64
-				     "\n",
-				     static_cast<uint64_t>(state_size),
-				     static_cast<uint64_t>(sizeof(Ngs2SamplerVoiceState)));
-			}
-			std::memset(state, 0, state_size);
-
-			state->state_flags = Ngs2GetStateFlags(voice);
 			if (state_size < sizeof(Ngs2SamplerVoiceState)) {
-				break;
+				return NGS2_ERROR_INVALID_OUT_SIZE;
 			}
-
-			auto* sampler                = reinterpret_cast<Ngs2SamplerVoiceState*>(state);
-			sampler->envelope_height     = 1.0f;
-			sampler->peak_height         = 0.0f;
-			sampler->reserved            = 0;
-			Ngs2FillSamplerState(*voice, *sampler);
+			// The envelope and peak meter heights read 0.0: neither module is ever in use.
+			auto& sampler = *reinterpret_cast<Ngs2SamplerVoiceState*>(state);
+			sampler       = {header};
+			Ngs2FillSamplerState(*voice, sampler);
 			break;
 		}
 		default: EXIT("unknown type: %s\n", magic_enum::enum_name(voice->rack->type));
@@ -4448,14 +4469,16 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state_flags) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(state_flags == nullptr);
 	EXIT_NOT_IMPLEMENTED(voice_handle == 0);
+	if (state_flags == nullptr) {
+		return NGS2_ERROR_INVALID_OUT_ADDRESS;
+	}
 
 	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
 
 	Common::LockGuard lock(voice->rack->ngs->mutex);
 
-	*state_flags = Ngs2GetStateFlags(voice);
+	*state_flags = voice->state_flags;
 
 	return OK;
 }

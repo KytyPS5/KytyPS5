@@ -42,7 +42,7 @@ struct Fixture {
 		setup.format    = {waveform_type, channels, rate};
 		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
 		      "sampler setup failed");
-		voice.state = Ngs2VoicePlayState::Playing;
+		voice.SetEvent(1);
 	}
 
 	void SetCapacity(uint32_t capacity) {
@@ -96,6 +96,7 @@ struct Fixture {
 	void Render(uint32_t frames) {
 		voice.rendered = false;
 		Ngs2RenderVoice(voice, {}, frames);
+		Ngs2PublishVoiceState(voice);
 	}
 
 	void Pitch(float ratio) {
@@ -114,6 +115,12 @@ struct Fixture {
 void RenderLag(Ngs2VoiceInternal& voice) {
 	voice.rendered = false;
 	Ngs2RenderVoice(voice, {}, 3);
+}
+
+// Whether every byte from `first` to `last` is `value`.
+template <typename It>
+bool AllBytes(It first, It last, uint8_t value) {
+	return std::all_of(first, last, [value](uint8_t b) { return b == value; });
 }
 
 void TestStereoPan() {
@@ -328,7 +335,8 @@ void TestWaveformRingReuse() {
 				      "ring buffer reuse replayed overwritten data or mixed stereo channels");
 			}
 			rendered += grain;
-			const auto decoded = f.State().num_decoded_samples;
+			// The last grain ends the voice, whose state then reads as zeros.
+			const auto decoded = f.voice.decoded_samples;
 			const auto read    = std::min(rendered, total_frames);
 			Check(f.voice.blocks.size() <= ring.buffers.size() &&
 			          decoded >= read && decoded - read < 256 &&
@@ -426,9 +434,7 @@ void TestStreamingResample() {
 	}
 	Check(f.voice.blocks.empty(), "final streaming block did not finish");
 	Check(f.voice.state == Ngs2VoicePlayState::Empty, "finished voice remained active");
-	Ngs2SamplerVoiceState state {};
-	Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&f.voice), &state.voice_state, sizeof(state));
-	Check(state.num_decoded_samples == 441 && state.decoded_data_size == pcm.size() * 2,
+	Check(f.voice.decoded_samples == 441 && f.voice.decoded_bytes == pcm.size() * 2,
 	      "streaming progress does not match consumed source data");
 }
 
@@ -1857,17 +1863,33 @@ void TestMasteringVoiceState() {
 	storage.fill(0xa5);
 	auto*      state  = reinterpret_cast<Ngs2VoiceState*>(storage.data());
 	const auto handle = reinterpret_cast<uintptr_t>(&m.voice);
+	// An undersized buffer gets only the header.
 	Check(m.Setup(2) == OK &&
 	          Ngs2VoiceGetState(handle, state, 0x137) == NGS2_ERROR_INVALID_OUT_SIZE &&
-	          std::ranges::all_of(storage, [](uint8_t v) { return v == 0xa5; }),
-	      "undersized mastering state buffer was accepted or modified");
+	          state->state_flags == 1 && state->error_code == 0 &&
+	          AllBytes(storage.begin() + 8, storage.end(), 0xa5),
+	      "undersized mastering state buffer was accepted or written past its header");
 	Check(Ngs2VoiceGetState(handle, state, storage.size()) == OK && state->state_flags == 1 &&
-	          state->error_code == 0 &&
-	          std::all_of(storage.begin() + 8, storage.begin() + 0x138,
-	                      [](uint8_t v) { return v == 0; }) &&
-	          std::all_of(storage.begin() + 0x138, storage.end(),
-	                      [](uint8_t v) { return v == 0xa5; }),
+	          state->error_code == 0 && AllBytes(storage.begin() + 8, storage.begin() + 0x138, 0) &&
+	          AllBytes(storage.begin() + 0x138, storage.end(), 0xa5),
 	      "mastering state was not filled or was written past its size");
+	// Between PLAY and the next render the limiter and the peak meters report nothing.
+	float pcm[4 * 2];
+	auto  reports = [&] {
+		const auto s = m.State();
+		return s.limiter_peak_level != 0.0f && s.input_peak_height[0] != 0.0f &&
+		       s.output_peak_height[0] != 0.0f;
+	};
+	m.Play({16384, 8192}, 64);
+	Check(m.Limiter(1, 0.25f) == OK && m.Control(6, 1) == OK && m.Render(pcm, 2) == OK && reports(),
+	      "the mastering limiter or peak meters reported nothing");
+	m.voice.SetEvent(1);
+	storage.fill(0xa5);
+	Check(Ngs2VoiceGetState(handle, state, storage.size()) == OK && state->state_flags == 1 &&
+	          state->error_code == 0 && AllBytes(storage.begin() + 8, storage.begin() + 0x138, 0),
+	      "a played mastering voice reported its modules before its first render");
+	Check(m.Render(pcm, 2) == OK && reports(),
+	      "a played mastering voice reported nothing after its first render");
 }
 
 struct ReverbControl {
@@ -2368,36 +2390,44 @@ void TestCustomVoiceStateCapacity() {
 		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
 		f.rack.type = type;
 		f.rack.option.custom_sampler.custom_rack_option.state_size = 212;
-		f.voice.state_flags = 3;
+		Ngs2PublishVoiceState(f.voice);
 		f.voice.decoded_samples = 37;
 		f.voice.decoded_bytes = 128;
 		alignas(Ngs2CustomSamplerVoiceState) std::array<uint8_t, 384> storage;
 		auto* state = reinterpret_cast<Ngs2VoiceState*>(storage.data() + 8);
-		const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
+		const auto   handle    = reinterpret_cast<uintptr_t>(&f.voice);
+		const auto*  sampler   = reinterpret_cast<const Ngs2CustomSamplerVoiceState*>(state);
+		const size_t base_size = type == Ngs2RackType::CustomSampler
+		                             ? sizeof(Ngs2CustomSamplerVoiceState)
+		                             : sizeof(Ngs2CustomMasteringVoiceState);
 		for (size_t capacity: {212u, 368u}) {
 			storage.fill(0xa5);
 			Check(Ngs2VoiceGetState(handle, state, capacity) == OK && state->state_flags == 3 &&
 			          state->error_code == 0 &&
-			          std::all_of(storage.begin(), storage.begin() + 8,
-			                      [](uint8_t v) { return v == 0xa5; }) &&
-			          std::all_of(storage.begin() + 220, storage.end(),
-			                      [](uint8_t v) { return v == 0xa5; }),
-			      "oversized custom state buffer was rejected or overwritten past configured state");
-			if (type == Ngs2RackType::CustomSampler) {
-				const auto* sampler = reinterpret_cast<const Ngs2CustomSamplerVoiceState*>(state);
-				Check(sampler->num_decoded_samples == 37 && sampler->decoded_data_size == 128,
-				      "custom sampler state omitted playback progress");
-			}
-			const size_t base_size = type == Ngs2RackType::CustomSampler
-			    ? sizeof(Ngs2CustomSamplerVoiceState) : sizeof(Ngs2CustomMasteringVoiceState);
-			Check(std::all_of(storage.begin() + 8 + base_size, storage.begin() + 220,
-			                  [](uint8_t v) { return v == 0; }),
+			          AllBytes(storage.begin(), storage.begin() + 8, 0xa5) &&
+			          AllBytes(storage.begin() + 220, storage.end(), 0xa5),
+			      "oversized custom state buffer was rejected or written past its configured size");
+			Check(type == Ngs2RackType::CustomMastering ||
+			          (sampler->num_decoded_samples == 37 && sampler->decoded_data_size == 128),
+			      "custom sampler state omitted playback progress");
+			Check(AllBytes(storage.begin() + 8 + base_size, storage.begin() + 220, 0),
 			      "configured custom state extension was not initialized");
 		}
-		storage.fill(0xa5);
-		Check(Ngs2VoiceGetState(handle, state, 211) == static_cast<int32_t>(0x804a8011u) &&
-		          std::ranges::all_of(storage, [](uint8_t v) { return v == 0xa5; }),
-		      "undersized custom state buffer was accepted or modified");
+		// A buffer smaller than the configured size gets the header, and the fixed part when it
+		// fits; a custom mastering voice's fixed part is zero after the header.
+		for (size_t capacity: {base_size - 1, size_t {211}}) {
+			storage.fill(0xa5);
+			const size_t written = capacity < base_size ? 8 : base_size;
+			Check(Ngs2VoiceGetState(handle, state, capacity) == static_cast<int32_t>(0x804a8011u) &&
+			          state->state_flags == 3 && state->error_code == 0 &&
+			          AllBytes(storage.begin(), storage.begin() + 8, 0xa5) &&
+			          AllBytes(storage.begin() + 8 + written, storage.end(), 0xa5),
+			      "undersized custom state buffer was accepted or written past its fixed part");
+		}
+		Check(type == Ngs2RackType::CustomSampler
+		          ? sampler->num_decoded_samples == 37 && sampler->decoded_data_size == 128
+				  : AllBytes(storage.begin() + 16, storage.begin() + 24, 0),
+		      "undersized custom state buffer did not get its fixed part");
 	}
 }
 
@@ -2889,7 +2919,7 @@ void TestDecodedDataSizeAndEmptyBlockCallbacks() {
 	          rest.QueueBlocks(pcm, &looped, 1, 0) == OK,
 	      "a looping block was rejected");
 	rest.Render(5);
-	Check(rest.State().decoded_data_size == 16,
+	Check(rest.voice.decoded_bytes == 16,
 	      "an extent end did not count the unread rest of its block");
 	// A dropped data-only block counts its whole data; one without data reports nothing.
 	Fixture drop(48000);
@@ -2899,8 +2929,7 @@ void TestDecodedDataSizeAndEmptyBlockCallbacks() {
 	    {0, 4, 0, 0, 2, 0, 1}, {4, 6, 0, 0, 0, 0, 2}, {4, 0, 0, 0, 0, 0, 3}};
 	Check(drop.QueueBlocks(pcm, blocks, 3, 0) == OK, "blocks after an extent were rejected");
 	drop.Render(3);
-	Check(drop.State().decoded_data_size == 10 &&
-	          g_block_end_users == std::vector<uintptr_t> {1, 2},
+	Check(drop.voice.decoded_bytes == 10 && g_block_end_users == std::vector<uintptr_t> {1, 2},
 	      "a dropped data-only block was not counted or a block without data reported its end");
 }
 
@@ -3200,10 +3229,13 @@ void TestPortInfo() {
 	      "port info did not report the port routing and volume");
 }
 
+// Until the next render a played voice reads as in use with nothing played, also when it was
+// playing.
 void TestPlayStateBeforeRender() {
 	Fixture       f(48000);
-	const int16_t pcm[] = {8192, -16384};
-	f.voice.state       = Ngs2VoicePlayState::Empty;
+	const int16_t pcm[] = {8192, -16384, 4096, 2048};
+	f.voice.SetEvent(8);
+	f.Render(1);
 	f.Queue(pcm, 2, 0);
 	Ngs2VoiceEventParam event {{sizeof(Ngs2VoiceEventParam), 0, 6}, 1};
 	const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
@@ -3211,13 +3243,95 @@ void TestPlayStateBeforeRender() {
 	uint32_t flags = 0;
 	Ngs2VoiceGetStateFlags(handle, &flags);
 	Check(flags == 1, "play must reserve the voice before rendering starts playback");
-	Ngs2SamplerVoiceState state {};
-	Ngs2VoiceGetState(handle, &state.voice_state, sizeof(state));
-	Check(state.voice_state.state_flags == flags && state.num_decoded_samples == 0,
-	      "state queries disagreed or play consumed samples before render");
+	auto nothing_played = [](const Ngs2SamplerVoiceState& state) {
+		return state.voice_state.state_flags == 1 && state.voice_state.error_code == 0 &&
+		       state.num_decoded_samples == 0 && state.decoded_data_size == 0 &&
+		       state.waveform_data == nullptr && state.user_data == 0;
+	};
+	Check(nothing_played(f.State()),
+	      "a played voice reported its waveform before its first render");
 	f.Render(5);
 	Check(f.voice.samples[3] == 0.25f && f.voice.samples[4] == -0.5f,
 	      "one-shot effect was dropped before its first render");
+
+	Fixture playing(48000);
+	playing.system.option.num_grain_samples = 1;
+	playing.Queue(pcm, 4, 1);
+	playing.Render(1);
+	const auto playing_handle = reinterpret_cast<uintptr_t>(&playing.voice);
+	Ngs2VoiceControl(playing_handle, &event.header);
+	Ngs2VoiceGetStateFlags(playing_handle, &flags);
+	Check(flags == 1 && nothing_played(playing.State()),
+	      "a playing voice played again reported playback before the next render");
+	playing.Render(1);
+	const auto state = playing.State();
+	Check(state.voice_state.state_flags == 3 && state.num_decoded_samples == 2 &&
+	          state.user_data == 123 && state.waveform_data == pcm + 2,
+	      "a playing voice played again did not report playback after the next render");
+}
+
+// A voice that is not in use reads as zeros of the requested size, whatever it has queued.
+void TestIdleVoiceStateReadsZero() {
+	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
+		Fixture       f(48000, 1, rack);
+		const int16_t pcm[]  = {8192, 16384, 24576};
+		const auto    handle = reinterpret_cast<uintptr_t>(&f.voice);
+		alignas(Ngs2SamplerVoiceState) std::array<uint8_t, 64> storage;
+		auto* state = reinterpret_cast<Ngs2VoiceState*>(storage.data());
+		auto  idle  = [&] {
+			storage.fill(0xa5);
+			return Ngs2VoiceGetState(handle, state, 56) == OK &&
+			       AllBytes(storage.begin(), storage.begin() + 56, 0) &&
+			       AllBytes(storage.begin() + 56, storage.end(), 0xa5);
+		};
+		f.Queue(pcm, 3, 1);
+		f.Render(1);
+		f.voice.SetEvent(8);
+		f.Render(1);
+		Check(idle(), "a killed voice reported its queued waveform");
+		// Setup ends a voice too; the blocks queued after it do not start it.
+		f.voice.SetEvent(1);
+		f.Render(1);
+		f.voice.SetupSampler({0x12, 1, 48000});
+		f.Render(1);
+		f.Queue(pcm, 3, 1);
+		Check(idle(), "a voice set up without PLAY reported its queued waveform");
+	}
+}
+
+// A buffer smaller than the header is rejected; the header is written before the sampler part's
+// size is checked; the sampler part is 56 bytes, with envelope and peak meter heights of 0.0.
+void TestSamplerVoiceStateSizes() {
+	const int16_t pcm[] = {8192, 16384, 24576};
+	Fixture       f(48000);
+	f.system.option.num_grain_samples = 1;
+	f.Queue(pcm, 3, 1);
+	f.Render(1);
+	const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
+	alignas(Ngs2SamplerVoiceState) std::array<uint8_t, 64> storage;
+	auto*      state     = reinterpret_cast<Ngs2VoiceState*>(storage.data());
+	const auto untouched = [&](size_t from) {
+		return AllBytes(storage.begin() + from, storage.end(), 0xa5);
+	};
+	storage.fill(0xa5);
+	Check(Ngs2VoiceGetState(handle, state, 4) == NGS2_ERROR_INVALID_OUT_SIZE && untouched(0),
+	      "a state buffer smaller than its header was accepted or written");
+	Check(Ngs2VoiceGetState(handle, nullptr, 56) == NGS2_ERROR_INVALID_OUT_ADDRESS &&
+	          Ngs2VoiceGetStateFlags(handle, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
+	      "a state query without an output buffer was accepted");
+	Check(Ngs2VoiceGetState(handle, state, 8) == OK && state->state_flags == 3 &&
+	          state->error_code == 0 && untouched(8),
+	      "a header-sized state buffer did not get only the header");
+	Check(Ngs2VoiceGetState(handle, state, 16) == NGS2_ERROR_INVALID_OUT_SIZE &&
+	          state->state_flags == 3 && state->error_code == 0 && untouched(8),
+	      "an undersized sampler state buffer was accepted or got more than the header");
+	const auto& sampler = *reinterpret_cast<const Ngs2SamplerVoiceState*>(storage.data());
+	Check(Ngs2VoiceGetState(handle, state, storage.size()) == OK &&
+	          sampler.voice_state.state_flags == 3 && sampler.envelope_height == 0.0f &&
+	          sampler.peak_height == 0.0f && sampler.reserved == 0 &&
+	          sampler.num_decoded_samples == 1 && sampler.decoded_data_size == 2 &&
+	          sampler.user_data == 123 && sampler.waveform_data == pcm + 1 && untouched(56),
+	      "the sampler state was not filled or was written past its 56 bytes");
 }
 
 void TestStatePublication() {
@@ -3266,10 +3380,10 @@ void TestStopThenPlayBeforeRender() {
 	f.Queue(pcm, 2, 0);
 	f.voice.SetEvent(2);
 	f.voice.SetEvent(1);
-	Check(Ngs2GetStateFlags(&f.voice) == 1, "stopped voice could not restart");
+	Check(f.voice.state_flags == 1, "stopped voice could not restart");
 	f.voice.SetEvent(8);
 	f.voice.SetEvent(1);
-	Check(Ngs2GetStateFlags(&f.voice) == 1, "kill/play commands lost their ordering");
+	Check(f.voice.state_flags == 1, "kill/play commands lost their ordering");
 	f.Render(5);
 	Check(f.voice.samples[3] == 0.5f && f.voice.samples[4] == -0.25f,
 	      "restarted voice produced no audio");
@@ -3760,7 +3874,7 @@ void TestWaveformReadAddress() {
 		Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&f.voice), &state.voice_state, sizeof(state));
 		return state.waveform_data;
 	};
-	Check(next_data() == pcm, "read address passed the skip prefix");
+	Check(next_data() == nullptr, "a played voice reported a read address before its first render");
 	f.Render(1);
 	Check(next_data() == pcm + 2, "read address did not advance by a stereo frame");
 	f.Render(2);
@@ -3910,13 +4024,6 @@ void TestUpstreamCustomSamplerControls() {
 	f.Pitch(4.0f);
 	f.Render(1);
 	Check(f.voice.blocks.empty(), "custom sampler pitch did not advance playback");
-	f.rack.option.custom_sampler.custom_rack_option.state_size =
-	    sizeof(Ngs2CustomSamplerVoiceState);
-	Ngs2CustomSamplerVoiceState state {};
-	Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&f.voice), &state.voice_state,
-	                        sizeof(state)) == OK &&
-	          state.voice_state.state_flags == Ngs2GetStateFlags(&f.voice),
-	      "custom sampler state layout regressed");
 }
 
 void TestFilterTailDuringStarvation() {
@@ -4262,6 +4369,8 @@ int main() {
 	TestSetupQuery();
 	TestPortInfo();
 	TestPlayStateBeforeRender();
+	TestIdleVoiceStateReadsZero();
+	TestSamplerVoiceStateSizes();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();
 	std::puts("Ngs2SamplerTests: all cases passed");

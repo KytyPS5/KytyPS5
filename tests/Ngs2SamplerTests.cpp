@@ -1230,6 +1230,75 @@ void TestMasteringLimiter() {
 	      "the limiter threshold or time constants were wrong");
 }
 
+void TestMasteringPeakMeters() {
+	MasteringRender m;
+	m.system.option.num_grain_samples = 64;
+	// 5.1ch at L 0.5, R 0.25, C 0.125, LFE 0.0625, SL 0.03125, SR -0.25, and a quarter of that in
+	// grains 2..9, 11, 12 and 16.
+	m.Play({16384, 8192, 4096, 2048, 1024, -8192}, 17 * 64);
+	for (uint32_t grain: {2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 16}) {
+		for (uint32_t i = grain * 64 * 6; i < (grain + 1) * 64 * 6; ++i) {
+			m.input[i] /= 4;
+		}
+	}
+	// The input meter reads every channel, the output meter the stereo downmix after a gain of 0.5.
+	struct Peaks {
+		std::array<float, 6> input;
+		std::array<float, 2> output;
+	};
+	constexpr float h    = std::numbers::sqrt2_v<float> / 2;
+	const Peaks     loud = {{0.5f, 0.25f, 0.125f, 0.0625f, 0.03125f, 0.25f},
+	                        {(0.5f + 0.125f * h + 0.03125f * h) * 0.5f,
+	                         std::abs(0.25f + 0.125f * h - 0.25f * h) * 0.5f}};
+	// The loud peaks with the input meter's scaled by `input` and the output meter's by `output`.
+	auto scaled = [&](float input, float output) {
+		auto peaks = loud;
+		std::ranges::for_each(peaks.input, [&](float& peak) { peak *= input; });
+		std::ranges::for_each(peaks.output, [&](float& peak) { peak *= output; });
+		return peaks;
+	};
+	const Peaks quiet = scaled(0.25f, 0.25f);
+	const Peaks none  = scaled(0.0f, 0.0f);
+	float       pcm[64 * 2];
+	// Renders a grain and checks both meters, every other channel reading zero.
+	auto render = [&](const Peaks& expected) {
+		Check(m.Render(pcm, 2) == OK, "5.1ch mastering voice failed to render");
+		const auto state = m.State();
+		bool       ok    = true;
+		for (size_t c = 0; c < 37; ++c) {
+			const float in  = c < 6 ? expected.input[c] : 0.0f;
+			const float out = c < 2 ? expected.output[c] : 0.0f;
+			ok              = ok && std::abs(state.input_peak_height[c] - in) <= 1e-5f * in &&
+			                  std::abs(state.output_peak_height[c] - out) <= 1e-5f * out;
+		}
+		return ok;
+	};
+	Check(m.Setup(6) == OK && m.Control(6, 3) == NGS2_ERROR_INVALID_PEAK_METER_DETECT_TYPE &&
+	          render(none),
+	      "a peak meter detect type above 2 was accepted");
+	Check(m.Control(6, 1) == OK && m.Gain(0.5f, 0.5f) == OK && render(loud),
+	      "the peak meters did not read before the converter and after the gain");
+	// The window holds 8 grains, and the same detect type keeps it.
+	for (uint32_t i = 0; i < 6; ++i) {
+		Check(render(loud), "the peak meter window dropped a grain early");
+	}
+	Check(m.Control(6, 1) == OK && render(loud), "repeating the detect type restarted the window");
+	Check(render(quiet), "the peak meter window kept a grain past its 8 blocks");
+	// A detect type change restarts the window; RMS takes the energy of every sample in it.
+	const float rms = std::sqrt(17.0f / 32.0f);
+	Check(m.Control(6, 2) == OK && render(loud), "a detect type change did not restart the window");
+	Check(render(scaled(rms, rms)), "the RMS did not average the window's samples");
+	m.voice.SetEvent(1);
+	Check(render(quiet), "PLAY did not restart the peak meter window");
+	Check(m.Control(6, 0) == OK && render(none), "detect type 0 reported peaks");
+	Check(m.Control(6, 1) == OK && render(loud), "peak meters did not restart after detect type 0");
+	// Setup clears the reports and turns the meters off; a grain without them restarts the window.
+	Check(m.Control(0, 6) == OK && m.State().input_peak_height[0] == 0.0f && render(none),
+	      "Setup did not clear or turn off the peak meters");
+	Check(m.Control(6, 1) == OK && render(scaled(0.25f, 0.5f)),
+	      "peak meters after a grain without them kept their window");
+}
+
 void TestMasteringDownmix() {
 	MasteringRender m;
 	constexpr float h = std::numbers::sqrt2_v<float> / 2;
@@ -1343,6 +1412,7 @@ void TestMasteringControlErrors() {
 	          m.Control(0, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(2, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(3, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+	          m.Control(6, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(4, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(5, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Matrix(5, levels, 4, 23) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
@@ -1365,7 +1435,7 @@ int32_t KYTY_SYSV_ABI RejectRackBuffer(Ngs2ContextBufferInfo* /*buffer*/) {
 	return -1;
 }
 
-void TestMasteringRackChannelRange() {
+void TestMasteringRackOptionRanges() {
 	Ngs2Internal              system;
 	const auto                system_handle = reinterpret_cast<uintptr_t>(&system);
 	const Ngs2BufferAllocator allocator {RejectRackBuffer, RejectRackBuffer, 0};
@@ -1376,21 +1446,33 @@ void TestMasteringRackChannelRange() {
 	      "mastering rack size query failed");
 	const auto storage = std::make_unique<std::byte[]>(buffer.host_buffer_size);
 	buffer.host_buffer = storage.get();
-	for (uint32_t max_channels: {0u, 38u}) {
-		option.mastering.max_channels = max_channels;
+	struct Case {
+		uint32_t max_channels, blocks;
+		int32_t  error;
+	};
+	for (const auto [max_channels, blocks, error]:
+	     {Case {0, 8, NGS2_ERROR_INVALID_NUM_CHANNELS},
+	      Case {38, 8, NGS2_ERROR_INVALID_NUM_CHANNELS},
+	      Case {8, 0, NGS2_ERROR_INVALID_PEAK_METER_NUM_BLOCKS},
+	      Case {8, 257, NGS2_ERROR_INVALID_PEAK_METER_NUM_BLOCKS}}) {
+		option.mastering.max_channels          = max_channels;
+		option.mastering.num_peak_meter_blocks = blocks;
 		Ngs2ContextBufferInfo query {};
 		uintptr_t             handle = 0;
-		Check(Ngs2RackQueryBufferSize(0x3000, &option.common, &query) ==
-		              NGS2_ERROR_INVALID_NUM_CHANNELS &&
+		Check(Ngs2RackQueryBufferSize(0x3000, &option.common, &query) == error &&
 		          Ngs2RackCreate(system_handle, 0x3000, &option.common, &buffer, &handle) ==
-		              NGS2_ERROR_INVALID_NUM_CHANNELS &&
+		              error &&
 		          Ngs2RackCreateWithAllocator(system_handle, 0x3000, &option.common, &allocator,
-		                                      &handle) == NGS2_ERROR_INVALID_NUM_CHANNELS &&
+		                                      &handle) == error &&
 		          handle == 0,
-		      "mastering rack accepted a channel count outside 1..37");
+		      "mastering rack accepted a channel count outside 1..37 or a peak meter block count "
+		      "outside 1..256");
 	}
-	option.mastering.max_channels = 37;
+	option.mastering.max_channels          = 37;
+	option.mastering.num_peak_meter_blocks = 256;
 	RenderRack rack(system, 0x3000, option.common);
+	Check(rack.Voice().mastering->meter_blocks.size() == 2 * 37 * 256,
+	      "a peak meter window was not sized for every channel and block");
 }
 
 void TestRackGetVoiceHandleErrors() {
@@ -2905,13 +2987,14 @@ int main() {
 	TestMasteringLfeDesignRate();
 	TestMasteringLfeFilter();
 	TestMasteringLimiter();
+	TestMasteringPeakMeters();
 	TestMasteringDownmix();
 	TestMasteringMonoStereoConversion();
 	TestMasteringUntypedConversions();
 	TestMasteringMatrixSpill();
 	TestMasteringOutputRange();
 	TestMasteringControlErrors();
-	TestMasteringRackChannelRange();
+	TestMasteringRackOptionRanges();
 	TestMasteringVoiceState();
 	TestRackGetVoiceHandleErrors();
 	TestReverbDryLevel();

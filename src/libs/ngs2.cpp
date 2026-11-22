@@ -18,6 +18,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <numbers>
+#include <numeric>
 #include <string_view>
 #include <vector>
 
@@ -43,6 +44,10 @@ constexpr int32_t NGS2_ERROR_INVALID_NUM_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8053u);
 constexpr int32_t NGS2_ERROR_FULL_WAVEFORM_BLOCKS =
     static_cast<int32_t>(0x804a8054u);
+constexpr int32_t NGS2_ERROR_INVALID_PEAK_METER_NUM_BLOCKS =
+    static_cast<int32_t>(0x804a8092u);
+constexpr int32_t NGS2_ERROR_INVALID_PEAK_METER_DETECT_TYPE =
+    static_cast<int32_t>(0x804a8093u);
 constexpr int32_t NGS2_ERROR_INVALID_MATRIX_TYPE =
     static_cast<int32_t>(0x804a809au);
 constexpr int32_t NGS2_ERROR_INVALID_VOICE_INDEX =
@@ -911,6 +916,21 @@ struct Ngs2VoiceInternal {
 		std::array<float, 2> previous_gain {};
 		bool                 gain_enabled  = false;
 		bool                 gain_rendered = false;
+		// Peak meters on the N channels before the converter and after the gain, sharing a detect
+		// type and a window of the rack's blocks. A peak meter control enables both until Setup;
+		// a detect type change, a grain without them and PLAY restart the window. Each grain
+		// writes its peak (detect type 1) or energy (2) per channel into the window's next block,
+		// and the meters report the window's peak or RMS per channel, none for detect type 0 or
+		// after Setup. Mode 0 means no window. Each channel keeps the input then the output
+		// meter's window.
+		std::vector<float>                   meter_blocks;
+		std::array<std::array<float, 37>, 2> meter_peaks {};
+		uint32_t                             meter_detect_type = 0;
+		uint32_t                             meter_mode        = 0;
+		uint32_t                             meter_index       = 0;
+		uint32_t                             meter_count       = 0;
+		uint32_t                             meter_channels    = 0;
+		bool                                 meters_enabled    = false;
 	};
 	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
 	uint32_t                        state_flags    = 0;
@@ -1147,6 +1167,7 @@ struct Ngs2VoiceInternal {
 					mastering->lfe[1].history  = {};
 					mastering->limiter_gain    = 1.0f;
 					mastering->gain_rendered   = false;
+					mastering->meter_mode      = 0;
 				}
 				break;
 			case 2:
@@ -1489,7 +1510,11 @@ static int Ngs2CheckRackOption(uint32_t rack_id, const Ngs2RackOption& option) {
 	}
 	EXIT_NOT_IMPLEMENTED(option.size != sizeof(Ngs2MasteringRackOption));
 	const auto& mastering = reinterpret_cast<const Ngs2MasteringRackOption&>(option);
-	return mastering.max_channels - 1 >= 37 ? NGS2_ERROR_INVALID_NUM_CHANNELS : OK;
+	if (mastering.max_channels - 1 >= 37) {
+		return NGS2_ERROR_INVALID_NUM_CHANNELS;
+	}
+	return mastering.num_peak_meter_blocks - 1 >= 256 ? NGS2_ERROR_INVALID_PEAK_METER_NUM_BLOCKS
+	                                                  : OK;
 }
 
 int KYTY_SYSV_ABI Ngs2RackQueryBufferSize(uint32_t rack_id, const Ngs2RackOption* option,
@@ -1785,6 +1810,8 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 		voice.matrices.resize(option->max_matrices);
 		if (rack->type == Ngs2RackType::Mastering) {
 			voice.mastering = std::make_unique<Ngs2VoiceInternal::Mastering>();
+			voice.mastering->meter_blocks.resize(size_t(2) * rack->option.mastering.max_channels *
+			                                     rack->option.mastering.num_peak_meter_blocks);
 		}
 		if (Ngs2RackIsCustom(rack->type)) {
 			voice.modules.resize(rack->option.custom_sampler.custom_rack_option.num_modules);
@@ -2483,13 +2510,46 @@ static void Ngs2Limit(Ngs2VoiceInternal::Mastering& mastering, float* samples, u
 	}
 }
 
-// Runs a playing mastering voice's channel converter, LFE filter, limiter, gain and output in place
-// on its N input channels.
+// Writes this grain's level of each channel into the window of peak meter `meter`, and reports
+// the window's peak or RMS per channel.
+static void Ngs2MeterPeaks(Ngs2VoiceInternal::Mastering& mastering, size_t meter,
+                           const float* samples, uint32_t channels, uint32_t grain,
+                           uint32_t blocks) {
+	const bool peak = mastering.meter_mode == 1;
+	for (uint32_t c = 0; c < channels; ++c) {
+		const auto* data  = samples + size_t(c) * grain;
+		float       level = 0.0f;
+		for (uint32_t i = 0; i < grain; ++i) {
+			level = peak ? std::max(level, std::abs(data[i])) : level + data[i] * data[i];
+		}
+		auto* window = mastering.meter_blocks.data() + (size_t(c) * 2 + meter) * blocks;
+		window[mastering.meter_index] = level;
+		auto* end                     = window + mastering.meter_count;
+		mastering.meter_peaks[meter][c] =
+		    peak ? *std::max_element(window, end)
+			     : std::sqrt(std::accumulate(window, end, 0.0f) /
+			                 static_cast<float>(mastering.meter_count * grain));
+	}
+}
+
+// Runs a playing mastering voice's input peak meter, channel converter, LFE filter, limiter, gain,
+// output peak meter and output in place on its N input channels.
 static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
                                 uint32_t                         num_buffer_info,
                                 std::vector<std::vector<float>>& output_mix, uint32_t grain) {
 	auto&          mastering = *voice.mastering;
 	const uint32_t inputs    = voice.channels;
+	const uint32_t blocks    = voice.rack->option.mastering.num_peak_meter_blocks;
+	const uint32_t mode      = mastering.meters_enabled ? mastering.meter_detect_type : 0;
+	if (mastering.meter_mode != mode) {
+		mastering.meter_mode  = mode;
+		mastering.meter_index = 0;
+		mastering.meter_count = 1;
+	}
+	const bool metering = mastering.meter_mode != 0;
+	if (metering) {
+		Ngs2MeterPeaks(mastering, 0, voice.samples.data(), inputs, grain, blocks);
+	}
 	// The converter writes the output buffer's channels, at most N, and zeroes the rest.
 	const uint32_t outputs = std::min(inputs, voice.output_id < num_buffer_info
 	                                              ? buffer_info[voice.output_id].num_channels
@@ -2565,6 +2625,13 @@ static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 		mastering.previous_gain = mastering.gain;
 	}
 	mastering.gain_rendered = mastering.gain_enabled;
+
+	if (metering) {
+		Ngs2MeterPeaks(mastering, 1, voice.samples.data(), inputs, grain, blocks);
+		mastering.meter_index = (mastering.meter_index + 1) % blocks;
+		mastering.meter_count = std::min(mastering.meter_count + 1, blocks);
+	}
+	mastering.meter_channels = metering ? inputs : 0;
 
 	Ngs2MixOutput(voice, buffer_info, num_buffer_info, output_mix, grain);
 }
@@ -3341,14 +3408,16 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							return NGS2_ERROR_INVALID_NUM_CHANNELS;
 						}
 						EXIT_NOT_IMPLEMENTED(values[0] > 8);
-						// Setup restores the default levels, disables the LFE filter, the limiter
-						// and the gain, and clears the limiter state; ramps, filter history and
-						// the limiter gain go on.
+						// Setup restores the default levels, disables the LFE filter, the limiter,
+						// the gain and the peak meters, and clears the limiter and meter states;
+						// ramps, filter history, the limiter gain and the meter window go on.
 						mastering.levels          = NGS2_MASTERING_DEFAULT_LEVELS;
 						mastering.lfe_enabled     = false;
 						mastering.limiter_enabled = false;
 						mastering.limiter_state   = {};
 						mastering.gain_enabled    = false;
+						mastering.meters_enabled  = false;
+						mastering.meter_channels  = 0;
 						voice->channels           = values[0];
 						voice->output_id          = 0;
 						break;
@@ -3398,7 +3467,13 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						break;
 					}
 					case 5: voice->output_id = std::min(values[0], 32u); break;
-					default: EXIT("unsupported mastering control: 0x%08" PRIx32 "\n", param->id);
+					case 6:
+						if (values[0] > 2) {
+							return NGS2_ERROR_INVALID_PEAK_METER_DETECT_TYPE;
+						}
+						mastering.meter_detect_type = values[0];
+						mastering.meters_enabled    = true;
+						break;
 				}
 				break;
 			}
@@ -3632,11 +3707,16 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			if (state_size < sizeof(Ngs2MasteringVoiceState)) {
 				return NGS2_ERROR_INVALID_OUT_SIZE;
 			}
-			auto* mastering                    = reinterpret_cast<Ngs2MasteringVoiceState*>(state);
+			const auto& modules                = *voice->mastering;
+			auto*       mastering              = reinterpret_cast<Ngs2MasteringVoiceState*>(state);
 			*mastering                         = {};
 			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
-			mastering->limiter_peak_level      = voice->mastering->limiter_state[0];
-			mastering->limiter_press_level     = voice->mastering->limiter_state[1];
+			mastering->limiter_peak_level      = modules.limiter_state[0];
+			mastering->limiter_press_level     = modules.limiter_state[1];
+			std::copy_n(modules.meter_peaks[0].begin(), modules.meter_channels,
+			            mastering->input_peak_height);
+			std::copy_n(modules.meter_peaks[1].begin(), modules.meter_channels,
+			            mastering->output_peak_height);
 			break;
 		}
 		case Ngs2RackType::CustomMastering:

@@ -2952,6 +2952,90 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
   }
 
+  void CheckStreamCopyWindow() {
+    constexpr const char *name = "StreamCopyWindow";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t range = 0x100;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "stream window allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "stream window mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
+      auto &scheduler = context.GetCommandScheduler();
+      // The guest writes `value` and a draw binds the range read-only: the copy's stream offset
+      // and first word.
+      const auto bind = [&](uint32_t value, uint64_t bytes = range) {
+        std::fill_n(reinterpret_cast<uint32_t *>(base), range / sizeof(uint32_t), value);
+        const auto [buffer, offset] = cache.ObtainBuffer(base, bytes, false);
+        Require(name, "stream copy", buffer == &stream,
+                "a CPU-written read-only range was not copied to the stream buffer");
+        uint32_t word = 0;
+        std::memcpy(&word, stream.Mapped().data() + offset, sizeof(word));
+        return std::pair{offset, word};
+      };
+      const auto run = [&](std::span<const uint32_t> packets) {
+        Pm4Execution execution;
+        Require(name, "packets", processor.Process(execution, packets) == Pm4ProcessResult::Complete,
+                "the command processor did not finish the packets");
+      };
+      const std::array<uint32_t, 2> nop{KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO), 0};
+      uint32_t label = 0;
+      const auto label_address = reinterpret_cast<uint64_t>(&label);
+      const std::array<uint32_t, 5> write_label{KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+          static_cast<uint32_t>(label_address), static_cast<uint32_t>(label_address >> 32u), 7};
+
+      const auto first = bind(1);
+      Require(name, "first copy", first.second == 1, "the stream copy lost the guest's bytes");
+      run(nop);
+      const auto kept = bind(2);
+      Require(name, "draw window reuse", kept == first,
+          "a later draw of the window copied the range again");
+      run(write_label);
+      const auto written = bind(3);
+      Require(name, "window end", label == 7 && written.first != first.first && written.second == 3,
+          "a draw after WRITE_DATA reused a copy made before it");
+      const auto tick = scheduler.CurrentTick();
+      const std::vector<uint8_t> filler(stream.Size() / 8 + 1);
+      (void)stream.Copy(filler.data(), filler.size());
+      const auto lapped = bind(4);
+      Require(name, "ring distance", scheduler.CurrentTick() == tick &&
+          lapped.first != written.first && lapped.second == 4,
+          "a draw reused a copy made more than an eighth of a ring lap ago");
+      scheduler.Flush();
+      const auto flushed = bind(5);
+      Require(name, "tick end", flushed.first != lapped.first && flushed.second == 5,
+          "a draw of a later submission reused a copy whose ring space can be overwritten");
+      const auto narrower = bind(6, range / 2);
+      Require(name, "range key", narrower.first != flushed.first && narrower.second == 6,
+          "a narrower range reused the copy of a wider one");
+      // A live copy the GPU-written range must not reuse.
+      (void)bind(7);
+      (void)cache.ObtainBuffer(base, range, true);
+      Require(name, "GPU-written range", cache.ObtainBuffer(base, range, false).first != &stream,
+          "a range the GPU wrote was bound from a stream copy");
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "stream window release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -57920,6 +58004,11 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--stream-window-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStreamCopyWindow();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
     CheckStorageTextureLinearUploadLayout();
     CheckStorageTextureDepthTileUploadLayout();
@@ -58542,6 +58631,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckStreamCopyWindow();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

@@ -899,13 +899,84 @@ void TestPcm16RenderOutput() {
 	}
 	int16_t output_samples[4] = {};
 	Ngs2RenderBufferInfo output {output_samples, sizeof(output_samples), 0x12, 1};
-	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
-	          output_samples[0] == 24576 && output_samples[1] == -24576 &&
-	          output_samples[2] == 32767 && output_samples[3] == -32768,
-	      "PCM16 output failed to mix or saturate mastering voices");
+	Check(Ngs2SystemRender(system_handle, &output, 1) == OK && output_samples[0] == 24575 &&
+	          output_samples[1] == -24575 && output_samples[2] == 32767 &&
+	          output_samples[3] == -32767,
+	      "PCM16 output did not truncate the mixed voices into -32767..32767");
 	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
 	          std::ranges::all_of(output_samples, [](int16_t sample) { return sample == 0; }),
 	      "PCM16 output retained samples from the previous render");
+}
+
+void TestInt16Conversion() {
+	struct Case {
+		float   sample;
+		int16_t expected;
+	};
+	for (const auto [sample, expected]:
+	     {Case {0.75f, 24575}, Case {-6e-5f, -1}, Case {1.5f, 32767}, Case {-1.0f, -32767},
+	      Case {-2.0f, -32767}, Case {std::numeric_limits<float>::quiet_NaN(), 0}}) {
+		Check(Ngs2ToInt16(sample) == expected, "a sample converted to the wrong int16 value");
+	}
+}
+
+// Two mastering voices into one render buffer: an int16 buffer holds one voice's grain, a float
+// buffer their sum.
+void TestMasteringVoicesShareOutput() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 4;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices   = 2;
+	sampler_option.common.max_ports    = 1;
+	mastering_option.common.max_voices = 2;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	const auto system_handle = reinterpret_cast<uintptr_t>(&system);
+	auto*      samplers      = &sampler.Voice();
+	auto*      masters       = &master.Voice();
+	// Voice 0 plays L 0.25 and R 0.125, voice 1 mono 0.5.
+	const int16_t stereo[8] = {8192, 4096, 8192, 4096, 8192, 4096, 8192, 4096};
+	const int16_t mono[4]   = {16384, 16384, 16384, 16384};
+	auto          play      = [&] {
+		samplers[0].SetupSampler({0x12, 2, 48000});
+		samplers[0].blocks.push_back(
+		    {reinterpret_cast<const uint8_t*>(stereo), {0, sizeof(stereo), 0, 0, 4}});
+		samplers[1].SetupSampler({0x12, 1, 48000});
+		samplers[1].blocks.push_back(
+		    {reinterpret_cast<const uint8_t*>(mono), {0, sizeof(mono), 0, 0, 4}});
+		for (uint32_t i = 0; i < 2; ++i) {
+			samplers[i].ports[0].dest = masters + i;
+			samplers[i].SetEvent(1);
+			masters[i].channels = 2 - i;
+			masters[i].state    = Ngs2VoicePlayState::Playing;
+		}
+	};
+	// Whether every frame of a 2ch grain holds `left` and `right`.
+	auto frames_are = [](const auto* pcm, auto left, auto right) {
+		bool same = true;
+		for (uint32_t i = 0; i < 4; ++i) {
+			same = same && pcm[i * 2] == left && pcm[i * 2 + 1] == right;
+		}
+		return same;
+	};
+	play();
+	int16_t pcm16[8] {};
+	int16_t unused[8];
+	std::ranges::fill(unused, int16_t {0x7f7f});
+	const Ngs2RenderBufferInfo buffers16[2] = {{pcm16, sizeof(pcm16), 0x12, 2},
+	                                           {unused, sizeof(unused), 0x12, 2}};
+	Check(Ngs2SystemRender(system_handle, buffers16, 2) == OK &&
+	          (frames_are(pcm16, 8191, 4095) || frames_are(pcm16, 16383, 0)) &&
+	          std::ranges::all_of(unused, [](int16_t sample) { return sample == 0; }),
+	      "an int16 buffer did not hold one voice's grain or a buffer without voices was kept");
+	play();
+	float                      pcm[8];
+	const Ngs2RenderBufferInfo buffer {pcm, sizeof(pcm), 0x18, 2};
+	Check(Ngs2SystemRender(system_handle, &buffer, 1) == OK && frames_are(pcm, 0.75f, 0.125f),
+	      "a float buffer did not sum the voices");
 }
 
 void TestPatchToRackHandle() {
@@ -2982,6 +3053,8 @@ int main() {
 	TestAtrac9Vibration();
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
+	TestInt16Conversion();
+	TestMasteringVoicesShareOutput();
 	TestPatchToRackHandle();
 	TestMasteringGainRamp();
 	TestMasteringLfeDesignRate();

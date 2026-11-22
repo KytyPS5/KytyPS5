@@ -626,9 +626,9 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 
 void TextureCache::CopyImageMipTail(ImageId destination_id, ImageId source_id, uint32_t layer) {
 	RefreshCopySource(source_id);
-	if (m_slot_images[destination_id].IsBufferModified()) {
-		RefreshImage(destination_id);
-	}
+	// The copy covers only the tail levels of one layer: a pending CPU write must reach the
+	// destination first, or a later refresh would upload the whole image over the copied texels.
+	RefreshImage(destination_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -935,6 +935,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		tail.binding.needs_rebind |= tail.binding.is_bound || tail.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= tail.binding.is_target;
 		CopyImageMipTail(merged_id, cached_id, static_cast<uint32_t>(layer));
+		// The array now holds the view's GPU writes, so it takes over a pending writeback.
+		if (m_download_images.contains(cached_id)) {
+			m_download_images.insert(merged_id);
+		}
 		FreeImage(cached_id);
 		return {merged_id};
 	}

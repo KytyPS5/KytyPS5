@@ -2758,13 +2758,6 @@ void TestFilterDesigns() {
 void TestFilterRecurrence() {
 	Fixture       f(48000, 2);
 	const int16_t pcm[] = {8192, 16384, 16384, -8192, 0, 0, 0, 0, 0, 0};
-	// The input history of OFF is no tail.
-	Check(SetFilter(f, 1, 0, {0, 0, {}}) == OK, "filter OFF control failed");
-	f.Queue(pcm, 1, 0);
-	f.Render(1);
-	Check(f.voice.state == Ngs2VoicePlayState::Empty, "filter OFF kept a finished voice playing");
-	f.voice.SetupSampler({0x12, 2, 48000});
-	f.voice.state = Ngs2VoicePlayState::Playing;
 	f.Queue(pcm, 5, 0);
 	// OFF passes both channels through, its history following them.
 	Check(SetFilter(f, 0, 0, {0, 0, {}}) == OK, "filter OFF control failed");
@@ -2785,6 +2778,17 @@ void TestFilterRecurrence() {
 	f.Render(1);
 	Check(f.voice.samples == std::vector<float> {0.0f, 0.0f},
 	      "PLAY did not zero the filter history");
+	// The input history of OFF follows a starved grain to zero.
+	Fixture       starved(48000);
+	const int16_t steps[] = {16384, 16384, 8192};
+	Check(SetFilter(starved, 0, 0, {0, 0, {}}) == OK, "filter OFF control failed");
+	starved.Queue(steps, 2, 1);
+	starved.Render(2);
+	starved.Render(2);
+	Check(SetFilter(starved, 0, 0, Direct(1, 1, 0, 0, 0)) == OK, "DIRECT control failed");
+	starved.Queue(steps + 2, 1, 0);
+	starved.Render(1);
+	Check(starved.voice.samples[0] == 0.25f, "a starved grain left a stale input history");
 }
 
 void TestFilterLocations() {
@@ -2823,20 +2827,21 @@ void TestFilterLocations() {
 	Check(source.voice.samples[0] == 0.5f && sends[0].samples[0] == 0.5f &&
 	          sends[1].samples[0] == 0.25f,
 	      "a pre-send filter did not filter only its port's send");
-	// y = x + 0.5 * y1 before a send muted after one grain: it runs on, and the voice still ends.
-	Fixture muted(48000);
-	muted.voice.ports = {{&sends[0], 0, 1.0f, -1}};
-	Check(SetFilter(muted, 0, 2, Direct(1, 0, 0, 0.5f, 0)) == OK, "pre-send filter control failed");
+	// y = x + 0.5 * y1 before a send: it runs on while the send is muted, then rings on into the
+	// send once the source starves.
+	Fixture pre(48000);
+	pre.voice.ports = {{&sends[0], 0, 1.0f, -1}};
+	Check(SetFilter(pre, 0, 2, Direct(1, 0, 0, 0.5f, 0)) == OK, "pre-send filter control failed");
 	const std::vector<int16_t> steps(8, 16384);
-	muted.Queue(steps.data(), 8, 0);
-	for (float volume: {1.0f, 0.0f}) {
-		muted.voice.ports[0].volume = volume;
-		muted.voice.rendered = sends[0].rendered = false;
-		Ngs2RenderVoice(sends[0], {&muted.voice, &sends[0]}, 4);
+	pre.Queue(steps.data(), 8, 1);
+	for (float volume: {1.0f, 0.0f, 1.0f}) {
+		pre.voice.ports[0].volume = volume;
+		pre.voice.rendered = sends[0].rendered = false;
+		Ngs2RenderVoice(sends[0], {&pre.voice, &sends[0]}, 4);
 	}
-	Check(muted.voice.filters[0].history[0][2] == 0.99609375f &&
-	          muted.voice.state == Ngs2VoicePlayState::Empty,
-	      "a muted send froze its pre-send filter or its tail kept the voice playing");
+	Check(sends[0].samples ==
+	          std::vector<float> {0.498046875f, 0.2490234375f, 0.12451171875f, 0.062255859375f},
+	      "a muted send froze its pre-send filter or a starved source froze its tail");
 }
 
 struct LoopCallbacks {
@@ -3319,25 +3324,16 @@ void TestResamplingPhaseAfterStarvation() {
 }
 
 void TestFiniteFilterTail() {
-	Fixture whole(48000), split(48000);
-	SetLowPass(whole);
-	SetLowPass(split);
+	// A voice ends in the grain its data runs out, filtered, and its filter tail ends with it.
+	Fixture f(48000);
+	SetLowPass(f);
 	const int16_t impulse = 16384;
-	whole.Queue(&impulse, 1, 0);
-	split.Queue(&impulse, 1, 0);
-	whole.Render(256);
-	for (size_t i = 0; i < whole.voice.samples.size(); ++i) {
-		split.Render(1);
-		Check(std::abs(split.voice.samples[0] - whole.voice.samples[i]) < 1e-7f,
-		      "finite filter tail changed with render grain size");
-	}
-	Check(split.voice.state == Ngs2VoicePlayState::Playing,
-	      "finite voice stopped before its filter tail decayed");
-	split.Render(8192);
-	Check(split.voice.state == Ngs2VoicePlayState::Empty,
-	      "finite voice remained active after its filter tail decayed");
-	split.Render(32);
-	Check(!split.voice.has_samples, "completed finite filter tail still produced samples");
+	f.Queue(&impulse, 1, 0);
+	f.Render(4);
+	Check(f.voice.state == Ngs2VoicePlayState::Empty && f.voice.samples[3] != 0,
+	      "a finite voice did not end with its last grain filtered");
+	f.Render(4);
+	Check(!f.voice.has_samples, "a finished voice kept its filter tail");
 }
 
 } // namespace

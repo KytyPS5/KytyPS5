@@ -602,17 +602,10 @@ struct Ngs2SamplerFilter {
 		return type == 0 || (channel < 64 && (channel_mask & (uint64_t {1} << channel)) != 0);
 	}
 
-	// Whether a front or rear filter still rings; a pre-send tail does not keep its voice playing.
+	// Whether the filter has history left; a bypassed channel's follows its input to zero.
 	bool HasTail() const {
-		if (location > 1) {
-			return false;
-		}
-		for (size_t c = 0; c < history.size(); ++c) {
-			if (!Bypasses(c) && history[c] != std::array<float, 4> {}) {
-				return true;
-			}
-		}
-		return false;
+		return std::ranges::any_of(history,
+		                           [](const auto& h) { return h != std::array<float, 4> {}; });
 	}
 
 	// Filters channel-major samples in place. A bypassed channel, every one for OFF, passes
@@ -2430,18 +2423,18 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 		if (voice.rack->type == Ngs2RackType::Sampler ||
 		    voice.rack->type == Ngs2RackType::CustomSampler) {
 			Ngs2ConsumeSamples(voice, grain);
-			// A playing stream can have no source data but still have a filter tail. The front
-			// filters run before the rear ones, each in index order.
+			// A playing stream can have no source data but still have a filter tail, at any
+			// location. The front filters run before the rear ones, each in index order.
 			if (voice.has_samples ||
 			    std::ranges::any_of(voice.filters, &Ngs2SamplerFilter::HasTail)) {
 				voice.RunFilters(0, voice.samples.data(), grain);
 				voice.RunFilters(1, voice.samples.data(), grain);
 				voice.has_samples = true;
 			}
+			// The voice ends in the grain its data runs out; the filter tails end with it.
 			if (voice.state == Ngs2VoicePlayState::Playing && voice.blocks.empty() &&
 			    voice.frame_cursor == voice.frame_samples && voice.next_frame_samples == 0 &&
-			    !voice.accepts_blocks &&
-			    std::ranges::none_of(voice.filters, &Ngs2SamplerFilter::HasTail)) {
+			    !voice.accepts_blocks) {
 				voice.state = Ngs2VoicePlayState::Empty;
 			}
 		}

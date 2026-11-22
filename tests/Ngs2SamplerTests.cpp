@@ -2262,9 +2262,10 @@ void TestPitchLoopAndSkip() {
 		uint32_t             reserved = 0;
 	} pitch;
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&f.voice), &pitch.header);
-	f.Render(5);
-	const float expected[] = {0.25f, 0.5f, 0.25f, 0.5f, 0.0f};
-	for (size_t i = 0; i < 5; ++i) {
+	f.Render(7);
+	// The skip prefix plays on every pass.
+	const float expected[] = {-30000 / 32768.0f, 0.25f, 0.5f, -30000 / 32768.0f, 0.25f, 0.5f, 0};
+	for (size_t i = 0; i < 7; ++i) {
 		Check(std::abs(f.voice.samples[i] - expected[i]) < 0.00001f,
 		      "pitch, repeat count, or skipped samples incorrect");
 	}
@@ -2309,28 +2310,68 @@ void TestPcmByteUnitStreaming() {
 	const int16_t           pcm[] = {0, 4096, 8192, 12288, 16384, 20480, 24576, 28672};
 	const Ngs2WaveformBlock first {0, 4, 0, 1, 5, 0, 0}, rest {4, 12, 0, 0, 99, 0, 0};
 	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK && f.QueueBlocks(pcm, &rest, 1, 0x12) == OK &&
-	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 1),
-	      "byte-unit stream was rejected or its read address ignored the skipped frame");
+	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm),
+	      "byte-unit stream was rejected or its read address passed the skip prefix");
 	f.Render(8);
-	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0, 0, 0} &&
+	Check(f.voice.samples == std::vector<float> {0, 0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0, 0} &&
 	          f.voice.blocks.empty() && f.voice.decoded_samples == 5,
 	      "byte-unit stream did not play exactly its duration across data-only blocks");
 }
 
 void TestPcmSkipAcrossBlocks() {
+	// The skip prefix plays on into a block of data alone added without the data-only flag, and
+	// does not count as decoded.
 	Fixture                 f(48000);
 	const int16_t           pcm[] = {1, 2, 3, 8192, 16384};
 	const Ngs2WaveformBlock first {0, 4, 0, 3, 2, 0, 0}, rest {4, 6, 0, 0, 0, 0, 0};
-	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK, "skipping stream block was rejected");
-	f.Render(1);
-	Check(!f.voice.has_samples && f.voice.blocks.empty(), "skip-only block produced samples");
-	Check(f.QueueBlocks(pcm, &rest, 1, 2) == OK &&
-	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 3),
-	      "read address ignored the skip remaining from the previous block");
-	f.Render(2);
-	Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} && f.voice.decoded_samples == 2 &&
-	          f.voice.decoded_bytes == sizeof(pcm),
-	      "skip spanning blocks played skipped frames or miscounted decoded data");
+	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK && f.QueueBlocks(pcm, &rest, 1, 0x10) == OK &&
+	          f.voice.blocks.size() == 2,
+	      "a data-only block without the flag was rejected or joined across NOJOINT");
+	f.Render(6);
+	Check(f.voice.samples ==
+	              std::vector<float> {1 / 32768.0f, 2 / 32768.0f, 3 / 32768.0f, 0.25f, 0.5f, 0} &&
+	          f.voice.decoded_samples == 2 && f.voice.decoded_bytes == sizeof(pcm) &&
+	          f.voice.blocks.empty(),
+	      "skip spanning blocks did not play or miscounted decoded data");
+}
+
+void TestPcmSkipPlaysAndDataOnlyBlocks() {
+	const int16_t pcm[] = {4096, 8192, 12288, 16384};
+	// A block of skip samples alone plays them.
+	Fixture                 skip(48000);
+	const Ngs2WaveformBlock skip_only {0, 6, 0, 3, 0, 0, 0};
+	Check(skip.QueueBlocks(pcm, &skip_only, 1, 0) == OK, "a skip-only block was rejected");
+	skip.Render(4);
+	Check(skip.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0},
+	      "a skip-only block did not play its skip samples");
+	// Only a contiguous data-only block of the same user data that does not repeat joins.
+	Fixture join(48000);
+	join.SetCapacity(8);
+	const Ngs2WaveformBlock pieces[] = {{0, 2, 0, 0, 4, 0, 7},
+	                                    {2, 2, 0, 0, 0, 0, 7},
+	                                    {4, 2, 0, 0, 1, 0, 7},
+	                                    {6, 2, 0, 0, 0, 0, 8},
+	                                    {8, 0, 1, 0, 0, 0, 8}};
+	Check(join.QueueBlocks(pcm, pieces, 5, 1) == OK && join.voice.blocks.size() == 4 &&
+	          join.voice.blocks.front().info.data_size == 4,
+	      "data-only blocks did not join by samples, user data and repeats");
+	// A data-only block after a finished extent is dropped.
+	Fixture                 drop(48000);
+	const Ngs2WaveformBlock ended[] = {
+	    {0, 4, 0, 0, 1, 0, 0}, {6, 2, 0, 0, 0, 0, 0}, {4, 2, 0, 0, 1, 0, 0}};
+	Check(drop.QueueBlocks(pcm, ended, 3, 1) == OK, "blocks after an extent were rejected");
+	drop.Render(3);
+	Check(drop.voice.samples == std::vector<float> {0.125f, 0.375f, 0} &&
+	          drop.voice.decoded_samples == 2,
+	      "a data-only block after its extent played");
+	// A canceled block of skip samples behind the playing block plays nothing.
+	const Ngs2WaveformBlock queued[] = {{0, 4, 0, 0, 2, 0, 0}, {0, 4, 0, 2, 0, 0, 0}};
+	Check(drop.QueueBlocks(pcm, queued, 2, 1) == OK, "blocks before a cancel were rejected");
+	drop.Render(1);
+	Check(drop.QueueBlocks(pcm, ended + 2, 1, 8) == OK, "a canceling addition was rejected");
+	drop.Render(3);
+	Check(drop.voice.samples == std::vector<float> {0.25f, 0.375f, 0},
+	      "a canceled block played its skip");
 }
 
 void TestPcmBlocksEndWithTheirData() {
@@ -3088,12 +3129,12 @@ void TestWaveformReadAddress() {
 		Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&f.voice), &state.voice_state, sizeof(state));
 		return state.waveform_data;
 	};
-	Check(next_data() == pcm + 2, "read address ignored skipped source samples");
+	Check(next_data() == pcm, "read address passed the skip prefix");
 	f.Render(1);
-	Check(next_data() == pcm + 4, "read address did not advance by a stereo frame");
-	f.Render(1);
-	Check(next_data() == pcm + 2, "read address did not wrap at a loop boundary");
+	Check(next_data() == pcm + 2, "read address did not advance by a stereo frame");
 	f.Render(2);
+	Check(next_data() == pcm, "read address did not wrap at a loop boundary");
+	f.Render(3);
 	Check(f.voice.blocks.empty() && next_data() == pcm + 6,
 	      "starved read address did not preserve the consumed waveform end");
 	f.Queue(pcm + 2, 2, 0);
@@ -3420,6 +3461,7 @@ int main() {
 	TestStarvationAndPause();
 	TestPcmByteUnitStreaming();
 	TestPcmSkipAcrossBlocks();
+	TestPcmSkipPlaysAndDataOnlyBlocks();
 	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
 	TestDefaultMatrix();

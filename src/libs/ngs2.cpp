@@ -245,6 +245,11 @@ struct Ngs2WaveformBlock {
 	uintptr_t user_data        = 0;
 };
 
+// A block without skip or samples only carries data for the samples of the blocks before it.
+static bool Ngs2IsDataOnly(const Ngs2WaveformBlock& block) {
+	return block.num_skip_samples == 0 && block.num_samples == 0;
+}
+
 struct Ngs2WaveformInfo {
 	Ngs2WaveformFormat format;
 	uint32_t           data_offset              = 0;
@@ -1056,19 +1061,7 @@ struct Ngs2VoiceInternal {
 	std::vector<Ngs2SamplerFilter>      filters;
 
 	const uint8_t* WaveformData() const {
-		if (blocks.empty()) {
-			return waveform_end;
-		}
-		const auto& block = blocks.front();
-		if (decoder != nullptr) {
-			return block.data + block.data_cursor;
-		}
-		// PCM never reads skipped samples, so the next read starts past a pending skip.
-		const auto skip = block.info.num_samples != 0 && block.data_cursor == 0
-		                      ? block.info.num_skip_samples
-		                      : skip_remaining;
-		return block.data + std::min(block.data_cursor + size_t(skip) * channels * sizeof(int16_t),
-		                             block.info.data_size);
+		return blocks.empty() ? waveform_end : blocks.front().data + blocks.front().data_cursor;
 	}
 
 	// Custom racks keep num_buffers consecutive channel-major buffers; other racks keep one.
@@ -1185,7 +1178,7 @@ struct Ngs2VoiceInternal {
 		}
 		const bool clear     = (flags & 4u) != 0;
 		const bool only_data = (flags & 2u) != 0;
-		const bool join      = only_data && (flags & 0x10u) == 0;
+		const bool join      = (flags & 0x10u) == 0;
 		// CLEAR reopens a list that the previous addition closed.
 		EXIT_NOT_IMPLEMENTED((!accepts_blocks && !clear) || (flags & ~0x1fu) != 0);
 		const auto retained = clear ? 0 : blocks.size();
@@ -1194,10 +1187,6 @@ struct Ngs2VoiceInternal {
 		pending.reserve(count);
 		for (uint32_t i = 0; i < count; ++i) {
 			auto info = waveform_blocks[i];
-			if (!only_data && info.num_samples == 0 && info.data_size == 0) {
-				continue;
-			}
-			EXIT_NOT_IMPLEMENTED(!only_data && info.num_samples == 0);
 			if (only_data) {
 				info.num_repeats      = 0;
 				info.num_skip_samples = 0;
@@ -1206,8 +1195,11 @@ struct Ngs2VoiceInternal {
 			Block block {data + info.data_offset, info};
 			auto* previous = pending.empty() ? (retained == 0 ? nullptr : &tail)
 			                                 : &pending.back();
-			if (join && previous != nullptr &&
-			    previous->data + previous->info.data_size == block.data) {
+			// A data-only block that does not repeat extends a contiguous previous block of the
+			// same user data.
+			if (join && previous != nullptr && Ngs2IsDataOnly(info) && info.num_repeats == 0 &&
+			    previous->data + previous->info.data_size == block.data &&
+			    previous->info.user_data == info.user_data) {
 				previous->info.data_size += block.info.data_size;
 			} else {
 				pending.push_back(block);
@@ -2189,14 +2181,19 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 	while (voice.state == Ngs2VoicePlayState::Playing && !voice.blocks.empty()) {
 		auto& block = voice.blocks.front();
 		if (block.canceled && block.data_cursor == 0 && block.repeated_count == 0) {
-			block.info.num_samples = 0;
-			block.info.num_repeats = 0;
+			block.info.num_skip_samples = 0;
+			block.info.num_samples      = 0;
+			block.info.num_repeats      = 0;
 		}
-		if (block.info.num_samples != 0 && block.data_cursor == 0) {
-			voice.duration_remaining = block.info.num_samples;
+		if (!Ngs2IsDataOnly(block.info) && block.data_cursor == 0) {
+			// PCM plays the skip prefix; the decoder drops it.
+			voice.duration_remaining = block.info.num_samples +
+			                           (voice.decoder == nullptr ? block.info.num_skip_samples : 0);
 			voice.skip_remaining     = block.info.num_skip_samples;
 		}
 		if (voice.duration_remaining == 0) {
+			// A block outside any samples' extent is dropped, whatever its repeats.
+			block.info.num_repeats = 0;
 			if (!Ngs2FinishBlock(voice)) {
 				return false;
 			}
@@ -2207,20 +2204,19 @@ static bool Ngs2DecodeFrame(Ngs2VoiceInternal& voice, std::vector<float>& frame,
 			const auto quantum     = std::max(voice.rack->ngs->option.num_grain_samples, 1u);
 			const auto frame_bytes = voice.channels * sizeof(int16_t);
 			const auto available   = (block.info.data_size - block.data_cursor) / frame_bytes;
-			const auto skip        = std::min<size_t>(voice.skip_remaining, available);
-			const auto count =
-			    std::min<size_t>({available - skip, voice.duration_remaining, quantum});
+			const auto count = std::min<size_t>({available, voice.duration_remaining, quantum});
 			frame.resize(size_t(quantum) * voice.channels);
-			const auto* pcm = reinterpret_cast<const int16_t*>(block.data + block.data_cursor) +
-			                  skip * voice.channels;
+			const auto* pcm = reinterpret_cast<const int16_t*>(block.data + block.data_cursor);
 			for (size_t i = 0; i < count * voice.channels; ++i) {
 				frame[i] = pcm[i] / 32768.0f;
 			}
-			voice.skip_remaining -= skip;
+			// The skip prefix does not count as decoded.
+			const auto skipped = std::min<size_t>(voice.skip_remaining, count);
+			voice.skip_remaining -= skipped;
 			voice.duration_remaining -= count;
-			block.data_cursor += (skip + count) * frame_bytes;
-			voice.decoded_bytes += (skip + count) * frame_bytes;
-			voice.decoded_samples += count;
+			block.data_cursor += count * frame_bytes;
+			voice.decoded_bytes += count * frame_bytes;
+			voice.decoded_samples += count - skipped;
 			frame_samples = static_cast<uint32_t>(count);
 			if (voice.duration_remaining == 0 ||
 			    block.info.data_size - block.data_cursor < frame_bytes) {

@@ -292,7 +292,7 @@ static int KYTY_SYSV_ABI SystemServiceGetRemoteplayStatus(bool* active) {
 	PRINT_NAME();
 
 	if (active == nullptr) {
-		return SYSTEM_SERVICE_ERROR_PARAMETER;
+		return SYSTEM_SERVICE_ERROR_REMOTEPLAY_PARAMETER;
 	}
 
 	*active = false;
@@ -656,7 +656,8 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("Getl+RqEhVQ", SystemService::SystemServiceGetRemoteplayStatus);
 	LIB_FUNC("sPuK5ic3GD4", SystemService::SystemServiceOpenChallengeActivity);
 	LIB_FUNC("gELp9ue2ccQ", SystemService::SystemServiceOpenTournamentOccurrence);
-	LIB_FUNC("EqcPA3ugRP8", SystemService::SystemServiceDeclareReadyForSuspend);
+	LIB_FUNC_IN("SystemServiceSuspend", "EqcPA3ugRP8",
+	            SystemService::SystemServiceDeclareReadyForSuspend);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
 	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
 	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);

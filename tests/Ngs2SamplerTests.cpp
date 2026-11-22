@@ -966,9 +966,21 @@ struct MasteringRender {
 		return Control(4, std::bit_cast<uint32_t>(fbw), std::bit_cast<uint32_t>(lfe));
 	}
 
+	int Limiter(uint32_t enable_flag, float threshold) {
+		return Control(3, enable_flag, std::bit_cast<uint32_t>(threshold));
+	}
+
 	int Matrix(uint32_t type, const float* levels, uint32_t count, uint16_t size = 24) {
 		Ngs2VoiceMatrixLevelsParam param {{size, 0, 0x30000001}, type, count, levels};
 		return Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header);
+	}
+
+	Ngs2MasteringVoiceState State() {
+		Ngs2MasteringVoiceState state {};
+		Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&voice), &state.voice_state,
+		                        sizeof(state)) == OK,
+		      "mastering state query failed");
+		return state;
 	}
 
 	// Plays `frames` copies of `frame` into the mastering voice.
@@ -986,7 +998,8 @@ struct MasteringRender {
 
 	// Renders one grain into a float buffer of `channels` interleaved channels.
 	int Render(float* pcm, uint32_t channels) {
-		Ngs2RenderBufferInfo output {pcm, 4 * channels * sizeof(float), 0x18, channels};
+		Ngs2RenderBufferInfo output {
+		    pcm, system.option.num_grain_samples * channels * sizeof(float), 0x18, channels};
 		return Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1);
 	}
 };
@@ -1137,6 +1150,86 @@ void TestMasteringLfeFilter() {
 	check(&lfe_120, 0.0f, "an LFE filter after a grain without it kept its history");
 }
 
+void TestMasteringLimiter() {
+	MasteringRender m;
+	// 5.1ch: L 0.125 and LFE 0.5, the LFE at 0.0625 in frames 36..67.
+	m.Play({4096, 0, 0, 16384, 0, 0}, 4888);
+	for (uint32_t i = 36; i < 68; ++i) {
+		m.input[i * 6 + 3] = 2048;
+	}
+	float        pcm[64 * 6];
+	const double attack  = std::exp(-1.0f / 480.0f);
+	const double release = std::exp(-1.0f / 4800.0f);
+	// Checks `count` frames from `frame` on against a gain going from `gain` toward `target` with
+	// coefficient `a`, channel 0 playing `left` and channel 3 `lfe`.
+	auto follows = [&](uint32_t frame, uint32_t count, double& gain, double target, double a,
+	                   float left, float lfe) {
+		bool ok = true;
+		for (uint32_t i = frame; i < frame + count; ++i) {
+			gain = a * gain + (1.0 - a) * target;
+			ok   = ok && std::abs(pcm[i * 6] - left * gain) <= 1e-6 &&
+			       std::abs(pcm[i * 6 + 3] - lfe * gain) <= 1e-6;
+		}
+		return ok;
+	};
+	// A grain at the threshold 0.25 from unity gain: the LFE's peak limits every channel.
+	auto fresh = [&] {
+		double gain = 1.0;
+		return follows(0, 4, gain, 0.5, attack, 0.125f, 0.5f);
+	};
+	auto unlimited = [&] {
+		return pcm[0] == 0.125f && pcm[3] == 0.5f && pcm[18] == 0.125f && pcm[21] == 0.5f;
+	};
+	auto state = [&](float peak, float press) {
+		const auto s = m.State();
+		return s.limiter_peak_level == peak && s.limiter_press_level == press;
+	};
+	Check(m.Setup(6) == OK && m.Limiter(1, 0.25f) == OK && m.Render(pcm, 6) == OK && fresh(),
+	      "the limiter did not limit every channel by their common peak");
+	// Each block of 32 samples sets its own target: the first one attacks, the second releases.
+	m.system.option.num_grain_samples = 64;
+	double gain                       = m.State().limiter_press_level;
+	Check(m.Render(pcm, 6) == OK && follows(0, 32, gain, 0.5, attack, 0.125f, 0.5f) &&
+	          follows(32, 32, gain, 1.0, release, 0.125f, 0.0625f) &&
+	          state(0.125f, m.voice.mastering->limiter_gain),
+	      "the limiter did not attack and release by blocks of 32 samples");
+	m.system.option.num_grain_samples = 4;
+	// A cleared enable flag passes the audio at unity gain, from which the limiter restarts.
+	Check(m.Limiter(0, 0.25f) == OK && m.Render(pcm, 6) == OK && unlimited() && state(0.0f, 1.0f),
+	      "a bypassed limiter changed the audio or its state");
+	Check(m.Limiter(1, 0.25f) == OK && m.Render(pcm, 6) == OK && fresh(),
+	      "a re-enabled limiter did not start at unity gain");
+	m.voice.SetEvent(1);
+	Check(m.Render(pcm, 6) == OK && fresh(), "PLAY did not restore unity limiter gain");
+	// Setup turns the limiter off and clears its state; a grain without it restores unity gain.
+	Check(m.Control(0, 6) == OK && m.Render(pcm, 6) == OK && unlimited() && state(0.0f, 0.0f),
+	      "Setup did not turn the limiter off or clear its state");
+	Check(m.Limiter(1, 0.25f) == OK && m.Render(pcm, 6) == OK && fresh(),
+	      "a limiter after a grain without it did not start at unity gain");
+	// From unity gain toward 0.75, steps of four samples stop moving the gain in block 150, which
+	// then takes the target.
+	m.voice.SetEvent(1);
+	m.system.option.num_grain_samples = 32;
+	Check(m.Limiter(1, 0.375f) == OK, "the limiter control failed");
+	for (uint32_t i = 0; i < 149; ++i) {
+		Check(m.Render(pcm, 6) == OK, "5.1ch mastering voice failed to render");
+	}
+	const float settling = m.State().limiter_press_level;
+	Check(settling != 0.75f && std::abs(settling - 0.75f) < 0.01f && m.Render(pcm, 6) == OK &&
+	          state(0.5f, 0.75f),
+	      "the limiter gain did not settle on its target in block 150");
+	// The threshold is clamped to 0..1 and kept when NaN; time constants are whole samples.
+	m.system.option.sample_rate = 22050;
+	const auto& mastering       = *m.voice.mastering;
+	Check(m.Limiter(1, 3.0f) == OK && mastering.limiter_threshold == 1.0f &&
+	          mastering.limiter_attack == std::exp(-1.0f / 220.0f) &&
+	          mastering.limiter_release == std::exp(-1.0f / 2205.0f) && m.Limiter(1, -1.0f) == OK &&
+	          mastering.limiter_threshold == 0.0f &&
+	          m.Limiter(1, std::numeric_limits<float>::quiet_NaN()) == OK &&
+	          std::isnan(mastering.limiter_threshold),
+	      "the limiter threshold or time constants were wrong");
+}
+
 void TestMasteringDownmix() {
 	MasteringRender m;
 	constexpr float h = std::numbers::sqrt2_v<float> / 2;
@@ -1249,6 +1342,7 @@ void TestMasteringControlErrors() {
 	Check(m.Control(0, 8) == OK &&
 	          m.Control(0, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(2, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
+	          m.Control(3, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(4, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Control(5, 0, 0, 15) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE &&
 	          m.Matrix(5, levels, 4, 23) == NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
@@ -2810,6 +2904,7 @@ int main() {
 	TestMasteringGainRamp();
 	TestMasteringLfeDesignRate();
 	TestMasteringLfeFilter();
+	TestMasteringLimiter();
 	TestMasteringDownmix();
 	TestMasteringMonoStereoConversion();
 	TestMasteringUntypedConversions();

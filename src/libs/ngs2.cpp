@@ -892,6 +892,19 @@ struct Ngs2VoiceInternal {
 		std::array<LfeSection, 2> lfe {};
 		bool                      lfe_enable_flag = false;
 		bool                      lfe_enabled     = false;
+		// Limiter: each block of 32 samples takes the peak of every channel, and the gain moves
+		// toward threshold / peak above the threshold, else 1, with the attack coefficient while
+		// above that target and the release coefficient otherwise. A limiter control enables the
+		// stage until Setup; a grain without it, a cleared enable flag or PLAY restore unity gain.
+		// The state is the last block's peak and the gain after it, {0, 1} with a cleared enable
+		// flag and zero until the stage renders after Setup.
+		float                limiter_threshold = 0.0f;
+		float                limiter_attack    = 0.0f;
+		float                limiter_release   = 0.0f;
+		float                limiter_gain      = 1.0f;
+		std::array<float, 2> limiter_state {};
+		bool                 limiter_enable_flag = false;
+		bool                 limiter_enabled     = false;
 		// Full band and LFE gains. A gain control enables the gain until Setup; the first grain
 		// after a grain without it, or after PLAY, starts at the new gains.
 		std::array<float, 2> gain {};
@@ -1132,6 +1145,7 @@ struct Ngs2VoiceInternal {
 					mastering->previous_inputs = 0;
 					mastering->lfe[0].history  = {};
 					mastering->lfe[1].history  = {};
+					mastering->limiter_gain    = 1.0f;
 					mastering->gain_rendered   = false;
 				}
 				break;
@@ -2413,8 +2427,64 @@ static void Ngs2SetMasteringLfe(Ngs2VoiceInternal::Mastering& mastering, uint32_
 	mastering.lfe[1].gain = 1.0f;
 }
 
-// Runs a playing mastering voice's channel converter, LFE filter, gain and output in place on its
-// N input channels.
+// The limiter coefficient of a time constant of `time` seconds, counted in whole samples.
+static float Ngs2LimiterCoefficient(uint32_t rate, float time) {
+	const auto samples = static_cast<uint32_t>(static_cast<float>(rate) * time);
+	return samples == 0 ? 0.0f : std::exp(-1.0f / static_cast<float>(samples));
+}
+
+// Limits `channels` channels of `grain` samples in place, in blocks of 32 samples.
+static void Ngs2Limit(Ngs2VoiceInternal::Mastering& mastering, float* samples, uint32_t channels,
+                      uint32_t grain) {
+	auto& g = mastering.limiter_gain;
+	for (uint32_t start = 0; start < grain; start += 32) {
+		const uint32_t length = std::min(grain - start, 32u);
+		float          peak   = 0.0f;
+		for (uint32_t c = 0; c < channels; ++c) {
+			const auto* data = samples + size_t(c) * grain + start;
+			for (uint32_t i = 0; i < length; ++i) {
+				peak = std::max(peak, std::abs(data[i]));
+			}
+		}
+		const float threshold = mastering.limiter_threshold;
+		const float target    = peak > threshold ? threshold / peak : 1.0f;
+		const float a         = g > target ? mastering.limiter_attack : mastering.limiter_release;
+		// g = a * g + (1 - a) * target per sample, four samples at a time: the first four from the
+		// block's start gain, every next four from the previous four. Samples past the last whole
+		// four are left as they are.
+		const float          a2   = a * a;
+		const float          a3   = a2 * a;
+		const float          a4   = a2 * a2;
+		const float          b    = (1.0f - a) * target;
+		const float          c4   = b * (1.0f + a + a2 + a3);
+		std::array<float, 4> step = {g * a + b, g * a2 + b * (1.0f + a),
+		                             g * a3 + b * (1.0f + a + a2), g * a4 + c4};
+
+		std::array<float, 32> gains;
+		const uint32_t        limited = length / 4 * 4;
+		for (uint32_t i = 0; i < limited; i += 4) {
+			std::copy(step.begin(), step.end(), gains.begin() + i);
+			for (auto& gain: step) {
+				gain = std::fma(gain, a4, c4);
+			}
+		}
+		for (uint32_t c = 0; c < channels; ++c) {
+			auto* data = samples + size_t(c) * grain + start;
+			for (uint32_t i = 0; i < limited; ++i) {
+				data[i] *= gains[i];
+			}
+		}
+		g = limited == 0 ? step[3] : gains[limited - 1];
+		// The gain takes the target once a step no longer moves it.
+		if (std::abs(target - g) < 0.01f && target + a * (g - target) == g) {
+			g = target;
+		}
+		mastering.limiter_state = {peak, g};
+	}
+}
+
+// Runs a playing mastering voice's channel converter, LFE filter, limiter, gain and output in place
+// on its N input channels.
 static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBufferInfo* buffer_info,
                                 uint32_t                         num_buffer_info,
                                 std::vector<std::vector<float>>& output_mix, uint32_t grain) {
@@ -2469,6 +2539,15 @@ static void Ngs2RenderMastering(Ngs2VoiceInternal& voice, const Ngs2RenderBuffer
 				samples[i]    = y;
 			}
 			section.history = h;
+		}
+	}
+
+	if (mastering.limiter_enabled && mastering.limiter_enable_flag) {
+		Ngs2Limit(mastering, voice.samples.data(), inputs, grain);
+	} else {
+		mastering.limiter_gain = 1.0f;
+		if (mastering.limiter_enabled) {
+			mastering.limiter_state = {0.0f, 1.0f};
 		}
 	}
 
@@ -3262,13 +3341,16 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 							return NGS2_ERROR_INVALID_NUM_CHANNELS;
 						}
 						EXIT_NOT_IMPLEMENTED(values[0] > 8);
-						// Setup restores the default levels and disables the LFE filter and the
-						// gain; ramps and filter history go on.
-						mastering.levels       = NGS2_MASTERING_DEFAULT_LEVELS;
-						mastering.lfe_enabled  = false;
-						mastering.gain_enabled = false;
-						voice->channels        = values[0];
-						voice->output_id       = 0;
+						// Setup restores the default levels, disables the LFE filter, the limiter
+						// and the gain, and clears the limiter state; ramps, filter history and
+						// the limiter gain go on.
+						mastering.levels          = NGS2_MASTERING_DEFAULT_LEVELS;
+						mastering.lfe_enabled     = false;
+						mastering.limiter_enabled = false;
+						mastering.limiter_state   = {};
+						mastering.gain_enabled    = false;
+						voice->channels           = values[0];
+						voice->output_id          = 0;
 						break;
 					case 1: {
 						const auto* matrix =
@@ -3297,6 +3379,17 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						                    voice->rack->ngs->option.sample_rate);
 						mastering.lfe_enabled = true;
 						break;
+					case 3: {
+						const auto* levels = reinterpret_cast<const float*>(values);
+						const auto  rate   = voice->rack->ngs->option.sample_rate;
+						// The threshold is clamped to 0..1; a NaN threshold never limits.
+						mastering.limiter_enable_flag = values[0] != 0;
+						mastering.limiter_threshold   = std::clamp(levels[1], 0.0f, 1.0f);
+						mastering.limiter_attack      = Ngs2LimiterCoefficient(rate, 0.01f);
+						mastering.limiter_release     = Ngs2LimiterCoefficient(rate, 0.1f);
+						mastering.limiter_enabled     = true;
+						break;
+					}
 					case 4: {
 						const auto* levels = reinterpret_cast<const float*>(values);
 						mastering.gain         = {std::clamp(levels[0], -32.0f, 32.0f),
@@ -3542,6 +3635,8 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			auto* mastering                    = reinterpret_cast<Ngs2MasteringVoiceState*>(state);
 			*mastering                         = {};
 			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
+			mastering->limiter_peak_level      = voice->mastering->limiter_state[0];
+			mastering->limiter_press_level     = voice->mastering->limiter_state[1];
 			break;
 		}
 		case Ngs2RackType::CustomMastering:

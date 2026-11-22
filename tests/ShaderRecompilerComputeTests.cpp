@@ -31872,14 +31872,15 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
-// V_MOVRELS reads v[12 + M0] from the 44 candidates v12..v55 with a runtime M0; only M0's
-// low byte counts, and an M0 past the candidates reads v12.
+// V_MOVRELS reads v[12 + M0] from the 44 candidates v12..v55 with a runtime M0; an M0 past
+// the candidates, including one of 256 or more, reads v0.
 TestCase Vop1MoveRelSourceRuntimeIndex() {
   using O = ShaderOpcode;
   TestCase test;
   test.name = "Vop1MoveRelSourceRuntimeIndex";
   test.initial = {0, 5, 31, 40, 44, 0x105};
   auto &code = test.code;
+  AppendVMovLiteral(&code, 0, 0x50000000u);
   for (u32 reg = 12; reg <= 52; reg++) AppendVMovLiteral(&code, reg, 0x51000000u + reg);
   for (u32 slot = 0; slot < test.initial.size(); slot++) {
     AppendVMovU32(&code, 30, slot * 4u);
@@ -31888,8 +31889,8 @@ TestCase Vop1MoveRelSourceRuntimeIndex() {
     code.push_back(EncodeSMovB32(124, 8));
     code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
     AppendStoreVgpr(&code, 55, slot);
-    const u32 index = test.initial[slot] & 0xffu;
-    test.expected.push_back(0x51000000u + 12u + (index < 44u ? index : 0u));
+    const u32 index = test.initial[slot];
+    test.expected.push_back(index < 44u ? 0x51000000u + 12u + index : 0x50000000u);
   }
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
@@ -31912,6 +31913,9 @@ TestCase Vop1MoveRelDestination() {
   code.push_back(EncodeSop1(0x04, 126, 106));
   code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
   code.push_back(EncodeSop1(0x04, 126, 8));
+  // M0 indexes with all its bits, so 0x102 is past the candidates and writes nothing.
+  AppendSMovLiteral(&code, 124, 0x102u);
+  code.push_back(EncodeVop1(0x42, 5, InlineU32(0)));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 7, 4);
   AppendEnd(&code);

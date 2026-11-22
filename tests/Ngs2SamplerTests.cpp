@@ -2390,6 +2390,38 @@ void TestPcmBlocksEndWithTheirData() {
 	      "partially filled blocks did not play their data back to back");
 }
 
+std::vector<uintptr_t> g_block_end_users;
+
+void KYTY_SYSV_ABI RecordBlockEndUser(const Ngs2VoiceCallbackInfo* info) {
+	g_block_end_users.push_back(info->user);
+}
+
+void TestDecodedDataSizeAndEmptyBlockCallbacks() {
+	const int16_t pcm[] = {4096, 8192, 12288, 16384, 20480};
+	// Each pass counts the data its extent leaves unread.
+	Fixture                 rest(48000);
+	const Ngs2WaveformBlock looped {0, 8, 1, 0, 2, 0, 0};
+	// A callback mask without a handler calls nothing.
+	Ngs2VoiceCallbackParam callback {{sizeof(Ngs2VoiceCallbackParam), 0, 7}, 0, 0, 3};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&rest.voice), &callback.header) == OK &&
+	          rest.QueueBlocks(pcm, &looped, 1, 0) == OK,
+	      "a looping block was rejected");
+	rest.Render(5);
+	Check(rest.State().decoded_data_size == 16,
+	      "an extent end did not count the unread rest of its block");
+	// A dropped data-only block counts its whole data; one without data reports nothing.
+	Fixture drop(48000);
+	drop.voice.callback       = reinterpret_cast<uintptr_t>(&RecordBlockEndUser);
+	drop.voice.callback_flags = 1;
+	const Ngs2WaveformBlock blocks[] = {
+	    {0, 4, 0, 0, 2, 0, 1}, {4, 6, 0, 0, 0, 0, 2}, {4, 0, 0, 0, 0, 0, 3}};
+	Check(drop.QueueBlocks(pcm, blocks, 3, 0) == OK, "blocks after an extent were rejected");
+	drop.Render(3);
+	Check(drop.State().decoded_data_size == 10 &&
+	          g_block_end_users == std::vector<uintptr_t> {1, 2},
+	      "a dropped data-only block was not counted or a block without data reported its end");
+}
+
 void TestMonoRateAndRouting() {
 	Fixture              f(22050);
 	std::vector<int16_t> pcm(441, 16384);
@@ -3007,8 +3039,9 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	f.voice.callback_flags = 3;
 	f.Queue(pcm, 2, 0, 2);
 	f.Render(6);
-	Check(log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {2, 2}, {1, 2}},
-	      "loop and completion callbacks lost the completed repeat count");
+	// The end reports no repeat count; each loop reports the passes so far.
+	Check(log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {2, 2}, {1, 0}},
+	      "loop and completion callbacks reported the wrong repeat counts");
 	Check(f.voice.blocks.empty(), "finite loop did not complete");
 
 	Fixture active(48000, 1, type);
@@ -3081,7 +3114,7 @@ void TestAtrac9Looping() {
 	finite->Render(822);
 	Check(finite->voice.state == Ngs2VoicePlayState::Empty &&
 	          finite->voice.decoded_samples == 411 && finite->voice.decoded_bytes == 576 &&
-	          finite_log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {2, 2}, {1, 2}},
+	          finite_log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {2, 2}, {1, 0}},
 	      "compressed finite loop lost samples, input progress, or completion callbacks");
 	for (size_t i = 0; i < 3; ++i) {
 		Check(std::equal(reference.begin(), reference.end() - 1,
@@ -3108,7 +3141,7 @@ void TestAtrac9Looping() {
 	infinite->Render(248);
 	Check(infinite->voice.state == Ngs2VoicePlayState::Empty &&
 	          infinite->voice.decoded_samples == 274 &&
-	          infinite_log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {1, 1}},
+	          infinite_log.events == std::vector<std::pair<uint32_t, uint32_t>> {{2, 1}, {1, 0}},
 	      "compressed loop exit failed to finish the active iteration");
 }
 
@@ -3548,6 +3581,7 @@ int main() {
 	TestPcmSkipAcrossBlocks();
 	TestPcmSkipPlaysAndDataOnlyBlocks();
 	TestPcmBlocksEndWithTheirData();
+	TestDecodedDataSizeAndEmptyBlockCallbacks();
 	TestMonoRateAndRouting();
 	TestDefaultMatrix();
 	TestMatrixOutputChannels();

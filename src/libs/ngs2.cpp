@@ -2135,6 +2135,8 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	const auto generation = voice.source_generation;
 	auto&      block      = voice.blocks.front();
 	const bool repeat     = block.info.num_repeats != 0;
+	// Every pass and every dropped block counts its whole data as decoded.
+	voice.decoded_bytes += block.info.data_size - block.data_cursor;
 	voice.waveform_end = voice.WaveformData();
 	if (repeat) {
 		if (block.info.num_repeats != UINT32_MAX) {
@@ -2154,12 +2156,13 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	                                  block.info.user_data,
 	                                  block.data,
 	                                  block.info.data_size,
-	                                  block.repeated_count,
+	                                  repeat ? block.repeated_count : 0,
 	                                  0};
 	if (!repeat) {
 		voice.blocks.pop_front();
 	}
-	if (voice.callback != 0 && (voice.callback_flags & info.flag) != 0) {
+	// A block without data reports nothing.
+	if (voice.callback != 0 && (voice.callback_flags & info.flag) != 0 && info.size != 0) {
 		reinterpret_cast<void KYTY_SYSV_ABI (*)(const Ngs2VoiceCallbackInfo*)>(voice.callback)(
 		    &info);
 	}

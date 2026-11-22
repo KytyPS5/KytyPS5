@@ -341,15 +341,16 @@ void TestCombinedDecode() {
 	for (uint32_t packet = 0; packet < 6; ++packet) {
 		CHECK(Decoder::Decode(decoder, BackendInput(packet), {pixels.data, pixels.size}, &output) == Decoder::Result::Ok);
 		if (output.valid) CheckBackendPicture(output, frames++, pixels);
-		CHECK(Decoder::Flush(decoder, {pixels.data, pixels.size}, &output) == Decoder::Result::Ok);
-		CHECK(!output.valid); // Legacy Flush is receive-only; the next AU remains acceptable.
 	}
 	CHECK(frames == 4);
-	CHECK(Decoder::Finalize(decoder) == Decoder::Result::Ok);
+	// Flush ends the sequence and returns the frames FFmpeg holds back; decoding resumes
+	// once the last frame is out (see 8ecc1af4). Flushing past the last frame reports none.
 	while (frames < 6) {
 		CHECK(Decoder::Flush(decoder, {pixels.data, pixels.size}, &output) == Decoder::Result::Ok);
 		CheckBackendPicture(output, frames++, pixels);
 	}
+	CHECK(Decoder::Flush(decoder, {pixels.data, pixels.size}, &output) == Decoder::Result::Ok);
+	CHECK(!output.valid); // The sequence ended; a following AU starts a new one.
 	Decoder::Destroy(decoder);
 }
 

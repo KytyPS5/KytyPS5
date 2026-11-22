@@ -2926,29 +2926,36 @@ int KYTY_SYSV_ABI Ngs2CalcWaveformBlock(const Ngs2WaveformFormat* format, uint32
 	}
 
 	std::memset(block, 0, sizeof(Ngs2WaveformBlock));
-	if (format == nullptr || format->num_channels == 0 || format->num_channels > 8 ||
-	    format->sample_rate == 0 || format->sample_rate > 192000) {
+	if (format == nullptr) {
 		return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
 	}
 	if (format->waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
-		std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config {
-		    static_cast<uint8_t>(format->config_data >> 24u),
-		    static_cast<uint8_t>(format->config_data >> 16u),
-		    static_cast<uint8_t>(format->config_data >> 8u),
-		    static_cast<uint8_t>(format->config_data)};
-		Atrac9CodecInfo codec {};
-		if (!Ngs2GetAtrac9CodecInfo(config, codec) ||
-		    codec.channels != format->num_channels || codec.samplingRate != format->sample_rate) {
-			return NGS2_ERROR_INVALID_WAVEFORM_FORMAT;
+		// The superframe of one stream (sync 0xfe) or of several (sync 0x30), in 32-bit math.
+		const uint32_t config = format->config_data;
+		uint32_t       frames = 0, superframe_size = 0;
+		if (config >> 24u == 0xfe) {
+			frames          = 1u << ((config >> 3u) & 3u);
+			superframe_size = (((config >> 5u) & 0x7ffu) + 1u) * frames;
+		} else if (config >> 24u == 0x30) {
+			const uint32_t streams = ((config >> 14u) & 0x3fu) + 1u;
+			frames                 = 1u << (config & 3u);
+			superframe_size        = streams * (((config >> 2u) & 0x7ffu) + 1u) * frames;
 		}
-		const uint64_t frame_samples = uint64_t(codec.frameSamples) * codec.framesInSuperframe;
-		const uint64_t skip          = sample_pos % frame_samples;
-		block->data_offset = uint64_t(sample_pos / frame_samples) * codec.superframeSize;
-		block->data_size = num_samples == 0
-		                       ? 0
-		                       : ((skip + num_samples + frame_samples - 1) / frame_samples) *
-		                             codec.superframeSize;
-		block->num_skip_samples = num_samples == 0 ? 0 : static_cast<uint32_t>(skip);
+		// Frame samples by sample rate index; only 12, 24 and 48 kHz have frames.
+		constexpr std::array<uint32_t, 16> FRAME_SAMPLES = {0, 64, 0, 0, 128, 0, 0, 256};
+
+		const uint32_t frame_samples      = FRAME_SAMPLES[(config >> 20u) & 0xfu];
+		const uint32_t superframe_samples = frame_samples * frames;
+		if (superframe_samples == 0) {
+			return NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT;
+		}
+		// Decoded samples lag the superframes by one frame.
+		const uint32_t first = sample_pos / superframe_samples;
+		const uint32_t last  = sample_pos + frame_samples + num_samples + superframe_samples - 1;
+
+		block->data_offset      = first * superframe_size;
+		block->data_size        = (last / superframe_samples - first) * superframe_size;
+		block->num_skip_samples = sample_pos + frame_samples - first * superframe_samples;
 	} else if (format->waveform_type == 0x12) {
 		// 16-bit PCM has fixed-size frames, so the block starts exactly at the sample.
 		const uint64_t frame_size = uint64_t(format->num_channels) * sizeof(int16_t);

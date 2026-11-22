@@ -733,19 +733,30 @@ void TestAtrac9ResampleAfterStarvation() {
 }
 
 void TestWaveformBlockGeometry() {
+	// 24 kHz ATRAC9: frames of 128 samples, superframes of 4 frames in 192 bytes.
 	const Ngs2WaveformFormat format {NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0};
-	Ngs2WaveformBlock block {};
-	Check(Ngs2CalcWaveformBlock(&format, 0, 34534, &block) == OK &&
-	          block.data_offset == 0 && block.data_size == 13056 &&
-	          block.num_skip_samples == 0 && block.num_samples == 34534,
-	      "ATRAC9 block calculation omitted encoded superframes");
-	Check(Ngs2CalcWaveformBlock(&format, 513, 1, &block) == OK &&
-	          block.data_offset == 192 && block.data_size == 192 &&
-	          block.num_skip_samples == 1 && block.num_samples == 1,
-	      "ATRAC9 block calculation lost the source offset");
-	Check(Ngs2CalcWaveformBlock(&format, 0, 0, &block) == OK && block.data_size == 0 &&
-	          block.num_samples == 0,
-	      "empty ATRAC9 block acquired encoded data");
+	Ngs2WaveformBlock        block {};
+	// Whether the block for `n` samples from `pos` has this offset, size and skip.
+	auto is = [&](const Ngs2WaveformFormat& f, uint32_t pos, uint32_t n, size_t offset, size_t size,
+	              uint32_t skip) {
+		return Ngs2CalcWaveformBlock(&f, pos, n, &block) == OK && block.data_offset == offset &&
+		       block.data_size == size && block.num_skip_samples == skip && block.num_samples == n;
+	};
+	// The skip holds the one-frame decoder delay, which can carry the end into the next superframe.
+	Check(is(format, 513, 1, 192, 192, 129) && is(format, 400, 100, 0, 384, 528) &&
+	          is(format, 0, 0, 0, 192, 128),
+	      "ATRAC9 block calculation lost the decoder delay or the source offset");
+	// Channel counts and sample rates are not checked. 0x3072c0fe holds 12 streams of 4 frames in
+	// 64 bytes at 48 kHz.
+	const Ngs2WaveformFormat streams {NGS2_WAVEFORM_TYPE_ATRAC9, 13, 0, 0x3072c0fe};
+	Check(is(streams, 0, 256, 0, 3072, 256),
+	      "block calculation checked the format or lost the streams of a multi-stream config");
+	// Sample rate indexes 0 and 6 (44.1 kHz) and an unknown sync byte have no frames.
+	for (const uint32_t config: {0xfe0005f0u, 0xfe6005f0u, 0x004005f0u}) {
+		const Ngs2WaveformFormat frameless {NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, config};
+		Check(Ngs2CalcWaveformBlock(&frameless, 0, 1, &block) == NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT,
+		      "an ATRAC9 config without frames was given a block");
+	}
 	Check(Ngs2CalcWaveformBlock(&format, 0, 1, nullptr) == NGS2_ERROR_INVALID_OUT_ADDRESS,
 	      "block calculation without an output block did not fail");
 	const Ngs2WaveformFormat pcm {0x12, 2, 48000};
@@ -2864,6 +2875,39 @@ void TestAtrac9Looping() {
 	      "compressed loop exit failed to finish the active iteration");
 }
 
+// A block from CalcWaveformBlock plays the decoded samples from its position on: the decoder drops
+// no samples itself, so the skip holds the decoder delay.
+void TestAtrac9CalculatedBlockPlayback() {
+	// Two superframes of four encoded mono frames, each with one nonzero spectral coefficient after
+	// its first frame, then superframe padding.
+	std::array<uint8_t, 384> encoded {};
+	for (size_t i = 0; i < 8; ++i) {
+		const auto frame = encoded.begin() + i / 4 * 192 + i % 4 * ATRAC9_MONO_BLOCK.size();
+		std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(), frame);
+		if (i % 4 != 0) *frame |= 0x80;
+	}
+	const Ngs2WaveformFormat format {NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0};
+
+	auto play = [&](const Ngs2WaveformBlock& block, uint32_t frames) {
+		auto f = std::make_unique<Fixture>(24000);
+		f->voice.SetupSampler(format);
+		f->voice.state = Ngs2VoicePlayState::Playing;
+		Check(f->QueueBlocks(encoded.data(), &block, 1, 0) == OK, "ATRAC9 block queue failed");
+		f->Render(frames);
+		return f->voice.samples;
+	};
+	// The whole stream, at two output samples per decoded sample. Block sample 400 is decoded
+	// sample 528, past the one-frame delay, and its 100 samples end in the second superframe.
+	const auto        whole = play({0, encoded.size(), 0, 0, 1024}, 2048);
+	Ngs2WaveformBlock block {};
+	Check(Ngs2CalcWaveformBlock(&format, 400, 100, &block) == OK, "ATRAC9 block failed");
+	const auto part = play(block, 200);
+	const auto from = whole.begin() + 2 * 528;
+	Check(std::any_of(from, from + 200, [](float sample) { return sample != 0.0f; }) &&
+	          std::equal(part.begin(), part.end() - 1, from),
+	      "a calculated ATRAC9 block did not play from its sample position");
+}
+
 void TestAtrac9WaveformJoining() {
 	std::array<uint8_t, 192> encoded {};
 	for (size_t i = 0; i < 4; ++i) {
@@ -3255,6 +3299,7 @@ int main() {
 	TestLoopCallbacksAndExit(Ngs2RackType::CustomSampler);
 	TestAtrac9Looping();
 	TestAtrac9WaveformJoining();
+	TestAtrac9CalculatedBlockPlayback();
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();

@@ -31895,7 +31895,9 @@ TestCase Vop1MoveRelSourceRuntimeIndex() {
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
                   O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.ir_counts = {{" = IEqual32 ", 0}};
+  // A full wave needs no entry EXEC compare; each of the six V_MOVRELS compares M0 44 times.
+  test.compute_info.threads_num[0] = 64;
+  test.ir_counts = {{" = IEqual32 ", 0}, {" = ULessThan32 ", 6 * 44}};
   return test;
 }
 

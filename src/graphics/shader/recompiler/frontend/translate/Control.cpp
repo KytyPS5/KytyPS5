@@ -403,22 +403,24 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	}
 	const auto base = inst.src0.reg;
 	const auto m0   = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
-	// Halve the candidates once per M0 bit, low bit first; an M0 past the last register reads v0.
+	// A binary search on M0 over the candidates, then v0 for an M0 past them. Each select tests M0
+	// against its upper half's first index, so a bound on M0 rules out the halves above it.
 	std::vector<IR::U32> level;
 	for (uint32_t index = base; index < current_vector_limit; index++) {
 		level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(index)));
 	}
-	const auto in_range = ir.ULessThan(m0, IR::U32(IR::Value(current_vector_limit - base)));
-	for (uint32_t bit = 1u; level.size() > 1u; bit <<= 1u) {
-		const auto set =
-		    ir.INotEqual(ir.BitwiseAnd(m0, IR::U32(IR::Value(bit))), IR::U32(IR::Value(0u)));
-		for (size_t i = 0; i < level.size(); i += 2) {
-			level[i / 2] = i + 1 < level.size() ? ir.Select(set, level[i + 1], level[i]) : level[i];
+	level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(0)));
+	for (uint32_t span = 1u; level.size() > 1u; span <<= 1u) {
+		for (uint32_t i = 1u; i < level.size(); i += 2u) {
+			const auto upper = ir.ULessThan(IR::U32(IR::Value(i * span - 1u)), m0);
+			level[i / 2]     = ir.Select(upper, level[i], level[i - 1]);
+		}
+		if (level.size() % 2u != 0u) {
+			level[level.size() / 2] = level.back();
 		}
 		level.resize((level.size() + 1) / 2);
 	}
-	WriteOperand(DestinationOperand(inst),
-	             ir.Select(in_range, level[0], ir.GetVectorReg(static_cast<IR::VectorReg>(0))));
+	WriteOperand(DestinationOperand(inst), level[0]);
 }
 
 void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {

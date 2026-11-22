@@ -512,7 +512,8 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		return static_cast<bool>(id);
 	});
-	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	bool stale = std::exchange(m_redirected, false);
+	stale |= ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
 	const auto resolve = [&](const Element& element) {
 		const auto resource = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
 		return executor.ResolveTexture(resource, element.key.value);
@@ -552,6 +553,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			element.serial     = image.serial;
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
+			element.binding    = binding;
 			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back(index);
 			m_away.emplace_back(image.serial, binding.image_id);
 		} else if (!binding.desc.info.data.Empty()) {
@@ -578,18 +580,159 @@ void ImageHeap::WriteDescriptors() {
 	m_writes.clear();
 }
 
+void ImageHeap::DepthViews(ImageId image_id, std::vector<DepthView>& views) const {
+	std::vector<uint32_t> selected;
+	for (const auto* view: m_active) {
+		for (uint64_t probe = 0; probe < view->count; ++probe) {
+			const auto index = view->slots[(view->first + probe * view->step) / 4u] & ElementMask;
+			if (index != 0u) selected.push_back(index);
+		}
+	}
+	std::ranges::sort(selected);
+	selected.erase(std::ranges::unique(selected).begin(), selected.end());
+	for (const auto index: selected) {
+		const auto& binding = m_elements[index].binding;
+		if (binding.image_id != image_id) continue;
+		DepthView depth_view;
+		depth_view.base = binding.desc.view_info;
+		depth_view.mips.reserve(binding.mip_views.size());
+		for (uint32_t mip = 0; mip < binding.mip_views.size(); ++mip) {
+			auto info          = binding.desc.view_info;
+			info.base_level   += mip;
+			info.level_count   = 1;
+			info.min_lod       = 0;
+			depth_view.mips.push_back(info);
+		}
+		views.push_back(std::move(depth_view));
+	}
+}
+
+void ImageHeap::RedirectDepth(ImageId image_id, ImageId copy_id,
+                              const ImageSubresourceRange& range,
+                              vk::ImageAspectFlags aspects) {
+	auto& textures = m_context.GetTextureCache();
+	auto& copy     = textures.GetImage(copy_id);
+	std::vector<uint32_t> selected;
+	for (const auto* view: m_active) {
+		for (uint64_t probe = 0; probe < view->count; ++probe) {
+			const auto index = view->slots[(view->first + probe * view->step) / 4u] & ElementMask;
+			if (index != 0u) selected.push_back(index);
+		}
+	}
+	std::ranges::sort(selected);
+	selected.erase(std::ranges::unique(selected).begin(), selected.end());
+	std::vector<uint32_t> redirects;
+	for (const auto index: selected) {
+		const auto& binding = m_elements[index].binding;
+		if (binding.image_id != image_id) continue;
+		const auto overlaps = [&](const ImageViewInfo& info) {
+			return (aspects & info.aspect) &&
+			       info.base_level < range.base_level + range.level_count &&
+			       range.base_level < info.base_level + info.level_count &&
+			       info.base_layer < range.base_layer + range.layer_count &&
+			       range.base_layer < info.base_layer + info.layer_count;
+		};
+		bool match = overlaps(binding.desc.view_info);
+		for (uint32_t mip = 0; !match && mip < binding.mip_views.size(); ++mip) {
+			auto info          = binding.desc.view_info;
+			info.base_level   += mip;
+			info.level_count   = 1;
+			info.min_lod       = 0;
+			match              = overlaps(info);
+		}
+		if (match) redirects.push_back(index);
+	}
+	if (redirects.empty()) {
+		return;
+	}
+	// The bindless set is shared by every recorded draw. Rewriting an element while an earlier
+	// draw still references the set could make that draw sample the copy. Only elements used by
+	// an earlier recording need synchronization; new elements and completed work do not.
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (scheduler.Active()) {
+		const auto current_tick = scheduler.CurrentTick();
+		uint64_t   wait_tick   = 0;
+		bool       flush       = false;
+		for (const auto index: redirects) {
+			const auto& element = m_elements[index];
+			if (element.last_draw == 0) {
+				continue;
+			}
+			if (element.last_tick < current_tick && scheduler.IsFree(element.last_tick)) {
+				continue;
+			}
+			wait_tick = std::max(wait_tick, element.last_tick);
+			flush |= element.last_tick >= current_tick;
+		}
+		if (flush) {
+			if (scheduler.HasCommand()) {
+				scheduler.Flush();
+			} else {
+				wait_tick = 0;
+			}
+		}
+		if (wait_tick != 0) {
+			scheduler.Wait(wait_tick);
+		}
+	}
+	for (const auto index: redirects) {
+		auto&      element = m_elements[index];
+		auto&      binding = element.binding;
+		const auto info    = binding.desc.view_info;
+		if (auto* old = textures.m_slot_images.try_get(element.image);
+		    old != nullptr && old->serial == element.serial) {
+			old->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
+		}
+		binding.image_id = copy_id;
+		binding.layout   = copy.ReadLayout();
+		if (!binding.mip_views.empty()) {
+			for (uint32_t mip = 0; mip < binding.mip_views.size(); ++mip) {
+				auto mip_info          = info;
+				mip_info.base_level   += mip;
+				mip_info.level_count   = 1;
+				mip_info.min_lod       = 0;
+				binding.mip_views[mip] = copy.FindView(mip_info);
+			}
+			binding.image_view = binding.mip_views.front();
+		} else {
+			binding.image_view = copy.FindView(info);
+		}
+		element.image  = copy_id;
+		element.serial = copy.serial;
+		copy.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+		m_writes.push_back({index, {nullptr, binding.image_view, binding.layout}});
+	}
+	// The redirection is per draw. The copy has no guest address, so main's change queue cannot
+	// rediscover it; mark these elements stale and let the next discovery intern the originals.
+	for (const auto index: redirects) Mark(index, State::Stale);
+	m_redirected = true;
+	WriteDescriptors();
+}
+
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();
+	const auto use_tick = m_context.GetCommandScheduler().CurrentTick();
 	for (auto* view: m_active) {
-		if (view->dirty_begin == view->dirty_end) continue;
-		const auto slots  = std::span(view->slots).subspan(view->dirty_begin,
-		                                                   view->dirty_end - view->dirty_begin);
-		auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		const auto offset = stream.Copy(slots.data(), slots.size_bytes(), sizeof(uint32_t));
-		view->buffer->CopyFrom(buffer, stream, offset, view->dirty_begin * sizeof(uint32_t),
-		                       slots.size_bytes());
-		view->dirty_begin = view->dirty_end = 0;
+		if (view->dirty_begin != view->dirty_end) {
+			const auto slots = std::span(view->slots).subspan(view->dirty_begin,
+			                                                  view->dirty_end - view->dirty_begin);
+			auto& stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			const auto offset = stream.Copy(slots.data(), slots.size_bytes(), sizeof(uint32_t));
+			view->buffer->CopyFrom(buffer, stream, offset, view->dirty_begin * sizeof(uint32_t),
+			                       slots.size_bytes());
+			view->dirty_begin = view->dirty_end = 0;
+		}
+		// Remember which elements this recording can still sample, so a later in-place redirect
+		// only waits for work that actually references them.
+		for (uint64_t probe = 0; probe < view->count; ++probe) {
+			const auto index = view->slots[(view->first + probe * view->step) / 4u] & ElementMask;
+			if (index == 0u) continue;
+			auto& element = m_elements[index];
+			if (element.refs == 0u) continue;
+			element.last_draw = m_draw;
+			element.last_tick = use_tick;
+		}
 	}
 	m_active.clear();
 	Retire();

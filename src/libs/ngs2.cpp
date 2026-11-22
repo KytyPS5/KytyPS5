@@ -2996,6 +2996,18 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						                            matrix->levels + matrix->num_levels);
 						break;
 					}
+					case 2:
+					case 3: {
+						// Seen from Trackmania (PPSA02195); their meaning is unknown, so they are
+						// accepted and ignored.
+						static std::atomic<bool> warned[2] = {};
+						if (!warned[param->id & 1u].exchange(true)) {
+							Log::WriteToConsoleAndLog(fmt::sprintf(
+							    "warning: NGS2 mastering control 0x%08" PRIx32 " is ignored\n",
+							    param->id));
+						}
+						break;
+					}
 					case 4: {
 						const auto* levels = reinterpret_cast<const float*>(values);
 						voice->fbw_level   = std::clamp(levels[0], 0.0f, 4.0f);

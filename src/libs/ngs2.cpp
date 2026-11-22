@@ -2123,12 +2123,13 @@ struct Ngs2VoiceCallbackInfo {
 	uint32_t    flag, reserved;
 	uintptr_t   user;
 	const void* block_data;
-	uint32_t    size, repeats, attributes, reserved2;
+	size_t      size;
+	uint32_t    repeats, attributes;
 };
-static_assert(sizeof(Ngs2VoiceCallbackInfo) == 56);
-static_assert(offsetof(Ngs2VoiceCallbackInfo, size) == 40 &&
-              offsetof(Ngs2VoiceCallbackInfo, repeats) == 44 &&
-              offsetof(Ngs2VoiceCallbackInfo, attributes) == 48);
+static_assert(sizeof(Ngs2VoiceCallbackInfo) == 0x38);
+static_assert(offsetof(Ngs2VoiceCallbackInfo, size) == 0x28 &&
+              offsetof(Ngs2VoiceCallbackInfo, repeats) == 0x30 &&
+              offsetof(Ngs2VoiceCallbackInfo, attributes) == 0x34);
 
 static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	const auto generation = voice.source_generation;
@@ -2152,9 +2153,8 @@ static bool Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 	                                  0,
 	                                  block.info.user_data,
 	                                  block.data,
-	                                  static_cast<uint32_t>(block.info.data_size),
+	                                  block.info.data_size,
 	                                  block.repeated_count,
-	                                  0,
 	                                  0};
 	if (!repeat) {
 		voice.blocks.pop_front();

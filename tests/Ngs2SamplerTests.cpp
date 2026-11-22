@@ -2548,6 +2548,26 @@ void KYTY_SYSV_ABI RecordBlockAttributes(const Ngs2VoiceCallbackInfo* info) {
 	g_block_attributes.push_back(info->attributes);
 }
 
+uint64_t g_callback_size;
+uint32_t g_callback_repeats;
+
+void KYTY_SYSV_ABI RecordCallbackTail(const Ngs2VoiceCallbackInfo* info) {
+	std::memcpy(&g_callback_size, reinterpret_cast<const uint8_t*>(info) + 0x28, 8);
+	std::memcpy(&g_callback_repeats, reinterpret_cast<const uint8_t*>(info) + 0x30, 4);
+}
+
+void TestBlockCallbackLayout() {
+	// A block callback reports the data size in 8 bytes at 0x28 and the repeat count at 0x30.
+	Fixture f(48000);
+	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordCallbackTail);
+	f.voice.callback_flags = 2;
+	const int16_t pcm[]    = {8192, 16384};
+	f.Queue(pcm, 2, 0, 1);
+	f.Render(2);
+	Check(g_callback_size == sizeof(pcm) && g_callback_repeats == 1,
+	      "the loop callback did not report its data size or repeat count at their offsets");
+}
+
 void TestCancelKeepsOnlyTheFrontBlock() {
 	Fixture f(48000);
 	f.system.option.num_grain_samples = 1;
@@ -3533,6 +3553,7 @@ int main() {
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestClearReopensClosedList();
+	TestBlockCallbackLayout();
 	TestCancelKeepsOnlyTheFrontBlock();
 	TestWaveformBlockAdditionErrors();
 	TestSetupQuery();

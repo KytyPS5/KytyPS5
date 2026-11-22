@@ -1,10 +1,10 @@
 #include "common/abi.h"
-#include "libs/ajm/aac_decoder.h"
 #include "libs/acm.h"
-#include "libs/audio3d.h"
+#include "libs/ajm/aac_decoder.h"
 #include "libs/audio.h"
-#include "libs/ngs2.h"
+#include "libs/audio3d.h"
 #include "libs/libs.h"
+#include "libs/ngs2.h"
 #include "loader/symbolDatabase.h"
 
 #include <array>
@@ -700,7 +700,7 @@ namespace LibAudiodec {
 
 LIB_NAME("Audiodec", "Audiodec");
 
-static constexpr int32_t AUDIODEC_ERROR_API_FAIL                = -2139160576; // 0x807F0000
+static constexpr int32_t AUDIODEC_ERROR_API_FAIL                 = -2139160576; // 0x807F0000
 static constexpr int32_t AUDIODEC_ERROR_INVALID_TYPE             = -2139160575; // 0x807F0001
 static constexpr int32_t AUDIODEC_ERROR_ARG                      = -2139160574; // 0x807F0002
 static constexpr int32_t AUDIODEC_ERROR_INVALID_PARAM_SIZE       = -2139160572; // 0x807F0004
@@ -727,10 +727,10 @@ static constexpr int32_t AUDIODEC_WORD_SZ_24BIT = 0;
 static constexpr int32_t AUDIODEC_WORD_SZ_16BIT = 1;
 static constexpr int32_t AUDIODEC_WORD_SZ_FLOAT = 2;
 
-static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SIZE      = 2048;
-static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SAMPLES   = 256;
-static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SIZE      = 1441;
-static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SAMPLES   = 1152;
+static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SIZE    = 2048;
+static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SAMPLES = 256;
+static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SIZE    = 1441;
+static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SAMPLES = 1152;
 
 static constexpr int32_t AUDIODEC_M4AAC_RESULT_DECODE_ERROR      = -4;
 static constexpr int32_t AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA = -5;
@@ -801,7 +801,7 @@ struct AudiodecParamM4aac {
 
 struct AudiodecParamM4aacEx {
 	AudiodecParamM4aac base;
-	uint32_t          uiEnableNondelayOutput;
+	uint32_t           uiEnableNondelayOutput;
 };
 
 static_assert(sizeof(AudiodecParamM4aacEx) == 28);
@@ -815,13 +815,13 @@ struct AudiodecM4aacInfo {
 };
 
 struct AudiodecDecoder {
-	bool     used          = false;
-	uint32_t codec_type    = 0;
-	int32_t  word_size     = AUDIODEC_WORD_SZ_16BIT;
-	uint32_t channels      = 2;
-	uint32_t sample_rate   = 48000;
-	uint32_t frame_bytes   = AUDIODEC_MP3_MAX_FRAME_SIZE;
-	uint32_t frame_samples = AUDIODEC_MP3_MAX_FRAME_SAMPLES;
+	bool                                       used          = false;
+	uint32_t                                   codec_type    = 0;
+	int32_t                                    word_size     = AUDIODEC_WORD_SZ_16BIT;
+	uint32_t                                   channels      = 2;
+	uint32_t                                   sample_rate   = 48000;
+	uint32_t                                   frame_bytes   = AUDIODEC_MP3_MAX_FRAME_SIZE;
+	uint32_t                                   frame_samples = AUDIODEC_MP3_MAX_FRAME_SAMPLES;
 	std::unique_ptr<Audio::Ajm::AjmAacDecoder> aac;
 };
 
@@ -963,8 +963,8 @@ static void audiodec_fill_info(AudiodecCtrl* ctrl, const AudiodecDecoder& decode
 			break;
 		}
 		case AUDIODEC_TYPE_M4AAC: {
-			const auto format       = decoder.aac->GetFormat();
-			auto* info               = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
+			const auto format        = decoder.aac->GetFormat();
+			auto*      info          = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
 			info->uiSamplingFreq     = format.sampling_frequency;
 			info->uiNumberOfChannels = format.channel_num;
 			info->uiHeaac            = 0;
@@ -1048,22 +1048,24 @@ static int32_t KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t 
 				case AUDIODEC_TYPE_M4AAC: {
 					using namespace Audio::Ajm;
 					const auto* param = static_cast<const AudiodecParamM4aac*>(ctrl->pParam);
-					const auto channels =
+					const auto  channels =
 					    std::min(param->uiMaxChannels == 0 ? 2u : param->uiMaxChannels, 8u);
-					const auto encoding = param->iBwPcm == AUDIODEC_WORD_SZ_16BIT
-					                          ? AjmSampleEncoding::S16
-					                          : param->iBwPcm == AUDIODEC_WORD_SZ_FLOAT
-					                                ? AjmSampleEncoding::Float : AjmSampleEncoding::S32;
+					const auto encoding =
+					    param->iBwPcm == AUDIODEC_WORD_SZ_16BIT   ? AjmSampleEncoding::S16
+					    : param->iBwPcm == AUDIODEC_WORD_SZ_FLOAT ? AjmSampleEncoding::Float
+					                                              : AjmSampleEncoding::S32;
 					uint64_t flags = param->uiEnableHeaac != 0
-					                     ? AJM_INSTANCE_FLAG_DEC_M4AAC_ENABLE_SBR_DECODE : 0;
+					                     ? AJM_INSTANCE_FLAG_DEC_M4AAC_ENABLE_SBR_DECODE
+					                     : 0;
 					if (param->uiSize >= sizeof(AudiodecParamM4aacEx) &&
-					    static_cast<const AudiodecParamM4aacEx*>(ctrl->pParam)->uiEnableNondelayOutput != 0) {
+					    static_cast<const AudiodecParamM4aacEx*>(ctrl->pParam)
+					            ->uiEnableNondelayOutput != 0) {
 						flags |= AJM_INSTANCE_FLAG_DEC_M4AAC_ENABLE_NONDELAY_OUTPUT;
 					}
-					decoder.aac = std::make_unique<AjmAacDecoder>(
-					    channels, decoder.sample_rate, encoding, flags);
-					const AjmDecM4aacInitializeParameters params {
-					    param->uiConfigNumber, param->uiSamplingFreqIndex};
+					decoder.aac = std::make_unique<AjmAacDecoder>(channels, decoder.sample_rate,
+					                                              encoding, flags);
+					const AjmDecM4aacInitializeParameters params {param->uiConfigNumber,
+					                                              param->uiSamplingFreqIndex};
 					if (decoder.aac->Initialize(&params, sizeof(params)).result != 0) {
 						decoder = {};
 						return AUDIODEC_ERROR_API_FAIL;
@@ -1119,25 +1121,27 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 
 	if (decoder.aac) {
 		using namespace Audio::Ajm;
-		const auto result = decoder.aac->Decode(
-		    ctrl->pAuInfo->pAuAddr, ctrl->pAuInfo->uiAuSize, ctrl->pPcmItem->pPcmAddr,
-		    ctrl->pPcmItem->uiPcmSize, false, nullptr);
+		const auto result = decoder.aac->Decode(ctrl->pAuInfo->pAuAddr, ctrl->pAuInfo->uiAuSize,
+		                                        ctrl->pPcmItem->pPcmAddr, ctrl->pPcmItem->uiPcmSize,
+		                                        false, nullptr);
 		ctrl->pAuInfo->uiAuSize   = static_cast<uint32_t>(result.input_consumed);
 		ctrl->pPcmItem->uiPcmSize = static_cast<uint32_t>(result.output_written);
 		audiodec_fill_info(ctrl, decoder);
 		auto* info = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
-		info->iResult = (result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_TOO_MANY_CHANNELS)) != 0
-		                    ? AUDIODEC_M4AAC_RESULT_DECODE_ERROR
-		                    : (result.result & AJM_RESULT_PARTIAL_INPUT) != 0
-		                          ? AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA : 0;
+		info->iResult =
+		    (result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_TOO_MANY_CHANNELS)) != 0
+		        ? AUDIODEC_M4AAC_RESULT_DECODE_ERROR
+		    : (result.result & AJM_RESULT_PARTIAL_INPUT) != 0
+		        ? AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA
+		        : 0;
 		if ((result.result & AJM_RESULT_INVALID_PARAMETER) != 0) {
 			return AUDIODEC_ERROR_ARG;
 		}
 		if ((result.result & AJM_RESULT_FATAL) != 0) {
 			return AUDIODEC_ERROR_API_FAIL;
 		}
-		return (result.result & AJM_RESULT_NOT_ENOUGH_ROOM) != 0
-		           ? AUDIODEC_ERROR_INVALID_PCM_SIZE : 0;
+		return (result.result & AJM_RESULT_NOT_ENOUGH_ROOM) != 0 ? AUDIODEC_ERROR_INVALID_PCM_SIZE
+		                                                         : 0;
 	}
 
 	const uint32_t word_bytes = static_cast<uint32_t>(audiodec_word_size_bytes(decoder.word_size));
@@ -1164,7 +1168,7 @@ static int32_t KYTY_SYSV_ABI AudiodecClearContext(int32_t handle) {
 	}
 
 	Common::LockGuard lock(g_audiodec_mutex);
-	auto& decoder = g_audiodec_decoders[static_cast<uint32_t>(handle - 1)];
+	auto&             decoder = g_audiodec_decoders[static_cast<uint32_t>(handle - 1)];
 	if (!decoder.used) {
 		return AUDIODEC_ERROR_INVALID_HANDLE;
 	}
@@ -1235,6 +1239,7 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("i0VnXM-C9fc", Ngs2::Ngs2SystemRender);
 	LIB_FUNC("l4Q2dWEH6UM", Ngs2::Ngs2SystemSetGrainSamples);
 	LIB_FUNC("hyVLT2VlOYk", Ngs2::Ngs2ParseWaveformData);
+	LIB_FUNC("iprCTXPVWMI", Ngs2::Ngs2ParseWaveformFile);
 	LIB_FUNC("3pCNbVM11UA", Ngs2::Ngs2CalcWaveformBlock);
 	LIB_FUNC("xa8oL9dmXkM", Ngs2::Ngs2PanInit);
 	LIB_FUNC("gbMKV+8Enuo", Ngs2::Ngs2PanGetVolumeMatrix);
@@ -1242,6 +1247,39 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("0lbbayqDNoE", Ngs2::Ngs2GeomResetSourceParam);
 	LIB_FUNC("1WsleK-MTkE", Ngs2::Ngs2GeomCalcListener);
 	LIB_FUNC("eF8yRCC6W64", Ngs2::Ngs2GeomApply);
+	LIB_FUNC("gXiormHoZZ4", Ngs2::Ngs2SystemRunCommands);
+	LIB_FUNC("3oIK7y7O4k0", Ngs2::Ngs2SystemQueryInfo);
+	LIB_FUNC("GZB2v0XnG0k", Ngs2::Ngs2SystemSetUserData);
+	LIB_FUNC("4lFaRxd-aLs", Ngs2::Ngs2SystemGetUserData);
+	LIB_FUNC("-tbc2SxQD60", Ngs2::Ngs2SystemSetSampleRate);
+	LIB_FUNC("vubFP0T6MP0", Ngs2::Ngs2SystemEnumHandles);
+	LIB_FUNC("U-+7HsswcIs", Ngs2::Ngs2SystemEnumRackHandles);
+	LIB_FUNC("MI2VmBx2RbM", Ngs2::Ngs2RackRunCommands);
+	LIB_FUNC("TZqb8E-j3dY", Ngs2::Ngs2RackQueryInfo);
+	LIB_FUNC("M4LYATRhRUE", Ngs2::Ngs2RackGetInfo);
+	LIB_FUNC("JNTMIaBIbV4", Ngs2::Ngs2RackSetUserData);
+	LIB_FUNC("Mn4XNDg03XY", Ngs2::Ngs2RackGetUserData);
+	LIB_FUNC("6qN1zaEZuN0", Ngs2::Ngs2CustomRackGetModuleInfo);
+	LIB_FUNC("jjBVvPN9964", Ngs2::Ngs2VoiceGetMatrixInfo);
+	LIB_FUNC("W-Z8wWMBnhk", Ngs2::Ngs2VoiceGetOwner);
+	LIB_FUNC("-YNfTO6KOMY", Ngs2::Ngs2FftQuerySize);
+	LIB_FUNC("Kg1MA5j7KFk", Ngs2::Ngs2FftInit);
+	LIB_FUNC("D8eCqBxSojA", Ngs2::Ngs2FftProcess);
+	LIB_FUNC("ekGJmmoc8j4", Ngs2::Ngs2GetWaveformFrameInfo);
+	LIB_FUNC("t9T0QM17Kvo", Ngs2::Ngs2ParseWaveformUser);
+	LIB_FUNC("q+2W8YdK0F8", Ngs2::Ngs2StreamResetOption);
+	LIB_FUNC("dxulc33msHM", Ngs2::Ngs2StreamQueryBufferSize);
+	LIB_FUNC("sU2St3agdjg", Ngs2::Ngs2StreamCreate);
+	LIB_FUNC("I+RLwaauggA", Ngs2::Ngs2StreamCreateWithAllocator);
+	LIB_FUNC("bfoMXnTRtwE", Ngs2::Ngs2StreamDestroy);
+	LIB_FUNC("qQHCi9pjDps", Ngs2::Ngs2StreamRunCommands);
+	LIB_FUNC("rfw6ufRsmow", Ngs2::Ngs2StreamQueryInfo);
+	LIB_FUNC("BcoPfWfpvVI", Ngs2::Ngs2JobSchedulerResetOption);
+	LIB_FUNC("TaoNtmMKkXQ", Ngs2::Ngs2ModuleEnumConfigs);
+	LIB_FUNC("EEemGEQCjO8", Ngs2::Ngs2ModuleArrayEnumItems);
+	LIB_FUNC("ve6bZi+1sYQ", Ngs2::Ngs2ModuleQueueEnumItems);
+	LIB_FUNC("uBIN24Tv2MI", Ngs2::Ngs2ReportRegisterHandler);
+	LIB_FUNC("nPzb7Ly-VjE", Ngs2::Ngs2ReportUnregisterHandler);
 }
 
 } // namespace LibNgs2

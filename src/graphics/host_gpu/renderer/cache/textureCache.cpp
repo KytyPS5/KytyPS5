@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -119,11 +120,13 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                           PageManager& page_manager, BufferCache& buffer_cache)
+                           PageManager& page_manager, BufferCache& buffer_cache,
+                           ResolveCache& resolve_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
-      m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_buffer_cache(buffer_cache), m_resolve_cache(resolve_cache),
+      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
       m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -223,6 +226,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	m_resolve_cache.Invalidate();
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -245,6 +249,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
+	m_resolve_cache.Invalidate();
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1224,6 +1229,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	auto& record = m_slot_images[association];
 	TouchImage(record);
 	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+		m_resolve_cache.Invalidate();
 		ImageInfo plane {};
 		plane.data         = stencil;
 		plane.pixel_format = vk::Format::eS8Uint;
@@ -1286,6 +1292,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				block_alias = true;
 			}
 		}
+		desc.stamp = m_resolve_cache.Stamp(desc.info, candidates.size(), result);
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1480,6 +1487,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (inserted) {
+			m_resolve_cache.Invalidate();
+		}
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}

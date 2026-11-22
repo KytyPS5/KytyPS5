@@ -664,8 +664,13 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
-                                       RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(buffer, color, slot);
+                                       RenderColorInfo &color, uint32_t slot,
+                                       bool exact_format = false) {
+    executor.ResolveRenderColorTarget(buffer, color, slot, false, exact_format);
+  }
+
+  static void SetLodStats(RenderExecutor &executor, bool enabled) {
+    executor.m_lod_stats = enabled;
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -3033,6 +3038,272 @@ public:
     context.ShutdownGpu();
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
             "stream window release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A resolve keeps a FindImage result while ResolveCache::Reuse holds and the resolver's own
+  // inputs are unchanged. A planted stamp window marks a kept result: plain results do not
+  // compare it.
+  void CheckResolveCache() {
+    constexpr const char *name = "ResolveCache";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t kept = ~0ull;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "resolve cache allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "resolve cache mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto &resolve_cache = context.GetResolveCache();
+      auto &executor = context.GetRenderExecutor();
+      const auto linear = [&](uint64_t offset, vk::Format format, Prospero::BufferFormat guest) {
+        return MakeLinearDesc(base + offset, 0x4000, format, guest, Prospero::ImageType::kColor2D,
+                              {64, 64, 1}, 1, 4, 1);
+      };
+      const auto rgba = linear(0x10000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm);
+      const auto find = [&](TextureCache::ImageDesc desc) {
+        const auto id = cache.FindImage(desc);
+        return std::pair{id, desc.stamp};
+      };
+      const auto unrelated = [&] {
+        return TextureCacheTestAccess::InsertImage(
+            cache, linear(0x18000, vk::Format::eR8G8B8A8Unorm,
+                          Prospero::BufferFormat::k8_8_8_8UNorm).info);
+      };
+
+      const auto created = find(rgba);
+      const auto [id, stamp] = find(rgba);
+      Require(name, "direct find", created.first == id && !created.second.epoch && stamp.epoch &&
+          resolve_cache.Reuse(id, stamp), "the second lookup of the only image at a range was not current");
+      TextureCacheTestAccess::SkipFrames(cache, 3);
+      Require(name, "access tick", resolve_cache.Reuse(id, stamp) &&
+          cache.GetImage(id).tick_accessed_last == TextureCacheTestAccess::GcTick(cache),
+          "a reuse did not access the image as FindImage does");
+      Require(name, "no image", !resolve_cache.Stamp(rgba.info, 1, {}).epoch,
+          "a lookup that matched no image was stamped");
+      auto keyed = rgba.info;
+      keyed.metadata.kind = ImageMetadataKind::Cmask;
+      const bool cmask = resolve_cache.Stamp(keyed, 1, id).clear_keys;
+      keyed.metadata.kind = ImageMetadataKind::Dcc;
+      const auto dcc = resolve_cache.Stamp(keyed, 1, id);
+      Require(name, "clear keys", cmask && dcc.clear_keys,
+          "a Dcc or Cmask result did not depend on its clear keys");
+      context.GetBufferCache().EndDrawWindow();
+      const auto windowed = resolve_cache.Stamp(keyed, 1, id);
+      Require(name, "draw window", !resolve_cache.Reuse(id, dcc) && resolve_cache.Reuse(id, windowed),
+          "a clear-key result outlived its draw window");
+      scheduler.Flush();
+      Require(name, "submission", !resolve_cache.Reuse(id, windowed) && resolve_cache.Reuse(id, stamp),
+          "a clear-key result outlived its submission, or a plain one did not");
+
+      const auto other = unrelated();
+      Require(name, "register", !resolve_cache.Reuse(id, stamp), "a registered image kept the stamp current");
+      const auto refound = find(rgba).second;
+      TextureCacheTestAccess::DeleteImage(cache, other);
+      Require(name, "unregister", !resolve_cache.Reuse(id, refound),
+          "an unregistered image kept the stamp current");
+      const auto overlap = TextureCacheTestAccess::InsertImage(
+          cache, linear(0x10000, vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float).info);
+      Require(name, "two candidates", !find(rgba).second.epoch,
+          "a lookup of two images at the range was stamped");
+      TextureCacheTestAccess::DeleteImage(cache, overlap);
+
+      // Textures: the T# and the module.
+      ShaderModule module;
+      module.id = 1;
+      module.info.stage = ShaderType::Pixel;
+      auto &resource = module.info.info.images.emplace_back();
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) | (1u << 30u), 1u << 14u,
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      auto &value = snapshot.images.emplace_back();
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      const ShaderStageRuntime runtime{&module, &snapshot};
+      PreparedBindings bindings;
+      // Whether PrepareBindings kept the slot's planted result.
+      const auto texture_kept = [&] {
+        bindings.images[0].desc.stamp.window = kept;
+        RenderExecutorTestAccess::ResetBindings(executor);
+        executor.PrepareBindings(runtime, bindings);
+        return bindings.images[0].desc.stamp.window == kept;
+      };
+      executor.PrepareBindings(runtime, bindings);
+      executor.PrepareBindings(runtime, bindings);
+      Require(name, "texture hit", texture_kept() &&
+          cache.GetImage(bindings.images[0].image_id).binding.is_bound,
+          "an unchanged texture slot was resolved again or not bound");
+      value.dwords[3] ^= DstSel(4, 5, 6, 7) ^ DstSel(5, 4, 6, 7);
+      Require(name, "T# key", !texture_kept(), "a changed T# kept the slot's result");
+      module.id = 2;
+      Require(name, "module key", !texture_kept(), "another module kept the slot's result");
+      RenderExecutorTestAccess::SetLodStats(executor, true);
+      Require(name, "mip stats", !texture_kept(), "a slot was kept while mip stats count");
+      RenderExecutorTestAccess::SetLodStats(executor, false);
+      const auto texture_other = unrelated();
+      Require(name, "texture image set", !texture_kept(),
+          "a slot was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, texture_other);
+
+      // Color targets: the registers and exact_format.
+      constexpr uint64_t color = base + 0x20000;
+      registers.SetColorBase(0, {.addr = color});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+                                 .channel_type = Prospero::ChannelType::kSrgb,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 63, .width = 63});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1, .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      RenderColorInfo target{};
+      const auto resolve_color = [&](bool exact_format = false) {
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), target,
+                                                           0, exact_format);
+      };
+      // Plants a marked result of the current registers; a resolve that keeps it returns the mark.
+      const auto plant_color = [&] {
+        auto planted = target;
+        planted.desc.stamp.window = kept;
+        resolve_cache.SetColor(0, registers.GetRenderTarget(0), false, planted);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      };
+      const auto color_kept = [&](bool exact_format = false) {
+        resolve_color(exact_format);
+        return target.desc.stamp.window == kept;
+      };
+      resolve_color();
+      resolve_color();
+      RenderColorInfo probe{};
+      Require(name, "color stored",
+          resolve_cache.FindColor(0, registers.GetRenderTarget(0), false, probe),
+          "a color resolve did not keep its result");
+      plant_color();
+      Require(name, "color hit", color_kept() && cache.GetImage(target.image_id).binding.is_target,
+          "unchanged color registers were resolved again or not bound");
+      plant_color();
+      Require(name, "exact format key", !color_kept(true),
+          "an exact-format resolve kept a result found without it");
+      Require(name, "exact format stored",
+          resolve_cache.FindColor(0, registers.GetRenderTarget(0), true, probe),
+          "an exact-format resolve did not keep its result");
+      plant_color();
+      registers.SetColorBase(0, {.addr = color + 0x20000});
+      Require(name, "color registers", !color_kept(), "changed color registers kept the result");
+      registers.SetColorBase(0, {.addr = color});
+      resolve_color();
+      plant_color();
+      const auto color_other = unrelated();
+      Require(name, "color image set", !color_kept(),
+          "a color slot was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, color_other);
+
+      // Depth targets: the registers. Stencil plane records and HTile metadata change lookups.
+      HW::DepthRenderTarget depth_target{};
+      depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      depth_target.z_info.texture_compatibility =
+          Prospero::TextureCompatiblePlaneCompression::kEnable;
+      depth_target.z_info.htile_acceleration = true;
+      depth_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
+      depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      depth_target.stencil_info.texture_compatibility = Prospero::TextureCompatibleStencil::kEnable;
+      depth_target.z_read_base_addr = base + 0x90000;
+      depth_target.z_write_base_addr = base + 0x90000;
+      depth_target.stencil_read_base_addr = base + 0xa0000;
+      depth_target.stencil_write_base_addr = base + 0xa0000;
+      depth_target.htile_data_base_addr = base + 0xb0000;
+      depth_target.size.valid = true;
+      registers.SetDepthRenderTarget(depth_target);
+      HW::DepthControl depth_control{};
+      depth_control.z_enable = true;
+      depth_control.z_write_enable = true;
+      registers.SetDepthControl(depth_control);
+      registers.SetRenderControl({});
+      const auto &z = registers.GetDepthRenderTarget();
+      RenderDepthInfo depth{};
+      const auto resolve_depth = [&] {
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      };
+      const auto plant_depth = [&] {
+        auto planted = depth;
+        planted.desc.stamp.window = kept;
+        resolve_cache.SetDepth(z, planted.desc, planted.image_id);
+      };
+      const auto depth_kept = [&] {
+        resolve_depth();
+        return depth.desc.stamp.window == kept;
+      };
+      resolve_depth();
+      const auto depth_id = depth.image_id;
+      // An image at the stencil range, which AssociateStencil adopts as the plane record.
+      ImageInfo plane_info{};
+      plane_info.data = depth.desc.info.stencil;
+      plane_info.extent = depth.desc.info.extent;
+      const auto plane = TextureCacheTestAccess::InsertImage(cache, plane_info);
+      resolve_depth();
+      RenderDepthInfo depth_probe{};
+      Require(name, "depth stored", depth.image_id == depth_id &&
+          resolve_cache.FindDepth(z, depth_probe.desc, depth_probe.image_id),
+          "a depth resolve did not keep its result");
+      plant_depth();
+      Require(name, "depth hit", depth_kept() && depth.image_id == depth_id,
+          "unchanged depth registers were resolved again");
+      plant_depth();
+      depth_target.shading_rate_encoding = 1;
+      registers.SetDepthRenderTarget(depth_target);
+      Require(name, "depth registers", !depth_kept(),
+          "changed depth registers kept the result");
+      plant_depth();
+      const auto depth_other = unrelated();
+      Require(name, "depth image set", !depth_kept(),
+          "a depth target was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, depth_other);
+
+      resolve_depth();
+      const auto adopted = depth.desc.stamp;
+      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
+      Require(name, "plane record", cache.GetImage(plane).depth_id == depth_id &&
+          !resolve_cache.Reuse(depth_id, adopted) && !resolve_cache.Stamp(plane_info, 1, plane).epoch,
+          "a rewritten plane record kept the stamp current, or a lookup of one was stamped");
+      resolve_depth();
+      const auto associated = depth.desc.stamp;
+      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
+      Require(name, "plane repeat", resolve_cache.Reuse(depth_id, associated),
+          "an unchanged stencil association changed the image set");
+      (void)cache.FindDepthTarget(depth_id, depth.desc);
+      Require(name, "metadata insert", !resolve_cache.Reuse(depth_id, associated),
+          "new HTile metadata kept the stamp current");
+      resolve_depth();
+      const auto described = depth.desc.stamp;
+      (void)cache.FindDepthTarget(depth_id, depth.desc);
+      Require(name, "metadata repeat", resolve_cache.Reuse(depth_id, described),
+          "known HTile metadata changed the image set");
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "resolve cache release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -58009,6 +58280,11 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamCopyWindow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--resolve-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResolveCache();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
     CheckStorageTextureLinearUploadLayout();
     CheckStorageTextureDepthTileUploadLayout();
@@ -58632,6 +58908,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckStreamCopyWindow();
+  vulkan.CheckResolveCache();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

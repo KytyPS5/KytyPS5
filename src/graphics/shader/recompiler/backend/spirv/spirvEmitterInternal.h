@@ -224,7 +224,6 @@ uint32_t EmitNative(EmitterState& state, Args... args) {
 	} else if constexpr ((type == IR::Type::F32 && opcode == spv::OpFNegate) ||
 	                     ((type == IR::Type::F32 || type == IR::Type::U32) &&
 	                      (opcode == spv::OpBitcast || opcode == spv::OpSelect))) {
-		// A VGPR write under a non-constant EXEC passes a product on as Bitcast(Select(...)).
 		if ((state.f32_products.contains(args) || ...)) {
 			state.f32_products.insert(result);
 		}

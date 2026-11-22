@@ -31810,10 +31810,10 @@ TestCase VectorMulThenSubF32RoundsProduct() {
     AppendVMovU32(&code, 30, source * sizeof(u32));
     AppendBufferLoadDword(&code, source, 30);
   }
-  code.push_back(EncodeVop2(0x08, 6, 256 + 0, 1));                     // v_mul_f32 v6, v0, v1
-  code.push_back(EncodeVop2(0x04, 7, 256 + 6, 2));                     // v_sub_f32 v7, v6, v2
-  code.push_back(EncodeVop2(0x08, 8, 256 + 3, 4));                     // v_mul_f32 v8, v3, v4
-  AppendVop3(&code, 0x103, 9, Vgpr(8), Vgpr(5), 0, 0, 0, false, 0, 1); // v_add_f32 v9, -v8, v5
+  code.push_back(EncodeVop2(0x08, 6, 256 + 0, 1));
+  code.push_back(EncodeVop2(0x04, 7, 256 + 6, 2));
+  code.push_back(EncodeVop2(0x08, 8, 256 + 3, 4));
+  AppendVop3(&code, 0x103, 9, Vgpr(8), Vgpr(5), 0, 0, 0, false, 0, 1);
   AppendStoreVgpr(&code, 7, 0);
   AppendStoreVgpr(&code, 9, 1);
   AppendEnd(&code);

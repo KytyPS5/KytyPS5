@@ -168,6 +168,26 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	return OK;
 }
 
+static_assert(sizeof(AjmDecMp3ParseFrameInfo) == 40);
+
+int KYTY_SYSV_ABI AjmDecMp3ParseFrame(const void* bitstream, size_t size, int parse_ofl,
+                                      AjmDecMp3ParseFrameInfo* frame_info) {
+	PRINT_NAME();
+	LOGF("\t size = %zu, parse_ofl = %d\n", size, parse_ofl);
+	if (frame_info == nullptr) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
+
+	AjmMp3FrameHeader header {};
+	if (!AjmParseMp3Header(static_cast<const uint8_t*>(bitstream), size, &header)) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
+
+	*frame_info = {header.frame_size, header.num_channels, header.samples_per_channel,
+	               header.bitrate, header.sample_rate};
+	return OK;
+}
+
 struct AjmInstanceState {
 	uint32_t                    context = 0;
 	uint32_t                    codec   = 0;

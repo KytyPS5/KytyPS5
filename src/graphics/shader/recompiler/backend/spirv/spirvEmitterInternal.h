@@ -92,6 +92,7 @@ struct EmitterState {
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
 	const Profile&                                      profile;
+	IR::PushData::Window                            push_data;
 	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
@@ -125,6 +126,7 @@ struct EmitterState {
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
 	uint32_t                                         bvh_stack_function      = 0;
+	std::array<uint32_t, 2>                          ray_query_variables {};
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;

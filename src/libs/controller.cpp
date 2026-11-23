@@ -72,10 +72,6 @@ struct PadTriggerEffectParam {
 	PadTriggerEffectCommand command[2];
 };
 
-struct PadTriggerEffectStateInformation {
-	int32_t state[2];
-};
-
 static_assert(sizeof(PadTriggerEffectCommand) == 56);
 static_assert(sizeof(PadTriggerEffectParam) == 120);
 static_assert(sizeof(PadTriggerEffectStateInformation) == 8);
@@ -126,7 +122,7 @@ public:
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
-	void TouchPad(int id, int finger, bool down, float x, float y);
+	void TouchPad(int id, int finger, bool down, float x, float y, bool click);
 	void Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
 	void SetMotionSensorState(bool enable);
 	void ResetOrientation();
@@ -323,6 +319,8 @@ static uint8_t Scale(uint8_t value, float scale) {
 	return static_cast<uint8_t>(std::max(1L, std::lround(value * scale)));
 }
 
+constexpr uint8_t DUALSENSE_TRIGGER_OFF = 0x05;
+
 static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, float scale,
                                  uint8_t type, uint8_t frequency = 0) {
 	uint16_t active = 0;
@@ -338,7 +336,7 @@ static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, floa
 		}
 	}
 
-	effect[0] = active != 0 && (type != 0x26 || frequency != 0) ? type : 0x05;
+	effect[0] = active != 0 && (type != 0x26 || frequency != 0) ? type : DUALSENSE_TRIGGER_OFF;
 	effect[1] = static_cast<uint8_t>(active);
 	effect[2] = static_cast<uint8_t>(active >> 8u);
 	effect[3] = static_cast<uint8_t>(packed);
@@ -352,7 +350,7 @@ static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, floa
 static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, uint8_t* effect,
                                         float scale) {
 	std::memset(effect, 0, 11);
-	effect[0] = 0x05;
+	effect[0] = DUALSENSE_TRIGGER_OFF;
 
 	uint8_t strengths[10] = {};
 	switch (command.mode) {
@@ -425,12 +423,17 @@ enum TriggerState : int32_t {
 
 static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value,
                                   int32_t previous) {
+	uint8_t effect[11];
+	(void)trigger_effect_to_dualsense(command, effect, 1.0f);
+	if (effect[0] == DUALSENSE_TRIGGER_OFF) {
+		return TRIGGER_STATE_OFF;
+	}
 	// Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.
 	const int pos = value == 0 ? 0 : value == 255 ? 9 : 1 + value / 32;
 	switch (command.mode) {
 		case 1: // feedback: resistance from position data[0], strength data[1]
-			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
-			                                                      : TRIGGER_STATE_FEEDBACK_STANDBY;
+			return pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
+			                              : TRIGGER_STATE_FEEDBACK_STANDBY;
 		case 2: // weapon: resistance from data[0], released at data[1]
 			if (value < command.data[0] * 32) {
 				return TRIGGER_STATE_WEAPON_STANDBY;
@@ -440,9 +443,8 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 			           ? TRIGGER_STATE_WEAPON_FIRED
 			           : TRIGGER_STATE_WEAPON_PULLING;
 		case 3: // vibration from position data[0], amplitude data[1], frequency data[2]
-			return command.data[1] != 0 && command.data[2] != 0 && pos >= command.data[0]
-			           ? TRIGGER_STATE_VIBRATION_ACTIVE
-			           : TRIGGER_STATE_VIBRATION_STANDBY;
+			return pos >= command.data[0] ? TRIGGER_STATE_VIBRATION_ACTIVE
+			                              : TRIGGER_STATE_VIBRATION_STANDBY;
 		case 4: // multiple-position feedback: strength per position
 			return command.data[pos] != 0 ? TRIGGER_STATE_FEEDBACK_ACTIVE
 			                              : TRIGGER_STATE_FEEDBACK_STANDBY;
@@ -450,9 +452,8 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 			return pos >= command.data[0] && pos < command.data[1] ? TRIGGER_STATE_FEEDBACK_ACTIVE
 			                                                       : TRIGGER_STATE_FEEDBACK_STANDBY;
 		case 6: // multiple-position vibration: frequency data[0], amplitude per position
-			return command.data[0] != 0 && command.data[1 + pos] != 0
-			           ? TRIGGER_STATE_VIBRATION_ACTIVE
-			           : TRIGGER_STATE_VIBRATION_STANDBY;
+			return command.data[1 + pos] != 0 ? TRIGGER_STATE_VIBRATION_ACTIVE
+			                                  : TRIGGER_STATE_VIBRATION_STANDBY;
 		default: return TRIGGER_STATE_OFF;
 	}
 }
@@ -626,7 +627,7 @@ void GameController::RightStick(int id, int x, int y) {
 	}
 }
 
-void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
+void GameController::TouchPad(int id, int finger, bool down, float x, float y, bool click) {
 	if (finger < 0 || finger >= 2) {
 		return;
 	}
@@ -642,7 +643,7 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 		touch.down = down;
 		touch.x    = static_cast<uint16_t>(std::clamp(x, 0.0f, 1.0f) * 1920.0f);
 		touch.y    = static_cast<uint16_t>(std::clamp(y, 0.0f, 1.0f) * 943.0f);
-		if (id == HOST_INPUT_CONTROLLER_ID) {
+		if (id == HOST_INPUT_CONTROLLER_ID && click) {
 			m_state.buttons = down ? m_state.buttons | PAD_BUTTON_TOUCH_PAD
 			                       : m_state.buttons & ~PAD_BUTTON_TOUCH_PAD;
 		}
@@ -856,8 +857,8 @@ static void StopHostPad(SDL_Gamepad* pad) {
 	if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 		DualSenseEffects effect {};
 		effect.enable_bits     = 0x0c;
-		effect.right_trigger[0] = 0x05;
-		effect.left_trigger[0]  = 0x05;
+		effect.right_trigger[0] = DUALSENSE_TRIGGER_OFF;
+		effect.left_trigger[0]  = DUALSENSE_TRIGGER_OFF;
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
 	(void)SDL_RumbleGamepad(pad, 0, 0, 0);
@@ -1132,10 +1133,10 @@ void SetRightStick(int id, int x, int y) {
 	}
 }
 
-void SetTouchPad(int id, int finger, bool down, float x, float y) {
+void SetTouchPad(int id, int finger, bool down, float x, float y, bool click) {
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
-		player->TouchPad(id, finger, down, x, y);
+		player->TouchPad(id, finger, down, x, y, click);
 	}
 }
 
@@ -1374,8 +1375,8 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 	info->touch_pixel_density   = 44.86f;
 	info->touch_resolution_x    = 1920;
 	info->touch_resolution_y    = 943;
-	info->stick_dead_zone_left  = controller_get_axis(-32768, 32767, 8000) - 128;
-	info->stick_dead_zone_right = controller_get_axis(-32768, 32767, 8000) - 128;
+	info->stick_dead_zone_left  = PAD_STICK_DEAD_ZONE;
+	info->stick_dead_zone_right = PAD_STICK_DEAD_ZONE;
 	info->connection_type       = 0;
 	info->connected_count       = static_cast<uint8_t>(std::min(connected_count, 255));
 	info->connected             = connected;

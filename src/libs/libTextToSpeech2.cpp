@@ -5,7 +5,7 @@
 
 namespace Libs {
 
-LIB_VERSION("TextToSpeech2", 1, "TextToSpeech2", 1, 1);
+LIB_NAME("TextToSpeech2", "TextToSpeech2");
 
 namespace TextToSpeech2 {
 

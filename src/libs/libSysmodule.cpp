@@ -12,7 +12,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Sysmodule", 1, "Sysmodule", 1, 1);
+LIB_NAME("Sysmodule", "Sysmodule");
 
 namespace LibKernel {
 struct ModuleInfoForUnwind;

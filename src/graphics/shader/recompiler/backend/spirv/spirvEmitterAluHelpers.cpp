@@ -119,10 +119,8 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
 }
 
-static constexpr uint32_t OrderKeyBiasF32    = 0x7fffffu;
-static constexpr uint32_t InfinityKeyF32     = 0x7f800000u - OrderKeyBiasF32;
-static constexpr uint32_t NegativeZeroKeyF32 = 0xffffffffu - OrderKeyBiasF32;
-static constexpr uint32_t PositiveZeroKeyF32 = 0u - OrderKeyBiasF32;
+static constexpr uint32_t OrderKeyBiasF32 = 0x7fffffu;
+static constexpr uint32_t InfinityKeyF32  = 0x7f800000u - OrderKeyBiasF32;
 
 static uint32_t EmitOrderKeyF32(EmitterState& state, uint32_t value) {
 	const auto bits = EmitBitcastF32ToU32(state, value);
@@ -154,33 +152,30 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto below = [&](uint32_t lhs, uint32_t rhs) {
 		return Binary(state, spv::OpSLessThan, TypeBool(state), lhs, rhs);
 	};
-	const auto at_least = [&](uint32_t lhs, uint32_t rhs) {
-		return Binary(state, spv::OpSGreaterThanEqual, TypeBool(state), lhs, rhs);
+	const auto same = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpLogicalEqual, TypeBool(state), lhs, rhs);
 	};
 	const auto pick = [&](uint32_t condition, uint32_t lhs, uint32_t rhs) {
 		return Select(state, TypeF32(state), condition, lhs, rhs);
 	};
-	const auto a_key     = EmitOrderKeyF32(state, a);
-	const auto b_key     = EmitOrderKeyF32(state, b);
-	const auto c_key     = EmitSignedMinMaxU32(state, EmitOrderKeyF32(state, c),
-	                                           ConstantU32(state, InfinityKeyF32 + 1u), false);
-	const auto a_below_b = below(a_key, b_key);
-	const auto a_below_c = below(a_key, c_key);
-	const auto b_below_c = below(b_key, c_key);
-	const auto min3 =
-	    pick(EmitLogicalAndBool(state, a_below_b, a_below_c), a, pick(b_below_c, b, c));
+	const auto nan_key   = ConstantU32(state, InfinityKeyF32 + 1u);
+	const auto below_min = [&](uint32_t key, uint32_t other_key) {
+		return below(key, EmitSignedMinMaxU32(state, other_key, nan_key, false));
+	};
+	const auto a_key      = EmitOrderKeyF32(state, a);
+	const auto b_key      = EmitOrderKeyF32(state, b);
+	const auto c_key      = EmitOrderKeyF32(state, c);
+	const auto take_b     = below_min(b_key, a_key);
+	const auto min_ab     = pick(take_b, b, a);
+	const auto min_ab_key = Select(state, TypeU32(state), take_b, b_key, a_key);
+	const auto min3       = pick(below_min(c_key, min_ab_key), c, min_ab);
 	const auto max_key =
 	    EmitSignedMinMaxU32(state, EmitSignedMinMaxU32(state, a_key, b_key, true), c_key, true);
-	const auto any_nan = Binary(state, spv::OpSGreaterThan, TypeBool(state), max_key,
-	                            ConstantU32(state, InfinityKeyF32));
-	const auto max_tie_key =
-	    Select(state, TypeU32(state),
-		       EmitCompareU32Constant(state, spv::OpIEqual, max_key, PositiveZeroKeyF32),
-		       ConstantU32(state, NegativeZeroKeyF32), max_key);
-	const auto a_is_max = at_least(a_key, max_tie_key);
-	const auto b_is_max = at_least(b_key, max_tie_key);
-	const auto median   = pick(a_is_max, pick(b_below_c, c, b),
-	                           pick(b_is_max, pick(a_below_c, c, a), pick(a_below_b, b, a)));
+	const auto any_nan   = Binary(state, spv::OpSGreaterThan, TypeBool(state), max_key,
+	                              ConstantU32(state, InfinityKeyF32));
+	const auto a_below_b = below(a_key, b_key);
+	const auto median    = pick(same(a_below_b, below(b_key, c_key)), b,
+	                            pick(same(a_below_b, below(a_key, c_key)), c, a));
 	return pick(any_nan, min3, median);
 }
 

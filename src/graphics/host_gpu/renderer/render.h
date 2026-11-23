@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
@@ -166,20 +167,19 @@ private:
 		PreparedBindings                pixel;
 	};
 
-	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages, DrawTargets& targets);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slot, bool ignore_target_mask = false,
 	                              bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
-	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                              DrawRenderState& state, const DrawEmitInfo& emit,
-	                                              const DrawIndexBufferSource& index_source);
+	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
+	                                       const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -194,6 +194,15 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                                  Dlss::Inputs& inputs);
+
+	// A null feature is one the upscaler refused or failed.
+	struct UpscalerContext {
+		uint64_t                           context;
+		Dlss::Creation                     creation;
+		std::unique_ptr<Upscaler::Feature> feature;
+	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
 	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
@@ -206,6 +215,8 @@ private:
 	RenderContext&                        m_context;
 	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
+	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.
+	DrawTargets                           m_targets;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
@@ -213,6 +224,7 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;

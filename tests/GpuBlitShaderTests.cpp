@@ -1,4 +1,5 @@
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <gtest/gtest.h>
 #include <spirv/unified1/spirv.hpp>
@@ -7,6 +8,35 @@
 #include <iterator>
 
 namespace {
+
+TEST(VideoOutFormat, SourceFlagsAndRouting) {
+	struct Case {
+		uint64_t format;
+		uint32_t flags;
+		bool     draw_on_sdr;
+		bool     draw_on_hdr;
+	};
+	// sRGB, linear, PQ and linear-nit PQ formats in R and B order; drawn sources go through the
+	// overlay shader, the others are blitted.
+	for (const auto& c: {Case {0x8000000022000000ull, 0, false, false},
+	                     Case {0x8000000000000000ull, 0, false, false},
+	                     Case {0x8100000022000000ull, 0, false, false},
+	                     Case {0x8100000000000000ull, 0, false, false},
+	                     Case {0x8100000622000000ull, 8, true, true},
+	                     Case {0x8100000600000000ull, 8, true, true},
+	                     Case {0xc001000622000000ull, 8, true, true},
+	                     Case {0xc001000600000000ull, 8, true, true},
+	                     Case {0x8100070422000000ull, 4, true, false},
+	                     Case {0x8100070400000000ull, 4, true, false},
+	                     Case {0xc001070722000000ull, 12, true, true},
+	                     Case {0xc001070700000000ull, 12, true, true}}) {
+		SCOPED_TRACE(testing::Message() << std::hex << c.format);
+		const uint32_t flags = Libs::Graphics::VideoOutSourceFlags(c.format);
+		EXPECT_EQ(flags, c.flags);
+		EXPECT_EQ(Libs::Graphics::VideoOutSourceNeedsDraw(flags, false), c.draw_on_sdr);
+		EXPECT_EQ(Libs::Graphics::VideoOutSourceNeedsDraw(flags, true), c.draw_on_hdr);
+	}
+}
 
 TEST(GpuBlitShaders, MeshIndirectTaskDeclaresLocalSize) {
 	bool local_size    = false;

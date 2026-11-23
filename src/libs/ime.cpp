@@ -843,7 +843,7 @@ void ApplyExternalInputs() {
 
 #if !defined(KYTY_IME_TESTS)
 
-LIB_VERSION("Ime", 1, "Ime", 1, 1);
+LIB_NAME("Ime", "Ime");
 
 LIB_DEFINE(InitPlatform_1_Ime) {
 	LIB_FUNC("ieCNrVrzKd4", ImeSetText);

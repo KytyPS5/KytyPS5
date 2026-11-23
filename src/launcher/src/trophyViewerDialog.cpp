@@ -264,6 +264,8 @@ QWidget* MakeGradeCount(QWidget* parent, int grade, int value, int icon_size, in
 	icon->setPixmap(MakeCupIcon(GradeColor(grade), icon_size));
 	auto* text = new QLabel(QString::number(value), box);
 	text->setStyleSheet(QStringLiteral("font-size: %1px;").arg(font_size));
+	text->ensurePolished();
+	text->setMinimumWidth(text->fontMetrics().size(0, QStringLiteral("00")).width());
 	row->addWidget(icon);
 	row->addWidget(text);
 	return box;
@@ -379,10 +381,14 @@ void TrophyViewerDialog::ShowOverview(const std::vector<const Configuration*>& g
 		percent_box->addWidget(bar);
 		row->addLayout(percent_box);
 		for (int grade = 1; grade <= 4; ++grade) {
+			auto* count = MakeGradeCount(row_widget, grade, progress.earned_grade[grade], 24, 18);
 			if (grade == 1 && progress.total_grade[1] == 0) {
-				continue;
+				auto policy = count->sizePolicy();
+				policy.setRetainSizeWhenHidden(true);
+				count->setSizePolicy(policy);
+				count->hide();
 			}
-			row->addWidget(MakeGradeCount(row_widget, grade, progress.earned_grade[grade], 24, 18));
+			row->addWidget(count);
 		}
 		list->setItemWidget(item, row_widget);
 	}

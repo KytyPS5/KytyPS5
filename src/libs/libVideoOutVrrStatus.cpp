@@ -9,7 +9,7 @@
 
 namespace Libs::LibGen5::VrrStatus {
 
-LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+LIB_NAME("VideoOutVrrStatus", "VideoOut");
 
 static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
 	// The observed guest call passes no arguments.

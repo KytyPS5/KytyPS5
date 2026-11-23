@@ -14,21 +14,10 @@
 #include <cmath>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Audio {
-
-namespace {
-
-constexpr int AUDIO_OUT_PORT_TYPE_MAIN      = 0;
-constexpr int AUDIO_OUT_PORT_TYPE_BGM       = 1;
-constexpr int AUDIO_OUT_PORT_TYPE_VOICE     = 2;
-constexpr int AUDIO_OUT_PORT_TYPE_PERSONAL  = 3;
-constexpr int AUDIO_OUT_PORT_TYPE_PADSPK    = 4;
-constexpr int AUDIO_OUT_PORT_TYPE_VIBRATION = 10;
-constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
-
-} // namespace
 
 namespace AudioOut2 {
 
@@ -198,6 +187,7 @@ struct AudioOut2ContextState {
 	AudioOut2ContextHandle handle              = 0;
 	uint32_t               queue_depth         = 4;
 	uint32_t               queued              = 0;
+	uint32_t               reserved            = 0;
 	uint32_t               num_grains          = 512;
 	uint64_t               last_update         = 0;
 	int                    object_audio_handle = 0;
@@ -250,6 +240,8 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr int AUDIO_OUT2_ERROR_OUT_OF_RESOURCE             = -2144960510; /* 0x80268002 */
 static constexpr int AUDIO_OUT2_ERROR_INVALID_PORT                = -2144960503; /* 0x80268009 */
+static constexpr int AUDIO_OUT2_ERROR_INVALID_POINTER             = -2144960500; /* 0x8026800C */
+static constexpr int AUDIO_OUT2_ERROR_INVALID_USER                = -2144960496; /* 0x80268010 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
@@ -259,6 +251,7 @@ static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_DEFAULT = 0x01010001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_V2      = 0x01020001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_LIMITER_DEFAULT    = 0x01010003;
+static constexpr uint32_t AUDIO_OUT2_GET_SPEAKER_INFO_FLAG_FOLLOW_HEADPHONE_CONNECT = 1;
 
 static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHandle ctx) {
 	for (auto& state: g_audioout2_contexts) {
@@ -612,82 +605,89 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 	return OK;
 }
 
+// Advance reserves a grain. A full queue changes nothing and keeps the port attributes locked.
 int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
-	g_audioout2_state_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
-		for (auto& port: state->ports) {
-			port.attributes_locked = false;
-		}
+	Common::LockGuard lock(g_audioout2_state_mutex);
+	auto*             state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
-	g_audioout2_state_mutex.Unlock();
-
+	audioout2_update_context_locked(state);
+	if (state->queued + state->reserved >= state->queue_depth) {
+		return AUDIO_OUT2_ERROR_NOT_READY;
+	}
+	state->reserved++;
+	for (auto& port: state->ports) {
+		port.attributes_locked = false;
+	}
 	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
-	uint32_t sleep_micros = audioout2_grain_micros(512);
-
-	for (;;) {
-		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
-		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
-		// vibration/failed-open handle) has no downstream operation that can block this call.
-		g_audioout2_state_mutex.Lock();
-		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-			const bool use_device_clock =
-			    blocking != 0 && audioout2_context_has_queueable_device(*state);
-			audioout2_update_context_locked(state);
-			sleep_micros = audioout2_grain_micros(state->num_grains);
-			if (state->queued < state->queue_depth || use_device_clock) {
-				if (state->queued == 0) {
-					state->last_update = audioout2_clock();
-				}
-				if (state->queued < state->queue_depth) {
-					state->queued++;
-				}
-				auto& submission = audioout2_submission(*state);
-				g_audioout2_state_mutex.Unlock();
-				audioout2_queue_context_audio(ctx, submission, blocking != 0);
-				return OK;
-			}
-		}
+	if (blocking > 1) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	g_audioout2_state_mutex.Lock();
+	auto* state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
 		g_audioout2_state_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	audioout2_update_context_locked(state);
+	// A push commits the reserved grains with the ports' PCM; without a reservation the PCM waits
+	// for the next grain. A synchronous push returns with a free queue entry. The SDL queue paces
+	// one carrying PCM to a real device, so the model keeps an entry free for it.
+	const auto reserved = std::exchange(state->reserved, 0u);
+	if (reserved != 0) {
+		const bool device_paced = blocking != 0 && audioout2_context_has_queueable_device(*state);
+		state->queued =
+		    std::min(state->queued + reserved, state->queue_depth - (device_paced ? 1u : 0u));
+	}
+	auto&      submission   = audioout2_submission(*state);
+	const auto sleep_micros = audioout2_grain_micros(state->num_grains);
+	g_audioout2_state_mutex.Unlock();
+	if (reserved != 0) {
+		audioout2_queue_context_audio(ctx, submission, blocking != 0);
+	}
 
-		if (blocking == 0) {
-			return AUDIO_OUT2_ERROR_NOT_READY;
+	while (blocking != 0) {
+		g_audioout2_state_mutex.Lock();
+		state = audioout2_find_context_locked(ctx);
+		audioout2_update_context_locked(state);
+		const bool full = state != nullptr && state->queued >= state->queue_depth;
+		g_audioout2_state_mutex.Unlock();
+		if (!full) {
+			break;
 		}
-
 		Common::Thread::SleepMicro(sleep_micros);
 	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	if (queue_level == nullptr && available_queues == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	Common::LockGuard lock(g_audioout2_state_mutex);
+	auto*             state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	audioout2_update_context_locked(state);
+	const auto level = state->queued + state->reserved;
 	if (queue_level != nullptr) {
-		*queue_level = 0;
+		*queue_level = level;
 	}
 	if (available_queues != nullptr) {
-		*available_queues = 4;
+		*available_queues = state->queue_depth - level;
 	}
-
-	g_audioout2_state_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
-		if (queue_level != nullptr) {
-			*queue_level = state->queued;
-		}
-		if (available_queues != nullptr) {
-			*available_queues =
-			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
-		}
-	}
-	g_audioout2_state_mutex.Unlock();
-
-	return OK;
+	return level < state->queue_depth ? OK : AUDIO_OUT2_ERROR_NOT_READY;
 }
 
-int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,
-                                      AudioOut2PortHandle* port) {
+// PPSA28180 calls this with rsp off the 16-byte alignment; the host device open needs it.
+[[gnu::force_align_arg_pointer]] int KYTY_SYSV_ABI AudioOut2PortCreate(
+    AudioOut2ContextHandle ctx, const AudioOut2PortParam* params, AudioOut2PortHandle* port) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 
@@ -890,13 +890,21 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	std::memset(state, 0, sizeof(AudioOut2PortState));
 	state->output          = 1;
 	state->num_channels    = 2;
-	state->volume          = 127;
+	state->volume          = -1;
 	state->reroute_counter = 0;
 	state->flags           = 0;
 
 	g_audioout2_state_mutex.Lock();
 	if (auto* port_state = audioout2_find_port_locked(port); port_state != nullptr) {
-		state->num_channels = audioout2_data_format_channels(port_state->data_format);
+		const auto type     = audioout2_port_type_to_audio_out_type(port_state->port_type);
+		const auto route    = AudioInternal::GetPortOutput(type);
+		const auto channels = audioout2_data_format_channels(port_state->data_format);
+		state->output       = route.output;
+		state->volume       = route.volume;
+		// Object ports report the route's channels, channel ports at most their own.
+		state->num_channels = audioout2_port_type_is_object(port_state->port_type)
+		                          ? route.channels
+		                          : std::min(channels, route.channels);
 	}
 	g_audioout2_state_mutex.Unlock();
 
@@ -908,8 +916,10 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 
 int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state) {
 	PRINT_NAME();
-	EXIT_NOT_IMPLEMENTED(state == nullptr);
-	std::memset(state, 0, sizeof(AudioOut2SystemState));
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	state->loudness = AUDIO_OUT_STATE_LOUDNESS_MIN;
 	return OK;
 }
 
@@ -947,18 +957,24 @@ int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
                                                       uint32_t*           context_attributes,
                                                       uint32_t*           port_attributes) {
-	if (context_attributes == nullptr || port_attributes == nullptr) {
+	if (context_attributes == nullptr && port_attributes == nullptr) {
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
+	// The system's attributes without 3D audio; games compiled before 9.00 lack those 9.00 added.
+	uint32_t sdk_version = 0;
+	LibKernel::KernelGetProsperoCompiledSdkVersion(&sdk_version);
+	const bool        sdk_9 = sdk_version >= 0x09000000;
 	Common::LockGuard lock(g_audioout2_state_mutex);
 	if (std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle) ==
 	    g_audioout2_users.end()) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return AUDIO_OUT2_ERROR_INVALID_USER;
 	}
-	*context_attributes = 0;
-	*port_attributes    = (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM) |
-	                      (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN) |
-	                      (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS);
+	if (context_attributes != nullptr) {
+		*context_attributes = sdk_9 ? 0x13 : 0x3;
+	}
+	if (port_attributes != nullptr) {
+		*port_attributes = sdk_9 ? 0xe53 : 0x653;
+	}
 	return OK;
 }
 
@@ -1071,14 +1087,31 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 }
 
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
-	info->type             = 0;
-	info->available_bits   = 0x03;
-	info->flags            = 0;
-	info->speaker_angle[0] = {-30, 0};
-	info->speaker_angle[1] = {30, 0};
+	if (info == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_POINTER;
+	}
+	if (flags > AUDIO_OUT2_GET_SPEAKER_INFO_FLAG_FOLLOW_HEADPHONE_CONNECT) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	// FL, FR, C, LFE, SL, SR, BL, BR; azimuth is counterclockwise, -360 means no angle.
+	static constexpr std::array<AudioOut2SpeakerAngle, 8> ANGLES {
+	    {{30, 0}, {-30, 0}, {0, 0}, {-360, -360}, {90, 0}, {-90, 0}, {135, 0}, {-135, 0}}};
 
+	const auto output = Config::GetAudioOutput();
+	const auto main   = AudioInternal::GetMainOutput();
+	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
+	// Without the flag, headphones report the HDMI device.
+	if (output != Config::AudioOutput::Headphones || flags != 0) {
+		info->type = static_cast<uint8_t>(output);
+	}
+	info->available_bits = (1u << main.channels) - 1;
+	for (uint32_t i = 0; i < std::size(info->speaker_angle); i++) {
+		info->speaker_angle[i] = i < main.channels ? ANGLES[i] : AudioOut2SpeakerAngle {-360, -360};
+	}
+	if (info->type == 3) {
+		info->speaker_angle[0] = {90, 0};
+		info->speaker_angle[1] = {-90, 0};
+	}
 	return OK;
 }
 

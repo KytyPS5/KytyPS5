@@ -211,6 +211,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
@@ -317,6 +319,8 @@ add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
+add_gpu_blit_shader(gpu_bvh_mirror gpu_bvh_mirror.comp)
+add_gpu_blit_shader(gpu_bvh_walk gpu_bvh_mirror.comp -DWALK=1)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
@@ -331,7 +335,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
+set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -342,13 +346,13 @@ endif()
 set(inc_headers
 	${KYTY_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
-	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
 	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
+	${KYTY_THIRD_PARTY_DIR}/ffx-api
 )
 
 if (KYTY_CLANG_CL)
@@ -530,6 +534,7 @@ target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padVr.cpp"
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
@@ -583,8 +588,39 @@ add_executable(rtc_tests EXCLUDE_FROM_ALL
 target_link_libraries(rtc_tests common kyty_test_gtest)
 target_include_directories(rtc_tests PRIVATE ${inc_headers})
 
+add_executable(playgo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayGoTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
+target_include_directories(playgo_tests PRIVATE ${inc_headers})
+
+add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VrTracker2Tests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libVrTracker2.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
+target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
+
+add_executable(font_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FontTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libFont.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(font_tests common SDL3::SDL3-static FFmpeg::ffmpeg kyty_test_gtest)
+target_include_directories(font_tests PRIVATE ${inc_headers})
+target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
+
+add_executable(splash_animation_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SplashAnimationTests.cpp")
+target_link_libraries(splash_animation_tests kyty_test_gtest)
+target_include_directories(splash_animation_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/descriptors.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
@@ -594,6 +630,9 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
+
+add_kyty_full_emulator_test(kernel_module_info_tests "${KYTY_TESTS_DIR}/KernelModuleInfoTests.cpp")
+target_link_libraries(kernel_module_info_tests kyty_test_gtest)
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -611,25 +650,23 @@ target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
-set(gpu_test_ms_depth_source
-	"${gpu_tiler_shader_dir}/gpu_test_ms_depth.comp")
-set(gpu_test_ms_depth_spv
-	"${gpu_test_generated_dir}/gpu_test_ms_depth.spv")
-set(gpu_test_ms_depth_header
-	"${gpu_test_generated_dir}/gpu_test_ms_depth_spv.h")
-add_custom_command(
-	OUTPUT "${gpu_test_ms_depth_header}"
-	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -o "${gpu_test_ms_depth_spv}" "${gpu_test_ms_depth_source}"
-	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_ms_depth_spv}
-	        -DOUTPUT=${gpu_test_ms_depth_header} -DSYMBOL=GPU_TEST_MS_DEPTH_SPV
-	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-	DEPENDS "${gpu_test_ms_depth_source}"
-	VERBATIM
-)
-target_sources(shader_recompiler_compute_tests PRIVATE
-	"${gpu_test_ms_depth_header}")
+foreach(test_shader gpu_test_ms_depth gpu_test_ray_query)
+	set(test_shader_spv "${gpu_test_generated_dir}/${test_shader}.spv")
+	set(test_shader_header "${gpu_test_generated_dir}/${test_shader}_spv.h")
+	string(TOUPPER "${test_shader}_SPV" test_shader_symbol)
+	add_custom_command(
+		OUTPUT "${test_shader_header}"
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		        -o "${test_shader_spv}" "${gpu_tiler_shader_dir}/${test_shader}.comp"
+		COMMAND ${CMAKE_COMMAND} -DINPUT=${test_shader_spv}
+		        -DOUTPUT=${test_shader_header} -DSYMBOL=${test_shader_symbol}
+		        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+		DEPENDS "${gpu_tiler_shader_dir}/${test_shader}.comp"
+		VERBATIM
+	)
+	target_sources(shader_recompiler_compute_tests PRIVATE "${test_shader_header}")
+endforeach()
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
@@ -640,6 +677,36 @@ target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
 target_link_libraries(net_resolver_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(agc_tests "${KYTY_TESTS_DIR}/AgcTests.cpp")
+target_link_libraries(agc_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(kernel_thread_tests "${KYTY_TESTS_DIR}/KernelThreadTests.cpp")
+target_link_libraries(kernel_thread_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
+target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(video_dec2_tests "${KYTY_TESTS_DIR}/VideoDec2Tests.cpp")
+target_link_libraries(video_dec2_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(user_service_tests "${KYTY_TESTS_DIR}/UserServiceTests.cpp")
+target_link_libraries(user_service_tests kyty_test_gtest)
+
+add_executable(dlss_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DlssTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/dlss.cpp")
+target_link_libraries(dlss_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
+target_include_directories(dlss_tests PRIVATE ${inc_headers})
+
+if (WIN32)
+	add_executable(fsr_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/FsrTests.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/dlss.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/upscaler/fsr.cpp")
+	target_link_libraries(fsr_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
+	target_include_directories(fsr_tests PRIVATE ${inc_headers})
+endif()
 
 add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
@@ -654,7 +721,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
-target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
+target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
@@ -712,6 +779,9 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
+	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
+	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
+	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -751,6 +821,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME video_out_flip_rate
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-rate-only)
 	add_test(NAME video_out_hdr10_to_sdr
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --video-out-only)
 	add_test(NAME depth_bits
@@ -831,6 +903,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
+		playgo_tests
+		vr_tracker2_tests
+		user_service_tests
 	)
 endif()
 

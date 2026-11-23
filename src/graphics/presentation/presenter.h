@@ -27,7 +27,7 @@ public:
 	KYTY_CLASS_NO_COPY(Presenter);
 
 	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info,
-	                                          bool hdr = false, bool headset = false);
+	                                          uint64_t video_out_format, bool headset);
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
 	[[nodiscard]] bool           PresentLastFrame();

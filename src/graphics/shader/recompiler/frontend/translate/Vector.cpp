@@ -594,6 +594,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MUL_HI_U32_U24: return Integer24(inst, false, false, true);
 		case O::V_MAD_U64_U32: return V_MAD_U64_U32(inst);
 		case O::V_SAD_U32: return V_SAD_U32(inst);
+		case O::V_MSAD_U8: return V_MSAD_U8(inst);
 		case O::V_ADD3_U32: return Integer3(inst, IR::ValueOpcode::IAdd32, IR::ValueOpcode::IAdd32);
 		case O::V_BCNT_U32_B32: return V_BCNT_U32_B32(inst);
 		case O::V_MBCNT_LO_U32_B32: return V_MBCNT_U32_B32(inst, true);
@@ -604,6 +605,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_BFI_B32: return V_BFI_B32(inst);
 		case O::V_ALIGNBIT_B32: return V_ALIGN_B32(inst, false);
 		case O::V_ALIGNBYTE_B32: return V_ALIGN_B32(inst, true);
+		case O::V_PERM_B32: return V_PERM_B32(inst);
 		case O::V_LSHL_ADD_U32:
 			return Integer3(inst, IR::ValueOpcode::ShiftLeftLogical32, IR::ValueOpcode::IAdd32);
 		case O::V_ADD_LSHL_U32:

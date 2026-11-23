@@ -162,6 +162,17 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
 		            log == Configuration::LogDirection::File);
 	        });
+	// Pro mode shows the upscaler and its folder.
+	const auto show_pssr = [this] {
+		const bool pro = m_ui->checkBox_pro->isChecked();
+		const auto upscaler =
+		    TextToEnum<Configuration::PssrUpscaler>(m_ui->comboBox_pssr_upscaler->currentText());
+		m_ui->pssrLayout->setRowVisible(0, pro);
+		m_ui->pssrLayout->setRowVisible(1, pro && upscaler == Configuration::PssrUpscaler::DLSS);
+		m_ui->pssrLayout->setRowVisible(2, pro && upscaler == Configuration::PssrUpscaler::FSR);
+	};
+	connect(m_ui->checkBox_pro, &QCheckBox::toggled, this, show_pssr);
+	connect(m_ui->comboBox_pssr_upscaler, &QComboBox::currentTextChanged, this, show_pssr);
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
 	connect(m_ui->comboBox_printf_direction, &QComboBox::currentTextChanged, this,
@@ -252,6 +263,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 		                    info.audio_input_device);
 	}
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
+	m_ui->comboBox_audio_output->setCurrentIndex(static_cast<int>(info.audio_output));
 	m_ui->comboBox_screen_resolution->setCurrentText(info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
 	m_ui->comboBox_gpu->clear();
@@ -294,9 +306,11 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_readback_tiled->setChecked(info.readback_tiled_images);
 	m_ui->checkBox_readback_storage->setChecked(info.readback_storage_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
+	m_ui->spinBox_flush_draws->setValue(info.flush_draws);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_occlusion_queries->setChecked(info.occlusion_queries_enabled);
 	m_ui->checkBox_relaxed_shader_float->setChecked(info.relaxed_shader_float);
+	m_ui->checkBox_native_rt->setChecked(info.native_rt);
 	m_ui->checkBox_shader_cache->setChecked(info.shader_cache_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_network_connected->setChecked(info.network_connected);
@@ -315,8 +329,20 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_pro->setChecked(info.pro_enabled);
+	ListInit(m_ui->comboBox_pssr_upscaler, info.pssr_upscaler);
+	m_ui->lineEdit_dlss_folder->setText(info.dlss_folder);
+	m_ui->lineEdit_fsr_folder->setText(info.fsr_folder);
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
 	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
+#if !defined(_WIN32)
+	// Unsupported upscalers are hidden; their saved choice falls back to Linear.
+	auto* upscaler = m_ui->comboBox_pssr_upscaler;
+	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::FSR)));
+#if defined(__APPLE__)
+	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::DLSS)));
+#endif
+	upscaler->setCurrentIndex(qMax(0, upscaler->findText(EnumToText(info.pssr_upscaler))));
+#endif
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 #endif
@@ -514,6 +540,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
+	info.audio_output =
+	    static_cast<Configuration::AudioOutput>(ui.comboBox_audio_output->currentIndex());
 	if (global_settings) {
 		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
 		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
@@ -533,9 +561,11 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.readback_tiled_images     = ui.checkBox_readback_tiled->isChecked();
 	info.readback_storage_images   = ui.checkBox_readback_storage->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
+	info.flush_draws               = ui.spinBox_flush_draws->value();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.occlusion_queries_enabled = ui.checkBox_occlusion_queries->isChecked();
 	info.relaxed_shader_float      = ui.checkBox_relaxed_shader_float->isChecked();
+	info.native_rt                 = ui.checkBox_native_rt->isChecked();
 	info.shader_cache_enabled      = ui.checkBox_shader_cache->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.network_connected         = ui.checkBox_network_connected->isChecked();
@@ -549,6 +579,10 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 	info.pro_enabled               = ui.checkBox_pro->isChecked();
+	info.pssr_upscaler =
+	    TextToEnum<Configuration::PssrUpscaler>(ui.comboBox_pssr_upscaler->currentText());
+	info.dlss_folder               = ui.lineEdit_dlss_folder->text();
+	info.fsr_folder                = ui.lineEdit_fsr_folder->text();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
 	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
@@ -566,10 +600,11 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
-	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
-	                   m_ui->lineEdit_cmd_dump_folder}) {
-		if (field->isEnabled() && field->text().isEmpty()) {
-			ShowTab(m_ui->debug_tab);
+	for (auto* field:
+	     {m_ui->lineEdit_dlss_folder, m_ui->lineEdit_fsr_folder, m_ui->lineEdit_shader_log_folder,
+	      m_ui->lineEdit_printf_file, m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && !field->isHidden() && field->text().isEmpty()) {
+			ShowTab(field);
 			field->setFocus();
 			break;
 		}

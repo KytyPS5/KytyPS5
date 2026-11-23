@@ -34,7 +34,7 @@ double GetTimeMs() {
 } // namespace Loader
 
 namespace Libs::LibKernel::FileSystem {
-void Mount(const std::filesystem::path& directory, const std::string& point) {
+void Mount(const std::filesystem::path& directory, const std::string& point, bool) {
 	g_mounted_directory = directory;
 	g_test_mounts[point] = directory;
 }
@@ -446,6 +446,28 @@ void TestConvert() {
 		convert.dst_blocks = blocks;
 		CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
 	}
+	// A larger size converts before the call returns, and its event reports the result.
+	SaveDataEvent event {};
+	convert.dst_dir_name = nullptr;
+	convert.dst_blocks   = 128;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK && event.user_id == 1 &&
+	      std::string(event.title_id.data) == "CONVERT" &&
+	      std::string(event.dir_name.data) == "save");
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	// A new name renames the converted save, and the event names it.
+	const auto renamed   = DirName("renamed");
+	convert.dst_dir_name = &renamed;
+	convert.dst_blocks   = 256;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK &&
+	      std::string(event.dir_name.data) == "renamed");
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NOT_FOUND);
+	convert.src_dir_name = &renamed;
+	convert.dst_dir_name = nullptr;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
 }
 
 void TestGuestSaveIsolation() {

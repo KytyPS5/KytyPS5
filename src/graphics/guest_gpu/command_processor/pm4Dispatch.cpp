@@ -85,16 +85,31 @@ constexpr auto MakeOpcodeDispatchTable() {
 	return table;
 }
 
+constexpr auto MakeKeepsDrawWindowTable() {
+	std::array<bool, 256> table {};
+
+	for (const uint32_t opcode:
+	     {Pm4::IT_NOP, Pm4::IT_SET_BASE, Pm4::IT_CLEAR_STATE, Pm4::IT_INDEX_BASE,
+	      Pm4::IT_INDEX_BUFFER_SIZE, Pm4::IT_DRAW_INDIRECT, Pm4::IT_DRAW_INDEX_INDIRECT,
+	      Pm4::IT_DRAW_INDIRECT_MULTI, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, Pm4::IT_DRAW_INDEX_2,
+	      Pm4::IT_DRAW_INDEX_OFFSET_2, Pm4::IT_DRAW_INDEX_MULTI_INST, Pm4::IT_INDEX_TYPE,
+	      Pm4::IT_NUM_INSTANCES, Pm4::IT_DRAW_INDEX_AUTO, Pm4::IT_INDIRECT_BUFFER,
+	      Pm4::IT_SET_CONTEXT_REG, Pm4::IT_SET_SH_REG, Pm4::IT_SET_UCONFIG_REG,
+	      Pm4::IT_SET_UCONFIG_REG_INDEX, Pm4::IT_SET_CONTEXT_REG_INDIRECT,
+	      Pm4::IT_SET_SH_REG_INDIRECT, Pm4::IT_SET_UCONFIG_REG_INDIRECT}) {
+		table[opcode] = true;
+	}
+
+	return table;
+}
+
 constexpr auto MakeCustomOpcodeDispatchTable() {
 	std::array<cp_op_parser_func_t, Pm4::R_NUM> table {};
 
-	table[Pm4::R_DISPATCH_RESET] = CpOpDispatchReset;
-	table[Pm4::R_WAIT_FLIP_DONE] = CpOpWaitFlipDone;
-	table[Pm4::R_PUSH_MARKER]    = CpOpPushMarker;
-	table[Pm4::R_POP_MARKER]     = CpOpPopMarker;
-	table[Pm4::R_FLIP]           = CpOpFlip;
-	table[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
-	table[Pm4::R_PSSR]           = CpOpPssr;
+	table[Pm4::R_PUSH_MARKER]   = CpOpPushMarker;
+	table[Pm4::R_POP_MARKER]    = CpOpPopMarker;
+	table[Pm4::R_CONTEXT_STATE] = CpOpContextState;
+	table[Pm4::R_PSSR]          = CpOpPssr;
 
 	return table;
 }
@@ -104,6 +119,7 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 constinit const std::array<hw_sh_parser_func_t, Pm4::SH_NUM> g_hw_sh_func =
     MakeShaderDispatchTable();
 constinit const std::array<cp_op_parser_func_t, 256> g_cp_op_func = MakeOpcodeDispatchTable();
+constinit const std::array<bool, 256> g_cp_op_keeps_draw_window = MakeKeepsDrawWindowTable();
 constinit const std::array<cp_op_parser_func_t, Pm4::R_NUM> g_cp_op_custom_func =
     MakeCustomOpcodeDispatchTable();
 

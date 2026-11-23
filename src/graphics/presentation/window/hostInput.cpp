@@ -31,6 +31,9 @@ struct ControlInfo {
 	Controller::Setting setting {};
 	bool                gyro          = false;
 	bool                touchpad_mode = false;
+	// Direction of a touch pad swipe along x and y.
+	float swipe_x = 0.0f;
+	float swipe_y = 0.0f;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -67,6 +70,10 @@ static constexpr std::array CONTROL_INFO = {
                  .setting = Controller::Setting::TriggerEffectIntensity},
     ControlInfo {.name = "GyroToggle", .gyro = true},
     ControlInfo {.name = "TouchPadMode", .touchpad_mode = true},
+    ControlInfo {.name = "TouchPadSwipeUp", .swipe_y = -1.0f},
+    ControlInfo {.name = "TouchPadSwipeDown", .swipe_y = 1.0f},
+    ControlInfo {.name = "TouchPadSwipeLeft", .swipe_x = -1.0f},
+    ControlInfo {.name = "TouchPadSwipeRight", .swipe_x = 1.0f},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
@@ -166,6 +173,13 @@ HostInputTouchPadVisualState                 g_mouse_touchpad;
 GamepadTouchPadState                         g_gamepad_touchpad;
 std::mutex                                   g_touchpad_mutex;
 std::unordered_map<int, std::array<bool, 2>> g_pad_trigger_pressed;
+
+constexpr float TOUCHPAD_SWIPE_MS      = 200.0f;
+constexpr int   TOUCHPAD_SWIPE_POLL_MS = 8;
+
+// The control of the touch pad swipe in progress and its start time.
+std::size_t g_swipe_control  = INVALID_CONTROL;
+uint64_t    g_swipe_start_ms = 0;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -311,7 +325,8 @@ private:
 			EXIT("Invalid input mapping: %s\n", original.c_str());
 		}
 		const auto& info = CONTROL_INFO[control];
-		if (info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) {
+		if ((info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) ||
+		    info.swipe_x != 0.0f || info.swipe_y != 0.0f) {
 			EXIT("Invalid input mapping: %s\n", original.c_str());
 		}
 		m_custom_pad = true;
@@ -363,6 +378,24 @@ void SetTouchPad(float x, bool down) {
 
 void SetSwipeTouchPad(bool down, float x, float y) {
 	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down, x, y);
+}
+
+// Moves the swipe finger across 60% of the pad without clicking it, then lifts it.
+int PollTouchPadSwipe(uint64_t now_ms) {
+	if (g_swipe_control == INVALID_CONTROL) {
+		return -1;
+	}
+	const auto& info     = CONTROL_INFO[g_swipe_control];
+	const float progress = static_cast<float>(now_ms - g_swipe_start_ms) / TOUCHPAD_SWIPE_MS;
+	const float offset   = 0.6f * progress - 0.3f;
+	const bool  down     = progress <= 1.0f;
+	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down,
+	                        0.5f + info.swipe_x * offset, 0.5f + info.swipe_y * offset, false);
+	if (down) {
+		return TOUCHPAD_SWIPE_POLL_MS;
+	}
+	g_swipe_control = INVALID_CONTROL;
+	return -1;
 }
 
 void RecordMouseTouchPadPosition(float x, float y) {
@@ -447,6 +480,18 @@ void SetControl(std::size_t control, bool down) {
 	if (info.touchpad_mode) {
 		if (down) {
 			HostInputToggleTouchPadMode();
+		}
+		return;
+	}
+	if (info.swipe_x != 0.0f || info.swipe_y != 0.0f) {
+		if (down) {
+			// A new swipe starts a new touch.
+			if (g_swipe_control != INVALID_CONTROL) {
+				Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, false, 0.5f, 0.5f,
+				                        false);
+			}
+			g_swipe_control  = control;
+			g_swipe_start_ms = SDL_GetTicks();
 		}
 		return;
 	}
@@ -967,6 +1012,9 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	}
 	if (const int touch_timeout = PollGamepadTouchPad(SDL_GetTicks()); touch_timeout >= 0) {
 		timeout = timeout < 0 ? touch_timeout : std::min(timeout, touch_timeout);
+	}
+	if (const int swipe_timeout = PollTouchPadSwipe(SDL_GetTicks()); swipe_timeout >= 0) {
+		timeout = timeout < 0 ? swipe_timeout : std::min(timeout, swipe_timeout);
 	}
 	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);

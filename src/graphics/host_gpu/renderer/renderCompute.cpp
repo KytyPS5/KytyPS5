@@ -214,18 +214,35 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
-// Global loads read pages without a buffer as zero. Back the 32 KiB after each base the shader
-// loads from scalar data before the dispatch reads it.
-static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
-	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
-	const auto&        flat = stage.resources->flattened_srt;
-	for (const auto [low, high]: stage.module->info.info.address_bases) {
-		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
+// Global loads read pages without a buffer as zero. Cache the 32 KiB after each base the shader
+// takes from user data or scalar loads before the dispatch reads it.
+static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stage) {
+	const auto back = [&context](uint32_t low, uint32_t high) {
+		const auto base = low | uint64_t {high} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
-			const auto page = base + index * Page;
+			const auto page = base + index * BufferCache::CACHING_PAGESIZE;
 			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
 		}
-	}
+	};
+	const auto& info = stage.module->info.info;
+	const auto& flat = stage.resources->flattened_srt;
+	const auto& user = stage.resources->user_data;
+	for (const auto [low, high]: info.address_bases) back(flat[low], flat[high]);
+	for (const auto [low, high]: info.user_address_bases) back(user[low], user[high]);
+}
+
+// Recognized traversals trace the mirror of the TLAS whose header address the shader loads from
+// scalar data.
+static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& stage,
+                            PreparedBindings& bindings) {
+	const auto& program = stage.module->info;
+	const auto  dword   = program.bindings.ray_query_dword;
+	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
+	const auto& flat       = stage.resources->flattened_srt;
+	const auto [low, high] = program.info.ray_query_tlas;
+	const auto address = context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+	bindings.shader_data[dword]     = static_cast<uint32_t>(address);
+	bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
 }
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
@@ -361,11 +378,12 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	PreparedBindings* descriptor_stage = &bindings;
-	BackAddressBases(m_context, input_info.stage);
+	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	PrepareRayQuery(m_context, input_info.stage, bindings);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
@@ -498,12 +516,13 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
-	BackAddressBases(m_context, input_info.stage);
+	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	PrepareRayQuery(m_context, input_info.stage, bindings);
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
@@ -520,14 +539,6 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (HasStorageWrites(input_info, bindings)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

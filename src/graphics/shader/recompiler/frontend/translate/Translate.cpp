@@ -1302,16 +1302,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				const auto index_low    = draw(3);
 				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
 				                                           entry_ir.IMul(input_vertex, index_bytes));
-				const auto index_resource = entry_ir.Emit(
-				    IR::ValueOpcode::GetAddressResource,
-				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(4)});
-				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
-				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+				// Indexed draws pass the device address of their indices.
 				const auto packed_index = entry_ir.Emit(
-				    IR::ValueOpcode::LoadAddressU32,
-				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-				    IR::MemoryFlags {.index = memory_index});
+				    IR::ValueOpcode::LoadDeviceAddressU32,
+				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(4),
+				     entry_ir.BitwiseAnd(byte_offset, u32(~3u)),
+				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))});
 				const auto index = IR::U32(entry_ir.Emit(
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
@@ -1436,8 +1432,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs,
-		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
+		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

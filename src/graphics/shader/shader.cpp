@@ -369,8 +369,11 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
 	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
 	// Alpha-to-mask coverage must gate depth writes, so it rules out early fragment tests.
+	// RDNA2 DB_SHADER_CONTROL.Z_ORDER: 1 = EARLY_Z_THEN_LATE_Z, 3 = EARLY_Z_THEN_RE_Z.
 	ps_info.ps_early_z =
-	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
+	    ((sh.db_shader_control.shader_z_behavior == 1 ||
+	      sh.db_shader_control.shader_z_behavior == 3) &&
+	     !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
 	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
 

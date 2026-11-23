@@ -57,7 +57,8 @@ public:
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
 
-	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
+	                               void* native_context = nullptr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

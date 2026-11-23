@@ -1,10 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/smallVector.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
+#include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
 
@@ -59,7 +63,8 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
-bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr,
+                                void* native_context) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -75,6 +80,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		if (native_context != nullptr && !m_buffer_cache.HasGpuDirtyBytesSafe(fault_vaddr, 16)) {
+			uint8_t bytes[16] {};
+			if (LibKernel::Memory::TryReadBacking(fault_vaddr, bytes, sizeof(bytes)) &&
+			    Loader::X64InstructionEmulator::TryEmulateLoadFromBacking(
+			        native_context, bytes, sizeof(bytes))) {
+				return true;
+			}
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -159,9 +172,12 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
+	m_fault_process_pending = true;
+	if (!m_buffer_cache.HasPendingBdaSync()) {
+		return;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
-	m_fault_process_pending = true;
 }
 
 void RenderContext::RunGarbageCollector() {
@@ -205,7 +221,7 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
-	std::vector<InterruptEqRegistration> registrations;
+	Common::SmallVector<InterruptEqRegistration, 8> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);
 		for (const auto& registration: m_interrupt_eqs) {

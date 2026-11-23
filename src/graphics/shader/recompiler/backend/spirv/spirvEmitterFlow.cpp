@@ -817,8 +817,11 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// Zero-kind predicates are already inverted by translation.
 	auto predicate = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
-		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
-		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
+		const auto high_predicate = ctx.HalfArg(inst, 0, 1);
+		if (high_predicate != predicate) {
+			predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
+			                   TypeBool(ctx.state), predicate, high_predicate);
+		}
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,

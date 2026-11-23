@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/smallVector.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -120,8 +121,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.emplace(buffer.CpuAddress(), id);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
-		std::vector<vk::DeviceAddress> addresses;
-		addresses.reserve(size_pages);
+		Common::SmallVector<vk::DeviceAddress, 64> addresses;
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
@@ -160,12 +160,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
-		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Start each packed range on its own 64-byte cache line.
-			    total_size += Common::AlignUp(end - start, 64);
-		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    {
+			    std::lock_guard lock(m_gpu_modified_mutex);
+			    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+				    copies.emplace_back(start - buffer_address, total_size, end - start);
+				    // Start each packed range on its own 64-byte cache line.
+				    total_size += Common::AlignUp(end - start, 64);
+			    });
+			    m_gpu_modified_ranges.Subtract(address, bytes);
+		    }
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -413,8 +416,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size = 0;
+	Common::SmallVector<vk::BufferCopy, 16> copies;
+	uint64_t                                total_size = 0;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -423,7 +426,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept {
 		    const BufferUpload upload {&buffer, copies.size()};
-		    UploadCopies({&upload, 1}, copies, total_size);
+		    UploadCopies({&upload, 1}, {copies.data(), copies.size()}, total_size);
 	    });
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -516,7 +519,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
+		{
+			std::lock_guard lock(m_gpu_modified_mutex);
+			m_gpu_modified_ranges.Add(vaddr, size);
+		}
 		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -656,6 +662,14 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::HasGpuDirtyBytesSafe(uint64_t vaddr, uint64_t size) {
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	std::lock_guard lock(m_gpu_modified_mutex);
+	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
 bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Contains(vaddr, size);
 }
@@ -723,16 +737,24 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
 	m_bda_sync.Add(begin, end - begin);
+	m_has_bda_sync.store(true, std::memory_order_release);
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	if (!m_has_bda_sync.load(std::memory_order_acquire)) {
+		return;
+	}
 	const auto queued = [this] {
 		std::lock_guard lock(m_bda_sync_mutex);
+		m_has_bda_sync.store(false, std::memory_order_release);
 		return std::exchange(m_bda_sync, {});
 	}();
-	std::vector<vk::BufferCopy> copies;
-	std::vector<BufferUpload>   uploads;
-	uint64_t                    total_size = 0;
+	if (queued.Empty()) {
+		return;
+	}
+	Common::SmallVector<vk::BufferCopy, 16> copies;
+	Common::SmallVector<BufferUpload, 8>    uploads;
+	uint64_t                                total_size = 0;
 	queued.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
 			auto it = m_buffers.upper_bound(start);
@@ -748,11 +770,11 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 					m_memory_tracker.ForEachUploadRange(
 					    first, last - first, false,
 					    [&](uint64_t address, uint64_t bytes) noexcept {
-						    if (uploads.empty() || uploads.back().buffer != &buffer) {
+						    if (uploads.empty() || uploads[uploads.size() - 1].buffer != &buffer) {
 							    uploads.push_back({&buffer, 0});
 						    }
 						    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-						    uploads.back().end = copies.size();
+						    uploads[uploads.size() - 1].end = copies.size();
 						    total_size += bytes;
 					    },
 					    []() noexcept {});
@@ -760,7 +782,7 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			}
 		});
 	});
-	UploadCopies(uploads, copies, total_size);
+	UploadCopies({uploads.data(), uploads.size()}, {copies.data(), copies.size()}, total_size);
 }
 
 } // namespace Libs::Graphics

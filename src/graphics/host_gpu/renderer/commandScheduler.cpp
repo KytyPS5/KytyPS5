@@ -173,15 +173,30 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	const auto next_tick = m_next_pending_tick.load(std::memory_order_acquire);
+	if (next_tick >= CurrentTick() || !IsFree(next_tick)) {
+		return;
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() || !IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
+				m_next_pending_tick.store(std::numeric_limits<uint64_t>::max(),
+				                          std::memory_order_release);
+				return;
+			}
+			const auto front_tick = m_pending_operations.front().tick;
+			if (!IsFree(front_tick)) {
+				m_next_pending_tick.store(front_tick, std::memory_order_release);
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			m_next_pending_tick.store(m_pending_operations.empty()
+			                              ? std::numeric_limits<uint64_t>::max()
+			                              : m_pending_operations.front().tick,
+			                          std::memory_order_release);
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -201,8 +216,12 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		auto&      queue = priority ? m_priority_operations : m_pending_operations;
+		const auto tick  = CurrentTick();
+		queue.push({std::move(operation), tick});
+		if (!priority && queue.size() == 1) {
+			m_next_pending_tick.store(tick, std::memory_order_release);
+		}
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();

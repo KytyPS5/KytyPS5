@@ -681,6 +681,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			     stage, ir.shader_hash, traced);
 		}
 	}
+	IR::SimplifyActiveLaneSelects(ir.blocks);
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	IR::RemoveIdentities(ir);
+	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;

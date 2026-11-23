@@ -157,7 +157,11 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
+	state.memory_dword_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
+	for (auto& buffer: state.storage_buffers) {
+		buffer.cached_static.assign(count, {});
+	}
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
 		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;
@@ -173,10 +177,39 @@ void EmitMemoryBindings(EmitterState& state) {
 		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
 		for (uint32_t lane = 0; lane < lanes; ++lane) {
 			if (dynamic_offsets[i + lane]) continue;
-			state.memory_byte_offsets[i + lane] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			const auto idx              = i + lane;
+			state.memory_byte_offsets[idx] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
-			state.memory_byte_sizes[i + lane] =
-			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + i + lane);
+			state.memory_dword_offsets[idx] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+			    state, word, ConstantU32(state, lane * 8u + 2u), ConstantU32(state, 6u));
+			state.memory_byte_sizes[idx] =
+			    EmitShaderDataDwordLoad(state, state.program.bindings.MemorySizeDword() + idx);
+		}
+	}
+	if (state.entry_label != 0) {
+		for (uint32_t shift = 0; shift < state.storage_buffers.size(); ++shift) {
+			auto& buffer = state.storage_buffers[shift];
+			if (buffer.variable == 0) continue;
+			if (buffer.pointer_type == 0) {
+				buffer.pointer_type =
+				    TypePointer(state, spv::StorageClassStorageBuffer, buffer.type);
+			}
+			for (uint32_t idx = 0; idx < count; ++idx) {
+				if (dynamic_offsets[idx]) continue;
+				const auto obj_ptr = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, obj_ptr,
+				                          buffer.variable, ConstantU32(state, idx));
+				auto len = state.memory_byte_sizes[idx];
+				if (shift != 0u) {
+					len = Binary(state, spv::OpShiftRightLogical, TypeU32(state), len,
+					             ConstantU32(state, shift));
+				}
+				buffer.cached_static[idx] = {
+				    .label          = state.entry_label,
+				    .object_pointer = obj_ptr,
+				    .length         = len,
+				};
+			}
 		}
 	}
 }
@@ -252,10 +285,12 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	                             .non_uniform      = non_uniform,
 	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
 	                                                              : spv::MemoryAccessMaskNone};
-	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
-	                          buffer.variable, array_index);
+	// storage_buffers[i] views the binding as 1 << i byte elements.
+	const auto shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
 	if (non_uniform) {
+		access.object_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
+		                          buffer.variable, array_index);
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
@@ -265,22 +300,43 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.memory_offset_dword + data_start),
 		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
-		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		const auto bit_shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
 		    ConstantU32(state, 3));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
-		    state, word, shift, ConstantU32(state, 8));
+		    state, word, bit_shift, ConstantU32(state, 8));
 		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
+		if (shift != 0u) {
+			access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.length,
+			                       ConstantU32(state, shift));
+		}
 	} else {
-		access.byte_offset = state.memory_byte_offsets[static_index];
-		access.length      = state.memory_byte_sizes[static_index];
-	}
-	// storage_buffers[i] views the binding as 1 << i byte elements.
-	const auto shift = static_cast<uint32_t>(&buffer - state.storage_buffers.data());
-	if (shift != 0u) {
-		access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.length,
-		                       ConstantU32(state, shift));
+		access.byte_offset  = state.memory_byte_offsets[static_index];
+		access.dword_offset = state.memory_dword_offsets[static_index];
+		if (state.current_label != 0 && static_index < buffer.cached_static.size() &&
+		    (buffer.cached_static[static_index].label == state.current_label ||
+		     (buffer.cached_static[static_index].label == state.entry_label &&
+		      state.entry_label != 0))) {
+			access.object_pointer = buffer.cached_static[static_index].object_pointer;
+			access.length         = buffer.cached_static[static_index].length;
+			return access;
+		}
+		access.object_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
+		                          buffer.variable, array_index);
+		access.length = state.memory_byte_sizes[static_index];
+		if (shift != 0u) {
+			access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.length,
+			                       ConstantU32(state, shift));
+		}
+		if (state.current_label != 0 && static_index < buffer.cached_static.size()) {
+			buffer.cached_static[static_index] = {
+			    .label          = state.current_label,
+			    .object_pointer = access.object_pointer,
+			    .length         = access.length,
+			};
+		}
 	}
 	return access;
 }

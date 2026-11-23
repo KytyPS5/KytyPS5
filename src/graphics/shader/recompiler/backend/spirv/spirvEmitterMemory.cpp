@@ -11,6 +11,8 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
+	if (lhs == ConstantBool(state, true)) return rhs;
+	if (rhs == ConstantBool(state, true)) return lhs;
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
 
@@ -388,9 +390,33 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
+uint32_t LocalArrayDwordCount(const EmitterState& state, IR::ResourceKind kind) {
+	if (kind == IR::ResourceKind::Lds &&
+	    state.lds_storage_class != spv::StorageClassStorageBuffer) {
+		return LdsDwordCount(state);
+	}
+	if (kind == IR::ResourceKind::Scratch) {
+		return state.program.scratch_dwords;
+	}
+	return 0u;
+}
+
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+	auto&      state       = ctx.state;
+	const auto exec        = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto local_words = LocalArrayDwordCount(state, mem.kind);
+	if (local_words > 0u) {
+		const auto resource   = PrepareMemoryResourceAccess(state, mem);
+		const auto index      = DwordIndex(ctx, inst, mem, resource.byte_offset);
+		const auto in_bounds  = EmitStorageElementInBounds(state, resource, index);
+		const auto safe_index =
+		    EmitUMin32(state, index, ConstantU32(state, local_words - 1u));
+		const auto loaded = LoadWordInBounds(ctx, resource, safe_index);
+		return Select(state, TypeU32(state), AndCondition(state, exec, in_bounds), loaded,
+		              ConstantU32(state, 0));
+	}
+	return EmitValueOrZeroIfCondition(state, exec, [&]() {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
 	});
 }
@@ -640,7 +666,19 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
-	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+	auto&      state = ctx.state;
+	const auto exec  = ctx.Arg(inst, inst.NumArgs() - 1);
+	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Scratch) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		if (resource.object_pointer == 0u) return;
+		const auto index     = DwordIndex(ctx, inst, mem, resource.byte_offset);
+		const auto in_bounds = EmitStorageElementInBounds(state, resource, index);
+		EmitIfCondition(state, AndCondition(state, exec, in_bounds), [&]() {
+			StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, inst.NumArgs() - 2));
+		});
+		return;
+	}
+	EmitIfCondition(state, exec, [&]() {
 		EmitBufferAccess(ctx, inst, mem, 0u, [&](const auto& selected, const auto& resource) {
 			StoreWordPrepared(ctx, inst, selected, resource, ctx.Arg(inst, inst.NumArgs() - 2));
 		});
@@ -1078,6 +1116,38 @@ uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	auto&      state  = ctx.state;
 	const auto scalar = [&] {
 		std::array<uint32_t, 4> values {};
+		if (components > 1u && mem.kind == IR::ResourceKind::Buffer) {
+			const auto packed  = StorageBufferPackedStride(state, mem);
+			const bool swizzle = (packed & 0x3fffu) != 0u && (packed & (1u << 14u)) != 0u;
+			if (!swizzle) {
+				const auto base_raw = BufferByteAddress(ctx, inst, mem);
+				auto       prefix   = resource.byte_offset;
+				if (prefix == 0u) {
+					const auto desc = state.program.info.buffers.at(mem.resource).descriptor_index;
+					prefix          = state.memory_byte_offsets[desc];
+				}
+				const auto two       = ConstantU32(state, 2);
+				const auto max_u32   = ConstantU32(state, UINT32_MAX);
+				const auto u32_type  = TypeU32(state);
+				const auto bool_type = TypeBool(state);
+				for (uint32_t component = 0; component < components; component++) {
+					const auto raw = component == 0u
+					                     ? base_raw
+					                     : Binary(state, spv::OpIAdd, u32_type, base_raw,
+					                              ConstantU32(state, component * 4u));
+					const auto address = Binary(state, spv::OpIAdd, u32_type, raw, prefix);
+					const auto guarded = Select(
+					    state, u32_type,
+					    Binary(state, spv::OpUGreaterThanEqual, bool_type, address, prefix),
+					    address, max_u32);
+					const auto index  = Binary(state, spv::OpShiftRightLogical, u32_type, guarded, two);
+					values[component] = EmitValueOrZeroIfCondition(
+					    state, EmitStorageElementInBounds(state, resource, index),
+					    [&]() { return LoadWordInBounds(ctx, resource, index); });
+				}
+				return ConstructU32Composite(state, components, values);
+			}
+		}
 		for (uint32_t component = 0; component < components; component++) {
 			values[component] =
 			    LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
@@ -1169,6 +1239,46 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 				StoreFormattedPrepared(ctx, inst, selected, resource, info, composite, components);
 				return;
 			}
+			if (components > 1u && selected.kind == IR::ResourceKind::Buffer) {
+				const auto packed  = StorageBufferPackedStride(state, selected);
+				const bool swizzle = (packed & 0x3fffu) != 0u && (packed & (1u << 14u)) != 0u;
+				if (!swizzle && resource.object_pointer != 0u) {
+					const auto base_raw = BufferByteAddress(ctx, inst, selected);
+					auto       prefix   = resource.byte_offset;
+					if (prefix == 0u) {
+						const auto desc =
+						    state.program.info.buffers.at(selected.resource).descriptor_index;
+						prefix = state.memory_byte_offsets[desc];
+					}
+					const auto two       = ConstantU32(state, 2);
+					const auto max_u32   = ConstantU32(state, UINT32_MAX);
+					const auto u32_type  = TypeU32(state);
+					const auto bool_type = TypeBool(state);
+					for (uint32_t component = 0; component < components; component++) {
+						const auto data = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, u32_type, data,
+						                          composite, component);
+						const auto raw = component == 0u
+						                     ? base_raw
+						                     : Binary(state, spv::OpIAdd, u32_type, base_raw,
+						                              ConstantU32(state, component * 4u));
+						const auto address = Binary(state, spv::OpIAdd, u32_type, raw, prefix);
+						const auto guarded = Select(
+						    state, u32_type,
+						    Binary(state, spv::OpUGreaterThanEqual, bool_type, address, prefix),
+						    address, max_u32);
+						const auto index =
+						    Binary(state, spv::OpShiftRightLogical, u32_type, guarded, two);
+						const auto in_bounds = BufferIndexInBounds(
+						    ctx, inst, selected, resource,
+						    EmitStorageElementInBounds(state, resource, index));
+						EmitIfCondition(state, in_bounds, [&]() {
+							StoreWordInBounds(ctx, resource, index, data);
+						});
+					}
+					return;
+				}
+			}
 			for (uint32_t component = 0; component < components; component++) {
 				auto data = composite;
 				if (components != 1u) {
@@ -1183,11 +1293,34 @@ void StoreBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t component
 }
 
 uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
-	auto& state = ctx.state;
+	auto&      state       = ctx.state;
+	const auto exec        = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto mem         = ctx.Memory(inst);
+	const auto local_words = LocalArrayDwordCount(state, mem.kind);
+	if (local_words > 0u) {
+		const auto              resource = PrepareMemoryResourceAccess(state, mem);
+		const auto              base     = ByteAddress(ctx, inst, mem);
+		const auto              max_idx  = ConstantU32(state, local_words - 1u);
+		const auto              zero     = ConstantU32(state, 0);
+		std::array<uint32_t, 4> values {};
+		for (uint32_t component = 0; component < components; component++) {
+			const auto address = component == 0u
+			                         ? base
+			                         : Binary(state, spv::OpIAdd, TypeU32(state), base,
+			                                  ConstantU32(state, component * 4u));
+			const auto index =
+			    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+			const auto in_bounds  = EmitMemoryElementInBounds(state, resource, index);
+			const auto safe_index = EmitUMin32(state, index, max_idx);
+			const auto loaded     = LoadWordInBounds(ctx, resource, safe_index);
+			values[component]     = Select(state, TypeU32(state),
+			                               AndCondition(state, exec, in_bounds), loaded, zero);
+		}
+		return ConstructU32Composite(state, components, values);
+	}
 	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
+	    state, exec, TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
-		    const auto              mem      = ctx.Memory(inst);
 		    const auto              resource = PrepareMemoryResourceAccess(state, mem);
 		    const auto              base     = ByteAddress(ctx, inst, mem);
 		    std::array<uint32_t, 4> values {};
@@ -1207,9 +1340,31 @@ uint32_t LoadWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t co
 }
 
 void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
-	auto& state = ctx.state;
-	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto mem      = ctx.Memory(inst);
+	auto&      state     = ctx.state;
+	const auto exec      = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto mem       = ctx.Memory(inst);
+	const auto lds_words = mem.kind == IR::ResourceKind::Lds ? LdsDwordCount(state) : 0u;
+	if (lds_words >= components && (lds_words % 4u) == 0u) {
+		const auto resource   = PrepareMemoryResourceAccess(state, mem);
+		const auto base       = ByteAddress(ctx, inst, mem);
+		const auto base_index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), base,
+		                               ConstantU32(state, 2));
+		const auto all_in_bounds =
+		    Binary(state, spv::OpULessThan, TypeBool(state), base_index,
+		           ConstantU32(state, lds_words - (components - 1u)));
+		EmitIfCondition(state, AndCondition(state, exec, all_in_bounds), [&]() {
+			for (uint32_t component = 0; component < components; component++) {
+				const auto index =
+				    component == 0u
+				        ? base_index
+				        : Binary(state, spv::OpIAdd, TypeU32(state), base_index,
+				                 ConstantU32(state, component));
+				StoreWordInBounds(ctx, resource, index, ctx.Arg(inst, component + 1u));
+			}
+		});
+		return;
+	}
+	EmitIfCondition(state, exec, [&]() {
 		const auto resource = PrepareMemoryResourceAccess(state, mem);
 		const auto base     = ByteAddress(ctx, inst, mem);
 		for (uint32_t component = 0; component < components; component++) {
@@ -1598,9 +1753,12 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
-	auto element = Binary(
-	    state, spv::OpIAdd, TypeU32(state), index,
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
+	const auto dword_offset =
+	    access.dword_offset != 0u
+	        ? access.dword_offset
+	        : Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset,
+	                 ConstantU32(state, 2));
+	auto element = Binary(state, spv::OpIAdd, TypeU32(state), index, dword_offset);
 	// The device computes byte offsets in 32 bits, so elements from 2^30 on would wrap back into
 	// the range; the host prefix adds at most 63.
 	constexpr uint32_t last_element = UINT32_MAX >> 2u;

@@ -745,12 +745,13 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 
 } // namespace
 
-void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
+void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height,
+                                  Clock::time_point now) noexcept {
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
 	std::scoped_lock lock(g_frame_mutex);
-	g_frames.Record(Clock::now(), ReadCounters());
+	g_frames.Record(now, ReadCounters());
 	g_frames.guest_width  = guest_width;
 	g_frames.guest_height = guest_height;
 }

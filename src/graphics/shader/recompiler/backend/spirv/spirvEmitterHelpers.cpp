@@ -106,6 +106,9 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
+	if (state.cached_subgroup_local_invocation_id[state.lane_half] != 0) {
+		return state.cached_subgroup_local_invocation_id[state.lane_half];
+	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
@@ -145,6 +148,9 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 }
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	if (state.cached_local_invocation_index[state.lane_half] != 0) {
+		return state.cached_local_invocation_index[state.lane_half];
+	}
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);

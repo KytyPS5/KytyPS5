@@ -92,13 +92,34 @@ public:
 		}
 		const auto compatible = std::ranges::find_if(m_free, [&](const auto* frame) {
 			return frame->image.extent.width == extent.width &&
-			       frame->image.extent.height == extent.height && frame->image.format == format;
+			       frame->image.extent.height == extent.height && frame->image.format == format &&
+			       m_scheduler.IsFree(frame->present_tick);
 		});
-		auto*      frame      = compatible == m_free.end() ? m_free.back() : *compatible;
+		Presenter::Frame* frame = nullptr;
 		if (compatible != m_free.end()) {
+			frame       = *compatible;
 			*compatible = m_free.back();
+			m_free.pop_back();
+		} else {
+			const auto ready = std::ranges::find_if(m_free, [&](const auto* candidate) {
+				return m_scheduler.IsFree(candidate->present_tick);
+			});
+			if (ready != m_free.end()) {
+				frame  = *ready;
+				*ready = m_free.back();
+				m_free.pop_back();
+			} else if (m_frames.size() < 8) {
+				auto created = std::make_unique<Presenter::Frame>();
+				frame        = created.get();
+				m_frames.push_back(std::move(created));
+			} else {
+				const auto oldest =
+				    std::ranges::min_element(m_free, {}, &Presenter::Frame::present_tick);
+				frame   = *oldest;
+				*oldest = m_free.back();
+				m_free.pop_back();
+			}
 		}
-		m_free.pop_back();
 		frame->busy = true;
 		m_mutex.Unlock();
 

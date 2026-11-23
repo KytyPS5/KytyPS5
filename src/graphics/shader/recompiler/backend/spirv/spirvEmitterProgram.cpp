@@ -231,16 +231,219 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+bool CanSharePureAluAcrossHalves(IR::ValueOpcode op) {
+	using Op = IR::ValueOpcode;
+	switch (op) {
+		case Op::BitCastU16F16:
+		case Op::BitCastF16U16:
+		case Op::BitCastU32F32:
+		case Op::BitCastF32U32:
+		case Op::BitCastU64F64:
+		case Op::BitCastF64U64:
+		case Op::ConvertU16U32:
+		case Op::ConvertU32U16:
+		case Op::ConvertU8U32:
+		case Op::ConvertU32U8:
+		case Op::ConvertF32F16:
+		case Op::ConvertF16F32:
+		case Op::ConvertS32F32:
+		case Op::ConvertU32F32:
+		case Op::ConvertF32S32:
+		case Op::ConvertF64S32:
+		case Op::ConvertF32F64:
+		case Op::ConvertF64F32:
+		case Op::ConvertF32U32:
+		case Op::ConvertF64U32:
+		case Op::CompositeConstructU64:
+		case Op::CompositeConstructU32x2:
+		case Op::CompositeConstructU32x3:
+		case Op::CompositeConstructF32x2:
+		case Op::CompositeConstructU32x4:
+		case Op::CompositeExtractU64:
+		case Op::CompositeExtractU32x2:
+		case Op::CompositeExtractU32x3:
+		case Op::CompositeExtractU32x4:
+		case Op::PackHalf2x16:
+		case Op::PackSnorm2x16:
+		case Op::PackUnorm2x16:
+		case Op::PackFloat2x16Rtz:
+		case Op::FPAbs32:
+		case Op::FPNeg32:
+		case Op::FPSaturate32:
+		case Op::BitFieldInsert:
+		case Op::BitFieldUExtract:
+		case Op::BitFieldSExtract:
+		case Op::SelectU1:
+		case Op::SelectF32:
+		case Op::SelectF64:
+		case Op::SelectU32:
+		case Op::IAdd32:
+		case Op::IAdd64:
+		case Op::ISub32:
+		case Op::ISub64:
+		case Op::IMul32:
+		case Op::UDiv32:
+		case Op::SMulHi:
+		case Op::UMulHi:
+		case Op::IAbs32:
+		case Op::ShiftLeftLogical32:
+		case Op::ShiftLeftLogical64:
+		case Op::ShiftRightLogical32:
+		case Op::ShiftRightLogical64:
+		case Op::ShiftRightArithmetic32:
+		case Op::ShiftRightArithmetic64:
+		case Op::BitwiseAnd32:
+		case Op::BitwiseAnd64:
+		case Op::BitwiseOr32:
+		case Op::BitwiseXor32:
+		case Op::BitwiseNot32:
+		case Op::BitReverse32:
+		case Op::BitCount32:
+		case Op::FindUMsb32:
+		case Op::FindILsb32:
+		case Op::SMin32:
+		case Op::UMin32:
+		case Op::SMax32:
+		case Op::UMax32:
+		case Op::SMinTri32:
+		case Op::UMinTri32:
+		case Op::SMaxTri32:
+		case Op::UMaxTri32:
+		case Op::SMedTri32:
+		case Op::UMedTri32:
+		case Op::SLessThan32:
+		case Op::SLessThan64:
+		case Op::SLessThanEqual64:
+		case Op::ULessThanEqual64:
+		case Op::UGreaterThanEqual64:
+		case Op::ULessThan32:
+		case Op::ULessThan64:
+		case Op::IEqual32:
+		case Op::IEqual64:
+		case Op::SLessThanEqual32:
+		case Op::ULessThanEqual32:
+		case Op::SGreaterThan32:
+		case Op::UGreaterThan32:
+		case Op::UGreaterThan64:
+		case Op::INotEqual32:
+		case Op::INotEqual64:
+		case Op::SGreaterThanEqual32:
+		case Op::UGreaterThanEqual32:
+		case Op::LogicalOr:
+		case Op::LogicalAnd:
+		case Op::LogicalXor:
+		case Op::LogicalNot:
+		case Op::FPOrdEqual32:
+		case Op::FPOrdEqual64:
+		case Op::FPOrdLessThanEqual64:
+		case Op::FPOrdGreaterThanEqual64:
+		case Op::FPOrdNotEqual64:
+		case Op::FPOrdLessThan64:
+		case Op::FPOrdGreaterThan64:
+		case Op::FPUnordEqual64:
+		case Op::FPUnordNotEqual64:
+		case Op::FPUnordLessThan64:
+		case Op::FPUnordGreaterThan64:
+		case Op::FPUnordLessThanEqual64:
+		case Op::FPUnordGreaterThanEqual64:
+		case Op::FPUnordEqual32:
+		case Op::FPOrdNotEqual32:
+		case Op::FPUnordNotEqual32:
+		case Op::FPOrdLessThan32:
+		case Op::FPUnordLessThan32:
+		case Op::FPOrdGreaterThan32:
+		case Op::FPUnordGreaterThan32:
+		case Op::FPOrdLessThanEqual32:
+		case Op::FPUnordLessThanEqual32:
+		case Op::FPOrdGreaterThanEqual32:
+		case Op::FPUnordGreaterThanEqual32:
+		case Op::FPIsNan32:
+		case Op::FPIsNan64:
+		case Op::FPCmpClass32:
+		case Op::FPCmpClass16:
+		case Op::FPAdd32:
+		case Op::FPSub32:
+		case Op::FPFma32:
+		case Op::FPMad32:
+		case Op::FPMul32:
+		case Op::FPAdd64:
+		case Op::FPMul64:
+		case Op::FPFma64:
+		case Op::FPRecip64:
+		case Op::FPMin32:
+		case Op::FPMax32:
+		case Op::FPMin64:
+		case Op::FPMax64:
+		case Op::FPMinTri32:
+		case Op::FPMaxTri32:
+		case Op::FPMedTri32:
+		case Op::FPRecip32:
+		case Op::FPRecipIFlag32:
+		case Op::FPRecipSqrt32:
+		case Op::FPSqrt:
+		case Op::FPSin:
+		case Op::FPCos:
+		case Op::FPExp2:
+		case Op::FPLog2:
+		case Op::FPLdexp:
+		case Op::FPRoundEven32:
+		case Op::FPFloor32:
+		case Op::FPCeil32:
+		case Op::FPTrunc32:
+		case Op::FPFloor64:
+		case Op::FPCeil64:
+		case Op::FPTrunc64:
+		case Op::FPFract32:
+		case Op::FPFract64: return true;
+		default: return false;
+	}
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	using Op = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
-	if (ctx.half != 0 &&
-	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupReduceU32 ||
-	     op == Op::ReadConstBuffer || op == Op::ReadRealtimeClock ||
-	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
-		// Whole-wave results, clocks and SMEM loads (SGPR operands, no EXEC) match in both halves.
-		ctx.Define(inst, ctx.other_half->Result(inst));
-		return;
+	if (ctx.half != 0) {
+		const bool half_invariant_builtin =
+		    op == Op::GetBuiltin && inst.Arg(0).IsImmediate() &&
+		    (static_cast<IR::StageInputKind>(inst.Arg(0).U32()) ==
+		         IR::StageInputKind::WorkgroupId ||
+		     static_cast<IR::StageInputKind>(inst.Arg(0).U32()) ==
+		         IR::StageInputKind::NumWorkgroups);
+		if (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::SubgroupReduceU32 ||
+		    op == Op::ReadConstBuffer || op == Op::ReadConst || op == Op::ReadRealtimeClock ||
+		    op == Op::GetUserData || op == Op::MeshDrawParameter ||
+		    op == Op::GetDispatchThreadExtent || op == Op::GetShaderBase ||
+		    op == Op::GetSrtResource || op == Op::GetBufferResource ||
+		    op == Op::GetAddressResource || op == Op::GetScratchResource ||
+		    op == Op::GetImageResource || op == Op::GetSamplerResource ||
+		    half_invariant_builtin ||
+		    (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress)) {
+			// Whole-wave results, clocks, uniform inputs, resource handles and SMEM loads match in
+			// both halves.
+			ctx.Define(inst, ctx.other_half->Result(inst));
+			return;
+		}
+		if (!ctx.state.program.dispatcher_fallback &&
+		    op == Op::ReadLane && ctx.state.program.blocks.size() > 2u &&
+		    ctx.Arg(inst, 1) == ctx.other_half->Arg(inst, 1)) {
+			ctx.Define(inst, ctx.other_half->Result(inst));
+			return;
+		}
+		if (!ctx.state.program.dispatcher_fallback &&
+		    (CanSharePureAluAcrossHalves(op) || op == Op::MakeImageAddress ||
+		     op == Op::GetBufferResourceIndex)) {
+			bool same_args = true;
+			for (size_t i = 0; i < inst.NumArgs(); ++i) {
+				if (ctx.Arg(inst, i) != ctx.other_half->Arg(inst, i)) {
+					same_args = false;
+					break;
+				}
+			}
+			if (same_args) {
+				ctx.Define(inst, ctx.other_half->Result(inst));
+				return;
+			}
+		}
 	}
 	switch (op) {
 #define VALUE_OPCODE(name, ...)                                                                    \
@@ -262,6 +465,26 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 			const auto* predecessor = inst.PhiBlock(index);
 			if (predecessor == nullptr || predecessor->Definition() == 0) {
 				ctx.Fail(inst, "has a predecessor outside the structured function");
+			}
+		}
+		if (ctx.half != 0) {
+			const auto* cur_block = ctx.state.current_block;
+			bool        can_share = cur_block != nullptr;
+			for (size_t index = 0; can_share && index < inst.NumArgs(); index++) {
+				const auto* pred = inst.PhiBlock(index);
+				if (!structured.block_exit_labels.contains(pred)) {
+					can_share = false;
+					break;
+				}
+				const auto arg = inst.Arg(index);
+				if (ctx.Def(arg) != ctx.other_half->Def(arg)) {
+					can_share = false;
+					break;
+				}
+			}
+			if (can_share) {
+				ctx.Define(inst, ctx.other_half->Result(inst));
+				return;
 			}
 		}
 		structured.deferred_phis.push_back(
@@ -737,6 +960,32 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	if (state.subgroup_local_invocation_id_variable != 0) {
+		const auto subid = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), subid,
+		                          state.subgroup_local_invocation_id_variable);
+		state.cached_subgroup_local_invocation_id[0] = subid;
+		if (state.lane_count == 2) {
+			state.cached_subgroup_local_invocation_id[1] =
+			    EmitAddU32(state, subid, ConstantU32(state, 32));
+		}
+	}
+	if (const auto local_var =
+	        InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
+	    local_var != 0) {
+		const auto local_val = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), local_val, local_var);
+		if (state.lane_count == 2) {
+			const auto wave_base =
+			    EmitBinaryU32(state, spv::OpBitwiseAnd, local_val, ConstantU32(state, ~31u));
+			const auto base0 = EmitAddU32(state, local_val, wave_base);
+			state.cached_local_invocation_index[0] = base0;
+			state.cached_local_invocation_index[1] =
+			    EmitAddU32(state, base0, ConstantU32(state, 32));
+		} else {
+			state.cached_local_invocation_index[0] = local_val;
+		}
+	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
@@ -757,7 +1006,9 @@ void EmitProgram(EmitterState& state) {
 		EmitStructuredFunction(ctx);
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
-	state.current_block = nullptr;
+	state.current_block                       = nullptr;
+	state.cached_subgroup_local_invocation_id = {};
+	state.cached_local_invocation_index       = {};
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}

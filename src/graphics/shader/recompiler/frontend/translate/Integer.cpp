@@ -347,13 +347,21 @@ void Translator::V_BCNT_U32_B32(const Decoder::Instruction& inst) {
 void Translator::V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low) {
 	const auto lane  = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto local = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
-	const auto below = RightMask32(local);
 	const auto high_lane =
 	    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {lane, IR::Value(32u)}));
-	const auto thread_mask = low ? ir.Select(high_lane, IR::U32(IR::Value(0xffffffffu)), below)
-	                             : ir.Select(high_lane, below, IR::U32(IR::Value(0u)));
-	const auto active      = ir.BitwiseAnd(ReadU32(inst.src0), thread_mask);
-	const auto count       = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {active}));
+	const auto mask = ReadU32(inst.src0);
+	IR::U32    count;
+	if (mask.IsImmediate() && mask.U32() == 0xffffffffu) {
+		count = low ? ir.Select(high_lane, IR::U32(IR::Value(32u)), local)
+		            : ir.Select(high_lane, local, IR::U32(IR::Value(0u)));
+	} else {
+		const auto below = RightMask32(local);
+		const auto thread_mask =
+		    low ? ir.Select(high_lane, IR::U32(IR::Value(0xffffffffu)), below)
+		        : ir.Select(high_lane, below, IR::U32(IR::Value(0u)));
+		const auto active = ir.BitwiseAnd(mask, thread_mask);
+		count             = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {active}));
+	}
 	WriteOperand(DestinationOperand(inst), ir.IAdd(count, ReadU32(inst.src1)));
 }
 

@@ -206,6 +206,7 @@ uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency();
+int KYTY_SYSV_ABI      KernelGetProsperoCompiledSdkVersion(uint32_t* version);
 
 } // namespace LibKernel
 

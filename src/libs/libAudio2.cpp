@@ -241,6 +241,7 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996;
 static constexpr int AUDIO_OUT2_ERROR_OUT_OF_RESOURCE             = -2144960510; /* 0x80268002 */
 static constexpr int AUDIO_OUT2_ERROR_INVALID_PORT                = -2144960503; /* 0x80268009 */
 static constexpr int AUDIO_OUT2_ERROR_INVALID_POINTER             = -2144960500; /* 0x8026800C */
+static constexpr int AUDIO_OUT2_ERROR_INVALID_USER                = -2144960496; /* 0x80268010 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
@@ -956,18 +957,24 @@ int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
                                                       uint32_t*           context_attributes,
                                                       uint32_t*           port_attributes) {
-	if (context_attributes == nullptr || port_attributes == nullptr) {
+	if (context_attributes == nullptr && port_attributes == nullptr) {
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
+	// The system's attributes without 3D audio; games compiled before 9.00 lack those 9.00 added.
+	uint32_t sdk_version = 0;
+	LibKernel::KernelGetProsperoCompiledSdkVersion(&sdk_version);
+	const bool        sdk_9 = sdk_version >= 0x09000000;
 	Common::LockGuard lock(g_audioout2_state_mutex);
 	if (std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle) ==
 	    g_audioout2_users.end()) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		return AUDIO_OUT2_ERROR_INVALID_USER;
 	}
-	*context_attributes = 0;
-	*port_attributes    = (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM) |
-	                      (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN) |
-	                      (1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS);
+	if (context_attributes != nullptr) {
+		*context_attributes = sdk_9 ? 0x13 : 0x3;
+	}
+	if (port_attributes != nullptr) {
+		*port_attributes = sdk_9 ? 0xe53 : 0x653;
+	}
 	return OK;
 }
 

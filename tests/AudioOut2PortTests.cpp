@@ -38,6 +38,7 @@ bool                              g_block_outputs = false;
 std::vector<int>                  g_blocked_output;
 std::atomic_uint64_t              g_process_time {0};
 std::atomic_bool                  g_process_time_frozen {false};
+uint32_t                          g_sdk_version = 0x09000000;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -150,6 +151,7 @@ AudioOut2::AudioOut2PortHandle CreatePort(AudioOut2::AudioOut2ContextHandle cont
 void TestUserSupportedAttributes() {
 	constexpr int invalid_param = static_cast<int32_t>(0x80268001u);
 	constexpr int busy          = static_cast<int32_t>(0x80268007u);
+	constexpr int invalid_user  = static_cast<int32_t>(0x80268010u);
 	AudioOut2::AudioOut2UserHandle user = 0;
 	Check(AudioOut2::AudioOut2UserCreate(1000, nullptr) == invalid_param,
 	      "null user handle output was accepted");
@@ -158,19 +160,27 @@ void TestUserSupportedAttributes() {
 	uint32_t port_attributes    = UINT32_MAX;
 	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
 	                                                    &port_attributes) == OK &&
-	          context_attributes == 0 && port_attributes == 0x103,
-	      "user capabilities do not match implemented attributes");
+	          context_attributes == 0x13 && port_attributes == 0xe53,
+	      "user capabilities do not match the system's attributes");
+	g_sdk_version = 0x08000000;
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
+	                                                    &port_attributes) == OK &&
+	          context_attributes == 0x3 && port_attributes == 0x653,
+	      "games compiled before 9.00 saw the attributes 9.00 added");
+	g_sdk_version = 0x09000000;
 
 	context_attributes = port_attributes = UINT32_MAX;
-	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, &port_attributes) ==
-	          invalid_param &&
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, &port_attributes) == OK &&
 	          AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes, nullptr) ==
-	              invalid_param &&
-	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
-	      "null capability outputs were accepted or modified");
+	              OK &&
+	          context_attributes == 0x13 && port_attributes == 0xe53,
+	      "one null capability output was rejected or skipped the other");
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, nullptr) == invalid_param,
+	      "two null capability outputs were accepted");
+	context_attributes = port_attributes = UINT32_MAX;
 	for (const auto invalid: {AudioOut2::AudioOut2UserHandle {0}, UINTPTR_MAX}) {
 		Check(AudioOut2::AudioOut2UserGetSupportedAttributes(invalid, &context_attributes,
-		                                                    &port_attributes) == invalid_param &&
+		                                                    &port_attributes) == invalid_user &&
 		          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
 		      "invalid user capabilities succeeded or modified outputs");
 	}
@@ -186,7 +196,7 @@ void TestUserSupportedAttributes() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 	Check(AudioOut2::AudioOut2UserDestroy(user) == OK, "unused user destroy failed");
 	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
-	                                                    &port_attributes) == invalid_param &&
+	                                                    &port_attributes) == invalid_user &&
 	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX &&
 	          AudioOut2::AudioOut2UserDestroy(user) == invalid_param,
 	      "destroyed user remained valid");
@@ -1132,6 +1142,11 @@ namespace Libs::LibKernel {
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 	return g_process_time_frozen ? g_process_time.load() : g_process_time.fetch_add(1000);
+}
+
+int KYTY_SYSV_ABI KernelGetProsperoCompiledSdkVersion(uint32_t* version) {
+	*version = g_sdk_version;
+	return OK;
 }
 
 } // namespace Libs::LibKernel

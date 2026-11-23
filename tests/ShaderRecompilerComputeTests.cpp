@@ -21192,9 +21192,11 @@ public:
       }
       auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, vertex.stage, pixel.stage, true);
+      const bool samples_native_depth =
+          depth_feedback && !bindings.pixel.images.empty() &&
+          bindings.pixel.images.front().image_id == depth.image_id;
       Require(name, "sampled attachment identity",
-              !depth_feedback ||
-                  bindings.pixel.images[0].image_id == depth.image_id,
+              !depth_feedback || samples_native_depth,
               "the fragment must sample the depth attachment's native image");
       auto &command = scheduler.Current();
       vk::ImageAspectFlags feedback_aspects;

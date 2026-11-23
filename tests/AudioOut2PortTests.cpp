@@ -986,6 +986,14 @@ void TestAudioOutputs() {
 	const auto object   = CreatePort(context, param);
 	param.port_type     = 3;
 	const auto pad      = CreatePort(context, param);
+	param.port_type     = 2;
+	const auto voice    = CreatePort(context, param);
+	param.port_type     = 4;
+	const auto personal = CreatePort(context, param);
+	param.port_type     = 5;
+	const auto aux      = CreatePort(context, param);
+	param.port_type     = 6;
+	const auto vibrator = CreatePort(context, param);
 	const auto check_port = [](AudioOut2::AudioOut2PortHandle port, uint16_t output,
 	                           uint8_t channels, int16_t volume, const char* message) {
 		PortState state {};
@@ -1019,7 +1027,14 @@ void TestAudioOutputs() {
 		           "8-channel main port is not limited to the output's channels");
 		check_port(object, expected.port_output, expected.channels, -1,
 		           "object port does not report the output's channels");
-		check_port(pad, 1, 1, 127, "pad speaker port followed the main output or lost its volume");
+		check_port(pad, 4, 1, 127, "pad speaker port is not on the controller");
+		check_port(vibrator, 4, 1, -1, "vibration port is not on the controller");
+		check_port(voice, expected.port_output, 1, -1, "voice port did not follow the main output");
+		check_port(aux, 1, 1, -1, "aux port is not on the primary output");
+		// Personal ports play only on headphones without mix-to-main.
+		const bool headphones = expected.port_output == 0x40;
+		check_port(personal, headphones ? 0x40 : 0, headphones ? 1 : 0, -1,
+		           "personal port state does not match the audio output");
 	}
 
 	Check(AudioOut2::AudioOut2GetSpeakerInfo(nullptr, 0) == static_cast<int32_t>(0x8026800Cu),
@@ -1028,7 +1043,7 @@ void TestAudioOutputs() {
 	Check(AudioOut2::AudioOut2GetSpeakerInfo(AsInfo(&info), 2) ==
 	          static_cast<int32_t>(0x80268001u),
 	      "unknown speaker info flags were accepted");
-	for (const auto port: {stereo, surround, object, pad}) {
+	for (const auto port: {stereo, surround, object, pad, voice, personal, aux, vibrator}) {
 		AudioOut2::AudioOut2PortDestroy(port);
 	}
 	AudioOut2::AudioOut2ContextDestroy(context);

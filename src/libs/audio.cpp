@@ -23,17 +23,9 @@ namespace Libs::Audio {
 
 namespace {
 
-constexpr int AUDIO_OUT_PORT_TYPE_MAIN      = 0;
-constexpr int AUDIO_OUT_PORT_TYPE_BGM       = 1;
-constexpr int AUDIO_OUT_PORT_TYPE_VOICE     = 2;
-constexpr int AUDIO_OUT_PORT_TYPE_PERSONAL  = 3;
-constexpr int AUDIO_OUT_PORT_TYPE_PADSPK    = 4;
-constexpr int AUDIO_OUT_PORT_TYPE_VIBRATION = 10;
-constexpr int AUDIO_OUT_PORT_TYPE_AUDIO3D   = 126;
-constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
-
-constexpr uint32_t AUDIO_OUT_PARAM_FORMAT_MASK = 0x000000ffu;
-constexpr uint64_t AUDIO_OUT_TARGET_LATENCY_US = 40000;
+constexpr uint32_t AUDIO_OUT_PARAM_FORMAT_MASK     = 0x000000ffu;
+constexpr uint32_t AUDIO_OUT_PARAM_ATTR_MIX_TO_MAIN = 0x00020000u;
+constexpr uint64_t AUDIO_OUT_TARGET_LATENCY_US      = 40000;
 
 constexpr int      AUDIO_IN_SILENT_STATE_DEVICE_NONE = 0x1;
 constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;
@@ -893,7 +885,10 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 
 	EXIT_IF(g_audio == nullptr);
 
-	auto id = g_audio->AudioOutOpen(type, len, freq, format);
+	// A personal port mixed to the main output plays as a main port.
+	const bool mixed =
+	    type == AUDIO_OUT_PORT_TYPE_PERSONAL && (param & AUDIO_OUT_PARAM_ATTR_MIX_TO_MAIN) != 0;
+	auto id = g_audio->AudioOutOpen(mixed ? AUDIO_OUT_PORT_TYPE_MAIN : type, len, freq, format);
 
 	if (!id.IsValid()) {
 		return AUDIO_OUT_ERROR_PORT_FULL;
@@ -925,34 +920,11 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 
 	state->reroute_counter = 0;
-	// Only pad speaker ports report a volume.
-	state->volume = type == AUDIO_OUT_PORT_TYPE_PADSPK ? 127 : -1;
 
-	switch (type) {
-		case AUDIO_OUT_PORT_TYPE_MAIN:
-		case AUDIO_OUT_PORT_TYPE_BGM:
-		case AUDIO_OUT_PORT_TYPE_AUDIO3D: {
-			const auto main = AudioInternal::GetMainOutput();
-			state->output   = main.output;
-			state->channel  = std::min<int>(channels_num, main.channels);
-			break;
-		}
-		case AUDIO_OUT_PORT_TYPE_VOICE:
-		case AUDIO_OUT_PORT_TYPE_PERSONAL:
-			state->output  = 0x40;
-			state->channel = 1;
-			break;
-		case AUDIO_OUT_PORT_TYPE_PADSPK:
-		case AUDIO_OUT_PORT_TYPE_VIBRATION:
-			state->output  = 4;
-			state->channel = 1;
-			break;
-		case AUDIO_OUT_PORT_TYPE_AUX:
-			state->output  = 0x80;
-			state->channel = 0;
-			break;
-		default: EXIT("unknown port type: %d\n", type);
-	}
+	const auto route = AudioInternal::GetPortOutput(type);
+	state->output    = route.output;
+	state->channel   = std::min<int>(channels_num, route.channels);
+	state->volume    = route.volume;
 
 	LOGF("\t output  = %" PRIu16 "\n"
 	     "\t channel = %" PRIu8 "\n",

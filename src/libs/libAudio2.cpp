@@ -19,18 +19,6 @@
 
 namespace Libs::Audio {
 
-namespace {
-
-constexpr int AUDIO_OUT_PORT_TYPE_MAIN      = 0;
-constexpr int AUDIO_OUT_PORT_TYPE_BGM       = 1;
-constexpr int AUDIO_OUT_PORT_TYPE_VOICE     = 2;
-constexpr int AUDIO_OUT_PORT_TYPE_PERSONAL  = 3;
-constexpr int AUDIO_OUT_PORT_TYPE_PADSPK    = 4;
-constexpr int AUDIO_OUT_PORT_TYPE_VIBRATION = 10;
-constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
-
-} // namespace
-
 namespace AudioOut2 {
 
 LIB_NAME("AudioOut2", "AudioOut");
@@ -908,19 +896,14 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	g_audioout2_state_mutex.Lock();
 	if (auto* port_state = audioout2_find_port_locked(port); port_state != nullptr) {
 		const auto type     = audioout2_port_type_to_audio_out_type(port_state->port_type);
-		state->num_channels = audioout2_data_format_channels(port_state->data_format);
-		// Only pad speaker ports report a volume.
-		if (type == AUDIO_OUT_PORT_TYPE_PADSPK) {
-			state->volume = 127;
-		}
-		// Main-route ports report the output's channels, channel ports at most their own.
-		if (type == AUDIO_OUT_PORT_TYPE_MAIN || type == AUDIO_OUT_PORT_TYPE_BGM) {
-			const auto main     = AudioInternal::GetMainOutput();
-			state->output       = main.output;
-			state->num_channels = audioout2_port_type_is_object(port_state->port_type)
-			                          ? main.channels
-			                          : std::min(state->num_channels, main.channels);
-		}
+		const auto route    = AudioInternal::GetPortOutput(type);
+		const auto channels = audioout2_data_format_channels(port_state->data_format);
+		state->output       = route.output;
+		state->volume       = route.volume;
+		// Object ports report the route's channels, channel ports at most their own.
+		state->num_channels = audioout2_port_type_is_object(port_state->port_type)
+		                          ? route.channels
+		                          : std::min(channels, route.channels);
 	}
 	g_audioout2_state_mutex.Unlock();
 

@@ -455,19 +455,31 @@ void TestChannelGains() {
 	      "connected controller did not receive channel gains");
 }
 
-void TestPortStateVolume() {
+void TestPortState() {
 	namespace AudioOut = Libs::Audio::AudioOut;
 	Fixture f;
 	Libs::Audio::Initialize();
-	const int main = AudioOut::AudioOutOpen(1000, 0, 0, 256, 48000, 4);
-	const int pad  = AudioOut::AudioOutOpen(1000, 4, 0, 256, 48000, 4);
-	AudioOut::AudioOutPortState state {};
-	Check(AudioOut::AudioOutGetPortState(main, &state) == OK && state.volume == -1,
-	      "main port reported a volume");
-	Check(AudioOut::AudioOutGetPortState(pad, &state) == OK && state.volume == 127,
-	      "pad speaker port lost its volume");
-	AudioOut::AudioOutClose(main);
-	AudioOut::AudioOutClose(pad);
+	const auto check = [](int type, uint32_t param, uint16_t output, uint8_t channel, int16_t volume,
+	                      const char* message) {
+		const int port = AudioOut::AudioOutOpen(1000, type, 0, 256, 48000, param);
+		AudioOut::AudioOutPortState state {};
+		Check(AudioOut::AudioOutGetPortState(port, &state) == OK && state.output == output &&
+		          state.channel == channel && state.volume == volume,
+		      message);
+		AudioOut::AudioOutClose(port);
+	};
+	check(0, 4, 1, 2, -1, "main port is not on the primary output");
+	check(2, 4, 1, 2, -1, "voice port did not follow the main output");
+	check(3, 4, 0, 0, -1, "personal port played without headphones");
+	check(3, 4 | 0x20000, 1, 2, -1, "mixed personal port is not on the primary output");
+	check(4, 4, 4, 1, 127, "pad speaker port is not on the controller");
+	check(10, 4, 4, 2, -1, "vibration port is not on the controller");
+	check(127, 4, 1, 2, -1, "aux port is not on the primary output");
+	Config::ConfigOptions options;
+	options.audio_output = Config::AudioOutput::Headphones;
+	Config::Load(options);
+	check(0, 4, 0x40, 2, -1, "main port is not on headphones");
+	check(3, 4, 0x40, 2, -1, "personal port is not on headphones");
 	Libs::Audio::Shutdown();
 }
 } // namespace
@@ -485,7 +497,7 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
-	TestPortStateVolume();
+	TestPortState();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

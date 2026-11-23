@@ -659,7 +659,7 @@ void TestTriggerEffectState() {
 	check_state(2, 5, "feedback at position 0 was suppressed by a dead zone");
 	param.command[0].data[1] = 0;
 	set_effect();
-	check_state(1, 5, "zero-strength feedback reported active");
+	check_state(0, 5, "zero-strength feedback reported an effect state");
 
 	param.command[0]         = {};
 	param.command[0].mode    = 4;
@@ -707,7 +707,7 @@ void TestTriggerEffectState() {
 	check_state(7, 5, "vibration at position 0 was suppressed");
 	param.command[0].data[2] = 0;
 	set_effect();
-	check_state(6, 5, "zero-frequency vibration reported active");
+	check_state(0, 5, "zero-frequency vibration reported an effect state");
 
 	param.command[0]          = {};
 	param.command[0].mode     = 6;
@@ -720,16 +720,21 @@ void TestTriggerEffectState() {
 	check_state(7, 5, "multi-position vibration did not activate at position 9");
 	param.command[0].data[0] = 0;
 	set_effect();
-	check_state(6, 5, "zero-frequency multi-position vibration reported active");
+	check_state(0, 5, "zero-frequency multi-position vibration reported an effect state");
 
 	ResetInputState();
-	check_state(6, 3, "input reset retained a fired weapon");
+	check_state(0, 3, "input reset retained a fired weapon");
 	param.command[0].mode = 0;
 	set_effect();
 	check_state(0, 3, "off mode retained an effect state");
 	Connect(2);
 	Disconnect(1);
 	check_state(0, 0, "switching controllers retained effect states");
+	param.trigger_mask       = 3;
+	param.command[0].mode    = 4;
+	param.command[1].data[2] = 0;
+	set_effect();
+	check_state(0, 0, "forceless multi-position feedback and weapon reported effect states");
 }
 
 void TestUnreadPressSurvivesStickBurst() {
@@ -771,8 +776,9 @@ void TestVrControllerInformation() {
 	PadTriggerEffectStateInformation triggers {};
 	Check(PadVrControllerGetDeviceInformation(left, nullptr) == PAD_ERROR_NOT_INITIALIZED &&
 	          PadVrControllerGetTriggerEffectStates(left, right, nullptr) ==
-	              PAD_ERROR_NOT_INITIALIZED,
-	      "an uninitialized library checked a Sense controller query's output first");
+	              PAD_ERROR_NOT_INITIALIZED &&
+	          PadVrControllerSetVibrationMode(left, 0) == PAD_ERROR_NOT_INITIALIZED,
+	      "an uninitialized library checked a Sense controller call's argument first");
 	Config::ConfigOptions options;
 	options.vr_enabled      = true;
 	options.keyboard_player = 2; // Only host pad 1 connects the first player.
@@ -814,11 +820,17 @@ void TestVrControllerInformation() {
 		          PadVrControllerGetTriggerEffectStates(right, left, &triggers) ==
 		              PAD_ERROR_INVALID_HANDLE,
 		      "a Sense controller query accepted a null output or a wrong handle");
+		Check(PadVrControllerSetVibrationMode(left, 1) == OK &&
+		          PadVrControllerSetVibrationMode(right, 5) == OK &&
+		          PadVrControllerSetVibrationMode(1, 0) == PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerSetVibrationMode(1, 6) == PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerSetVibrationMode(1, 1) == PAD_ERROR_INVALID_HANDLE,
+		      "a Sense controller vibration mode or handle was checked wrongly");
 		Disconnect(1);
 		Check(info_is(left, 0, 0) && info_is(right, 0, 0) && triggers_off(),
 		      "disconnected Sense controllers reported the wrong information");
-		Check(PadClose(right) == OK &&
-		          info_rejected(right) &&
+		Check(PadClose(right) == OK && info_rejected(right) &&
+		          PadVrControllerSetVibrationMode(right, 1) == PAD_ERROR_INVALID_HANDLE &&
 		          PadVrControllerGetTriggerEffectStates(left, right, &triggers) ==
 		              PAD_ERROR_INVALID_HANDLE &&
 		          PadClose(left) == OK,

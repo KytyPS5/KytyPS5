@@ -16,7 +16,7 @@
 
 namespace Libs {
 
-LIB_VERSION("JpegEnc", 1, "JpegEnc", 1, 1);
+LIB_NAME("JpegEnc", "JpegEnc");
 
 namespace JpegEnc {
 

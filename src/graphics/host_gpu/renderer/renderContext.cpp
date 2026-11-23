@@ -15,7 +15,8 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_resolve_cache(*this), m_texture_cache(graphics, m_command_scheduler, m_page_manager,
+	                                          m_buffer_cache, m_resolve_cache),
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	if (graphics.ray_query_enabled) {
@@ -214,11 +215,11 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 		}
 	}
 
+	const auto ident = static_cast<uintptr_t>(event_id);
+	auto*      data  = reinterpret_cast<void*>((static_cast<uintptr_t>(context_id) << 16u) | ident);
 	for (const auto& registration: registrations) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
-		    registration.eq, static_cast<uintptr_t>(registration.event_id),
-		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
-		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
+		    registration.eq, ident, LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS, data);
 		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
 			DeleteInterruptEq(registration.eq, registration.event_id);
 			continue;

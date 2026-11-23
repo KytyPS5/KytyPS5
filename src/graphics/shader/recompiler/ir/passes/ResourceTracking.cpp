@@ -3634,7 +3634,9 @@ private:
 				    SelectorMaximum(inst->Arg(arg ^ 1u), bounds, depth + 1u, guard) < target) return true;
 			}
 		}
-		return false;
+		uint32_t target;
+		return inst->GetOpcode() == ValueOpcode::ULessThan32 && ImmediateU32(inst->Arg(0), target) &&
+		       SelectorMaximum(inst->Arg(1), bounds, depth + 1u, guard) <= target;
 	}
 
 	struct SelectorDomain {

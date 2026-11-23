@@ -19,7 +19,7 @@
 
 namespace Libs::LibPsml {
 
-LIB_VERSION("Psml", 1, "Psml", 1, 1);
+LIB_NAME("Psml", "Psml");
 
 namespace {
 
@@ -446,7 +446,7 @@ int KYTY_SYSV_ABI ValidateContext(const void* context) {
 
 namespace Mfsr2 {
 
-LIB_VERSION("Psml_mfsr2", 1, "Psml", 1, 1);
+LIB_NAME("Psml_mfsr2", "Psml");
 
 namespace {
 

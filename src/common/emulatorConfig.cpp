@@ -52,6 +52,10 @@ const std::string& GetAudioInputDevice() {
 	return g_config->audio_input_device;
 }
 
+AudioOutput GetAudioOutput() {
+	return g_config->audio_output;
+}
+
 const std::optional<ControllerColor>& GetControllerColor() {
 	return g_config->controller_color;
 }

@@ -133,6 +133,7 @@ struct PadVrControllerDeviceInformation {
 int KYTY_SYSV_ABI PadVrControllerReadState(int handle, PadVrControllerData* data);
 int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int                               handle,
                                                       PadVrControllerDeviceInformation* info);
+int KYTY_SYSV_ABI PadVrControllerSetVibrationMode(int handle, int mode);
 int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_handle,
                                                    const PadTriggerEffectParam* param);
 int KYTY_SYSV_ABI PadVrControllerGetTriggerEffectStates(int left_handle, int right_handle,

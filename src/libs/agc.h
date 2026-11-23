@@ -31,7 +31,7 @@ struct Lifecycle {
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);
 
-namespace Gen5 {
+namespace Agc {
 
 struct CommandBuffer;
 struct Label;
@@ -310,9 +310,9 @@ uint32_t* KYTY_SYSV_ABI AgcAcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
                                       int32_t display_buffer_index, uint32_t flip_mode,
                                       int64_t flip_arg);
 
-} // namespace Gen5
+} // namespace Agc
 
-namespace Gen5Driver {
+namespace AgcDriver {
 
 int Initialize();
 
@@ -329,6 +329,7 @@ static_assert(offsetof(Packet, dw_num) == 0x8);
 static_assert(offsetof(Packet, flags) == 0xc);
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet);
+int KYTY_SYSV_ABI AgcDriverAgrSubmit();
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count);
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet);
@@ -348,7 +349,7 @@ int KYTY_SYSV_ABI  AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, 
 bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress();
 int KYTY_SYSV_ABI  AgcDriverRegisterDefaultOwner();
 
-} // namespace Gen5Driver
+} // namespace AgcDriver
 
 } // namespace Libs::Graphics
 

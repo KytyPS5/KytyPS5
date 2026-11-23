@@ -20,7 +20,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Hmd2", 1, "Hmd2", 1, 1);
+LIB_NAME("Hmd2", "Hmd2");
 
 namespace Hmd2 {
 
@@ -38,6 +38,7 @@ constexpr uint32_t REPROJECTION_LAYER_TYPE_VR3D  = 0x10;
 constexpr uint32_t REPROJECTION_LAYER_TYPE_VR2D  = 0x12;
 constexpr uint32_t REPROJECTION_MAX_SOURCE_COUNT = 5;
 constexpr int32_t  GAZE_TRACKING_STATUS_DISABLE  = -1;
+constexpr uint32_t VIBRATION_FREQ_MAX            = 25;
 
 struct SceHmd2InitializeParam {
 	void*   reserved0;
@@ -323,6 +324,17 @@ static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t ind
 	return HMD_HANDLE;
 }
 
+static int32_t KYTY_SYSV_ABI Hmd2SetVibration(int32_t handle, int32_t frequency) {
+	PRINT_NAME();
+	if (handle != HMD_HANDLE) {
+		return ERROR_HANDLE_INVALID;
+	}
+	// A disconnected headset accepts any frequency.
+	return Config::VrEnabled() && static_cast<uint32_t>(frequency) > VIBRATION_FREQ_MAX
+	           ? ERROR_PARAMETER_INVALID
+	           : OK;
+}
+
 static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(int64_t flip_arg) {
 	PRINT_NAME();
 	LOGF("\t flip_arg = %" PRId64 "\n", flip_arg);
@@ -476,6 +488,7 @@ LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("VVvFh51o20s", Hmd2::Hmd2ReprojectionEnableVrMode);
 	LIB_FUNC("FkQX7rjFomk", Hmd2::Hmd2ReprojectionSetTiming);
 	LIB_FUNC("f3kPeoTZnIE", Hmd2::Hmd2Open);
+	LIB_FUNC("Al4qjNREVQQ", Hmd2::Hmd2SetVibration);
 	LIB_FUNC("Ocf081WpBpA", Hmd2::Hmd2ReprojectionBeginFrame);
 	LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
 	LIB_FUNC("hA9LshbSkzw", Hmd2::Hmd2ReprojectionSetRenderConfig);

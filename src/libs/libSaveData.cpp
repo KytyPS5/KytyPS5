@@ -22,7 +22,7 @@
 
 namespace Libs {
 
-LIB_VERSION("SaveData", 1, "SaveData", 1, 1);
+LIB_NAME("SaveData", "SaveData");
 
 namespace SaveData {
 
@@ -1394,7 +1394,7 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 
 namespace LibSaveDataNative {
 
-LIB_VERSION("SaveData_native", 1, "SaveData_native", 1, 1);
+LIB_NAME("SaveData_native", "SaveData_native");
 
 LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("TywrFKCoLGY", ::Libs::SaveData::SaveDataInitialize3);

@@ -1311,7 +1311,7 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    style()->standardIcon(QStyle::SP_FileDialogContentsView), tr("View trophies..."));
 	connect(action_view_trophies, &QAction::triggered, this,
 	        &ConfigurationListWidget::ViewTrophies);
-	QAction* action_patches = menu.addAction(tr("Cheats (experimental)..."));
+	QAction* action_patches = menu.addAction(tr("Cheats and patches (experimental)..."));
 	connect(action_patches, &QAction::triggered, this,
 	        [this, item = QPointer<ConfigurationItem>(item)]() {
 		        if (item != nullptr) {

@@ -14,7 +14,7 @@
 
 namespace Libs {
 
-LIB_VERSION("VrTracker2", 1, "VrTracker2", 1, 1);
+LIB_NAME("VrTracker2", "VrTracker2");
 
 namespace VrTracker2 {
 
@@ -31,6 +31,9 @@ constexpr int32_t  DEVICE_TYPE_VR_CONTROLLER_LEFT = 2;
 constexpr uint32_t STATUS_TRACKING                = 1;
 constexpr uint32_t QUALITY_FULL                   = 9;
 constexpr uint8_t  MOTION_SENSOR_DATA_VALID       = 3; // Velocity and acceleration.
+constexpr uint32_t COORDINATE_SYSTEM_LOCAL_FLOOR  = 0;
+constexpr uint32_t COORDINATE_SYSTEM_LOCAL        = 1;
+constexpr uint32_t COORDINATE_SYSTEM_STAGE        = 2;
 
 struct SceFQuaternion {
 	float x;
@@ -131,16 +134,30 @@ static_assert(sizeof(SceVrTracker2PlayAreaBoundaryGeometryData) == 0xc08);
 
 static std::atomic<bool> g_initialized = false;
 // Handle registered for each device type.
-static std::atomic<int32_t> g_devices[DEVICE_TYPE_VR_CONTROLLER_LEFT + 1] = {-1, -1, -1};
+static std::atomic<int32_t>  g_devices[DEVICE_TYPE_VR_CONTROLLER_LEFT + 1] = {-1, -1, -1};
+static std::atomic<uint32_t> g_coordinate_system = COORDINATE_SYSTEM_LOCAL_FLOOR;
 
-// Writes a tracking-space pose moved along its own x axis by shift metres. w stays non-negative so
-// that a rotation always has one representation, whatever sign the runtime reports.
+// The tracking origin in the coordinate system: the local floor has its origin on the stage floor
+// below it, and without a stage every system is the local one.
+static Vr::VrPose OriginInCoordinateSystem() {
+	const auto system = g_coordinate_system.load();
+	const auto stage  = Vr::OpenXrGetOriginInStage();
+	if (!stage.valid || system == COORDINATE_SYSTEM_LOCAL) {
+		return {true};
+	}
+	if (system == COORDINATE_SYSTEM_LOCAL_FLOOR) {
+		return {true, {0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, stage.position[1], 0.0f}};
+	}
+	return stage;
+}
+
+// Writes a pose moved along its own x axis by shift metres. w stays non-negative so that a
+// rotation always has one representation, whatever sign the runtime reports.
 static void SetPose(SceVrTracker2PoseData& out, const Vr::VrPose& pose, float shift = 0.0f) {
-	const auto [x, y, z, w] = pose.orientation;
+	const auto moved = Vr::Compose(pose, {true, {0.0f, 0.0f, 0.0f, 1.0f}, {shift, 0.0f, 0.0f}});
+	const auto [x, y, z, w] = moved.orientation;
 	const float s           = w < 0.0f ? -1.0f : 1.0f;
-	out.position            = {pose.position[0] + shift * (1.0f - 2.0f * (y * y + z * z)),
-	                           pose.position[1] + shift * 2.0f * (x * y + w * z),
-	                           pose.position[2] + shift * 2.0f * (x * z - w * y)};
+	out.position            = {moved.position[0], moved.position[1], moved.position[2]};
 	out.orientation         = {s * x, s * y, s * z, s * w};
 }
 
@@ -206,8 +223,9 @@ static int32_t KYTY_SYSV_ABI GetResult(const SceVrTracker2GetResultParam* param,
 	result->positionQuality            = QUALITY_FULL;
 	result->orientationQuality         = QUALITY_FULL;
 	result->motionSensorDataValidFlags = MOTION_SENSOR_DATA_VALID;
+	const auto origin                  = OriginInCoordinateSystem();
 	if (type == DEVICE_TYPE_HMD) {
-		const auto pose = Vr::OpenXrGetHeadPose();
+		const auto pose = Vr::Compose(origin, Vr::OpenXrGetHeadPose());
 		auto&      hmd  = result->hmdInfo;
 		SetPose(hmd.devicePose, pose);
 		SetPose(hmd.leftEyePose, pose, -Hmd2::EYE_OFFSET_M);
@@ -216,11 +234,24 @@ static int32_t KYTY_SYSV_ABI GetResult(const SceVrTracker2GetResultParam* param,
 		hmd.gazeOriginPose = hmd.devicePose;
 		return OK;
 	}
-	auto& controller = result->vrControllerInfo;
-	SetPose(controller.devicePose,
-	        Vr::OpenXrGetController(type == DEVICE_TYPE_VR_CONTROLLER_LEFT ? 0 : 1).pose);
+	auto&      controller = result->vrControllerInfo;
+	const auto input      = Vr::OpenXrGetController(type == DEVICE_TYPE_VR_CONTROLLER_LEFT ? 0 : 1);
+	SetPose(controller.devicePose, Vr::Compose(origin, input.pose));
 	controller.lastValidVisionTimestamp = result->timestamp;
 	controller.lastValidSensorTimestamp = result->timestamp;
+	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI SetCoordinateSystem(int32_t type) {
+	PRINT_NAME();
+	LOGF("\t type = %d\n", type);
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INIT;
+	}
+	if (static_cast<uint32_t>(type) > COORDINATE_SYSTEM_STAGE) {
+		return ERROR_ARGUMENT_INVALID;
+	}
+	g_coordinate_system.store(type);
 	return OK;
 }
 
@@ -245,6 +276,7 @@ LIB_DEFINE(InitVrTracker2_1) {
 	LIB_FUNC("6Jy73SRfG-o", VrTracker2::Initialize);
 	LIB_FUNC("Dog+g25QYjw", VrTracker2::RegisterDevice);
 	LIB_FUNC("J4Vh3VVX0iU", VrTracker2::GetResult);
+	LIB_FUNC("UVCMLmS-Eas", VrTracker2::SetCoordinateSystem);
 	LIB_FUNC("SCph4ZbkqzU", VrTracker2::GetPlayAreaBoundaryGeometry);
 }
 

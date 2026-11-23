@@ -167,6 +167,19 @@ int KYTY_SYSV_ABI PadVrControllerGetDeviceInformation(int                       
 	return OK;
 }
 
+int KYTY_SYSV_ABI PadVrControllerSetVibrationMode(int handle, int mode) {
+	PRINT_NAME();
+
+	if (!PadInitialized()) {
+		return PAD_ERROR_NOT_INITIALIZED;
+	}
+	// Modes 1 (advanced) to 5 (advanced and compatible2).
+	if (mode < 1 || mode > 5) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+	return PadVrCheckHandle(handle);
+}
+
 // True when both handles are open and name the left and the right Sense controller, in order.
 static bool PadVrHandlePair(int left_handle, int right_handle) {
 	return left_handle == PAD_HANDLE_VR_LEFT && right_handle == PAD_HANDLE_VR_LEFT + 1 &&

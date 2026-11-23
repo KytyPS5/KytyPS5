@@ -166,7 +166,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 
 namespace LibContentExport {
 
-LIB_VERSION("ContentExport", 1, "ContentExport", 1, 1);
+LIB_NAME("ContentExport", "ContentExport");
 
 namespace ContentExport {
 
@@ -216,7 +216,7 @@ LIB_DEFINE(InitContentExport_1) {
 
 namespace LibContentSearch {
 
-LIB_VERSION("ContentSearch", 1, "ContentSearch", 1, 0);
+LIB_NAME("ContentSearch", "ContentSearch");
 
 namespace ContentSearch {
 
@@ -254,7 +254,7 @@ LIB_DEFINE(InitContentSearch_1) {
 
 namespace LibContentDelete {
 
-LIB_VERSION("ContentDelete", 1, "ContentDelete", 1, 1);
+LIB_NAME("ContentDelete", "ContentDelete");
 
 namespace ContentDelete {
 

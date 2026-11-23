@@ -12132,18 +12132,26 @@ public:
       HW::Shader shaders{};
       auto &scheduler = context.GetCommandScheduler();
       scheduler.Begin(registers, user_config, shaders);
-      context.MapMemory(partly_mapped_base, size / 2);
-      ShaderRecompiler::IR::DescriptorValue value{};
-      value.dword_count = 8;
-      std::copy(words.begin(), words.end(), value.dwords.begin());
-      value.dwords[0] = static_cast<u32>(partly_mapped_base >> 8u);
-      ShaderRecompiler::IR::ImageResource resource{};
+      ShaderModule module;
+      auto &resource = module.info.info.images.emplace_back();
       resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
       resource.numeric_class = Prospero::TextureNumericClass::Float;
       resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       resource.read = true;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      auto &value = snapshot.images.emplace_back();
+      value.dword_count = 8;
+      std::copy(words.begin(), words.end(), value.dwords.begin());
+      value.dwords[0] = static_cast<u32>(partly_mapped_base >> 8u);
+      const ShaderStageRuntime runtime{&module, &snapshot};
+      PreparedBindings bindings;
       auto &executor = context.GetRenderExecutor();
-      const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      executor.PrepareBindings(runtime, bindings);
+      Require(name, "bound before map", !bindings.images[0].image_id,
+              "a texture bound before its mapping was resolved");
+      context.MapMemory(partly_mapped_base, size / 2);
+      executor.PrepareBindings(runtime, bindings);
+      const auto &binding = bindings.images[0];
       Require(name, "partly mapped texture",
               binding.image_id && context.GetTextureCache().FindTexture(binding.image_id, binding.desc),
               "a texture with a mapped byte was bound as null");

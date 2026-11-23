@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <deque>
@@ -43,6 +44,17 @@ public:
 	void Rebind(RenderExecutor& executor);
 	// Recording: uploads slots, moves resident images to their read layout and binds the array.
 	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
+	// One resident heap entry that samples `image_id`, with its base and dynamic-mip views.
+	struct DepthView {
+		ImageViewInfo             base;
+		std::vector<ImageViewInfo> mips;
+	};
+	// Views this draw's heap selects from an image, for the depth-feedback copy range.
+	void DepthViews(ImageId image_id, std::vector<DepthView>& views) const;
+	// Redirects heap elements sampling the writable depth image to its host-only copy. `range`
+	// must cover every base and mip view of a redirected element.
+	void RedirectDepth(ImageId image_id, ImageId copy_id, const ImageSubresourceRange& range,
+	                   vk::ImageAspectFlags aspects);
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -67,12 +79,15 @@ private:
 	enum class State : uint8_t { Live, Stale, Buried };
 
 	struct Element {
-		Key      key;
-		ImageId  image;
-		uint64_t serial = 0; // Image::serial of image.
-		uint32_t kind   = 0;
-		uint32_t refs   = 0; // Slots of all views that select it.
-		State    state  = State::Live;
+		Key             key;
+		TextureBinding  binding; // Last resolved descriptor, including dynamic mip views.
+		ImageId         image;
+		uint64_t        serial = 0; // Image::serial of image.
+		uint32_t        kind   = 0;
+		uint32_t        refs   = 0; // Slots of all views that select it.
+		State           state  = State::Live;
+		uint64_t        last_draw = 0; // Last draw whose commit selected it.
+		uint64_t        last_tick = 0; // Scheduler tick of that draw's command buffer.
 	};
 
 	struct Memory;
@@ -142,6 +157,7 @@ private:
 	std::vector<uint32_t>                             m_released; // Unselected after the upload.
 	std::vector<uint32_t>                             m_held; // Another extent holds the address.
 	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
+	bool                                              m_redirected = false; // Stale elements await Repoint.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
 	uint64_t                                          m_held_serial = 0; // Image::serials.
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.

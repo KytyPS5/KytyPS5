@@ -930,10 +930,12 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 	switch (type) {
 		case AUDIO_OUT_PORT_TYPE_MAIN:
 		case AUDIO_OUT_PORT_TYPE_BGM:
-		case AUDIO_OUT_PORT_TYPE_AUDIO3D:
-			state->output  = 1;
-			state->channel = (channels_num > 2 ? 2 : channels_num);
+		case AUDIO_OUT_PORT_TYPE_AUDIO3D: {
+			const auto main = AudioInternal::GetMainOutput();
+			state->output   = main.output;
+			state->channel  = std::min<int>(channels_num, main.channels);
 			break;
+		}
 		case AUDIO_OUT_PORT_TYPE_VOICE:
 		case AUDIO_OUT_PORT_TYPE_PERSONAL:
 			state->output  = 0x40;

@@ -252,6 +252,7 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr int AUDIO_OUT2_ERROR_OUT_OF_RESOURCE             = -2144960510; /* 0x80268002 */
 static constexpr int AUDIO_OUT2_ERROR_INVALID_PORT                = -2144960503; /* 0x80268009 */
+static constexpr int AUDIO_OUT2_ERROR_INVALID_POINTER             = -2144960500; /* 0x8026800C */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
@@ -261,6 +262,7 @@ static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_DEFAULT = 0x01010001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_COMPRESSOR_V2      = 0x01020001;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_STRUCT_ID_LIMITER_DEFAULT    = 0x01010003;
+static constexpr uint32_t AUDIO_OUT2_GET_SPEAKER_INFO_FLAG_FOLLOW_HEADPHONE_CONNECT = 1;
 
 static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHandle ctx) {
 	for (auto& state: g_audioout2_contexts) {
@@ -905,7 +907,16 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 
 	g_audioout2_state_mutex.Lock();
 	if (auto* port_state = audioout2_find_port_locked(port); port_state != nullptr) {
+		const auto type     = audioout2_port_type_to_audio_out_type(port_state->port_type);
 		state->num_channels = audioout2_data_format_channels(port_state->data_format);
+		// Main-route ports report the output's channels, channel ports at most their own.
+		if (type == AUDIO_OUT_PORT_TYPE_MAIN || type == AUDIO_OUT_PORT_TYPE_BGM) {
+			const auto main     = AudioInternal::GetMainOutput();
+			state->output       = main.output;
+			state->num_channels = audioout2_port_type_is_object(port_state->port_type)
+			                          ? main.channels
+			                          : std::min(state->num_channels, main.channels);
+		}
 	}
 	g_audioout2_state_mutex.Unlock();
 
@@ -1080,14 +1091,31 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 }
 
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
-	info->type             = 0;
-	info->available_bits   = 0x03;
-	info->flags            = 0;
-	info->speaker_angle[0] = {-30, 0};
-	info->speaker_angle[1] = {30, 0};
+	if (info == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_POINTER;
+	}
+	if (flags > AUDIO_OUT2_GET_SPEAKER_INFO_FLAG_FOLLOW_HEADPHONE_CONNECT) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	// FL, FR, C, LFE, SL, SR, BL, BR; azimuth is counterclockwise, -360 means no angle.
+	static constexpr std::array<AudioOut2SpeakerAngle, 8> ANGLES {
+	    {{30, 0}, {-30, 0}, {0, 0}, {-360, -360}, {90, 0}, {-90, 0}, {135, 0}, {-135, 0}}};
 
+	const auto output = Config::GetAudioOutput();
+	const auto main   = AudioInternal::GetMainOutput();
+	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
+	// Without the flag, headphones report the HDMI device.
+	if (output != Config::AudioOutput::Headphones || flags != 0) {
+		info->type = static_cast<uint8_t>(output);
+	}
+	info->available_bits = (1u << main.channels) - 1;
+	for (uint32_t i = 0; i < std::size(info->speaker_angle); i++) {
+		info->speaker_angle[i] = i < main.channels ? ANGLES[i] : AudioOut2SpeakerAngle {-360, -360};
+	}
+	if (info->type == 3) {
+		info->speaker_angle[0] = {90, 0};
+		info->speaker_angle[1] = {-90, 0};
+	}
 	return OK;
 }
 

@@ -114,7 +114,6 @@ uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
-bool                  PthreadHasAnyPendingSignal(Pthread thread);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -207,6 +206,7 @@ uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency();
+int KYTY_SYSV_ABI      KernelGetProsperoCompiledSdkVersion(uint32_t* version);
 
 } // namespace LibKernel
 
@@ -290,8 +290,6 @@ int KYTY_SYSV_ABI   pthread_mutexattr_init(LibKernel::PthreadMutexattr* attr);
 int KYTY_SYSV_ABI   pthread_mutexattr_settype(LibKernel::PthreadMutexattr* attr, int type);
 int KYTY_SYSV_ABI   pthread_mutexattr_setprotocol(LibKernel::PthreadMutexattr* attr, int protocol);
 int KYTY_SYSV_ABI   pthread_mutexattr_destroy(LibKernel::PthreadMutexattr* attr);
-int KYTY_SYSV_ABI   pthread_getstack(const LibKernel::PthreadAttr* __restrict attr,
-                                     void** __restrict stack_addr, size_t* __restrict stack_size);
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence);
 
 } // namespace Posix

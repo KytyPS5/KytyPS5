@@ -144,8 +144,8 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
-	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	// process the preceding graphics frame. The first point returns immediately.
+	m_suspend_point_ready.acquire();
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -282,7 +282,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	}
 }
 
-void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
+void CommandProcessor::WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
@@ -295,12 +295,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		case 6: break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
-	if (dw_num == 0) {
+
+	// A GDS destination is a 16-bit DWORD offset.
+	if (dst_sel == 6) {
+		for (uint32_t i = 0; i < dw_num; i++, dst += !write_one_address) {
+			m_renderer.GetBufferCache().FillBuffer((dst & 0xffffu) * 4u, 4u, src[i], true);
+		}
 		return;
 	}
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
+	auto* output = reinterpret_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
@@ -346,7 +351,7 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
-	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	if (num_bytes == 0) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
@@ -407,6 +412,10 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
+	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GPU: command processor assigned to the core of logical processor {}.\n", processor));
+	}
 
 	for (;;) {
 		Submission                   submission;
@@ -521,10 +530,11 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
+			// Like completion labels, the point has executed once the CP has submitted every
+			// packet before it, without waiting for the host GPU.
+			m_suspend_point_ready.release();
 			break;
 	}
 
@@ -621,6 +631,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
+		if (!g_cp_op_keeps_draw_window[opcode]) {
+			m_renderer.GetBufferCache().EndDrawWindow();
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);

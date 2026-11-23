@@ -11,13 +11,16 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -159,12 +162,10 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
-static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
+static void ShaderApplyAttribSemantics(ShaderVertexInputInfo&          info,
                                        std::span<const ShaderSemantic> input_semantics,
-                                       const uint32_t* attrib, const uint32_t* buffer) {
+                                       uint64_t attrib_address, uint64_t buffer_address) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
@@ -176,21 +177,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attrib = 0;
+		LibKernel::Memory::ReadGuestMemory(attrib_address + in.semantic * sizeof(attrib), &attrib,
+		                                   sizeof(attrib));
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t   index       = attrib & 0x1fu;
+		auto     format      = static_cast<Prospero::VertexAttribFormat>((attrib >> 5u) & 0x1ffu);
+		uint32_t offset      = (attrib >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attrib >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
-
-		const auto* sharp = &buffer[index * 4];
-
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
 		auto& r           = info.resources[info.resources_num];
@@ -199,10 +198,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		rd.registers_num  = static_cast<int>(size);
 		rd.attr_id        = static_cast<int>(in.semantic);
 		rd.fetch_index    = fetch_index;
-		r.fields[0]       = sharp[0];
-		r.fields[1]       = sharp[1];
-		r.fields[2]       = sharp[2];
-		r.fields[3]       = sharp[3];
+		LibKernel::Memory::ReadGuestMemory(buffer_address + index * sizeof(r.fields), r.fields,
+		                                   sizeof(r.fields));
 		EXIT_NOT_IMPLEMENTED(r.AddTid());
 		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
@@ -308,14 +305,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		info.fetch_attrib_reg         = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg         = metadata.vertex_buffer_reg;
 
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
+		const auto attrib =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u);
+		const auto buffer =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u);
 
-		if (attrib == nullptr || buffer == nullptr) {
+		if (attrib == 0 || buffer == 0) {
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;
@@ -409,6 +406,24 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
+// The part of each raw buffer format a vertex module depends on: its channel count and, for
+// integer formats, its component type (Float otherwise).
+constexpr auto kVertexFetchFormats = [] {
+	std::array<uint8_t, 128> formats {};
+	for (uint32_t raw = 0; raw < formats.size(); raw++) {
+		const auto format =
+		    ShaderRecompiler::Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(raw));
+		auto type = ShaderRecompiler::Format::ComponentType::Float;
+		if (format.type == ShaderRecompiler::Format::ComponentType::Uint ||
+		    format.type == ShaderRecompiler::Format::ComponentType::Sint) {
+			type = format.type;
+		}
+		formats[raw] =
+		    static_cast<uint8_t>(format.component_count | static_cast<uint32_t>(type) << 3u);
+	}
+	return formats;
+}();
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
@@ -445,12 +460,21 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
 		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
 	}
-	key.push_back(info.tess.input_control_points);
-	if (info.tess.input_control_points != 0) {
-		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
-		                       tess.output_topology});
+	// Each tessellation stage keys only the layout fields its module depends on.
+	const auto& tess = info.tess;
+	switch (info.logical_stage) {
+		case ShaderType::Local: key.push_back(tess.ls_stride); break;
+		case ShaderType::TessellationControl:
+			key.insert(key.end(), {tess.input_control_points, tess.output_control_points,
+			                       tess.ls_stride, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain});
+			break;
+		case ShaderType::TessellationEvaluation:
+			key.insert(key.end(), {tess.output_control_points, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain, tess.partitioning,
+			                       tess.output_topology});
+			break;
+		default: break;
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -458,7 +482,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& destination = info.resources_dst[i];
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		// Swizzle, channel count and type class; the pipeline key holds the format itself.
+		key.push_back(resource.DstSelXYZW() |
+		              static_cast<uint32_t>(kVertexFetchFormats[resource.RawFormat()]) << 12u);
 	}
 }
 
@@ -516,8 +542,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

@@ -630,7 +630,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
-                             uint32_t push_data_start_dword) {
+                             IR::PushData::Window push_data) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	const auto* stage = StageName(ir.stage);
@@ -691,7 +691,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data, *options.profile,
 	                                options.emit_debug_info);
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",

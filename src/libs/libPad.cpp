@@ -10,7 +10,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Pad", 1, "Pad", 1, 1);
+LIB_NAME("Pad", "Pad");
 
 static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	PRINT_NAME();
@@ -186,7 +186,7 @@ LIB_DEFINE(InitPad_1) {
 
 namespace LibMouse {
 
-LIB_VERSION("Mouse", 1, "Mouse", 1, 1);
+LIB_NAME("Mouse", "Mouse");
 
 namespace Mouse {
 
@@ -272,7 +272,7 @@ LIB_DEFINE(InitMouse_1) {
 
 namespace LibKeyboard {
 
-LIB_VERSION("Keyboard", 1, "Keyboard", 1, 1);
+LIB_NAME("Keyboard", "Keyboard");
 
 namespace Keyboard {
 

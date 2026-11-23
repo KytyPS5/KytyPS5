@@ -96,6 +96,20 @@
             <item row="0" column="1">
              <widget class="QComboBox" name="comboBox_audio_input_device"/>
             </item>
+            <item row="1" column="0">
+             <widget class="QLabel" name="label_audio_output">
+              <property name="text"><string>Output:</string></property>
+             </widget>
+            </item>
+            <item row="1" column="1">
+             <widget class="QComboBox" name="comboBox_audio_output">
+              <property name="toolTip"><string>Audio device games see: TV, AV amplifier (7.1), sound bar (5.1) or headphones.</string></property>
+              <item><property name="text"><string>TV</string></property></item>
+              <item><property name="text"><string>AV Amplifier</string></property></item>
+              <item><property name="text"><string>Sound Bar</string></property></item>
+              <item><property name="text"><string>Headphones</string></property></item>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>

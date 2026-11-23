@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpu_format.h"
+
+#include <bit>
 
 namespace Libs::Graphics {
 
@@ -95,7 +98,19 @@ struct TileSurfaceLayout {
 
 bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
                         TileBlockLayout& layout);
-bool TileGetTextureElementLayout(Prospero::BufferFormat format, TileTextureElementLayout& layout);
+// Inline, so callers keep the layout in registers instead of reloading it from memory.
+inline bool TileGetTextureElementLayout(Prospero::BufferFormat format,
+                                        TileTextureElementLayout& layout) {
+	if (const auto bytes = Prospero::NumBytesPerElement(format); std::has_single_bit(bytes)) {
+		layout = {bytes, 1, 1};
+		return true;
+	}
+	if (const auto bytes = Prospero::BlockCompressedBytesPerBlock(format); bytes != 0) {
+		layout = {bytes, 4, 4};
+		return true;
+	}
+	return false;
+}
 bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode tile, bool volume,
                                TileTextureBlockLayout& layout);
 // mips receives the description.levels levels of one block slice.

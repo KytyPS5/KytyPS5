@@ -71,13 +71,13 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 		EXPECT_EQ(mode, test.expected ? 3 : 2);
 		EXPECT_EQ(submode, 0);
 		uint8_t graphics_mode = 0xff;
-		Libs::Graphics::Gen5::AgcGetIsTrinityMode(&graphics_mode);
+		Libs::Graphics::Agc::AgcGetIsTrinityMode(&graphics_mode);
 		EXPECT_EQ(graphics_mode, test.expected ? 1 : 0);
 		std::array<uint32_t, 5> packet {};
 		CommandBuffer buffer {packet.data(), packet.data() + packet.size(), packet.data(),
 		                      packet.data() + packet.size(), nullptr, nullptr, 0};
-		Libs::Graphics::Gen5::AgcDcbSetUcRegistersIndirect(
-		    reinterpret_cast<Libs::Graphics::Gen5::CommandBuffer*>(&buffer), nullptr, 0);
+		Libs::Graphics::Agc::AgcDcbSetUcRegistersIndirect(
+		    reinterpret_cast<Libs::Graphics::Agc::CommandBuffer*>(&buffer), nullptr, 0);
 		EXPECT_EQ(packet[0], KYTY_PM4(5, Pm4::IT_SET_UCONFIG_REG_INDIRECT,
 		                              test.expected ? 1 : 0));
 		const auto console = testing::internal::GetCapturedStdout();

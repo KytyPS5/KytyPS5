@@ -22,6 +22,9 @@ extern const std::array<hw_reg_func_t, Pm4::SH_NUM>       g_hw_sh_indirect_func;
 extern const std::array<hw_reg_func_t, Pm4::UC_NUM>       g_hw_uc_indirect_func;
 extern const std::array<cp_op_parser_func_t, 256>         g_cp_op_func;
 extern const std::array<cp_op_parser_func_t, Pm4::R_NUM>  g_cp_op_custom_func;
+// Draw, state and command-buffer control packets keep the draw window; every other packet may
+// write guest memory or tell the guest CPU that earlier work ran.
+extern const std::array<bool, 256>                        g_cp_op_keeps_draw_window;
 
 uint32_t HwShSetPsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwShSetGsUserSgpr(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
@@ -66,7 +69,6 @@ uint32_t CpOpIndirectCxRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32
 uint32_t CpOpIndirectShRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndirectUcRegs(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpGetLodStats(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
-uint32_t CpOpDispatchReset(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem32(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPushMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

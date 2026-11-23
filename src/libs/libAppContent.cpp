@@ -26,7 +26,7 @@ namespace AprShared {
 void InvalidateFailedResolves();
 }
 
-LIB_VERSION("AppContent", 1, "AppContentUtil", 1, 1);
+LIB_NAME("AppContent", "AppContentUtil");
 
 namespace AppContent {
 

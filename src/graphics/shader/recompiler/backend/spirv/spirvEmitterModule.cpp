@@ -268,7 +268,7 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.memory_offset_dword += 2u;
 	}
 	bindings.push_data_start_dword =
-	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
+	    state.push_data.StartFor(bindings.ShaderDataDwords(), state.program.stage);
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||

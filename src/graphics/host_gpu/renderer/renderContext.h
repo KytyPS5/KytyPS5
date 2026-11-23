@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
+#include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/eventQueue.h"
 
 #include <memory>
@@ -51,6 +52,7 @@ public:
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	ResolveCache&       GetResolveCache() { return m_resolve_cache; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 	RayTracing*         GetRayTracing() { return m_ray_tracing.get(); } // With ray queries only.
@@ -86,6 +88,7 @@ private:
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
+	ResolveCache              m_resolve_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
 	OcclusionQueries          m_occlusion_queries;

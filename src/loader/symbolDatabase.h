@@ -27,10 +27,7 @@ struct SymbolRecord {
 struct SymbolResolve {
 	std::string name;
 	std::string library;
-	int         library_version;
 	std::string module;
-	int         module_version_major;
-	int         module_version_minor;
 	SymbolType  type;
 };
 
@@ -45,7 +42,6 @@ public:
 	[[nodiscard]] const SymbolRecord* Find(const SymbolResolve& s) const;
 	[[nodiscard]] const SymbolRecord* FindByNid(const std::string& nid, SymbolType type,
 	                                              uint64_t vaddr = 0) const;
-	[[nodiscard]] const SymbolRecord* FindByName(const std::string& name, SymbolType type) const;
 
 	void DbgDump(const std::string& folder, const std::string& file_name);
 

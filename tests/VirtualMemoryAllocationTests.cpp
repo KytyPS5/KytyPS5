@@ -93,6 +93,10 @@ namespace Libs::LibAmpr {
 void InitAmpr_1(Loader::SymbolDatabase* symbols);
 }
 
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+}
+
 namespace {
 
 using Libs::LibKernel::Memory::VirtualQueryInfo;
@@ -1825,6 +1829,36 @@ void TestFlexibleMapQueryAndWholeMunmap() {
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "whole munmap should return flexible memory to Prospero-reported budget");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAnonymousMmapUsesFlexibleMemory() {
+	using Mmap = void*(KYTY_SYSV_ABI*)(void*, size_t, int, int, int, int64_t);
+	const char*            test             = "AnonymousMmapUsesFlexibleMemory";
+	constexpr int          prot_read_write  = 0x3;
+	constexpr int          map_private_anon = 0x1002;
+	Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* symbol = symbols.FindByNid("BPE9s9vQQXo", Loader::SymbolType::Func);
+	Check(test, symbol != nullptr, "mmap does not resolve");
+	const auto mmap     = reinterpret_cast<Mmap>(symbol->vaddr);
+	const auto baseline = AvailableFlexibleMemory(test);
+
+	const auto base = reinterpret_cast<uint64_t>(
+	    mmap(nullptr, SceKernelPageSize + 1, prot_read_write, map_private_anon, -1, 0));
+	Check(test, base != UINT64_MAX, "anonymous mmap failed");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize * 2, prot_read_write, 1, 0,
+	            0, 1, "");
+	Check(test, AvailableFlexibleMemory(test) + SceKernelPageSize * 2 == baseline,
+	      "anonymous mmap should consume whole flexible pages");
+	*Libs::Posix::GetErrorAddr() = 0;
+	Check(test,
+	      mmap(nullptr, 0, prot_read_write, map_private_anon, -1, 0) == reinterpret_cast<void*>(-1) &&
+	          *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+	      "zero-length mmap should fail with EINVAL");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -3795,13 +3829,15 @@ struct AmmCommandBuffer {
 	Loader::SymbolDatabase   symbols;
 	std::array<uint64_t, 3>  header {};
 	std::array<uint32_t, 16> data {};
+	uint32_t*                buffer;
 
-	explicit AmmCommandBuffer(const char* name): test(name) {
+	explicit AmmCommandBuffer(const char* name, uint32_t* storage = nullptr)
+	    : test(name), buffer(storage != nullptr ? storage : data.data()) {
 		Libs::LibAmpr::InitAmpr_1(&symbols);
 		Find<int(KYTY_SYSV_ABI*)(void*)>("8aI7R7WaOlc")(header.data());
 		CheckOk(test,
 		        Find<int(KYTY_SYSV_ABI*)(void*, void*, uint32_t)>("N-FSPA4S3nI")(
-		            header.data(), data.data(), sizeof(data)),
+		            header.data(), buffer, sizeof(data)),
 		        "set AMM command buffer");
 	}
 	template <class Function>
@@ -3822,7 +3858,7 @@ struct AmmCommandBuffer {
 		Libs::LibKernel::Memory::TestSetGpuRangeCallback(ObserveGpuRange);
 		CheckOk(test,
 		        Find<int(KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, Result*, uint32_t*)>(
-		            "OJf3vCckPAM")(data.data(), Offset(), 0, &result, &submission),
+		            "OJf3vCckPAM")(buffer, Offset(), 0, &result, &submission),
 		        "submit AMM commands");
 		CheckOk(test, Find<int(KYTY_SYSV_ABI*)(uint32_t)>("HXymib4T8gc")(submission),
 		        "wait AMM commands");
@@ -3981,9 +4017,63 @@ void TestAmmRemapIntoPrt() {
 	      MapAutomaticMemory(old, page, SceKernelMtypeC, SceKernelProtCpuRw) ==
 	          Libs::LibKernel::KERNEL_ERROR_EAGAIN,
 	      "remapIntoPrt released the moved pages to the automatic allocator");
+
+	std::array<uint32_t, 3> unmap_record {};
+	CheckOk(test, KernelWriteUnmapToPrtCommand(unmap_record.data(), target, block, &record_size),
+	        "encode unmapToPrt");
+	Check(test,
+	      record_size == 12 &&
+	          unmap_record == std::array<uint32_t, 3> {0x228u, static_cast<uint32_t>(target >> 14),
+	                                                   static_cast<uint32_t>(block >> 14 << 5)},
+	      "unexpected unmapToPrt record");
+	AmmCommandBuffer unmap(test);
+	const auto       unmap_to_prt =
+	    unmap.Find<int(KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t)>("3A2X6OCHtnA");
+	Check(test,
+	      unmap_to_prt(unmap.header.data(), target + page / 2, block) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          unmap_to_prt(unmap.header.data(), target, 0) == Libs::LibKernel::KERNEL_ERROR_EINVAL &&
+	          unmap_to_prt(unmap.header.data(), kExtendedMemoryBase - block, block) ==
+	              Libs::LibKernel::KERNEL_ERROR_EINVAL,
+	      "unmapToPrt accepted invalid arguments");
+	CheckOk(test, unmap_to_prt(unmap.header.data(), target, block), "append unmapToPrt");
+	Check(test,
+	      unmap.Offset() == 12 &&
+	          std::equal(unmap_record.begin(), unmap_record.end(), unmap.data.begin()),
+	      "unmapToPrt did not append its three dword record");
+	CheckOk(test, unmap.Submit().result, "submit unmapToPrt");
+	Check(test, g_gpu_range_events == std::vector<GpuRangeEvent> {{false, target, block}},
+	      "unmapToPrt did not unmap the range on the GPU");
+	ExpectRange(test, Query(test, prt), prt, prt + block * 4, 0, 0, 0, 0, 0, "anon");
+	CheckOk(test, MapAutomaticMemory(old, block, SceKernelMtypeC, SceKernelProtCpuRw),
+	        "unmapToPrt kept the pages it unmapped");
+	AmmCommandBuffer again(test);
+	CheckOk(test, remap(again.header.data(), target, old, block, SceKernelProtCpuRead, all),
+	        "append remapIntoPrt after unmapToPrt");
+	CheckOk(test, again.Submit().result, "remapIntoPrt into a range unmapped to PRT");
 	CheckOk(test, UnmapAmmMemory(prt, block * 4), "AMM unmap PRT range");
 	CheckOk(test, KernelCheckedReleaseDirectMemory(physical, block),
 	        "KernelCheckedReleaseDirectMemory(donation)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// A submission runs the command buffer that owns the submitted buffer, even when that buffer
+// occupies the header storage of a command buffer that was never destroyed.
+void TestAmmSubmitReusedHeaderStorage() {
+	const char*      test  = "AmmSubmitReusedHeaderStorage";
+	uint64_t         value = 0;
+	AmmCommandBuffer abandoned(test);
+	const auto       write =
+	    abandoned.Find<int(KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint64_t, uint32_t)>(
+	        "j0+3uJMxYJY");
+	CheckOk(test, write(abandoned.header.data(), &value, 1, 0), "append abandoned writeAddress");
+
+	AmmCommandBuffer commands(test, reinterpret_cast<uint32_t*>(abandoned.header.data()));
+	CheckOk(test, write(commands.header.data(), &value, 2, 0), "append writeAddress");
+	CheckOk(test, write(commands.header.data(), &value, 3, 0), "append second writeAddress");
+	const auto result = commands.Submit();
+	Check(test, result.result == OK && result.error_offset == 0 && value == 3,
+	      "submission did not run the command buffer that owns the buffer");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6227,6 +6317,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveReplacesFragmentedFlexibleRange);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
+	RunTest(TestAnonymousMmapUsesFlexibleMemory);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestFlexibleRangeEditsCoalesce);
 	RunTest(TestPageTableStatsTrackRangeEdits);
@@ -6273,6 +6364,7 @@ int main(int argc, char** argv) {
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAmmMapAsPrt);
 	RunTest(TestAmmRemapIntoPrt);
+	RunTest(TestAmmSubmitReusedHeaderStorage);
 	RunTest(TestAutomaticMemoryFragmentedMap);
 	RunTest(TestMemoryPoolReserveInsideReservation);
 	RunTest(TestMemoryPoolAlignmentContracts);

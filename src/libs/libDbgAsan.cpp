@@ -16,7 +16,7 @@
 
 namespace Libs {
 
-LIB_VERSION("DbgAddressSanitizer", 1, "DbgAddressSanitizer", 1, 1);
+LIB_NAME("DbgAddressSanitizer", "DbgAddressSanitizer");
 
 namespace DbgAddressSanitizer {
 

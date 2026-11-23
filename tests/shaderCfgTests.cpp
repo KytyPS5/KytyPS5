@@ -144,7 +144,7 @@ struct TestCompileResult {
 TestCompileResult RecompileForTest(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
-    uint32_t push_data_start_dword = 0) {
+    ShaderRecompiler::IR::PushData::Window push_data = {}) {
   auto translated = ShaderRecompiler::TranslateProgram(code, options);
   auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -158,7 +158,7 @@ TestCompileResult RecompileForTest(
             plan, runtime, resources, specialization),
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), options, specialization, push_data);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -1177,8 +1177,7 @@ void TestNormalizedImageContracts() {
         "normalized image block extent changed");
   Check(subresource.IsCompatible(container),
         "normalized compatible image was rejected");
-  Check(subresource.MipOf(container) == 0 &&
-            subresource.SliceOf(container, 0) == 1,
+  Check(subresource.SubresourceOf(container) == ImageSubresource{0, 1},
         "PS5 mip-chain stride did not resolve the captured second array layer");
 
   auto smaller = subresource;
@@ -1186,29 +1185,29 @@ void TestNormalizedImageContracts() {
   smaller.extent = {128, 128, 1};
   smaller.pitch = 128;
   smaller.mip_layout[0] = {0, 0x10000, 128, 128};
-  Check(smaller.MipOf(container) == 1 && smaller.SliceOf(container, 1) == 0,
+  Check(smaller.SubresourceOf(container) == ImageSubresource{1, 0},
         "PS5 reversed mip ordering did not resolve the captured smaller mip");
 
   auto boundary = subresource;
   boundary.data.address = container.data.address + 99 * 0x56000 + 0x16000;
-  Check(boundary.SliceOf(container, 0) == 99,
+  Check(boundary.SubresourceOf(container) == ImageSubresource{0, 99},
         "PS5 array lookup rejected the final complete layer");
   boundary.data.address += 0x56000;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted a layer beyond the parent range");
   boundary = subresource;
   boundary.data.address += 0x1000;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted a misaligned layer address");
   boundary = subresource;
   boundary.resources.layers = 2;
   boundary.data.size *= 2;
   boundary.mip_layout[0].size *= 2;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted contiguous child layers with a different stride");
   boundary = subresource;
   boundary.mip_layout[0].pitch *= 2;
-  Check(boundary.MipOf(container) == -1,
+  Check(boundary.SubresourceOf(container).mip == -1,
         "PS5 array lookup accepted a different storage pitch");
 
   auto small_atlas = container;
@@ -1225,17 +1224,33 @@ void TestNormalizedImageContracts() {
   small_child.extent = {32, 32, 1};
   small_child.pitch = 32;
   small_child.mip_layout[0] = {0, 0x1000, 32, 32};
-  Check(small_child.MipOf(small_atlas) == 0 &&
-            small_child.SliceOf(small_atlas, 0) == 6,
+  Check(small_child.SubresourceOf(small_atlas) == ImageSubresource{0, 6},
         "PS5 array lookup doubled the captured small-atlas layer index");
   small_child.data.address = 0x23900d000;
-  Check(small_child.MipOf(small_atlas) == -1,
+  Check(small_child.SubresourceOf(small_atlas).mip == -1,
         "PS5 array lookup treated a packed tail block as the full-size mip");
+
+  // A stencil plane must lie within the container's stencil plane.
+  auto stenciled = container;
+  stenciled.stencil = {0x250000000, 100 * 0x10000};
+  auto stencil_child = subresource;
+  stencil_child.stencil = {stenciled.stencil.End() - 0x10000, 0x10000};
+  Check(stencil_child.SubresourceOf(stenciled) == ImageSubresource{0, 1},
+        "PS5 array lookup rejected a stencil plane ending with its parent");
+  Check(subresource.SubresourceOf(stenciled).mip == -1 &&
+            stencil_child.SubresourceOf(container).mip == -1,
+        "PS5 array lookup ignored a missing stencil plane");
+  auto below = stencil_child;
+  below.stencil.address = stenciled.stencil.address - 0x10000;
+  auto past = stencil_child;
+  past.stencil.address += 0x1000;
+  Check(below.SubresourceOf(stenciled).mip == -1 && past.SubresourceOf(stenciled).mip == -1,
+        "PS5 array lookup accepted a stencil plane outside its parent");
 
   auto incompatible = subresource;
   incompatible.samples = 2;
   Check(!incompatible.IsCompatible(container) &&
-            incompatible.MipOf(container) == -1,
+            incompatible.SubresourceOf(container).mip == -1,
         "sample-count mismatch was accepted as a compatible image");
 
   auto compressed = container;
@@ -1293,13 +1308,12 @@ void TestRebasedTextureMipViews() {
                 view.tiled_slice_stride == std::max<uint64_t>(0x1000, bytes) &&
                 view.DataAlignment() == std::min<uint64_t>(0x1000,
                                                std::max<uint64_t>(0x100, bytes)) &&
-                view.MipOf(chain) == static_cast<int32_t>(level) &&
-                view.SliceOf(chain, static_cast<int32_t>(level)) ==
-                    static_cast<int32_t>(layer),
+                view.SubresourceOf(chain) ==
+                    ImageSubresource{static_cast<int32_t>(level), static_cast<int32_t>(layer)},
             "rebased mip footprint/origin or parent layer stride was incorrect");
       view.UpdateSize();
       Check(view.data.size == bytes && view.mip_layout[0].size == bytes &&
-                view.MipOf(chain) == static_cast<int32_t>(level),
+                view.SubresourceOf(chain).mip == static_cast<int32_t>(level),
             "resizing a normalized view lost its compact footprint");
     }
   }
@@ -1309,19 +1323,19 @@ void TestRebasedTextureMipViews() {
             view.LinearLayout().mips[0].pitch == 32 && view.LinearSize() == 0x1000,
         "captured 16x16 view changed its padded tiling or linear transfer size");
   view.data.address += 0x800;
-  Check(view.MipOf(chain) == -1, "tail view accepted the following mip's address");
+  Check(view.SubresourceOf(chain).mip == -1, "tail view accepted the following mip's address");
   view = make_view(4, 0);
   view.mip_layout[0].pitch /= 2;
-  Check(view.MipOf(chain) == -1, "tail view accepted a different padded pitch");
+  Check(view.SubresourceOf(chain).mip == -1, "tail view accepted a different padded pitch");
   view = make_view(4, 0);
   view.resources.layers = 2;
   view.data.size *= 2;
   view.mip_layout[0].size *= 2;
-  Check(view.MipOf(chain) == -1, "tail array view ignored the parent chain stride");
+  Check(view.SubresourceOf(chain).mip == -1, "tail array view ignored the parent chain stride");
   view = make_view(4, 0);
   view.data = {chain.data.address, 0x1000};
   view.UpdateSize();
-  Check(view.MipOf(chain) == -1,
+  Check(view.SubresourceOf(chain).mip == -1,
         "full-block child ignored the parent mip's nonzero tail origin");
 
   for (uint32_t variant = 0; variant < 9; ++variant) {
@@ -1379,14 +1393,14 @@ void TestRebasedTextureMipViews() {
   Check(sparse_chain.tiled_slice_stride == 0x16000 &&
             sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
             sparse.DataAlignment() == 0x100 && sparse.LinearSize() == 0x200 &&
-            sparse.MipOf(sparse_chain) == 5 && sparse.SliceOf(sparse_chain, 5) == 6,
+            sparse.SubresourceOf(sparse_chain) == ImageSubresource{5, 6},
         "captured sparse 2x2 view lost its byte span, tail origin, or array layer");
   sparse.UpdateSize();
   Check(sparse.data.size == 0x60 && sparse.mip_layout[0].size == 0x60 &&
             sparse.DataAlignment() == 0x100,
         "repeated sparse view sizing changed its span or alignment");
   sparse.data.address -= 0x100;
-  Check(sparse.MipOf(sparse_chain) == -1,
+  Check(sparse.SubresourceOf(sparse_chain).mip == -1,
         "sparse view accepted a different mip-tail origin");
 }
 
@@ -2088,7 +2102,7 @@ void TestSopkCompareImmediateExtension() {
     }
   }
 
-  // GTA3's LUT GS exports its UV parameter only when packed primitive count > 0.
+  // This LUT GS exports its UV parameter only when packed primitive count > 0.
   for (uint32_t counts : {0x00000006u, 0x00020006u}) {
     const std::array shader = {
         EncodeSMovB32(2, 255), counts,
@@ -3004,7 +3018,6 @@ void TestNewShaderDecoderArchitecture() {
             d16_hi_write.src1.sdwa_sel == 5u,
         "DS decoder rejected the captured high-half D16 write");
 
-  // Captured from GTA V (PPSA04264) compute shader, pc 0x1598.
   const uint32_t d16_hi_byte_write_ds[] = {0xda800200u, 0x00001413u};
   Instruction d16_hi_byte_write;
   ShaderRecompiler::Decoder::DecodeInstruction(d16_hi_byte_write_ds, 0u,
@@ -4066,7 +4079,7 @@ void TestPixelAncillaryLayerInput() {
 void TestGraphicsCreateInterpolantMapping() {
   ShaderRegister regs[32] = {};
 
-  Check(Gen5::AgcCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
+  Check(Agc::AgcCreateInterpolantMapping(regs, nullptr, nullptr) == 0,
         "null pixel shader interpolant mapping failed");
   for (uint32_t i = 0; i < 32u; i++) {
     Check(regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
@@ -4076,7 +4089,7 @@ void TestGraphicsCreateInterpolantMapping() {
   }
 
   ShaderRegister native_regs[32] = {};
-  Check(Gen5::AgcCreateInterpolantMapping2(native_regs, nullptr, nullptr) == 0,
+  Check(Agc::AgcCreateInterpolantMapping2(native_regs, nullptr, nullptr) == 0,
         "native interpolant mapping identity path failed");
   for (uint32_t i = 0; i < 32u; i++) {
     Check(native_regs[i].offset == Pm4::SPI_PS_INPUT_CNTL_0 + i,
@@ -4122,7 +4135,7 @@ void TestGraphicsCreateInterpolantMapping() {
   ps.input_semantics = ps_semantics;
   ps.num_input_semantics = static_cast<uint32_t>(std::size(ps_semantics));
 
-  Check(Gen5::AgcCreateInterpolantMapping(regs, &gs, &ps) == 0,
+  Check(Agc::AgcCreateInterpolantMapping(regs, &gs, &ps) == 0,
         "shader interpolant mapping failed");
   Check(regs[0].value == 0x00000005u,
         "matched interpolant mapping did not use GS hardware mapping");
@@ -4135,7 +4148,7 @@ void TestGraphicsCreateInterpolantMapping() {
   Check(regs[6].offset == Pm4::SPI_PS_INPUT_CNTL_0 + 6u && regs[6].value == 6u,
         "interpolant identity tail was not filled");
 
-  Check(Gen5::AgcCreateInterpolantMapping2(native_regs, &gs, &ps) == 0,
+  Check(Agc::AgcCreateInterpolantMapping2(native_regs, &gs, &ps) == 0,
         "native shader interpolant mapping failed");
   Check(native_regs[0].value == 0x00000005u &&
             native_regs[1].value == 0x00000220u &&
@@ -6091,7 +6104,7 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   Check(!materialize(), "material selection accepted a non-buffer descriptor type");
   batch_root[11] &= ~(1u << 30u);
   Check(materialize(), "restored material batch failed to materialize");
-  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
+  auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
   CheckSpirvBinaryValidates(result.spirv);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   auto unbounded = code;
@@ -6853,7 +6866,7 @@ void TestNewShaderRecompilerPlanningOnlyLoads() {
   ir.Emit(IR::ValueOpcode::ReferenceU32, {read});
   program.shader_info_complete = false;
   IR::CollectShaderInfo(program, options.input_info);
-  const auto spirv = Spirv::EmitProgram(program, options.input_info, 0, {}, true);
+  const auto spirv = Spirv::EmitProgram(program, options.input_info, {}, {}, true);
   CheckSpirvBinaryValidates(spirv);
   Check(spirv == result.spirv,
         "planning-only loads or references emitted GPU operands/instructions");
@@ -7311,10 +7324,12 @@ void TestGraphicsComputeGetreg() {
               decoded.src0.value == (word & 0xffffu), "GETREG field or VCC destination decoded incorrectly");
     for (const auto wave : {32u, 64u}) {
       IR::Program program;
+      program.stage = ShaderType::Compute;
       program.wave_size = wave;
       IR::Block block;
-      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false, true);
+      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false);
       translator.TranslateInstruction(decoded);
+      Check(program.info.reads_queue_id, "GETREG did not record its queue read");
       bool wrote_vcc = false;
       for (const auto& inst : block) {
         Check(inst.GetOpcode() != IR::ValueOpcode::SetScc, "GETREG changed SCC");
@@ -7338,13 +7353,10 @@ void TestGraphicsComputeGetreg() {
   (void)PrepareProgram(regs, graphics);
   (void)PrepareProgram(regs, async);
   Check(!graphics.async_compute && async.async_compute &&
-            MakeStageStaticKey(graphics) != MakeStageStaticKey(async) &&
-            MakeStageStaticKey(graphics).size() == MakeStageStaticKey(async).size(),
-        "compute input reset or cache identity lost queue provenance");
+            MakeStageStaticKey(graphics) == MakeStageStaticKey(async),
+        "compute input reset lost the queue, or the queue split the cache identity");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   auto options = MakeCompileOptions(ShaderType::Compute);
-  options.input_info.compute = &async;
-  ExpectFatal([&] { (void)TranslateProgram(shader, options); }, "async GETREG used graphics constants");
   auto vertex = MakeCompileOptions(ShaderType::Vertex);
   ExpectFatal([&] { (void)TranslateProgram(shader, vertex); }, "vertex GETREG used compute constants");
   options.input_info.compute = &graphics;
@@ -7695,7 +7707,7 @@ void TestMeshExportStorage() {
     options.back_code = split ? std::span{back} : std::span<const uint32_t>{};
     const auto result = RecompileForTest(
         split ? std::span{front} : std::span<const uint32_t>{monolithic},
-        options, push_data_start);
+        options, {.begin = push_data_start});
     CheckSpirvBinaryValidates(result.spirv);
     const auto &layout = result.program.bindings;
     Check(layout.UsesPushData() == (push_data_start == PushData::MeshDrawDwordCount) &&
@@ -10495,7 +10507,7 @@ void TestAutomaticObjectPrimitiveId() {
             PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
         "graphics draw data reserved an incorrect prefix");
   for (const uint32_t start : {prefix, PushData::DwordCount}) {
-    const auto result = RecompileForTest(shader, options, start);
+    const auto result = RecompileForTest(shader, options, {.begin = start});
     Check(result.program.bindings.UsesPushData() == (start == prefix),
           "object ID changed shader-data push/spill selection");
     Check(std::ranges::any_of(result.program.info.outputs, [](const StageOutput& output) {
@@ -10512,7 +10524,7 @@ void TestAutomaticObjectPrimitiveId() {
   }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   pixel.target_shader_mask = 0xf0000000u;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options, prefix); },
+  ExpectFatal([&] { (void)RecompileForTest(shader, options, {.begin = prefix}); },
               "automatic RT7 silently overlapped an explicit MRT7 export");
 #endif
 }
@@ -11049,7 +11061,7 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   const auto bindings = result.program.bindings;
   result.program.bindings = {};
   result.program.info.buffers[0].descriptor_index = UINT32_MAX;
-  Check(ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info, 0, {}, true) ==
+  Check(ShaderRecompiler::Spirv::EmitProgram(result.program, options.input_info, {}, {}, true) ==
                 result.spirv &&
             result.program.bindings == bindings &&
             result.program.info.buffers[0].descriptor_index == 0,
@@ -11180,7 +11192,7 @@ void TestTypedDescriptorRealWideMoveTranslation() {
 
 void TestComputeImageFill() {
   using namespace ShaderRecompiler::IR;
-  // Captured GTA3 stencil clear: one scalar load and one IMAGE_STORE, with
+  // A stencil clear: one scalar load and one IMAGE_STORE, with
   // x/y = local + 8 * group and array layer = group.z.
   const uint32_t shader[] = {
       0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u,
@@ -12631,36 +12643,40 @@ void TestGraphicsPushConstantPlacement() {
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
 
-  constexpr uint32_t PushDataStart = 7;
-  auto placed =
-      RecompileForTest(shader, options, PushDataStart);
+  using ShaderRecompiler::IR::PushData;
+  auto placed = RecompileForTest(shader, options, {.begin = 7});
   Check(placed.program.bindings.UsesPushData() &&
-            placed.program.bindings.push_data_start_dword == PushDataStart &&
+            placed.program.bindings.push_data_start_dword == 28 &&
             placed.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 0,
-        "pixel shader did not use its assigned shared push-data position");
+        "pixel shader data did not take the end of the push space");
   Check(SpirvHasMemberDecorationValue(placed.spirv, OffsetDecoration, 0),
         "SPIR-V push-data block did not use the canonical zero base");
   CheckSpirvBinaryValidates(placed.spirv);
+  PushData::Window window{.begin = 7};
+  placed.program.bindings.AdvancePushData(window, ShaderType::Pixel);
+  Check(window.StartFor(21, ShaderType::Vertex) == 7 &&
+            window.StartFor(22, ShaderType::Vertex) == PushData::NoStart,
+        "pixel shader data moved the vertex stages' start or let them overlap it");
 
-  auto exact = RecompileForTest(shader, options, 28);
+  auto exact = RecompileForTest(shader, options, {.begin = 28});
   Check(exact.program.bindings.UsesPushData() &&
             exact.program.bindings.push_data_start_dword == 28 &&
             exact.program.bindings.ShaderDataDwords() == 4,
         "exact-fit shader data did not use the remaining push space");
-  uint32_t cursor = 28;
-  exact.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 32, "exact-fit shader data advanced the cursor incorrectly");
+  window = {.begin = 28};
+  exact.program.bindings.AdvancePushData(window, ShaderType::Pixel);
+  Check(window.begin == 28 && window.end == 28, "exact-fit shader data left push space free");
   CheckSpirvBinaryValidates(exact.spirv);
 
-  auto spill = RecompileForTest(shader, options, 29);
-  auto full = RecompileForTest(shader, options, 32);
+  auto spill = RecompileForTest(shader, options, {.begin = 29});
+  auto full = RecompileForTest(shader, options, {.begin = 32});
   Check(!spill.program.bindings.UsesPushData() &&
             spill.program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] == 1 &&
             spill.program.bindings == full.program.bindings && spill.spirv == full.spirv,
         "insufficient push space did not produce canonical storage-backed data");
-  cursor = 29;
-  spill.program.bindings.AdvancePushData(cursor);
-  Check(cursor == 29, "spilled shader data consumed push space");
+  window = {.begin = 29};
+  spill.program.bindings.AdvancePushData(window, ShaderType::Pixel);
+  Check(window.begin == 29 && window.end == 32, "spilled shader data consumed push space");
   CheckSpirvBinaryValidates(spill.spirv);
 }
 
@@ -13226,7 +13242,7 @@ void CheckSpirvBlockSourceMapping(TestCompileResult &result) {
             SpirvInstructionOpcodeCount(plain, spv::OpName) == 0,
         "default emission unexpectedly contains debug info");
   const auto mapped =
-      Spirv::EmitProgram(result.program, options.input_info, 0, {}, true);
+      Spirv::EmitProgram(result.program, options.input_info, {}, {}, true);
   Check(SpirvInstructionOpcodeCount(mapped, spv::OpName) != 0,
         "debug emission omitted names");
   CheckSpirvBinaryValidates(mapped);

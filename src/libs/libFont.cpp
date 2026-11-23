@@ -50,7 +50,7 @@ const uint8_t* avpriv_vga16_font_get(void);
 
 namespace Libs {
 
-LIB_VERSION("Font", 1, "Font", 1, 1);
+LIB_NAME("Font", "Font");
 namespace Font {
 
 using FontLibrarySelection      = void*;

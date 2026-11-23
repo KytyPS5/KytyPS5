@@ -167,15 +167,11 @@ else()
 	target_compile_options(imgui PRIVATE -w)
 endif()
 
-set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
 set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
 set(SPIRV-Headers_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Headers" CACHE PATH "" FORCE)
-add_subdirectory(SPIRV-Tools)
-
-add_library(spirv-tools ALIAS SPIRV-Tools-static)
-add_library(spirv-tools-opt ALIAS SPIRV-Tools-opt)
+add_subdirectory(SPIRV-Tools EXCLUDE_FROM_ALL)
 
 add_subdirectory(xxHash/build/cmake)
 

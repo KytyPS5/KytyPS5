@@ -7,7 +7,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <memory>
 
 namespace {
 
@@ -39,17 +38,6 @@ bool RejectSpecializationRead(void *userdata, uint64_t, std::span<uint32_t>) {
   return false;
 }
 
-Libs::Graphics::ShaderRecompiler::IR::Block &
-AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto block = std::make_unique<Block>();
-  auto *result = block.get();
-  program.blocks.push_back(result);
-  result->id = static_cast<uint32_t>(program.blocks.size() - 1u);
-  program.block_storage.push_back(std::move(block));
-  return *result;
-}
-
 // Lists one extra source per block and walks the plan: each source's activity is its block's reachability.
 std::vector<uint8_t> ReachedBlocks(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
                                    const Libs::Graphics::ShaderRecompiler::IR::SrtRuntime &runtime) {
@@ -66,39 +54,6 @@ std::vector<uint8_t> ReachedBlocks(Libs::Graphics::ShaderRecompiler::IR::Resourc
   for (uint32_t block = 0; block < plan.control_flow.size(); ++block)
     reached.push_back(WalkedActive(plan, first + block));
   return reached;
-}
-
-Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
-  using namespace Libs::Graphics::ShaderRecompiler::IR;
-  Program program;
-  program.stage = Libs::Graphics::ShaderType::Compute;
-  program.srt_plan_complete = true;
-  program.resource_tracking_complete = true;
-  auto &value_block = AddValueBlock(program);
-
-  MemoryInfo memory;
-  memory.kind = ResourceKind::ScalarAddress;
-  memory.planning_only = true;
-  program.memory_info.push_back(memory);
-  const auto low = Value(static_cast<uint32_t>(address));
-  const auto high = Value(static_cast<uint32_t>(address >> 32u));
-  auto &handle =
-      value_block.AppendNewInst(ValueOpcode::GetAddressResource, {low, high});
-  auto &raw = value_block.AppendNewInst(
-      ValueOpcode::LoadAddressU32,
-      {Value(&handle), Value(0u), Value(0u), Value(true)});
-  raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
-  program.srt_reads.push_back({Value(&raw), 0});
-
-  auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
-  auto &flat = value_block.AppendNewInst(ValueOpcode::ReadConst,
-                                         {Value(&srt), Value(0u)});
-  DescriptorSource source;
-  source.dwords[0] = Value(&flat);
-  source.dwords[1] = Value(0u);
-  source.dword_count = 2;
-  program.descriptor_sources.push_back(source);
-  return program;
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {

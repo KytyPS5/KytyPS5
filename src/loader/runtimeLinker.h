@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/hostException.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "loader/symbolDatabase.h"
@@ -12,6 +13,9 @@
 #include <vector>
 
 namespace Loader {
+
+// The emulator's host exception handler: emulated instructions, walker loads, GPU-tracked pages.
+bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info);
 
 struct EntryParams {
 	int         argc;

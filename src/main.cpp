@@ -36,6 +36,8 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --audio-output <value>              Report TV, AVReceiver (7.1), SoundBar (5.1),\n"
+	         "                                      or Headphones to games. Default: TV.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
@@ -352,6 +354,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--mic") {
 			options.config.audio_input_device = value;
+		} else if (arg == "--audio-output") {
+			if (!ParseEnum(value, options.config.audio_output)) {
+				::printf("invalid audio output: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--controller-color") {
 			Config::ControllerColor color {};
 			if (!ParseControllerColor(value, color)) {

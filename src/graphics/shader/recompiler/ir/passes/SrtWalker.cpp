@@ -1015,7 +1015,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 		}
-		// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+		// Every guest load is mov eax, [r10] (41 8b 02), which the fault handler completes.
 		c.mov(c.eax, c.dword[c.r10]);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);

@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "libs/audio.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
@@ -37,6 +38,7 @@ bool                              g_block_outputs = false;
 std::vector<int>                  g_blocked_output;
 std::atomic_uint64_t              g_process_time {0};
 std::atomic_bool                  g_process_time_frozen {false};
+uint32_t                          g_sdk_version = 0x09000000;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -76,6 +78,18 @@ struct PortState {
 	uint64_t reserved[6];
 };
 
+using Angle = std::array<int16_t, 2>;
+
+struct SpeakerInfo {
+	uint8_t               type;
+	uint8_t               pad1;
+	int16_t               pad2;
+	uint32_t              available_bits;
+	uint32_t              flags;
+	uint32_t              pad3;
+	std::array<Angle, 16> angles;
+};
+
 struct Attribute {
 	uint32_t    attribute_id;
 	int32_t     reserved;
@@ -97,6 +111,10 @@ const auto* AsParam(const ContextParam* param) {
 
 auto* AsState(PortState* state) {
 	return reinterpret_cast<AudioOut2::AudioOut2PortState*>(state);
+}
+
+auto* AsInfo(SpeakerInfo* info) {
+	return reinterpret_cast<AudioOut2::AudioOut2SpeakerInfo*>(info);
 }
 
 const auto* AsAttribute(const Attribute* attribute) {
@@ -133,6 +151,7 @@ AudioOut2::AudioOut2PortHandle CreatePort(AudioOut2::AudioOut2ContextHandle cont
 void TestUserSupportedAttributes() {
 	constexpr int invalid_param = static_cast<int32_t>(0x80268001u);
 	constexpr int busy          = static_cast<int32_t>(0x80268007u);
+	constexpr int invalid_user  = static_cast<int32_t>(0x80268010u);
 	AudioOut2::AudioOut2UserHandle user = 0;
 	Check(AudioOut2::AudioOut2UserCreate(1000, nullptr) == invalid_param,
 	      "null user handle output was accepted");
@@ -141,19 +160,27 @@ void TestUserSupportedAttributes() {
 	uint32_t port_attributes    = UINT32_MAX;
 	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
 	                                                    &port_attributes) == OK &&
-	          context_attributes == 0 && port_attributes == 0x103,
-	      "user capabilities do not match implemented attributes");
+	          context_attributes == 0x13 && port_attributes == 0xe53,
+	      "user capabilities do not match the system's attributes");
+	g_sdk_version = 0x08000000;
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
+	                                                    &port_attributes) == OK &&
+	          context_attributes == 0x3 && port_attributes == 0x653,
+	      "games compiled before 9.00 saw the attributes 9.00 added");
+	g_sdk_version = 0x09000000;
 
 	context_attributes = port_attributes = UINT32_MAX;
-	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, &port_attributes) ==
-	          invalid_param &&
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, &port_attributes) == OK &&
 	          AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes, nullptr) ==
-	              invalid_param &&
-	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
-	      "null capability outputs were accepted or modified");
+	              OK &&
+	          context_attributes == 0x13 && port_attributes == 0xe53,
+	      "one null capability output was rejected or skipped the other");
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, nullptr) == invalid_param,
+	      "two null capability outputs were accepted");
+	context_attributes = port_attributes = UINT32_MAX;
 	for (const auto invalid: {AudioOut2::AudioOut2UserHandle {0}, UINTPTR_MAX}) {
 		Check(AudioOut2::AudioOut2UserGetSupportedAttributes(invalid, &context_attributes,
-		                                                    &port_attributes) == invalid_param &&
+		                                                    &port_attributes) == invalid_user &&
 		          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
 		      "invalid user capabilities succeeded or modified outputs");
 	}
@@ -169,7 +196,7 @@ void TestUserSupportedAttributes() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 	Check(AudioOut2::AudioOut2UserDestroy(user) == OK, "unused user destroy failed");
 	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
-	                                                    &port_attributes) == invalid_param &&
+	                                                    &port_attributes) == invalid_user &&
 	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX &&
 	          AudioOut2::AudioOut2UserDestroy(user) == invalid_param,
 	      "destroyed user remained valid");
@@ -569,7 +596,7 @@ void TestFloat12ChannelPortOutputsPcm() {
 	PortState state {};
 	Check(AudioOut2::AudioOut2PortGetState(port, AsState(&state)) == OK,
 	      "12-channel port state query failed");
-	Check(state.num_channels == 12, "12-channel port lost its guest channel count");
+	Check(state.num_channels == 8, "12-channel port did not report the receiver's 8 channels");
 
 	float pcm[512 * 12] {};
 	SetPcm(port, pcm);
@@ -940,6 +967,113 @@ void TestBlockedPushOnlyHoldsItsContext() {
 	AudioOut2::AudioOut2ContextDestroy(other);
 }
 
+void TestSystemState() {
+	struct SystemState {
+		float    loudness;
+		uint32_t pad;
+		uint64_t reserved[7];
+	} state;
+	std::memset(&state, 0xab, sizeof(state));
+	auto* result = reinterpret_cast<AudioOut2::AudioOut2SystemState*>(&state);
+	Check(AudioOut2::AudioOut2GetSystemState(result) == OK && state.loudness == -70.0f &&
+	          state.pad == 0xabababab && state.reserved[6] == 0xababababababababull,
+	      "system state did not write only the -70 loudness");
+	Check(AudioOut2::AudioOut2GetSystemState(nullptr) == static_cast<int32_t>(0x80268001u),
+	      "null system state was accepted");
+}
+
+void SetAudioOutput(Config::AudioOutput output) {
+	Config::ConfigOptions options;
+	options.audio_output = output;
+	Config::Load(options);
+}
+
+void TestAudioOutputs() {
+	struct Expected {
+		Config::AudioOutput output;
+		uint8_t             type;
+		uint8_t             headphone_type; // With FOLLOW_HEADPHONE_CONNECT
+		uint32_t            bits;
+		uint16_t            port_output;
+		uint8_t             channels;
+	};
+	constexpr std::array<Expected, 4> cases {{
+	    {Config::AudioOutput::TV, 0, 0, 0x3, 1, 2},
+	    {Config::AudioOutput::AVReceiver, 1, 1, 0xff, 1, 8},
+	    {Config::AudioOutput::SoundBar, 2, 2, 0x3f, 1, 6},
+	    {Config::AudioOutput::Headphones, 0, 3, 0x3, 0x40, 2},
+	}};
+	const auto context  = CreateContext(4, 1);
+	const auto stereo   = CreatePort(context, MakeParam(0x200));
+	const auto surround = CreatePort(context, MakeParam(0x800));
+	auto       param    = MakeParam(0x100);
+	param.port_type     = 0x100;
+	const auto object   = CreatePort(context, param);
+	param.port_type     = 3;
+	const auto pad      = CreatePort(context, param);
+	param.port_type     = 2;
+	const auto voice    = CreatePort(context, param);
+	param.port_type     = 4;
+	const auto personal = CreatePort(context, param);
+	param.port_type     = 5;
+	const auto aux      = CreatePort(context, param);
+	param.port_type     = 6;
+	const auto vibrator = CreatePort(context, param);
+	const auto check_port = [](AudioOut2::AudioOut2PortHandle port, uint16_t output,
+	                           uint8_t channels, int16_t volume, const char* message) {
+		PortState state {};
+		Check(AudioOut2::AudioOut2PortGetState(port, AsState(&state)) == OK &&
+		          state.output == output && state.num_channels == channels &&
+		          state.volume == volume,
+		      message);
+	};
+
+	for (const auto& expected: cases) {
+		SetAudioOutput(expected.output);
+		for (const uint32_t flags: {0u, 1u}) {
+			SpeakerInfo info {};
+			Check(AudioOut2::AudioOut2GetSpeakerInfo(AsInfo(&info), flags) == OK,
+			      "speaker info failed");
+			const auto    type  = flags != 0 ? expected.headphone_type : expected.type;
+			const int16_t front = type == 3 ? 90 : 30;
+			Check(info.type == type && info.available_bits == expected.bits && info.flags == 0,
+			      "speaker type or layout does not match the audio output");
+			Check(info.angles[0] == Angle {front, 0} &&
+			          info.angles[1] == Angle {static_cast<int16_t>(-front), 0},
+			      "front speakers are not at their default angles");
+			Check(info.angles[3] == Angle {-360, -360} && info.angles[8] == Angle {-360, -360},
+			      "LFE or an absent speaker has an angle");
+			Check((expected.bits & 0x10) == 0 || info.angles[4] == Angle {90, 0},
+			      "side left speaker is not at 90 degrees");
+		}
+		check_port(stereo, expected.port_output, 2, -1,
+		           "stereo main port state does not match the audio output");
+		check_port(surround, expected.port_output, expected.channels, -1,
+		           "8-channel main port is not limited to the output's channels");
+		check_port(object, expected.port_output, expected.channels, -1,
+		           "object port does not report the output's channels");
+		check_port(pad, 4, 1, 127, "pad speaker port is not on the controller");
+		check_port(vibrator, 4, 1, -1, "vibration port is not on the controller");
+		check_port(voice, expected.port_output, 1, -1, "voice port did not follow the main output");
+		check_port(aux, 1, 1, -1, "aux port is not on the primary output");
+		// Personal ports play only on headphones without mix-to-main.
+		const bool headphones = expected.port_output == 0x40;
+		check_port(personal, headphones ? 0x40 : 0, headphones ? 1 : 0, -1,
+		           "personal port state does not match the audio output");
+	}
+
+	Check(AudioOut2::AudioOut2GetSpeakerInfo(nullptr, 0) == static_cast<int32_t>(0x8026800Cu),
+	      "null speaker info was accepted");
+	SpeakerInfo info {};
+	Check(AudioOut2::AudioOut2GetSpeakerInfo(AsInfo(&info), 2) ==
+	          static_cast<int32_t>(0x80268001u),
+	      "unknown speaker info flags were accepted");
+	for (const auto port: {stereo, surround, object, pad, voice, personal, aux, vibrator}) {
+		AudioOut2::AudioOut2PortDestroy(port);
+	}
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -1010,9 +1144,17 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 	return g_process_time_frozen ? g_process_time.load() : g_process_time.fetch_add(1000);
 }
 
+int KYTY_SYSV_ABI KernelGetProsperoCompiledSdkVersion(uint32_t* version) {
+	*version = g_sdk_version;
+	return OK;
+}
+
 } // namespace Libs::LibKernel
 
 int main() {
+	Config::Initialize();
+	// The other cases read 8-channel port states, which a 7.1 receiver reports unclamped.
+	SetAudioOutput(Config::AudioOutput::AVReceiver);
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
 	TestUserSupportedAttributes();
 	TestSlotReuse();
@@ -1035,6 +1177,8 @@ int main() {
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
 	TestBlockedPushOnlyHoldsItsContext();
+	TestAudioOutputs();
+	TestSystemState();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

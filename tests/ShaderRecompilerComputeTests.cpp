@@ -66,6 +66,7 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
@@ -329,9 +330,6 @@ struct ImageHeapTestAccess {
     return heap.m_memories.back()->dirty_pages.back() != 0u;
   }
 };
-
-// Guest faults the GPU fault route handled.
-std::atomic<uint64_t> g_handled_gpu_faults{0};
 
 struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
@@ -664,8 +662,13 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
-                                       RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(buffer, color, slot);
+                                       RenderColorInfo &color, uint32_t slot,
+                                       bool exact_format = false) {
+    executor.ResolveRenderColorTarget(buffer, color, slot, false, exact_format);
+  }
+
+  static void SetLodStats(RenderExecutor &executor, bool enabled) {
+    executor.m_lod_stats = enabled;
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -2952,6 +2955,356 @@ public:
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
   }
 
+  void CheckStreamCopyWindow() {
+    constexpr const char *name = "StreamCopyWindow";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t range = 0x100;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "stream window allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "stream window mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
+      auto &scheduler = context.GetCommandScheduler();
+      // The guest writes `value` and a draw binds the range read-only: the copy's stream offset
+      // and first word.
+      const auto bind = [&](uint32_t value, uint64_t bytes = range) {
+        std::fill_n(reinterpret_cast<uint32_t *>(base), range / sizeof(uint32_t), value);
+        const auto [buffer, offset] = cache.ObtainBuffer(base, bytes, false);
+        Require(name, "stream copy", buffer == &stream,
+                "a CPU-written read-only range was not copied to the stream buffer");
+        uint32_t word = 0;
+        std::memcpy(&word, stream.Mapped().data() + offset, sizeof(word));
+        return std::pair{offset, word};
+      };
+      const auto run = [&](std::span<const uint32_t> packets) {
+        Pm4Execution execution;
+        Require(name, "packets", processor.Process(execution, packets) == Pm4ProcessResult::Complete,
+                "the command processor did not finish the packets");
+      };
+      const std::array<uint32_t, 2> nop{KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO), 0};
+      uint32_t label = 0;
+      const auto label_address = reinterpret_cast<uint64_t>(&label);
+      const std::array<uint32_t, 5> write_label{KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+          static_cast<uint32_t>(label_address), static_cast<uint32_t>(label_address >> 32u), 7};
+
+      const auto first = bind(1);
+      Require(name, "first copy", first.second == 1, "the stream copy lost the guest's bytes");
+      run(nop);
+      const auto kept = bind(2);
+      Require(name, "draw window reuse", kept == first,
+          "a later draw of the window copied the range again");
+      run(write_label);
+      const auto written = bind(3);
+      Require(name, "window end", label == 7 && written.first != first.first && written.second == 3,
+          "a draw after WRITE_DATA reused a copy made before it");
+      const auto tick = scheduler.CurrentTick();
+      const std::vector<uint8_t> filler(stream.Size() / 8 + 1);
+      (void)stream.Copy(filler.data(), filler.size());
+      const auto lapped = bind(4);
+      Require(name, "ring distance", scheduler.CurrentTick() == tick &&
+          lapped.first != written.first && lapped.second == 4,
+          "a draw reused a copy made more than an eighth of a ring lap ago");
+      scheduler.Flush();
+      const auto flushed = bind(5);
+      Require(name, "tick end", flushed.first != lapped.first && flushed.second == 5,
+          "a draw of a later submission reused a copy whose ring space can be overwritten");
+      const auto narrower = bind(6, range / 2);
+      Require(name, "range key", narrower.first != flushed.first && narrower.second == 6,
+          "a narrower range reused the copy of a wider one");
+      // A live copy the GPU-written range must not reuse.
+      (void)bind(7);
+      (void)cache.ObtainBuffer(base, range, true);
+      Require(name, "GPU-written range", cache.ObtainBuffer(base, range, false).first != &stream,
+          "a range the GPU wrote was bound from a stream copy");
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "stream window release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A resolve keeps a FindImage result while ResolveCache::Reuse holds and the resolver's own
+  // inputs are unchanged. A planted stamp window marks a kept result: plain results do not
+  // compare it.
+  void CheckResolveCache() {
+    constexpr const char *name = "ResolveCache";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t kept = ~0ull;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "resolve cache allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "resolve cache mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto &resolve_cache = context.GetResolveCache();
+      auto &executor = context.GetRenderExecutor();
+      const auto linear = [&](uint64_t offset, vk::Format format, Prospero::BufferFormat guest) {
+        return MakeLinearDesc(base + offset, 0x4000, format, guest, Prospero::ImageType::kColor2D,
+                              {64, 64, 1}, 1, 4, 1);
+      };
+      const auto rgba = linear(0x10000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm);
+      const auto find = [&](TextureCache::ImageDesc desc) {
+        const auto id = cache.FindImage(desc);
+        return std::pair{id, desc.stamp};
+      };
+      const auto unrelated = [&] {
+        return TextureCacheTestAccess::InsertImage(
+            cache, linear(0x18000, vk::Format::eR8G8B8A8Unorm,
+                          Prospero::BufferFormat::k8_8_8_8UNorm).info);
+      };
+
+      const auto created = find(rgba);
+      const auto [id, stamp] = find(rgba);
+      Require(name, "direct find", created.first == id && !created.second.epoch && stamp.epoch &&
+          resolve_cache.Reuse(id, stamp), "the second lookup of the only image at a range was not current");
+      TextureCacheTestAccess::SkipFrames(cache, 3);
+      Require(name, "access tick", resolve_cache.Reuse(id, stamp) &&
+          cache.GetImage(id).tick_accessed_last == TextureCacheTestAccess::GcTick(cache),
+          "a reuse did not access the image as FindImage does");
+      Require(name, "no image", !resolve_cache.Stamp(rgba.info, 1, {}).epoch,
+          "a lookup that matched no image was stamped");
+      auto keyed = rgba.info;
+      keyed.metadata.kind = ImageMetadataKind::Cmask;
+      const bool cmask = resolve_cache.Stamp(keyed, 1, id).clear_keys;
+      keyed.metadata.kind = ImageMetadataKind::Dcc;
+      const auto dcc = resolve_cache.Stamp(keyed, 1, id);
+      Require(name, "clear keys", cmask && dcc.clear_keys,
+          "a Dcc or Cmask result did not depend on its clear keys");
+      context.GetBufferCache().EndDrawWindow();
+      const auto windowed = resolve_cache.Stamp(keyed, 1, id);
+      Require(name, "draw window", !resolve_cache.Reuse(id, dcc) && resolve_cache.Reuse(id, windowed),
+          "a clear-key result outlived its draw window");
+      scheduler.Flush();
+      Require(name, "submission", !resolve_cache.Reuse(id, windowed) && resolve_cache.Reuse(id, stamp),
+          "a clear-key result outlived its submission, or a plain one did not");
+
+      const auto other = unrelated();
+      Require(name, "register", !resolve_cache.Reuse(id, stamp), "a registered image kept the stamp current");
+      const auto refound = find(rgba).second;
+      TextureCacheTestAccess::DeleteImage(cache, other);
+      Require(name, "unregister", !resolve_cache.Reuse(id, refound),
+          "an unregistered image kept the stamp current");
+      const auto overlap = TextureCacheTestAccess::InsertImage(
+          cache, linear(0x10000, vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float).info);
+      Require(name, "two candidates", !find(rgba).second.epoch,
+          "a lookup of two images at the range was stamped");
+      TextureCacheTestAccess::DeleteImage(cache, overlap);
+
+      // Textures: the T# and the module.
+      ShaderModule module;
+      module.id = 1;
+      module.info.stage = ShaderType::Pixel;
+      auto &resource = module.info.info.images.emplace_back();
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) | (1u << 30u), 1u << 14u,
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      auto &value = snapshot.images.emplace_back();
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      const ShaderStageRuntime runtime{&module, &snapshot};
+      PreparedBindings bindings;
+      // Whether PrepareBindings kept the slot's planted result.
+      const auto texture_kept = [&] {
+        bindings.images[0].desc.stamp.window = kept;
+        RenderExecutorTestAccess::ResetBindings(executor);
+        executor.PrepareBindings(runtime, bindings);
+        return bindings.images[0].desc.stamp.window == kept;
+      };
+      executor.PrepareBindings(runtime, bindings);
+      executor.PrepareBindings(runtime, bindings);
+      Require(name, "texture hit", texture_kept() &&
+          cache.GetImage(bindings.images[0].image_id).binding.is_bound,
+          "an unchanged texture slot was resolved again or not bound");
+      value.dwords[3] ^= DstSel(4, 5, 6, 7) ^ DstSel(5, 4, 6, 7);
+      Require(name, "T# key", !texture_kept(), "a changed T# kept the slot's result");
+      module.id = 2;
+      Require(name, "module key", !texture_kept(), "another module kept the slot's result");
+      RenderExecutorTestAccess::SetLodStats(executor, true);
+      Require(name, "mip stats", !texture_kept(), "a slot was kept while mip stats count");
+      RenderExecutorTestAccess::SetLodStats(executor, false);
+      const auto texture_other = unrelated();
+      Require(name, "texture image set", !texture_kept(),
+          "a slot was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, texture_other);
+
+      // Color targets: the registers and exact_format.
+      constexpr uint64_t color = base + 0x20000;
+      registers.SetColorBase(0, {.addr = color});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+                                 .channel_type = Prospero::ChannelType::kSrgb,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 63, .width = 63});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1, .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      RenderColorInfo target{};
+      const auto resolve_color = [&](bool exact_format = false) {
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), target,
+                                                           0, exact_format);
+      };
+      // Plants a marked result of the current registers; a resolve that keeps it returns the mark.
+      const auto plant_color = [&] {
+        auto planted = target;
+        planted.desc.stamp.window = kept;
+        resolve_cache.SetColor(0, registers.GetRenderTarget(0), false, planted);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      };
+      const auto color_kept = [&](bool exact_format = false) {
+        resolve_color(exact_format);
+        return target.desc.stamp.window == kept;
+      };
+      resolve_color();
+      resolve_color();
+      RenderColorInfo probe{};
+      Require(name, "color stored",
+          resolve_cache.FindColor(0, registers.GetRenderTarget(0), false, probe),
+          "a color resolve did not keep its result");
+      plant_color();
+      Require(name, "color hit", color_kept() && cache.GetImage(target.image_id).binding.is_target,
+          "unchanged color registers were resolved again or not bound");
+      plant_color();
+      Require(name, "exact format key", !color_kept(true),
+          "an exact-format resolve kept a result found without it");
+      Require(name, "exact format stored",
+          resolve_cache.FindColor(0, registers.GetRenderTarget(0), true, probe),
+          "an exact-format resolve did not keep its result");
+      plant_color();
+      registers.SetColorBase(0, {.addr = color + 0x20000});
+      Require(name, "color registers", !color_kept(), "changed color registers kept the result");
+      registers.SetColorBase(0, {.addr = color});
+      resolve_color();
+      plant_color();
+      const auto color_other = unrelated();
+      Require(name, "color image set", !color_kept(),
+          "a color slot was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, color_other);
+
+      // Depth targets: the registers. Stencil plane records and HTile metadata change lookups.
+      HW::DepthRenderTarget depth_target{};
+      depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      depth_target.z_info.texture_compatibility =
+          Prospero::TextureCompatiblePlaneCompression::kEnable;
+      depth_target.z_info.htile_acceleration = true;
+      depth_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
+      depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      depth_target.stencil_info.texture_compatibility = Prospero::TextureCompatibleStencil::kEnable;
+      depth_target.z_read_base_addr = base + 0x90000;
+      depth_target.z_write_base_addr = base + 0x90000;
+      depth_target.stencil_read_base_addr = base + 0xa0000;
+      depth_target.stencil_write_base_addr = base + 0xa0000;
+      depth_target.htile_data_base_addr = base + 0xb0000;
+      depth_target.size.valid = true;
+      registers.SetDepthRenderTarget(depth_target);
+      HW::DepthControl depth_control{};
+      depth_control.z_enable = true;
+      depth_control.z_write_enable = true;
+      registers.SetDepthControl(depth_control);
+      registers.SetRenderControl({});
+      const auto &z = registers.GetDepthRenderTarget();
+      RenderDepthInfo depth{};
+      const auto resolve_depth = [&] {
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      };
+      const auto plant_depth = [&] {
+        auto planted = depth;
+        planted.desc.stamp.window = kept;
+        resolve_cache.SetDepth(z, planted.desc, planted.image_id);
+      };
+      const auto depth_kept = [&] {
+        resolve_depth();
+        return depth.desc.stamp.window == kept;
+      };
+      resolve_depth();
+      const auto depth_id = depth.image_id;
+      // An image at the stencil range, which AssociateStencil adopts as the plane record.
+      ImageInfo plane_info{};
+      plane_info.data = depth.desc.info.stencil;
+      plane_info.extent = depth.desc.info.extent;
+      const auto plane = TextureCacheTestAccess::InsertImage(cache, plane_info);
+      resolve_depth();
+      RenderDepthInfo depth_probe{};
+      Require(name, "depth stored", depth.image_id == depth_id &&
+          resolve_cache.FindDepth(z, depth_probe.desc, depth_probe.image_id),
+          "a depth resolve did not keep its result");
+      plant_depth();
+      Require(name, "depth hit", depth_kept() && depth.image_id == depth_id,
+          "unchanged depth registers were resolved again");
+      plant_depth();
+      depth_target.shading_rate_encoding = 1;
+      registers.SetDepthRenderTarget(depth_target);
+      Require(name, "depth registers", !depth_kept(),
+          "changed depth registers kept the result");
+      plant_depth();
+      const auto depth_other = unrelated();
+      Require(name, "depth image set", !depth_kept(),
+          "a depth target was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, depth_other);
+
+      resolve_depth();
+      const auto adopted = depth.desc.stamp;
+      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
+      Require(name, "plane record", cache.GetImage(plane).depth_id == depth_id &&
+          !resolve_cache.Reuse(depth_id, adopted) && !resolve_cache.Stamp(plane_info, 1, plane).epoch,
+          "a rewritten plane record kept the stamp current, or a lookup of one was stamped");
+      resolve_depth();
+      const auto associated = depth.desc.stamp;
+      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
+      Require(name, "plane repeat", resolve_cache.Reuse(depth_id, associated),
+          "an unchanged stencil association changed the image set");
+      (void)cache.FindDepthTarget(depth_id, depth.desc);
+      Require(name, "metadata insert", !resolve_cache.Reuse(depth_id, associated),
+          "new HTile metadata kept the stamp current");
+      resolve_depth();
+      const auto described = depth.desc.stamp;
+      (void)cache.FindDepthTarget(depth_id, depth.desc);
+      Require(name, "metadata repeat", resolve_cache.Reuse(depth_id, described),
+          "known HTile metadata changed the image set");
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "resolve cache release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckStreamBufferRing() {
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -3200,46 +3553,22 @@ public:
                                       initial_cache_ticks.second + 1},
             "a suspend point did not age both caches exactly once");
 
-    std::binary_semaphore second_entered{0};
+    // The CP executes a point once it submits the packets before it, so the
+    // next point does not wait for their native completion.
     std::binary_semaphore second_returned{0};
     std::jthread second([&] {
-      second_entered.release();
       gpu.SuspendPoint();
       second_returned.release();
     });
-    second_entered.acquire();
-    const bool second_overtook_completion =
-        second_returned.try_acquire_for(std::chrono::milliseconds(100));
-
-    uint32_t compute_value = 0;
-    std::array<uint32_t, 5> compute_commands{};
-    write(compute_commands.data(), &compute_value, 33);
-    bool host_lane_responded = false;
-    std::binary_semaphore compute_progress{0};
-    std::jthread compute([&] {
-      gpu.SubmitCompute(0x20, compute_commands);
-      gpu.SendCommandSync([&] { host_lane_responded = true; });
-      gpu.WaitForIdle();
-      compute_progress.release();
-    });
-    const bool compute_did_not_wait =
-        compute_progress.try_acquire_for(std::chrono::seconds(2));
+    const bool second_nonblocking =
+        second_returned.try_acquire_for(std::chrono::seconds(2));
     signal(1);
     second.join();
-    compute.join();
     finish();
-    Require(name, "one outstanding point", !second_overtook_completion,
-            "a second suspend point returned before the first native completion");
-    Require(name, "independent queue progress",
-            compute_did_not_wait && host_lane_responded && compute_value == 33,
-            "waiting for a previous suspend point blocked compute submissions "
-            "or the host command lane");
+    Require(name, "executed point", second_nonblocking,
+            "a second suspend point waited for native GPU completion");
     Require(name, "frame count", gpu.GetFrameNum() == 2,
             "suspend-point insertion did not advance the frame counter once");
-    Require(name, "async cache lifetime",
-            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
-                                      initial_cache_ticks.second + 2},
-            "asynchronous work aged the caches between frame boundaries");
 
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.
@@ -3291,60 +3620,55 @@ public:
     queued.join();
     gpu.Submit(after);
     release_lane.release();
+    // The stalled stream holds the queued point back, so the next point waits
+    // for it while asynchronous compute and the host command lane progress.
+    std::binary_semaphore next_returned{0};
+    std::jthread next([&] {
+      gpu.SuspendPoint();
+      next_returned.release();
+    });
+    const bool next_overtook_point =
+        next_returned.try_acquire_for(std::chrono::milliseconds(100));
+    uint32_t compute_value = 0;
+    std::array<uint32_t, 5> compute_commands{};
+    write(compute_commands.data(), &compute_value, 33);
+    gpu.SubmitCompute(0x20, compute_commands);
     bool prefix_reached = false;
     bool graphics_ordered = false;
+    bool compute_progressed = false;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(2);
     do {
       gpu.SendCommandSync([&] {
         prefix_reached = prefix == 22;
         graphics_ordered = skipped == 0 && after_reset == 0;
+        compute_progressed = compute_value == 33;
       });
       std::this_thread::yield();
-    } while (!prefix_reached && std::chrono::steady_clock::now() < deadline);
+    } while (!(prefix_reached && compute_progressed) &&
+             std::chrono::steady_clock::now() < deadline);
     std::array<uint32_t, 5> release_graphics{};
     write(release_graphics.data(), &label, 1);
     gpu.SubmitCompute(0x20, release_graphics);
+    next.join();
     finish();
+    Require(name, "one outstanding point", !next_overtook_point,
+            "a suspend point returned before the CP executed the previous one");
+    Require(name, "independent queue progress", compute_progressed,
+            "waiting for a previous suspend point blocked compute submissions "
+            "or the host command lane");
+    Require(name, "async cache lifetime",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 4,
+                                      initial_cache_ticks.second + 4},
+            "asynchronous work aged the caches between frame boundaries");
     Require(name, "graphics FIFO",
             prefix_reached && graphics_ordered && skipped == 0,
             "suspend point or later graphics overtook a stalled graphics stream");
     Require(name, "graphics reset", after_reset == 44,
             "suspend point preserved the previous frame's predicate");
 
-    // Delay the completion callback beyond the owner's shutdown when possible.
-    // Its credit must remain alive independently of the GuestGpu object.
-    std::binary_semaphore priority_entered{0};
-    std::binary_semaphore release_priority{0};
-    gpu.SendCommandSync([&] {
-      scheduler.DeferPriorityOperation([&] {
-        priority_entered.release();
-        release_priority.acquire();
-      });
-      SubmitInfo blocked;
-      blocked.AddWait(gate, 2);
-      scheduler.Flush(blocked);
-    });
-    gpu.SuspendPoint();
-    gpu.WaitForIdle();
-    std::binary_semaphore shutdown_returned{0};
-    std::jthread shutdown([&] {
-      context.ShutdownGpu();
-      shutdown_returned.release();
-    });
-    const bool shutdown_overtook_native =
-        shutdown_returned.try_acquire_for(std::chrono::milliseconds(100));
-    signal(2);
-    priority_entered.acquire();
-    if (!shutdown_overtook_native) {
-      (void)shutdown_returned.try_acquire_for(std::chrono::seconds(2));
-    }
-    release_priority.release();
-    shutdown.join();
-    scheduler.DrainPriorityOperations();
+    context.ShutdownGpu();
     m_runtime_context.device.destroySemaphore(gate, nullptr);
-    Require(name, "shutdown native completion", !shutdown_overtook_native,
-            "shutdown returned while the suspend point was still executing");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -4392,6 +4716,96 @@ public:
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
 
+    // A GPU-thread vertex table read or SRT walker load beside GPU-written
+    // bytes on their page takes the backing and leaves those bytes GPU-written.
+    constexpr uint64_t table_gpu_address = fault_base + 0xf200;
+    constexpr uint64_t table_attrib_address = fault_base + 0xf800;
+    constexpr uint64_t table_vsharp_address = fault_base + 0xf900;
+    constexpr std::array<uint32_t, 2> table_attribs{0x0u, 0x1u};
+    std::array<ShaderBufferResource, 2> table_vsharps{};
+    table_vsharps[1].UpdateAddress48(0x123450);
+    Require("GpuCommandLane", "vertex table setup",
+            LibKernel::Memory::TryWriteBacking(table_attrib_address,
+                                               table_attribs.data(),
+                                               sizeof(table_attribs)) &&
+                LibKernel::Memory::TryWriteBacking(table_vsharp_address,
+                                                   table_vsharps.data(),
+                                                   sizeof(table_vsharps)),
+            "the vertex tables could not be written");
+    static const uint32_t table_shader[] = {0xbf810000u};
+    static std::array<uint16_t,
+                      static_cast<size_t>(DirectResourceType::Last) + 1>
+        table_offsets;
+    table_offsets.fill(ILLEGAL_DIRECT_OFFSET);
+    table_offsets[static_cast<size_t>(
+        DirectResourceType::PtrVertexBufferTable)] = 0;
+    table_offsets[static_cast<size_t>(
+        DirectResourceType::PtrVertexAttribDescTable)] = 2;
+    static ShaderUserData table_user_data{
+        .direct_resource_offset = table_offsets.data(),
+        .direct_resource_count = static_cast<uint16_t>(table_offsets.size())};
+    static ShaderSemantic table_semantic{.semantic = 1, .size_in_elements = 1};
+    HW::VertexShaderInfo table_vs{};
+    table_vs.es_regs.data_addr = reinterpret_cast<uint64_t>(table_shader);
+    table_vs.gs_regs.rsrc2.user_sgpr = 4;
+    const std::array<uint64_t, 2> table_pointers{table_vsharp_address,
+                                                 table_attrib_address};
+    std::memcpy(table_vs.gs_user_sgpr.value, table_pointers.data(),
+                sizeof(table_pointers));
+    ShaderMapUserData(table_vs.es_regs.data_addr,
+                      {.user_data = &table_user_data,
+                       .input_semantics = &table_semantic,
+                       .num_input_semantics = 1,
+                       .code_size_bytes = sizeof(table_shader)});
+    bool tables_read = false;
+    bool table_gpu_kept = false;
+    bool walker_read = false;
+    bool walker_gpu_kept = false;
+    bool walker_unmapped_zero = false;
+    LibKernel::Memory::InstallGpuResources(&resources);
+    gpu.SendCommandSync([&] {
+      (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
+                                      false);
+      buffer_cache.FillBuffer(table_gpu_address, sizeof(uint32_t), 0x7ab1e5u,
+                              false);
+      ShaderVertexInputInfo input{};
+      (void)PrepareProgram(table_vs, HW::Context{}, HW::UserConfig{}, input);
+      tables_read = input.resources_num == 1 &&
+                    std::ranges::equal(input.resources[0].fields,
+                                       table_vsharps[1].fields);
+      table_gpu_kept =
+          buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      walker_read = ShaderRecompiler::IR::MaterializeResources(
+                        ShaderRecompiler::IR::ExtractResourcePlan(
+                            SrtProgram(table_attrib_address + 4)),
+                        {}, snapshot, specialization) &&
+                    snapshot.flattened_srt == std::vector{table_attribs[1]};
+      walker_gpu_kept =
+          buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+      uint32_t unmapped = 0;
+      walker_unmapped_zero =
+          !LibKernel::Memory::TryReadBacking(empty_unmap_base, &unmapped,
+                                             sizeof(unmapped)) &&
+          ShaderRecompiler::IR::MaterializeResources(
+              ShaderRecompiler::IR::ExtractResourcePlan(
+                  SrtProgram(empty_unmap_base)),
+              {}, snapshot, specialization) &&
+          snapshot.flattened_srt == std::vector{0u};
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require("GpuCommandLane", "vertex tables beside GPU-written bytes",
+            tables_read && table_gpu_kept,
+            "a vertex table read beside GPU-written bytes downloaded them or "
+            "read the wrong entries");
+    Require("GpuCommandLane", "SRT walker load beside GPU-written bytes",
+            walker_read && walker_gpu_kept,
+            "an SRT walker load beside GPU-written bytes downloaded them or "
+            "read the wrong DWORD");
+    Require("GpuCommandLane", "SRT walker load of unmapped memory",
+            walker_unmapped_zero, "an unmapped SRT walker load did not read zero");
+
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest
     // memory, and guest accesses wait for the copy; a plain rewrite or a
@@ -4612,7 +5026,9 @@ public:
       // The label landed at once. A read waits for the copies instead of
       // faulting in a loop, and so does an invalidation beside them before
       // host I/O.
-      const auto faults = g_handled_gpu_faults.load();
+      Common::DebugCounters::SetEnabled(true);
+      const auto faults =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
       std::array<uint32_t, 4> read{};
       std::atomic<bool> read_done{false};
       std::atomic<bool> invalidated{false};
@@ -4652,7 +5068,10 @@ public:
                   texture_cache.WriteBackTick(suspended_address, 1) ==
                       suspended_tick,
               "a landed copy cleared another pending write-back");
-      const auto wait_faults = g_handled_gpu_faults.load() - faults;
+      const auto wait_faults =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults) -
+          faults;
+      Common::DebugCounters::SetEnabled(false);
       const bool unsubmitted =
           resources.GetCommandScheduler().CurrentTick() == suspended_tick;
       std::array<uint32_t, 4> suspended{};
@@ -24000,22 +24419,7 @@ private:
     }
     namespace Exception = Common::HostException;
     Require("VulkanHarness", "guest fault handler",
-            Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
-              if (info.type != Exception::ExceptionType::AccessViolation ||
-                  (info.access_violation_type != Exception::AccessViolationType::Read &&
-                   info.access_violation_type != Exception::AccessViolationType::Write)) {
-                return false;
-              }
-              const auto access =
-                  info.access_violation_type == Exception::AccessViolationType::Write
-                      ? PageFaultAccess::Write : PageFaultAccess::Read;
-              if (!LibKernel::Memory::HandleGpuFault(
-                      access, info.access_violation_vaddr)) {
-                return false;
-              }
-              g_handled_gpu_faults.fetch_add(1, std::memory_order_relaxed);
-              return true;
-            }),
+            Exception::InstallHandler(Loader::KytyExceptionHandler),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
@@ -30982,12 +31386,16 @@ TestCase VectorMinMaxMed3F16Ops() {
   AppendVMovLiteral(&code, 10, 0xaaaa5555u);
   AppendVMovLiteral(&code, 11, 0x12345678u);
   AppendVMovLiteral(&code, 12, 0x77772222u);
+  AppendVMovLiteral(&code, 6, 0x00008000u); // low=-0.0h
+  AppendVMovLiteral(&code, 7, 0x00000000u); // low=+0.0h
+  AppendVMovLiteral(&code, 13, 0x55551234u);
 
   AppendVop3(&code, 0x351, 10, Vgpr(0), Vgpr(1), Vgpr(2));
   AppendVop3(&code, 0x354, 11, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0xf, false, 0,
              0x4);
   AppendVop3(&code, 0x357, 12, Vgpr(3), Vgpr(4), Vgpr(5));
-  for (u32 i = 0; i < 3; i++) {
+  AppendVop3(&code, 0x357, 13, Vgpr(6), Vgpr(7), Vgpr(6));
+  for (u32 i = 0; i < 4; i++) {
     AppendStoreVgpr(&code, 10 + i, i);
   }
   AppendEnd(&code);
@@ -30995,7 +31403,7 @@ TestCase VectorMinMaxMed3F16Ops() {
   return {"VectorMinMaxMed3F16Ops",
           code,
           {},
-          {0xaaaa3c00u, 0x48005678u, 0x77773c00u},
+          {0xaaaa3c00u, 0x48005678u, 0x77773c00u, 0x55558000u},
           {O::V_MOV_B32, O::V_MIN3_F16, O::V_MAX3_F16, O::V_MED3_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -31868,6 +32276,35 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
+// V_MOVRELS reads v[12 + M0] from the 44 candidates v12..v55 with a runtime M0; an M0 past
+// the candidates, including one of 256 or more, reads v0.
+TestCase Vop1MoveRelSourceRuntimeIndex() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Vop1MoveRelSourceRuntimeIndex";
+  test.initial = {0, 5, 31, 40, 44, 0x105};
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 0, 0x50000000u);
+  for (u32 reg = 12; reg <= 52; reg++) AppendVMovLiteral(&code, reg, 0x51000000u + reg);
+  for (u32 slot = 0; slot < test.initial.size(); slot++) {
+    AppendVMovU32(&code, 30, slot * 4u);
+    AppendBufferLoadDword(&code, 54, 30);
+    code.push_back(EncodeVop1(0x02, 8, Vgpr(54)));
+    code.push_back(EncodeSMovB32(124, 8));
+    code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
+    AppendStoreVgpr(&code, 55, slot);
+    const u32 index = test.initial[slot];
+    test.expected.push_back(index < 44u ? 0x51000000u + 12u + index : 0x50000000u);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
+                  O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // A full wave needs no entry EXEC compare; each of the six V_MOVRELS compares M0 44 times.
+  test.compute_info.threads_num[0] = 64;
+  test.ir_counts = {{" = IEqual32 ", 0}, {" = ULessThan32 ", 6 * 44}};
+  return test;
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -31882,6 +32319,9 @@ TestCase Vop1MoveRelDestination() {
   code.push_back(EncodeSop1(0x04, 126, 106));
   code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
   code.push_back(EncodeSop1(0x04, 126, 8));
+  // M0 indexes with all its bits, so 0x102 is past the candidates and writes nothing.
+  AppendSMovLiteral(&code, 124, 0x102u);
+  code.push_back(EncodeVop1(0x42, 5, InlineU32(0)));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 7, 4);
   AppendEnd(&code);
@@ -32377,22 +32817,22 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x40400000u, 0x7fc01234u, 0x40000000u, 0x40000000u},
       {0x80000000u, 0x00000000u, 0x3f800000u, 0x00000000u},
       {0x00000000u, 0x80000000u, 0xbf800000u, 0x80000000u},
-      {0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0x00000000u, 0x80000000u, 0x00000000u},
-      {0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u},
       {0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u},
-      {0xbf800000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0xbf800000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0xbf800000u, 0x00000000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0xbf800000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0x00000000u, 0xbf800000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0xbf800000u, 0x80000000u},
       {0x7fc01234u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x3f800000u, 0x40400000u, 0x40000000u, 0x40000000u},
       {0xc0400000u, 0xbf800000u, 0xc0000000u, 0xc0000000u},
       {0xff800000u, 0x7f800000u, 0x3f800000u, 0x3f800000u},
       {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
       {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
-      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
+      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0x7fc01234u},
       {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
   TestCase test;
   test.name = "VectorMed3F32NanUsesMin3Path";
@@ -32418,8 +32858,8 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
+  // Measured 13,727/32,230 words; keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 13737u : 32245u;
   return test;
 }
 
@@ -49497,6 +49937,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  AddCase(Vop1MoveRelSourceRuntimeIndex);
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -57894,6 +58335,16 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--stream-window-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStreamCopyWindow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--resolve-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResolveCache();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
     CheckStorageTextureLinearUploadLayout();
     CheckStorageTextureDepthTileUploadLayout();
@@ -58516,6 +58967,8 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckStreamCopyWindow();
+  vulkan.CheckResolveCache();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

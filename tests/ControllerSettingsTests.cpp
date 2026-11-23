@@ -659,7 +659,7 @@ void TestTriggerEffectState() {
 	check_state(2, 5, "feedback at position 0 was suppressed by a dead zone");
 	param.command[0].data[1] = 0;
 	set_effect();
-	check_state(1, 5, "zero-strength feedback reported active");
+	check_state(0, 5, "zero-strength feedback reported an effect state");
 
 	param.command[0]         = {};
 	param.command[0].mode    = 4;
@@ -707,7 +707,7 @@ void TestTriggerEffectState() {
 	check_state(7, 5, "vibration at position 0 was suppressed");
 	param.command[0].data[2] = 0;
 	set_effect();
-	check_state(6, 5, "zero-frequency vibration reported active");
+	check_state(0, 5, "zero-frequency vibration reported an effect state");
 
 	param.command[0]          = {};
 	param.command[0].mode     = 6;
@@ -720,16 +720,21 @@ void TestTriggerEffectState() {
 	check_state(7, 5, "multi-position vibration did not activate at position 9");
 	param.command[0].data[0] = 0;
 	set_effect();
-	check_state(6, 5, "zero-frequency multi-position vibration reported active");
+	check_state(0, 5, "zero-frequency multi-position vibration reported an effect state");
 
 	ResetInputState();
-	check_state(6, 3, "input reset retained a fired weapon");
+	check_state(0, 3, "input reset retained a fired weapon");
 	param.command[0].mode = 0;
 	set_effect();
 	check_state(0, 3, "off mode retained an effect state");
 	Connect(2);
 	Disconnect(1);
 	check_state(0, 0, "switching controllers retained effect states");
+	param.trigger_mask       = 3;
+	param.command[0].mode    = 4;
+	param.command[1].data[2] = 0;
+	set_effect();
+	check_state(0, 0, "forceless multi-position feedback and weapon reported effect states");
 }
 
 void TestUnreadPressSurvivesStickBurst() {

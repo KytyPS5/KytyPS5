@@ -95,6 +95,19 @@ struct OutputInfo {
 	uint32_t frame_pitch_in_bytes = 0;
 };
 
+struct ComputeMemory {
+	size_t this_size           = sizeof(ComputeMemory);
+	size_t cpu_gpu_memory_size = 0;
+	void*  cpu_gpu_memory      = nullptr;
+};
+
+struct ComputeConfig {
+	size_t   this_size             = sizeof(ComputeConfig);
+	uint16_t compute_pipe_id       = 0;
+	uint16_t compute_queue_id      = 0;
+	uint8_t  flags_and_reserved[4] = {};
+};
+
 constexpr uint32_t AVC  = 1;
 constexpr uint32_t HEVC = 974921;
 constexpr uint32_t VP9  = 2382845;
@@ -132,6 +145,24 @@ TEST(VideoDec2, FrameBufferSizeFollowsCodecAndBitDepth) {
 	EXPECT_EQ(FrameBufferSize(VP9, 0, 1090), 3547136u);
 	EXPECT_EQ(FrameBufferSize(VP9, 2, 1088), 6275072u);
 	EXPECT_EQ(FrameBufferSize(VP9, 2, 1088, &vp9_8bit), 3350528u);
+}
+
+TEST(VideoDec2, ComputeQueueTakesExactlyTheQueriedMemory) {
+	using QueryCompute  = int32_t(KYTY_SYSV_ABI*)(ComputeMemory*);
+	using AllocateQueue = int32_t(KYTY_SYSV_ABI*)(const ComputeConfig*, const ComputeMemory*, void**);
+
+	ComputeMemory memory;
+	ASSERT_EQ(Export<QueryCompute>("RnDibcGCPKw")(&memory), 0);
+	EXPECT_EQ(memory.cpu_gpu_memory_size, 0x495300u);
+
+	std::vector<uint8_t> backing(memory.cpu_gpu_memory_size);
+	memory.cpu_gpu_memory = backing.data();
+	const ComputeConfig config;
+	void*               queue    = nullptr;
+	const auto          allocate = Export<AllocateQueue>("eD+X2SmxUt4");
+	EXPECT_EQ(allocate(&config, &memory, &queue), 0);
+	memory.cpu_gpu_memory_size--;
+	EXPECT_EQ(allocate(&config, &memory, &queue), static_cast<int32_t>(0x811d0104));
 }
 
 // A 16x16 lossless HEVC Main10 frame with luma 0x123, Cb 0x234 and Cr 0x345.

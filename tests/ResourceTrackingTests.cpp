@@ -8566,6 +8566,61 @@ void TestBoundedRelativeRegisterWrites() {
   }
 }
 
+// M0 is a loop counter below 5, so the relative read's selects for M0 >= 5 and M0 >= 6 are
+// ruled out and only candidates 100 and 104 remain.
+void TestBoundedRelativeRegisterReads() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
+  auto *body = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(header);
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  body->AddBranch(header);
+  entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+  header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = body, .false_block = exit};
+  body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+  exit->terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto base = fixture.UserData(0u);
+  const auto records = fixture.UserData(2u);
+  auto &counter = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto &bound = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  auto &read = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  const auto in_range = fixture.Emit(ValueOpcode::ULessThan32,
+                                     {Value(&counter), Value(&bound)}, 0, header);
+  header->condition = fixture.Emit(ValueOpcode::ConditionRef, {in_range},
+                                   CFG::BranchCondition::VccNonZero, header);
+  const auto upper = [&](uint32_t first, Value high, Value low) {
+    const auto reached = fixture.Emit(ValueOpcode::ULessThan32,
+                                      {Value(first - 1u), Value(&counter)}, 0, body);
+    return fixture.Emit(ValueOpcode::SelectU32, {reached, high, low}, 0, body);
+  };
+  bound.AddPhiOperand(entry, Value(5u));
+  bound.AddPhiOperand(body, Value(&bound));
+  read.AddPhiOperand(entry, Value(0u));
+  read.AddPhiOperand(body, upper(6u, Value(999u),
+                                 upper(5u, Value(105u), upper(4u, Value(104u), Value(100u)))));
+  counter.AddPhiOperand(entry, Value(0u));
+  counter.AddPhiOperand(body, fixture.Emit(ValueOpcode::IAdd32,
+                                           {Value(&counter), Value(1u)}, 0, body));
+  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+      {base, Value(4u << 16u), records, Value(0x16204u)}, MemoryFlags{0, 0x3e8}, exit);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(&read), Value(true)},
+      fixture.AddMemory(memory, 0x3e8), exit);
+  fixture.PlanAndTrack();
+  const auto *select = read.Arg(1).Resolve().TryInstruction();
+  Check(select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32 &&
+            select->Arg(1).Resolve() == Value(104u) && select->Arg(2).Resolve() == Value(100u),
+        "a loop bound on M0 left an impossible relative read");
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -9368,6 +9423,7 @@ int main() {
 #endif
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
+    Run("bounded relative register reads", TestBoundedRelativeRegisterReads);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);

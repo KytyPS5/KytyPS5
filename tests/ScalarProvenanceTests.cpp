@@ -696,7 +696,7 @@ void TestCompleteWaveReduction(bool butterfly) {
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
     Endpoint, EndpointSource, CrossBlock, WrongOperation, MixedJoin, MixedRows,
-    Or, Add, SignedMin, SignedMax, And, Xor, SameHalf, DynamicEndpoint
+    Or, Add, SignedMin, SignedMax, And, Xor, SameHalf, DynamicEndpoint, Wave32SameRow
   };
   const uint32_t row_control = butterfly ? 0x160u : 0x110u;
   for (const auto test : {Case::Masked, Case::ScalarExec, Case::Wave32,
@@ -708,7 +708,7 @@ void TestCompleteWaveReduction(bool butterfly) {
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
        Case::CrossBlock, Case::WrongOperation, Case::MixedJoin, Case::MixedRows,
        Case::Or, Case::Add, Case::SignedMin, Case::SignedMax, Case::And, Case::Xor,
-       Case::SameHalf, Case::DynamicEndpoint}) {
+       Case::SameHalf, Case::DynamicEndpoint, Case::Wave32SameRow}) {
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
     const auto source = fixture.Emit(ValueOpcode::LaneId);
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
@@ -782,12 +782,13 @@ void TestCompleteWaveReduction(bool butterfly) {
     const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
     // Wave32 reads each half's row endpoint from the scan itself.
     const bool rows = test == Case::Wave32Rows || test == Case::ScalarExec ||
-                      test == Case::Wave32Maximum;
+                      test == Case::Wave32Maximum || test == Case::Wave32SameRow;
     const auto endpoints = rows ? prefix : final;
     uint32_t low_lane = butterfly ? 5u : (rows ? 15u : 31u);
     const uint32_t high_lane = butterfly ? (rows ? 24u : 56u) : (rows ? 31u : 63u);
     if (test == Case::Endpoint) low_lane = 30u;
     if (test == Case::SameHalf) low_lane = 32u;
+    if (test == Case::Wave32SameRow) low_lane = high_lane - 1u;
     const auto low = fixture.Emit(ValueOpcode::ReadLane,
         {endpoints, test == Case::DynamicEndpoint ? source : Value(low_lane)}, 0, result_block);
     const auto high = fixture.Emit(ValueOpcode::ReadLane,
@@ -808,7 +809,7 @@ void TestCompleteWaveReduction(bool butterfly) {
     ConstantPropagationPass(fixture.program.blocks, wave_size);
     const auto stats = EliminateReadLane(fixture.program, wave_size);
     // Each case that sets an operation other than UMin, except WrongOperation, matches.
-    const bool matches = test == Case::Masked || rows ||
+    const bool matches = test == Case::Masked || (rows && test != Case::Wave32SameRow) ||
                          (operation != ValueOpcode::UMin32 && test != Case::WrongOperation) ||
                          (butterfly && test == Case::Endpoint);
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,

@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cinttypes>
@@ -6257,13 +6258,15 @@ int RunFaultReportChild(const char* test, const std::filesystem::path& log_path)
 	const auto deadline = std::chrono::steady_clock::now() + FaultReportChildTimeout;
 	int        status   = 0;
 	pid_t      waited   = 0;
-	while ((waited = ::waitpid(pid, &status, WNOHANG)) == 0 &&
+	while (((waited = ::waitpid(pid, &status, WNOHANG)) == 0 ||
+	        (waited < 0 && errno == EINTR)) &&
 	       std::chrono::steady_clock::now() < deadline) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-	if (waited == 0) {
+	if (waited != pid) {
 		::kill(pid, SIGKILL);
-		::waitpid(pid, &status, 0);
+		while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+		}
 	}
 	Check(test, waited == pid, "the fault report child timed out");
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;

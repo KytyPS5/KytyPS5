@@ -4,10 +4,14 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 namespace Libs {
@@ -24,7 +28,10 @@ struct PlayGoInitParams {
 
 constexpr int      PLAYGO_ERROR_BAD_CHUNK_ID = static_cast<int>(0x80B2000Cu);
 constexpr int8_t   PLAYGO_LOCUS_LOCAL_FAST   = 3;
+constexpr uint16_t PLAYGO_CHUNK_ID_LIMIT     = 1000;
 constexpr uint32_t PLAYGO_BUFFER_SIZE        = 2u * 1024u * 1024u;
+constexpr size_t   PLAYGO_CHUNK_COUNT_OFFSET = 10;
+constexpr uint16_t PACKAGE_CHUNKS_NUM        = 2;
 
 class PlayGo: public testing::Test {
 protected:
@@ -72,7 +79,7 @@ private:
 	Loader::SymbolDatabase m_symbols;
 };
 
-TEST_F(PlayGo, PackageWithoutChunkMetadataHasOnlyChunkZeroInstalled) {
+TEST_F(PlayGo, PackageWithoutChunkMetadataListsChunkZeroAndInstallsChunksBelowTheLimit) {
 	ASSERT_EQ(OpenAndCountChunks(false), 1u);
 
 	const auto get_locus =
@@ -81,12 +88,42 @@ TEST_F(PlayGo, PackageWithoutChunkMetadataHasOnlyChunkZeroInstalled) {
 	int8_t         locus      = 0;
 	EXPECT_EQ(get_locus(1, &chunk_zero, 1, &locus), 0);
 	EXPECT_EQ(locus, PLAYGO_LOCUS_LOCAL_FAST);
-	const uint16_t chunk_one = 1;
-	EXPECT_EQ(get_locus(1, &chunk_one, 1, &locus), PLAYGO_ERROR_BAD_CHUNK_ID);
+	const uint16_t chunk_one       = 1;
+	int8_t         chunk_one_locus = 0;
+	EXPECT_EQ(get_locus(1, &chunk_one, 1, &chunk_one_locus), 0);
+	EXPECT_EQ(chunk_one_locus, PLAYGO_LOCUS_LOCAL_FAST);
+	const uint16_t first_chunk_past_limit = PLAYGO_CHUNK_ID_LIMIT;
+	EXPECT_EQ(get_locus(1, &first_chunk_past_limit, 1, &locus), PLAYGO_ERROR_BAD_CHUNK_ID);
 }
 
 TEST_F(PlayGo, PlayGoHackReportsDefaultChunksWithoutMetadata) {
 	EXPECT_EQ(OpenAndCountChunks(true), 1000u);
+}
+
+TEST_F(PlayGo, PackageWithChunkMetadataRejectsChunksPastItsTable) {
+	const auto package      = std::filesystem::temp_directory_path() / "kyty_playgo_chunk_table";
+	const auto bare_package = package / "bare";
+	std::filesystem::create_directories(bare_package);
+	std::ofstream(package / "param.json") << "{}";
+	std::ofstream(bare_package / "param.json") << "{}";
+	std::array<char, PLAYGO_CHUNK_COUNT_OFFSET + sizeof(uint16_t)> chunk_table {'p', 'l', 'g', 'o'};
+	chunk_table[PLAYGO_CHUNK_COUNT_OFFSET] = PACKAGE_CHUNKS_NUM;
+	std::ofstream(package / "playgo-chunk.dat", std::ios::binary)
+	    .write(chunk_table.data(), chunk_table.size());
+	Loader::SystemContentLoadParamSfo(package / "param.json");
+
+	EXPECT_EQ(OpenAndCountChunks(false), PACKAGE_CHUNKS_NUM);
+	const auto get_locus =
+	    Find<int(KYTY_SYSV_ABI*)(int, const uint16_t*, uint32_t, int8_t*)>("uWIYLFkkwqk");
+	const uint16_t last_chunk = PACKAGE_CHUNKS_NUM - 1;
+	int8_t         locus      = 0;
+	EXPECT_EQ(get_locus(1, &last_chunk, 1, &locus), 0);
+	EXPECT_EQ(locus, PLAYGO_LOCUS_LOCAL_FAST);
+	const uint16_t first_chunk_past_table = PACKAGE_CHUNKS_NUM;
+	EXPECT_EQ(get_locus(1, &first_chunk_past_table, 1, &locus), PLAYGO_ERROR_BAD_CHUNK_ID);
+
+	Loader::SystemContentLoadParamSfo(bare_package / "param.json");
+	std::filesystem::remove_all(package);
 }
 
 } // namespace

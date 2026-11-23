@@ -28,7 +28,8 @@ static constexpr uint32_t PLAYGO_DEFAULT_CHUNKS_NUM     = 1000;
 static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL      = 0xffffffffffffffffull;
 static constexpr uint64_t PLAYGO_SCENARIO_MASK_ALL      = 0x1full;
 
-static uint32_t g_chunks_num = 0;
+static uint32_t g_chunks_num        = 0;
+static bool     g_chunk_table_known = false;
 
 struct PlayGoInitParams {
 	const void* buf_addr;
@@ -54,7 +55,7 @@ union PlayGoOptionalChunk {
 };
 
 static bool is_valid_chunk(uint16_t chunk_id) {
-	return chunk_id < g_chunks_num;
+	return chunk_id < (g_chunk_table_known ? g_chunks_num : PLAYGO_DEFAULT_CHUNKS_NUM);
 }
 
 static bool is_valid_locus(int8_t locus) {
@@ -95,7 +96,8 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
 	// An application package always has chunk 0, which holds its file system.
-	if (!Loader::SystemContentGetChunksNum(&g_chunks_num)) {
+	g_chunk_table_known = Loader::SystemContentGetChunksNum(&g_chunks_num);
+	if (!g_chunk_table_known) {
 		g_chunks_num = Config::PlayGoHackEnabled() ? PLAYGO_DEFAULT_CHUNKS_NUM : 1;
 	}
 

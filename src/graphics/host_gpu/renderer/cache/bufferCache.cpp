@@ -98,12 +98,12 @@ void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
 }
 
-void BufferCache::Unregister(BufferId id) {
-	ChangeRegister<false>(id);
+void BufferCache::Unregister(BufferId id, bool clear_bda_table) {
+	ChangeRegister<false>(id, clear_bda_table);
 }
 
 template <bool insert>
-void BufferCache::ChangeRegister(BufferId id) {
+void BufferCache::ChangeRegister(BufferId id, bool clear_bda_table) {
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
@@ -132,8 +132,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_buffers.erase(m_buffers.find(buffer.CpuAddress()));
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		if (clear_bda_table) {
+			m_bda_pagetable_buffer.Fill(table_offset,
+			                            size_pages * sizeof(vk::DeviceAddress), 0);
+		}
 		buffer.is_deleted = true;
 	}
 }
@@ -142,8 +144,8 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
-void BufferCache::DeleteBuffer(BufferId id) {
-	Unregister(id);
+void BufferCache::DeleteBuffer(BufferId id, bool clear_bda_table) {
+	Unregister(id, clear_bda_table);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 	} else {
@@ -390,7 +392,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
-	DeleteBuffer(overlap_id);
+	DeleteBuffer(overlap_id, false);
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {

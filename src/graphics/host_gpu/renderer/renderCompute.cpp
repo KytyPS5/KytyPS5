@@ -218,10 +218,23 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 // takes from user data or scalar loads before the dispatch reads it.
 static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stage) {
 	const auto back = [&context](uint32_t low, uint32_t high) {
-		const auto base = low | uint64_t {high} << 32u;
+		const auto base  = low | uint64_t {high} << 32u;
+		uint64_t   start = 0;
+		uint64_t   size  = 0;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * BufferCache::CACHING_PAGESIZE;
-			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+			if (context.IsMapped(page, 1)) {
+				if (size == 0) {
+					start = page;
+				}
+				size = (page - start) + 1;
+			} else if (size != 0) {
+				(void)context.GetBufferCache().FindBuffer(start, size);
+				size = 0;
+			}
+		}
+		if (size != 0) {
+			(void)context.GetBufferCache().FindBuffer(start, size);
 		}
 	};
 	const auto& info = stage.module->info.info;

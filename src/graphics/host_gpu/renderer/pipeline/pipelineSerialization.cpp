@@ -43,7 +43,7 @@ struct Frame {
 
 // Changes whenever serialized shader/pipeline record layouts change.
 uint64_t BuildStamp() {
-	return uint64_t {0x4b59545953484440ull} ^
+	return uint64_t {0x4b59545953484441ull} ^
 	       (static_cast<uint64_t>(sizeof(ShaderModule)) << 1u) ^
 	       (static_cast<uint64_t>(sizeof(ShaderRecompiler::Spirv::Profile)) << 9u) ^
 	       (static_cast<uint64_t>(sizeof(GraphicsPipelineKey)) << 17u) ^

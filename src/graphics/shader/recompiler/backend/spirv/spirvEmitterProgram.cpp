@@ -47,11 +47,19 @@ struct DeferredPhiPatch {
 	DeferredPhi     phi;
 	const IR::Inst* instruction = nullptr;
 	uint32_t        half        = 0;
+	std::vector<std::pair<size_t, uint32_t>> backedge_bool_overrides;
+};
+
+struct BackedgeBoolMaterialization {
+	uint32_t half      = 0;
+	IR::Value value    = {};
+	uint32_t result_id = 0;
 };
 
 struct StructuredFunctionState {
-	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
-	std::vector<DeferredPhiPatch>                  deferred_phis;
+	std::unordered_map<const IR::Block*, uint32_t>                             block_exit_labels;
+	std::vector<DeferredPhiPatch>                                              deferred_phis;
+	std::unordered_map<const IR::Block*, std::vector<BackedgeBoolMaterialization>> backedge_bools;
 };
 
 struct DispatcherFunctionState {
@@ -469,7 +477,7 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		}
 		if (ctx.half != 0) {
 			const auto* cur_block = ctx.state.current_block;
-			bool        can_share = cur_block != nullptr;
+			bool        can_share = cur_block != nullptr && inst.Definition(ctx.half) == 0;
 			for (size_t index = 0; can_share && index < inst.NumArgs(); index++) {
 				const auto* pred = inst.PhiBlock(index);
 				if (!structured.block_exit_labels.contains(pred)) {
@@ -487,9 +495,21 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 				return;
 			}
 		}
-		structured.deferred_phis.push_back(
-		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst,
-		     ctx.half});
+		DeferredPhiPatch patch {
+		    ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst,
+		    ctx.half, {}};
+		if (inst.GetType() == IR::Type::U1) {
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				const auto* pred = inst.PhiBlock(index);
+				if (!structured.block_exit_labels.contains(pred)) {
+					const auto fresh_id = ctx.state.builder.AllocateId();
+					structured.backedge_bools[pred].push_back(
+					    {ctx.half, inst.Arg(index), fresh_id});
+					patch.backedge_bool_overrides.emplace_back(index, fresh_id);
+				}
+			}
+		}
+		structured.deferred_phis.push_back(std::move(patch));
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
@@ -550,8 +570,17 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 			if (found == structured.block_exit_labels.end()) {
 				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
-			ctx.state.builder.PatchDeferredPhi(
-			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), found->second);
+			uint32_t value_id = 0;
+			for (const auto& [override_index, override_id]: deferred.backedge_bool_overrides) {
+				if (override_index == index) {
+					value_id = override_id;
+					break;
+				}
+			}
+			if (value_id == 0) {
+				value_id = lane.Def(deferred.instruction->Arg(index));
+			}
+			ctx.state.builder.PatchDeferredPhi(deferred.phi, index, value_id, found->second);
 		}
 	}
 }
@@ -565,6 +594,15 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		if (const auto found = structured.backedge_bools.find(block);
+		    found != structured.backedge_bools.end()) {
+			const auto bool_type = TypeBool(ctx.state);
+			for (const auto& mat: found->second) {
+				auto&      lane = mat.half == 0 ? ctx : *ctx.other_half;
+				const auto val  = lane.Def(mat.value);
+				ctx.state.builder.AddFunction(spv::OpLogicalOr, bool_type, mat.result_id, val, val);
+			}
+		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
 	}

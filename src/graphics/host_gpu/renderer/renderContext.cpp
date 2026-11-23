@@ -167,13 +167,13 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool sync_dirty) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
 	m_fault_process_pending = true;
-	if (!m_buffer_cache.HasPendingBdaSync()) {
+	if (!sync_dirty || !m_buffer_cache.HasPendingBdaSync()) {
 		return;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);

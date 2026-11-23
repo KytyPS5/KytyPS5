@@ -132,7 +132,7 @@ public:
 	int                    flush_draws                 = 0;
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
-	bool                   relaxed_shader_float        = false;
+	bool                   relaxed_shader_float        = true;
 	bool                   native_rt                   = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;

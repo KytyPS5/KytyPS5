@@ -263,7 +263,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	});
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
-	if (!Log::IsSilent()) {
+	if (Config::GraphicsDebugDumpEnabled() && !Log::IsSilent()) {
 		std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
 		            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
 		            m_compiled[static_cast<size_t>(ShaderType::Pixel)],

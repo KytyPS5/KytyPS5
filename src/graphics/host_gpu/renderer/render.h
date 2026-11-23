@@ -97,6 +97,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;

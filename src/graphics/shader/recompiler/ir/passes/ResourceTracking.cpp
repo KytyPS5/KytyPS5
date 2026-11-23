@@ -1483,7 +1483,10 @@ private:
 		                                      const Block* header) {
 			if (ThreadBitOfLiveMask(incoming)) return true;
 			const auto accepts = [&](const EdgePredicate& edge) {
-				return edge.positive && Implies(edge.condition, incoming);
+				if (edge.positive) return Implies(edge.condition, incoming);
+				const auto* negated = SimplifyGuard(incoming).TryInstruction();
+				return negated != nullptr && negated->GetOpcode() == ValueOpcode::LogicalNot &&
+				       Implies(negated->Arg(0), edge.condition);
 			};
 			const auto edge = ConditionalEdge(from, to);
 			if (edge && accepts(*edge)) return true;
@@ -1527,13 +1530,15 @@ private:
 			return Implies(inst->Arg(0), required, allow_phi) || Implies(inst->Arg(1), required, allow_phi);
 		if (inst->GetOpcode() == ValueOpcode::LogicalOr)
 			return Implies(inst->Arg(0), required, allow_phi) && Implies(inst->Arg(1), required, allow_phi);
-		if (!allow_phi || inst->GetOpcode() != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
-		    test == nullptr || test->Parent() == inst->Parent() || !AvailableBefore(*test, *inst)) return false;
+		if (inst->GetOpcode() != ValueOpcode::Phi || inst->GetType() != Type::U1 ||
+		    test == nullptr || test->Parent() == inst->Parent() || !AvailableBefore(*test, *inst))
+			return false;
 		// The required predicate must be invariant across this loop. Every entry
 		// establishes it; carried masks may only remove lanes from this same Phi.
 		bool entry = false;
 		for (size_t arm = 0; arm < inst->NumArgs(); ++arm) {
 			const bool carried = Dominates(inst->Parent(), inst->PhiBlock(arm));
+			if (carried && !allow_phi) return false;
 			if (!Implies(inst->Arg(arm), carried ? guard : required, false)) return false;
 			entry |= !carried;
 		}

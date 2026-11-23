@@ -3688,14 +3688,26 @@ void TestIndexedMaterialImageKeys() {
 
 void TestGraphicsPointerTableMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Variant { Pixel, Compute, GuardedEntry, UnpredicatedUse, MaskedLoad, BackedgeOnly, EmptyEntry };
+  enum class Variant {
+    Pixel, Compute, GuardedEntry, UnpredicatedUse, MaskedLoad, BackedgeOnly, EmptyEntry, NegatedEntry,
+    NegatedNarrower, NegatedWrongPolarity, MergedMask, UnmergedArm
+  };
   const auto make = [](Variant variant) {
     auto fixture = std::make_unique<Fixture>(variant == Variant::Compute ? ShaderType::Compute : ShaderType::Pixel);
     auto &f = *fixture;
-    auto *entry = f.block, *header = f.AddBlock(), *body = f.AddBlock(), *done = f.AddBlock();
-    const bool guarded = variant == Variant::GuardedEntry;
-    entry->AddBranch(header);
-    if (guarded) entry->AddBranch(done);
+    const bool negated = variant == Variant::NegatedEntry || variant == Variant::NegatedNarrower ||
+                         variant == Variant::NegatedWrongPolarity;
+    const bool merged = variant == Variant::MergedMask || variant == Variant::UnmergedArm;
+    const bool guarded = variant == Variant::GuardedEntry || negated || merged;
+    auto *entry = f.block, *side = merged ? f.AddBlock() : nullptr, *join = merged ? f.AddBlock() : entry;
+    auto *header = f.AddBlock(), *body = f.AddBlock(), *done = f.AddBlock();
+    if (merged) {
+      entry->AddBranch(side);
+      entry->AddBranch(join);
+      side->AddBranch(join);
+    }
+    join->AddBranch(header);
+    if (guarded) join->AddBranch(done);
     header->AddBranch(body);
     body->AddBranch(header);
     body->AddBranch(done);
@@ -3726,19 +3738,45 @@ void TestGraphicsPointerTableMaterialKeys() {
     request.kind = ResourceKind::Buffer;
     request.idxen = true;
     request.offset = 8u;
-    const auto load_mask = variant == Variant::MaskedLoad
-        ? f.Emit(ValueOpcode::INotEqual32, {lane, Value(5u)}) : Value(true);
-    const auto launch = Value(variant != Variant::EmptyEntry);
-    const auto local = f.Emit(ValueOpcode::SMax32, {Value(0u),
-        f.Emit(ValueOpcode::LoadBufferU32, {f.Buffer(material_words, 0x138u), row, Value(0u), Value(0u), load_mask},
-               f.AddMemory(request, 0x138u))});
+    const auto narrow = f.Emit(ValueOpcode::INotEqual32, {lane, Value(5u)});
+    const auto bit = f.Emit(ValueOpcode::UGreaterThan32, {Value(1u), material_index});
+    const auto not_bit = f.Emit(ValueOpcode::LogicalNot, {bit});
+    const auto both = f.Emit(ValueOpcode::LogicalAnd, {bit, narrow});
+    Value first = Value(variant != Variant::EmptyEntry), key_mask, load_mask = Value(true),
+          branch = f.Emit(ValueOpcode::INotEqual32, {lane, Value(UINT32_MAX)});
+    if (variant == Variant::MaskedLoad) load_mask = narrow;
+    if (negated) {
+      first = key_mask = variant == Variant::NegatedWrongPolarity ? both : not_bit;
+      branch = variant == Variant::NegatedNarrower ? f.Emit(ValueOpcode::LogicalNot, {both}) : not_bit;
+    }
+    if (merged) key_mask = narrow;
+    const auto selected = [&](Value value) {
+      return key_mask.IsEmpty() ? value : f.Emit(ValueOpcode::SelectU32, {key_mask, value, Value(0u)});
+    };
+    const auto load = f.Emit(ValueOpcode::LoadBufferU32,
+        {f.Buffer(material_words, 0x138u), row, Value(0u), Value(0u), key_mask.IsEmpty() ? load_mask : key_mask},
+        f.AddMemory(request, 0x138u));
+    const auto local = selected(f.Emit(ValueOpcode::SMax32, {Value(0u), selected(load)}));
+    if (merged) {
+      entry->condition = f.Emit(ValueOpcode::ConditionRef, {bit}, CFG::BranchCondition::ExecNonZero);
+      entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = side,
+                           .false_block = join};
+      f.block = side;
+      const auto kept = variant == Variant::UnmergedArm ? bit : f.Emit(ValueOpcode::LogicalAnd,
+          {both, f.Emit(ValueOpcode::LogicalNot, {f.Emit(ValueOpcode::IEqual32, {lane, Value(9u)})})});
+      side->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = join};
+      auto &merge = join->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+      merge.AddPhiOperand(entry, both);
+      merge.AddPhiOperand(side, kept);
+      f.block = join;
+      first = branch = f.Emit(ValueOpcode::LogicalAnd, {Value(&merge), bit});
+    }
     if (guarded) {
-      entry->condition = f.Emit(ValueOpcode::ConditionRef,
-          {f.Emit(ValueOpcode::INotEqual32, {lane, Value(UINT32_MAX)})}, CFG::BranchCondition::ExecNonZero);
-      entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header,
-                           .false_block = done};
+      join->condition = f.Emit(ValueOpcode::ConditionRef, {branch}, CFG::BranchCondition::ExecNonZero);
+      join->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header,
+                          .false_block = done};
     } else {
-      entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+      join->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
     }
     header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body};
     auto &mask = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
@@ -3763,7 +3801,7 @@ void TestGraphicsPointerTableMaterialKeys() {
          variant == Variant::UnpredicatedUse ? Value(true) : same},
         f.AddMemory(sample, 0x194u));
     const auto next = f.Emit(ValueOpcode::LogicalAnd, {Value(&mask), f.Emit(ValueOpcode::LogicalNot, {same})});
-    mask.AddPhiOperand(entry, launch);
+    mask.AddPhiOperand(join, first);
     mask.AddPhiOperand(body, variant == Variant::BackedgeOnly ? same : next);
     body->condition = f.Emit(ValueOpcode::ConditionRef, {next}, CFG::BranchCondition::ExecNonZero);
     body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header,
@@ -3772,14 +3810,15 @@ void TestGraphicsPointerTableMaterialKeys() {
     fixture->PlanAndTrack();
     return fixture;
   };
-  for (const auto variant : {Variant::Compute, Variant::GuardedEntry}) {
+  for (const auto variant : {Variant::Compute, Variant::GuardedEntry, Variant::NegatedEntry, Variant::MergedMask}) {
     const auto tracked = make(variant);
     const auto plan = ExtractResourcePlan(tracked->program);
     const auto &indirect = plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
     Check(indirect && indirect->selector, "first-lane material key lost its indexed selector");
   }
-  for (const auto variant :
-       {Variant::UnpredicatedUse, Variant::MaskedLoad, Variant::BackedgeOnly, Variant::EmptyEntry}) {
+  for (const auto variant : {Variant::UnpredicatedUse, Variant::MaskedLoad, Variant::BackedgeOnly,
+                             Variant::EmptyEntry, Variant::NegatedNarrower, Variant::NegatedWrongPolarity,
+                             Variant::UnmergedArm}) {
     CheckFatal([&] { make(variant); }, "not a valid runtime value",
                "first-lane material key accepted without a witnessed lane, load mask or back edge");
   }

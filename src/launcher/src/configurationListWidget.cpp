@@ -1282,6 +1282,9 @@ void ConfigurationListWidget::ShowContextMenu(QTreeWidgetItem* witem) {
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());
 
 	QAction* action_run = menu.addAction(tr("Run"), this, SIGNAL(Run()));
+	QAction* action_copy_command =
+	    menu.addAction(tr("Copy launch command"), this, SIGNAL(CopyLaunchCommand()));
+	action_copy_command->setEnabled(item != nullptr && !item->IsRunning() && m_run_enabled);
 	if (item != nullptr && item->GetInfo().activity_intent) {
 		auto* action_activity = menu.addAction(
 		    tr("Launch activity..."), this, [this, base = item->GetInfo().basedir]() {

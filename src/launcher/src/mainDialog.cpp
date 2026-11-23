@@ -11,6 +11,8 @@
 
 #include <QApplication>
 #include <QByteArray>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
@@ -72,6 +74,7 @@ public:
 	void Update();
 	void FindInterpreter();
 	void Run(const QString& activity);
+	void CopyLaunchCommand();
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
 
@@ -152,6 +155,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 	        });
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
+	connect(m_ui->widget, &ConfigurationListWidget::CopyLaunchCommand, this,
+	        &MainDialogPrivate::CopyLaunchCommand);
 	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
 	        [this](const QString&) { m_update_checker->Check(true); });
 	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
@@ -408,6 +413,18 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 }
 #endif
 
+// Quotes one argument for a command line pasted into a shortcut; embedded quotes are
+// backslash-escaped. Paths with spaces are the case that matters, so trailing backslashes
+// before a closing quote are not expected here.
+static QString QuoteArgument(const QString& argument) {
+	if (!argument.contains(QLatin1Char(' ')) && !argument.contains(QLatin1Char('"'))) {
+		return argument;
+	}
+	QString escaped = argument;
+	escaped.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+	return QLatin1Char('"') + escaped + QLatin1Char('"');
+}
+
 #if defined(_WIN32)
 // cmd /K arguments that keep the console open (with close_on_clean_exit, only after an error).
 // A quote is written as "" rather than \" so cmd's quote count stays even and operators inside
@@ -548,6 +565,26 @@ void MainDialogPrivate::Run(const QString& activity) {
 	m_main_dialog->RunInterpreter(process, *info, g_close_terminal);
 
 	Update();
+}
+
+// The emulator takes its whole configuration from the command line and never reads kyty.ini, so
+// a shortcut built by hand runs the game with defaults instead of its custom config (#2522).
+// Copy the full command the launcher itself would run, ready to paste into a shortcut.
+void MainDialogPrivate::CopyLaunchCommand() {
+	QPointer<ConfigurationItem> item = m_ui->widget->GetSelectedItem();
+	if (item == nullptr) {
+		return;
+	}
+	const auto info = m_ui->widget->CreateConfiguration(*item);
+	const auto args = CreateEmulatorArgs(*info);
+	if (args.isEmpty()) {
+		return;
+	}
+	QStringList quoted {QuoteArgument(m_interpreter)};
+	for (const auto& arg: args) {
+		quoted << QuoteArgument(arg);
+	}
+	QGuiApplication::clipboard()->setText(quoted.join(QLatin1Char(' ')));
 }
 
 void MainDialogPrivate::Update() {

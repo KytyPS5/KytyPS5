@@ -3837,6 +3837,183 @@ void TestGraphicsPointerTableMaterialKeys() {
         "pixel pointer-table selector lost its sorted raw keys or the OOB-zero root descriptor");
 }
 
+void TestGraphicsThreadBitMaterialKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant {
+    Avatar, ComputeBallot, PixelBallot, UnguardedEntry, OtherWitness, NotLive, ZeroBranch, WrongHalf, WrongBit,
+    OtherLane, OtherSelect
+  };
+  const auto make = [](Variant variant) {
+    auto fixture =
+        std::make_unique<Fixture>(variant == Variant::ComputeBallot ? ShaderType::Compute : ShaderType::Pixel);
+    auto &f = *fixture;
+    auto *entry = f.block, *pre = f.AddBlock(), *header = f.AddBlock(), *body = f.AddBlock(),
+         *done = f.AddBlock();
+    const bool guarded = variant != Variant::UnguardedEntry;
+    entry->AddBranch(pre);
+    if (guarded) entry->AddBranch(done);
+    pre->AddBranch(header);
+    header->AddBranch(body);
+    body->AddBranch(header);
+    body->AddBranch(done);
+    const bool ballot_words = variant == Variant::ComputeBallot || variant == Variant::PixelBallot;
+    const auto live = ballot_words ? f.Emit(ValueOpcode::Ballot, {Value(true)}) : f.Emit(ValueOpcode::LiveMask);
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto discarded = f.Emit(ValueOpcode::IEqual32, {lane, Value(7u)});
+    const auto ballot = f.Emit(ValueOpcode::Ballot, {discarded});
+    std::array<Value, 2> launched, kept;
+    for (uint32_t word = 0; word < 2u; ++word) {
+      launched[word] = variant == Variant::NotLive
+          ? Value(UINT32_MAX) : f.Emit(ValueOpcode::CompositeExtractU32x4, {live, Value(word)});
+      kept[word] = f.Emit(ValueOpcode::BitwiseAnd32, {launched[word], f.Emit(ValueOpcode::BitwiseNot32,
+          {f.Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(word)})})});
+    }
+    const auto &witness = variant == Variant::OtherWitness ? launched : kept;
+    const auto any = f.Emit(variant == Variant::ZeroBranch ? ValueOpcode::IEqual32 : ValueOpcode::INotEqual32,
+        {f.Emit(ValueOpcode::BitwiseOr32, {witness[0], witness[1]}), Value(0u)});
+    if (guarded) {
+      entry->condition = f.Emit(ValueOpcode::ConditionRef, {any}, CFG::BranchCondition::SccNonZero);
+      entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = pre,
+                           .false_block = done};
+    } else {
+      entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = pre};
+    }
+    f.block = pre;
+    const auto wqm = f.Emit(ValueOpcode::WqmU64, {f.Emit(ValueOpcode::CompositeConstructU64, {kept[0], kept[1]})});
+    const auto pre_lane = f.Emit(ValueOpcode::LaneId);
+    const auto other = variant == Variant::OtherLane || variant == Variant::OtherSelect
+        ? f.Emit(ValueOpcode::GetInterpolationParameter, {Value(1u), Value(1u), Value(2u)}) : pre_lane;
+    const auto half = Value(variant == Variant::WrongHalf ? 16u : 32u);
+    const auto word = f.Emit(ValueOpcode::SelectU32,
+        {f.Emit(ValueOpcode::ULessThan32, {variant == Variant::OtherSelect ? other : pre_lane, half}),
+        f.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(0u)}),
+        f.Emit(ValueOpcode::CompositeExtractU64, {wqm, Value(1u)})});
+    const auto bit = f.Emit(ValueOpcode::INotEqual32, {f.Emit(ValueOpcode::BitwiseAnd32,
+        {f.Emit(ValueOpcode::ShiftRightLogical32, {word, f.Emit(ValueOpcode::BitwiseAnd32,
+             {variant == Variant::OtherLane ? other : pre_lane, Value(variant == Variant::WrongBit ? 15u : 31u)})}),
+         Value(1u)}), Value(0u)});
+    const auto alive = f.Emit(ValueOpcode::LogicalOr, {f.Emit(ValueOpcode::LogicalNot, {discarded}), bit});
+    MemoryInfo record_info;
+    record_info.kind = ResourceKind::ScalarAddress;
+    record_info.offset = 120u;
+    const auto record = f.Emit(ValueOpcode::LoadAddressU32,
+        {f.Address(f.UserData(4), f.UserData(5)), Value(0u), Value(0u), Value(true)}, f.AddMemory(record_info, 0xbcu));
+    const auto material_offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {record, Value(4u)});
+    const auto materials = f.Address(f.UserData(6), f.UserData(7));
+    std::array<Value, 4> material_words;
+    for (uint32_t dword = 0; dword < 4u; ++dword) {
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = dword * 4u;
+      material_words[dword] = f.Emit(ValueOpcode::LoadAddressU32,
+          {materials, material_offset, Value(0u), Value(true)}, f.AddMemory(scalar, 0xd4u));
+    }
+    MemoryInfo request;
+    request.kind = ResourceKind::Buffer;
+    request.idxen = true;
+    request.offset = 4u;
+    const auto index = f.Emit(ValueOpcode::SelectU32,
+        {alive, f.Emit(ValueOpcode::GetInterpolationParameter, {Value(1u), Value(0u), Value(2u)}), Value(0u)});
+    const auto local = f.Emit(ValueOpcode::SelectU32, {alive,
+        f.Emit(ValueOpcode::LoadBufferU32, {f.Buffer(material_words, 0xe4u), index, Value(0u), Value(0u), alive},
+               f.AddMemory(request, 0xe4u)),
+        f.Emit(ValueOpcode::GetBuiltin, {Value(10u), Value(0u)})});
+    pre->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = body};
+    auto &mask = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    f.block = body;
+    const auto key = f.Emit(ValueOpcode::ReadFirstLane, {local, Value(&mask)});
+    const auto same = f.Emit(ValueOpcode::LogicalAnd, {Value(&mask), f.Emit(ValueOpcode::IEqual32, {key, local})});
+    const auto sampled = f.Emit(ValueOpcode::LogicalAnd, {Value(&mask), same});
+    const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    const auto table = f.Address(f.UserData(8), f.UserData(9));
+    std::array<Value, 8> words;
+    for (uint32_t dword = 0; dword < words.size(); ++dword) {
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarAddress;
+      scalar.offset = dword * 4u;
+      words[dword] = f.Emit(ValueOpcode::LoadAddressU32, {table, offset, Value(0u), Value(true)},
+                            f.AddMemory(scalar, 0x124u));
+    }
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    f.Emit(ValueOpcode::ImageSampleRaw,
+        {f.Image(words, 0x130u), f.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}), f.ImageAddress(), sampled},
+        f.AddMemory(sample, 0x130u));
+    const auto next = f.Emit(ValueOpcode::LogicalAnd, {Value(&mask), f.Emit(ValueOpcode::LogicalNot, {same})});
+    mask.AddPhiOperand(pre, alive);
+    mask.AddPhiOperand(body, next);
+    body->condition = f.Emit(ValueOpcode::ConditionRef, {next}, CFG::BranchCondition::ExecNonZero);
+    body->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = header,
+                        .false_block = done};
+    done->terminator.kind = CFG::TerminatorKind::Return;
+    fixture->PlanAndTrack();
+    return fixture;
+  };
+  for (const auto variant : {Variant::PixelBallot, Variant::UnguardedEntry, Variant::OtherWitness, Variant::NotLive,
+                             Variant::ZeroBranch, Variant::WrongHalf, Variant::WrongBit, Variant::OtherLane,
+                             Variant::OtherSelect}) {
+    CheckFatal([&] { make(variant); }, "not a valid runtime value",
+               "thread-bit material key accepted without a nonzero live mask on entry");
+  }
+  const auto compute = make(Variant::ComputeBallot);
+  const auto ballot = ExtractResourcePlan(compute->program);
+  const auto &ballot_indirect = ballot.descriptor_sources[ballot.info.images[0].source].indirect_descriptor;
+  Check(ballot_indirect && ballot_indirect->selector,
+        "thread-bit waterfall over ballot words lost its indexed selector");
+  const auto avatar = make(Variant::Avatar);
+  auto plan = ExtractResourcePlan(avatar->program);
+  const auto &indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(indirect.selector && indirect.selector->offset == 4u && !indirect.table_scalar &&
+            indirect.table_stride == 32u && plan.descriptor_sources[indirect.table_source].dword_count == 2u,
+        "thread-bit waterfall lost its indexed material selector");
+
+  constexpr uint32_t base = 0x1000u, material = 0x2000u, heap = 0x8000u, stride = 16u, records = 4u;
+  struct Memory {
+    std::vector<uint32_t> words = std::vector<uint32_t>((heap - base + 16u * 32u) / 4u);
+    uint32_t descriptors = 0;
+  } memory;
+  memory.words[120u / 4u] = 2u;
+  const std::array<uint32_t, 4> material_descriptor{material, stride << 16u, records, 0x5204u};
+  std::copy(material_descriptor.begin(), material_descriptor.end(), memory.words.begin() + (0x100u + 32u) / 4u);
+  const std::array<uint32_t, records> keys{3u, 9u, 3u, 0u};
+  for (uint32_t row = 0; row < records; ++row)
+    memory.words[(material - base + row * stride + 4u) / 4u] = keys[row];
+  for (const uint32_t key : {0u, 3u, 9u}) {
+    auto *texture = memory.words.data() + (heap - base + key * 32u) / 4u;
+    texture[0] = 0x100u + key;
+    texture[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k16UNorm) << 20u;
+    texture[3] = (9u << 28u) | Libs::Graphics::DstSel(4, 5, 6, 7);
+  }
+  const std::array<uint32_t, 10> user_data{0u, 0u, 0u, 0u, base, 0u, base + 0x100u, 0u, heap, 0u};
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &m = *static_cast<Memory *>(data);
+    if (address < base || address - base + words.size_bytes() > m.words.size() * 4u) return false;
+    if (address >= heap) {
+      const auto key = (address - heap) / 32u;
+      if (words.size() != 8u || (key != 0u && key != 3u && key != 9u)) return false;
+      ++m.descriptors;
+    }
+    std::copy_n(m.words.begin() + (address - base) / 4u, words.size(), words.begin());
+    return true;
+  };
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory, .read_specialization_memory = read};
+  FakeGuestMemory fake(read, &memory);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.descriptors == 3u,
+        "thread-bit selector did not read exactly the zero and material-key descriptors");
+  Check(std::ranges::find(snapshot.specialization_reads,
+                          std::pair<uint64_t, uint64_t>{material + 4u, (records - 1u) * stride + 4u}) !=
+            snapshot.specialization_reads.end(),
+        "thread-bit selector rows escaped writable-alias tracking");
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  Check(snapshot.flattened_srt[mapping] == 3u && snapshot.flattened_srt[mapping + 3u] == 3u &&
+            snapshot.flattened_srt[mapping + 5u] == 9u,
+        "thread-bit selector lost its sorted raw keys or the OOB-zero root descriptor");
+}
+
 void TestPointerTableIndexedMaterialKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   // A waterfall scalarizes one lane's x3 key from record 2 * lane + 1, clamped at zero;
@@ -9798,6 +9975,7 @@ int main() {
     Run("pointer-table indexed material keys", TestPointerTableIndexedMaterialKeys);
     Run("guarded material image key", TestGuardedMaterialImageKey);
     Run("graphics pointer-table material keys", TestGraphicsPointerTableMaterialKeys);
+    Run("graphics thread-bit material keys", TestGraphicsThreadBitMaterialKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("compact scalar image table", TestCompactScalarImageTable);

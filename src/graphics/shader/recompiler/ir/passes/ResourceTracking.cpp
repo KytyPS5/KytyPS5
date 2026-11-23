@@ -1150,6 +1150,16 @@ private:
 		return true;
 	}
 
+	static bool ImmediateIs(Value value, uint32_t expected) {
+		uint32_t actual = 0;
+		return ImmediateU32(value, actual) && actual == expected;
+	}
+
+	static const Inst* InstOf(Value value, ValueOpcode opcode) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == opcode ? inst : nullptr;
+	}
+
 	static bool UsesOnlyImageDescriptors(const Inst& value) {
 		if (value.Uses().empty()) return false;
 		std::vector<const Inst*> values {&value};
@@ -1240,6 +1250,70 @@ private:
 			}
 		}
 		return {};
+	}
+
+	bool LiveLaneWord(Value word, uint32_t index) const {
+		if (const auto* both = InstOf(word, ValueOpcode::BitwiseAnd32))
+			return LiveLaneWord(both->Arg(0), index) || LiveLaneWord(both->Arg(1), index);
+		const auto* extract = InstOf(word, ValueOpcode::CompositeExtractU32x4);
+		if (extract == nullptr || !ImmediateIs(extract->Arg(1), index)) return false;
+		return InstOf(extract->Arg(0), ValueOpcode::LiveMask) != nullptr ||
+		       (m_program.stage != ShaderType::Pixel &&
+		        InstOf(extract->Arg(0), ValueOpcode::Ballot) != nullptr);
+	}
+
+	Value MaskWord(Value word, uint32_t index) const {
+		const auto* extract = InstOf(word, ValueOpcode::CompositeExtractU64);
+		if (extract == nullptr || !ImmediateIs(extract->Arg(1), index)) return word;
+		const auto* quad = InstOf(extract->Arg(0), ValueOpcode::WqmU64);
+		const auto* pair = InstOf(quad != nullptr ? quad->Arg(0) : extract->Arg(0),
+		                          ValueOpcode::CompositeConstructU64);
+		return pair != nullptr ? pair->Arg(index) : word;
+	}
+
+	bool ThreadBitOfLiveMask(Value predicate) const {
+		if (const auto* either = InstOf(predicate, ValueOpcode::LogicalOr))
+			return ThreadBitOfLiveMask(either->Arg(0)) || ThreadBitOfLiveMask(either->Arg(1));
+		const auto* test = InstOf(predicate, ValueOpcode::INotEqual32);
+		if (test == nullptr || !ImmediateIs(test->Arg(1), 0u)) return false;
+		const auto* bit = InstOf(test->Arg(0), ValueOpcode::BitwiseAnd32);
+		if (bit == nullptr || !ImmediateIs(bit->Arg(1), 1u)) return false;
+		const auto* shift = InstOf(bit->Arg(0), ValueOpcode::ShiftRightLogical32);
+		if (shift == nullptr) return false;
+		const auto* position = InstOf(shift->Arg(1), ValueOpcode::BitwiseAnd32);
+		if (position == nullptr || !ImmediateIs(position->Arg(1), 31u) ||
+		    InstOf(position->Arg(0), ValueOpcode::LaneId) == nullptr)
+			return false;
+		std::array<Value, 2> words {MaskWord(shift->Arg(0), 0u), {}};
+		if (const auto* half = InstOf(shift->Arg(0), ValueOpcode::SelectU32)) {
+			const auto* low = InstOf(half->Arg(0), ValueOpcode::ULessThan32);
+			if (low == nullptr || InstOf(low->Arg(0), ValueOpcode::LaneId) == nullptr ||
+			    !ImmediateIs(low->Arg(1), 32u))
+				return false;
+			words = {MaskWord(half->Arg(1), 0u), MaskWord(half->Arg(2), 1u)};
+		}
+		if (!LiveLaneWord(words[0], 0u) || (!words[1].IsEmpty() && !LiveLaneWord(words[1], 1u)))
+			return false;
+		const auto tests_words = [&](Value tested) {
+			if (words[1].IsEmpty()) return EquivalentValue(m_program, tested, words[0]);
+			const auto* either = InstOf(tested, ValueOpcode::BitwiseOr32);
+			if (either == nullptr) return false;
+			return std::ranges::any_of(std::array {0u, 1u}, [&](uint32_t first) {
+				return EquivalentValue(m_program, either->Arg(first), words[0]) &&
+				       EquivalentValue(m_program, either->Arg(first ^ 1u), words[1]);
+			});
+		};
+		return GuardedOnEntry(
+		    test->Parent(),
+		    [](const Block* current) { return current->ImmPredecessors().size() != 1u; },
+		    [&](const EdgePredicate& edge) {
+			    const auto* tested = edge.condition.TryInstruction();
+			    if (tested == nullptr || tested->NumArgs() != 2u) return false;
+			    return std::ranges::any_of(std::array {0u, 1u}, [&](uint32_t arg) {
+				    return tests_words(tested->Arg(arg)) &&
+				           ExcludedBy(edge, tested->Arg(arg)) == 0u;
+			    });
+		    });
 	}
 
 	bool NonzeroOnEntry(Value value, const Block* block) const {
@@ -1405,8 +1479,9 @@ private:
 	bool HasActiveLane(Value mask, const Block* use, bool launch_lanes_suffice = false) const {
 		mask = SimplifyGuard(mask);
 		if (mask.IsImmediate()) return mask.GetType() == Type::U1 && mask.U1();
-		const auto incoming_is_nonempty = [&](const Block* from, const Block* to,
-		                                     Value incoming, const Block* header) {
+		const auto incoming_is_nonempty = [&](const Block* from, const Block* to, Value incoming,
+		                                      const Block* header) {
+			if (ThreadBitOfLiveMask(incoming)) return true;
 			const auto accepts = [&](const EdgePredicate& edge) {
 				return edge.positive && Implies(edge.condition, incoming);
 			};

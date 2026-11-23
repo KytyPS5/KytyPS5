@@ -111,6 +111,16 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
+// Reads the format's channels in order, a missing Y or Z as 0 and a missing W as 1.
+uint32_t FormatFillSwizzle(Prospero::BufferFormat format) {
+	switch (Format::GetFormatInfo(format).component_count) {
+		case 1: return DstSel(4, 0, 0, 1);
+		case 2: return DstSel(4, 5, 0, 1);
+		case 3: return DstSel(4, 5, 6, 1);
+		default: return ShaderImageIdentitySwizzle;
+	}
+}
+
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	return Prospero::RemapTextureFormat(format) != format ? format
 	                                                      : Prospero::BufferFormat::kInvalid;
@@ -990,12 +1000,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb)) {
 			image.srgb_decode = format;
 		}
-		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
-			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
-		}
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
+		// An unconverted storage view applies its swizzle only to stores, which drop the channels
+		// its format lacks, so a swizzle that only fills those is the identity. Indirect table
+		// candidates keep theirs: a table with filtered accesses requires equal swizzles.
+		const auto swizzle = DescriptorImageSwizzle(descriptor);
+		if (image.conversion_format != Prospero::BufferFormat::kInvalid ||
+		    (storage && (image.indirect_root != ImageResource::NoIndirectImage ||
+		                 swizzle != FormatFillSwizzle(format)))) {
+			image.shader_swizzle = swizzle;
+		}
 		image.numeric_class = Prospero::SampledTextureNumericClass(
 		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {

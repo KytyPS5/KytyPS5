@@ -99,6 +99,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
+		case ValueOpcode::SMin32:
 		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -1014,7 +1015,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 		}
-		// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+		// Every guest load is mov eax, [r10] (41 8b 02), which the fault handler completes.
 		c.mov(c.eax, c.dword[c.r10]);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1072,6 +1073,10 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 		case ValueOpcode::UMax32:
 			c.cmp(c.eax, c.ecx);
 			c.cmovb(c.eax, c.ecx);
+			break;
+		case ValueOpcode::SMin32:
+			c.cmp(c.eax, c.ecx);
+			c.cmovg(c.eax, c.ecx);
 			break;
 		case ValueOpcode::SMax32:
 			c.cmp(c.eax, c.ecx);

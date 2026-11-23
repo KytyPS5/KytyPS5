@@ -623,7 +623,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
+bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
@@ -642,13 +642,22 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+		        info->exception_address)) {
+			// The backing serves an SRT walker load, so false sharing with GPU-written bytes
+			// needs no readback. Otherwise the load retries once its fault is handled, or
+			// reads zero.
+			uint32_t value = 0;
+			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
+			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				return true;
+			}
+			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 			return true;
 		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
-			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}
@@ -761,11 +770,8 @@ static void GetDynModules(Elf64* elf, T* out, const char* names, Elf64_Sxword ta
 	GetDynValues(elf, &needed_modules, tag);
 	for (auto need: needed_modules) {
 		ModuleId id {};
-		// id.id            = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
-		id.version_major = static_cast<int>((need >> 40u) & 0xffu);
-		id.version_minor = static_cast<int>((need >> 32u) & 0xffu);
-		id.name          = names + (need & 0xffffffff);
+		id.name = names + (need & 0xffffffff);
 		out->push_back(id);
 	}
 }
@@ -776,10 +782,8 @@ static void GetDynLibs(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) 
 	GetDynValues(elf, &needed_modules, tag);
 	for (auto need: needed_modules) {
 		LibraryId id {};
-		// id.id      = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
-		id.version = static_cast<int>((need >> 32u) & 0xffffu);
-		id.name    = names + (need & 0xffffffff);
+		id.name = names + (need & 0xffffffff);
 		out->push_back(id);
 	}
 }
@@ -916,18 +920,16 @@ struct Tcb {
 };
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static DWORD TcbSlot() {
-	static const DWORD slot = TlsAlloc();
-	EXIT_IF(slot >= 64); // later slots are not at a fixed TEB offset
-	return slot;
-}
+// Allocated before main: host libraries loaded later can use up the slots at a fixed TEB offset.
+static const DWORD g_tcb_slot = TlsAlloc();
 
 static uint32_t TcbGsOffset() {
-	return 0x1480 + 8 * TcbSlot();
+	return 0x1480 + 8 * g_tcb_slot;
 }
 
 void RuntimeLinker::SetThreadTcb(void* tcb) {
-	EXIT_IF(TlsSetValue(TcbSlot(), tcb) == 0);
+	EXIT_IF(g_tcb_slot >= 64); // later slots are not at a fixed TEB offset
+	EXIT_IF(TlsSetValue(g_tcb_slot, tcb) == 0);
 }
 #elif defined(__APPLE__)
 static pthread_key_t TcbKey() {
@@ -1369,95 +1371,40 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 		*bind_self = false;
 	}
 
-	if (ids.size() == 3) {
-		const LibraryId* l = FindLibrary(*program, ids.at(1));
-		const ModuleId*  m = FindModule(*program, ids.at(2));
-
-		auto resolve_by_nid = [this, type](const std::string& nid, SymbolRecord* out) -> bool {
-			EXIT_IF(out == nullptr);
-
-			if (m_symbols != nullptr) {
-				if (const auto* rec = m_symbols->FindByNid(nid, type); rec != nullptr) {
-					*out = *rec;
-					return true;
-				}
-			}
-
-			for (auto* p: m_programs) {
-				if (p != nullptr && p->export_symbols != nullptr) {
-					if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
-						*out = *rec;
-						return true;
-					}
-				}
-			}
-
-			return false;
-		};
-
-		if (l != nullptr && m != nullptr) {
-			SymbolResolve sr {};
-			sr.name                 = ids.at(0);
-			sr.library              = l->name;
-			sr.library_version      = l->version;
-			sr.module               = m->name;
-			sr.module_version_major = m->version_major;
-			sr.module_version_minor = m->version_minor;
-			sr.type                 = type;
-
-			const SymbolRecord* rec = nullptr;
-
-			if (m_symbols != nullptr) {
-				rec = m_symbols->Find(sr);
-			}
-
-			if (rec == nullptr) {
-				for (auto* p: m_programs) {
-					const auto& libs = p->dynamic_info->export_libs;
-					const auto& modules = p->dynamic_info->export_modules;
-					if (p->export_symbols == nullptr ||
-					    std::find(libs.begin(), libs.end(), *l) == libs.end() ||
-					    std::find(modules.begin(), modules.end(), *m) == modules.end()) {
-						continue;
-					}
-					rec = p->export_symbols->Find(sr);
-					if (rec != nullptr) {
-						if (bind_self != nullptr) {
-							*bind_self = (p == program);
-						}
-						break;
-					}
-				}
-			}
-
-			if (rec == nullptr) {
-				if (resolve_by_nid(sr.name, out_info)) {
-					LOGF("PS5 NID fallback: %s -> %s\n", sr.name.c_str(), out_info->name.c_str());
-					return;
-				}
-			}
-
-			if (rec != nullptr) {
-				*out_info = *rec;
-			} else {
-				out_info->vaddr    = 0;
-				out_info->name     = SymbolDatabase::GenerateName(sr);
-				out_info->dbg_name = "";
-			}
-		} else {
-			if (resolve_by_nid(ids.at(0), out_info)) {
-				LOGF("PS5 NID fallback: %s -> %s (missing lib/module metadata)\n",
-				     ids.at(0).c_str(), out_info->name.c_str());
-				return;
-			}
-
-			EXIT("l == nullptr || m == nullptr");
-		}
-	} else {
-		out_info->vaddr    = 0;
-		out_info->name     = name;
-		out_info->dbg_name = "";
+	*out_info = {.name = name};
+	if (ids.size() != 3) {
+		return;
 	}
+
+	// The PS5 binds an import by NID, library name and module name.
+	const LibraryId* l = FindLibrary(*program, ids.at(1));
+	const ModuleId*  m = FindModule(*program, ids.at(2));
+	EXIT_IF(l == nullptr || m == nullptr);
+
+	auto find = [&](const SymbolResolve& key) {
+		if (const auto* rec = m_symbols->Find(key); rec != nullptr) {
+			*out_info = *rec;
+			return true;
+		}
+		for (auto* p: m_programs) {
+			if (const auto* rec = p->export_symbols->Find(key); rec != nullptr) {
+				*out_info = *rec;
+				if (bind_self != nullptr) {
+					*bind_self = (p == program);
+				}
+				return true;
+			}
+		}
+		return false;
+	};
+
+	const SymbolResolve sr {ids.at(0), l->name, m->name, type};
+	// libc exports the LibcInternal functions under the same NIDs; it serves a LibcInternal import
+	// nothing else exports.
+	if (find(sr) || (l->name == "libSceLibcInternal" && find({sr.name, "libc", "libc", type}))) {
+		return;
+	}
+	out_info->name = SymbolDatabase::GenerateName(sr);
 }
 
 uint64_t RuntimeLinker::ReadFromElf(Program* program, uint64_t vaddr) {
@@ -1503,6 +1450,13 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 	}
 
 	return nullptr;
+}
+
+std::vector<int32_t> RuntimeLinker::GetProgramIds() {
+	Common::LockGuard    lock(m_mutex);
+	std::vector<int32_t> ids(m_programs.size());
+	std::ranges::transform(m_programs, ids.begin(), &Program::unique_id);
+	return ids;
 }
 
 Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {
@@ -2078,12 +2032,9 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 				    (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE) &&
 				    is_export == (sym->st_value != 0)) {
 					SymbolResolve sr {};
-					sr.name                 = ids.at(0);
-					sr.library              = l->name;
-					sr.library_version      = l->version;
-					sr.module               = m->name;
-					sr.module_version_major = m->version_major;
-					sr.module_version_minor = m->version_minor;
+					sr.name    = ids.at(0);
+					sr.library = l->name;
+					sr.module  = m->name;
 					switch (type) {
 						case STT_NOTYPE: sr.type = SymbolType::NoType; break;
 						case STT_FUNC: sr.type = SymbolType::Func; break;

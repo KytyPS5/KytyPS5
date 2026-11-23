@@ -10,7 +10,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Pad", 1, "Pad", 1, 1);
+LIB_NAME("Pad", "Pad");
 
 static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	PRINT_NAME();
@@ -177,12 +177,16 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
 	LIB_FUNC("iA-DdobUen8", Controller::PadVrControllerReadState);
+	LIB_FUNC("mbJHDdjhVeY", Controller::PadVrControllerGetDeviceInformation);
+	LIB_FUNC("Wf6-PNCyY20", Controller::PadVrControllerSetVibrationMode);
 	LIB_FUNC("v8P+9PRqg10", Controller::PadVrControllerSetTriggerEffects);
+	LIB_FUNC("AVr6AKXGc0M", Controller::PadVrControllerGetTriggerEffectStates);
+	LIB_FUNC("OL2CJ2idmhk", Controller::PadVrControllerGetTriggerEffectStates);
 }
 
 namespace LibMouse {
 
-LIB_VERSION("Mouse", 1, "Mouse", 1, 1);
+LIB_NAME("Mouse", "Mouse");
 
 namespace Mouse {
 
@@ -268,7 +272,7 @@ LIB_DEFINE(InitMouse_1) {
 
 namespace LibKeyboard {
 
-LIB_VERSION("Keyboard", 1, "Keyboard", 1, 1);
+LIB_NAME("Keyboard", "Keyboard");
 
 namespace Keyboard {
 

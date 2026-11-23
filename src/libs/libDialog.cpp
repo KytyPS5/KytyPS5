@@ -8,7 +8,7 @@ namespace Libs {
 
 namespace LibCommonDialog {
 
-LIB_VERSION("CommonDialog", 1, "CommonDialog", 1, 1);
+LIB_NAME("CommonDialog", "CommonDialog");
 
 namespace CommonDialog = Dialog::CommonDialog;
 
@@ -21,7 +21,7 @@ LIB_DEFINE(InitDialog_1_CommonDialog) {
 
 namespace LibImeDialog {
 
-LIB_VERSION("ImeDialog", 1, "ImeDialog", 1, 1);
+LIB_NAME("ImeDialog", "ImeDialog");
 
 namespace ImeDialog = Dialog::ImeDialog;
 
@@ -40,7 +40,7 @@ LIB_DEFINE(InitDialog_1_ImeDialog) {
 
 namespace LibLoginDialog {
 
-LIB_VERSION("LoginDialog", 1, "LoginDialog", 1, 1);
+LIB_NAME("LoginDialog", "LoginDialog");
 
 namespace LoginDialog = Dialog::LoginDialog;
 
@@ -59,7 +59,7 @@ LIB_DEFINE(InitDialog_1_LoginDialog) {
 
 namespace LibSigninDialog {
 
-LIB_VERSION("SigninDialog", 1, "SigninDialog", 1, 1);
+LIB_NAME("SigninDialog", "SigninDialog");
 
 namespace SigninDialog = Dialog::SigninDialog;
 
@@ -77,7 +77,7 @@ LIB_DEFINE(InitDialog_1_SigninDialog) {
 
 namespace LibSaveDataDialog {
 
-LIB_VERSION("SaveDataDialog", 1, "SaveDataDialog", 1, 1);
+LIB_NAME("SaveDataDialog", "SaveDataDialog");
 
 namespace SaveDataDialog = Dialog::SaveDataDialog;
 
@@ -93,7 +93,7 @@ LIB_DEFINE(InitDialog_1_SaveDataDialog) {
 
 namespace LibSaveDataDialogNative {
 
-LIB_VERSION("SaveDataDialog.native", 1, "SaveDataDialog", 1, 1);
+LIB_NAME("SaveDataDialog.native", "SaveDataDialog");
 
 namespace SaveDataDialog = Dialog::SaveDataDialog;
 
@@ -114,7 +114,7 @@ LIB_DEFINE(InitDialog_1_SaveDataDialogNative) {
 
 namespace LibMsgDialog {
 
-LIB_VERSION("MsgDialog.native", 1, "MsgDialog", 1, 1);
+LIB_NAME("MsgDialog.native", "MsgDialog");
 
 namespace MsgDialog = Dialog::MsgDialog;
 
@@ -135,7 +135,7 @@ LIB_DEFINE(InitDialog_1_MsgDialog) {
 
 namespace LibErrorDialog {
 
-LIB_VERSION("ErrorDialog", 1, "ErrorDialog", 1, 1);
+LIB_NAME("ErrorDialog", "ErrorDialog");
 
 namespace ErrorDialog = Dialog::ErrorDialog;
 
@@ -152,7 +152,7 @@ LIB_DEFINE(InitDialog_1_ErrorDialog) {
 
 namespace LibPlayerInvitationDialog {
 
-LIB_VERSION("PlayerInvitationDialog", 1, "PlayerInvitationDialog", 1, 1);
+LIB_NAME("PlayerInvitationDialog", "PlayerInvitationDialog");
 
 constexpr int PLAYER_INVITATION_DIALOG_STATUS_NONE = 0;
 

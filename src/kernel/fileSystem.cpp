@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "kernel/descriptors.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -32,7 +33,7 @@ namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
 
-constexpr int      DESCRIPTOR_MIN = 3;
+using Descriptors::DESCRIPTOR_MIN;
 constexpr uint64_t DIR_BLOCK_SIZE = 512;
 
 enum class SpecialFile {
@@ -207,16 +208,13 @@ int FileDescriptors::CreateDescriptor() {
 	file->sync_writes = false;
 	file->special     = SpecialFile::None;
 
-	int files_num = static_cast<int>(m_files.size());
-	for (int index = 0; index < files_num; index++) {
-		if (m_files[index] == nullptr) {
-			m_files[index] = file;
-			return index + DESCRIPTOR_MIN;
-		}
+	const int  d     = Descriptors::Allocate();
+	const auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) {
+		m_files.resize(index + 1);
 	}
-
-	m_files.push_back(file);
-	return static_cast<int>(m_files.size()) + DESCRIPTOR_MIN - 1;
+	m_files[index] = file;
+	return d;
 }
 
 void FileDescriptors::DeleteDescriptor(int d) {
@@ -235,6 +233,7 @@ void FileDescriptors::DeleteDescriptor(int d) {
 
 	delete m_files[index];
 	m_files[index] = nullptr;
+	Descriptors::Release(d);
 }
 
 File* FileDescriptors::GetFile(int d) {

@@ -254,6 +254,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (!info.audio_input_device.isEmpty()) {
 		args << "--mic" << info.audio_input_device;
 	}
+	args << "--audio-output" << EnumToText(info.audio_output);
 	if (!info.controller.color.isEmpty()) {
 		args << "--controller-color" << info.controller.color;
 	}

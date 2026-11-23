@@ -23,7 +23,7 @@ namespace Libs::LibKernel::SyncOnAddress {
 
 namespace {
 
-constexpr uint32_t SIGNAL_POLL_MICROS = 10000;
+constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
 
 using Clock = std::chrono::steady_clock;
 
@@ -62,7 +62,7 @@ struct WaitDeadline {
 
 [[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
 	if (!deadline.finite) {
-		return SIGNAL_POLL_MICROS;
+		return SIGNAL_APC_POLL_MICROS;
 	}
 
 	const auto now = Clock::now();
@@ -72,20 +72,13 @@ struct WaitDeadline {
 
 	const auto remaining =
 	    std::chrono::ceil<std::chrono::microseconds>(deadline.end - now).count();
-	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_POLL_MICROS));
-}
-
-void PollSignals(signal_poll_func_t signal_poll) {
-	if (signal_poll != nullptr) {
-		signal_poll();
-	}
+	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_APC_POLL_MICROS));
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 
 template <typename T>
-int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
-              signal_poll_func_t signal_poll) {
+int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline) {
 	bool       first_wait = true;
 
 	for (;;) {
@@ -115,7 +108,6 @@ int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		PollSignals(signal_poll);
 		if (deadline.finite && Clock::now() >= deadline.end) {
 			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
 		}
@@ -190,8 +182,7 @@ void UnregisterPortableWaiter(volatile void*                               addre
 }
 
 template <typename T>
-int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
-                 signal_poll_func_t signal_poll) {
+int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline) {
 	PortableWaiter waiter;
 	auto           entry      = RegisterPortableWaiter(address, &waiter);
 	bool           first_wait = true;
@@ -209,9 +200,6 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
 		}
 
 		(void)waiter.condition.WaitFor(&entry->mutex, slice_micros);
-		entry->mutex.Unlock();
-		PollSignals(signal_poll);
-		entry->mutex.Lock();
 
 		if (deadline.finite && Clock::now() >= deadline.end && ReadWord(address) == expected &&
 		    !waiter.wake_requested) {
@@ -254,37 +242,30 @@ int WakePortable(volatile void* address, int32_t count) {
 }
 
 template <typename T>
-int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
-             signal_poll_func_t signal_poll) {
+int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline) {
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, deadline, signal_poll);
+	return WaitLinux(address, expected, deadline);
 #else
-	result = WaitPortable(address, expected, deadline, signal_poll);
+	return WaitPortable(address, expected, deadline);
 #endif
-	PollSignals(signal_poll);
-	return result;
 }
 
 } // namespace
 
-int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros,
-           signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros) {
+	return WaitImpl(address, expected, MakeDeadline(timeout_micros));
 }
 
-int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros,
-           signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros) {
+	return WaitImpl(address, expected, MakeDeadline(timeout_micros));
 }
 
-int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout,
-           signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, MakeDeadline(timeout), signal_poll);
+int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout) {
+	return WaitImpl(address, expected, MakeDeadline(timeout));
 }
 
 int Wake(volatile void* address, int32_t count) {

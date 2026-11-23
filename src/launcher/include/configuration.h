@@ -87,6 +87,9 @@ public:
 	enum class PssrUpscaler { Linear, DLSS, FSR };
 	Q_ENUM(PssrUpscaler)
 
+	enum class AudioOutput { TV, AVReceiver, SoundBar, Headphones };
+	Q_ENUM(AudioOutput)
+
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
 
@@ -115,6 +118,7 @@ public:
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
+	AudioOutput            audio_output                = AudioOutput::TV;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -167,6 +171,7 @@ public:
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
+		audio_output                = other.audio_output;
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;

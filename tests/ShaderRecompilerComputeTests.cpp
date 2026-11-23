@@ -45,6 +45,7 @@
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -64,6 +65,8 @@
 #include "libs/agc.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
@@ -126,6 +129,7 @@
 
 namespace Libs {
 void InitAgcDriver_1(Loader::SymbolDatabase *symbols);
+void InitHmd2_1(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::Graphics {
@@ -326,9 +330,6 @@ struct ImageHeapTestAccess {
     return heap.m_memories.back()->dirty_pages.back() != 0u;
   }
 };
-
-// Guest faults the GPU fault route handled.
-std::atomic<uint64_t> g_handled_gpu_faults{0};
 
 struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
@@ -532,15 +533,26 @@ struct RenderExecutorTestAccess {
     if (pixel_active) {
       executor.PrepareBindings(pixel, result.pixel);
     }
+    DrawTargets targets{};
     executor.PrepareGraphicsBindings(
-        std::span{stages.data(), pixel_active ? 2u : 1u}, {});
+        std::span{stages.data(), pixel_active ? 2u : 1u}, targets);
     return result;
   }
 
   static void PrepareGraphicsBindings(RenderExecutor &executor,
                                       std::span<PreparedBindings *const> stages,
+                                      DrawTargets &targets) {
+    executor.PrepareGraphicsBindings(stages, targets);
+  }
+
+  static void PrepareGraphicsBindings(RenderExecutor &executor,
+                                      std::span<PreparedBindings *const> stages,
                                       std::span<RenderColorInfo> colors) {
-    executor.PrepareGraphicsBindings(stages, colors);
+    DrawTargets targets{};
+    std::ranges::copy(colors, targets.colors);
+    targets.color_count = static_cast<uint32_t>(colors.size());
+    executor.PrepareGraphicsBindings(stages, targets);
+    std::ranges::copy(std::span{targets.colors, colors.size()}, colors.begin());
   }
 
   static PipelineCache::Pipeline
@@ -650,8 +662,13 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
-                                       RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(buffer, color, slot);
+                                       RenderColorInfo &color, uint32_t slot,
+                                       bool exact_format = false) {
+    executor.ResolveRenderColorTarget(buffer, color, slot, false, exact_format);
+  }
+
+  static void SetLodStats(RenderExecutor &executor, bool enabled) {
+    executor.m_lod_stats = enabled;
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -712,10 +729,11 @@ struct PipelineCacheTestAccess {
 
   static auto Compiled(const PipelineCache &cache) { return cache.m_compiled; }
 
+  template <typename InputInfo>
   static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
-                                        ShaderVertexInputInfo &input) {
-    uint32_t push_data_cursor = 0;
-    return cache.GetProgram(params, input, push_data_cursor);
+                                        InputInfo &input,
+                                        ShaderRecompiler::IR::PushData::Window push_data = {}) {
+    return cache.GetProgram(params, input, push_data);
   }
 
   static void StoreLayout(PipelineCache &cache, uint64_t key,
@@ -1955,7 +1973,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, *options.profile, true);
+        result.program, options.input_info, {}, *options.profile, true);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -2113,7 +2131,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization,
-      static_cast<u32>(pixel_info.object_primitive_id));
+      {.begin = static_cast<u32>(pixel_info.object_primitive_id)});
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
@@ -2757,6 +2775,33 @@ public:
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
 
+    // An empty queue queries no timeline; a tick finished unobserved still releases its operation.
+    {
+      static uint32_t counter_queries = 0;
+      static PFN_vkGetSemaphoreCounterValue get_counter = nullptr;
+      auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+      get_counter = std::exchange(dispatcher.vkGetSemaphoreCounterValue, [](auto... args) {
+        ++counter_queries;
+        return get_counter(args...);
+      });
+      scheduler.PopPendingOperations();
+      const auto empty_queries = counter_queries;
+      const auto unobserved_tick = scheduler.CurrentTick();
+      scheduler.DeferOperation([&completed] { completed = 4; });
+      scheduler.Flush();
+      const auto timeline = scheduler.GetMasterSemaphore().Handle();
+      const vk::SemaphoreWaitInfo unobserved_wait{
+          .semaphoreCount = 1, .pSemaphores = &timeline, .pValues = &unobserved_tick};
+      const bool signaled =
+          m_runtime_context.device.waitSemaphores(&unobserved_wait, UINT64_MAX) ==
+          vk::Result::eSuccess;
+      scheduler.PopPendingOperations();
+      dispatcher.vkGetSemaphoreCounterValue = get_counter;
+      Require("SchedulerTimeline", "pending operation refresh",
+              empty_queries == 0 && signaled && completed == 4,
+              "an empty queue queried the timeline, or a finished tick stayed pending");
+    }
+
     vk::SemaphoreTypeCreateInfo timeline_type{};
     timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
     timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -2908,6 +2953,356 @@ public:
     scheduler.Finish();
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
+  }
+
+  void CheckStreamCopyWindow() {
+    constexpr const char *name = "StreamCopyWindow";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t range = 0x100;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "stream window allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "stream window mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
+      auto &scheduler = context.GetCommandScheduler();
+      // The guest writes `value` and a draw binds the range read-only: the copy's stream offset
+      // and first word.
+      const auto bind = [&](uint32_t value, uint64_t bytes = range) {
+        std::fill_n(reinterpret_cast<uint32_t *>(base), range / sizeof(uint32_t), value);
+        const auto [buffer, offset] = cache.ObtainBuffer(base, bytes, false);
+        Require(name, "stream copy", buffer == &stream,
+                "a CPU-written read-only range was not copied to the stream buffer");
+        uint32_t word = 0;
+        std::memcpy(&word, stream.Mapped().data() + offset, sizeof(word));
+        return std::pair{offset, word};
+      };
+      const auto run = [&](std::span<const uint32_t> packets) {
+        Pm4Execution execution;
+        Require(name, "packets", processor.Process(execution, packets) == Pm4ProcessResult::Complete,
+                "the command processor did not finish the packets");
+      };
+      const std::array<uint32_t, 2> nop{KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO), 0};
+      uint32_t label = 0;
+      const auto label_address = reinterpret_cast<uint64_t>(&label);
+      const std::array<uint32_t, 5> write_label{KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+          static_cast<uint32_t>(label_address), static_cast<uint32_t>(label_address >> 32u), 7};
+
+      const auto first = bind(1);
+      Require(name, "first copy", first.second == 1, "the stream copy lost the guest's bytes");
+      run(nop);
+      const auto kept = bind(2);
+      Require(name, "draw window reuse", kept == first,
+          "a later draw of the window copied the range again");
+      run(write_label);
+      const auto written = bind(3);
+      Require(name, "window end", label == 7 && written.first != first.first && written.second == 3,
+          "a draw after WRITE_DATA reused a copy made before it");
+      const auto tick = scheduler.CurrentTick();
+      const std::vector<uint8_t> filler(stream.Size() / 8 + 1);
+      (void)stream.Copy(filler.data(), filler.size());
+      const auto lapped = bind(4);
+      Require(name, "ring distance", scheduler.CurrentTick() == tick &&
+          lapped.first != written.first && lapped.second == 4,
+          "a draw reused a copy made more than an eighth of a ring lap ago");
+      scheduler.Flush();
+      const auto flushed = bind(5);
+      Require(name, "tick end", flushed.first != lapped.first && flushed.second == 5,
+          "a draw of a later submission reused a copy whose ring space can be overwritten");
+      const auto narrower = bind(6, range / 2);
+      Require(name, "range key", narrower.first != flushed.first && narrower.second == 6,
+          "a narrower range reused the copy of a wider one");
+      // A live copy the GPU-written range must not reuse.
+      (void)bind(7);
+      (void)cache.ObtainBuffer(base, range, true);
+      Require(name, "GPU-written range", cache.ObtainBuffer(base, range, false).first != &stream,
+          "a range the GPU wrote was bound from a stream copy");
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "stream window release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A resolve keeps a FindImage result while ResolveCache::Reuse holds and the resolver's own
+  // inputs are unchanged. A planted stamp window marks a kept result: plain results do not
+  // compare it.
+  void CheckResolveCache() {
+    constexpr const char *name = "ResolveCache";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr uint64_t kept = ~0ull;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "resolve cache allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "resolve cache mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto &resolve_cache = context.GetResolveCache();
+      auto &executor = context.GetRenderExecutor();
+      const auto linear = [&](uint64_t offset, vk::Format format, Prospero::BufferFormat guest) {
+        return MakeLinearDesc(base + offset, 0x4000, format, guest, Prospero::ImageType::kColor2D,
+                              {64, 64, 1}, 1, 4, 1);
+      };
+      const auto rgba = linear(0x10000, vk::Format::eR8G8B8A8Unorm,
+                               Prospero::BufferFormat::k8_8_8_8UNorm);
+      const auto find = [&](TextureCache::ImageDesc desc) {
+        const auto id = cache.FindImage(desc);
+        return std::pair{id, desc.stamp};
+      };
+      const auto unrelated = [&] {
+        return TextureCacheTestAccess::InsertImage(
+            cache, linear(0x18000, vk::Format::eR8G8B8A8Unorm,
+                          Prospero::BufferFormat::k8_8_8_8UNorm).info);
+      };
+
+      const auto created = find(rgba);
+      const auto [id, stamp] = find(rgba);
+      Require(name, "direct find", created.first == id && !created.second.epoch && stamp.epoch &&
+          resolve_cache.Reuse(id, stamp), "the second lookup of the only image at a range was not current");
+      TextureCacheTestAccess::SkipFrames(cache, 3);
+      Require(name, "access tick", resolve_cache.Reuse(id, stamp) &&
+          cache.GetImage(id).tick_accessed_last == TextureCacheTestAccess::GcTick(cache),
+          "a reuse did not access the image as FindImage does");
+      Require(name, "no image", !resolve_cache.Stamp(rgba.info, 1, {}).epoch,
+          "a lookup that matched no image was stamped");
+      auto keyed = rgba.info;
+      keyed.metadata.kind = ImageMetadataKind::Cmask;
+      const bool cmask = resolve_cache.Stamp(keyed, 1, id).clear_keys;
+      keyed.metadata.kind = ImageMetadataKind::Dcc;
+      const auto dcc = resolve_cache.Stamp(keyed, 1, id);
+      Require(name, "clear keys", cmask && dcc.clear_keys,
+          "a Dcc or Cmask result did not depend on its clear keys");
+      context.GetBufferCache().EndDrawWindow();
+      const auto windowed = resolve_cache.Stamp(keyed, 1, id);
+      Require(name, "draw window", !resolve_cache.Reuse(id, dcc) && resolve_cache.Reuse(id, windowed),
+          "a clear-key result outlived its draw window");
+      scheduler.Flush();
+      Require(name, "submission", !resolve_cache.Reuse(id, windowed) && resolve_cache.Reuse(id, stamp),
+          "a clear-key result outlived its submission, or a plain one did not");
+
+      const auto other = unrelated();
+      Require(name, "register", !resolve_cache.Reuse(id, stamp), "a registered image kept the stamp current");
+      const auto refound = find(rgba).second;
+      TextureCacheTestAccess::DeleteImage(cache, other);
+      Require(name, "unregister", !resolve_cache.Reuse(id, refound),
+          "an unregistered image kept the stamp current");
+      const auto overlap = TextureCacheTestAccess::InsertImage(
+          cache, linear(0x10000, vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float).info);
+      Require(name, "two candidates", !find(rgba).second.epoch,
+          "a lookup of two images at the range was stamped");
+      TextureCacheTestAccess::DeleteImage(cache, overlap);
+
+      // Textures: the T# and the module.
+      ShaderModule module;
+      module.id = 1;
+      module.info.stage = ShaderType::Pixel;
+      auto &resource = module.info.info.images.emplace_back();
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      const ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8Srgb) << 20u) | (1u << 30u), 1u << 14u,
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      auto &value = snapshot.images.emplace_back();
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      const ShaderStageRuntime runtime{&module, &snapshot};
+      PreparedBindings bindings;
+      // Whether PrepareBindings kept the slot's planted result.
+      const auto texture_kept = [&] {
+        bindings.images[0].desc.stamp.window = kept;
+        RenderExecutorTestAccess::ResetBindings(executor);
+        executor.PrepareBindings(runtime, bindings);
+        return bindings.images[0].desc.stamp.window == kept;
+      };
+      executor.PrepareBindings(runtime, bindings);
+      executor.PrepareBindings(runtime, bindings);
+      Require(name, "texture hit", texture_kept() &&
+          cache.GetImage(bindings.images[0].image_id).binding.is_bound,
+          "an unchanged texture slot was resolved again or not bound");
+      value.dwords[3] ^= DstSel(4, 5, 6, 7) ^ DstSel(5, 4, 6, 7);
+      Require(name, "T# key", !texture_kept(), "a changed T# kept the slot's result");
+      module.id = 2;
+      Require(name, "module key", !texture_kept(), "another module kept the slot's result");
+      RenderExecutorTestAccess::SetLodStats(executor, true);
+      Require(name, "mip stats", !texture_kept(), "a slot was kept while mip stats count");
+      RenderExecutorTestAccess::SetLodStats(executor, false);
+      const auto texture_other = unrelated();
+      Require(name, "texture image set", !texture_kept(),
+          "a slot was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, texture_other);
+
+      // Color targets: the registers and exact_format.
+      constexpr uint64_t color = base + 0x20000;
+      registers.SetColorBase(0, {.addr = color});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+                                 .channel_type = Prospero::ChannelType::kSrgb,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = 63, .width = 63});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1, .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      RenderColorInfo target{};
+      const auto resolve_color = [&](bool exact_format = false) {
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), target,
+                                                           0, exact_format);
+      };
+      // Plants a marked result of the current registers; a resolve that keeps it returns the mark.
+      const auto plant_color = [&] {
+        auto planted = target;
+        planted.desc.stamp.window = kept;
+        resolve_cache.SetColor(0, registers.GetRenderTarget(0), false, planted);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      };
+      const auto color_kept = [&](bool exact_format = false) {
+        resolve_color(exact_format);
+        return target.desc.stamp.window == kept;
+      };
+      resolve_color();
+      resolve_color();
+      RenderColorInfo probe{};
+      Require(name, "color stored",
+          resolve_cache.FindColor(0, registers.GetRenderTarget(0), false, probe),
+          "a color resolve did not keep its result");
+      plant_color();
+      Require(name, "color hit", color_kept() && cache.GetImage(target.image_id).binding.is_target,
+          "unchanged color registers were resolved again or not bound");
+      plant_color();
+      Require(name, "exact format key", !color_kept(true),
+          "an exact-format resolve kept a result found without it");
+      Require(name, "exact format stored",
+          resolve_cache.FindColor(0, registers.GetRenderTarget(0), true, probe),
+          "an exact-format resolve did not keep its result");
+      plant_color();
+      registers.SetColorBase(0, {.addr = color + 0x20000});
+      Require(name, "color registers", !color_kept(), "changed color registers kept the result");
+      registers.SetColorBase(0, {.addr = color});
+      resolve_color();
+      plant_color();
+      const auto color_other = unrelated();
+      Require(name, "color image set", !color_kept(),
+          "a color slot was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, color_other);
+
+      // Depth targets: the registers. Stencil plane records and HTile metadata change lookups.
+      HW::DepthRenderTarget depth_target{};
+      depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      depth_target.z_info.texture_compatibility =
+          Prospero::TextureCompatiblePlaneCompression::kEnable;
+      depth_target.z_info.htile_acceleration = true;
+      depth_target.z_info.z_compare_base = Prospero::ZCompareBase::kZMax;
+      depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      depth_target.stencil_info.texture_compatibility = Prospero::TextureCompatibleStencil::kEnable;
+      depth_target.z_read_base_addr = base + 0x90000;
+      depth_target.z_write_base_addr = base + 0x90000;
+      depth_target.stencil_read_base_addr = base + 0xa0000;
+      depth_target.stencil_write_base_addr = base + 0xa0000;
+      depth_target.htile_data_base_addr = base + 0xb0000;
+      depth_target.size.valid = true;
+      registers.SetDepthRenderTarget(depth_target);
+      HW::DepthControl depth_control{};
+      depth_control.z_enable = true;
+      depth_control.z_write_enable = true;
+      registers.SetDepthControl(depth_control);
+      registers.SetRenderControl({});
+      const auto &z = registers.GetDepthRenderTarget();
+      RenderDepthInfo depth{};
+      const auto resolve_depth = [&] {
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      };
+      const auto plant_depth = [&] {
+        auto planted = depth;
+        planted.desc.stamp.window = kept;
+        resolve_cache.SetDepth(z, planted.desc, planted.image_id);
+      };
+      const auto depth_kept = [&] {
+        resolve_depth();
+        return depth.desc.stamp.window == kept;
+      };
+      resolve_depth();
+      const auto depth_id = depth.image_id;
+      // An image at the stencil range, which AssociateStencil adopts as the plane record.
+      ImageInfo plane_info{};
+      plane_info.data = depth.desc.info.stencil;
+      plane_info.extent = depth.desc.info.extent;
+      const auto plane = TextureCacheTestAccess::InsertImage(cache, plane_info);
+      resolve_depth();
+      RenderDepthInfo depth_probe{};
+      Require(name, "depth stored", depth.image_id == depth_id &&
+          resolve_cache.FindDepth(z, depth_probe.desc, depth_probe.image_id),
+          "a depth resolve did not keep its result");
+      plant_depth();
+      Require(name, "depth hit", depth_kept() && depth.image_id == depth_id,
+          "unchanged depth registers were resolved again");
+      plant_depth();
+      depth_target.shading_rate_encoding = 1;
+      registers.SetDepthRenderTarget(depth_target);
+      Require(name, "depth registers", !depth_kept(),
+          "changed depth registers kept the result");
+      plant_depth();
+      const auto depth_other = unrelated();
+      Require(name, "depth image set", !depth_kept(),
+          "a depth target was kept after an image registered");
+      TextureCacheTestAccess::DeleteImage(cache, depth_other);
+
+      resolve_depth();
+      const auto adopted = depth.desc.stamp;
+      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
+      Require(name, "plane record", cache.GetImage(plane).depth_id == depth_id &&
+          !resolve_cache.Reuse(depth_id, adopted) && !resolve_cache.Stamp(plane_info, 1, plane).epoch,
+          "a rewritten plane record kept the stamp current, or a lookup of one was stamped");
+      resolve_depth();
+      const auto associated = depth.desc.stamp;
+      TextureCacheTestAccess::AssociateStencil(cache, depth_id, depth.desc.info.stencil);
+      Require(name, "plane repeat", resolve_cache.Reuse(depth_id, associated),
+          "an unchanged stencil association changed the image set");
+      (void)cache.FindDepthTarget(depth_id, depth.desc);
+      Require(name, "metadata insert", !resolve_cache.Reuse(depth_id, associated),
+          "new HTile metadata kept the stamp current");
+      resolve_depth();
+      const auto described = depth.desc.stamp;
+      (void)cache.FindDepthTarget(depth_id, depth.desc);
+      Require(name, "metadata repeat", resolve_cache.Reuse(depth_id, described),
+          "known HTile metadata changed the image set");
+
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "resolve cache release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckStreamBufferRing() {
@@ -3158,46 +3553,22 @@ public:
                                       initial_cache_ticks.second + 1},
             "a suspend point did not age both caches exactly once");
 
-    std::binary_semaphore second_entered{0};
+    // The CP executes a point once it submits the packets before it, so the
+    // next point does not wait for their native completion.
     std::binary_semaphore second_returned{0};
     std::jthread second([&] {
-      second_entered.release();
       gpu.SuspendPoint();
       second_returned.release();
     });
-    second_entered.acquire();
-    const bool second_overtook_completion =
-        second_returned.try_acquire_for(std::chrono::milliseconds(100));
-
-    uint32_t compute_value = 0;
-    std::array<uint32_t, 5> compute_commands{};
-    write(compute_commands.data(), &compute_value, 33);
-    bool host_lane_responded = false;
-    std::binary_semaphore compute_progress{0};
-    std::jthread compute([&] {
-      gpu.SubmitCompute(0x20, compute_commands);
-      gpu.SendCommandSync([&] { host_lane_responded = true; });
-      gpu.WaitForIdle();
-      compute_progress.release();
-    });
-    const bool compute_did_not_wait =
-        compute_progress.try_acquire_for(std::chrono::seconds(2));
+    const bool second_nonblocking =
+        second_returned.try_acquire_for(std::chrono::seconds(2));
     signal(1);
     second.join();
-    compute.join();
     finish();
-    Require(name, "one outstanding point", !second_overtook_completion,
-            "a second suspend point returned before the first native completion");
-    Require(name, "independent queue progress",
-            compute_did_not_wait && host_lane_responded && compute_value == 33,
-            "waiting for a previous suspend point blocked compute submissions "
-            "or the host command lane");
+    Require(name, "executed point", second_nonblocking,
+            "a second suspend point waited for native GPU completion");
     Require(name, "frame count", gpu.GetFrameNum() == 2,
             "suspend-point insertion did not advance the frame counter once");
-    Require(name, "async cache lifetime",
-            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
-                                      initial_cache_ticks.second + 2},
-            "asynchronous work aged the caches between frame boundaries");
 
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.
@@ -3249,60 +3620,55 @@ public:
     queued.join();
     gpu.Submit(after);
     release_lane.release();
+    // The stalled stream holds the queued point back, so the next point waits
+    // for it while asynchronous compute and the host command lane progress.
+    std::binary_semaphore next_returned{0};
+    std::jthread next([&] {
+      gpu.SuspendPoint();
+      next_returned.release();
+    });
+    const bool next_overtook_point =
+        next_returned.try_acquire_for(std::chrono::milliseconds(100));
+    uint32_t compute_value = 0;
+    std::array<uint32_t, 5> compute_commands{};
+    write(compute_commands.data(), &compute_value, 33);
+    gpu.SubmitCompute(0x20, compute_commands);
     bool prefix_reached = false;
     bool graphics_ordered = false;
+    bool compute_progressed = false;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(2);
     do {
       gpu.SendCommandSync([&] {
         prefix_reached = prefix == 22;
         graphics_ordered = skipped == 0 && after_reset == 0;
+        compute_progressed = compute_value == 33;
       });
       std::this_thread::yield();
-    } while (!prefix_reached && std::chrono::steady_clock::now() < deadline);
+    } while (!(prefix_reached && compute_progressed) &&
+             std::chrono::steady_clock::now() < deadline);
     std::array<uint32_t, 5> release_graphics{};
     write(release_graphics.data(), &label, 1);
     gpu.SubmitCompute(0x20, release_graphics);
+    next.join();
     finish();
+    Require(name, "one outstanding point", !next_overtook_point,
+            "a suspend point returned before the CP executed the previous one");
+    Require(name, "independent queue progress", compute_progressed,
+            "waiting for a previous suspend point blocked compute submissions "
+            "or the host command lane");
+    Require(name, "async cache lifetime",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 4,
+                                      initial_cache_ticks.second + 4},
+            "asynchronous work aged the caches between frame boundaries");
     Require(name, "graphics FIFO",
             prefix_reached && graphics_ordered && skipped == 0,
             "suspend point or later graphics overtook a stalled graphics stream");
     Require(name, "graphics reset", after_reset == 44,
             "suspend point preserved the previous frame's predicate");
 
-    // Delay the completion callback beyond the owner's shutdown when possible.
-    // Its credit must remain alive independently of the GuestGpu object.
-    std::binary_semaphore priority_entered{0};
-    std::binary_semaphore release_priority{0};
-    gpu.SendCommandSync([&] {
-      scheduler.DeferPriorityOperation([&] {
-        priority_entered.release();
-        release_priority.acquire();
-      });
-      SubmitInfo blocked;
-      blocked.AddWait(gate, 2);
-      scheduler.Flush(blocked);
-    });
-    gpu.SuspendPoint();
-    gpu.WaitForIdle();
-    std::binary_semaphore shutdown_returned{0};
-    std::jthread shutdown([&] {
-      context.ShutdownGpu();
-      shutdown_returned.release();
-    });
-    const bool shutdown_overtook_native =
-        shutdown_returned.try_acquire_for(std::chrono::milliseconds(100));
-    signal(2);
-    priority_entered.acquire();
-    if (!shutdown_overtook_native) {
-      (void)shutdown_returned.try_acquire_for(std::chrono::seconds(2));
-    }
-    release_priority.release();
-    shutdown.join();
-    scheduler.DrainPriorityOperations();
+    context.ShutdownGpu();
     m_runtime_context.device.destroySemaphore(gate, nullptr);
-    Require(name, "shutdown native completion", !shutdown_overtook_native,
-            "shutdown returned while the suspend point was still executing");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -3708,7 +4074,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     const bool compute_interrupt_matches =
         compute_interrupt_wait == 0 && interrupt_count == 1 &&
-        interrupt_event.ident == 0x20 && interrupt_event.data == 0x456u &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == (0x456 << 16 | 0x20) &&
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_interrupt_label == 0x55667788u;
 
@@ -3724,7 +4090,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     const bool compute_clock_matches =
         compute_clock_wait == 0 && interrupt_count == 1 &&
-        interrupt_event.ident == 0x20 && interrupt_event.data == 0x567u &&
+        interrupt_event.ident == 0x20 && interrupt_event.data == (0x567 << 16 | 0x20) &&
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_clock_label != 0;
 
@@ -3742,12 +4108,12 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
             compute_done_wait == 0 && interrupt_count == 1 &&
-                interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
+                interrupt_event.ident == 0x20 && interrupt_event.data == (0x678 << 16 | 0x20) &&
                 interrupt_event.udata == &compute_interrupt_udata &&
                 compute_done_label == compute_done_value,
             "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
 
-    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x789u);
+    auto send_context_commands = make_interrupt_packet(0, 4, nullptr, 0, 0x7654789u);
     gpu.SubmitCompute(0x20, send_context_commands);
     gpu.WaitForIdle();
     finish_gpu();
@@ -3757,7 +4123,7 @@ public:
         wait_for_interrupt(interrupt_event, interrupt_count);
     Require("GpuCommandLane", "kSendIntCtx interrupt",
             send_context_wait == 0 && interrupt_count == 1 &&
-                interrupt_event.ident == 0x20 && interrupt_event.data == 0x789u,
+                interrupt_event.ident == 0x20 && interrupt_event.data == (0x7654789ll << 16 | 0x20),
             "kSendIntCtx lost its interrupt or context id");
 
     // A GDS release interrupt follows the interrupts queued before it, so
@@ -3788,8 +4154,8 @@ public:
     const auto second_wait = wait_for_interrupt(second_event, second_count);
     Require("GpuCommandLane", "GDS interrupt order",
             parked_wait == LibKernel::KERNEL_ERROR_ETIMEDOUT && first_wait == 0 &&
-                interrupt_count == 1 && interrupt_event.data == 0xa1u &&
-                second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
+                interrupt_count == 1 && interrupt_event.data == (0xa1 << 16 | 0x20) &&
+                second_wait == 0 && second_count == 1 && second_event.data == (0xa2 << 16 | 0x20),
             "a GDS release interrupt overtook an earlier interrupt");
 
     // Repeats of the newest undelivered data count in its event instead of queuing.
@@ -3798,8 +4164,8 @@ public:
     }
     const bool coalesced =
         wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.fflags == 2 &&
-        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 &&
-        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3;
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 << 16 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3 << 16;
     Require("GpuCommandLane", "interrupt coalescing", coalesced,
             "undelivered interrupts with the same data were not counted in one event");
 
@@ -4350,6 +4716,96 @@ public:
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
 
+    // A GPU-thread vertex table read or SRT walker load beside GPU-written
+    // bytes on their page takes the backing and leaves those bytes GPU-written.
+    constexpr uint64_t table_gpu_address = fault_base + 0xf200;
+    constexpr uint64_t table_attrib_address = fault_base + 0xf800;
+    constexpr uint64_t table_vsharp_address = fault_base + 0xf900;
+    constexpr std::array<uint32_t, 2> table_attribs{0x0u, 0x1u};
+    std::array<ShaderBufferResource, 2> table_vsharps{};
+    table_vsharps[1].UpdateAddress48(0x123450);
+    Require("GpuCommandLane", "vertex table setup",
+            LibKernel::Memory::TryWriteBacking(table_attrib_address,
+                                               table_attribs.data(),
+                                               sizeof(table_attribs)) &&
+                LibKernel::Memory::TryWriteBacking(table_vsharp_address,
+                                                   table_vsharps.data(),
+                                                   sizeof(table_vsharps)),
+            "the vertex tables could not be written");
+    static const uint32_t table_shader[] = {0xbf810000u};
+    static std::array<uint16_t,
+                      static_cast<size_t>(DirectResourceType::Last) + 1>
+        table_offsets;
+    table_offsets.fill(ILLEGAL_DIRECT_OFFSET);
+    table_offsets[static_cast<size_t>(
+        DirectResourceType::PtrVertexBufferTable)] = 0;
+    table_offsets[static_cast<size_t>(
+        DirectResourceType::PtrVertexAttribDescTable)] = 2;
+    static ShaderUserData table_user_data{
+        .direct_resource_offset = table_offsets.data(),
+        .direct_resource_count = static_cast<uint16_t>(table_offsets.size())};
+    static ShaderSemantic table_semantic{.semantic = 1, .size_in_elements = 1};
+    HW::VertexShaderInfo table_vs{};
+    table_vs.es_regs.data_addr = reinterpret_cast<uint64_t>(table_shader);
+    table_vs.gs_regs.rsrc2.user_sgpr = 4;
+    const std::array<uint64_t, 2> table_pointers{table_vsharp_address,
+                                                 table_attrib_address};
+    std::memcpy(table_vs.gs_user_sgpr.value, table_pointers.data(),
+                sizeof(table_pointers));
+    ShaderMapUserData(table_vs.es_regs.data_addr,
+                      {.user_data = &table_user_data,
+                       .input_semantics = &table_semantic,
+                       .num_input_semantics = 1,
+                       .code_size_bytes = sizeof(table_shader)});
+    bool tables_read = false;
+    bool table_gpu_kept = false;
+    bool walker_read = false;
+    bool walker_gpu_kept = false;
+    bool walker_unmapped_zero = false;
+    LibKernel::Memory::InstallGpuResources(&resources);
+    gpu.SendCommandSync([&] {
+      (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
+                                      false);
+      buffer_cache.FillBuffer(table_gpu_address, sizeof(uint32_t), 0x7ab1e5u,
+                              false);
+      ShaderVertexInputInfo input{};
+      (void)PrepareProgram(table_vs, HW::Context{}, HW::UserConfig{}, input);
+      tables_read = input.resources_num == 1 &&
+                    std::ranges::equal(input.resources[0].fields,
+                                       table_vsharps[1].fields);
+      table_gpu_kept =
+          buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      walker_read = ShaderRecompiler::IR::MaterializeResources(
+                        ShaderRecompiler::IR::ExtractResourcePlan(
+                            SrtProgram(table_attrib_address + 4)),
+                        {}, snapshot, specialization) &&
+                    snapshot.flattened_srt == std::vector{table_attribs[1]};
+      walker_gpu_kept =
+          buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+      uint32_t unmapped = 0;
+      walker_unmapped_zero =
+          !LibKernel::Memory::TryReadBacking(empty_unmap_base, &unmapped,
+                                             sizeof(unmapped)) &&
+          ShaderRecompiler::IR::MaterializeResources(
+              ShaderRecompiler::IR::ExtractResourcePlan(
+                  SrtProgram(empty_unmap_base)),
+              {}, snapshot, specialization) &&
+          snapshot.flattened_srt == std::vector{0u};
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require("GpuCommandLane", "vertex tables beside GPU-written bytes",
+            tables_read && table_gpu_kept,
+            "a vertex table read beside GPU-written bytes downloaded them or "
+            "read the wrong entries");
+    Require("GpuCommandLane", "SRT walker load beside GPU-written bytes",
+            walker_read && walker_gpu_kept,
+            "an SRT walker load beside GPU-written bytes downloaded them or "
+            "read the wrong DWORD");
+    Require("GpuCommandLane", "SRT walker load of unmapped memory",
+            walker_unmapped_zero, "an unmapped SRT walker load did not read zero");
+
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest
     // memory, and guest accesses wait for the copy; a plain rewrite or a
@@ -4570,7 +5026,9 @@ public:
       // The label landed at once. A read waits for the copies instead of
       // faulting in a loop, and so does an invalidation beside them before
       // host I/O.
-      const auto faults = g_handled_gpu_faults.load();
+      Common::DebugCounters::SetEnabled(true);
+      const auto faults =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
       std::array<uint32_t, 4> read{};
       std::atomic<bool> read_done{false};
       std::atomic<bool> invalidated{false};
@@ -4610,7 +5068,10 @@ public:
                   texture_cache.WriteBackTick(suspended_address, 1) ==
                       suspended_tick,
               "a landed copy cleared another pending write-back");
-      const auto wait_faults = g_handled_gpu_faults.load() - faults;
+      const auto wait_faults =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults) -
+          faults;
+      Common::DebugCounters::SetEnabled(false);
       const bool unsubmitted =
           resources.GetCommandScheduler().CurrentTick() == suspended_tick;
       std::array<uint32_t, 4> suspended{};
@@ -7343,6 +7804,35 @@ public:
               "an exact backing with insufficient resources was expanded "
               "instead of being discarded and recreated");
 
+      // A view keeps its mip once later candidates resolve against its container.
+      const auto make_linear = [&](uint64_t offset, vk::Format format,
+                                   Prospero::BufferFormat guest, uint32_t bytes,
+                                   uint32_t extent, uint32_t levels) {
+        auto desc = MakeLinearDesc(base + offset, 0, format, guest,
+                                   Prospero::ImageType::kColor2D, {extent, extent, 1}, 1,
+                                   bytes, 1);
+        desc.info.resources.levels = levels;
+        desc.info.pitch = 0;
+        desc.info.UpdateSize();
+        desc.view_info.level_count = levels;
+        return desc;
+      };
+      constexpr uint64_t view_chain_offset = 0x780000;
+      auto view_chain = make_linear(view_chain_offset, vk::Format::eR8Unorm,
+                                    Prospero::BufferFormat::k8UNorm, 1, 64, 3);
+      const auto view_chain_id = texture_cache.FindImage(view_chain);
+      auto view_neighbor = make_linear(view_chain_offset + 0x2000, vk::Format::eR32Sfloat,
+                                       Prospero::BufferFormat::k32Float, 4, 8, 1);
+      const auto view_neighbor_id = texture_cache.FindImage(view_neighbor);
+      auto mip_view = make_linear(view_chain_offset + view_chain.info.mip_layout[1].offset,
+                                  vk::Format::eR8Unorm, Prospero::BufferFormat::k8UNorm, 1,
+                                  32, 1);
+      Require(name, "view mip after a later candidate",
+              view_neighbor_id != view_chain_id &&
+                  texture_cache.FindImage(mip_view) == view_chain_id &&
+                  mip_view.view_info.base_level == 1,
+              "a later overlapping candidate reset a view to its container's base level");
+
       ImageInfo chain = sampled.info;
       chain.data = {0x2394c1000, 0x384000};
       chain.extent = {64, 64, 1};
@@ -7359,9 +7849,8 @@ public:
       subresource.resources = {1, 1};
       subresource.mip_layout = {};
       subresource.mip_layout[0] = {0, 0x4000, 64, 64};
-      const auto mip = subresource.MipOf(chain);
       Require(name, "overlap resolution",
-              mip == 0 && subresource.SliceOf(chain, mip) == 0 &&
+              subresource.SubresourceOf(chain) == ImageSubresource{0, 0} &&
                   ImageRangeOverlaps(chain.data, subresource.data),
               "captured PS5 atlas mip/slice overlap did not resolve");
 
@@ -8167,6 +8656,69 @@ public:
           "the partial depth view lost a layer or failed to restore raw UINT "
           "sampling");
       DestroyBuffer(&layered_raw_d16_readback);
+
+      // PPSA18026: an image heap samples a four-layer shadow array as R16 while a draw renders
+      // slice 1 of its two-layer D16 HTile depth target.
+      constexpr uint64_t grow_depth_offset = layered_raw_d16_offset + 0x1000;
+      constexpr uint64_t grow_htile_address = base + grow_depth_offset + 0x800;
+      constexpr std::array<uint16_t, 8> grow_depth_values{
+          0x1111u, 0x1112u, 0x2221u, 0x2222u, 0x3331u, 0x3332u, 0x4441u, 0x4442u};
+      std::memcpy(memory + grow_depth_offset, grow_depth_values.data(),
+                  sizeof(grow_depth_values));
+      DrawTargets grow_targets{};
+      auto &grow_depth = grow_targets.depth;
+      grow_depth.desc = MakeLinearDesc(
+          base + grow_depth_offset, sizeof(grow_depth_values) / 2, vk::Format::eD16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+          sizeof(uint16_t), 1);
+      grow_depth.desc.type = BindingType::DepthTarget;
+      grow_depth.desc.info.metadata.kind = ImageMetadataKind::Htile;
+      grow_depth.desc.info.metadata.range = {grow_htile_address, 0x200};
+      grow_depth.desc.info.htile_initial_clear = true;
+      grow_depth.desc.view_info.type = vk::ImageViewType::e2D;
+      grow_depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      grow_depth.desc.view_info.base_layer = 1;
+      grow_depth.desc.view_info.layer_count = 1;
+      grow_depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      grow_depth.image_id = texture_cache.FindImage(grow_depth.desc);
+      (void)texture_cache.FindDepthTarget(grow_depth.image_id, grow_depth.desc);
+      RenderExecutorTestAccess::BindRenderTarget(context.GetRenderExecutor(),
+                                                 grow_depth.image_id);
+      const auto two_layer_depth = grow_depth.image_id;
+      vk::ClearValue grow_clear{};
+      grow_clear.depthStencil.depth = 1.0f;
+      TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), two_layer_depth,
+                                         {vk::ImageAspectFlagBits::eDepth, 0, 1, 1, 1},
+                                         grow_clear);
+      texture_cache.MarkGpuWritten(two_layer_depth);
+      auto grow_sampled = MakeLinearDesc(
+          base + grow_depth_offset, sizeof(grow_depth_values), vk::Format::eR16Unorm,
+          Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {2, 1, 1}, 4,
+          sizeof(uint16_t), 1);
+      const auto grown = texture_cache.FindImage(grow_sampled);
+      Require(name, "sampled depth array grows as depth",
+              grown != two_layer_depth &&
+                  !TextureCacheTestAccess::Contains(texture_cache, two_layer_depth) &&
+                  texture_cache.GetImage(grown).backing.format == vk::Format::eD16Unorm &&
+                  texture_cache.GetImage(grown).info.resources.layers == 4 &&
+                  texture_cache.IsMetaCleared(grow_htile_address, 3) &&
+                  texture_cache.FindTexture(grown, grow_sampled) != nullptr,
+              "a sampled view of more layers moved the depth target to a color copy");
+      RenderExecutorTestAccess::PrepareGraphicsBindings(
+          context.GetRenderExecutor(), std::span<PreparedBindings *const>{}, grow_targets);
+      const auto grow_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          context.GetRenderExecutor(), scheduler.Current(), grow_targets.colors, 0, grow_depth);
+      Require(name, "grown depth target rediscovery",
+              grow_depth.image_id == grown &&
+                  grow_rendering.depth_stencil_attachment.image_view != nullptr,
+              "the draw did not find its depth target in the grown image");
+      RenderExecutorTestAccess::ResetBindings(context.GetRenderExecutor());
+      Require(name, "grown depth layers",
+              ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 1) ==
+                      std::vector<u32>{0xffffffffu} &&
+                  ReadCachedTexel(name, context, grown, {}, {2, 1, 1}, 3) ==
+                      std::vector<u32>{0x44424441u},
+              "the grown depth image lost a GPU-written layer or skipped guest memory");
 
       // RE2 converts a prefix of a 32-layer HTile depth array to R32F storage.
       constexpr uint32_t htile_layers = 32;
@@ -14767,7 +15319,9 @@ public:
                 &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "captured scene mapping failed");
-    for (const auto initial_size : {metadata_size - 0x1000, metadata_size}) {
+    // Partial fills end at a 4 KiB block boundary or inside a block.
+    for (const auto initial_size :
+         {metadata_size - 0x1000, metadata_size - 0x800, metadata_size}) {
       std::memset(mapped, 0x5a, color_size);
       std::memset(reinterpret_cast<void *>(dcc_address), 0xff, metadata_size);
       RenderContext context(m_runtime_context);
@@ -16456,6 +17010,58 @@ public:
                     binding.offset == owner.Offset(buffer_address) &&
                     binding.range == 0x5000,
                 "descriptor rebind lost its clamped guest range or retained a stale host owner");
+      }
+
+      {
+        // A GiB-sized pool descriptor whose window is mapped in pieces around a free hole.
+        constexpr uint64_t page = 0x10000;
+        constexpr uint64_t address = base + allocation_size - page;
+        constexpr uint64_t piece = base + allocation_size + page;
+        constexpr u32 resident_value = 0x2468ace1u;
+        int64_t piece_offset = -1;
+        void *piece_mapping = reinterpret_cast<void *>(piece);
+        Require(name, "pool piece mapping",
+                LibKernel::Memory::KernelAllocateDirectMemory(
+                    0, LibKernel::Memory::KernelGetDirectMemorySize(), page, page, 0,
+                    &piece_offset) == 0 &&
+                    LibKernel::Memory::KernelMapDirectMemory(&piece_mapping, page, 0x3, 0x10,
+                                                             piece_offset, page) == 0,
+                "pool piece fixed mapping failed");
+        resources.MapMemory(piece, page);
+        LibKernel::Memory::WriteBacking(piece, &resident_value, sizeof(resident_value));
+        const auto program = make_buffer_program(ShaderType::Compute, {.read = true});
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        auto &value = snapshot.buffers.emplace_back();
+        value.dword_count = 4;
+        value.dwords = {static_cast<u32>(address), static_cast<u32>(address >> 32), 0x40000000u};
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
+        executor.RebindBuffers(bindings);
+        const auto &source = bindings.buffer_sources[0];
+        const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
+        Require(name, "oversized descriptor across a free hole",
+                source.address == address && source.size == 3u * page &&
+                    bindings.buffers[0].range == 3u * page,
+                "oversized descriptor stopped at its first unmapped hole");
+        auto output = CreateHostBuffer(name, 2u * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array<vk::BufferCopy, 2> copies{{
+            {owner.Offset(base + allocation_size), 0, sizeof(u32)},
+            {owner.Offset(piece), sizeof(u32), sizeof(u32)}}};
+        scheduler.Current().Handle().copyBuffer(owner.Handle(), output.buffer, copies.size(), copies.data());
+        scheduler.Finish();
+        Require(name, "oversized descriptor upload across a free hole",
+                ReadBuffer(name, output, 2) == std::vector<u32>{0u, resident_value},
+                "pool upload lost its zero-filled hole or the piece past it");
+        DestroyBuffer(&output);
+        // The buffer also watches the hole, which the section's own unmap does not cover.
+        resources.UnmapMemory(base + allocation_size, 2u * page);
+        Require(name, "pool piece release",
+                LibKernel::Memory::KernelMunmap(piece, page) == 0 &&
+                    LibKernel::Memory::KernelReleaseDirectMemory(piece_offset, page) == 0,
+                "pool piece release failed");
       }
 
       {
@@ -20480,9 +21086,6 @@ public:
     vertex_shader.info.stage = ShaderType::Vertex;
     vertex_shader.info.info.vertex_fetch_components[0] = 2;
     vertex_shader.info.info.vertex_fetch_components[1] = packed_vertex_color ? 3 : 4;
-    // No narrower host format covers the components the stage reads from either attribute.
-    vertex_shader.vertex_formats = {VulkanFormat(Prospero::BufferFormat::k32_32Float),
-                                    VulkanFormat(color_format)};
     ShaderModule pixel_shader{.id = 2, .module = CreateShaderModule(name, fragment.spirv)};
     pixel_shader.info.stage = ShaderType::Pixel;
     pixel_shader.info.info = fragment.program.info;
@@ -23816,22 +24419,7 @@ private:
     }
     namespace Exception = Common::HostException;
     Require("VulkanHarness", "guest fault handler",
-            Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
-              if (info.type != Exception::ExceptionType::AccessViolation ||
-                  (info.access_violation_type != Exception::AccessViolationType::Read &&
-                   info.access_violation_type != Exception::AccessViolationType::Write)) {
-                return false;
-              }
-              const auto access =
-                  info.access_violation_type == Exception::AccessViolationType::Write
-                      ? PageFaultAccess::Write : PageFaultAccess::Read;
-              if (!LibKernel::Memory::HandleGpuFault(
-                      access, info.access_violation_vaddr)) {
-                return false;
-              }
-              g_handled_gpu_faults.fetch_add(1, std::memory_order_relaxed);
-              return true;
-            }),
+            Exception::InstallHandler(Loader::KytyExceptionHandler),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;
@@ -30798,12 +31386,16 @@ TestCase VectorMinMaxMed3F16Ops() {
   AppendVMovLiteral(&code, 10, 0xaaaa5555u);
   AppendVMovLiteral(&code, 11, 0x12345678u);
   AppendVMovLiteral(&code, 12, 0x77772222u);
+  AppendVMovLiteral(&code, 6, 0x00008000u); // low=-0.0h
+  AppendVMovLiteral(&code, 7, 0x00000000u); // low=+0.0h
+  AppendVMovLiteral(&code, 13, 0x55551234u);
 
   AppendVop3(&code, 0x351, 10, Vgpr(0), Vgpr(1), Vgpr(2));
   AppendVop3(&code, 0x354, 11, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0xf, false, 0,
              0x4);
   AppendVop3(&code, 0x357, 12, Vgpr(3), Vgpr(4), Vgpr(5));
-  for (u32 i = 0; i < 3; i++) {
+  AppendVop3(&code, 0x357, 13, Vgpr(6), Vgpr(7), Vgpr(6));
+  for (u32 i = 0; i < 4; i++) {
     AppendStoreVgpr(&code, 10 + i, i);
   }
   AppendEnd(&code);
@@ -30811,7 +31403,7 @@ TestCase VectorMinMaxMed3F16Ops() {
   return {"VectorMinMaxMed3F16Ops",
           code,
           {},
-          {0xaaaa3c00u, 0x48005678u, 0x77773c00u},
+          {0xaaaa3c00u, 0x48005678u, 0x77773c00u, 0x55558000u},
           {O::V_MOV_B32, O::V_MIN3_F16, O::V_MAX3_F16, O::V_MED3_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -31684,6 +32276,35 @@ TestCase Vop1MoveRelSource() {
            O::S_ENDPGM}};
 }
 
+// V_MOVRELS reads v[12 + M0] from the 44 candidates v12..v55 with a runtime M0; an M0 past
+// the candidates, including one of 256 or more, reads v0.
+TestCase Vop1MoveRelSourceRuntimeIndex() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Vop1MoveRelSourceRuntimeIndex";
+  test.initial = {0, 5, 31, 40, 44, 0x105};
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 0, 0x50000000u);
+  for (u32 reg = 12; reg <= 52; reg++) AppendVMovLiteral(&code, reg, 0x51000000u + reg);
+  for (u32 slot = 0; slot < test.initial.size(); slot++) {
+    AppendVMovU32(&code, 30, slot * 4u);
+    AppendBufferLoadDword(&code, 54, 30);
+    code.push_back(EncodeVop1(0x02, 8, Vgpr(54)));
+    code.push_back(EncodeSMovB32(124, 8));
+    code.push_back(EncodeVop1(0x43, 55, Vgpr(12)));
+    AppendStoreVgpr(&code, 55, slot);
+    const u32 index = test.initial[slot];
+    test.expected.push_back(index < 44u ? 0x51000000u + 12u + index : 0x50000000u);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
+                  O::V_MOVRELS_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // A full wave needs no entry EXEC compare; each of the six V_MOVRELS compares M0 44 times.
+  test.compute_info.threads_num[0] = 64;
+  test.ir_counts = {{" = IEqual32 ", 0}, {" = ULessThan32 ", 6 * 44}};
+  return test;
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -31698,6 +32319,9 @@ TestCase Vop1MoveRelDestination() {
   code.push_back(EncodeSop1(0x04, 126, 106));
   code.push_back(EncodeVop1(0x42, 5, Vgpr(1)));
   code.push_back(EncodeSop1(0x04, 126, 8));
+  // M0 indexes with all its bits, so 0x102 is past the candidates and writes nothing.
+  AppendSMovLiteral(&code, 124, 0x102u);
+  code.push_back(EncodeVop1(0x42, 5, InlineU32(0)));
   code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 7, 4);
   AppendEnd(&code);
@@ -32193,22 +32817,22 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x40400000u, 0x7fc01234u, 0x40000000u, 0x40000000u},
       {0x80000000u, 0x00000000u, 0x3f800000u, 0x00000000u},
       {0x00000000u, 0x80000000u, 0xbf800000u, 0x80000000u},
-      {0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0x00000000u, 0x80000000u, 0x00000000u},
-      {0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u},
       {0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u},
-      {0xbf800000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0xbf800000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0xbf800000u, 0x00000000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0xbf800000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0x00000000u, 0xbf800000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0xbf800000u, 0x80000000u},
       {0x7fc01234u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x3f800000u, 0x40400000u, 0x40000000u, 0x40000000u},
       {0xc0400000u, 0xbf800000u, 0xc0000000u, 0xc0000000u},
       {0xff800000u, 0x7f800000u, 0x3f800000u, 0x3f800000u},
       {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
       {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
-      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
+      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0x7fc01234u},
       {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
   TestCase test;
   test.name = "VectorMed3F32NanUsesMin3Path";
@@ -32234,8 +32858,8 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
+  // Measured 13,727/32,230 words; keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 13737u : 32245u;
   return test;
 }
 
@@ -36819,7 +37443,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
     std::copy(row.begin(), row.end(), test.initial.begin() + descriptor_base / 4u + i * 8);
     if (!input.zero_payload)
       std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4);
-    // Read the selection on the GPU, as GTA's descriptor waterfall does.
+    // Read the selection on the GPU, as a descriptor waterfall does.
     test.initial[selection_base / 4u + i] = std::size(cases) - 1 - i;
     test.expected.push_back(cases[std::size(cases) - 1 - i].expected);
   }
@@ -44825,9 +45449,10 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
     }
     program.shader_info_complete = false;
     CollectShaderInfo(program, {.compute = &compute});
-    const auto push_start = layout == Layout::ShiftedPushData ? 3u :
-                            layout == Layout::StorageData ? PushData::NoStart : 0u;
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_start);
+    PushData::Window push_data;
+    if (layout == Layout::ShiftedPushData) push_data.begin = 3u;
+    if (layout == Layout::StorageData) push_data.begin = PushData::DwordCount;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_data);
     Require(test.name, "candidate bindings",
             program.bindings.descriptor_counts[0] == (single ? 1u : 2u) &&
                 program.info.buffers[0].descriptor_index == 0u &&
@@ -49303,6 +49928,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
+  AddCase(Vop1MoveRelSourceRuntimeIndex);
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -49876,7 +50502,7 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   for (const auto [stages, hs_wave, gs_wave] :
        {std::tuple{0x0260210du, 32u, 32u}, {0x0020210du, 32u, 64u}, {0x0040210du, 64u, 32u}}) {
     context.SetShaderStages(stages);
-    std::array<ShaderVertexInputInfo, 3> info;
+    std::array<ShaderVertexInputInfo, 3> info{};
     const auto params = PrepareTessellationPrograms(regs, context, info);
     for (u32 i = 0; i < 3; i++) {
       info[i].tess.ls_stride = info[i].tess.hs_stride = 16;
@@ -49955,6 +50581,117 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
   const std::set<uint64_t> ids(forward.begin(), forward.end());
   Require(name, "distinct modules", ids.size() == forward.size(),
           "different code or specialization shared a module id");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// A lookup finds the same pixel module whatever the draw data's size, and the same vertex
+// module whatever the pixel shader data's size.
+void CheckGraphicsPushDataModules(VulkanHarness &vulkan) {
+  using ShaderRecompiler::IR::PushData;
+  constexpr const char *name = "GraphicsPushDataModules";
+  // v_mov_b32 v0..v3, s0..s3; exp mrt0 v0..v3
+  const std::vector<u32> pixel{EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
+                               EncodeVop1(0x01, 2, 2), EncodeVop1(0x01, 3, 3),
+                               EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+  // v_mov_b32 v0, s8; exp pos0 v0, v0, v0, v0
+  const std::vector<u32> vertex{EncodeVop1(0x01, 0, 8), EncodeExp0(0x0c, 0xf),
+                                EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01)};
+  const ShaderParams pixel_params{.code = pixel, .user_data_count = 4, .hash = 1};
+  const ShaderParams vertex_params{.code = vertex, .user_data_count = 1, .hash = 2};
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto lookup = [&](const ShaderParams &params, auto input, PushData::Window push_data) {
+    return PipelineCacheTestAccess::GetProgram(cache, params, input, push_data);
+  };
+  const auto *pixel_module = lookup(pixel_params, ShaderPixelInputInfo{}, {});
+  Require(name, "pixel module",
+          pixel_module->info.bindings.push_data_start_dword == PushData::DwordCount - 4 &&
+              lookup(pixel_params, ShaderPixelInputInfo{}, {.begin = 1}) == pixel_module,
+          "a pixel program's push data moved with the draw's");
+  const auto *vertex_module = lookup(vertex_params, ShaderVertexInputInfo{}, {.end = 28});
+  Require(name, "vertex module",
+          vertex_module->info.bindings.push_data_start_dword == 0 &&
+              lookup(vertex_params, ShaderVertexInputInfo{}, {}) == vertex_module,
+          "a vertex program's push data moved with the pixel program's");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Vertex formats with the same channel count and type class (Uint, Sint, or any other as
+// Float) share a vertex module; each draw's pipeline holds its own format.
+void CheckVertexFormatModules(VulkanHarness &vulkan) {
+  using F = Prospero::BufferFormat;
+  constexpr const char *name = "VertexFormatModules";
+  // s_mov_b32 s0, 0; s_load_dwordx4 s[20:23], s[8:9]; v_cndmask_b32 v0, v8, v5;
+  // buffer_load_format_xyzw v[9:12], v0, s[20:23] idxen; exp pos0 v9..v12
+  const std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
+                              EncodeSmem1(0), EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                              EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                              EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12), EncodeSopp(0x01)};
+  const ShaderParams params{.code = code, .user_data_count = 2, .hash = 3};
+  RenderContext context(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = context.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  auto &cache = context.GetPipelineCache();
+  // The vertex module and pipeline of a draw fetching attribute 0 in `format`.
+  const auto draw = [&](F format) {
+    DrawRenderState state{.topology = vk::PrimitiveTopology::eTriangleList};
+    auto &input = state.vertex_info[0];
+    input.has_dynamic_vertex_fetch = true;
+    input.resources_num = input.buffers_num = 1;
+    input.buffers[0].stride = 16;
+    input.resources[0].fields[3] = DstSel(4, 5, 6, 7) | BufferFormat(format) << 12u;
+    input.resources_dst[0] = {.registers_num = 4, .attr_id = 0};
+    const auto *module = PipelineCacheTestAccess::GetProgram(cache, params, input);
+    return std::pair{module, cache.GetGraphicsPipeline(scheduler.Current(), state, {}).pipeline};
+  };
+  const auto uint8 = draw(F::k8_8_8_8UInt);
+  const auto uint16 = draw(F::k16_16_16_16UInt);
+  const auto unorm8 = draw(F::k8_8_8_8UNorm);
+  const auto float32 = draw(F::k32_32_32_32Float);
+  Require(name, "shared module",
+          uint16.first == uint8.first && float32.first == unorm8.first &&
+              uint16.second != uint8.second,
+          "formats differing only in channel widths compiled separate vertex modules or shared "
+          "a pipeline");
+  Require(name, "distinct modules",
+          unorm8.first != uint8.first && draw(F::k8_8_8_8SInt).first != uint8.first &&
+              draw(F::k8_8UInt).first != uint8.first,
+          "a vertex module was shared across integer signedness or channel counts");
+  scheduler.Finish();
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+// Graphics and async dispatches share a compute module; an async dispatch of one that reads HW_ID2 exits.
+void CheckComputeQueueModules(VulkanHarness &vulkan) {
+  constexpr const char *name = "ComputeQueueModules";
+  const std::vector<u32> plain{EncodeSopp(0x01)};
+  const std::vector<u32> queue_read{0xb96a1818u, EncodeSopp(0x01)}; // s_getreg_b32 vcc_lo, HW_ID2
+  for (const auto *code : {&plain, &queue_read})
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  const auto compile = [&](const std::vector<u32> &code, bool async) {
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+    regs.cs_regs.num_thread_x = 1;
+    regs.cs_regs.num_thread_y = 1;
+    regs.cs_regs.num_thread_z = 1;
+    regs.cs_regs.wave_size = 32;
+    ShaderComputeInputInfo input{};
+    input.async_compute = async;
+    return cache.GetComputeProgram(regs, input);
+  };
+  const auto *graphics = compile(plain, false);
+  Require(name, "shared module", compile(plain, true) == graphics,
+          "async compute recompiled a shader that does not read its queue");
+  Require(name, "queue read", compile(queue_read, false)->info.info.reads_queue_id,
+          "the graphics module did not record its HW_ID2 queue read");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal(name, [&] { (void)compile(queue_read, true); });
+#endif
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
@@ -50274,8 +51011,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                     packed_clear, size),
           "partial buffer coverage was classified as a complete clear");
 
-  // Same descriptor/dispatch as GTA3, with the stored value encoded in the
-  // shader.
+  // A clear whose stored value is encoded in the shader.
   user_data = {0x00200000u, 4u << 16u, 64u, 0x14204u};
   compute.workgroup_register = 4;
   compute.dispatch_thread_dimensions = false;
@@ -50292,7 +51028,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                    packed_clear, size) &&
               descriptor.Base48() == 0x200000u && size == 256u &&
               packed_clear == 0u,
-          "GTA3's actual scalar store was not recognized from IR");
+          "the inline scalar store was not recognized from IR");
   Require("Ps5GameExampleImageClear", "excess dispatch",
           !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
@@ -50371,7 +51107,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
-          "GTA3's scalar input was confused with its destination");
+          "the scalar input was confused with its destination");
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
@@ -50385,7 +51121,7 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
                                            ShaderType stage,
                                            const ShaderTessellationInputInfo &tess) {
   using namespace ShaderRecompiler;
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.logical_stage = stage;
   vertex.tess = tess;
   CompileOptions options;
@@ -50409,6 +51145,15 @@ TessellationStage CompileTessellationStage(const char *name, const std::vector<u
   Require(name, "disassembly", tools.Disassemble(compiled.spirv, &result.assembly),
           "failed to disassemble tessellation shader");
   return result;
+}
+
+std::vector<u32> TessellationStageKey(ShaderType stage, const ShaderTessellationInputInfo &tess) {
+  ShaderVertexInputInfo vertex{};
+  vertex.logical_stage = stage;
+  vertex.tess = tess;
+  std::vector<u32> key;
+  BuildStageStaticKey(vertex, key);
+  return key;
 }
 
 // Whether a Patch uvec4[vectors] variable of a storage class sits at a Location.
@@ -50595,6 +51340,43 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
               ds.assembly.find(output_topology == 2 ? "VertexOrderCcw" : "VertexOrderCw") ==
                   std::string::npos,
           "TES must preserve guest domain, partitioning, and winding");
+
+  // Each stage keys exactly the layout fields its module depends on; the rest leave it unchanged.
+  using Layout = ShaderTessellationInputInfo;
+  struct Field {
+    u32 Layout::*member;
+    u32 value;
+    const char *stages; // The stages depending on the field: L(S), H(S), T(ES).
+  };
+  const Field fields[] = {
+      {&Layout::input_control_points, tess.input_control_points + 1, "H"},
+      {&Layout::output_control_points, tess.output_control_points + 1, "HT"},
+      {&Layout::ls_stride, tess.ls_stride + 16, "LH"},
+      {&Layout::hs_stride, tess.hs_stride + 16, "HT"},
+      {&Layout::patch_base, tess.patch_base + 16, "HT"},
+      {&Layout::patch_size, tess.patch_size + 16, "HT"},
+      {&Layout::domain, 3 - domain, "HT"},
+      {&Layout::partitioning, 5 - partitioning, "T"},
+      {&Layout::output_topology, 5 - output_topology, "T"},
+  };
+  const auto check_layout = [&](const char *what, char stage_letter, ShaderType stage,
+                                const std::vector<u32> &code, const std::string &assembly) {
+    const auto key = TessellationStageKey(stage, tess);
+    for (const auto &field : fields) {
+      auto layout = tess;
+      layout.*field.member = field.value;
+      const bool depends = std::strchr(field.stages, stage_letter) != nullptr;
+      Require(name, what,
+              (TessellationStageKey(stage, layout) != key) == depends &&
+                  (depends ||
+                   CompileTessellationStage(name, code, stage, layout).assembly == assembly),
+              "a tessellation stage key must hold exactly the layout fields its module depends on");
+    }
+  };
+  check_layout("LS layout key", 'L', ShaderType::Local, local, ls.assembly);
+  check_layout("HS layout key", 'H', ShaderType::TessellationControl, control, hs.assembly);
+  check_layout("TES layout key", 'T', ShaderType::TessellationEvaluation, evaluation,
+               ds.assembly);
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -50883,7 +51665,7 @@ void CheckEmbeddedFetchVertexOffset() {
                            Prospero::BufferFormat format = Prospero::BufferFormat::k32_32_32_32Float) {
     std::array<u32, 11> user_data{};
     user_data[10] = slot10;
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.logical_stage = stage;
     vertex.tess = {.input_control_points = 3, .output_control_points = 3,
                    .ls_stride = 124, .hs_stride = 128, .domain = 1,
@@ -50927,7 +51709,7 @@ void CheckEmbeddedFetchVertexOffset() {
 
   const auto Resolve = [](const CompiledShader &result,
                           u32 index_offset) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.has_dynamic_vertex_fetch = true;
     ShaderModule module;
     module.info.user_data_base = result.program.user_data_base;
@@ -50938,7 +51720,7 @@ void CheckEmbeddedFetchVertexOffset() {
   };
 
   const auto ResolveInstance = [](const CompiledShader &result) {
-    ShaderVertexInputInfo vertex;
+    ShaderVertexInputInfo vertex{};
     vertex.has_dynamic_vertex_fetch = true;
     ShaderModule module;
     module.info.user_data_base = result.program.user_data_base;
@@ -53919,7 +54701,7 @@ void CheckEmbeddedFetchLaneSpill() {
   AppendEnd(&code);
 
   std::array<u32, 11> user_data{};
-  ShaderVertexInputInfo vertex;
+  ShaderVertexInputInfo vertex{};
   vertex.has_dynamic_vertex_fetch = true;
   vertex.fetch_buffer_reg = 0;
   vertex.resources_num = 1;
@@ -54687,7 +55469,7 @@ void CheckShaderFusion() {
         back.type = static_cast<uint8_t>(c.gs ? Prospero::ShaderBinaryType::kGsBack
                                             : Prospero::ShaderBinaryType::kHsBack);
         Shader fused{};
-        const auto fuse = older ? Gen5::AgcFuseShaderHalves : Gen5::AgcFuseShaderHalves_0200;
+        const auto fuse = older ? Agc::AgcFuseShaderHalves : Agc::AgcFuseShaderHalves_0200;
         const auto result = fuse(&fused, &front, &back, in_place ? nullptr : scratch.data());
         const auto *regs = fused.sh_registers;
         Require("ShaderFusion", "native fused registers",
@@ -54716,7 +55498,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
       0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
       0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e};
   LibKernel::Memory::InstallGpuResources(&renderer);
-  Require(name, "driver module startup", Gen5Driver::Initialize() == 0,
+  Require(name, "driver module startup", AgcDriver::Initialize() == 0,
           "driver module startup failed before guest initialization");
   const auto direct_memory_size = LibKernel::Memory::KernelGetDirectMemorySize();
   int64_t available_offset = -1;
@@ -54732,7 +55514,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
               0, direct_memory_size, available_size, 0x4000, 0, &guest_allocation) == 0,
           "guest could not allocate all remaining direct memory");
   uint32_t state = 0xabcdef01u;
-  Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
+  Require(name, "driver startup", Agc::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
           "Agc startup required free guest memory or changed its ignored public state pointer");
   LibKernel::Memory::VirtualQueryInfo mapping{};
   Require(name, "shared driver backing",
@@ -54760,8 +55542,8 @@ void CheckAgcSystemTable(RenderContext &renderer) {
   Require(name, "default instrumentation", *instrumentation == 0,
           "unused vertex validation was enabled at startup");
   *instrumentation = 0x12340000u;
-  Require(name, "repeat startup", Gen5Driver::Initialize() == 0 &&
-              Gen5::AgcInit(nullptr, 13) == 0 &&
+  Require(name, "repeat startup", AgcDriver::Initialize() == 0 &&
+              Agc::AgcInit(nullptr, 13) == 0 &&
               *instrumentation == 0x12340000u,
           "repeat Agc initialization reset existing system state");
   *instrumentation = 0;
@@ -54773,7 +55555,7 @@ void CheckAgcSystemTable(RenderContext &renderer) {
 }
 
 struct CommandBufferLayout {
-  using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
+  using Callback = KYTY_SYSV_ABI bool (*)(Agc::CommandBuffer *, uint32_t,
                                           void *);
 
   uint32_t *bottom;
@@ -54812,19 +55594,19 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
       {"async byte range", true, 0, 0, 0x9000, 0x2036000308ull, 0x20, 400,
        {0xc0065800, 0, 1, 0, 0x20360003, 0, 25, 0x9000}},
   };
-  Require(name, "packet sizes", Gen5::AgcDcbAcquireMemGetSize() == 32 &&
-              Gen5::AgcAcbAcquireMemGetSize() == 32,
+  Require(name, "packet sizes", Agc::AgcDcbAcquireMemGetSize() == 32 &&
+              Agc::AgcAcbAcquireMemGetSize() == 32,
           "native single ACQUIRE_MEM packet size changed");
   for (const auto &test : cases) {
     std::array<uint32_t, 8> packet{};
     CommandBufferLayout layout{packet.data(), packet.data() + packet.size(),
                                packet.data(), packet.data() + packet.size(),
                                nullptr, nullptr, 0};
-    auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&layout);
+    auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&layout);
     const auto *base = reinterpret_cast<const volatile void *>(test.base);
     auto *emitted = test.async
-        ? Gen5::AgcAcbAcquireMem(buffer, test.gcr, base, test.size, test.poll)
-        : Gen5::AgcDcbAcquireMem(buffer, test.engine, test.cb_db, test.gcr,
+        ? Agc::AgcAcbAcquireMem(buffer, test.gcr, base, test.size, test.poll)
+        : Agc::AgcDcbAcquireMem(buffer, test.engine, test.cb_db, test.gcr,
                                  base, test.size, test.poll);
     Require(name, test.label, emitted == packet.data() &&
                 layout.cursor_up == packet.data() + packet.size() && packet == test.expected,
@@ -54853,7 +55635,7 @@ void CheckPm4ResetQueue(RenderContext &renderer) {
     CommandBufferLayout dcb{packets.data(), packets.data() + packets.size(),
                             packets.data(), packets.data() + packets.size(),
                             nullptr, nullptr, 0};
-    Gen5::AgcDcbResetQueue(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), op,
+    Agc::AgcDcbResetQueue(reinterpret_cast<Agc::CommandBuffer *>(&dcb), op,
                            0);
     Pm4Execution execution;
     Require(name, "processed",
@@ -54892,6 +55674,43 @@ void CheckPm4ResetQueue(RenderContext &renderer) {
           ctx.GetPrimitiveResetIndex() == 0xffffffffu &&
               processor.GetDispatchIndirectArgsBaseAddress() == 0,
           "the reset did not clear the context and the indirect bases");
+
+  // A compute queue resets Sh state only, and only when the op names it.
+  CommandProcessor compute(renderer, 0x20);
+  const auto reset_async = [&](uint32_t op, uint32_t gcr) {
+    std::array<uint32_t, 11> packet{};
+    CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                            packet.data(), packet.data() + packet.size(),
+                            nullptr, nullptr, 0};
+    Agc::AgcAcbResetQueue(reinterpret_cast<Agc::CommandBuffer *>(&acb), op);
+    const std::array<uint32_t, 11> expected{
+        0xc0017900u, 0x342u, 0xce000000u | op, gcr == 0 ? 0u : 0xc0065800u,
+        0,           0,      0,                0,
+        0,           0,      gcr};
+    Pm4Execution execution;
+    Require(name, "async packet",
+            packet == expected &&
+                compute.Process(execution, {packet.data(), acb.cursor_up}) ==
+                    Pm4ProcessResult::Complete,
+            "the async reset packets are not the native ones or did not complete");
+  };
+  compute.GetCtx().SetPrimitiveResetIndex(7);
+  compute.GetShCtx().SetCsUserSgpr(0, 7);
+  compute.GetUcfg().SetPrimitiveResetControl(7);
+  compute.SetDispatchIndirectArgsBaseAddress(0x1000);
+  const auto kept = [&](uint32_t sgpr) {
+    return compute.GetShCtx().GetCs().cs_user_sgpr.value[0] == sgpr &&
+           compute.GetCtx().GetPrimitiveResetIndex() == 7 &&
+           compute.GetUcfg().GetPrimitiveResetControl() == 7 &&
+           compute.GetDispatchIndirectArgsBaseAddress() == 0x1000;
+  };
+  reset_async(0x40u, 0xc1u);
+  reset_async(0x1c0u, 0xc3a1u);
+  Require(name, "async keeps state", kept(7),
+          "an async reset without Sh state reset the queue");
+  reset_async(Op::ShState, 0);
+  Require(name, "async Sh", kept(0),
+          "an async Sh reset did not reset only Sh state");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -54915,10 +55734,10 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
                             0};
   const auto address32 = reinterpret_cast<uint64_t>(&label32);
   auto *emitted32 =
-      Gen5::AgcDcbWaitRegMem(reinterpret_cast<Gen5::CommandBuffer *>(&dcb32), 0,
+      Agc::AgcDcbWaitRegMem(reinterpret_cast<Agc::CommandBuffer *>(&dcb32), 0,
                              3, 0, 0, &label32, label32, UINT32_MAX, 400);
   Require("Pm4WaitPackets", "native 32-bit packet",
-          Gen5::AgcDcbWaitOnAddressGetSize(0) == 56 &&
+          Agc::AgcDcbWaitOnAddressGetSize(0) == 56 &&
               emitted32 == packet32.data() &&
               dcb32.cursor_up == packet32.data() + 14 &&
               packet32[0] == 0xc0027904u && packet32[1] == 0x342u &&
@@ -54942,8 +55761,8 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
   packet32[7] |= 0xa5a40000u;
   Require(
       "Pm4WaitPackets", "native 32-bit patch",
-      Gen5::AgcWaitRegMemPatchAddress(packet32.data(), &patched_label32) == 0 &&
-          Gen5::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) ==
+      Agc::AgcWaitRegMemPatchAddress(packet32.data(), &patched_label32) == 0 &&
+          Agc::AgcWaitRegMemPatchReference(packet32.data(), patched_label32) ==
               0 &&
           packet32[2] ==
               (0xc8010000u |
@@ -54957,6 +55776,22 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
           packet32[8] == patched_label32 && execute(packet32.data(), 14),
       "32-bit native wait patch did not update metadata and hardware packet");
 
+  // 0xfc patches FUNCTION to NOT_EQUAL, so the satisfied wait now blocks; the
+  // cache policy bits stay.
+  const auto patch_compare = [&](auto &packet, uint32_t size_dw) {
+    packet[5] |= 0x06000000u;
+    auto expected = packet;
+    expected[5] = 0x06000014u;
+    Pm4Execution execution;
+    return Agc::AgcWaitRegMemPatchCompareFunction(packet.data(), 0xfc) == 0 &&
+           packet == expected &&
+           processor.Process(execution, {packet.data(), size_dw}) ==
+               Pm4ProcessResult::Blocked;
+  };
+  Require("Pm4WaitPackets", "32-bit compare function patch",
+          patch_compare(packet32, 14),
+          "32-bit compare function patch did not rewrite FUNCTION alone");
+
   alignas(8) uint64_t label64 = 0x1122334455667788ull;
   std::array<uint32_t, 16> packet64{};
   CommandBufferLayout dcb64{packet64.data(),
@@ -54968,11 +55803,11 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
                             0};
   const auto address64 = reinterpret_cast<uint64_t>(&label64);
   auto *emitted64 =
-      Gen5::AgcDcbWaitRegMem(reinterpret_cast<Gen5::CommandBuffer *>(&dcb64), 1,
+      Agc::AgcDcbWaitRegMem(reinterpret_cast<Agc::CommandBuffer *>(&dcb64), 1,
                              3, 0, 0, &label64, label64, UINT64_MAX, 400);
   Require("Pm4WaitPackets", "native 64-bit packet",
-          Gen5::AgcDcbWaitOnAddressGetSize(1) == 64 &&
-              Gen5::AgcDcbWaitOnAddressGetSize(2) == 0 &&
+          Agc::AgcDcbWaitOnAddressGetSize(1) == 64 &&
+              Agc::AgcDcbWaitOnAddressGetSize(2) == 0 &&
               emitted64 == packet64.data() &&
               dcb64.cursor_up == packet64.data() + packet64.size() &&
               packet64[0] == 0xc0027904u && packet64[1] == 0x342u &&
@@ -54998,8 +55833,8 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
   packet64[7] |= 0x5a580000u;
   Require(
       "Pm4WaitPackets", "native 64-bit patch",
-      Gen5::AgcWaitRegMemPatchAddress(packet64.data(), &patched_label64) == 0 &&
-          Gen5::AgcWaitRegMemPatchReference(packet64.data(),
+      Agc::AgcWaitRegMemPatchAddress(packet64.data(), &patched_label64) == 0 &&
+          Agc::AgcWaitRegMemPatchReference(packet64.data(),
                                             0xdeadbeefaabbccddull) == 0 &&
           packet64[2] ==
               (0xc8020000u |
@@ -55014,16 +55849,22 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
           execute(packet64.data(), packet64.size()),
       "64-bit native wait patch did not preserve the native high reference "
       "DWORD");
+  Require("Pm4WaitPackets", "64-bit compare function patch",
+          patch_compare(packet64, packet64.size()),
+          "64-bit compare function patch did not rewrite FUNCTION alone");
 
   std::array<uint32_t, 16> invalid{};
   const uint32_t short_payload = 0x342u;
   Require(
       "Pm4WaitPackets", "invalid packet",
-      Gen5::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
+      Agc::AgcWaitRegMemPatchAddress(invalid.data(), &label32) ==
               packet_mismatch &&
-          Gen5::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
+          Agc::AgcWaitRegMemPatchReference(invalid.data(), label32) ==
               packet_mismatch &&
-          !Gen5::AgcIsInternalDataPacket(
+          Agc::AgcWaitRegMemPatchCompareFunction(invalid.data(), 4) ==
+              packet_mismatch &&
+          invalid == std::array<uint32_t, 16>{} &&
+          !Agc::AgcIsInternalDataPacket(
               KYTY_PM4(2, Pm4::IT_SET_UCONFIG_REG, 1), &short_payload),
       "wait patch accepted a packet without the metadata prefix");
   std::printf("[host]    %-32s ok\n", "Pm4WaitPackets");
@@ -55055,8 +55896,8 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
                           nullptr,
                           nullptr,
                           0};
-  auto *emitted = Gen5::AgcDcbDrawIndirectMulti(
-      reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0x11223344u, 1u,
+  auto *emitted = Agc::AgcDcbDrawIndirectMulti(
+      reinterpret_cast<Agc::CommandBuffer *>(&dcb), 0x11223344u, 1u,
       0x55667788u, count_address, 0xaabbccddu, modifier);
 
   const uint32_t invalid_payload[]{0x342u, 0xc6000010u};
@@ -55065,11 +55906,11 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
               dcb.cursor_up == packet.data() + packet.size() &&
               packet == expected && execute(packet.data(), 3u) &&
               execute(packet.data() + 13u, 3u) &&
-              Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
+              Agc::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
                   packet_mismatch &&
-              Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
+              Agc::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
                   packet_mismatch &&
-              !Gen5::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
+              !Agc::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
           "indirect multi-draw packet differs from the expected stream");
 
   constexpr uint32_t data_offset = 0x5c08;
@@ -55095,19 +55936,19 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
       for (const uint64_t draw_modifier : {0ull, 0x100ull, 1ull << 32u, (1ull << 32u) | 0x100ull}) {
         packet.fill(0);
         dcb.cursor_up = packet.data();
-        auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+        auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&dcb);
         alignas(4) uint32_t draw_count = 3;
         if (multi) {
-          emitted = indexed ? Gen5::AgcDcbDrawIndexIndirectMulti(buffer, data_offset, 1, 2,
+          emitted = indexed ? Agc::AgcDcbDrawIndexIndirectMulti(buffer, data_offset, 1, 2,
                                   &draw_count, stride, draw_modifier)
-                            : Gen5::AgcDcbDrawIndirectMulti(buffer, data_offset, 1, 2,
+                            : Agc::AgcDcbDrawIndirectMulti(buffer, data_offset, 1, 2,
                                   &draw_count, stride, draw_modifier);
         } else {
-          emitted = indexed ? Gen5::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
-                            : Gen5::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
+          emitted = indexed ? Agc::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
+                            : Agc::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
         }
-        const uint32_t begin = multi && !indexed ? 3 : 0;
-        const uint32_t words = multi ? (indexed ? 10 : 16) : 5;
+        const uint32_t begin = multi ? 3 : 0;
+        const uint32_t words = multi ? 16 : 5;
         const uint32_t opcode = multi ? (indexed ? 0xc0083800u : 0xc0082c00u)
                                       : (indexed ? 0xc0032500u : 0xc0032400u);
         const uint32_t initiator = (indexed ? 0 : 2) |
@@ -55302,9 +56143,9 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
       break;
     }
     const auto size_dw = static_cast<size_t>(
-        Gen5::AgcDcbContextStateOpGetSize(operation_value) / 4);
-    auto *emitted = Gen5::AgcDcbContextStateOp(
-        reinterpret_cast<Gen5::CommandBuffer *>(&dcb), operation_value);
+        Agc::AgcDcbContextStateOpGetSize(operation_value) / 4);
+    auto *emitted = Agc::AgcDcbContextStateOp(
+        reinterpret_cast<Agc::CommandBuffer *>(&dcb), operation_value);
     bool packet_matches = true;
     size_t segment_offset = 0;
     for (size_t i = 0; i < segment_count; i++) {
@@ -55444,11 +56285,11 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
           "processor reset retained an invalid saved Cx state");
 
   Require("Pm4ContextState", "HLE packet size",
-          Gen5::AgcDcbContextStateOpGetSize(0) == 20 &&
-              Gen5::AgcDcbContextStateOpGetSize(1) == 108 &&
-              Gen5::AgcDcbContextStateOpGetSize(2) == 108 &&
-              Gen5::AgcDcbContextStateOpGetSize(3) == 128 &&
-              Gen5::AgcDcbContextStateOpGetSize(4) == 0,
+          Agc::AgcDcbContextStateOpGetSize(0) == 20 &&
+              Agc::AgcDcbContextStateOpGetSize(1) == 108 &&
+              Agc::AgcDcbContextStateOpGetSize(2) == 108 &&
+              Agc::AgcDcbContextStateOpGetSize(3) == 128 &&
+              Agc::AgcDcbContextStateOpGetSize(4) == 0,
           "context-state HLE sizes do not match the expected packet layout");
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
@@ -55481,19 +56322,19 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   std::array<uint32_t, 7> nop_commands{};
   CommandBufferLayout nop_dcb{nop_commands.data(), nop_commands.data() + nop_commands.size(),
       nop_commands.data(), nop_commands.data() + nop_commands.size(), nullptr, nullptr, 0};
-  auto* nop_cb = reinterpret_cast<Gen5::CommandBuffer*>(&nop_dcb);
-  Require(name, "zero-sized NOP", Gen5::AgcCbNop(nop_cb, 0) == nullptr &&
+  auto* nop_cb = reinterpret_cast<Agc::CommandBuffer*>(&nop_dcb);
+  Require(name, "zero-sized NOP", Agc::AgcCbNop(nop_cb, 0) == nullptr &&
               nop_dcb.cursor_up == nop_commands.data() && nop_commands[0] == 0,
           "zero-sized reservation changed the command buffer");
-  Require(name, "empty command list NOP", Gen5::AgcCbNop(nop_cb, 1) == nop_commands.data() &&
+  Require(name, "empty command list NOP", Agc::AgcCbNop(nop_cb, 1) == nop_commands.data() &&
               nop_dcb.cursor_up == nop_commands.data() + 1 && nop_commands[0] == 0xffff1000u &&
-              Gen5::AgcCbNopGetSize(1) == 4 && Gen5::AgcGetPacketSize(nop_commands.data()) == 1,
+              Agc::AgcCbNopGetSize(1) == 4 && Agc::AgcGetPacketSize(nop_commands.data()) == 1,
           "native NOP(1) did not reserve one DWORD");
   const auto completion = write(&selected, 7);
   std::copy(completion.begin(), completion.end(), nop_commands.begin() + 1);
   nop_commands.back() = 0xffff1000u;
   for (uint32_t predication : {1u, 0u}) {
-    Gen5::AgcSetRangePredication(nop_commands.data(), nop_commands.data() + nop_commands.size(), predication);
+    Agc::AgcSetRangePredication(nop_commands.data(), nop_commands.data() + nop_commands.size(), predication);
     Require(name, "NOP range predication", nop_commands[0] == (0xffff1000u | predication) &&
                 nop_commands.back() == (0xffff1000u | predication) &&
                 nop_commands[1] == (completion[0] | predication) && nop_commands[5] == 7,
@@ -55516,7 +56357,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   CommandBufferLayout payload_dcb{payload.data(), payload.data() + payload.size(),
       payload.data(), payload.data() + payload.size(), nullptr, nullptr, 0};
   Require(name, "NOP payload reservation",
-          Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
+          Agc::AgcCbNop(reinterpret_cast<Agc::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
               payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
           "NOP emitter overwrote the caller's reserved payload");
   // The PS4-era flip tags are payload too.
@@ -55539,24 +56380,24 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   disabled_commands[6] = 0x68750123u;
   CommandBufferLayout release_dcb{disabled_commands.data() + 7, disabled_commands.data() + 15,
       disabled_commands.data() + 7, disabled_commands.data() + 15, nullptr, nullptr, 0};
-  auto* release = Gen5::AgcCbReleaseMem(
-      reinterpret_cast<Gen5::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
-      reinterpret_cast<const volatile Gen5::Label*>(&released), 2, 77, 0, 0, 0, 0);
+  auto* release = Agc::AgcCbReleaseMem(
+      reinterpret_cast<Agc::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
+      reinterpret_cast<const volatile Agc::Label*>(&released), 2, 77, 0, 0, 0, 0);
   const auto enabled_write = write(&selected, 88);
   std::copy(enabled_write.begin(), enabled_write.end(), disabled_commands.begin() + 15);
   const auto unpatched_commands = disabled_commands;
   Require(name, "SetNop packets",
           release == disabled_commands.data() + 7 &&
-              Gen5::AgcSetNop(disabled_commands.data()) == 0 &&
-              Gen5::AgcSetNop(disabled_commands.data() + 5) == 0 && Gen5::AgcSetNop(release) == 0 &&
+              Agc::AgcSetNop(disabled_commands.data()) == 0 &&
+              Agc::AgcSetNop(disabled_commands.data() + 5) == 0 && Agc::AgcSetNop(release) == 0 &&
               disabled_commands[0] == ((disabled_write[0] & 0xffff00ffu) | (Pm4::IT_NOP << 8u)) &&
               disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
               disabled_commands[6] == 0x68750123u &&
               release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
               unpatched_commands[7] == 0xc0064900u &&
-              Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
-              Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
-              Gen5::AgcGetPacketSize(release) == 8 &&
+              Agc::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
+              Agc::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
+              Agc::AgcGetPacketSize(release) == 8 &&
               std::equal(disabled_commands.begin() + 1, disabled_commands.begin() + 5,
                          unpatched_commands.begin() + 1) &&
               std::equal(disabled_commands.begin() + 8, disabled_commands.end(),
@@ -55573,20 +56414,20 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   std::array<uint32_t, 8> patched{};
   std::copy_n(unpatched_commands.begin() + 7, patched.size(), patched.begin());
   patched[3] |= 1u;
-  const auto* label = reinterpret_cast<const volatile Gen5::Label*>(0x123456789abcdef7ull);
+  const auto* label = reinterpret_cast<const volatile Agc::Label*>(0x123456789abcdef7ull);
   bool patch_helpers_match =
-      Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) == 0 &&
+      Agc::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) == 0 &&
       patched[3] == 0x9abcdef5u && patched[4] == 0x12345678u &&
-      Gen5::AgcQueueEndOfPipeActionPatchData(patched.data(), 0x1122334455667788ull) == 0 &&
+      Agc::AgcQueueEndOfPipeActionPatchData(patched.data(), 0x1122334455667788ull) == 0 &&
       patched[5] == 0x55667788u && patched[6] == 0x11223344u;
   patched[2] |= 4u << 24u;
-  patch_helpers_match &= Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), nullptr) == 0 &&
+  patch_helpers_match &= Agc::AgcQueueEndOfPipeActionPatchAddress(patched.data(), nullptr) == 0 &&
                          patched[3] == 0x9abcdef5u && patched[4] == 0x12345678u;
   patched[0] = KYTY_PM4(8, Pm4::IT_NOP, 0x18);
   patch_helpers_match &=
-      Gen5::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) ==
+      Agc::AgcQueueEndOfPipeActionPatchAddress(patched.data(), label) ==
           static_cast<int>(0x8a6c000cu) &&
-      Gen5::AgcQueueEndOfPipeActionPatchData(patched.data(), 0) == static_cast<int>(0x8a6c000cu);
+      Agc::AgcQueueEndOfPipeActionPatchData(patched.data(), 0) == static_cast<int>(0x8a6c000cu);
   Require(name, "end-of-pipe patch helpers", patch_helpers_match,
           "RELEASE_MEM or its patch helpers diverged from the driver");
   const auto then_commands = write(&selected, 11);
@@ -55635,9 +56476,9 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                             nullptr, nullptr, 0};
   const ShaderRegister cx_register{Pm4::CB_TARGET_MASK, 0x76543210u};
   Require(name, "indirect context packet size",
-          Gen5::AgcDcbSetCxRegistersIndirectGetSize() == sizeof(cx_packet) &&
-              Gen5::AgcDcbSetCxRegistersIndirect(
-                  reinterpret_cast<Gen5::CommandBuffer *>(&cx_dcb), &cx_register, 1) ==
+          Agc::AgcDcbSetCxRegistersIndirectGetSize() == sizeof(cx_packet) &&
+              Agc::AgcDcbSetCxRegistersIndirect(
+                  reinterpret_cast<Agc::CommandBuffer *>(&cx_dcb), &cx_register, 1) ==
                   cx_packet.data() && cx_dcb.cursor_up == cx_dcb.top,
           "indirect Cx size did not match the emitted command buffer");
 
@@ -55647,8 +56488,8 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
       patched_branch.data(), patched_branch.data() + patched_branch.size(),
       nullptr, nullptr, 0};
   Require(name, "branch packet size",
-          Gen5::AgcCbBranchGetSize() == sizeof(patched_branch) &&
-              Gen5::AgcCbBranch(reinterpret_cast<Gen5::CommandBuffer *>(&branch_dcb),
+          Agc::AgcCbBranchGetSize() == sizeof(patched_branch) &&
+              Agc::AgcCbBranch(reinterpret_cast<Agc::CommandBuffer *>(&branch_dcb),
                                 1, 0, &condition, 0, 0, 0, nullptr, 0,
                                 3, else_commands.data(), else_commands.size()) ==
                   patched_branch.data() && branch_dcb.cursor_up == branch_dcb.top,
@@ -55657,7 +56498,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   patched_branch[10] = 0xc5a00000u;
   const auto unpatched = patched_branch;
   Require(name, "patched indirect context branch",
-          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 2,
+          Agc::AgcBranchPatchSetThenTarget(patched_branch.data(), 2,
                                             cx_packet.data(), cx_packet.size()) == 0 &&
               (patched_branch[8] & 3u) == 3u &&
               patched_branch[10] == 0xe5a00005u &&
@@ -55674,7 +56515,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   patched_branch[0] = KYTY_PM4(14, Pm4::IT_NOP, 0);
   const auto mismatched = patched_branch;
   Require(name, "branch packet mismatch",
-          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 0,
+          Agc::AgcBranchPatchSetThenTarget(patched_branch.data(), 0,
                                             then_commands.data(), then_commands.size()) ==
                   static_cast<int>(0x8a6c000cu) && patched_branch == mismatched,
           "branch patch accepted or changed a different packet type");
@@ -55694,6 +56535,17 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
           processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
               selected == 11 && returned == 22,
           "long chain did not complete and return to the original caller");
+
+  // A jump fetches from its target with bits 1:0 of the low DWORD cleared.
+  auto jump = indirect(then_commands, false);
+  jump[1] |= 3u;
+  std::copy(jump.begin(), jump.end(), caller.begin());
+  selected = returned = 0;
+  Pm4Execution jump_execution;
+  Require(name, "jump low bits",
+          processor.Process(jump_execution, caller) == Pm4ProcessResult::Complete &&
+              selected == 11 && returned == 22,
+          "a jump fetched its target with the low bits as address bits");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -55859,8 +56711,9 @@ void CheckPm4Flip() {
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
 
-  // A GPU-written storage image the flip's GL2 writeback copies back.
-  constexpr uint64_t image_size = 0x10000;
+  // A GPU-written storage image the flip's GL2 writeback copies back, and at
+  // 0x20000 a two-layer eye array.
+  constexpr uint64_t image_size = 0x40000;
   int64_t image_offset = -1;
   void *image_memory = nullptr;
   Require(name, "image memory",
@@ -55891,16 +56744,16 @@ void CheckPm4Flip() {
   auto *begin = commands.data() + 8;
   auto *end = commands.data() + commands.size();
   CommandBufferLayout dcb{begin, end, begin, end, nullptr, nullptr, 0};
-  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+  auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&dcb);
   int bus = -1;
   const auto label = reinterpret_cast<uint64_t>(
       VideoOut::VideoOutGetBufferLabels(handle, &bus));
   const bool emitted =
-      Gen5::AgcDcbSetFlip(buffer, handle, 16, 1, 0) == nullptr &&
-      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -3) == nullptr &&
-      Gen5::AgcDcbSetFlip(buffer, handle, -1, 1, flip_arg) == begin &&
-      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, 0) == begin + 64 &&
-      Gen5::AgcDcbWaitUntilSafeForRendering(buffer, handle, -1) ==
+      Agc::AgcDcbSetFlip(buffer, handle, 16, 1, 0) == nullptr &&
+      Agc::AgcDcbWaitUntilSafeForRendering(buffer, handle, -3) == nullptr &&
+      Agc::AgcDcbSetFlip(buffer, handle, -1, 1, flip_arg) == begin &&
+      Agc::AgcDcbWaitUntilSafeForRendering(buffer, handle, 0) == begin + 64 &&
+      Agc::AgcDcbWaitUntilSafeForRendering(buffer, handle, -1) ==
           begin + 96 &&
       dcb.cursor_up == end;
   const std::array<uint32_t, 19> flip{
@@ -56009,7 +56862,7 @@ void CheckPm4Flip() {
   compute_flip[8] = static_cast<uint32_t>(compute_arg);
   compute_flip[11] = 0x0620062fu;
   const bool compute_emitted =
-      Gen5::AgcAcbSetFlip(reinterpret_cast<Gen5::CommandBuffer *>(&acb_layout),
+      Agc::AgcAcbSetFlip(reinterpret_cast<Agc::CommandBuffer *>(&acb_layout),
                           handle, -1, 1, compute_arg) == acb.data() &&
       std::equal(compute_flip.begin(), compute_flip.end(), acb.begin());
   bool compute_complete = false;
@@ -56050,13 +56903,13 @@ void CheckPm4Flip() {
                                 shown.data(), shown.data() + shown.size(),
                                 nullptr,      nullptr,
                                 0};
-  auto *shown_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&shown_dcb);
+  auto *shown_buffer = reinterpret_cast<Agc::CommandBuffer *>(&shown_dcb);
   const auto headset_label = reinterpret_cast<uint64_t>(
       VideoOut::VideoOutGetBufferLabels(headset, &bus));
   Require(name, "shown flip packet",
-          Gen5::AgcDcbSetFlip(shown_buffer, headset, 0, 1, 0) ==
+          Agc::AgcDcbSetFlip(shown_buffer, headset, 0, 1, 0) ==
                   shown.data() &&
-              Gen5::AgcDcbWaitUntilSafeForRendering(shown_buffer, headset, 0) ==
+              Agc::AgcDcbWaitUntilSafeForRendering(shown_buffer, headset, 0) ==
                   shown.data() + 64 &&
               shown[2] == 0xc7010107u && shown[3] == 32u &&
               shown[12] == 0x42010000u &&
@@ -56078,6 +56931,27 @@ void CheckPm4Flip() {
   Require(name, "wait for a shown buffer", shown_complete && shown_pending == 0,
           "the wait returned before its buffer's flip was presented");
 
+  // A flipped surface can be the first layer of a cached array, as a headset
+  // eye of a stereo render target is; the frame copies only that layer.
+  gpu.SendCommandSync([&] {
+    auto eyes = VulkanHarness::MakeLinearDesc(
+        image_base + 0x20000, 0, vk::Format::eR8G8B8A8Srgb,
+        Prospero::BufferFormat::k8_8_8_8Srgb, Prospero::ImageType::kColor2D,
+        {64, 64, 1}, 2, 4, 1);
+    eyes.info.tile_mode = Prospero::TileMode::kRenderTarget;
+    eyes.info.pitch = 0;
+    eyes.info.UpdateSize();
+    (void)renderer.GetTextureCache().FindImage(eyes);
+    eyes.info.data.size = 0;
+    eyes.info.resources.layers = 1;
+    eyes.info.UpdateSize();
+    auto &scheduler = renderer.GetCommandScheduler();
+    auto &frame = window.presenter->PrepareFrame(
+        scheduler.Current(), eyes.info, 0x8000000022000000ull, false);
+    scheduler.Finish();
+    window.presenter->Discard(frame);
+  });
+
   gpu.WaitForIdle();
   Require(name, "close",
           VideoOut::VideoOutClose(headset) == 0 &&
@@ -56086,6 +56960,65 @@ void CheckPm4Flip() {
   EventQueue::KernelDeleteEqueue(flips);
   renderer.ShutdownGpu();
   VideoOut::VideoOutShutdown();
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// Device information by handle checks the handle, then clears the output
+// before it checks that the library is initialized. No reprojection pass runs
+// on the host, so every status field is zero once reprojection is initialized.
+// Vibration checks the handle, then the frequency only while a headset is
+// connected.
+void CheckHmd2() {
+  constexpr const char *name = "Hmd2";
+  Loader::SymbolDatabase hmd2;
+  Libs::InitHmd2_1(&hmd2);
+  const auto func = [&](const char *nid) {
+    return hmd2.FindByNid(nid, Loader::SymbolType::Func)->vaddr;
+  };
+  const auto get_status =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(void *)>(func("8GkaY2B7opM"));
+  const auto initialize =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(const void *, void *)>(
+          func("C0rPwER-yxg"));
+  const auto device_info =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, void *)>(
+          func("4BlE4IPXP0Q"));
+  std::array<uint8_t, 28> info;
+  info.fill(0xff);
+  const auto filled = info;
+  Require(name, "device information by handle",
+          device_info(0x0f000002, info.data()) == -1972240381 && // 0x8a720003
+              info == filled &&
+              device_info(0x0f000001, info.data()) == -1972240382 && // 0x8a720002
+              info == std::array<uint8_t, 28>{},
+          "the handle or the output was checked out of order");
+  const auto set_vibration =
+      reinterpret_cast<int(KYTY_SYSV_ABI *)(int32_t, int32_t)>(
+          func("Al4qjNREVQQ"));
+  const auto vibration_checked = [&](bool connected) {
+    Config::Load({.vr_enabled = connected});
+    const int out_of_range = connected ? -1972240375 : 0; // 0x8a720009
+    return set_vibration(0x0f000002, 26) == -1972240381 && // 0x8a720003
+           set_vibration(0x0f000001, 0) == 0 &&
+           set_vibration(0x0f000001, 25) == 0 &&
+           set_vibration(0x0f000001, 26) == out_of_range &&
+           set_vibration(0x0f000001, -1) == out_of_range;
+  };
+  Require(name, "vibration",
+          vibration_checked(false) && vibration_checked(true),
+          "the handle or the frequency was checked wrongly");
+  static Hmd2::ReprojectionState work;
+  // Work and display buffers, and no see-through buffer.
+  const std::array<void *, 9> param{&work, &work};
+  std::array<uint8_t, 0x68> status;
+  status.fill(0xff);
+  Require(name, "status",
+          get_status(status.data()) ==
+                  Hmd2::ERROR_REPROJECTION_NOT_INITIALIZED &&
+              initialize(param.data(), nullptr) == 0 &&
+              get_status(status.data()) == 0 &&
+              status == std::array<uint8_t, 0x68>{},
+          "the reprojection status is not that of none completed");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -56242,7 +57175,7 @@ void CheckPm4LodStats(RenderContext &renderer) {
     CommandBufferLayout dcb{packet.data(), packet.data() + packet.size(), packet.data(),
                             packet.data() + packet.size(), nullptr, nullptr, 0};
     Pm4Execution execution;
-    return Gen5::AgcDcbGetLodStats(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0,
+    return Agc::AgcDcbGetLodStats(reinterpret_cast<Agc::CommandBuffer *>(&dcb), 0,
                                    report.data(), size, 0, 0, 0, 0) == packet.data() &&
            processor.Process(execution, packet) == Pm4ProcessResult::Complete && report[0] != 0;
   };
@@ -56305,7 +57238,7 @@ void CheckPm4LodStatsBoundTextures(VulkanHarness &vulkan, bool enabled) {
       CommandBufferLayout dcb{packet.data(), packet.data() + packet.size(), packet.data(),
                               packet.data() + packet.size(), nullptr, nullptr, 0};
       Pm4Execution execution;
-      return Gen5::AgcDcbGetLodStats(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0,
+      return Agc::AgcDcbGetLodStats(reinterpret_cast<Agc::CommandBuffer *>(&dcb), 0,
                                      report.data(), sizeof(report), 0, force_reset,
                                      report_and_reset, 0) == packet.data() &&
              processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
@@ -56389,7 +57322,7 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   const auto *symbol = symbols.FindByNid("q4VuU-QsLOE", Loader::SymbolType::Func);
   Require(name, "async export",
           symbol != nullptr &&
-              symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
+              symbol->vaddr == reinterpret_cast<uint64_t>(&Agc::AgcAcbMemSemaphore),
           "async semaphore import did not resolve to the emitter");
 
   CommandProcessor processor(renderer, 0x20);
@@ -56410,18 +57343,18 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   const auto emit = [&](uint8_t signal_type, uint8_t op) {
     packet.fill(poison);
     acb.cursor_up = packet.data();
-    return Gen5::AgcAcbMemSemaphore(reinterpret_cast<Gen5::CommandBuffer *>(&acb), &counter, 1,
+    return Agc::AgcAcbMemSemaphore(reinterpret_cast<Agc::CommandBuffer *>(&acb), &counter, 1,
                                     signal_type, op) == packet.data() &&
            acb.cursor_up == end;
   };
 
   Require(name, "wait stream",
           emit(0, 7) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
+              packet == decltype(packet){0xc0027900u, 0x342u, 0xc9020000u | (high & 0xffffu), low,
                                          0xc0023900u, low & ~0x7u, high, 0xe0010000u,
-                                         0xc0017904u, 0x342u, 0xc9000000u} &&
-              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
-              Gen5::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
+                                         0xc0017900u, 0x342u, 0xc9000000u} &&
+              Agc::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
+              Agc::AgcIsInternalDataPacket(packet[8], packet.data() + 9),
           "semaphore wait differs from the native stream");
   const auto wait = packet;
   Pm4Execution waiting;
@@ -56433,10 +57366,10 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
 
   Require(name, "increment stream",
           emit(0, 6) &&
-              packet == decltype(packet){0xc0027904u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
+              packet == decltype(packet){0xc0027900u, 0x342u, 0xc9010000u | (high & 0xffffu), low,
                                          0xc0011000u, poison, poison,
                                          0xc0023900u, low & ~0x7u, high, 0xc0010000u} &&
-              Gen5::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
+              Agc::AgcIsInternalDataPacket(packet[0], packet.data() + 1) &&
               execute(packet) && counter == 1 && execute(packet) && counter == 2,
           "semaphore increment differs from the native stream or count");
   Require(name, "resume",
@@ -56450,6 +57383,68 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckPm4WriteDataGds(VulkanHarness &vulkan) {
+  constexpr const char *name = "Pm4WriteDataGds";
+  RenderContext context(vulkan.RuntimeContext());
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  auto &scheduler = context.GetCommandScheduler();
+  scheduler.Begin(registers, user_config, shaders);
+  CommandProcessor processor(context, 0x20);
+  // Increment 0 writes consecutive DWORDs, 1 writes one address.
+  const auto write = [&](uint64_t offset, uint8_t increment) {
+    constexpr std::array<uint32_t, 3> data{0x11u, 0x22u, 0x33u};
+    std::array<uint32_t, 7> packet{};
+    CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                            packet.data(), packet.data() + packet.size(),
+                            nullptr, nullptr, 0};
+    Agc::AgcAcbWriteData(reinterpret_cast<Agc::CommandBuffer *>(&acb), 3, 0,
+                          offset, data.data(), 3, increment, 0);
+    Pm4Execution execution;
+    return processor.Process(execution, packet) == Pm4ProcessResult::Complete;
+  };
+  Require(name, "process", write(3, 0) && write(7, 1),
+          "the GDS writes did not complete");
+  scheduler.Finish();
+  std::array<uint32_t, 5> gds{};
+  Sync::ReadGds(*context.GetBufferCache().GetGdsBuffer(), gds.data(), 3, 5);
+  Require(name, "contents", gds == std::array<uint32_t, 5>{0x11u, 0x22u, 0x33u, 0, 0x33u},
+          "the GDS writes did not land at their DWORD offsets");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
+void CheckPm4DmaDataAddress(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DmaDataAddress";
+  namespace Memory = Libs::LibKernel::Memory;
+  constexpr uint64_t base = 0x0000000300030000ull;
+  constexpr uint64_t size = 0x10000;
+  // A destination whose low 32 bits are 0x3022c.
+  constexpr uint64_t destination = base + 0x22c;
+  int64_t direct_offset = -1;
+  void *mapped = reinterpret_cast<void *>(base);
+  Require(name, "map",
+          Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size,
+                                             size, 0, &direct_offset) == 0 &&
+              Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+              mapped == reinterpret_cast<void *>(base),
+          "the fixed direct-memory mapping failed");
+  const std::array<uint32_t, 7> fill{KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 2u << 29u, 0x5eedu, 0,
+                                     static_cast<uint32_t>(destination),
+                                     static_cast<uint32_t>(destination >> 32u), 4};
+  CommandProcessor processor(renderer, 0);
+  Pm4Execution execution;
+  Require(name, "fill",
+          processor.Process(execution, fill) == Pm4ProcessResult::Complete &&
+              *reinterpret_cast<const uint32_t *>(destination) == 0x5eedu,
+          "the DMA fill skipped its destination");
+  Require(name, "unmap",
+          Memory::KernelMunmap(base, size) == 0 &&
+              Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+          "the direct-memory release failed");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4RewindResume(RenderContext &renderer) {
   constexpr const char *name = "Pm4RewindResume";
   Loader::SymbolDatabase symbols;
@@ -56458,23 +57453,23 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   const auto *patch_symbol = symbols.FindByNid("eWaWyFegzgQ", Loader::SymbolType::Func);
   Require(name, "async exports",
           emit_symbol != nullptr && patch_symbol != nullptr &&
-              emit_symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbRewind) &&
+              emit_symbol->vaddr == reinterpret_cast<uint64_t>(&Agc::AgcAcbRewind) &&
               patch_symbol->vaddr ==
-                  reinterpret_cast<uint64_t>(&Gen5::AgcRewindPatchSetRewindState),
+                  reinterpret_cast<uint64_t>(&Agc::AgcRewindPatchSetRewindState),
           "async rewind imports did not resolve to the emitter and state patch");
-  const auto async_patch = reinterpret_cast<decltype(&Gen5::AgcRewindPatchSetRewindState)>(
+  const auto async_patch = reinterpret_cast<decltype(&Agc::AgcRewindPatchSetRewindState)>(
       patch_symbol->vaddr);
 
   constexpr uint32_t sentinel = 0x12345678u;
   std::array<uint32_t, 4> packet{sentinel, sentinel, sentinel, sentinel};
   CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
                           packet.data() + 1, packet.data() + 3, nullptr, nullptr, 0};
-  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&acb);
+  auto *buffer = reinterpret_cast<Agc::CommandBuffer *>(&acb);
   for (const uint8_t state : {0, 1}) {
     for (const uint8_t offload : {0, 1}) {
       acb.cursor_up = packet.data() + 1;
       Require(name, "async packet",
-              Gen5::AgcAcbRewind(buffer, state, offload) == packet.data() + 1 &&
+              Agc::AgcAcbRewind(buffer, state, offload) == packet.data() + 1 &&
                   acb.cursor_up == packet.data() + 3 &&
                   packet[0] == sentinel && packet[3] == sentinel &&
                   packet[1] == 0xc0005900u &&
@@ -56486,8 +57481,8 @@ void CheckPm4RewindResume(RenderContext &renderer) {
   acb.cursor_up = packet.data() + 1;
   acb.reserved_dw = 1;
   Require(name, "bounded allocation",
-          Gen5::AgcAcbRewind(buffer, 1, 1) == nullptr &&
-              Gen5::AgcAcbRewind(nullptr, 1, 1) == nullptr &&
+          Agc::AgcAcbRewind(buffer, 1, 1) == nullptr &&
+              Agc::AgcAcbRewind(nullptr, 1, 1) == nullptr &&
               acb.cursor_up == packet.data() + 1 && packet == before,
           "failed rewind allocation changed the cursor or command storage");
 
@@ -56518,10 +57513,10 @@ void CheckPm4RewindResume(RenderContext &renderer) {
           static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), 33};
       CommandBufferLayout cb{commands.data(), commands.data() + 2,
                              commands.data(), commands.data() + 2, nullptr, nullptr, 0};
-      auto *command_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&cb);
-      const auto *emitted = async ? Gen5::AgcAcbRewind(command_buffer, 0, offload)
-                                 : Gen5::AgcDcbRewind(command_buffer, 0);
-      const auto patch = async ? async_patch : &Gen5::AgcRewindPatchSetRewindState;
+      auto *command_buffer = reinterpret_cast<Agc::CommandBuffer *>(&cb);
+      const auto *emitted = async ? Agc::AgcAcbRewind(command_buffer, 0, offload)
+                                 : Agc::AgcDcbRewind(command_buffer, 0);
+      const auto patch = async ? async_patch : &Agc::AgcRewindPatchSetRewindState;
       Pm4Execution execution;
       Require(name, "pending",
               emitted == commands.data() &&
@@ -57329,6 +58324,16 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--stream-window-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStreamCopyWindow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--resolve-cache-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResolveCache();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
     CheckStorageTextureLinearUploadLayout();
     CheckStorageTextureDepthTileUploadLayout();
@@ -57352,6 +58357,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-rate-only") == 0) {
     CheckFlipRate();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--hmd2-only") == 0) {
+    CheckHmd2();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--device-creation-only") == 0) {
@@ -57574,6 +58583,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--write-data-gds-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4WriteDataGds(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dma-data-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4DmaDataAddress(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
@@ -57890,6 +58909,8 @@ int main(int argc, char **argv) {
   CheckPm4LodStatsBoundTextures(vulkan, false);
   CheckPm4LodStatsBoundTextures(vulkan, true);
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
+  CheckPm4WriteDataGds(vulkan);
+  CheckPm4DmaDataAddress(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
@@ -57935,11 +58956,16 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckStreamCopyWindow();
+  vulkan.CheckResolveCache();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   CheckTessellationWaveSizes(vulkan);
   CheckStableProgramIds(vulkan);
+  CheckComputeQueueModules(vulkan);
+  CheckGraphicsPushDataModules(vulkan);
+  CheckVertexFormatModules(vulkan);
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();

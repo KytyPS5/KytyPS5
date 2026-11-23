@@ -15,7 +15,7 @@ namespace Libs {
 
 namespace LibJson2 {
 
-LIB_VERSION("Json2", 1, "Json2", 1, 1);
+LIB_NAME("Json2", "Json");
 
 enum JsonValueType : uint32_t {
 	JsonValueTypeNull = 0,

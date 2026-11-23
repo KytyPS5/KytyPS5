@@ -44,6 +44,13 @@ struct ImageSubresources {
 	auto     operator<=>(const ImageSubresources&) const = default;
 };
 
+// The level and first layer of a container that a single-level image occupies, or -1.
+struct ImageSubresource {
+	int32_t mip                                       = -1;
+	int32_t layer                                     = -1;
+	bool    operator==(const ImageSubresource&) const = default;
+};
+
 struct ImageSubresourceRange {
 	uint32_t base_level                                      = 0;
 	uint32_t level_count                                     = 1;
@@ -127,18 +134,7 @@ struct ImageInfo {
 		       bytes_per_block == other.bytes_per_block &&
 		       GetColorTransform() == other.GetColorTransform();
 	}
-	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
-		if (container.resources.levels > container.mip_layout.size()) {
-			return -1;
-		}
-		for (uint32_t level = 0; level < container.resources.levels; level++) {
-			if (SliceOf(container, static_cast<int32_t>(level)) >= 0) {
-				return static_cast<int32_t>(level);
-			}
-		}
-		return -1;
-	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
+	[[nodiscard]] ImageSubresource SubresourceOf(const ImageInfo& container) const noexcept;
 };
 
 struct ImageViewInfo {
@@ -268,7 +264,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
-	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+	if (metadata_address == 0 || (metadata_address & 0xffu) != 0) {
 		return VideoOutCompression::Unsupported;
 	}
 	switch (dcc_control) {

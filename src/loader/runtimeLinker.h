@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/hostException.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "loader/symbolDatabase.h"
@@ -16,6 +17,9 @@ struct ExceptionInfo;
 } // namespace Common::HostException
 
 namespace Loader {
+
+// The emulator's host exception handler: emulated instructions, walker loads, GPU-tracked pages.
+bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info);
 
 struct EntryParams {
 	int         argc;
@@ -35,24 +39,12 @@ using application_heap_malloc_func_t         = KYTY_SYSV_ABI void* (*)(uint64_t)
 using application_heap_posix_memalign_func_t = KYTY_SYSV_ABI int (*)(void**, uint64_t, uint64_t);
 
 struct ModuleId {
-	bool operator==(const ModuleId& other) const {
-		return version_major == other.version_major && version_minor == other.version_minor &&
-		       name == other.name;
-	}
-
 	std::string id;
-	int         version_major;
-	int         version_minor;
 	std::string name;
 };
 
 struct LibraryId {
-	bool operator==(const LibraryId& other) const {
-		return version == other.version && name == other.name;
-	}
-
 	std::string id;
-	int         version;
 	std::string name;
 };
 
@@ -167,6 +159,8 @@ public:
 	Program*        FindProgramByAddr(uint64_t vaddr);
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
+	// The ids of the loaded programs in load order.
+	std::vector<int32_t> GetProgramIds();
 
 	// CreateThreadTls runs on each guest thread before its first guest instruction.
 	static void     CreateThreadTls();

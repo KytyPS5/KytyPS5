@@ -486,6 +486,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		// Within one draw window the guest has no signal to rewrite the range. A copy made in this
+		// tick at most an eighth of a lap ago is nearly a lap ahead of the ring's writes, like a
+		// fresh copy, even if the draw's preparation submits the tick.
+		auto& copy = m_stream_copies[(vaddr * 0x9e3779b97f4a7c15ull) >> (64u - STREAM_COPY_BITS)];
+		const auto tick = m_scheduler.CurrentTick();
+		if (copy.vaddr == vaddr && copy.size == size && copy.window == m_draw_window &&
+		    copy.tick == tick &&
+		    m_stream_buffer.Position() - copy.position <= m_stream_buffer.Size() / 8) {
+			return {&m_stream_buffer, copy.offset};
+		}
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
@@ -494,6 +504,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			m_stream_buffer.Commit();
+			copy = {vaddr, size, m_draw_window, tick, offset, m_stream_buffer.Position()};
 			return {&m_stream_buffer, offset};
 		}
 	}

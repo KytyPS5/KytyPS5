@@ -131,6 +131,7 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 		const auto ac = EmitMinMaxF32Value(state, a, c, true);
 		return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, ab, bc, false), ac, false);
 	}
+	// The median with -0 ordered below +0; a NaN source gives MIN3 in source order.
 	const auto a_bits = EmitBitcastF32ToU32(state, a);
 	const auto b_bits = EmitBitcastF32ToU32(state, b);
 	const auto c_bits = EmitBitcastF32ToU32(state, c);

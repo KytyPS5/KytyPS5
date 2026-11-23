@@ -30982,8 +30982,8 @@ TestCase VectorMinMaxMed3F16Ops() {
   AppendVMovLiteral(&code, 10, 0xaaaa5555u);
   AppendVMovLiteral(&code, 11, 0x12345678u);
   AppendVMovLiteral(&code, 12, 0x77772222u);
-  AppendVMovLiteral(&code, 6, 0x00008000u);
-  AppendVMovLiteral(&code, 7, 0x00000000u);
+  AppendVMovLiteral(&code, 6, 0x00008000u); // low=-0.0h
+  AppendVMovLiteral(&code, 7, 0x00000000u); // low=+0.0h
   AppendVMovLiteral(&code, 13, 0x55551234u);
 
   AppendVop3(&code, 0x351, 10, Vgpr(0), Vgpr(1), Vgpr(2));
@@ -32422,8 +32422,8 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
+  // Measured 13,727/32,230 words; keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 13737u : 32245u;
   return test;
 }
 

@@ -520,6 +520,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BvhIntersect: info.bvh = info.uses_dma = true; break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
+		case ValueOpcode::RayQueryInitialize: info.ray_query = true; break;
 		case ValueOpcode::LoadDeviceAddressU32: info.uses_device_address = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_vote |=
@@ -527,9 +528,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			break;
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
-		case ValueOpcode::SubgroupUMinU32:
-		case ValueOpcode::SubgroupUMaxU32:
-		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupReduceU32: info.subgroup_arithmetic = true; break;
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -588,7 +587,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
 	        false;
-	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
+	info.bvh = info.ray_query = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
 	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =

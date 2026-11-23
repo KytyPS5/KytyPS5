@@ -16,8 +16,6 @@ using Libs::LibKernel::SyncOnAddress::Wait32;
 using Libs::LibKernel::SyncOnAddress::Wait64;
 using Libs::LibKernel::SyncOnAddress::Wake;
 
-std::atomic<int> g_signal_poll_count{0};
-
 void Check(bool value, const char *text) {
   if (!value) {
     std::fprintf(stderr, "SyncOnAddressTests: failed: %s\n", text);
@@ -27,10 +25,6 @@ void Check(bool value, const char *text) {
 
 template <typename T> void Store(T *address, T value) {
   std::atomic_ref<T>(*address).store(value, std::memory_order_release);
-}
-
-void CountSignalPoll() {
-  g_signal_poll_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TestInvalidAddress() {
@@ -61,15 +55,11 @@ void TestMismatchReturnsImmediately() {
   uint64_t word64 = UINT64_C(0x100000000);
   uint32_t timeout = 500000;
   const auto start = std::chrono::steady_clock::now();
-  Check(Wait32(&word, 6, &timeout, CountSignalPoll) == OK,
-        "mismatch succeeds without parking");
-  Check(Wait64(&word64, 0, &timeout, CountSignalPoll) == OK,
-        "wait64 compares all 64 bits");
+  Check(Wait32(&word, 6, &timeout) == OK, "mismatch succeeds without parking");
+  Check(Wait64(&word64, 0, &timeout) == OK, "wait64 compares all 64 bits");
   Check(std::chrono::steady_clock::now() - start <
             std::chrono::milliseconds(100),
         "mismatched value is a fast path");
-  Check(g_signal_poll_count.load(std::memory_order_relaxed) >= 2,
-        "mismatch remains a guest signal safe-point");
 }
 
 void TestTimeout() {
@@ -124,22 +114,15 @@ void TestNanosecondTimeout() {
   Check(Wait64(&word, 1, std::chrono::nanoseconds(0)) == OK,
         "zero timespec succeeds on mismatch");
 
-  g_signal_poll_count.store(0, std::memory_order_relaxed);
-  std::atomic<bool> returned{false};
+  // Outlast two wait slices before waking.
   std::thread waker([&] {
-    while (g_signal_poll_count.load(std::memory_order_relaxed) < 2 &&
-           !returned.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
     Store(&word, UINT64_C(0x100000000));
     Check(Wake(&word, 1) == OK, "wake releases a long timespec wait");
   });
-  const int result = Wait64(&word, 0, std::chrono::nanoseconds::max(), CountSignalPoll);
-  returned.store(true, std::memory_order_release);
+  const int result = Wait64(&word, 0, std::chrono::nanoseconds::max());
   waker.join();
   Check(result == OK, "long timespec wait does not overflow its deadline");
-  Check(g_signal_poll_count.load(std::memory_order_relaxed) > 1,
-        "timespec wait continues polling guest signals");
 }
 
 void TestWakeOneThenAll() {

@@ -14,10 +14,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace Libs::LibKernel {
-void KernelDispatchPendingSignalForCurrentThread();
-} // namespace Libs::LibKernel
-
 namespace Libs::LibKernel::Semaphore {
 
 LIB_NAME("libkernel", "libkernel");
@@ -225,10 +221,6 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 		waiter.cond_var.WaitFor(&m_mutex, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
 
-		m_mutex.Unlock();
-		LibKernel::KernelDispatchPendingSignalForCurrentThread();
-		m_mutex.Lock();
-
 		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
 	}
 
@@ -410,10 +402,6 @@ public:
 			} else {
 				m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
 			}
-
-			m_mutex.Unlock();
-			LibKernel::KernelDispatchPendingSignalForCurrentThread();
-			m_mutex.Lock();
 
 			m_waiters--;
 			elapsed = static_cast<uint32_t>(timer.GetTimeS() * 1000000.0);

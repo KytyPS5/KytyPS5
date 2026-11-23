@@ -32,6 +32,11 @@ struct PreparedBindings {
 		uint64_t size    = 0;
 		BufferId id;
 	};
+	// What an image was resolved from; the module id fixes its resource.
+	struct ImageSource {
+		ShaderRecompiler::IR::DescriptorValue value;
+		uint64_t                              module = 0;
+	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
@@ -40,6 +45,7 @@ struct PreparedBindings {
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
+	std::vector<ImageSource>              image_sources;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;

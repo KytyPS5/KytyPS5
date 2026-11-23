@@ -1,5 +1,6 @@
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "emulator.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
@@ -180,6 +181,7 @@ int LoadExec(const char* path, const char* const argv[]) {
 	environment.push_back(relaunched_entry.data());
 	environment.push_back(nullptr);
 	if (close_range(3, ~0u, CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) == 0) {
+		Common::Thread::RestoreProcessAffinity();
 		execvpe(host_argv[0], host_argv.data(), environment.data());
 	}
 	LOGF("LoadExec failed: %s\n", std::strerror(errno));

@@ -52,6 +52,10 @@ const std::string& GetAudioInputDevice() {
 	return g_config->audio_input_device;
 }
 
+AudioOutput GetAudioOutput() {
+	return g_config->audio_output;
+}
+
 const std::optional<ControllerColor>& GetControllerColor() {
 	return g_config->controller_color;
 }
@@ -117,12 +121,20 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
+PssrUpscaler GetPssrUpscaler() {
+	return g_config->pssr_upscaler;
+}
+
 const std::filesystem::path& GetDlssFolder() {
 	return g_config->dlss_folder;
 }
 
 uint32_t GetDlssPreset() {
 	return g_config->dlss_preset;
+}
+
+const std::filesystem::path& GetFsrFolder() {
+	return g_config->fsr_folder;
 }
 
 bool AmdCpuEnabled() {
@@ -237,6 +249,10 @@ bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
 }
 
+bool NativeRtEnabled() {
+	return g_config->native_rt;
+}
+
 bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }
@@ -255,6 +271,10 @@ bool PlayGoHackEnabled() {
 
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
+}
+
+const std::string& GetLaunchActivity() {
+	return g_config->launch_activity;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

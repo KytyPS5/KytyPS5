@@ -26,12 +26,10 @@ private:
 
 	struct Batch {
 		std::array<vk::DescriptorSet, DescriptorSetBatch> sets {};
-		uint32_t                                          size       = 0;
-		uint32_t                                          allocation = DescriptorSetBatch;
+		uint32_t                                          size = 0;
 	};
 
-	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
-	void               CreateDescriptorPool();
+	void CreateDescriptorPool();
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;

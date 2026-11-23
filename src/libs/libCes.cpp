@@ -18,7 +18,7 @@ namespace Libs {
 
 namespace LibCes {
 
-LIB_VERSION("Ces", 1, "Ces", 1, 1);
+LIB_NAME("Ces", "Ces");
 
 static const uint8_t* KYTY_SYSV_ABI CesRefersUcsProfileCp1252() {
 	PRINT_NAME();

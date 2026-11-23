@@ -6,7 +6,7 @@
 
 namespace Libs {
 
-LIB_VERSION("BluetoothHid", 1, "BluetoothHid", 1, 1);
+LIB_NAME("BluetoothHid", "BluetoothHid");
 
 namespace BluetoothHid {
 

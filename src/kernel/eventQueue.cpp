@@ -6,12 +6,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/descriptors.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
 #include <fmt/format.h>
-#include <limits>
 #include <list>
 #include <unordered_map>
 #include <vector>
@@ -221,7 +221,7 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		m_events.push_back(event);
 	}
 
-	m_cond_var.Signal();
+	m_cond_var.SignalAll();
 	return OK;
 }
 
@@ -243,7 +243,7 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 			event.triggered = true;
 		}
 
-		m_cond_var.Signal();
+		m_cond_var.SignalAll();
 
 		return OK;
 	}
@@ -321,12 +321,11 @@ int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	// The handle is (object id << 32) | descriptor.
+	const int fd = Descriptors::Allocate();
 	{
 		Common::LockGuard lock(g_equeues_mutex);
-		if (g_next_equeue > static_cast<uint64_t>(std::numeric_limits<KernelEqueue>::max())) {
-			EXIT("event queue handle space exhausted\n");
-		}
-		*eq        = static_cast<KernelEqueue>(g_next_equeue++);
+		*eq        = static_cast<KernelEqueue>(g_next_equeue++ << 32 | static_cast<uint32_t>(fd));
 		auto owner = std::make_shared<KernelEqueuePrivate>(*eq);
 		owner->SetName(std::string(name));
 		g_equeues.emplace(*eq, std::move(owner));
@@ -379,6 +378,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 		owner = std::move(entry->second);
 		g_equeues.erase(entry);
 	}
+	Descriptors::Release(static_cast<int>(static_cast<uint32_t>(eq)));
 
 	LOGF("\tEqueue delete: %s\n", owner->GetName().c_str());
 	owner->Close();

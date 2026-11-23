@@ -19,6 +19,10 @@ namespace Cheats {
                                            const QString& version, const QString& process);
 [[nodiscard]] QJsonDocument WithSelection(const QJsonDocument& document,
                                           const QList<bool>&   enabled);
+// Adds the imported cheats unchecked, replacing same-named ones; keeps the other local cheats when
+// the local file would pass ValidateImport for the same game. The saved process is the game's.
+[[nodiscard]] QJsonDocument Merge(const QJsonDocument& local, const QJsonDocument& imported,
+                                  const QString& process);
 // Refuse to replace a file changed since it was loaded; empty data also permits creation.
 [[nodiscard]] QString SaveDocument(const QString& path, const QJsonDocument& document,
                                    const QByteArray& expected_data);

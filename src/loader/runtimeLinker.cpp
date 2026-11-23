@@ -622,7 +622,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
+bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
@@ -632,6 +632,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		// An SRT walker load completes from the backing, so false sharing with GPU-written
+		// bytes needs no readback.
+		const auto walker_load =
+		    Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
+		uint32_t value = 0;
+		if (walker_load != 0 &&
+		    Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value))) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, walker_load, value);
+			return true;
+		}
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -645,9 +656,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
-			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+		if (walker_load != 0) {
+			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, walker_load, 0);
 			return true;
 		}
 	}

@@ -66,6 +66,7 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
@@ -329,9 +330,6 @@ struct ImageHeapTestAccess {
     return heap.m_memories.back()->dirty_pages.back() != 0u;
   }
 };
-
-// Guest faults the GPU fault route handled.
-std::atomic<uint64_t> g_handled_gpu_faults{0};
 
 struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
@@ -4747,8 +4745,8 @@ public:
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
 
-    // A GPU-thread vertex table read beside GPU-written bytes on their page
-    // takes the backing and leaves those bytes GPU-written.
+    // A GPU-thread vertex table read or SRT walker load beside GPU-written
+    // bytes on their page takes the backing and leaves those bytes GPU-written.
     constexpr uint64_t table_gpu_address = fault_base + 0xf200;
     constexpr uint64_t table_attrib_address = fault_base + 0xf800;
     constexpr uint64_t table_vsharp_address = fault_base + 0xf900;
@@ -4790,6 +4788,8 @@ public:
                        .code_size_bytes = sizeof(table_shader)});
     bool tables_read = false;
     bool table_gpu_kept = false;
+    bool walker_read = false;
+    bool walker_gpu_kept = false;
     LibKernel::Memory::InstallGpuResources(&resources);
     gpu.SendCommandSync([&] {
       (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
@@ -4803,12 +4803,25 @@ public:
                                        table_vsharps[1].fields);
       table_gpu_kept =
           buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      walker_read = ShaderRecompiler::IR::MaterializeResources(
+                        ShaderRecompiler::IR::ExtractResourcePlan(
+                            SrtProgram(table_attrib_address + 4)),
+                        {}, snapshot, specialization) &&
+                    snapshot.flattened_srt == std::vector{table_attribs[1]};
+      walker_gpu_kept =
+          buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     Require("GpuCommandLane", "vertex tables beside GPU-written bytes",
             tables_read && table_gpu_kept,
             "a vertex table read beside GPU-written bytes downloaded them or "
             "read the wrong entries");
+    Require("GpuCommandLane", "SRT walker load beside GPU-written bytes",
+            walker_read && walker_gpu_kept,
+            "an SRT walker load beside GPU-written bytes downloaded them or "
+            "read the wrong DWORD");
 
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest
@@ -5030,7 +5043,9 @@ public:
       // The label landed at once. A read waits for the copies instead of
       // faulting in a loop, and so does an invalidation beside them before
       // host I/O.
-      const auto faults = g_handled_gpu_faults.load();
+      Common::DebugCounters::SetEnabled(true);
+      const auto faults =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
       std::array<uint32_t, 4> read{};
       std::atomic<bool> read_done{false};
       std::atomic<bool> invalidated{false};
@@ -5070,7 +5085,10 @@ public:
                   texture_cache.WriteBackTick(suspended_address, 1) ==
                       suspended_tick,
               "a landed copy cleared another pending write-back");
-      const auto wait_faults = g_handled_gpu_faults.load() - faults;
+      const auto wait_faults =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults) -
+          faults;
+      Common::DebugCounters::SetEnabled(false);
       const bool unsubmitted =
           resources.GetCommandScheduler().CurrentTick() == suspended_tick;
       std::array<uint32_t, 4> suspended{};
@@ -24418,22 +24436,7 @@ private:
     }
     namespace Exception = Common::HostException;
     Require("VulkanHarness", "guest fault handler",
-            Exception::InstallHandler([](const Exception::ExceptionInfo &info) {
-              if (info.type != Exception::ExceptionType::AccessViolation ||
-                  (info.access_violation_type != Exception::AccessViolationType::Read &&
-                   info.access_violation_type != Exception::AccessViolationType::Write)) {
-                return false;
-              }
-              const auto access =
-                  info.access_violation_type == Exception::AccessViolationType::Write
-                      ? PageFaultAccess::Write : PageFaultAccess::Read;
-              if (!LibKernel::Memory::HandleGpuFault(
-                      access, info.access_violation_vaddr)) {
-                return false;
-              }
-              g_handled_gpu_faults.fetch_add(1, std::memory_order_relaxed);
-              return true;
-            }),
+            Exception::InstallHandler(Loader::KytyExceptionHandler),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
     m_runtime_context.physical_device = m_physical_device;

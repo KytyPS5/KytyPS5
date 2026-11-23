@@ -82,9 +82,7 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
-	// Completion callbacks can outlive GuestGpu during renderer shutdown.
-	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
-	    std::make_shared<std::binary_semaphore>(1);
+	std::binary_semaphore                          m_suspend_point_ready {1};
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

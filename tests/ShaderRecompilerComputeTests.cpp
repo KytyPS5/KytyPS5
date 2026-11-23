@@ -30982,12 +30982,16 @@ TestCase VectorMinMaxMed3F16Ops() {
   AppendVMovLiteral(&code, 10, 0xaaaa5555u);
   AppendVMovLiteral(&code, 11, 0x12345678u);
   AppendVMovLiteral(&code, 12, 0x77772222u);
+  AppendVMovLiteral(&code, 6, 0x00008000u);
+  AppendVMovLiteral(&code, 7, 0x00000000u);
+  AppendVMovLiteral(&code, 13, 0x55551234u);
 
   AppendVop3(&code, 0x351, 10, Vgpr(0), Vgpr(1), Vgpr(2));
   AppendVop3(&code, 0x354, 11, Vgpr(0), Vgpr(1), Vgpr(2), 0, 0xf, false, 0,
              0x4);
   AppendVop3(&code, 0x357, 12, Vgpr(3), Vgpr(4), Vgpr(5));
-  for (u32 i = 0; i < 3; i++) {
+  AppendVop3(&code, 0x357, 13, Vgpr(6), Vgpr(7), Vgpr(6));
+  for (u32 i = 0; i < 4; i++) {
     AppendStoreVgpr(&code, 10 + i, i);
   }
   AppendEnd(&code);
@@ -30995,7 +30999,7 @@ TestCase VectorMinMaxMed3F16Ops() {
   return {"VectorMinMaxMed3F16Ops",
           code,
           {},
-          {0xaaaa3c00u, 0x48005678u, 0x77773c00u},
+          {0xaaaa3c00u, 0x48005678u, 0x77773c00u, 0x55558000u},
           {O::V_MOV_B32, O::V_MIN3_F16, O::V_MAX3_F16, O::V_MED3_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -32377,22 +32381,22 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x40400000u, 0x7fc01234u, 0x40000000u, 0x40000000u},
       {0x80000000u, 0x00000000u, 0x3f800000u, 0x00000000u},
       {0x00000000u, 0x80000000u, 0xbf800000u, 0x80000000u},
-      {0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0x00000000u, 0x80000000u, 0x00000000u},
-      {0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u},
       {0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u},
-      {0xbf800000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0xbf800000u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0xbf800000u, 0x00000000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x80000000u},
       {0x00000000u, 0xbf800000u, 0x80000000u, 0x80000000u},
-      {0x80000000u, 0x00000000u, 0xbf800000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0xbf800000u, 0x80000000u},
       {0x7fc01234u, 0x80000000u, 0x00000000u, 0x80000000u},
       {0x3f800000u, 0x40400000u, 0x40000000u, 0x40000000u},
       {0xc0400000u, 0xbf800000u, 0xc0000000u, 0xc0000000u},
       {0xff800000u, 0x7f800000u, 0x3f800000u, 0x3f800000u},
       {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
       {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
-      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
+      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0x7fc01234u},
       {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
   TestCase test;
   test.name = "VectorMed3F32NanUsesMin3Path";

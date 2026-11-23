@@ -134,21 +134,13 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto a_bits = EmitBitcastF32ToU32(state, a);
 	const auto b_bits = EmitBitcastF32ToU32(state, b);
 	const auto c_bits = EmitBitcastF32ToU32(state, c);
-	// The NaN path is RDNA2 MIN3, which keeps the later source when two are NaN.
-	const auto min_ba = EmitMinMaxF32(state, b, a, b_bits, a_bits, false);
+	const auto min_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, false);
 	const auto min3 =
-	    EmitMinMaxF32(state, c, min_ba, c_bits, EmitBitcastF32ToU32(state, min_ba), false);
+	    EmitMinMaxF32(state, min_ab, c, EmitBitcastF32ToU32(state, min_ab), c_bits, false);
 	const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
-	const auto max3 =
-	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, true);
-	// RDNA2 compares numerically against MAX3, including ties between signed zeros, then takes
-	// V_MAX_F32 of the other two sources in their original order.
-	const auto a_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, a);
-	const auto b_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, b);
-	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
-	const auto y =
-	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
-	const auto median = EmitMinMaxF32Value(state, x, y, true);
+	const auto capped_max =
+	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, false);
+	const auto median = EmitMinMaxF32Value(state, min_ab, capped_max, true);
 	const auto is_nan = [&](uint32_t value) {
 		return Unary(state, spv::OpIsNan, TypeBool(state), value);
 	};

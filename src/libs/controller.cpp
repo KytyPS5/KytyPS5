@@ -424,7 +424,8 @@ enum TriggerState : int32_t {
 static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value,
                                   int32_t previous) {
 	uint8_t effect[11];
-	if (trigger_effect_to_dualsense(command, effect, 1.0f) && effect[0] == DUALSENSE_TRIGGER_OFF) {
+	(void)trigger_effect_to_dualsense(command, effect, 1.0f);
+	if (effect[0] == DUALSENSE_TRIGGER_OFF) {
 		return TRIGGER_STATE_OFF;
 	}
 	// Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.

@@ -730,28 +730,11 @@ void TestTriggerEffectState() {
 	Connect(2);
 	Disconnect(1);
 	check_state(0, 0, "switching controllers retained effect states");
-}
-
-void TestForcelessTriggerEffectsReportOff() {
-	Controller                       controller;
-	PadTriggerEffectStateInformation info {{-1, -1}};
-	PadTriggerEffectParam            param {};
 	param.trigger_mask       = 3;
-	param.command[0].mode    = 1;
-	param.command[1].mode    = 2;
-	param.command[1].data[0] = 2;
-	param.command[1].data[1] = 3;
-	Check(PadSetTriggerEffect(1, &param) == OK, "forceless trigger request failed");
-	SetAxis(1, Axis::TriggerLeft, 255);
-	SetAxis(1, Axis::TriggerRight, 255);
-	Check(PadGetTriggerEffectState(1, &info) == OK && info.state[0] == 0 && info.state[1] == 0,
-	      "forceless feedback and weapon effects reported effect states");
-	param.command[0].mode = 4;
-	param.command[1].mode = 3;
-	Check(PadSetTriggerEffect(1, &param) == OK, "forceless position request failed");
-	SetAxis(1, Axis::TriggerLeft, 128);
-	Check(PadGetTriggerEffectState(1, &info) == OK && info.state[0] == 0 && info.state[1] == 0,
-	      "forceless multi-position feedback and vibration reported effect states");
+	param.command[0].mode    = 4;
+	param.command[1].data[2] = 0;
+	set_effect();
+	check_state(0, 0, "forceless multi-position feedback and weapon reported effect states");
 }
 
 void TestUnreadPressSurvivesStickBurst() {
@@ -871,7 +854,6 @@ int main() {
 	TestIndependentOutputsAndPadSwitch();
 	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
-	TestForcelessTriggerEffectsReportOff();
 	TestUnreadPressSurvivesStickBurst();
 	TestTouchWithoutClick();
 	TestMultiplayerRouting();

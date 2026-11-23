@@ -4790,6 +4790,7 @@ public:
     bool table_gpu_kept = false;
     bool walker_read = false;
     bool walker_gpu_kept = false;
+    bool walker_unmapped_zero = false;
     LibKernel::Memory::InstallGpuResources(&resources);
     gpu.SendCommandSync([&] {
       (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
@@ -4812,6 +4813,15 @@ public:
                     snapshot.flattened_srt == std::vector{table_attribs[1]};
       walker_gpu_kept =
           buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+      uint32_t unmapped = 0;
+      walker_unmapped_zero =
+          !LibKernel::Memory::TryReadBacking(empty_unmap_base, &unmapped,
+                                             sizeof(unmapped)) &&
+          ShaderRecompiler::IR::MaterializeResources(
+              ShaderRecompiler::IR::ExtractResourcePlan(
+                  SrtProgram(empty_unmap_base)),
+              {}, snapshot, specialization) &&
+          snapshot.flattened_srt == std::vector{0u};
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     Require("GpuCommandLane", "vertex tables beside GPU-written bytes",
@@ -4822,6 +4832,8 @@ public:
             walker_read && walker_gpu_kept,
             "an SRT walker load beside GPU-written bytes downloaded them or "
             "read the wrong DWORD");
+    Require("GpuCommandLane", "SRT walker load of unmapped memory",
+            walker_unmapped_zero, "an unmapped SRT walker load did not read zero");
 
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest

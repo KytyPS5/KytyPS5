@@ -632,17 +632,6 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-		// An SRT walker load completes from the backing, so false sharing with GPU-written
-		// bytes needs no readback.
-		const auto walker_load =
-		    Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address);
-		uint32_t value = 0;
-		if (walker_load != 0 &&
-		    Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value))) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
-			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, walker_load, value);
-			return true;
-		}
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -652,12 +641,22 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+		        info->exception_address)) {
+			// The backing serves an SRT walker load, so false sharing with GPU-written bytes
+			// needs no readback. Otherwise the load retries once its fault is handled, or
+			// reads zero.
+			uint32_t value = 0;
+			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
+			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				return true;
+			}
+			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 			return true;
 		}
-		if (walker_load != 0) {
-			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, walker_load, 0);
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}

@@ -23,7 +23,6 @@ namespace {
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
-		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
 		case Prospero::ImageType::kColor3D: return vk::ImageType::e3D;
 		case Prospero::ImageType::kColor2D: return vk::ImageType::e2D;
 		default: EXIT("non-base image type: %u\n", static_cast<uint32_t>(type));
@@ -283,8 +282,6 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
@@ -339,9 +336,9 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	}
 	if (source_type == destination_type) {
 		source_layers = destination_layers = std::min(source_layers, destination_layers);
-	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
+	} else if (source_type == vk::ImageType::e2D) {
 		source_layers = depth;
-	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
+	} else {
 		destination_layers = depth;
 	}
 	return {source_layers, destination_layers};
@@ -351,17 +348,17 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = source.backing.image_type == backing.image_type
-	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
-	                            : backing.image_type == vk::ImageType::e3D
-	                                ? backing.extent.depth
-	                                : source.backing.extent.depth;
-	const auto     source_aspect =
+	uint32_t       base_depth = source.backing.extent.depth;
+	if (source.backing.image_type == backing.image_type) {
+		base_depth = std::min(base_depth, backing.extent.depth);
+	} else if (backing.image_type == vk::ImageType::e3D) {
+		base_depth = backing.extent.depth;
+	}
+	const auto source_aspect =
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
 	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	std::vector<vk::ImageCopy> copies;
-	copies.reserve(levels);
+	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
 		// destination writes out of bounds and loses the device.
@@ -371,7 +368,8 @@ void Image::CopyImage(Image& source) {
 		                             std::max(backing.extent.height >> level, 1u));
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
-		vk::ImageCopy copy {};
+
+		auto& copy          = copies[level];
 		copy.srcSubresource = {source_aspect, level, 0, 1};
 		copy.dstSubresource = {destination_aspect, level, 0, 1};
 		if (source.backing.image_type == backing.image_type) {
@@ -389,20 +387,13 @@ void Image::CopyImage(Image& source) {
 			copy.dstSubresource.layerCount = destination_layers;
 			copy.extent                    = {width, height, destination_layers};
 		}
-		copies.push_back(copy);
-	}
-	if (copies.empty()) {
-		return;
 	}
 	auto command = m_scheduler.Current().Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
-	                  copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	                  vk::ImageLayout::eTransferDstOptimal, levels, copies.data());
 }
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
@@ -494,9 +485,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
 	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
-	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.buffer              = buffer.Handle();
@@ -570,8 +559,6 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 			}
 		}
 	}
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
@@ -603,8 +590,6 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	               command);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
-	Transit(vk::ImageLayout::eGeneral,
-	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 namespace ImageOps {
@@ -616,7 +601,6 @@ void Validate(const ImageInfo& info) {
 	if (info.pixel_format == vk::Format::eUndefined) {
 		const bool metadata_empty =
 		    info.metadata.range.Empty() && info.metadata.kind == ImageMetadataKind::None &&
-		    info.metadata.control == 0 &&
 		    info.metadata.compression == VideoOutCompression::Uncompressed &&
 		    !info.metadata.stencil_compressed;
 		if (info.data.Empty() || info.HasStencil() || !metadata_empty || info.extent.width == 0 ||
@@ -637,11 +621,6 @@ void Validate(const ImageInfo& info) {
 	}
 
 	switch (info.type) {
-		case Prospero::ImageType::kColor1D:
-			if (info.extent.height != 1 || info.extent.depth != 1) {
-				EXIT("invalid 1D image shape\n");
-			}
-			break;
 		case Prospero::ImageType::kColor3D:
 			if (info.resources.layers != 1) {
 				EXIT("3D images cannot have array layers\n");
@@ -663,7 +642,7 @@ void Validate(const ImageInfo& info) {
 	}
 	switch (info.metadata.kind) {
 		case ImageMetadataKind::None:
-			if (!info.metadata.range.Empty() || info.metadata.control != 0 ||
+			if (!info.metadata.range.Empty() ||
 			    info.metadata.compression != VideoOutCompression::Uncompressed ||
 			    info.metadata.stencil_compressed) {
 				EXIT("metadata-free image has metadata state\n");
@@ -749,7 +728,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 }
 
 uint64_t Image::HashGuestEdges() const {
-	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
+	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes;
 	const auto                                 range = info.data;
 	const uint64_t head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
@@ -770,9 +749,7 @@ uint64_t Image::HashGuestEdges() const {
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
 	for (const auto& cached: views) {
-		if (cached.view != nullptr) {
-			m_graphics.device.destroyImageView(cached.view, nullptr);
-		}
+		m_graphics.device.destroyImageView(cached.view, nullptr);
 	}
 	if (backing.image != nullptr) {
 		m_graphics.DeleteImage(backing);

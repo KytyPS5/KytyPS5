@@ -38,21 +38,23 @@ public:
 	uint32_t Import(const char* name);
 	template <typename... Args>
 	uint32_t Type(spv::Op opcode, const Args&... operands) {
-		return DeclareType(opcode, MakeTypeKey(opcode, operands...));
+		return DecoratedType(opcode, {}, operands...);
 	}
 
 	template <typename... Args>
 	uint32_t DecoratedType(spv::Op opcode, std::initializer_list<TypeAnnotation> annotations,
 	                       const Args&... operands) {
-		return DeclareDecoratedType(opcode, MakeTypeKey(opcode, operands...), annotations);
+		const auto operand_count = static_cast<uint32_t>((0u + ... + OperandWordCount(operands)));
+		m_key.clear();
+		AppendOperands(m_key, opcode, operand_count, operands...);
+		return DeclareType(opcode, annotations);
 	}
 
 	template <typename... Args>
 	uint32_t Constant(spv::Op opcode, uint32_t type, const Args&... operands) {
-		std::vector<uint32_t> key;
-		key.reserve(2u + (0u + ... + OperandWordCount(operands)));
-		AppendOperands(key, opcode, type, operands...);
-		return DeclareConstant(opcode, std::move(key));
+		m_key.clear();
+		AppendOperands(m_key, opcode, type, operands...);
+		return DeclareConstant(opcode);
 	}
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
@@ -120,15 +122,6 @@ private:
 	}
 
 	template <typename... Args>
-	static std::vector<uint32_t> MakeTypeKey(spv::Op opcode, const Args&... operands) {
-		const auto operand_count = static_cast<uint32_t>((0u + ... + OperandWordCount(operands)));
-		std::vector<uint32_t> key;
-		key.reserve(2u + operand_count);
-		AppendOperands(key, opcode, operand_count, operands...);
-		return key;
-	}
-
-	template <typename... Args>
 	static void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
 	                              const Args&... operands) {
 		const auto offset = section.size();
@@ -137,10 +130,8 @@ private:
 		section[offset] |= word_count << spv::WordCountShift;
 	}
 
-	uint32_t    DeclareType(spv::Op opcode, std::vector<uint32_t> key);
-	uint32_t    DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
-	                                 std::initializer_list<TypeAnnotation> annotations);
-	uint32_t    DeclareConstant(spv::Op opcode, std::vector<uint32_t> key);
+	uint32_t    DeclareType(spv::Op opcode, std::initializer_list<TypeAnnotation> annotations);
+	uint32_t    DeclareConstant(spv::Op opcode);
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
 	uint32_t                                  m_next_id = 1;
@@ -159,6 +150,7 @@ private:
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	std::vector<uint32_t>                     m_key; // Reused declaration lookup key.
 	size_t                                    m_unpatched_phi_incomings = 0;
 	bool                                      m_emit_names              = false;
 };

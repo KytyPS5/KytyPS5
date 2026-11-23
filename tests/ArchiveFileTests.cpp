@@ -286,6 +286,10 @@ int main() {
   const auto archive_directory = Common::File::GetInfo(root / "assets/");
   Check(archive_file && archive_file->is_file && archive_file->size == payload.size(),
         "query archive member type and size together");
+  const auto host_times = Common::File::GetTimes(archive_path);
+  const auto member_times = Common::File::GetTimes(root / "assets/subdir/data.bin");
+  Check(host_times && member_times && member_times->write_ns == host_times->write_ns,
+        "archive members report the host archive time");
   Check(archive_directory && !archive_directory->is_file && archive_directory->size == 0 &&
             !Common::File::GetInfo(root / "missing.bin"),
         "distinguish archive directories from missing members");
@@ -332,7 +336,8 @@ int main() {
   const auto data_path = root / "assets/subdir/data.bin";
   Check(Common::File::Size(data_path) == payload.size(), "report member size");
   Common::File file(data_path, Common::File::Mode::Read);
-  Check(!file.IsInvalid(), "open archive member");
+  Check(!file.IsInvalid() && file.GetTimes() && file.GetTimes()->write_ns == host_times->write_ns,
+        "open archive member reports the host archive time");
   Check(file.Remaining() == payload.size(), "report initial remaining bytes");
   Check(file.Seek(64 * 1024 - 19), "seek before compression block boundary");
   std::vector<uint8_t> slice(97);
@@ -434,15 +439,13 @@ int main() {
   Check(!Common::File::CreateDirectory(root / "new-dir"),
         "reject member directory creation");
   Check(!file.Truncate(0) && !file.Unlink(), "reject descriptor mutations");
-  const auto copied = temporary.Path() / "copied.bin";
+  const auto host_file = temporary.Path() / "host.bin";
   Common::File host_fixture;
-  Check(host_fixture.Create(copied), "create host mutation fixture");
+  Check(host_fixture.Create(host_file), "create host mutation fixture");
   host_fixture.Close();
-  Check(!Common::File::CopyFile(data_path, copied) &&
-            !Common::File::CopyFile(copied, data_path) &&
-            !Common::File::RenameFile(data_path, copied) &&
-            !Common::File::RenameFile(copied, data_path),
-        "reject unsupported copy and rename operations involving archives");
+  Check(!Common::File::RenameFile(data_path, host_file) &&
+            !Common::File::RenameFile(host_file, data_path),
+        "reject rename operations involving archives");
 
   CheckMalformedArchives(archive_path, payload);
 

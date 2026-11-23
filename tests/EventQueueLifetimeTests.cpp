@@ -68,6 +68,33 @@ void TestLevelUserEventDelivery() {
 	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete user event queue");
 }
 
+void TestLevelEventWakesEveryWaiter() {
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "level-waiters") == OK &&
+	          EventQueue::KernelAddUserEvent(queue, 1) == OK,
+	      "create a queue with a level user event");
+	std::atomic<int> woken {0};
+	auto             wait = [&] {
+		EventQueue::KernelEvent event {};
+		int                     out = 0;
+		if (EventQueue::KernelWaitEqueue(queue, &event, 1, &out, nullptr) == OK && out == 1) {
+			woken++;
+		}
+	};
+	std::thread first(wait);
+	std::thread second(wait);
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	Check(EventQueue::KernelTriggerUserEvent(queue, 1, nullptr) == OK, "trigger the level event");
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+	while (woken < 2 && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	Check(woken == 2, "one trigger of a level event wakes every waiter");
+	first.join();
+	second.join();
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete the level-waiters queue");
+}
+
 void TestPeriodicTimerEvents() {
 	using namespace std::chrono_literals;
 	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
@@ -102,8 +129,7 @@ void TestPeriodicTimerEvents() {
 	      "timer update preserves accumulated occurrences and updates userdata");
 	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
 	      "timer update replaces the repeating interval");
-	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
-	      "delete periodic timer");
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "delete periodic timer");
 
 	Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
 	      "add immediate periodic timer");
@@ -116,8 +142,11 @@ void TestPeriodicTimerEvents() {
 		          events[0].data == 1,
 		      "zero interval remains immediately ready after delivery");
 	}
-	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
-	      "delete immediate timer");
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "delete immediate timer");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
+	      "deleted timer is not delivered again");
+	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == KERNEL_ERROR_ENOENT,
+	      "deleting a missing timer reports ENOENT");
 
 	const Libs::LibKernel::KernelTimespec delay {0, 1000000};
 	Check(EventQueue::KernelAddHRTimerEvent(queue, 10, &delay, user_data) == OK,
@@ -542,6 +571,7 @@ void TestConcurrentDelete() {
 
 int main() {
 	TestLevelUserEventDelivery();
+	TestLevelEventWakesEveryWaiter();
 	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();

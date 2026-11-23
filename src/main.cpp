@@ -1,11 +1,8 @@
 #include "common/archive.h"
 #include "common/common.h"
-#include "common/dateTime.h"
-#include "common/debug.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/virtualMemory.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -15,34 +12,15 @@
 #include <filesystem>
 #include <string_view>
 #include <vector>
-#include <fmt/format.h>
 #include <magic_enum.hpp>
 
 using namespace Common;
 using namespace Emulator;
 
-static std::string GetBuildString() {
-	Date date = Date::FromMacros(std::string(__DATE__));
-
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	std::string type = "Debug";
-#elif KYTY_BUILD == KYTY_BUILD_RELEASE
-	std::string type = "Release";
-#else
-	std::string type = "????";
-#endif
-
-	std::string compiler = Debug::GetCompiler() + "-" + Debug::GetLinker();
-
-	std::string str =
-	    fmt::format("{}, {}, ver = {}, git = {}, date = {}", type.c_str(), compiler.c_str(),
-	                KYTY_VERSION, KYTY_GIT_VERSION, date.ToString().c_str());
-
-	return str;
-}
-
 static void PrintUsage() {
-	::printf("%s\n", GetBuildString().c_str());
+	::printf("%s, %s, ver = %s, git = %s, date = %s\n",
+	         KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release", KYTY_TOOLCHAIN, KYTY_VERSION,
+	         KYTY_GIT_VERSION, __DATE__);
 	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
@@ -58,6 +36,8 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --audio-output <value>              Report TV, AVReceiver (7.1), SoundBar (5.1),\n"
+	         "                                      or Headphones to games. Default: TV.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
@@ -74,8 +54,13 @@ static void PrintUsage() {
 	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
-	         "                                       (PSSR uses linear scaling). Default: off.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
+	         "                                       supported titles. Default: off.\n");
+	::printf("  --pssr-upscaler <value>              With --trinity, upscale PSSR with Linear,\n"
+	         "                                       DLSS, or FSR. Default: Linear.\n");
+	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
+	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
+	::printf("  --fsr-folder <folder>                FidelityFX DLL folder (Windows).\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -89,7 +74,9 @@ static void PrintUsage() {
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
-	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
+	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
+	::printf("  --native-rt                          Use native RT on the GPU.\n");
+	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
 	::printf("  --command-buffer-dump                Enable command buffer dumps.\n");
@@ -101,13 +88,17 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf                 Enable SPIR-V debug printf.\n");
 	::printf("  --readback-linear-images             Read back writable linear images on submit.\n");
 	::printf("  --readback-tiled-images              Read back small writable tiled images on submit.\n");
+	::printf("  --readback-storage-images            Read back storage images on GL2 writeback.\n");
 	::printf("  --sync-raw-image-buffers             Synchronize raw reads of GPU images.\n");
+	::printf(
+	    "  --flush-draws <num>                  Submit GPU work every <num> draws; 0 is off.\n");
 	::printf("  --no-trophy-notifications            Disable trophy unlock toasts and their sound.\n");
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                        Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable ASCII chars).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -127,7 +118,7 @@ static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
 
 template <typename E>
 static bool ParseEnum(const std::string& value, E& out) {
-	auto enum_value = magic_enum::enum_cast<E>(value.c_str());
+	auto enum_value = magic_enum::enum_cast<E>(value, magic_enum::case_insensitive);
 	if (!enum_value.has_value()) {
 		return false;
 	}
@@ -219,12 +210,16 @@ static constexpr Flag FLAGS[] = {
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
+    {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
+    {"--native-rt", &ConfigOptions::native_rt},
+    {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},
     {"--graphics-debug-dump", &ConfigOptions::graphics_debug_dump_enabled},
     {"--profile", &ConfigOptions::profiler_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
+    {"--readback-storage-images", &ConfigOptions::readback_storage_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},
     {"--no-trophy-notifications", &ConfigOptions::trophy_enabled, false},
     {"--perf-overlay", &ConfigOptions::perf_overlay_enabled},
@@ -345,6 +340,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.user_name = value;
+		} else if (arg == "--launch-activity") {
+			if (value.empty() || value.size() > 32 ||
+			    !std::ranges::all_of(value, [](char c) { return c >= ' ' && c <= '~'; })) {
+				::printf("invalid activity ID: must contain 1-32 printable ASCII characters\n");
+				return false;
+			}
+			options.config.launch_activity = value;
 		} else if (arg == "--user-id") {
 			if (!ParseUserId(value, options.config.user_id)) {
 				::printf("invalid user ID: %s\n", value.c_str());
@@ -352,6 +354,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--mic") {
 			options.config.audio_input_device = value;
+		} else if (arg == "--audio-output") {
+			if (!ParseEnum(value, options.config.audio_output)) {
+				::printf("invalid audio output: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--controller-color") {
 			Config::ControllerColor color {};
 			if (!ParseControllerColor(value, color)) {
@@ -382,6 +389,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--pssr-upscaler") {
+			if (!ParseEnum(value, options.config.pssr_upscaler)) {
+				::printf("invalid PSSR upscaler: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--dlss-folder") {
+			options.config.dlss_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--dlss-preset") {
+			if (value.size() != 1 || value[0] < 'A' || value[0] > 'O') {
+				::printf("invalid DLSS preset: %s\n", value.c_str());
+				return false;
+			}
+			options.config.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
+		} else if (arg == "--fsr-folder") {
+			options.config.fsr_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
@@ -392,6 +414,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid vblank frequency: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--flush-draws") {
+			if (!ParseUint32(value, options.config.flush_draws)) {
+				::printf("invalid draw count: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--trophy-duration") {
 			if (!ParseUint32(value, options.config.trophy_duration_seconds)) {
 				::printf("invalid trophy duration: %s\n", value.c_str());
@@ -400,11 +427,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
-				return false;
-			}
-		} else if (arg == "--shader-optimization-type") {
-			if (!ParseEnum(value, options.config.shader_optimization_type)) {
-				::printf("invalid shader optimization type: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--shader-log-direction") {
@@ -444,7 +466,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
-	VirtualMemory::Init();
 	InitializeThreads();
 
 	RunOptions options;

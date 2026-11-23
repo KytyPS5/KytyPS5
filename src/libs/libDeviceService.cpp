@@ -6,7 +6,7 @@
 
 namespace Libs {
 
-LIB_VERSION("DeviceService", 1, "Mbus", 1, 1);
+LIB_NAME("DeviceService", "Mbus");
 
 namespace DeviceService {
 

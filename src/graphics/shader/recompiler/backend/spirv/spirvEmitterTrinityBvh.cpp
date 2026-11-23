@@ -27,10 +27,11 @@ struct Bvh8Emitter {
 	uint32_t Shl(uint32_t x, uint32_t n) { return Binary(s, spv::OpShiftLeftLogical, u, x, C(n)); }
 	uint32_t Shr(uint32_t x, uint32_t n) { return Binary(s, spv::OpShiftRightLogical, u, x, C(n)); }
 	uint32_t Eq(uint32_t x, uint32_t y) { return Binary(s, spv::OpIEqual, b, x, y); }
+	uint32_t Ne(uint32_t x, uint32_t y) { return Binary(s, spv::OpINotEqual, b, x, y); }
 	uint32_t Both(uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalAnd, b, x, y); }
 	uint32_t Either(uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalOr, b, x, y); }
 	uint32_t Not(uint32_t x) { return Unary(s, spv::OpLogicalNot, b, x); }
-	uint32_t Bit(uint32_t x, uint32_t n) { return Not(Eq(And(x, C(1u << n)), C(0))); }
+	uint32_t Bit(uint32_t x, uint32_t n) { return Ne(And(x, C(1u << n)), C(0)); }
 	uint32_t Choose(uint32_t condition, uint32_t x, uint32_t y) { return Select(s, u, condition, x, y); }
 	uint32_t Float(uint32_t x) { return Unary(s, spv::OpBitcast, f, x); }
 	uint32_t Raw(uint32_t x) { return Unary(s, spv::OpBitcast, u, x); }
@@ -54,14 +55,7 @@ struct Bvh8Emitter {
 	Vec3 Unpack3(uint32_t value) {
 		return {Extract(f, value, 0), Extract(f, value, 1), Extract(f, value, 2)};
 	}
-	uint32_t Word(uint32_t block, uint32_t index) {
-		const auto offset = Unary(s, spv::OpUConvert, w, Shl(index, 2));
-		const auto address = Binary(s, spv::OpIAdd, w, block, offset);
-		const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
-		const auto id = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpLoad, u, id, pointer, spv::MemoryAccessAlignedMask, 4u);
-		return id;
-	}
+	uint32_t Word(uint32_t block, uint32_t index) { return BvhNodeWord(s, block, index); }
 	uint32_t Call(uint32_t type, uint32_t function, std::span<const uint32_t> args) {
 		const auto id = s.builder.AllocateId();
 		std::vector<uint32_t> call {spv::OpFunctionCall, type, id, function};
@@ -102,7 +96,7 @@ struct Bvh8Emitter {
 	void DefineTriangle() {
 		const auto a = Begin(triangle_function, "trinity_triangle", v4,
 		    std::array{w, u, u, u, v3, v3});
-		const auto block = a[0], slot = a[1], flags = a[2], descriptor = a[3];
+		const auto block = BvhNode(s, a[0]), slot = a[1], flags = a[2], descriptor = a[3];
 		const auto origin = Unpack3(a[4]), direction = Unpack3(a[5]);
 		const auto flag_word = Word(block, C(15));
 		const auto remap = Binary(s, spv::OpShiftRightLogical, u, flag_word, Shl(slot, 3));
@@ -113,11 +107,12 @@ struct Bvh8Emitter {
 		const auto raw = EmitValueOrDefaultIfCondition(s, Not(procedural), v4,
 		    Make4(C(0), C(0x3f800000), C(0x3f800000), C(0x3f800000)), [&] {
 			std::array<Vec3, 3> positions;
-			const std::array vertices {slot, Choose(Eq(slot, C(0)), C(1), C(3)), C(2)};
+			// Slot 0 is triangle (0,1,2) and slot 1 is (1,3,2), at three words per vertex.
+			const std::array starts {Binary(s, spv::OpIMul, u, slot, C(3)),
+			    Choose(Eq(slot, C(0)), C(3), C(9)), C(6)};
 			for (uint32_t vertex = 0; vertex < 3; ++vertex)
 				for (uint32_t axis = 0; axis < 3; ++axis)
-					positions[vertex][axis] = Float(Word(block,
-					    Add(Binary(s, spv::OpIMul, u, vertices[vertex], C(3)), C(axis))));
+					positions[vertex][axis] = Float(Word(block, Add(starts[vertex], C(axis))));
 			return EmitBvhTriangle(s, positions, origin, direction, remap, Add(flag_word, slot), bary);
 		});
 		std::array<uint32_t, 4> result;
@@ -175,8 +170,6 @@ struct Bvh8Emitter {
 
 	void DefineDecompress();
 	void DefineBoxes();
-	uint32_t Boxes(uint32_t first, uint32_t second, uint32_t full, uint32_t compressed,
-	               uint32_t flags, uint32_t descriptor, uint32_t extent, uint32_t org, uint32_t dir);
 	void DefineIntersect();
 };
 
@@ -184,15 +177,15 @@ void Bvh8Emitter::DefineDecompress() {
 	const auto a = Begin(decompress_function, "trinity_shared_exponent", f, std::array{u, u, b});
 	const auto exponent = a[0], packed = a[1], minimum = a[2];
 	const auto negative = Bit(packed, 17), mantissa = And(packed, C(0x1ffff));
-	const auto outward = Eq(Choose(negative, C(1), C(0)), Choose(minimum, C(1), C(0)));
-	const auto nonzero = Not(Eq(mantissa, C(0)));
+	const auto outward = Binary(s, spv::OpLogicalEqual, b, negative, minimum);
+	const auto nonzero = Ne(mantissa, C(0));
 	const auto highest = EmitGlsl<GLSLstd450FindUMsb, IR::Type::U32>(s, mantissa);
 	const auto shift = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(s, Sub(C(16), highest), exponent);
 	const auto decoded_exp = Choose(nonzero, Sub(exponent, shift),
 	    Choose(Both(outward, Binary(s, spv::OpUGreaterThan, b, exponent, C(17))), Sub(exponent, C(17)), C(0)));
 	// Zero mantissas take a separate result, but their unused shifts must still be defined.
 	const auto amount = Add(C(7), Choose(nonzero, shift, C(0)));
-	const auto trail = Choose(Both(outward, Not(Eq(decoded_exp, C(255)))),
+	const auto trail = Choose(Both(outward, Ne(decoded_exp, C(255))),
 	    Sub(Binary(s, spv::OpShiftLeftLogical, u, C(1), amount), C(1)), C(0));
 	const auto fraction = Choose(nonzero,
 	    And(Or(Binary(s, spv::OpShiftLeftLogical, u, mantissa, amount), trail), C(0x7fffff)),
@@ -204,18 +197,16 @@ void Bvh8Emitter::DefineBoxes() {
 	const auto result_type = s.builder.Type(spv::OpTypeStruct, v4, v4);
 	const auto a = Begin(boxes_function, "trinity_box_slot", result_type,
 	    std::array{w, w, b, b, u, u, f, v3, v3});
-	const auto first = a[0], second = a[1], full = a[2], compressed = a[3];
+	const auto first = BvhNode(s, a[0]), full = a[2], compressed = a[3];
 	const auto flags = a[4], descriptor = a[5], extent = a[6];
-	const auto org = Unpack3(a[7]), dir = Unpack3(a[8]);
+	const auto org = Unpack3(a[7]), inverse = Unpack3(a[8]);
 	const auto zero = ConstantF32Value(s, 0.0f), infinity = ConstantF32(s, 0x7f800000);
-	Vec3 inverse;
-	for (uint32_t i = 0; i < 3; ++i) inverse[i] = Fop(spv::OpFDiv, ConstantF32Value(s, 1.0f), dir[i]);
 	const auto packed = [&](uint32_t offset, uint32_t width) {
-		const auto word = Shr(offset, 5), shift = And(offset, C(31));
-		const auto lo = Binary(s, spv::OpShiftRightLogical, u, Word(first, word), shift);
+		const auto word = Shr(offset, 5);
 		const auto next = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(s, Add(word, C(1)), C(15));
-		const auto hi = Binary(s, spv::OpShiftLeftLogical, u, Word(first, next), And(Sub(C(32), shift), C(31)));
-		return And(Or(lo, Choose(Eq(shift, C(0)), C(0), hi)), C((1u << width) - 1));
+		const auto pair = PackU64(s, Word(first, word), Word(first, next));
+		const auto bits = Binary(s, spv::OpShiftRightLogical, w, pair, And(offset, C(31)));
+		return And(Unary(s, spv::OpUConvert, u, bits), C((1u << width) - 1));
 	};
 	const auto format = Choose(compressed, C(0), Choose(full, C(1), C(2)));
 	const auto entry_label = s.current_label;
@@ -236,7 +227,8 @@ void Bvh8Emitter::DefineBoxes() {
 	s.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlDontUnrollMask);
 	s.builder.AddFunction(spv::OpBranchConditional, more, body, merge);
 	EmitLabel(s, body);
-	const auto kind = packed(Add(C(29), Binary(s, spv::OpIMul, u, child, C(3))), 3);
+	const auto child3 = Binary(s, spv::OpIMul, u, child, C(3));
+	const auto kind = packed(Add(C(29), child3), 3);
 	const auto direct_node = Word(first, child);
 	const auto node = Choose(compressed, Or(Shl(prefix, 3), kind), direct_node);
 	const auto child_flags = Choose(compressed,
@@ -250,20 +242,22 @@ void Bvh8Emitter::DefineBoxes() {
 		if (encoding == 0) {
 			const auto yz = Word(first, C(2));
 			const std::array exponents {Shr(Word(first, C(1)), 24), And(yz, C(255)), And(Shr(yz, 8), C(255))};
+			const auto stride = Binary(s, spv::OpIMul, u, child, C(108));
 			for (uint32_t component = 0; component < 6; ++component) {
-				const auto offset = Add(C(80 + component * 18), Binary(s, spv::OpIMul, u, child, C(108)));
+				const auto offset = Add(C(80 + component * 18), stride);
 				bounds[component] = Call(f, decompress_function,
 				    std::array{exponents[component % 3], packed(offset, 18), ConstantBool(s, component < 3)});
 			}
 		} else if (encoding == 1) {
-			for (uint32_t component = 0; component < 6; ++component) {
-				const auto word = Add(C(4 + component), Binary(s, spv::OpIMul, u, child, C(6)));
-				const auto block = Select(s, w, Binary(s, spv::OpULessThan, b, word, C(16)), first, second);
-				bounds[component] = Float(Word(block, And(word, C(15))));
-			}
+			// A child's six bounds never cross the 16-word block boundary.
+			const auto low = Binary(s, spv::OpULessThan, b, child, C(2));
+			const auto block = BvhNode(s, Select(s, w, low, a[0], a[1]));
+			const auto start = And(Add(C(4), Binary(s, spv::OpIMul, u, child, C(6))), C(15));
+			for (uint32_t component = 0; component < 6; ++component)
+				bounds[component] = Float(Word(block, Add(start, C(component))));
 		} else {
 			for (uint32_t pair = 0; pair < 3; ++pair) {
-				const auto word = Add(C(4 + pair), Binary(s, spv::OpIMul, u, child, C(3)));
+				const auto word = Add(C(4 + pair), child3);
 				const auto value = EmitGlsl<GLSLstd450UnpackHalf2x16, IR::Type::F32x2>(s, Word(first, word));
 				bounds[pair * 2] = Extract(f, value, 0);
 				bounds[pair * 2 + 1] = Extract(f, value, 1);
@@ -274,7 +268,7 @@ void Bvh8Emitter::DefineBoxes() {
 	});
 	const auto lo_bound = Unpack3(Extract(v3, box, 0)), hi_bound = Unpack3(Extract(v3, box, 1));
 	Vec3 near, far;
-	auto valid = Not(Eq(And(child_flags, C(3)), C(3)));
+	auto valid = Ne(And(child_flags, C(3)), C(3));
 	for (uint32_t axis = 0; axis < 3; ++axis) {
 		valid = Both(valid, Fcmp(spv::OpFOrdLessThanEqual, lo_bound[axis], hi_bound[axis]));
 		const auto lo = Fop(spv::OpFMul, Fop(spv::OpFSub, lo_bound[axis], org[axis]), inverse[axis]);
@@ -318,13 +312,6 @@ void Bvh8Emitter::DefineBoxes() {
 	End(Make(result_type, std::array{nodes, keys}));
 }
 
-uint32_t Bvh8Emitter::Boxes(uint32_t first, uint32_t second, uint32_t full, uint32_t compressed,
-                            uint32_t flags, uint32_t descriptor, uint32_t extent,
-                            uint32_t org, uint32_t dir) {
-	return Call(s.builder.Type(spv::OpTypeStruct, v4, v4), boxes_function,
-	    std::array{first, second, full, compressed, flags, descriptor, extent, org, dir});
-}
-
 void Bvh8Emitter::DefineIntersect() {
 	const auto result_type = TypeBvh8Result(s);
 	const auto a = Begin(s.bvh8_intersect_function, "trinity_bvh_intersect", result_type,
@@ -352,7 +339,7 @@ void Bvh8Emitter::DefineIntersect() {
 	    Binary(s, spv::OpShiftLeftLogical, w, capacity, C(6)));
 	auto valid = Both(Eq(Shr(d[3], 28), C(8)),
 	    Eq(And(Unary(s, spv::OpUConvert, u, encoded_base), C(7)), C(0)));
-	valid = Both(valid, Both(Not(Eq(kind, C(7))), Either(Not(instance), Bit(d[3], 22))));
+	valid = Both(valid, Both(Ne(kind, C(7)), Either(Not(instance), Bit(d[3], 22))));
 	valid = Both(valid, Not(Unary(s, spv::OpIsNan, b, extent)));
 	for (uint32_t i = 0; i < 3; ++i) {
 		valid = Both(valid, Not(Either(Unary(s, spv::OpIsNan, b, org[i]), Unary(s, spv::OpIsInf, b, org[i]))));
@@ -370,7 +357,7 @@ void Bvh8Emitter::DefineIntersect() {
 		    ConstantU64(s, 0), [&] { return GetBdaPointer(s, at); });
 	};
 	const auto first = fetch(address, ConstantBool(s, true));
-	const auto present = [&](uint32_t pointer) { return Not(Binary(s, spv::OpIEqual, b, pointer, ConstantU64(s, 0))); };
+	const auto present = [&](uint32_t pointer) { return Ne(pointer, ConstantU64(s, 0)); };
 	const auto tail = [&](uint32_t at, uint32_t pointer) {
 		return EmitValueOrDefaultIfCondition(s, Both(full, present(pointer)), w, ConstantU64(s, 0), [&] {
 			return GetBdaPointer(s, Binary(s, spv::OpIAdd, w, at, ConstantU64(s, 64)));
@@ -378,6 +365,7 @@ void Bvh8Emitter::DefineIntersect() {
 	};
 	const auto second = tail(address, first);
 	const auto available = Both(present(first), Either(Not(full), present(second)));
+	const auto block = BvhNode(s, first);
 	std::array<uint32_t, 10> invalid;
 	invalid.fill(C(~0u));
 	for (uint32_t slot = 0; slot < 2; ++slot) {
@@ -387,7 +375,7 @@ void Bvh8Emitter::DefineIntersect() {
 	}
 	const auto default_result = Result(invalid, org, dir, C(0));
 	const auto value = EmitValueOrDefaultIfCondition(s, Both(instance, available), result_type, default_result, [&] {
-		return Instance(first, flags, mask, org, dir);
+		return Instance(block, flags, mask, org, dir);
 	});
 	const auto result = EmitValueOrDefaultIfCondition(s, Both(Not(instance), valid), result_type, value, [&] {
 		const auto second_address = Binary(s, spv::OpIAdd, w, address, fetch_size);
@@ -396,16 +384,19 @@ void Bvh8Emitter::DefineIntersect() {
 		const auto next_available = Both(present(next_first), Either(Not(full), present(next_second)));
 		const auto triangles = EmitValueOrDefaultIfCondition(s, triangle, result_type, default_result, [&] {
 			auto dst = invalid;
+			const auto pair = Eq(kind, C(1));
+			const auto absent = Both(available, Both(Eq(kind, C(0)), Bit(d[3], 24)));
+			const auto shape = EmitValueOrDefaultIfCondition(s, available, u, C(~0u),
+			    [&] { return Word(block, C(14)); });
 			for (uint32_t slot = 0; slot < 2; ++slot) {
-				const auto active = Both(available, slot == 0 ? ConstantBool(s, true) : Eq(kind, C(1)));
-				const auto absent = Both(available, Both(Eq(kind, C(0)), Bit(d[3], 24)));
+				const auto active = slot == 0 ? available : Both(available, pair);
 				const auto miss = Make4(C(0x7f800000), C(0x3f800000),
 				    slot == 1 ? Choose(absent, C(0), C(~0u)) : C(~0u), C(0));
 				const auto hit = EmitValueOrDefaultIfCondition(s, active, v4, miss, [&] {
 					return Call(v4, triangle_function, std::array{first, C(slot), flags, d[3], a[5], a[6]});
 				});
 				for (uint32_t i = 0; i < 4; ++i) dst[slot * 4 + i] = Extract(u, hit, i);
-				dst[8 + slot] = EmitValueOrDefaultIfCondition(s, active, u, C(~0u), [&] { return Word(first, C(14)); });
+				dst[8 + slot] = slot == 0 ? shape : Choose(pair, shape, C(~0u));
 			}
 			return Result(dst, org, dir, C(0));
 		});
@@ -415,11 +406,16 @@ void Bvh8Emitter::DefineIntersect() {
 			const auto miss = Make(slot_type, std::array{Make4(C(~0u), C(~0u), C(~0u), C(~0u)),
 			    Make4(C(0x7f800000), C(0x7f800000), C(0x7f800000), C(0x7f800000))});
 			std::array<uint32_t, 8> keys;
+			Vec3 inverse;
+			for (uint32_t i = 0; i < 3; ++i)
+				inverse[i] = Fop(spv::OpFDiv, ConstantF32Value(s, 1.0f), dir[i]);
+			const auto inverse_dir = Make(v3, inverse);
 			for (uint32_t slot = 0; slot < 2; ++slot) {
 				const auto hit = EmitValueOrDefaultIfCondition(s, slot == 0 ? available : next_available,
 				    slot_type, miss, [&] {
-					return Boxes(slot == 0 ? first : next_first, slot == 0 ? second : next_second,
-					    full, compressed, flags, d[1], extent, a[5], a[6]);
+					return Call(slot_type, boxes_function, std::array{slot == 0 ? first : next_first,
+					    slot == 0 ? second : next_second, full, compressed, flags, d[1], extent,
+					    a[5], inverse_dir});
 				});
 				const auto indices = Extract(v4, hit, 0), depths = Extract(v4, hit, 1);
 				for (uint32_t i = 0; i < 4; ++i) {

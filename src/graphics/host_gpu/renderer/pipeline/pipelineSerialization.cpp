@@ -81,9 +81,8 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
-	       mesh_task] = stage;
-	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task);
+	auto& [id, handle, info, specialization, function_code, rect_parameters, mesh_task] = stage;
+	IoAll(io, id, info, specialization, rect_parameters, mesh_task);
 }
 
 } // namespace
@@ -99,9 +98,9 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 		m_file.Truncate(kept);
 		m_file.Seek(kept);
 	}
-	if (m_file.IsInvalid()) {
-		return;
-	}
+}
+
+ShaderStoreWriter::ShaderStoreWriter() {
 	m_thread = std::jthread([this](std::stop_token stop) {
 		std::unique_lock lock(m_mutex);
 		// Once stop is requested the wait returns false only when the queue is empty.
@@ -244,9 +243,6 @@ bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
 				return false;
 			}
 			module.module = CompileSPV(spirv, m_graphics.device);
-			if (module.module == nullptr) {
-				return false;
-			}
 			program->second.modules.push_back(std::move(module));
 			break;
 		}

@@ -25,6 +25,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(user_name);
 	KYTY_CFG_SET(user_id);
 	KYTY_CFG_SET(audio_input_device);
+	KYTY_CFG_SET(audio_output);
 	KYTY_CFG_SET(present_mode);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
@@ -33,9 +34,13 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(stretch_enabled);
 	KYTY_CFG_SET(readback_linear_images);
 	KYTY_CFG_SET(readback_tiled_images);
+	KYTY_CFG_SET(readback_storage_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
+	KYTY_CFG_SET(flush_draws);
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(occlusion_queries_enabled);
+	KYTY_CFG_SET(relaxed_shader_float);
+	KYTY_CFG_SET(native_rt);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -47,7 +52,6 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
 	KYTY_CFG_SET(shader_validation_enabled);
-	KYTY_CFG_SET(shader_optimization_type);
 	KYTY_CFG_SET(shader_log_direction);
 	KYTY_CFG_SET(shader_log_folder);
 	KYTY_CFG_SET(command_buffer_dump_enabled);
@@ -57,6 +61,9 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
 	KYTY_CFG_SET(pro_enabled);
+	KYTY_CFG_SET(pssr_upscaler);
+	KYTY_CFG_SET(dlss_folder);
+	KYTY_CFG_SET(fsr_folder);
 	KYTY_CFG_SET(amd_cpu_enabled);
 	KYTY_CFG_SET(guest_tsc_enabled);
 #if defined(_WIN32)
@@ -79,6 +86,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	                         ? saved_user_id
 	                         : Config::DEFAULT_USER_ID;
 	audio_input_device = s.value("audio_input_device", audio_input_device).toString();
+	KYTY_CFG_GET(audio_output);
 	KYTY_CFG_GET(present_mode);
 	gpu_index = s.value("gpu_index", -1).toInt();
 	if (EnumToText(present_mode).isEmpty()) {
@@ -90,9 +98,13 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(stretch_enabled);
 	KYTY_CFG_GET(readback_linear_images);
 	KYTY_CFG_GET(readback_tiled_images);
+	KYTY_CFG_GET(readback_storage_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
+	KYTY_CFG_GET(flush_draws);
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
+	KYTY_CFG_GET(relaxed_shader_float);
+	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
@@ -107,7 +119,6 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	}
 	KYTY_CFG_GET(vulkan_validation_enabled);
 	KYTY_CFG_GET(shader_validation_enabled);
-	KYTY_CFG_GET(shader_optimization_type);
 	KYTY_CFG_GET(shader_log_direction);
 	KYTY_CFG_GET(shader_log_folder);
 	KYTY_CFG_GET(command_buffer_dump_enabled);
@@ -117,6 +128,9 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
 	KYTY_CFG_GET(guest_tsc_enabled);
+	KYTY_CFG_GET(pssr_upscaler);
+	KYTY_CFG_GET(dlss_folder);
+	KYTY_CFG_GET(fsr_folder);
 	pro_enabled     = s.value("pro_enabled", false).toBool();
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
@@ -181,6 +195,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	}
 	if (vblank_frequency < 30 || vblank_frequency > 360) {
 		return fail(tr("Vblank frequency must be between 30 and 360."));
+	}
+	if (flush_draws < 0) {
+		return fail(tr("Draws per GPU submit must be 0 or greater."));
 	}
 	if (trophy_duration_seconds < 5 || trophy_duration_seconds > 10) {
 		return fail(tr("Trophy notification duration must be between 5 and 10 seconds."));

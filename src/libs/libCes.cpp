@@ -11,9 +11,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #endif
 
@@ -21,7 +18,7 @@ namespace Libs {
 
 namespace LibCes {
 
-LIB_VERSION("Ces", 1, "Ces", 1, 1);
+LIB_NAME("Ces", "Ces");
 
 static const uint8_t* KYTY_SYSV_ABI CesRefersUcsProfileCp1252() {
 	PRINT_NAME();

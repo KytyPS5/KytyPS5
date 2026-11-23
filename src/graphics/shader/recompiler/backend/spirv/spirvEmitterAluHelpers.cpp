@@ -22,8 +22,8 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	        EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0)};
 }
 
-uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
-                               uint32_t class_match) {
+static uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
+                                      uint32_t class_match) {
 	const auto selected =
 	    EmitCompareU32Constant(state, spv::OpINotEqual, EmitAndConstant(state, mask, 1u << bit), 0);
 	return EmitLogicalAndBool(state, selected, class_match);
@@ -113,7 +113,7 @@ static uint32_t EmitMinMaxF32(EmitterState& state, uint32_t lhs, uint32_t rhs, u
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (state.profile.native_float_min_max) {
+	if (state.profile.native_float_min_max || state.profile.relaxed_float) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
 		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
@@ -124,24 +124,24 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (state.profile.relaxed_float) {
+		// The smallest pairwise maximum; a NaN source gives the minimum of the other two.
+		const auto ab = EmitMinMaxF32Value(state, a, b, true);
+		const auto bc = EmitMinMaxF32Value(state, b, c, true);
+		const auto ac = EmitMinMaxF32Value(state, a, c, true);
+		return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, ab, bc, false), ac, false);
+	}
+	// The median with -0 ordered below +0; a NaN source gives MIN3 in source order.
 	const auto a_bits = EmitBitcastF32ToU32(state, a);
 	const auto b_bits = EmitBitcastF32ToU32(state, b);
 	const auto c_bits = EmitBitcastF32ToU32(state, c);
-	// The NaN path is RDNA2 MIN3, which keeps the later source when two are NaN.
-	const auto min_ba = EmitMinMaxF32(state, b, a, b_bits, a_bits, false);
+	const auto min_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, false);
 	const auto min3 =
-	    EmitMinMaxF32(state, c, min_ba, c_bits, EmitBitcastF32ToU32(state, min_ba), false);
+	    EmitMinMaxF32(state, min_ab, c, EmitBitcastF32ToU32(state, min_ab), c_bits, false);
 	const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
-	const auto max3 =
-	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, true);
-	// RDNA2 compares numerically against MAX3, including ties between signed zeros, then takes
-	// V_MAX_F32 of the other two sources in their original order.
-	const auto a_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, a);
-	const auto b_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, b);
-	const auto x        = Select(state, TypeF32(state), a_is_max, b, a);
-	const auto y =
-	    Select(state, TypeF32(state), EmitLogicalOrBool(state, a_is_max, b_is_max), c, b);
-	const auto median = EmitMinMaxF32Value(state, x, y, true);
+	const auto capped_max =
+	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, false);
+	const auto median = EmitMinMaxF32Value(state, min_ab, capped_max, true);
 	const auto is_nan = [&](uint32_t value) {
 		return Unary(state, spv::OpIsNan, TypeBool(state), value);
 	};
@@ -151,6 +151,9 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (state.profile.relaxed_float) {
+		return value;
+	}
 	// x * 0 keeps the sign of a denormal; NaN and infinity fail the ordered compare.
 	const auto magnitude = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), magnitude, GlslStd450(state),

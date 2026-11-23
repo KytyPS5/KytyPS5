@@ -26,10 +26,12 @@ struct ResourceSpecialization {
 		uint32_t                      mip_count     = 1;
 		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
+		Prospero::BufferFormat        srgb_decode                = Prospero::BufferFormat::kInvalid;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
+		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
 		bool                          heap                       = false;
 		bool                          operator==(const Image&) const = default;

@@ -16,7 +16,7 @@ namespace Libs {
 
 namespace LibAudioPropagation {
 
-LIB_VERSION("AudioPropagation", 1, "AudioPropagation", 1, 0);
+LIB_NAME("AudioPropagation", "AudioPropagation");
 
 using AudioPropagationHandle = uint64_t;
 
@@ -75,6 +75,52 @@ static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /
 	return 0;
 }
 
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceCreate(
+    AudioPropagationHandle /*system_handle*/, AudioPropagationHandle* out_source_handle) {
+	PRINT_NAME();
+
+	if (out_source_handle != nullptr) {
+		*out_source_handle = AudioPropagationNextHandle();
+	}
+
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI
+AudioPropagationSourceSetAttributes(AudioPropagationHandle /*source_handle*/,
+                                    const void* /*attributes*/, uint32_t /*num_attributes*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI
+AudioPropagationSourceGetAudioPath(AudioPropagationHandle /*source_handle*/, uint32_t /*id*/,
+                                   AudioPropagationHandle* out_path_handle) {
+	PRINT_NAME();
+
+	if (out_path_handle != nullptr) {
+		*out_path_handle = AudioPropagationNextHandle();
+	}
+
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceSetAudioPath(
+    AudioPropagationHandle /*path_handle*/, const void* /*path*/, float /*gain*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
+static int32_t KYTY_SYSV_ABI AudioPropagationSourceRender(AudioPropagationHandle /*system_handle*/,
+                                                          void* /*render_info*/,
+                                                          uint32_t /*num_sources*/) {
+	PRINT_NAME();
+
+	return 0;
+}
+
 static int32_t KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
     AudioPropagationHandle /*system_handle*/, const void* /*material*/,
     AudioPropagationHandle* out_material_handle) {
@@ -110,6 +156,11 @@ LIB_DEFINE(InitAudio_1_AudioPropagation) {
 	LIB_FUNC("7xyAxrusLko", LibAudioPropagation::AudioPropagationSystemQueryMemory);
 	LIB_FUNC("aNEqtSHdUSo", LibAudioPropagation::AudioPropagationSystemCreate);
 	LIB_FUNC("8bI5h8req30", LibAudioPropagation::AudioPropagationRoomCreate);
+	LIB_FUNC("d84otraxt2s", LibAudioPropagation::AudioPropagationSourceCreate);
+	LIB_FUNC("-wsUTr31yeg", LibAudioPropagation::AudioPropagationSourceSetAttributes);
+	LIB_FUNC("eEeKqFeNI3o", LibAudioPropagation::AudioPropagationSourceGetAudioPath);
+	LIB_FUNC("tKSmk2JsMAA", LibAudioPropagation::AudioPropagationSourceSetAudioPath);
+	LIB_FUNC("hhz9pITnC8k", LibAudioPropagation::AudioPropagationSourceRender);
 	LIB_FUNC("CPLV6G-eXmk", LibAudioPropagation::AudioPropagationSystemRegisterMaterial);
 	LIB_FUNC("kIdb+iQUzCs", LibAudioPropagation::AudioPropagationSystemSetAttributes);
 	LIB_FUNC("ht-QXT3zGxo", LibAudioPropagation::AudioPropagationSystemGetRays);
@@ -119,7 +170,7 @@ LIB_DEFINE(InitAudio_1_AudioPropagation) {
 
 namespace LibAudioOut {
 
-LIB_VERSION("AudioOut", 1, "AudioOut", 1, 1);
+LIB_NAME("AudioOut", "AudioOut");
 
 namespace AudioOut = Audio::AudioOut;
 
@@ -138,7 +189,7 @@ LIB_DEFINE(InitAudio_1_AudioOut) {
 
 namespace LibAudioOut2 {
 
-LIB_VERSION("AudioOut2", 1, "AudioOut", 1, 1);
+LIB_NAME("AudioOut2", "AudioOut");
 
 namespace AudioOut2 = Audio::AudioOut2;
 
@@ -178,7 +229,7 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 
 namespace LibAudioIn {
 
-LIB_VERSION("AudioIn", 1, "AudioIn", 1, 1);
+LIB_NAME("AudioIn", "AudioIn");
 
 namespace AudioIn = Audio::AudioIn;
 
@@ -194,7 +245,7 @@ LIB_DEFINE(InitAudio_1_AudioIn) {
 
 namespace LibVoiceQoS {
 
-LIB_VERSION("VoiceQoS", 1, "VoiceQoS", 0, 0);
+LIB_NAME("VoiceQoS", "VoiceQoS");
 
 namespace VoiceQoS = Audio::VoiceQoS;
 
@@ -206,7 +257,7 @@ LIB_DEFINE(InitAudio_1_VoiceQoS) {
 
 namespace LibVoice {
 
-LIB_VERSION("Voice", 1, "Voice", 1, 1);
+LIB_NAME("Voice", "Voice");
 
 struct VoiceInitParam {
 	int32_t  app_type;
@@ -523,9 +574,25 @@ LIB_DEFINE(InitAudio_1_Voice) {
 
 } // namespace LibVoice
 
+namespace LibVoiceChat {
+
+LIB_NAME("VoiceChat", "VoiceChat");
+
+static int KYTY_SYSV_ABI VoiceChatStub() {
+	return OK;
+}
+
+LIB_DEFINE(InitAudio_1_VoiceChat) {
+	LIB_FUNC("spdS-hedavE", VoiceChatStub);
+	LIB_FUNC("Ptmkf9UnWBg", VoiceChatStub);
+	LIB_FUNC("CscDZAFA5+c", VoiceChatStub);
+}
+
+} // namespace LibVoiceChat
+
 namespace LibAjm {
 
-LIB_VERSION("Ajm", 1, "Ajm", 1, 1);
+LIB_NAME("Ajm", "Ajm");
 
 namespace Ajm = Audio::Ajm;
 
@@ -562,13 +629,14 @@ LIB_DEFINE(InitAudio_1_Ajm) {
 	LIB_FUNC("jVCWcthifr8", Ajm::AjmBatchJobRun);
 	LIB_FUNC("Z9NVCesiP0Q", Ajm::AjmBatchJobRunSplit);
 	LIB_FUNC("1t3ixYNXyuc", Ajm::AjmDecAt9ParseConfigData);
+	LIB_FUNC("eDFeTyi+G3Y", Ajm::AjmDecMp3ParseFrame);
 }
 
 } // namespace LibAjm
 
 namespace LibAcm {
 
-LIB_VERSION("Acm", 1, "Acm", 1, 1);
+LIB_NAME("Acm", "Acm");
 
 namespace Acm = Audio::Acm;
 
@@ -591,7 +659,7 @@ LIB_DEFINE(InitAudio_1_Acm) {
 
 namespace LibAvPlayer {
 
-LIB_VERSION("AvPlayer", 1, "AvPlayer", 1, 0);
+LIB_NAME("AvPlayer", "AvPlayer");
 
 namespace AvPlayer = Audio::AvPlayer;
 
@@ -630,7 +698,7 @@ LIB_DEFINE(InitAudio_1_AvPlayer) {
 
 namespace LibAudiodec {
 
-LIB_VERSION("Audiodec", 1, "Audiodec", 1, 1);
+LIB_NAME("Audiodec", "Audiodec");
 
 static constexpr int32_t AUDIODEC_ERROR_API_FAIL                = -2139160576; // 0x807F0000
 static constexpr int32_t AUDIODEC_ERROR_INVALID_TYPE             = -2139160575; // 0x807F0001
@@ -1120,7 +1188,7 @@ LIB_DEFINE(InitAudio_1_Audiodec) {
 
 namespace LibAudio3d {
 
-LIB_VERSION("Audio3d", 1, "Audio3d", 1, 1);
+LIB_NAME("Audio3d", "Audio3d");
 
 namespace Audio3d = Audio::Audio3d;
 
@@ -1138,7 +1206,7 @@ LIB_DEFINE(InitAudio_1_Audio3d) {
 
 namespace LibNgs2 {
 
-LIB_VERSION("Ngs2", 1, "Ngs2", 1, 1);
+LIB_NAME("Ngs2", "Ngs2");
 
 namespace Ngs2 = Audio::Ngs2;
 
@@ -1184,6 +1252,7 @@ LIB_DEFINE(InitAudio_1) {
 	LibAudioIn::InitAudio_1_AudioIn(s);
 	LibVoiceQoS::InitAudio_1_VoiceQoS(s);
 	LibVoice::InitAudio_1_Voice(s);
+	LibVoiceChat::InitAudio_1_VoiceChat(s);
 	LibAjm::InitAudio_1_Ajm(s);
 	LibAcm::InitAudio_1_Acm(s);
 	LibAvPlayer::InitAudio_1_AvPlayer(s);

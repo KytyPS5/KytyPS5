@@ -1,233 +1,224 @@
 #include "common/threads.h"
 
-#include "common/assert.h"
-
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <chrono>             // IWYU pragma: keep
-#include <condition_variable> // IWYU pragma: keep
-#include <mutex>
-
-// macOS has no clock_nanosleep.
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
-#define KYTY_POSIX_HIGH_RES_SLEEP
+#include <chrono> // IWYU pragma: keep
 #include <ctime>
-#endif
-
-#include <sstream>
-#include <string>
+#include <memory>
 #include <thread>
+#include <tuple>
+
+#ifdef __linux__
+#include <fstream>
+#include <map>
+#include <sched.h>
+#include <string>
+
+struct CoreReservation {
+	cpu_set_t allowed {};
+	cpu_set_t cpus {};
+	int       first = -1;
+};
+
+// Threads inherit affinity, so the calling thread and every thread it starts later leave the core.
+static const CoreReservation& GetCoreReservation() {
+	static const auto reservation = []() -> CoreReservation {
+		cpu_set_t allowed {};
+		if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+			return {};
+		}
+		struct Core {
+			cpu_set_t cpus {};
+			int       lowest      = CPU_SETSIZE;
+			unsigned  performance = 0;
+			unsigned  frequency   = 0;
+		};
+		// Keyed by the first CPU of the core's sibling list, which can lie outside the affinity.
+		std::map<int, Core> cores;
+		for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+			if (!CPU_ISSET(cpu, &allowed)) {
+				continue;
+			}
+			const auto path  = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/";
+			int        first = 0;
+			if (!(std::ifstream(path + "topology/thread_siblings_list") >> first)) {
+				return {};
+			}
+			auto& core = cores[first];
+			CPU_SET(cpu, &core.cpus);
+			core.lowest = std::min(core.lowest, cpu);
+			std::ifstream(path + "acpi_cppc/highest_perf") >> core.performance;
+			std::ifstream(path + "cpufreq/cpuinfo_max_freq") >> core.frequency;
+		}
+		// Leave the guest at least the seven cores a PS5 game expects for its own threads.
+		if (cores.size() < 8) {
+			return {};
+		}
+		// The highest performance, then frequency, then the last core; core 0 serves interrupts.
+		const auto best = std::ranges::max_element(cores, {}, [](const auto& entry) {
+			return std::tuple(entry.second.performance, entry.second.frequency, entry.first);
+		});
+		// Without either value the fastest core is unknown.
+		if (best->second.performance == 0 && best->second.frequency == 0) {
+			return {};
+		}
+		cpu_set_t others {};
+		CPU_XOR(&others, &allowed, &best->second.cpus);
+		if (sched_setaffinity(0, sizeof(others), &others) != 0) {
+			return {};
+		}
+		return {allowed, best->second.cpus, best->second.lowest};
+	}();
+	return reservation;
+}
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
+
+#include <bitset>
+#include <vector>
+
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+// High-resolution waitable timers need Windows 10 1803, the floor MapViewOfFile3 already sets.
 static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
 	}
-
-	thread_local HANDLE timer = CreateWaitableTimerExW(
-	    nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-	if (timer == nullptr) {
-		thread_local HANDLE fallback_timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
-		timer                              = fallback_timer;
+	// Closed when the thread exits.
+	thread_local const std::unique_ptr<void, decltype(&CloseHandle)> timer {
+	    CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+		                       TIMER_ALL_ACCESS),
+	    &CloseHandle};
+	LARGE_INTEGER due_time {};
+	due_time.QuadPart = -static_cast<LONGLONG>(units_100ns);
+	if (SetWaitableTimerEx(timer.get(), &due_time, 0, nullptr, nullptr, nullptr, 0) != 0) {
+		WaitForSingleObject(timer.get(), INFINITE);
 	}
-
-	if (timer != nullptr) {
-		LARGE_INTEGER due_time {};
-		due_time.QuadPart = -static_cast<LONGLONG>(units_100ns);
-		if (SetWaitableTimerEx(timer, &due_time, 0, nullptr, nullptr, nullptr, 0) != 0) {
-			WaitForSingleObject(timer, INFINITE);
-			return;
-		}
-	}
-
-	std::this_thread::sleep_for(std::chrono::nanoseconds(units_100ns * 100));
 }
 
 // IWYU pragma: no_include <minwindef.h>
 // IWYU pragma: no_include <synchapi.h>
 // IWYU pragma: no_include <minwinbase.h>
-// IWYU pragma: no_include <__mutex_base>
-// IWYU pragma: no_include <__threading_support>
 // IWYU pragma: no_include <errhandlingapi.h>
 // IWYU pragma: no_include <winerror.h>
 
-using InitializeConditionVariable_func_t = /*WINBASEAPI*/ VOID WINAPI (*)(PCONDITION_VARIABLE);
-using WakeConditionVariable_func_t    = /*WINBASEAPI*/ VOID       WINAPI (*)(PCONDITION_VARIABLE);
-using WakeAllConditionVariable_func_t = /*WINBASEAPI*/ VOID    WINAPI (*)(PCONDITION_VARIABLE);
-using SleepConditionVariableCS_func_t = /*WINBASEAPI*/ BOOL    WINAPI (*)(PCONDITION_VARIABLE,
-                                                                          PCRITICAL_SECTION, DWORD);
-
-static InitializeConditionVariable_func_t ResolveInitializeConditionVariable() {
-	if (HMODULE h = GetModuleHandle("KernelBase"); h != nullptr) // @suppress("Invalid arguments")
-	{
-		return reinterpret_cast<InitializeConditionVariable_func_t>(
-		    GetProcAddress(h, "InitializeConditionVariable"));
-	}
-	return nullptr;
-}
-static WakeConditionVariable_func_t ResolveWakeConditionVariable() {
-	if (HMODULE h = GetModuleHandle("KernelBase"); h != nullptr) // @suppress("Invalid arguments")
-	{
-		return reinterpret_cast<WakeConditionVariable_func_t>(
-		    GetProcAddress(h, "WakeConditionVariable"));
-	}
-	return nullptr;
-}
-static WakeAllConditionVariable_func_t ResolveWakeAllConditionVariable() {
-	if (HMODULE h = GetModuleHandle("KernelBase"); h != nullptr) // @suppress("Invalid arguments")
-	{
-		return reinterpret_cast<WakeAllConditionVariable_func_t>(
-		    GetProcAddress(h, "WakeAllConditionVariable"));
-	}
-	return nullptr;
-}
-static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
-	if (HMODULE h = GetModuleHandle("KernelBase"); h != nullptr) // @suppress("Invalid arguments")
-	{
-		return reinterpret_cast<SleepConditionVariableCS_func_t>(
-		    GetProcAddress(h, "SleepConditionVariableCS"));
-	}
-	return nullptr;
+static CRITICAL_SECTION* ToCs(unsigned char* storage) {
+	return reinterpret_cast<CRITICAL_SECTION*>(storage);
 }
 
-#endif
-
-#ifdef KYTY_POSIX_HIGH_RES_SLEEP
-// An absolute deadline preserves the requested sleep across signal interruptions.
-static void SleepHighResolutionNanos(uint64_t nanos) {
-	if (nanos == 0) {
-		return;
-	}
-
-	constexpr uint64_t NANOS_PER_SEC = 1000000000;
-
-	timespec deadline {};
-	if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
-		std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
-		return;
-	}
-
-	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
-	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
-	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
-
-	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
-	}
+static CONDITION_VARIABLE* ToCv(void** storage) {
+	return reinterpret_cast<CONDITION_VARIABLE*>(storage);
 }
+
+static int ReserveCore() {
+	// Leave explicit affinity/CPU-set policies and multi-group systems alone.
+	DWORD_PTR      process_mask = 0;
+	DWORD_PTR      system_mask  = 0;
+	GROUP_AFFINITY thread_affinity {};
+	ULONG          count = 0;
+	if (GetActiveProcessorGroupCount() != 1 ||
+	    GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) == 0 ||
+	    GetThreadGroupAffinity(GetCurrentThread(), &thread_affinity) == 0 ||
+	    process_mask != system_mask || thread_affinity.Mask != process_mask ||
+	    GetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0, &count) == 0 || count != 0 ||
+	    GetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0, &count) == 0 || count != 0) {
+		return -1;
+	}
+	ULONG size = 0;
+	GetSystemCpuSetInformation(nullptr, 0, &size, GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(size);
+	if (GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()),
+	                               size, &size, GetCurrentProcess(), 0) == 0) {
+		return -1;
+	}
+	using CpuSet = decltype(SYSTEM_CPU_SET_INFORMATION::CpuSet);
+	std::vector<const CpuSet*> sets;
+	std::bitset<256>           cores;
+	for (ULONG offset = 0; offset < size;) {
+		const auto& entry = *reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(&buffer[offset]);
+		offset += entry.Size;
+		if (entry.Type != CpuSetInformation ||
+		    (entry.CpuSet.Allocated != 0 && entry.CpuSet.AllocatedToTargetProcess == 0)) {
+			continue;
+		}
+		sets.push_back(&entry.CpuSet);
+		cores.set(entry.CpuSet.CoreIndex);
+	}
+	// Leave the guest at least the seven cores a PS5 game expects for its own threads.
+	if (cores.count() < 8) {
+		return -1;
+	}
+	// Highest efficiency, then scheduling class, then the last core; core 0 serves interrupts.
+	const auto* best = *std::ranges::max_element(sets, {}, [](const CpuSet* set) {
+		return std::tuple(set->EfficiencyClass, set->SchedulingClass, set->CoreIndex);
+	});
+
+	std::vector<ULONG> reserved;
+	std::vector<ULONG> others;
+	int                first = best->LogicalProcessorIndex;
+	for (const auto* set: sets) {
+		if (set->CoreIndex == best->CoreIndex) {
+			reserved.push_back(set->Id);
+			first = std::min<int>(first, set->LogicalProcessorIndex);
+		} else {
+			others.push_back(set->Id);
+		}
+	}
+	if (SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(),
+	                             static_cast<ULONG>(others.size())) == 0) {
+		return -1;
+	}
+	if (SetThreadSelectedCpuSets(GetCurrentThread(), reserved.data(),
+	                             static_cast<ULONG>(reserved.size())) == 0) {
+		SetProcessDefaultCpuSets(GetCurrentProcess(), nullptr, 0);
+		return -1;
+	}
+	return first;
+}
+
 #endif
 
 namespace Common {
 
-using thread_id_t = std::thread::id;
-
-struct MutexPrivate {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, KYTY_CS_SPIN_COUNT); }
-	~MutexPrivate() { DeleteCriticalSection(&m_cs); }
-	KYTY_CLASS_NO_COPY(MutexPrivate);
-	CRITICAL_SECTION m_cs {};
-#else
-	std::recursive_mutex m_mutex;
-#endif
-};
-
-struct CondVarPrivate {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	CondVarPrivate() {
-		static auto func = ResolveInitializeConditionVariable();
-		EXIT_NOT_IMPLEMENTED(func == nullptr);
-		func(&m_cv);
-	}
-	~CondVarPrivate() = default;
-	KYTY_CLASS_NO_COPY(CondVarPrivate);
-	CONDITION_VARIABLE m_cv {};
-#else
-	std::condition_variable_any m_cv;
-#endif
-};
-
-static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
-
-struct ThreadPrivate {
-	ThreadPrivate(thread_func_t f, void* a): func(f), arg(a), m_thread(&Run, this) {}
-
-	static void Run(ThreadPrivate* t) {
-		t->unique_id = Thread::GetThreadIdUnique();
-		t->started   = true;
-		t->func(t->arg);
-	}
-
-	thread_func_t    func;
-	void*            arg;
-	std::atomic_bool finished    = false;
-	std::atomic_bool auto_delete = false;
-	std::atomic_bool started     = false;
-	int              unique_id   = 0;
-	std::thread      m_thread;
-};
-
-static thread_id_t      g_main_thread;
-static int              g_main_thread_int;
-static std::atomic<int> g_thread_counter = 0;
+static std::thread::id g_main_thread;
 
 void InitializeThreads() {
-	g_main_thread     = std::this_thread::get_id();
-	g_main_thread_int = Thread::GetThreadIdUnique();
-}
-
-Thread::Thread(thread_func_t func, void* arg)
-    : m_thread(std::make_unique<ThreadPrivate>(func, arg)) {
-	while (!m_thread->started) {
-		Common::Thread::SleepMicro(1000);
-	}
-}
-
-Thread::~Thread() {
-	EXIT_IF(!m_thread->finished && !m_thread->auto_delete);
-
-	m_thread.reset();
-}
-
-void Thread::Join() {
-	EXIT_IF(m_thread->finished || m_thread->auto_delete);
-
-	m_thread->m_thread.join();
-
-	m_thread->finished = true;
-}
-
-void Thread::Detach() {
-	EXIT_IF(m_thread->finished || m_thread->auto_delete);
-
-	m_thread->auto_delete = true;
-	m_thread->m_thread.detach();
+	g_main_thread = std::this_thread::get_id();
+#ifdef __linux__
+	GetCoreReservation();
+#endif
 }
 
 void Thread::SleepMicro(uint32_t micros) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
-#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
-	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000);
-#else
-	std::this_thread::sleep_for(std::chrono::microseconds(micros));
-#endif
+	SleepNano(uint64_t {micros} * 1000);
 }
 
 void Thread::SleepNano(uint64_t nanos) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SleepHighResolution100ns((nanos + 99) / 100);
-#elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
-	SleepHighResolutionNanos(nanos);
-#else
+#elif defined(__APPLE__) // no clock_nanosleep
 	std::this_thread::sleep_for(std::chrono::nanoseconds(nanos));
+#else
+	if (nanos == 0) {
+		return;
+	}
+	constexpr uint64_t NANOS_PER_SEC = 1000000000;
+	// An absolute deadline preserves the requested sleep across signal interruptions.
+	timespec deadline {};
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
+	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
+	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
+	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
+	}
 #endif
 }
 
@@ -235,147 +226,78 @@ bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
 }
 
-std::string Thread::GetId() const {
-	std::stringstream ss;
-	ss << m_thread->m_thread.get_id();
-	return ss.str();
+int Thread::ReserveCoreForCurrentThread() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return ReserveCore();
+#elif defined(__linux__)
+	const auto& core = GetCoreReservation();
+	return core.first >= 0 && sched_setaffinity(0, sizeof(core.cpus), &core.cpus) == 0 ? core.first
+	                                                                                   : -1;
+#else
+	return -1;
+#endif
 }
 
-int Thread::GetUniqueId() const {
-	return m_thread->unique_id;
+#ifdef __linux__
+void Thread::RestoreProcessAffinity() {
+	if (const auto& core = GetCoreReservation(); core.first >= 0) {
+		sched_setaffinity(0, sizeof(core.allowed), &core.allowed);
+	}
+}
+#endif
+
+int Thread::GetThreadIdUnique() {
+	static std::atomic<int> counter = 0;
+	static thread_local int tid     = ++counter;
+	return tid;
 }
 
-std::string Thread::GetThreadId() {
-	std::stringstream ss;
-	ss << std::this_thread::get_id();
-	return ss.str();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+Mutex::Mutex() {
+	static_assert(sizeof(CRITICAL_SECTION) == sizeof(m_cs) &&
+	              alignof(CRITICAL_SECTION) <= alignof(Mutex));
+	InitializeCriticalSectionAndSpinCount(ToCs(m_cs), KYTY_CS_SPIN_COUNT);
 }
-
-Mutex::Mutex(): m_mutex(std::make_unique<MutexPrivate>()) {}
 
 Mutex::~Mutex() {
-	m_mutex.reset();
+	DeleteCriticalSection(ToCs(m_cs));
 }
 
 void Mutex::Lock() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	EnterCriticalSection(&m_mutex->m_cs);
-#else
-	m_mutex->m_mutex.lock();
-#endif
+	EnterCriticalSection(ToCs(m_cs));
 }
 
 void Mutex::Unlock() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	LeaveCriticalSection(&m_mutex->m_cs);
-#else
-	m_mutex->m_mutex.unlock();
-#endif
-}
-
-bool Mutex::TryLock() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	return (TryEnterCriticalSection(&m_mutex->m_cs) != 0);
-#else
-	return m_mutex->m_mutex.try_lock();
-#endif
-}
-
-CondVar::CondVar(): m_cond_var(std::make_unique<CondVarPrivate>()) {}
-
-CondVar::~CondVar() {
-	m_cond_var.reset();
-}
-
-void CondVar::Wait(Mutex* mutex) {
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
-#endif
-	auto poll_callback = [&] {
-		auto* callback = g_cond_wait_poll_callback;
-		if (callback == nullptr) {
-			return;
-		}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		LeaveCriticalSection(&mutex->m_mutex->m_cs);
-		callback();
-		EnterCriticalSection(&mutex->m_mutex->m_cs);
-#else
-		cpp_lock.unlock();
-		callback();
-		cpp_lock.lock();
-#endif
-	};
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static auto func = ResolveSleepConditionVariableCS();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	if (g_cond_wait_poll_callback == nullptr) {
-		func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, INFINITE);
-	} else {
-		if (func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, 10) == 0 &&
-		    GetLastError() == ERROR_TIMEOUT) {
-			poll_callback();
-		}
-	}
-#else
-	if (g_cond_wait_poll_callback == nullptr) {
-		m_cond_var->m_cv.wait(cpp_lock);
-	} else {
-		if (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(10000)) ==
-		    std::cv_status::timeout) {
-			poll_callback();
-		}
-	}
-	cpp_lock.release();
-#endif
-}
-
-void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
-	g_cond_wait_poll_callback = callback;
-}
-
-bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
-	bool ok = false;
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
-#endif
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static auto func = ResolveSleepConditionVariableCS();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
-	           0 &&
-	       GetLastError() == ERROR_TIMEOUT);
-#else
-	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
-	      std::cv_status::no_timeout);
-	cpp_lock.release();
-#endif
-	return ok;
+	LeaveCriticalSection(ToCs(m_cs));
 }
 
 void CondVar::Signal() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static auto func = ResolveWakeConditionVariable();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	func(&m_cond_var->m_cv);
-#else
-	m_cond_var->m_cv.notify_one();
-#endif
+	WakeConditionVariable(ToCv(&m_cv));
 }
 
 void CondVar::SignalAll() {
+	WakeAllConditionVariable(ToCv(&m_cv));
+}
+#endif
+
+void CondVar::Wait(Mutex* mutex) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	static auto func = ResolveWakeAllConditionVariable();
-	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	func(&m_cond_var->m_cv);
+	// A guest signal queued as a special user APC runs only when the wait returns.
+	SleepConditionVariableCS(ToCv(&m_cv), ToCs(mutex->m_cs), 10);
 #else
-	m_cond_var->m_cv.notify_all();
+	m_cv.wait(mutex->m_mutex);
 #endif
 }
 
-int Thread::GetThreadIdUnique() {
-	static thread_local int tid = ++g_thread_counter;
-	return tid;
+bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return SleepConditionVariableCS(ToCv(&m_cv), ToCs(mutex->m_cs),
+	                                micros < 1000 ? 1 : micros / 1000) != 0 ||
+	       GetLastError() != ERROR_TIMEOUT;
+#else
+	return m_cv.wait_for(mutex->m_mutex, std::chrono::microseconds(micros)) ==
+	       std::cv_status::no_timeout;
+#endif
 }
 
 } // namespace Common

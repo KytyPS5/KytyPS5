@@ -1,39 +1,25 @@
 #ifndef KYTY_COMMON_TIMER_H_
 #define KYTY_COMMON_TIMER_H_
 
-#include "common/common.h"
+#include <chrono>
+#include <cstdint>
 
 namespace Common {
 
+inline uint64_t SteadyNs() {
+	return static_cast<uint64_t>(
+	    std::chrono::nanoseconds(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Measures from its construction.
 class Timer final {
 public:
-	Timer() noexcept;
-	~Timer() = default;
-
-	void Start();
-
-	void Pause();
-
-	void Resume();
-
-	[[nodiscard]] bool IsPaused() const;
-
-	// return time in milliseconds
-	[[nodiscard]] double GetTimeMs() const;
-
-	// return time in seconds
-	[[nodiscard]] double GetTimeS() const;
-
-	KYTY_CLASS_NO_COPY(Timer);
-
-	[[nodiscard]] static uint64_t QueryPerformanceFrequency();
-	[[nodiscard]] static uint64_t QueryPerformanceCounter();
+	[[nodiscard]] double GetTimeS() const {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count();
+	}
 
 private:
-	bool     m_is_paused = true;
-	uint64_t m_Frequency = 0;
-	uint64_t m_StartTime = 0;
-	uint64_t m_PauseTime = 0;
+	std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
 };
 
 } // namespace Common

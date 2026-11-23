@@ -33,17 +33,42 @@ DescriptorHeap::~DescriptorHeap() {
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(layout == nullptr);
-
 	auto& batch = m_sets[layout];
 	if (batch.size != 0) {
 		return batch.sets[--batch.size];
 	}
-	if (Allocate(layout, batch)) {
+
+	std::array<vk::DescriptorSetLayout, DescriptorSetBatch> layouts;
+	layouts.fill(layout);
+	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.descriptorPool     = m_current_pool;
+	allocate.descriptorSetCount = DescriptorSetBatch;
+	allocate.pSetLayouts        = layouts.data();
+	const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
+	if (result == vk::Result::eSuccess) {
+		batch.size = DescriptorSetBatch;
+		return batch.sets[--batch.size];
+	}
+	EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
+	        result != vk::Result::eErrorFragmentedPool);
+
+	// A failed multi-set allocation can leave a pool unable to allocate even one set until it is
+	// reset, so the rest of this pool and a fresh one are filled one set per call.
+	const auto fill = [&](Batch& target) {
+		while (target.size < DescriptorSetBatch &&
+		       m_graphics.device.allocateDescriptorSets(&allocate, &target.sets[target.size]) ==
+		           vk::Result::eSuccess) {
+			target.size++;
+		}
+		return target.size != 0;
+	};
+	allocate.descriptorSetCount = 1;
+	if (fill(batch)) {
 		return batch.sets[--batch.size];
 	}
 
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+	m_master_semaphore.Refresh();
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();
@@ -53,33 +78,10 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	}
 
 	m_sets.clear();
-	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
-	return fresh_batch.sets[--fresh_batch.size];
-}
-
-bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
-	std::array<vk::DescriptorSetLayout, DescriptorSetBatch> layouts;
-	layouts.fill(layout);
-
-	vk::DescriptorSetAllocateInfo allocate {};
+	auto& fresh_batch       = m_sets[layout];
 	allocate.descriptorPool = m_current_pool;
-	allocate.pSetLayouts    = layouts.data();
-
-	for (;;) {
-		allocate.descriptorSetCount = batch.allocation;
-		const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
-		if (result == vk::Result::eSuccess) {
-			batch.size = batch.allocation;
-			return true;
-		}
-		EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
-		        result != vk::Result::eErrorFragmentedPool);
-		if (batch.allocation == 1) {
-			return false;
-		}
-		batch.allocation /= 2;
-	}
+	EXIT_IF(!fill(fresh_batch));
+	return fresh_batch.sets[--fresh_batch.size];
 }
 
 void DescriptorHeap::CreateDescriptorPool() {

@@ -277,6 +277,7 @@ enum class Opcode {
 	V_BFI_B32,
 	V_ALIGNBIT_B32,
 	V_ALIGNBYTE_B32,
+	V_PERM_B32,
 	V_MIN3_F32,
 	V_MIN3_I32,
 	V_MIN3_U32,
@@ -296,6 +297,7 @@ enum class Opcode {
 	V_MED3_I16,
 	V_MED3_U16,
 	V_SAD_U32,
+	V_MSAD_U8,
 	V_ADD3_U32,
 	V_LSHL_ADD_U32,
 	V_ADD_LSHL_U32,
@@ -465,6 +467,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_U_F16,
 	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
@@ -559,6 +562,7 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
 	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
 	BUFFER_LOAD_FORMAT_D16_XY,
 	BUFFER_LOAD_FORMAT_D16_XYZ,
 	BUFFER_LOAD_FORMAT_D16_XYZW,
@@ -573,7 +577,10 @@ enum class Opcode {
 	BUFFER_STORE_FORMAT_D16_XYZW,
 	BUFFER_LOAD_UBYTE,
 	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
 	BUFFER_LOAD_SBYTE,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
 	BUFFER_LOAD_SHORT_D16,
@@ -874,6 +881,7 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	bool           image_cube                                   = false; // DIM is CUBE.
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;

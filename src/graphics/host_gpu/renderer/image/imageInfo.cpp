@@ -88,14 +88,9 @@ void ImageInfo::UpdateSize() {
 		bytes_per_block = element.bytes;
 	}
 	EXIT_IF(bytes_per_block != element.bytes);
-	mip_layout                     = {};
-	tiling                         = {};
-	tiling.texel_width             = element.texel_width;
-	tiling.texel_height            = element.texel_height;
-	tiling.block.bytes_per_element = element.bytes;
-	tiled_slice_stride             = 0;
-	linear_slice_stride            = 0;
-	first_tail_level               = 16;
+	tiling = {{.bytes_per_element = element.bytes}, element.texel_width, element.texel_height};
+	tiled_slice_stride = 0;
+	first_tail_level   = 16;
 
 	if (samples > 1) {
 		EXIT_NOT_IMPLEMENTED(IsVolume() || resources.levels != 1 ||
@@ -103,9 +98,7 @@ void ImageInfo::UpdateSize() {
 		                      tile_mode != Prospero::TileMode::kRenderTarget));
 		const auto fragments = std::countr_zero(samples);
 		if (pitch == 0) {
-			pitch = tile_mode == Prospero::TileMode::kDepth
-			            ? TileGetDepthPitch(extent.width, bytes_per_block, fragments)
-			            : TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
+			pitch = TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
 		}
 		EXIT_NOT_IMPLEMENTED(!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
 		if (data.size == 0) {
@@ -139,9 +132,8 @@ void ImageInfo::UpdateSize() {
 		EXIT_IF(data.size % resources.layers != 0);
 		const auto slice = data.size / resources.layers;
 		EXIT_IF(Multiply(Multiply(pitch, extent.height), bytes_per_block) > slice);
-		linear_slice_stride = slice;
-		tiled_slice_stride  = IsTiled() ? slice : 0;
-		mip_layout[0]       = {0, data.size, pitch, extent.height, 0, slice, pitch};
+		tiled_slice_stride = IsTiled() ? slice : 0;
+		mip_layout[0]      = {0, data.size, pitch, extent.height};
 		return;
 	}
 	if (!IsTiled()) {
@@ -154,19 +146,10 @@ void ImageInfo::UpdateSize() {
 			data.size = Multiply(total.size, TransferLayers());
 		}
 		for (uint32_t level = 0; level < resources.levels; ++level) {
-			auto& mip         = mip_layout[level];
-			mip.offset        = offsets[level].offset;
-			mip.size          = Multiply(offsets[level].size, MipExtent(level).depth);
-			mip.pitch         = padded[level].width / element.texel_width;
-			mip.height        = padded[level].height / element.texel_height;
-			mip.linear_offset = offsets[level].offset;
-			mip.linear_size   = offsets[level].size;
-			mip.linear_pitch  = mip.pitch;
-			linear_slice_stride =
-			    std::max(linear_slice_stride, Add(mip.linear_offset, mip.linear_size));
-		}
-		if (TransferLayers() > 1 && data.size % TransferLayers() == 0) {
-			linear_slice_stride = std::max(linear_slice_stride, data.size / TransferLayers());
+			mip_layout[level] = {offsets[level].offset,
+			                     Multiply(offsets[level].size, MipExtent(level).depth),
+			                     padded[level].width / element.texel_width,
+			                     padded[level].height / element.texel_height};
 		}
 	} else {
 		TileSurfaceLayout            surface {};
@@ -179,7 +162,7 @@ void ImageInfo::UpdateSize() {
 		                                          IsVolume() ? extent.depth : 1u,
 		                                          resources.levels,
 		                                          resources.layers};
-		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface));
+		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface, mip_layout.data()));
 		tiling             = surface.texture;
 		first_tail_level   = surface.first_tail_level;
 		tiled_slice_stride = surface.block_slice_size;
@@ -189,34 +172,51 @@ void ImageInfo::UpdateSize() {
 		if (!IsVolume() && resources.layers > 1 && data.size % resources.layers == 0) {
 			tiled_slice_stride = std::max(tiled_slice_stride, data.size / resources.layers);
 		}
-		uint64_t linear_offset = 0;
-		uint32_t mip_pitch     = IsVolume() ? extent.width : pitch;
-		for (uint32_t level = 0; level < resources.levels; ++level) {
-			const auto& source = surface.mips[level];
-			auto&       mip    = mip_layout[level];
-			const auto  active = MipExtent(level);
-			mip.offset         = source.offset;
-			mip.size           = Multiply(source.size, IsVolume() ? 1u : resources.layers);
-			mip.pitch          = source.padded_width;
-			mip.height         = source.padded_height;
-			mip.tail_x         = source.tail_x;
-			mip.tail_y         = source.tail_y;
-			mip.linear_pitch =
-			    Common::AlignUp(mip_pitch, element.texel_width) / element.texel_width;
-			const auto rows =
-			    Common::AlignUp(active.height, element.texel_height) / element.texel_height;
-			mip.linear_size      = Multiply(Multiply(mip.linear_pitch, rows), element.bytes);
-			const auto alignment = std::max(element.bytes, 4u);
-			EXIT_IF(linear_offset > UINT64_MAX - (alignment - 1u));
-			mip.linear_offset = Common::AlignUp<uint64_t>(linear_offset, alignment);
-			linear_offset     = Add(mip.linear_offset, Multiply(mip.linear_size, active.depth));
-			mip_pitch         = std::max(mip_pitch >> 1u, 1u);
+		if (!IsVolume()) {
+			for (uint32_t level = 0; level < resources.levels; ++level) {
+				mip_layout[level].size = Multiply(mip_layout[level].size, resources.layers);
+			}
 		}
 		const auto compact_size = CompactMipSize(*this);
 		if (compact_size != 0 && (auto_size || data.size == compact_size)) {
 			data.size = mip_layout[0].size = compact_size;
 		}
 	}
+}
+
+ImageLinearLayout ImageInfo::LinearLayout() const {
+	ImageLinearLayout layout {};
+	// Guest-linear and depth-plane slices hold every level at its guest offset and pitch.
+	if (!IsTiled() || (IsDepthPlane(*this) && resources.levels == 1)) {
+		for (uint32_t level = 0; level < resources.levels; ++level) {
+			const auto  slices  = MipExtent(level).depth;
+			const auto& mip     = mip_layout[level];
+			const auto  size    = mip.size / slices;
+			layout.mips[level]  = {mip.offset, size, mip.pitch};
+			layout.slice_stride = std::max(layout.slice_stride, Add(mip.offset, size));
+		}
+		if (TransferLayers() > 1 && data.size % TransferLayers() == 0) {
+			layout.slice_stride = std::max(layout.slice_stride, data.size / TransferLayers());
+		}
+		return layout;
+	}
+	const auto bytes     = tiling.block.bytes_per_element;
+	const auto alignment = std::max(bytes, 4u);
+	uint64_t   offset    = 0;
+	uint32_t   mip_pitch = IsVolume() ? extent.width : pitch;
+	for (uint32_t level = 0; level < resources.levels; ++level) {
+		const auto active = MipExtent(level);
+		const auto linear_pitch =
+		    Common::AlignUp(mip_pitch, tiling.texel_width) / tiling.texel_width;
+		const auto rows = Common::AlignUp(active.height, tiling.texel_height) / tiling.texel_height;
+		const auto size = Multiply(Multiply(linear_pitch, rows), bytes);
+		EXIT_IF(offset > UINT64_MAX - (alignment - 1u));
+		offset             = Common::AlignUp<uint64_t>(offset, alignment);
+		layout.mips[level] = {offset, size, linear_pitch};
+		offset             = Add(offset, Multiply(size, active.depth));
+		mip_pitch          = std::max(mip_pitch >> 1u, 1u);
+	}
+	return layout;
 }
 
 uint32_t ImageInfo::DataAlignment() const {
@@ -230,82 +230,75 @@ uint32_t ImageInfo::DataAlignment() const {
 	return tiling.block.block_size;
 }
 
-int32_t ImageInfo::SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
+ImageSubresource ImageInfo::SubresourceOf(const ImageInfo& container) const noexcept {
 	if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
 	    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
-	    container.resources.layers == 0 || mip < 0 ||
-	    static_cast<uint32_t>(mip) >= container.resources.levels ||
-	    container.resources.levels > container.mip_layout.size() ||
-	    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
-	    data.End() > container.data.End()) {
-		return -1;
-	}
-	if (HasStencil() != container.HasStencil() ||
+	    container.resources.layers == 0 ||
+	    container.resources.levels > container.mip_layout.size() || !data.Valid() ||
+	    !container.data.Valid() || data.address < container.data.address ||
+	    data.End() > container.data.End() ||
+	    container.data.size % container.resources.layers != 0 ||
+	    data.size % resources.layers != 0 || HasStencil() != container.HasStencil() ||
 	    (HasStencil() && (stencil.address < container.stencil.address ||
 	                      stencil.End() > container.stencil.End()))) {
-		return -1;
-	}
-
-	const auto  level  = static_cast<uint32_t>(mip);
-	const auto& layout = container.mip_layout[level];
-	if (extent.width != std::max(container.extent.width >> level, 1u) ||
-	    extent.height != std::max(container.extent.height >> level, 1u) ||
-	    extent.depth != container.extent.depth || mip_layout[0].pitch != layout.pitch ||
-	    mip_layout[0].height != layout.height || layout.size == 0 ||
-	    layout.size % container.resources.layers != 0 ||
-	    container.data.size % container.resources.layers != 0 ||
-	    data.size % resources.layers != 0) {
-		return -1;
+		return {};
 	}
 
 	// PS5 block slices contain the entire reversed mip chain. A rebased tail
 	// descriptor covers its addressed span within the shared tail block.
-	const auto slice_stride = container.data.size / container.resources.layers;
-	const auto child_stride = data.size / resources.layers;
-	auto mip_offset = layout.offset;
-	auto mip_size   = layout.size / container.resources.layers;
-	const auto compact_size = CompactMipSize(*this);
-	if (compact_size != 0 && child_stride == compact_size && mip_layout[0].size == compact_size) {
-		const auto range = TiledMipRange(container, level);
-		if (range.size != compact_size) {
-			return -1;
-		}
-		mip_offset = range.address;
-		mip_size   = range.size;
-	} else if (mip_layout[0].tail_x != layout.tail_x || mip_layout[0].tail_y != layout.tail_y) {
-		return -1;
-	}
-	if (child_stride != mip_size || mip_offset >= slice_stride ||
-	    child_stride > slice_stride - mip_offset ||
-	    (resources.layers > 1 && child_stride != slice_stride)) {
-		return -1;
-	}
+	const auto slice_stride  = container.data.size / container.resources.layers;
+	const auto child_stride  = data.size / resources.layers;
 	const auto address_delta = data.address - container.data.address;
-	if (address_delta < mip_offset || (address_delta - mip_offset) % slice_stride != 0) {
-		return -1;
+	const auto layer         = address_delta / slice_stride;
+	if ((resources.layers > 1 && child_stride != slice_stride) || layer > INT32_MAX) {
+		return {};
 	}
-	const auto layer = (address_delta - mip_offset) / slice_stride;
-	if (layer > INT32_MAX || layer >= container.resources.layers ||
-	    resources.layers > container.resources.layers - layer) {
-		return -1;
+	const auto compact_size = CompactMipSize(*this);
+	const bool compact =
+	    compact_size != 0 && child_stride == compact_size && mip_layout[0].size == compact_size;
+	// Tail levels share an offset, so the extent identifies the level.
+	for (uint32_t level = 0; level < container.resources.levels; ++level) {
+		const auto& layout = container.mip_layout[level];
+		if (extent.width != std::max(container.extent.width >> level, 1u) ||
+		    extent.height != std::max(container.extent.height >> level, 1u) ||
+		    mip_layout[0].pitch != layout.pitch || mip_layout[0].height != layout.height ||
+		    layout.size == 0 || layout.size % container.resources.layers != 0) {
+			continue;
+		}
+		auto mip_offset = layout.offset;
+		if (compact) {
+			const auto range = TiledMipRange(container, level);
+			if (range.size != compact_size) {
+				continue;
+			}
+			mip_offset = range.address;
+		} else if (mip_layout[0].tail_x != layout.tail_x || mip_layout[0].tail_y != layout.tail_y ||
+		           child_stride != layout.size / container.resources.layers) {
+			continue;
+		}
+		if (mip_offset != address_delta % slice_stride ||
+		    child_stride > slice_stride - mip_offset) {
+			continue;
+		}
+		return {static_cast<int32_t>(level), static_cast<int32_t>(layer)};
 	}
-	return static_cast<int32_t>(layer);
+	return {};
 }
 
 uint64_t ImageInfo::LinearSize(uint32_t levels) const {
 	levels = levels == 0 ? resources.levels : levels;
 	EXIT_IF(levels == 0 || levels > resources.levels || levels > mip_layout.size());
-	if (linear_slice_stride == 0) {
-		const auto& mip = mip_layout[levels - 1u];
-		return Add(mip.linear_offset, Multiply(mip.linear_size, MipExtent(levels - 1u).depth));
+	const auto linear = LinearLayout();
+	if (linear.slice_stride == 0) {
+		const auto& mip = linear.mips[levels - 1u];
+		return Add(mip.offset, Multiply(mip.size, MipExtent(levels - 1u).depth));
 	}
 	uint64_t size = 0;
 	for (uint32_t level = 0; level < levels; ++level) {
-		const auto& mip    = mip_layout[level];
+		const auto& mip    = linear.mips[level];
 		const auto  slices = MipExtent(level).depth;
-		const auto  stride = linear_slice_stride != 0 ? linear_slice_stride : mip.linear_size;
-		size               = std::max(
-		    size, Add(Add(mip.linear_offset, Multiply(slices - 1u, stride)), mip.linear_size));
+		const auto  last   = Add(mip.offset, Multiply(slices - 1u, linear.slice_stride));
+		size               = std::max(size, Add(last, mip.size));
 	}
 	return size;
 }
@@ -315,22 +308,26 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 	levels = levels == 0 ? resources.levels : levels;
 	EXIT_IF(levels > resources.levels || levels > mip_layout.size() || tiling.texel_width == 0 ||
 	        tiling.texel_height == 0);
-	const auto aspect = IsDepth()                             ? vk::ImageAspectFlagBits::eDepth
-	                    : pixel_format == vk::Format::eS8Uint ? vk::ImageAspectFlagBits::eStencil
-	                                                          : vk::ImageAspectFlagBits::eColor;
+	auto aspect = vk::ImageAspectFlagBits::eColor;
+	if (IsDepth()) {
+		aspect = vk::ImageAspectFlagBits::eDepth;
+	} else if (pixel_format == vk::Format::eS8Uint) {
+		aspect = vk::ImageAspectFlagBits::eStencil;
+	}
+	const auto                       linear = LinearLayout();
 	std::vector<vk::BufferImageCopy> copies;
 	std::array<uint32_t, 16>         image_heights {};
 	uint64_t                         count = 0;
 	for (uint32_t level = 0; level < levels; ++level) {
-		const auto& mip    = mip_layout[level];
+		const auto& mip    = linear.mips[level];
 		const auto  active = MipExtent(level);
-		if (linear_slice_stride == 0) {
+		if (linear.slice_stride == 0) {
 			image_heights[level] = Common::AlignUp(active.height, tiling.texel_height);
 		} else {
-			const auto row_bytes = Multiply(mip.linear_pitch, tiling.block.bytes_per_element);
+			const auto row_bytes = Multiply(mip.pitch, tiling.block.bytes_per_element);
 			EXIT_IF(row_bytes == 0);
-			const auto rows = linear_slice_stride / row_bytes;
-			if (linear_slice_stride % row_bytes == 0 &&
+			const auto rows = linear.slice_stride / row_bytes;
+			if (linear.slice_stride % row_bytes == 0 &&
 			    rows >=
 			        (uint64_t {active.height} + tiling.texel_height - 1u) / tiling.texel_height &&
 			    rows <= UINT32_MAX / tiling.texel_height) {
@@ -341,20 +338,20 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 	}
 	copies.reserve(static_cast<size_t>(count));
 	for (uint32_t level = 0; level < levels; ++level) {
-		const auto&         mip    = mip_layout[level];
+		const auto&         mip    = linear.mips[level];
 		const auto          active = MipExtent(level);
 		vk::BufferImageCopy copy {};
-		copy.bufferOffset      = Add(buffer_offset, mip.linear_offset);
-		copy.bufferRowLength   = mip.linear_pitch * tiling.texel_width;
-		copy.bufferImageHeight = image_heights[level] != 0 ? image_heights[level]
-		                         : !IsTiled() ? mip.height * tiling.texel_height
-		                                      : Common::AlignUp(active.height, tiling.texel_height);
+		copy.bufferOffset      = Add(buffer_offset, mip.offset);
+		copy.bufferRowLength   = mip.pitch * tiling.texel_width;
+		copy.bufferImageHeight = image_heights[level];
 		copy.imageSubresource  = {aspect, level, 0, 1};
 		copy.imageExtent       = {active.width, active.height, 1};
 		if (image_heights[level] == 0) {
+			copy.bufferImageHeight = IsTiled() ? Common::AlignUp(active.height, tiling.texel_height)
+			                                   : mip_layout[level].height * tiling.texel_height;
 			for (uint32_t slice = 0; slice < active.depth; ++slice) {
-				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),
-				                                           Multiply(slice, linear_slice_stride));
+				copy.bufferOffset =
+				    Add(Add(buffer_offset, mip.offset), Multiply(slice, linear.slice_stride));
 				copy.imageSubresource.baseArrayLayer = IsVolume() ? 0u : slice;
 				copy.imageOffset.z                   = IsVolume() ? static_cast<int32_t>(slice) : 0;
 				copies.push_back(copy);

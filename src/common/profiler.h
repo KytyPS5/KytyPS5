@@ -9,13 +9,6 @@
 namespace profiler::colors {
 
 inline constexpr uint32_t RedA100        = 0xff8a80;
-inline constexpr uint32_t Blue300        = 0x64b5f6;
-inline constexpr uint32_t CyanA700       = 0x00b8d4;
-inline constexpr uint32_t Green100       = 0xc8e6c9;
-inline constexpr uint32_t Green200       = 0xa5d6a7;
-inline constexpr uint32_t Green300       = 0x81c784;
-inline constexpr uint32_t Green400       = 0x66bb6a;
-inline constexpr uint32_t Amber300       = 0xffd54f;
 inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 } // namespace profiler::colors

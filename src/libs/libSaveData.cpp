@@ -22,7 +22,7 @@
 
 namespace Libs {
 
-LIB_VERSION("SaveData", 1, "SaveData", 1, 1);
+LIB_NAME("SaveData", "SaveData");
 
 namespace SaveData {
 
@@ -266,6 +266,7 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
+static constexpr uint32_t SAVE_DATA_EVENT_TYPE_CONVERT_END       = 5u;
 
 static constexpr size_t   SAVE_DATA_MEMORY_MAX_SIZE      = 32 * 1024 * 1024;
 static constexpr uint32_t SAVE_DATA_MEMORY_SET_PARAM     = 1u;
@@ -420,9 +421,8 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 			continue;
 		}
 		if (it->is_regular_file(error) && !error) {
-			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
-			if (!time.IsInvalid()) {
-				mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
+			if (const auto times = Common::File::GetTimes(it->path())) {
+				mtime = std::max(mtime, times->write_ns / 1000000000);
 			}
 		}
 		error.clear();
@@ -710,8 +710,6 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	     mount->user_id, mount->dir_name->data, mount->blocks, mount->system_blocks,
 	     mount->mount_mode, mount->resource);
 
-	*mount_result = {};
-
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name  = mount->dir_name->data;
 	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id);
@@ -731,16 +729,17 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
-	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
+	const bool exists = Common::File::IsDirectoryExisting(mount_dir);
+	if (open && !exists) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
+	if (create && exists) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
-	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
+	if ((create || create2) && !exists) {
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
@@ -766,6 +765,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		created = true;
 	}
 
+	*mount_result = {};
 	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
 }
 
@@ -1247,15 +1247,34 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 	uint64_t blocks = 0;
-	if (read_save_blocks(source, &blocks) == OK) {
+	int      status = read_save_blocks(source, &blocks);
+	if (status == OK) {
 		if (convert->dst_blocks == blocks) {
 			return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 		}
 		if (convert->dst_blocks < blocks) {
 			return SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC;
 		}
+		status = write_save_file(source / "sce_sys" / "blocks.bin", &convert->dst_blocks,
+		                         sizeof(convert->dst_blocks));
 	}
-	EXIT("save data conversion of %s is not implemented\n", convert->src_dir_name->data);
+	const auto* dir_name = convert->src_dir_name;
+	if (status == OK && convert->dst_dir_name != nullptr) {
+		std::error_code error;
+		std::filesystem::rename(
+		    source, save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id),
+		    error);
+		if (error) {
+			status = SAVE_DATA_ERROR_INTERNAL;
+		} else {
+			dir_name = convert->dst_dir_name;
+		}
+	}
+	SceSaveDataTitleId title {};
+	std::snprintf(title.data, sizeof(title.data), "%s", get_title_id().c_str());
+	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, &title, dir_name,
+	                      status);
+	return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
@@ -1375,7 +1394,7 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 
 namespace LibSaveDataNative {
 
-LIB_VERSION("SaveData_native", 1, "SaveData_native", 1, 1);
+LIB_NAME("SaveData_native", "SaveData_native");
 
 LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("TywrFKCoLGY", ::Libs::SaveData::SaveDataInitialize3);

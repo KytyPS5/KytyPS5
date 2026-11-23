@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_COMMON_BITARRAY_H_
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 
 namespace Common {
 
+// Words are accessed atomically, so an array whose writers hold a lock can be read without it.
 template <size_t N>
 class BitArray final {
 	static_assert(N != 0, "BitArray size must be nonzero");
@@ -54,132 +56,93 @@ public:
 	using const_iterator = Iterator;
 
 	constexpr BitArray() = default;
+	BitArray(const BitArray& other): BitArray(other, 0, N) {}
+	BitArray& operator=(const BitArray&) = delete;
 
-	constexpr BitArray(const BitArray& other, size_t start, size_t end) {
-		if (start >= end || end > N) {
-			return;
-		}
-
-		const auto first_word = start / BITS_PER_WORD;
-		const auto last_word  = (end - 1) / BITS_PER_WORD;
-		const auto start_bit  = start % BITS_PER_WORD;
-		const auto end_bit    = (end - 1) % BITS_PER_WORD;
-		const auto start_mask = ~uint64_t {0} << start_bit;
-		const auto end_mask =
-		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
-
-		if (first_word == last_word) {
-			m_data[first_word] = other.m_data[first_word] & start_mask & end_mask;
-			return;
-		}
-
-		m_data[first_word] = other.m_data[first_word] & start_mask;
-		for (auto word = first_word + 1; word < last_word; word++) {
-			m_data[word] = other.m_data[word];
-		}
-		m_data[last_word] = other.m_data[last_word] & end_mask;
+	BitArray(const BitArray& other, size_t start, size_t end) {
+		ForEachWord(start, end, [&](size_t word, uint64_t mask) {
+			Store(word, other.Load(word) & mask);
+			return false;
+		});
 	}
 
-	[[nodiscard]] constexpr bool Get(size_t index) const {
-		return (m_data[index / BITS_PER_WORD] & (uint64_t {1} << (index % BITS_PER_WORD))) != 0;
+	[[nodiscard]] bool Get(size_t index) const {
+		return (Load(index / BITS_PER_WORD) & (uint64_t {1} << (index % BITS_PER_WORD))) != 0;
 	}
 
-	constexpr void Set(size_t index) {
-		m_data[index / BITS_PER_WORD] |= uint64_t {1} << (index % BITS_PER_WORD);
+	void Set(size_t index) {
+		const auto word = index / BITS_PER_WORD;
+		Store(word, Load(word) | (uint64_t {1} << (index % BITS_PER_WORD)));
 	}
 
-	constexpr void Unset(size_t index) {
-		m_data[index / BITS_PER_WORD] &= ~(uint64_t {1} << (index % BITS_PER_WORD));
+	void Unset(size_t index) {
+		const auto word = index / BITS_PER_WORD;
+		Store(word, Load(word) & ~(uint64_t {1} << (index % BITS_PER_WORD)));
 	}
 
-	constexpr void SetRange(size_t start, size_t end) {
-		if (start >= end || end > N) {
-			return;
-		}
-
-		const auto first_word = start / BITS_PER_WORD;
-		const auto last_word  = (end - 1) / BITS_PER_WORD;
-		const auto start_bit  = start % BITS_PER_WORD;
-		const auto end_bit    = (end - 1) % BITS_PER_WORD;
-		const auto start_mask = ~uint64_t {0} << start_bit;
-		const auto end_mask =
-		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
-
-		if (first_word == last_word) {
-			m_data[first_word] |= start_mask & end_mask;
-			return;
-		}
-
-		m_data[first_word] |= start_mask;
-		for (auto word = first_word + 1; word < last_word; word++) {
-			m_data[word] = ~uint64_t {0};
-		}
-		m_data[last_word] |= end_mask;
+	void SetRange(size_t start, size_t end) {
+		ForEachWord(start, end, [this](size_t word, uint64_t mask) {
+			Store(word, Load(word) | mask);
+			return false;
+		});
 	}
 
-	constexpr void UnsetRange(size_t start, size_t end) {
-		if (start >= end || end > N) {
-			return;
-		}
-
-		const auto first_word = start / BITS_PER_WORD;
-		const auto last_word  = (end - 1) / BITS_PER_WORD;
-		const auto start_bit  = start % BITS_PER_WORD;
-		const auto end_bit    = (end - 1) % BITS_PER_WORD;
-		const auto start_mask = (uint64_t {1} << start_bit) - 1;
-		const auto end_mask =
-		    end_bit == BITS_PER_WORD - 1 ? uint64_t {0} : ~((uint64_t {1} << (end_bit + 1)) - 1);
-
-		if (first_word == last_word) {
-			m_data[first_word] &= start_mask | end_mask;
-			return;
-		}
-
-		m_data[first_word] &= start_mask;
-		for (auto word = first_word + 1; word < last_word; word++) {
-			m_data[word] = 0;
-		}
-		m_data[last_word] &= end_mask;
+	void UnsetRange(size_t start, size_t end) {
+		ForEachWord(start, end, [this](size_t word, uint64_t mask) {
+			Store(word, Load(word) & ~mask);
+			return false;
+		});
 	}
 
-	constexpr void Clear() { m_data.fill(0); }
-	constexpr void Fill() { m_data.fill(~uint64_t {0}); }
+	void Clear() {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, 0);
+		}
+	}
 
-	[[nodiscard]] constexpr bool None() const {
+	void Fill() {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, ~uint64_t {0});
+		}
+	}
+
+	[[nodiscard]] bool None() const {
 		uint64_t combined = 0;
-		for (const auto word: m_data) {
-			combined |= word;
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			combined |= Load(word);
 		}
 		return combined == 0;
 	}
 
-	[[nodiscard]] constexpr bool Any() const { return !None(); }
+	[[nodiscard]] bool Any(size_t start, size_t end) const {
+		return ForEachWord(start, end,
+		                   [this](size_t word, uint64_t mask) { return (Load(word) & mask) != 0; });
+	}
 
-	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
+	[[nodiscard]] Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};
 		}
 
 		auto word_index = start / BITS_PER_WORD;
-		auto word       = m_data[word_index] & (~uint64_t {0} << (start % BITS_PER_WORD));
+		auto word       = Load(word_index) & StartMask(start);
 		while (word == 0) {
 			word_index++;
 			if (word_index == WORD_COUNT) {
 				return {N, N};
 			}
-			word = m_data[word_index];
+			word = Load(word_index);
 		}
 
-		const auto first     = word_index * BITS_PER_WORD + std::countr_zero(word);
-		const auto first_bit = first % BITS_PER_WORD;
-		const auto first_ones =
-		    static_cast<size_t>(std::countr_one(m_data[word_index] >> first_bit));
+		const auto first      = word_index * BITS_PER_WORD + std::countr_zero(word);
+		const auto first_bit  = first % BITS_PER_WORD;
+		const auto first_ones = static_cast<size_t>(std::countr_one(word >> first_bit));
 		if (first_bit + first_ones < BITS_PER_WORD) {
 			return {first, first + first_ones};
 		}
 
 		for (word_index++; word_index < WORD_COUNT; word_index++) {
-			word = m_data[word_index];
+			word = Load(word_index);
 			if (word != ~uint64_t {0}) {
 				return {first, word_index * BITS_PER_WORD + std::countr_one(word)};
 			}
@@ -187,9 +150,9 @@ public:
 		return {first, N};
 	}
 
-	[[nodiscard]] constexpr Range FirstRange() const { return FirstRangeFrom(0); }
+	[[nodiscard]] Range FirstRange() const { return FirstRangeFrom(0); }
 
-	[[nodiscard]] constexpr Range LastRangeFrom(size_t end) const {
+	[[nodiscard]] Range LastRangeFrom(size_t end) const {
 		if (end == 0) {
 			return {0, 0};
 		}
@@ -197,16 +160,13 @@ public:
 			end = N;
 		}
 
-		auto       word_index = (end - 1) / BITS_PER_WORD;
-		const auto end_bit    = (end - 1) % BITS_PER_WORD;
-		const auto end_mask =
-		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
-		auto word = m_data[word_index] & end_mask;
+		auto word_index = (end - 1) / BITS_PER_WORD;
+		auto word       = Load(word_index) & EndMask(end);
 		while (word == 0) {
 			if (word_index == 0) {
 				return {0, 0};
 			}
-			word = m_data[--word_index];
+			word = Load(--word_index);
 		}
 
 		const auto empty_bits = static_cast<size_t>(std::countl_zero(word));
@@ -217,7 +177,7 @@ public:
 		}
 
 		while (word_index != 0) {
-			word = m_data[--word_index];
+			word = Load(--word_index);
 			if (word != ~uint64_t {0}) {
 				return {(word_index + 1) * BITS_PER_WORD - std::countl_one(word), last};
 			}
@@ -225,33 +185,57 @@ public:
 		return {0, last};
 	}
 
-	[[nodiscard]] constexpr Range LastRange() const { return LastRangeFrom(N); }
+	[[nodiscard]] Range LastRange() const { return LastRangeFrom(N); }
 
 	[[nodiscard]] const_iterator begin() const { return Iterator(*this, 0); }
 	[[nodiscard]] const_iterator end() const { return Iterator(*this, N); }
 
-	constexpr BitArray& operator^=(const BitArray& other) {
+	[[nodiscard]] BitArray operator~() const {
+		BitArray result;
 		for (size_t word = 0; word < WORD_COUNT; word++) {
-			m_data[word] ^= other.m_data[word];
-		}
-		return *this;
-	}
-
-	[[nodiscard]] constexpr BitArray operator^(const BitArray& other) const {
-		auto result = *this;
-		result ^= other;
-		return result;
-	}
-
-	[[nodiscard]] constexpr BitArray operator~() const {
-		auto result = *this;
-		for (auto& word: result.m_data) {
-			word = ~word;
+			result.Store(word, ~Load(word));
 		}
 		return result;
 	}
 
 private:
+	static constexpr uint64_t StartMask(size_t start) {
+		return ~uint64_t {0} << (start % BITS_PER_WORD);
+	}
+
+	static constexpr uint64_t EndMask(size_t end) {
+		const auto end_bit = (end - 1) % BITS_PER_WORD;
+		return end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+	}
+
+	// Calls func(word, mask) for each word of [start, end), with mask selecting the bits in range,
+	// until func returns true; returns whether it did.
+	template <typename Func>
+	static bool ForEachWord(size_t start, size_t end, Func&& func) {
+		if (start >= end || end > N) {
+			return false;
+		}
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		for (auto word = first_word; word <= last_word; word++) {
+			const auto mask = (word == first_word ? StartMask(start) : ~uint64_t {0}) &
+			                  (word == last_word ? EndMask(end) : ~uint64_t {0});
+			if (func(word, mask)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	[[nodiscard]] uint64_t Load(size_t word) const {
+		// A load never writes, so it may reference the word through a const member.
+		return std::atomic_ref(const_cast<uint64_t&>(m_data[word])).load(std::memory_order_relaxed);
+	}
+
+	void Store(size_t word, uint64_t value) {
+		std::atomic_ref(m_data[word]).store(value, std::memory_order_relaxed);
+	}
+
 	std::array<uint64_t, WORD_COUNT> m_data {};
 };
 

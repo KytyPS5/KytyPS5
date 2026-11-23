@@ -378,6 +378,7 @@ constexpr int SYSTEM_SERVICE_ERROR_INVALID_URI_LEN                 = -2136932345
 constexpr int SYSTEM_SERVICE_ERROR_INVALID_URI_SCHEME              = -2136932344; /* 0x80A10008 */
 constexpr int SYSTEM_SERVICE_ERROR_NO_APP_INFO                     = -2136932343; /* 0x80A10009 */
 constexpr int SYSTEM_SERVICE_ERROR_NOT_FLAG_IN_PARAM_SFO           = -2136932342; /* 0x80A1000A */
+constexpr int SYSTEM_SERVICE_ERROR_REMOTEPLAY_PARAMETER            = -2132606973; /* 0x80E30003 */
 
 } // namespace SystemService
 

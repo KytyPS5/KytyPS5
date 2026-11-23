@@ -50,7 +50,7 @@ const uint8_t* avpriv_vga16_font_get(void);
 
 namespace Libs {
 
-LIB_VERSION("Font", 1, "Font", 1, 1);
+LIB_NAME("Font", "Font");
 namespace Font {
 
 using FontLibrarySelection      = void*;
@@ -61,7 +61,6 @@ using FontRenderer              = void*;
 using FontMemoryDestroyCallback = void (*)(void* font_memory, void* object, void* destroy_arg);
 using FontMemoryInterface       = void;
 using FontOpenDetail            = void;
-using FontGenerateGlyphDetail   = void;
 using FontString                = void*;
 using FontTextCharacter         = const void*;
 using FontRenderCharacter       = const void*;
@@ -98,6 +97,42 @@ struct FontMemory {
 	void*                      user_object;
 	void*                      parent_object;
 };
+
+struct FontGenerateGlyphDetail {
+	uint16_t          detail_id;
+	uint16_t          reserved;
+	uint16_t          form_options;
+	uint8_t           glyph_form;
+	uint8_t           metrics_form;
+	const FontMemory* memory;
+	void*             reserved2;
+	void*             reserved1;
+};
+static_assert(sizeof(FontGenerateGlyphDetail) == 0x20);
+
+constexpr uint8_t FONT_GLYPH_FORM_OUTLINE = 1;
+
+struct FontPointF {
+	float x;
+	float y;
+};
+
+// Contours close implicitly; contour_indexes holds each contour's last point.
+struct FontGlyphOutline {
+	int16_t     contours_count;
+	int16_t     points_count;
+	uint32_t    flags;
+	FontPointF* points;
+	uint8_t*    point_tags;
+	uint16_t*   contour_indexes;
+};
+static_assert(sizeof(FontGlyphOutline) == 0x20);
+
+constexpr uint8_t FONT_OUTLINE_TAG_CONIC = 0;
+constexpr uint8_t FONT_OUTLINE_TAG_ON    = 1;
+constexpr uint8_t FONT_OUTLINE_TAG_CUBIC = 2;
+// Set for CFF outlines, whose outer contours run counter-clockwise.
+constexpr uint32_t FONT_OUTLINE_REVERSE_FILL = 0x4;
 
 struct LibraryState {
 	const FontMemory* memory;
@@ -233,6 +268,11 @@ struct GlyphState {
 	FontGlyphMetrics                                               metrics;
 	std::vector<uint8_t>                                           image;
 	FontTransImage                                                 trans_image;
+	uint8_t                                                        glyph_form;
+	std::vector<FontPointF>                                        outline_points;
+	std::vector<uint8_t>                                           outline_tags;
+	std::vector<uint16_t>                                          outline_contours;
+	FontGlyphOutline                                               outline;
 };
 
 union FontTextParseResult {
@@ -379,7 +419,7 @@ struct FontWritingLineStep {
 };
 
 struct FontWritingState {
-	FontStringState*      string;
+	FontCharacterState*   next;
 	FontCharacterState*   character;
 	FontWritingStep       step;
 	FontWritingLetterStep letter_step;
@@ -563,12 +603,12 @@ static uint32_t count_characters_until(FontCharacterState* first, FontCharacterS
 
 	uint32_t count = 0;
 	for (auto* c = first; c != nullptr; c = get_next_character(c)) {
-		if (last != nullptr && c == last) {
-			break;
-		}
 		count++;
+		if (c == last) {
+			return count;
+		}
 	}
-	return count;
+	return last == nullptr ? count : 0;
 }
 
 static void fill_text_codes(FontTextCodes* text_codes, FontCharacterState* character,
@@ -601,41 +641,25 @@ static void fill_writing_metrics(FontWritingMetrics* metrics, uint32_t character
 	metrics->extent.right  = advance;
 }
 
-static void fill_writing_step(FontWritingStep* step, FontCharacterState* character) {
-	if (step == nullptr) {
-		return;
-	}
-
+static void fill_writing_step(FontWritingStep* step, const FontCharacterState* character, float x) {
 	std::memset(step, 0, sizeof(FontWritingStep));
-	step->advance_x               = 8.0f;
-	step->advance_y               = 0.0f;
-	step->font                    = character != nullptr ? character->font : nullptr;
-	step->profile.character_count = character != nullptr ? 1u : 0u;
-	step->profile.invisible_glyph = 0u;
-	step->glyph_code              = character != nullptr ? character->code : 0u;
-	fill_metrics_for_code(&step->glyph_metrics,
-	                      static_cast<FontState*>(character != nullptr ? character->font : nullptr),
-	                      character != nullptr ? character->code : static_cast<uint32_t>('?'));
+	step->x                       = x;
+	step->font                    = character->font;
+	step->profile.character_count = 1;
+	step->glyph_code              = character->code;
+	step->positioning.x           = x;
+	fill_metrics_for_code(&step->glyph_metrics, static_cast<FontState*>(character->font),
+	                      character->code);
+	step->advance_x = step->glyph_metrics.horizontal.advance;
 }
 
 static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
-                                     FontCharacterState*    character) {
-	if (letter_step == nullptr) {
-		return;
-	}
-
+                                     const FontWritingStep* step) {
 	std::memset(letter_step, 0, sizeof(FontWritingLetterStep));
-	letter_step->advance_x = 8.0f;
-	letter_step->advance_y = 0.0f;
-
-	if (character == nullptr) {
-		return;
-	}
-
+	letter_step->x                                = step->x;
+	letter_step->advance_x                        = step->advance_x;
 	letter_step->components.texts_count           = 1;
-	letter_step->components.texts_index           = character->index;
 	letter_step->components.glyphs_count          = 1;
-	letter_step->components.glyphs_index          = 0;
 	letter_step->components.base_components_count = 1;
 	letter_step->components.base_focus_count      = 1;
 	letter_step->components.character_text_count  = 1;
@@ -950,6 +974,71 @@ static void init_image(std::vector<uint8_t>* image, FontTransImage* trans_image,
 	trans_image->width_byte   = width;
 	trans_image->image_width  = width;
 	trans_image->image_height = height;
+}
+
+// Pixels at the font's scale, y up from the pen origin on the baseline.
+static void init_outline(GlyphState* glyph, FontState* font) {
+	if (!ensure_stb_font(font)) {
+		return;
+	}
+
+	const auto  code    = stb_supported_codepoint(font, glyph->code);
+	const float scale_x = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_w);
+	const float scale_y = stbtt_ScaleForMappingEmToPixels(&font->font_info, font->scale_h);
+
+	stbtt_vertex* vertices = nullptr;
+	const int     num_vertices =
+	    stbtt_GetCodepointShape(&font->font_info, static_cast<int>(code), &vertices);
+
+	auto&      points    = glyph->outline_points;
+	auto&      tags      = glyph->outline_tags;
+	auto&      contours  = glyph->outline_contours;
+	const auto add_point = [&](int x, int y, uint8_t tag) {
+		points.push_back({static_cast<float>(x) * scale_x, static_cast<float>(y) * scale_y});
+		tags.push_back(tag);
+	};
+	// The shape ends each contour on its start point, which the implicit close repeats.
+	const auto close_contour = [&](size_t begin) {
+		if (points.size() <= begin) {
+			return;
+		}
+		if (points.size() - begin > 1) {
+			points.pop_back();
+			tags.pop_back();
+		}
+		contours.push_back(static_cast<uint16_t>(points.size() - 1));
+	};
+
+	size_t begin = 0;
+	for (int i = 0; i < num_vertices; i++) {
+		const auto& v = vertices[i];
+		switch (v.type) {
+			case STBTT_vmove:
+				close_contour(begin);
+				begin = points.size();
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			case STBTT_vline: add_point(v.x, v.y, FONT_OUTLINE_TAG_ON); break;
+			case STBTT_vcurve:
+				add_point(v.cx, v.cy, FONT_OUTLINE_TAG_CONIC);
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+			case STBTT_vcubic:
+				add_point(v.cx, v.cy, FONT_OUTLINE_TAG_CUBIC);
+				add_point(v.cx1, v.cy1, FONT_OUTLINE_TAG_CUBIC);
+				add_point(v.x, v.y, FONT_OUTLINE_TAG_ON);
+				break;
+		}
+	}
+	close_contour(begin);
+	stbtt_FreeShape(&font->font_info, vertices);
+
+	glyph->outline = {static_cast<int16_t>(contours.size()),
+	                  static_cast<int16_t>(points.size()),
+	                  (font->font_info.cff.size != 0 ? FONT_OUTLINE_REVERSE_FILL : 0u),
+	                  points.data(),
+	                  tags.data(),
+	                  contours.data()};
 }
 
 static void fill_render_result(FontState* font, FontRenderSurface* surf, float x, float y,
@@ -1644,17 +1733,17 @@ FontStringRefersRenderCharacters(FontString font_string, FontTextCharacter start
 		first = &state->characters.front();
 	}
 
+	const uint32_t count = count_characters_until(first, last);
 	if (character_count != nullptr) {
-		*character_count = count_characters_until(first, last);
+		*character_count = count;
 	}
 
 	LOGF("\t string = 0x%016" PRIx64 ", start = 0x%016" PRIx64 ", last = 0x%016" PRIx64
 	     ", count = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(font_string), reinterpret_cast<uint64_t>(start_character),
-	     reinterpret_cast<uint64_t>(last_character),
-	     character_count != nullptr ? *character_count : count_characters_until(first, last));
+	     reinterpret_cast<uint64_t>(last_character), count);
 
-	return first;
+	return count != 0 ? first : nullptr;
 }
 
 FontTextCharacter KYTY_SYSV_ABI FontCharacterRefersTextNext(FontTextCharacter text_character) {
@@ -1802,23 +1891,17 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
 	}
 	std::memset(font_writing, 0, sizeof(FontWriting));
 
-	auto* state           = new FontWritingState {};
-	state->string         = static_cast<FontStringState*>(font_string);
-	state->character      = get_character(font_character);
-	state->invisible_mask = 0;
-	if (state->character == nullptr && state->string != nullptr &&
-	    !state->string->characters.empty()) {
-		state->character = &state->string->characters.front();
+	auto* string = static_cast<FontStringState*>(font_string);
+	auto* state  = new FontWritingState {};
+	state->next  = get_character(font_character);
+	if (state->next == nullptr && string != nullptr && !string->characters.empty()) {
+		state->next = &string->characters.front();
 	}
-
-	fill_writing_step(&state->step, state->character);
-	fill_writing_letter_step(&state->letter_step, state->character);
-	fill_writing_metrics(&state->metrics, state->step.profile.character_count);
 	register_writing_state(state);
 
 	font_writing->system_use[0] = state;
 	font_writing->system_use[1] = &state->step;
-	font_writing->system_use[2] = state->character;
+	font_writing->system_use[2] = state->next;
 	font_writing->system_use[3] = &state->letter_step;
 	font_writing->system_use[4] = &state->metrics;
 
@@ -1847,26 +1930,60 @@ const FontWritingStep* KYTY_SYSV_ABI FontWritingRefersRenderStep(FontWriting* fo
 	PRINT_NAME();
 
 	auto* state = get_writing_state(font_writing);
-	auto* step  = state != nullptr ? &state->step : nullptr;
+	if (state == nullptr) {
+		return nullptr;
+	}
+
+	state->character = state->next;
+	if (state->character == nullptr) {
+		return nullptr;
+	}
+	state->next = get_next_character(state->character);
+
+	// The step stays zeroed until the first character is written.
+	const bool first = state->step.profile.character_count == 0;
+	fill_writing_step(&state->step, state->character, state->metrics.advance_x);
+	fill_writing_letter_step(&state->letter_step, &state->step);
+
+	const auto& glyph  = state->step.glyph_metrics;
+	const float left   = state->step.x + glyph.horizontal.bearing_x;
+	const float right  = left + glyph.width;
+	const float top    = -glyph.horizontal.bearing_y;
+	const float bottom = top + glyph.height;
+	auto&       extent = state->metrics.extent;
+	if (first) {
+		extent = {top, bottom, left, right};
+	} else {
+		extent.top    = std::min(extent.top, top);
+		extent.bottom = std::max(extent.bottom, bottom);
+		extent.left   = std::min(extent.left, left);
+		extent.right  = std::max(extent.right, right);
+	}
+	state->metrics.advance_x += state->step.advance_x;
+
 	LOGF("\t writing = 0x%016" PRIx64 ", step = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(step));
-	return step;
+	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(&state->step));
+	return &state->step;
 }
 
 FontTextCharacter KYTY_SYSV_ABI FontWritingRefersRenderStepCharacter(FontWriting* font_writing,
                                                                      const void** letter_step) {
 	PRINT_NAME();
 
-	auto* state = get_writing_state(font_writing);
+	auto*               state     = get_writing_state(font_writing);
+	FontCharacterState* character = nullptr;
+	if (state != nullptr) {
+		character        = state->character;
+		state->character = nullptr;
+	}
 	if (letter_step != nullptr) {
-		*letter_step = state != nullptr ? &state->letter_step : nullptr;
+		*letter_step = character != nullptr ? &state->letter_step : nullptr;
 	}
 	LOGF("\t writing = 0x%016" PRIx64 ", character = 0x%016" PRIx64 ", letter_step = 0x%016" PRIx64
 	     "\n",
-	     reinterpret_cast<uint64_t>(font_writing),
-	     reinterpret_cast<uint64_t>(state != nullptr ? state->character : nullptr),
+	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(character),
 	     reinterpret_cast<uint64_t>(letter_step != nullptr ? *letter_step : nullptr));
-	return state != nullptr ? state->character : nullptr;
+	return character;
 }
 
 int KYTY_SYSV_ABI FontWritingGetRenderMetrics(FontWriting*        font_writing,
@@ -2159,6 +2276,11 @@ int KYTY_SYSV_ABI FontGenerateCharGlyph(FontHandle font_handle, uint32_t code,
 	glyph->code = code;
 	fill_metrics_for_code(&glyph->metrics, font, code);
 	init_image(&glyph->image, &glyph->trans_image, code, font);
+	// Without a detail the glyph is private and refers no outline.
+	glyph->glyph_form = (detail != nullptr ? detail->glyph_form : 0);
+	if (glyph->glyph_form == FONT_GLYPH_FORM_OUTLINE) {
+		init_outline(glyph, font);
+	}
 	register_glyph(glyph);
 
 	*font_glyph = glyph;
@@ -2202,6 +2324,21 @@ int KYTY_SYSV_ABI FontGlyphDefineAttribute(void* font_glyph, int attribute, int*
 	     attribute);
 
 	return OK;
+}
+
+const FontGlyphOutline* KYTY_SYSV_ABI FontGlyphRefersOutline(void* font_glyph) {
+	PRINT_NAME();
+
+	auto* glyph = (is_known_glyph(font_glyph) ? static_cast<GlyphState*>(font_glyph) : nullptr);
+	const FontGlyphOutline* outline = nullptr;
+	if (glyph != nullptr && glyph->glyph_form == FONT_GLYPH_FORM_OUTLINE) {
+		outline = &glyph->outline;
+	}
+
+	LOGF("\t glyph = 0x%016" PRIx64 ", outline = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(font_glyph), reinterpret_cast<uint64_t>(outline));
+
+	return outline;
 }
 
 int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uint32_t code,
@@ -2264,6 +2401,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("sDuhHGNhHvE", Font::FontGetKerning);
 	LIB_FUNC("IQtleGLL5pQ", Font::FontGetRenderCharGlyphMetrics);
 	LIB_FUNC("8-zmgsxkBek", Font::FontGlyphDefineAttribute);
+	LIB_FUNC("R1T4i+DOhNY", Font::FontGlyphRefersOutline);
 	LIB_FUNC("whrS4oksXc4", Font::FontMemoryInit);
 	LIB_FUNC("h6hIgxXEiEc", Font::FontMemoryTerm);
 	LIB_FUNC("JzCH3SCFnAU", Font::FontOpenFontInstance);

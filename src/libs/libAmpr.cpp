@@ -1,6 +1,5 @@
 #include "common/abi.h"
 #include "common/assert.h"
-#include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -31,13 +30,6 @@
 #include <variant>
 #include <vector>
 
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
-
 namespace Libs {
 
 namespace AprShared {
@@ -45,6 +37,11 @@ namespace AprShared {
 struct ResultBuffer {
 	int32_t  result      = 0;
 	uint32_t errorOffset = 0;
+};
+
+struct HostFile {
+	std::filesystem::path path;
+	uint64_t              size;
 };
 
 struct ResolvedPathInfo {
@@ -57,11 +54,10 @@ struct ResolvedPathInfo {
 
 static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
-static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, bool>                g_submissions;
 static std::condition_variable                           g_submission_cv;
-static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
-static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
+// Resolved files by ID - 1; IDs are never released.
+static std::vector<HostFile>                             g_files;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
@@ -119,64 +115,20 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 
 static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto       it = g_files.find(file_id);
-	if (it == g_files.end()) {
+	if (file_id == 0 || file_id > g_files.size()) {
 		return false;
 	}
-	*out = it->second;
+	*out = g_files[file_id - 1].path;
 	return true;
 }
 
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
-	const auto       it = g_file_sizes.find(file_id);
-	if (it == g_file_sizes.end()) {
+	if (file_id == 0 || file_id > g_files.size()) {
 		return false;
 	}
-	*out = it->second;
+	*out = g_files[file_id - 1].size;
 	return true;
-}
-
-static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
-	if (st == nullptr) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
-	}
-
-	const bool is_dir  = Common::File::IsDirectoryExisting(host_path);
-	const bool is_file = Common::File::IsFileExisting(host_path);
-	if (!is_dir && !is_file) {
-		return LibKernel::KERNEL_ERROR_ENOENT;
-	}
-
-	LibKernel::FileSystem::FileStat stat {};
-	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
-
-	auto at = Common::DateTime::FromSystemUTC();
-	auto wt = at;
-
-	if (is_dir) {
-		stat.st_size    = 0;
-		stat.st_blksize = 512;
-		stat.st_blocks  = 0;
-	} else {
-		stat.st_size    = static_cast<int64_t>(Common::File::Size(host_path));
-		stat.st_blksize = 512;
-		stat.st_blocks  = (stat.st_size + 511) / 512;
-
-		Common::File::GetLastAccessAndWriteTimeUTC(host_path, &at, &wt);
-	}
-
-	stat.st_atim.tv_sec  = static_cast<int64_t>(at.ToUnix());
-	stat.st_atim.tv_nsec = static_cast<int64_t>(
-	    (at.ToUnix() - static_cast<double>(stat.st_atim.tv_sec)) * 1000000000.0);
-	stat.st_mtim.tv_sec  = static_cast<int64_t>(wt.ToUnix());
-	stat.st_mtim.tv_nsec = static_cast<int64_t>(
-	    (wt.ToUnix() - static_cast<double>(stat.st_mtim.tv_sec)) * 1000000000.0);
-	stat.st_ctim     = stat.st_atim;
-	stat.st_birthtim = stat.st_mtim;
-	*st              = stat;
-
-	return OK;
 }
 
 // Mounts can appear after a failed lookup (e.g. additional content), so forget negative results.
@@ -208,13 +160,13 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = real_path;
 
-		if (Common::File::IsDirectoryExisting(real_path)) {
+		if (const auto host = Common::File::GetInfo(real_path); !host) {
+			info.result = LibKernel::KERNEL_ERROR_ENOENT;
+		} else if (host->is_file) {
+			info.file_size = host->size;
+		} else {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
-		} else if (Common::File::IsFileExisting(real_path)) {
-			info.file_size = Common::File::Size(real_path);
-		} else {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
 		}
 
 		bool log_missing = false;
@@ -224,14 +176,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
-				// Allocate once under the cache lock; distinct paths can share a hash.
-				if (g_next_file_id == 0xffffffffu) {
-					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
-				} else {
-					info.file_id = it->second.file_id = g_next_file_id++;
-					g_files.emplace(info.file_id, info.host_path);
-					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
-				}
+				g_files.push_back({info.host_path, info.is_dir ? 0 : info.file_size});
+				info.file_id = it->second.file_id = static_cast<uint32_t>(g_files.size());
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
@@ -394,7 +340,7 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 
 namespace LibKernelApr {
 
-LIB_VERSION("libkernel", 1, "libkernel", 1, 1);
+LIB_NAME("libkernel", "libkernel");
 
 namespace Apr {
 
@@ -433,7 +379,7 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	return KernelSyscallResult(AprShared::GetHostPathStat(host_path, st));
+	return KernelSyscallResult(LibKernel::FileSystem::StatHostPath(host_path, st));
 }
 
 static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
@@ -446,27 +392,12 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	std::filesystem::path host_path;
-	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
+	uint64_t cached_size = 0;
+	if (!AprShared::TryGetHostFileSize(file_id, &cached_size)) {
 		LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
-
-	uint64_t cached_size = 0;
-	if (AprShared::TryGetHostFileSize(file_id, &cached_size)) {
-		*size = cached_size;
-		return OK;
-	}
-
-	if (Common::File::IsDirectoryExisting(host_path)) {
-		*size = 0;
-		return OK;
-	}
-	if (!Common::File::IsFileExisting(host_path)) {
-		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
-	}
-
-	*size = Common::File::Size(host_path);
+	*size = cached_size;
 	return OK;
 }
 
@@ -591,7 +522,7 @@ LIB_DEFINE(InitLibKernel_1_Apr) {
 
 namespace LibAmpr {
 
-LIB_VERSION("Ampr", 1, "Ampr", 1, 1);
+LIB_NAME("Ampr", "Ampr");
 
 namespace Ampr {
 
@@ -619,6 +550,8 @@ constexpr uint64_t APR_MAP_END_RECORD_SIZE       = 0x04;
 constexpr uint64_t AMM_MAP_RECORD_SIZE           = 0x20;
 constexpr uint64_t AMM_MAP_DIRECT_RECORD_SIZE    = 0x30;
 constexpr uint64_t AMM_UNMAP_RECORD_SIZE         = 0x20;
+constexpr uint64_t AMM_MAP_AS_PRT_RECORD_SIZE    = 0x0c;
+constexpr uint64_t AMM_REMAP_RECORD_SIZE         = 0x10;
 constexpr uint64_t AMM_PAGE_SIZE                 = 0x4000;
 constexpr int      AMM_MAP_FIXED                 = 0x10;
 constexpr int      AMM_USAGE_DIRECT              = 0;
@@ -642,6 +575,8 @@ constexpr uint32_t APR_TYPE_MAP_ACTIVE           = 0x00020000;
 enum class AmmCommandKind : uint32_t {
 	MapAuto,
 	MapDirect,
+	MapAsPrt,
+	RemapIntoPrt,
 	Unmap,
 };
 
@@ -679,6 +614,7 @@ struct CommandBufferState {
 	struct AmmMapCommand {
 		AmmCommandKind kind        = AmmCommandKind::MapAuto;
 		uint64_t       va          = 0;
+		uint64_t       old_va      = 0;
 		uint64_t       dmem_offset = 0;
 		uint64_t       size        = 0;
 		int32_t        type        = 0;
@@ -904,24 +840,6 @@ static bool UpdateCommandBufferTypeFlags(uint64_t command_buffer, uint32_t set_b
 	return true;
 }
 
-static std::unordered_map<uint64_t, CommandBufferState>::iterator
-ResolveCommandBufferStateLocked(uint64_t command_buffer) {
-	auto it = g_command_buffers.find(command_buffer);
-	if (it != g_command_buffers.end() && !it->second.commands.empty()) {
-		return it;
-	}
-
-	const auto alias = g_command_buffer_aliases.find(command_buffer);
-	if (alias != g_command_buffer_aliases.end()) {
-		const auto alias_it = g_command_buffers.find(alias->second);
-		if (alias_it != g_command_buffers.end()) {
-			return alias_it;
-		}
-	}
-
-	return it;
-}
-
 static bool WriteVisibleCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
                                               uint64_t size) {
 	if (size > std::numeric_limits<uint32_t>::max() ||
@@ -972,7 +890,9 @@ static bool TryGetCommandBufferState(uint64_t command_buffer, CommandBufferState
 
 	{
 		std::scoped_lock lock(g_command_buffer_mutex);
-		const auto       it = ResolveCommandBufferStateLocked(command_buffer);
+		const auto       alias = g_command_buffer_aliases.find(command_buffer);
+		const auto       it    = g_command_buffers.find(
+		    alias != g_command_buffer_aliases.end() ? alias->second : command_buffer);
 		if (it != g_command_buffers.end()) {
 			*out = it->second;
 			return true;
@@ -1155,6 +1075,13 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
 		                                             NormalizeAmmProtection(command.prot));
 	}
+	if (command.kind == AmmCommandKind::MapAsPrt) {
+		return LibKernel::Memory::MapPrtMemory(command.va, command.size);
+	}
+	if (command.kind == AmmCommandKind::RemapIntoPrt) {
+		return LibKernel::Memory::RemapIntoPrtMemory(command.va, command.old_va, command.size,
+		                                             NormalizeAmmProtection(command.prot));
+	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
 	return LibKernel::Memory::KernelMapDirectMemory2(
@@ -1162,23 +1089,25 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 	    static_cast<int64_t>(command.dmem_offset), AMM_PAGE_SIZE);
 }
 
-static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::CommandData command,
-                                uint64_t record_size) {
+// Returns the zeroed record in the guest buffer, or null when it was not appended.
+static uint32_t* AppendCommandRecord(uint64_t                        command_buffer,
+                                     CommandBufferState::CommandData command,
+                                     uint64_t                        record_size) {
 	std::scoped_lock      lock(g_command_buffer_mutex);
 	CommandBufferIterator it;
 	if (!GetOrCreateCommandBufferStateLocked(command_buffer, &it)) {
-		return false;
+		return nullptr;
 	}
 
 	auto& state = it->second;
 	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
-		return false;
+		return nullptr;
 	}
 
-	auto* record_addr    = reinterpret_cast<void*>(state.buffer + state.write_offset);
+	auto* record_addr = reinterpret_cast<uint32_t*>(state.buffer + state.write_offset);
 	std::memset(record_addr, 0, static_cast<size_t>(record_size));
 	state.commands.push_back({state.write_offset, std::move(command)});
-	return CommitCommandBufferRecord(command_buffer, &state, record_size);
+	return CommitCommandBufferRecord(command_buffer, &state, record_size) ? record_addr : nullptr;
 }
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
@@ -2330,6 +2259,75 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapDirectWithGpuMaskId(void* command_bu
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
+static int KYTY_SYSV_ABI AmmCommandBufferMapAsPrt(void* command_buffer, uint64_t va,
+                                                  uint64_t size) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAsPrt;
+	command.va   = va;
+	command.size = size;
+
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                           AMM_MAP_AS_PRT_RECORD_SIZE)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferRemapIntoPrt(void* command_buffer, uint64_t va,
+                                                      uint64_t old_va, uint64_t size, int32_t prot,
+                                                      int32_t prot_mask) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || (prot & PROT_CPU_EXEC) != 0 ||
+	    LibKernel::Memory::KernelWriteRemapIntoPrtCommand(nullptr, va, old_va, size, prot,
+	                                                      prot_mask, nullptr) != OK) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind   = AmmCommandKind::RemapIntoPrt;
+	command.va     = va;
+	command.old_va = old_va;
+	command.size   = size;
+	command.prot   = prot;
+
+	auto* record = AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                                   AMM_REMAP_RECORD_SIZE);
+	if (record == nullptr) {
+		return LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	return LibKernel::Memory::KernelWriteRemapIntoPrtCommand(record, va, old_va, size, prot,
+	                                                         prot_mask, nullptr);
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferUnmapToPrt(void* command_buffer, uint64_t va,
+                                                    uint64_t size) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr ||
+	    LibKernel::Memory::KernelWriteUnmapToPrtCommand(nullptr, va, size, nullptr) != OK) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	// The range ends in the state MapAsPrt leaves it in.
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAsPrt;
+	command.va   = va;
+	command.size = size;
+
+	auto* record = AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                                   AMM_MAP_AS_PRT_RECORD_SIZE);
+	if (record == nullptr) {
+		return LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	return LibKernel::Memory::KernelWriteUnmapToPrtCommand(record, va, size, nullptr);
+}
+
 static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va, uint64_t size) {
 	PRINT_NAME();
 
@@ -2530,6 +2528,9 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("ojBkmG7+CgE", Ampr::AmmCommandBufferMapWithGpuMaskId);
 	LIB_FUNC("8TBE+9XCZbI", Ampr::AmmCommandBufferMapDirect);
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
+	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
+	LIB_FUNC("0Xo9g4goDXU", Ampr::AmmCommandBufferRemapIntoPrt);
+	LIB_FUNC("3A2X6OCHtnA", Ampr::AmmCommandBufferUnmapToPrt);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);
 	LIB_FUNC("lwS-7y3jcBI", Ampr::AmmSubmitCommandBuffer);
 	LIB_FUNC("NnKhlMJtIsI", Ampr::AmmSubmitCommandBufferAndGetId);

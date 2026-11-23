@@ -390,6 +390,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	inst.image_dimension  = dimension;
 	inst.image_r128       = r128;
+	inst.image_cube       = ((word0 >> 3u) & 0x7u) == 3u;
 	inst.image_nsa_dwords = nsa_dwords;
 	for (uint32_t i = 0; i < nsa_dwords * 4u; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;

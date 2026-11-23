@@ -26,7 +26,6 @@ enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
-	Fetch,
 	Compute,
 	Mesh,
 	Local,
@@ -81,13 +80,14 @@ struct ShaderWorkgroupInputInfo {
 };
 
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
-	uint32_t input_primitive      = 0;
-	uint32_t primitives_per_group = 0;
-	uint32_t vertices_per_group   = 0;
-	uint32_t max_vertices         = 0;
-	uint32_t max_primitives       = 0;
-	uint32_t provoking_vertex     = 0;
-	bool     fast_launch          = false;
+	uint32_t input_primitive       = 0;
+	uint32_t output_primitive_size = 3;
+	uint32_t primitives_per_group  = 0;
+	uint32_t vertices_per_group    = 0;
+	uint32_t max_vertices          = 0;
+	uint32_t max_primitives        = 0;
+	uint32_t provoking_vertex      = 0;
+	bool     fast_launch           = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -221,7 +221,6 @@ struct ShaderPixelInputInfo {
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
-	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }

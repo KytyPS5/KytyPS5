@@ -19,7 +19,7 @@
 
 namespace Libs {
 
-LIB_VERSION("PngEnc", 1, "PngEnc", 1, 1);
+LIB_NAME("PngEnc", "PngEnc");
 
 namespace PngEnc {
 

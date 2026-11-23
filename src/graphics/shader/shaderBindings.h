@@ -7,9 +7,9 @@
 
 namespace Libs::Graphics {
 
-inline constexpr uint16_t AGC_ILLEGAL_DIRECT_OFFSET = 0xffff;
+inline constexpr uint16_t ILLEGAL_DIRECT_OFFSET = 0xffff;
 
-enum class AgcDirectResourceType : uint32_t {
+enum class DirectResourceType : uint32_t {
 	GdsCounterRange          = 0,
 	ShaderResourceTable      = 1,
 	SubPtrFetchShader        = 2,
@@ -22,13 +22,6 @@ enum class AgcDirectResourceType : uint32_t {
 	StereoXOffset            = 9,
 	PtrVertexAttribDescTable = 10,
 	Last                     = PtrVertexAttribDescTable,
-};
-
-enum class ResourceDescriptorType {
-	Texture,
-	Buffer,
-	Sampler,
-	Unused,
 };
 
 struct ShaderBufferResource {
@@ -173,19 +166,20 @@ struct ShaderSamplerResource {
 	}
 };
 
+// Trivial, as is ShaderVertexDestination: a draw zero-initializes its state in one memset.
 struct ShaderVertexInputBuffer {
-	uint64_t addr        = 0;
-	uint32_t stride      = 0;
-	uint32_t num_records = 0;
-	uint32_t fetch_index = 0;
+	uint64_t addr;
+	uint32_t stride;
+	uint32_t num_records;
+	uint32_t fetch_index;
 };
 
 struct ShaderVertexDestination {
-	int      register_start = 0;
-	int      registers_num  = 0;
-	int      attr_id        = -1;
-	uint32_t fetch_index    = 0;
-	int      buffer_index   = 0;
+	int      register_start;
+	int      registers_num;
+	int      attr_id;
+	uint32_t fetch_index;
+	int      buffer_index;
 };
 
 enum class ShaderStorageUsage {
@@ -194,8 +188,6 @@ enum class ShaderStorageUsage {
 	ReadOnly,
 	ReadWrite,
 };
-
-ResourceDescriptorType ShaderClassifyResourceDescriptor(const uint32_t* desc);
 
 } // namespace Libs::Graphics
 

@@ -77,23 +77,17 @@ class TypedValue: public Value {
 public:
 	TypedValue() = default;
 
-	template <Type other_type>
-	requires(TypesOverlap(type_, other_type))
-	TypedValue(const TypedValue<other_type>& value): Value(value) {}
-
 	explicit TypedValue(Value value): Value(value) {
 		EXIT_IF(!AreTypesCompatible(value.GetType(), type_));
 	}
 };
 
-using U1     = TypedValue<Type::U1>;
-using U8     = TypedValue<Type::U8>;
-using U16    = TypedValue<Type::U16>;
-using U32    = TypedValue<Type::U32>;
-using U64    = TypedValue<Type::U64>;
-using F16    = TypedValue<Type::F16>;
-using F32    = TypedValue<Type::F32>;
-using U32F32 = TypedValue<Type::U32 | Type::F32>;
+using U1  = TypedValue<Type::U1>;
+using U16 = TypedValue<Type::U16>;
+using U32 = TypedValue<Type::U32>;
+using U64 = TypedValue<Type::U64>;
+using F16 = TypedValue<Type::F16>;
+using F32 = TypedValue<Type::F32>;
 
 struct Use {
 	Inst*  user    = nullptr;

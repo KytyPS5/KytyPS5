@@ -34,7 +34,7 @@ double GetTimeMs() {
 } // namespace Loader
 
 namespace Libs::LibKernel::FileSystem {
-void Mount(const std::filesystem::path& directory, const std::string& point) {
+void Mount(const std::filesystem::path& directory, const std::string& point, bool) {
 	g_mounted_directory = directory;
 	g_test_mounts[point] = directory;
 }
@@ -396,6 +396,26 @@ void TestClassicSavePaths() {
 	CHECK(Search(1) == names);
 }
 
+void TestBusyMountPreservesResult() {
+	Reset("BUSYMOUNT");
+	const auto name = DirName("slot");
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = 4;
+	mount.blocks     = 48;
+	SaveDataMountResult result {};
+	CHECK(SaveDataMount3(&mount, &result) == OK);
+	const std::string first_mount_point = result.mount_point.data;
+	CHECK(first_mount_point == "/savedata0");
+
+	mount.mount_mode = 32;
+	CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_BUSY);
+	CHECK(result.mount_point.data == first_mount_point);
+	CHECK(g_test_mounts.contains(first_mount_point));
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+}
+
 void TestConvert() {
 	Reset("CONVERT");
 	const auto             source = DirName("save");
@@ -426,6 +446,28 @@ void TestConvert() {
 		convert.dst_blocks = blocks;
 		CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_PARAMETER);
 	}
+	// A larger size converts before the call returns, and its event reports the result.
+	SaveDataEvent event {};
+	convert.dst_dir_name = nullptr;
+	convert.dst_blocks   = 128;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK && event.user_id == 1 &&
+	      std::string(event.title_id.data) == "CONVERT" &&
+	      std::string(event.dir_name.data) == "save");
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
+	// A new name renames the converted save, and the event names it.
+	const auto renamed   = DirName("renamed");
+	convert.dst_dir_name = &renamed;
+	convert.dst_blocks   = 256;
+	CHECK(SaveDataConvert(&convert) == OK);
+	CHECK(SaveDataGetEventResult(nullptr, &event) == OK);
+	CHECK(event.type == 5 && event.error_code == OK &&
+	      std::string(event.dir_name.data) == "renamed");
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NOT_FOUND);
+	convert.src_dir_name = &renamed;
+	convert.dst_dir_name = nullptr;
+	CHECK(SaveDataConvert(&convert) == SAVE_DATA_ERROR_NO_NEED_CONVERT);
 }
 
 void TestGuestSaveIsolation() {
@@ -493,6 +535,12 @@ void TestSaveAllocations() {
 		CHECK(SaveDataMount3(&invalid, &result) == SAVE_DATA_ERROR_PARAMETER);
 		CHECK(!fs::exists("_SaveData/CAPACITY/Options"));
 	}
+	struct SaveDataMount3 open_missing {};
+	open_missing.user_id = 1;
+	open_missing.dir_name = &names[0];
+	open_missing.mount_mode = 1;
+	SaveDataMountResult missing_result {};
+	CHECK(SaveDataMount3(&open_missing, &missing_result) == SAVE_DATA_ERROR_NOT_FOUND);
 	for (size_t i = 0; i < names.size(); i++) {
 		struct SaveDataMount3 mount {};
 		mount.user_id = 1;
@@ -523,9 +571,11 @@ void TestSaveAllocations() {
 		struct SaveDataMount3 mount {};
 		mount.user_id = 1;
 		mount.dir_name = &names[i];
-		mount.mount_mode = 34;
+		mount.mount_mode = 4;
 		mount.blocks = 16384;
 		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == SAVE_DATA_ERROR_EXISTS);
+		mount.mount_mode = 34;
 		CHECK(SaveDataMount3(&mount, &result) == OK && result.mount_status == 0);
 		std::ofstream(g_mounted_directory / "USR-DATA", std::ios::app) << "more data";
 		SaveDataMountInfo info {};
@@ -743,6 +793,7 @@ int main(int argc, char** argv) {
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
+	TestBusyMountPreservesResult();
 	TestConvert();
 	TestGuestSaveIsolation();
 	TestSaveAllocations();

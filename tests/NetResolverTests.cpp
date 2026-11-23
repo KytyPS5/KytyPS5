@@ -12,6 +12,10 @@ namespace Libs::LibNet {
 void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
+namespace Libs::LibSsl {
+void InitNet_1_Ssl(Loader::SymbolDatabase *symbols);
+}
+
 namespace {
 
 namespace Network = Libs::Network;
@@ -22,6 +26,8 @@ using StartNtoa = int(KYTY_SYSV_ABI *)(int, const char *, uint32_t *, int, int,
 using StartNtoaMultipleRecords = int(KYTY_SYSV_ABI *)(int, const char *,
                                                       NetResolverInfo *, int,
                                                       int, int);
+using SslGetMemoryPoolStats =
+    int(KYTY_SYSV_ABI *)(int, Network::Net::NetMemoryPoolStats *);
 
 class NetResolverTest : public testing::Test {
 protected:
@@ -90,6 +96,37 @@ TEST_F(NetResolverTest, NtoaStoresFirstAddress) {
   EXPECT_EQ(addr, 0x0302010au);
   ASSERT_EQ(ntoa(rid, "localhost", &addr, 0, 0, 0), 0);
   EXPECT_EQ(addr, 0x0100007fu);
+}
+
+TEST_F(NetResolverTest, SocketReuseAddressOption) {
+  const int s = Network::Net::Socket(2, 1, 6);
+  ASSERT_GE(s, 0);
+  const int enable = 1;
+  EXPECT_EQ(Network::Net::Setsockopt(s, 0xffff, 0x4, &enable, sizeof(enable)),
+            0);
+  int value = 0;
+  uint32_t length = sizeof(value);
+  EXPECT_EQ(Network::Net::Getsockopt(s, 0xffff, 0x4, &value, &length), 0);
+  EXPECT_NE(value, 0);
+  EXPECT_EQ(Network::Net::SocketClose(s), 0);
+}
+
+TEST_F(NetResolverTest, SslMemoryPoolStatsReportInitPoolSize) {
+  Libs::LibSsl::InitNet_1_Ssl(&symbols);
+  const auto get_stats = Function<SslGetMemoryPoolStats>("-PoIzr3PEk0");
+  ASSERT_NE(get_stats, nullptr);
+  const int ssl = Network::Ssl::SslInit(0x24000);
+  Network::Net::NetMemoryPoolStats stats;
+  std::memset(&stats, 0xff, sizeof(stats));
+  ASSERT_EQ(get_stats(ssl, &stats), 0);
+  EXPECT_EQ(stats.pool_size, 0x24000u);
+  EXPECT_EQ(stats.max_inuse_size, 0u);
+  EXPECT_EQ(stats.current_inuse_size, 0u);
+  EXPECT_EQ(stats.reserved, 0);
+  ASSERT_EQ(Network::Ssl::SslTerm(ssl), 0);
+  EXPECT_EQ(get_stats(ssl, nullptr), Network::SSL_ERROR_INVALID_VALUE);
+  EXPECT_EQ(get_stats(ssl, &stats), Network::SSL_ERROR_INVALID_ID);
+  EXPECT_EQ(stats.pool_size, 0u);
 }
 
 } // namespace

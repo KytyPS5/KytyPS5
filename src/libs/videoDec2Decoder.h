@@ -46,6 +46,7 @@ struct Output {
 	uint32_t codec_type      = 0;
 	uint32_t width           = 0;
 	uint32_t pitch           = 0;
+	uint32_t pitch_in_bytes  = 0;
 	uint32_t height          = 0;
 	void*    buffer          = nullptr;
 	size_t   buffer_size     = 0;
@@ -70,6 +71,7 @@ struct PictureInfo {
 	uint8_t  color_primaries = 0;
 	uint8_t  color_trc       = 0;
 	uint8_t  color_space     = 0;
+	uint8_t  bit_depth       = 8;
 	bool     key_frame       = false;
 };
 
@@ -139,7 +141,30 @@ struct AvcPictureInfo {
 
 static_assert(sizeof(AvcPictureInfo) == 120);
 
+struct Vp9PictureInfo {
+	size_t   this_size;
+	bool     is_valid;
+	uint64_t pts_data;
+	uint64_t dts_data;
+	uint64_t attached_data;
+	uint32_t profile;
+	uint32_t level;
+	uint32_t key_frame_flag;
+	uint32_t intra_only;
+	uint8_t  bit_depth;
+	uint8_t  color_range;
+	uint32_t color_space;
+	uint32_t num_frames;
+	uint32_t frame_width;
+	uint32_t frame_height;
+	uint32_t render_width;
+	uint32_t render_height;
+};
+
+static_assert(sizeof(Vp9PictureInfo) == 88);
+
 [[nodiscard]] AvcPictureInfo MakeAvcPictureInfo(const PictureInfo& decoded, size_t size);
+[[nodiscard]] Vp9PictureInfo MakeVp9PictureInfo(const PictureInfo& decoded);
 
 class Instance;
 

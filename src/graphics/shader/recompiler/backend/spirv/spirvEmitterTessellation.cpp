@@ -74,6 +74,12 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 void DefineTessellationInterfaces(EmitterState& state) {
 	using Attribute = IR::TessellationAttribute;
+	// Tessellation lowering emits attribute accesses only in these stages.
+	const auto stage = state.program.stage;
+	if (stage != ShaderType::Local && stage != ShaderType::TessellationControl &&
+	    stage != ShaderType::TessellationEvaluation) {
+		return;
+	}
 	std::array<bool, IR::NumTessellationAttributes> used {};
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {

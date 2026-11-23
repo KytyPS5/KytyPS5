@@ -1,0 +1,59 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Traces a ray along +z from each origin through a mirrored TLAS, accepting every candidate.
+// Writes the context's {valid, instances}, then {hit, t, u, v, custom index, SBT offset +
+// primitive} per ray.
+
+layout(local_size_x = 8) in;
+
+layout(buffer_reference, std430) readonly buffer Context {
+	uint     valid;
+	uint     instances;
+	uint     missing_count;
+	uint64_t structure;
+};
+layout(buffer_reference, std430) readonly buffer Origins { vec4 origins[]; };
+layout(buffer_reference, std430) writeonly buffer Output { uint words[]; };
+layout(push_constant) uniform Parameters {
+	Context context;
+	Origins origins;
+	Output  result;
+	uint    count;
+};
+
+void main() {
+	const uint ray = gl_GlobalInvocationID.x;
+	if (ray == 0u) {
+		result.words[0] = context.valid;
+		result.words[1] = context.instances;
+	}
+	if (ray >= count) {
+		return;
+	}
+	uint hit[6] = uint[6](0u, 0u, 0u, 0u, 0u, 0u);
+	if (context.valid != 0u) {
+		rayQueryEXT query;
+		rayQueryInitializeEXT(query, accelerationStructureEXT(context.structure),
+		                      gl_RayFlagsNoneEXT, 0xffu, origins.origins[ray].xyz, 0.0,
+		                      vec3(0.0, 0.0, 1.0), 100.0);
+		while (rayQueryProceedEXT(query)) {
+			rayQueryConfirmIntersectionEXT(query);
+		}
+		if (rayQueryGetIntersectionTypeEXT(query, true) ==
+		    gl_RayQueryCommittedIntersectionTriangleEXT) {
+			const vec2 weights = rayQueryGetIntersectionBarycentricsEXT(query, true);
+			const uint record =
+			    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, true) +
+			    uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+			hit = uint[6](1u, floatBitsToUint(rayQueryGetIntersectionTEXT(query, true)),
+			              floatBitsToUint(weights.x), floatBitsToUint(weights.y),
+			              uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)), record);
+		}
+	}
+	for (uint i = 0u; i < 6u; ++i) {
+		result.words[2u + ray * 6u + i] = hit[i];
+	}
+}

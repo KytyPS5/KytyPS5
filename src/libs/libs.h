@@ -23,30 +23,13 @@
 	static constexpr char                     g_library[]        = l;                              \
 	static constexpr char                     g_module[]         = m;
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LIB_VERSION(l, lv, m, mv1, mv2)                                                            \
-	LIB_NAME(l, m);                                                                                \
-	static constexpr int g_library_version      = lv;                                              \
-	static constexpr int g_module_version_major = mv1;                                             \
-	static constexpr int g_module_version_minor = mv2;
+#define LIB_ADD(l, n, f, t) s->Add({n, l, g_module, t}, reinterpret_cast<uint64_t>(f), "" #f)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LIB_ADD(n, f, t)                                                                           \
-	{                                                                                              \
-		Loader::SymbolResolve sr {};                                                               \
-		sr.name                 = n;                                                               \
-		sr.library              = g_library;                                                       \
-		sr.library_version      = g_library_version;                                               \
-		sr.module               = g_module;                                                        \
-		sr.module_version_major = g_module_version_major;                                          \
-		sr.module_version_minor = g_module_version_minor;                                          \
-		sr.type                 = t;                                                               \
-		auto        func        = reinterpret_cast<uint64_t>(f);                                   \
-		const char* dbg_name    = "" #f;                                                           \
-		s->Add(sr, func, dbg_name);                                                                \
-	}
+#define LIB_OBJECT(n, f) LIB_ADD(g_library, n, f, Loader::SymbolType::Object)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LIB_OBJECT(n, f) LIB_ADD(n, f, Loader::SymbolType::Object)
+#define LIB_FUNC(n, f) LIB_ADD(g_library, n, f, Loader::SymbolType::Func)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define LIB_FUNC(n, f) LIB_ADD(n, f, Loader::SymbolType::Func)
+#define LIB_FUNC_IN(l, n, f) LIB_ADD(l, n, f, Loader::SymbolType::Func)
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
@@ -62,7 +45,7 @@ namespace Libs {
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
-	if (Log::GetDirection() != Log::Direction::Silent) {
+	if (!Log::IsSilent()) {
 		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
 		const auto print_name_time = fmt::format(
 		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,

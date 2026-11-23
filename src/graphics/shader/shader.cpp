@@ -11,13 +11,16 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -31,12 +34,7 @@
 #include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#undef min
-#undef max
 #endif
 
 namespace Libs::Graphics {
@@ -164,12 +162,10 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
-static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
+static void ShaderApplyAttribSemantics(ShaderVertexInputInfo&          info,
                                        std::span<const ShaderSemantic> input_semantics,
-                                       const uint32_t* attrib, const uint32_t* buffer) {
+                                       uint64_t attrib_address, uint64_t buffer_address) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
@@ -181,21 +177,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attrib = 0;
+		LibKernel::Memory::ReadGuestMemory(attrib_address + in.semantic * sizeof(attrib), &attrib,
+		                                   sizeof(attrib));
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t   index       = attrib & 0x1fu;
+		auto     format      = static_cast<Prospero::VertexAttribFormat>((attrib >> 5u) & 0x1ffu);
+		uint32_t offset      = (attrib >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attrib >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
-
-		const auto* sharp = &buffer[index * 4];
-
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
 		auto& r           = info.resources[info.resources_num];
@@ -204,17 +198,15 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		rd.registers_num  = static_cast<int>(size);
 		rd.attr_id        = static_cast<int>(in.semantic);
 		rd.fetch_index    = fetch_index;
-		r.fields[0]       = sharp[0];
-		r.fields[1]       = sharp[1];
-		r.fields[2]       = sharp[2];
-		r.fields[3]       = sharp[3];
+		LibKernel::Memory::ReadGuestMemory(buffer_address + index * sizeof(r.fields), r.fields,
+		                                   sizeof(r.fields));
 		EXIT_NOT_IMPLEMENTED(r.AddTid());
 		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
-			// AGC vertex formats encode the buffer format above the two channel-count bits.
+			// Vertex attribute formats encode the buffer format above the two channel-count bits.
 			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
 			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
 			              (buffer_format << 12u) |
@@ -291,20 +283,18 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
                                            ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
-
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
 	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
 	info.scratch_size_dwords = data.scratch_size_dwords;
 
 	if (data.user_data == nullptr) {
-		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
+		LOGF("ShaderGetVertexInputInfo(): no user data for shader=0x%016" PRIx64
 		     " user_sgpr_num=%u\n",
 		     shader_addr, user_sgpr_num);
 	}
 	if (data.vertex_error != nullptr) {
-		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+		LOGF("ShaderGetVertexInputInfo(): invalid vertex metadata shader=0x%016" PRIx64 ": %s\n",
 		     shader_addr, data.vertex_error);
 		return false;
 	}
@@ -315,14 +305,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		info.fetch_attrib_reg         = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg         = metadata.vertex_buffer_reg;
 
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
+		const auto attrib =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u);
+		const auto buffer =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u);
 
-		if (attrib == nullptr || buffer == nullptr) {
+		if (attrib == 0 || buffer == 0) {
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;
@@ -339,7 +329,6 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
-	ps_info = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
 
@@ -384,7 +373,6 @@ static void ShaderGetStaticInputInfoPS(
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
 	     !sh.db_shader_control.shader_mask_export_enable && !sh.AlphaToMask());
-	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
@@ -402,32 +390,39 @@ static void ShaderGetStaticInputInfoPS(
 
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
-	const bool async_compute             = info.async_compute;
-	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
-	const auto host_subgroup_size         = info.host_subgroup_size;
-	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
-	const auto indirect_args_address      = info.indirect_args_address;
-	info                                  = {};
-	info.async_compute                    = async_compute;
-	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
-	info.host_subgroup_size               = host_subgroup_size;
-	std::ranges::copy(workgroup_counts, info.workgroup_counts);
-	info.indirect_args_address            = indirect_args_address;
-	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
-	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
-	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
-	info.lds_size_dwords                  = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
-	info.scratch_size_dwords              = data.scratch_size_dwords;
-	info.float_mode                       = regs.cs_regs.float_mode;
-	info.group_id[0]                      = regs.cs_regs.tgid_x_en != 0;
-	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
-	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
-	info.wave_size                        = regs.cs_regs.wave_size;
+	info.threads_num[0]      = regs.cs_regs.num_thread_x;
+	info.threads_num[1]      = regs.cs_regs.num_thread_y;
+	info.threads_num[2]      = regs.cs_regs.num_thread_z;
+	info.lds_size_dwords     = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
+	info.scratch_size_dwords = data.scratch_size_dwords;
+	info.float_mode          = regs.cs_regs.float_mode;
+	info.group_id[0]         = regs.cs_regs.tgid_x_en != 0;
+	info.group_id[1]         = regs.cs_regs.tgid_y_en != 0;
+	info.group_id[2]         = regs.cs_regs.tgid_z_en != 0;
+	info.wave_size           = regs.cs_regs.wave_size;
 	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
 	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
+
+// The part of each raw buffer format a vertex module depends on: its channel count and, for
+// integer formats, its component type (Float otherwise).
+constexpr auto kVertexFetchFormats = [] {
+	std::array<uint8_t, 128> formats {};
+	for (uint32_t raw = 0; raw < formats.size(); raw++) {
+		const auto format =
+		    ShaderRecompiler::Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(raw));
+		auto type = ShaderRecompiler::Format::ComponentType::Float;
+		if (format.type == ShaderRecompiler::Format::ComponentType::Uint ||
+		    format.type == ShaderRecompiler::Format::ComponentType::Sint) {
+			type = format.type;
+		}
+		formats[raw] =
+		    static_cast<uint8_t>(format.component_count | static_cast<uint32_t>(type) << 3u);
+	}
+	return formats;
+}();
 
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
@@ -461,16 +456,25 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& mesh = info.mesh;
 		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		                       mesh.output_primitive_size, mesh.primitives_per_group,
+		                       mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
+		                       mesh.provoking_vertex, static_cast<uint32_t>(mesh.fast_launch)});
 	}
-	key.push_back(info.tess.input_control_points);
-	if (info.tess.input_control_points != 0) {
-		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
-		                       tess.output_topology});
+	// Each tessellation stage keys only the layout fields its module depends on.
+	const auto& tess = info.tess;
+	switch (info.logical_stage) {
+		case ShaderType::Local: key.push_back(tess.ls_stride); break;
+		case ShaderType::TessellationControl:
+			key.insert(key.end(), {tess.input_control_points, tess.output_control_points,
+			                       tess.ls_stride, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain});
+			break;
+		case ShaderType::TessellationEvaluation:
+			key.insert(key.end(), {tess.output_control_points, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain, tess.partitioning,
+			                       tess.output_topology});
+			break;
+		default: break;
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -478,7 +482,9 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& destination = info.resources_dst[i];
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		// Swizzle, channel count and type class; the pipeline key holds the format itself.
+		key.push_back(resource.DstSelXYZW() |
+		              static_cast<uint32_t>(kVertexFetchFormats[resource.RawFormat()]) << 12u);
 	}
 }
 
@@ -536,8 +542,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	              (static_cast<uint32_t>(info.async_compute) << 1u));
+	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
@@ -568,16 +573,18 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
-	info                     = {};
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
 	mesh.input_primitive     = static_cast<uint32_t>(user_config.GetPrimType());
 	mesh.wave_size           = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 	mesh.max_vertices        = sh.m_geMaxOutputPerSubgroup;
-	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 	mesh.scratch_size_dwords = data.scratch_size_dwords;
+	// VGT_GS_OUT_PRIM_TYPE 0, 1 and 2 output points, lines and triangles.
+	mesh.output_primitive_size = sh.m_vgtGsOutPrimType + 1u;
+	mesh.provoking_vertex =
+	    context.GetModeControl().provoking_vtx_last ? mesh.output_primitive_size - 1u : 0u;
 	const auto fast_launch = (context.GetShaderStages() >> 19u) & 3u;
 	EXIT_NOT_IMPLEMENTED(fast_launch > 1u);
 	mesh.fast_launch = fast_launch != 0;
@@ -612,7 +619,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || (!native_ngg && sh.m_vgtGsMaxVertOut < 3u) ||
+	    sh.m_vgtGsOutPrimType > 2u ||
+	    (!native_ngg && sh.m_vgtGsMaxVertOut < mesh.output_primitive_size) ||
 	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
 	    mesh.max_vertices == 0u) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
@@ -644,8 +652,8 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||
 	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
-	EXIT_NOT_IMPLEMENTED((context.GetShaderStages() & 0x4u) == 0 ||
-	                     (context.GetShaderStages() & 0x00600020u) != 0);
+	const auto stages = context.GetShaderStages();
+	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
@@ -661,15 +669,18 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
-	input_info = {};
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
+	// LS and HS share the HS wave; the TES runs in the GS wave.
 	input_info[0].logical_stage       = ShaderType::Local;
+	input_info[0].wave_size           = (stages & 0x00200000u) != 0 ? 32u : 64u;
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
+	input_info[1].wave_size           = input_info[0].wave_size;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
+	input_info[2].wave_size           = (stages & 0x00400000u) != 0 ? 32u : 64u;
 	input_info[2].scratch_size_dwords = evaluation.scratch_size_dwords;
 	input_info[2].pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 
@@ -778,7 +789,6 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_no_perspective    = %s\n"
 	     "\t ps_pixel_kill_enable = %s\n"
 	     "\t ps_early_z           = %s\n"
-	     "\t ps_execute_on_noop   = %s\n"
 	     "\t lds_size_dwords      = %u\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
 	     info.ps_perspective_center_vgpr, info.ps_perspective_sample_vgpr,
@@ -788,7 +798,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     info.ps_front_face_all_bits ? "true" : "false", info.ps_ancillary ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
-	     info.ps_execute_on_noop ? "true" : "false", info.lds_size_dwords);
+	     info.lds_size_dwords);
 
 	for (uint32_t i = 0; i < info.input_num; i++) {
 		LOGF("\t interpolator_settings[%u] = %u\n", i, info.interpolator_settings[i]);

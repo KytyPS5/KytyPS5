@@ -243,6 +243,7 @@ TestCase TrinityBvhIntersections(bool compressed, bool bary, bool sorted,
   test.has_compute_info = true;
   test.decoded_counts = {{"IMAGE_BVH8_INTERSECT_RAY", 1}};
   test.required_spirv = {"trinity_bvh_intersect"};
+  test.max_spirv_words = wave_size == 32 ? 10950 : 13300;
   return test;
 }
 
@@ -435,7 +436,7 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.name = wave_size == 32 ? "FlatStackApertures32" : "FlatStackApertures64";
   auto &code = test.code;
   code = {EncodeSop1(0x04, 8, 237), // private base
-          EncodeSop1(0x0b, 11, InlineU32(1)), // S_BREV_B32 shared aperture, as in GTA.
+          EncodeSop1(0x0b, 11, InlineU32(1)), // S_BREV_B32 shared aperture.
           EncodeVop2(0x1a, 20, InlineU32(2), 0),
           EncodeVop2(0x1b, 22, InlineU32(1), 0),
           EncodeVop2(0x1a, 22, InlineU32(31), 22)};
@@ -676,5 +677,6 @@ TestCase BvhIntersections(bool barycentrics, bool sorted, u32 grow = 0, bool wid
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   test.required_spirv = {"get_bda_pointer"};
+  test.max_spirv_words = 6350;
   return test;
 }

@@ -20,7 +20,6 @@
       return result;
     };
     EnsureRuntimeContext();
-    GraphicsInitJmpTables();
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
         0, LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000, 0, &physical) == 0,

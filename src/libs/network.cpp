@@ -2,9 +2,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
@@ -30,6 +27,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/descriptors.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -52,6 +50,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -115,6 +114,7 @@ public:
 
 	int  PoolCreate(const char* name, int size);
 	bool PoolDestroy(int memid);
+	int  PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats);
 	int  ResolverCreate(const char* name, int memid);
 	bool ResolverDestroy(int rid);
 	bool ResolverValid(int rid);
@@ -122,6 +122,7 @@ public:
 	Id   SslInit(uint64_t pool_size);
 	bool SslTerm(Id ssl_ctx_id);
 	bool SslValid(Id ssl_ctx_id);
+	int  SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats);
 
 	Id   HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size);
 	bool HttpTerm(Id http_ctx_id);
@@ -288,6 +289,22 @@ bool Network::PoolDestroy(int memid) {
 	return false;
 }
 
+int Network::PoolGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
+	Common::LockGuard lock(m_mutex);
+
+	if (memid < 0 || memid >= POOLS_MAX || !m_pools[memid].used) {
+		return NET_ERROR_EBADF;
+	}
+	if (stats == nullptr) {
+		return NET_ERROR_EINVAL;
+	}
+
+	// Pool allocations are not tracked; only the configured size is available.
+	*stats = {};
+	stats->pool_size = static_cast<uint64_t>(m_pools[memid].size);
+	return OK;
+}
+
 int Network::ResolverCreate(const char* name, int memid) {
 	Common::LockGuard lock(m_mutex);
 
@@ -358,6 +375,23 @@ bool Network::SslValid(Id ssl_ctx_id) {
 
 	return ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
 	       ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used;
+}
+
+int Network::SslGetMemoryPoolStats(Id ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	if (stats == nullptr) {
+		return SSL_ERROR_INVALID_VALUE;
+	}
+	*stats = {};
+
+	Common::LockGuard lock(m_mutex);
+
+	if (!SslValid(ssl_ctx_id)) {
+		return SSL_ERROR_INVALID_ID;
+	}
+
+	// Nothing allocates from the pool.
+	stats->pool_size = m_ssl[ssl_ctx_id.GetId()].size;
+	return OK;
 }
 
 Network::Id Network::HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size) {
@@ -914,13 +948,11 @@ struct NetTimeval {
 	int64_t tv_usec;
 };
 
-static constexpr int                         SOCKET_FD_MIN = 128;
 static constexpr int                         SOCKET_FD_MAX = 1024;
 static Common::Mutex                         g_socket_mutex;
 static std::array<SocketSlot, SOCKET_FD_MAX> g_sockets;
 static std::atomic_bool                      g_winsock_initialized = false;
 
-constexpr int      EPOLL_ID_BASE = SOCKET_FD_MAX;
 constexpr uint32_t EPOLL_IN      = 0x00000001;
 constexpr uint32_t EPOLL_OUT     = 0x00000002;
 constexpr uint32_t EPOLL_ERR     = 0x00000008;
@@ -931,31 +963,22 @@ struct EpollRegistration {
 };
 
 struct EpollSlot {
-	bool                           used = false;
-	std::string                    name;
 	std::vector<EpollRegistration> registrations;
 };
 
-static std::mutex                g_epoll_mutex;
-static std::condition_variable   g_epoll_changed;
-static std::array<EpollSlot, 32> g_epolls;
+static std::mutex                         g_epoll_mutex;
+static std::condition_variable            g_epoll_changed;
+static std::unordered_map<int, EpollSlot> g_epolls;
 
 static EpollSlot* GetEpollSlot(int eid) {
-	const auto index = eid - EPOLL_ID_BASE;
-	if (index < 0 || index >= static_cast<int>(g_epolls.size())) {
-		return nullptr;
-	}
-	auto& slot = g_epolls[static_cast<size_t>(index)];
-	return slot.used ? &slot : nullptr;
+	const auto entry = g_epolls.find(eid);
+	return entry != g_epolls.end() ? &entry->second : nullptr;
 }
 
 static void RemoveSocketFromEpolls(int id) {
 	std::lock_guard lock(g_epoll_mutex);
-	for (auto& epoll: g_epolls) {
-		if (!epoll.used) {
-			continue;
-		}
-		std::erase_if(epoll.registrations,
+	for (auto& entry: g_epolls) {
+		std::erase_if(entry.second.registrations,
 		              [id](const auto& registration) { return registration.id == id; });
 	}
 	g_epoll_changed.notify_all();
@@ -1081,6 +1104,7 @@ static int ConvertSocketOptionLevel(int level) {
 static int ConvertSocketOptionName(int level, int option) {
 	if (level == 0xffff) {
 		switch (option) {
+			case 0x0004: return SO_REUSEADDR;
 			case 0x0020: return SO_BROADCAST;
 			case 0x1001: return SO_SNDBUF;
 			case 0x1002: return SO_RCVBUF;
@@ -1270,23 +1294,24 @@ static bool TakeSocketBackend(int guest_fd, SocketSlot* out) {
 
 	*out = std::move(slot);
 	slot = {};
+	LibKernel::Descriptors::Release(guest_fd);
 	return true;
 }
 
 static int AllocSocketFd(const std::shared_ptr<SocketTransport>& transport, bool p2p = false) {
-	Common::LockGuard lock(g_socket_mutex);
-	for (int fd = SOCKET_FD_MIN; fd < SOCKET_FD_MAX; fd++) {
-		auto& slot = g_sockets[static_cast<size_t>(fd)];
-		if (!slot.transport) {
-			slot.transport = transport;
-			if (p2p) {
-				slot.p2p.emplace();
-			}
-			return fd;
-		}
+	const int fd = LibKernel::Descriptors::Allocate();
+	if (fd >= SOCKET_FD_MAX) {
+		LibKernel::Descriptors::Release(fd);
+		return -1;
 	}
 
-	return -1;
+	Common::LockGuard lock(g_socket_mutex);
+	auto&             slot = g_sockets[static_cast<size_t>(fd)];
+	slot.transport         = transport;
+	if (p2p) {
+		slot.p2p.emplace();
+	}
+	return fd;
 }
 
 static int SelectSockets(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
@@ -1418,6 +1443,13 @@ int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	}
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->PoolGetMemoryPoolStats(memid, stats);
 }
 
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
@@ -1636,17 +1668,9 @@ int KYTY_SYSV_ABI EpollCreate(const char* name, int flags) {
 	}
 
 	std::lock_guard lock(g_epoll_mutex);
-	for (size_t index = 0; index < g_epolls.size(); index++) {
-		auto& slot = g_epolls[index];
-		if (!slot.used) {
-			slot.used = true;
-			slot.name = name;
-			slot.registrations.clear();
-			return EPOLL_ID_BASE + static_cast<int>(index);
-		}
-	}
-
-	return SetGuestSocketError(Posix::POSIX_EMFILE);
+	const int       eid = LibKernel::Descriptors::Allocate();
+	g_epolls.try_emplace(eid);
+	return eid;
 }
 
 int KYTY_SYSV_ABI EpollControl(int eid, int op, int id, const NetEpollEvent* event) {
@@ -1842,14 +1866,11 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 
 int KYTY_SYSV_ABI EpollDestroy(int eid) {
 	std::lock_guard lock(g_epoll_mutex);
-	auto*           slot = GetEpollSlot(eid);
-	if (slot == nullptr) {
+	if (g_epolls.erase(eid) == 0) {
 		return SetGuestSocketError(Posix::POSIX_EBADF);
 	}
 
-	slot->used = false;
-	slot->name.clear();
-	slot->registrations.clear();
+	LibKernel::Descriptors::Release(eid);
 	g_epoll_changed.notify_all();
 	return 0;
 }
@@ -2284,7 +2305,9 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
+	// SO_ONESBCAST: Linux and Winsock have no equivalent and reject the raw ID. Black Ops II's
+	// local lobby sets it on its UDP socket after SO_BROADCAST and drops the socket on failure.
 	if (level == 0xffff && optname == 0x10000) {
 		if (optlen != sizeof(int)) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
@@ -2808,6 +2831,13 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 	certs->pool          = nullptr;
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI SslGetMemoryPoolStats(int ssl_ctx_id, Net::NetMemoryPoolStats* stats) {
+	PRINT_NAME();
+
+	EXIT_IF(g_net == nullptr);
+	return g_net->SslGetMemoryPoolStats(Network::Id(ssl_ctx_id), stats);
 }
 
 } // namespace Ssl

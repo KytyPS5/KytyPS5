@@ -3,11 +3,6 @@
 
 #include "common/config.h" // IWYU pragma: export
 
-#if __cplusplus < 201703L
-#undef __cplusplus
-#define __cplusplus 201703L
-#endif
-
 #if defined(__MINGW32__) || defined(__MINGW64__)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage,cert-dcl51-cpp,cert-dcl37-c,bugprone-reserved-identifier)
 #define __USE_MINGW_ANSI_STDIO 1

@@ -54,6 +54,9 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Ends the draw window, whose draws share the stream copies of CPU-written ranges.
+	void                   EndDrawWindow() noexcept { m_draw_window++; }
+	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -79,6 +82,7 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
@@ -86,10 +90,10 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
+	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] RangeSet TakeBdaSync();
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
@@ -106,6 +110,23 @@ private:
 		bool                has_stream_leap;
 	};
 
+	// Copies [previous upload's end, end) go to `buffer`.
+	struct BufferUpload {
+		Buffer* buffer;
+		size_t  end;
+	};
+
+	// The stream copy of a CPU-written range, in a slot picked by its address.
+	struct StreamCopy {
+		uint64_t vaddr    = 0;
+		uint64_t size     = 0;
+		uint64_t window   = 0;
+		uint64_t tick     = 0;
+		uint64_t offset   = 0;
+		uint64_t position = 0;
+	};
+	static constexpr uint32_t STREAM_COPY_BITS = 10;
+
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
@@ -120,8 +141,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
+	                  uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -147,6 +168,8 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	std::array<StreamCopy, 1u << STREAM_COPY_BITS>    m_stream_copies {};
+	uint64_t                                          m_draw_window = 0;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

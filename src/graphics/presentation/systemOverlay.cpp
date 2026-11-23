@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/ddsImage.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "graphics/presentation/splashAnimation.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -249,7 +250,7 @@ std::atomic<bool>              g_trophy_notification_active {false};
 std::array<std::filesystem::path, 2> g_splash_paths;
 std::atomic<bool>                    g_splash_active {false};
 std::atomic<Clock::duration::rep>    g_splash_hidden_at {0};
-bool                                 g_splash_fast = false;
+bool                                 g_splash_logo_first = false;
 
 std::vector<std::string_view> WrapTrophyTitle(std::string_view text, float font_size, float width) {
 	std::vector<std::string_view> lines;
@@ -643,7 +644,7 @@ void InitializeSplashScreen(const std::filesystem::path& sce_sys) {
 	}
 	int32_t attribute = 0;
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute);
-	g_splash_fast = (attribute & 0x1000) != 0;
+	g_splash_logo_first = (attribute & 0x1000) != 0;
 	g_splash_hidden_at.store(0, std::memory_order_release);
 	g_splash_active.store(Common::File::IsFileExisting(g_splash_paths[0]) &&
 	                          Common::File::IsFileExisting(g_splash_paths[1]),
@@ -710,7 +711,7 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            (cursor.enabled && cursor.cursor_visible),
+	            cursor.enabled,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
 	            PerformanceOverlayRevision()};
@@ -1079,20 +1080,54 @@ struct SystemOverlay::Impl {
 			FinishSplash();
 			return;
 		}
-		const float  age  = std::chrono::duration<float>(now - splash_born).count();
-		const float  logo = g_splash_fast ? 1.0f : std::clamp((age - 1.4f) / 2.2f, 0.0f, 1.0f);
+		const float  age    = std::chrono::duration<float>(now - splash_born).count();
+		const auto   layers = AnimateSplash(age, g_splash_logo_first);
 		const ImVec2 screen {static_cast<float>(frame_extent.width),
 		                     static_cast<float>(frame_extent.height)};
 		const float  fit = std::min(screen.x / 3840.0f, screen.y / 2160.0f);
 		const ImVec2 size {3840.0f * fit, 2160.0f * fit};
 		const ImVec2 begin {(screen.x - size.x) * 0.5f, (screen.y - size.y) * 0.5f};
-		const ImVec2 end {begin.x + size.x, begin.y + size.y};
 		auto*        draw = ImGui::GetBackgroundDrawList();
-		draw->AddRectFilled({0, 0}, screen, IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha)));
-		for (size_t i = 0; i < g_splash_paths.size(); ++i) {
-			draw->AddImage(
-			    splash_dds[i]->Texture(), begin, end, {0, 0}, {1, 1},
-			    IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha * (i == 0 ? 1.0f : logo))));
+		// Black bars beside, or above and below, the image.
+		const ImU32  black = IM_COL32(0, 0, 0, static_cast<int>(255.0f * alpha));
+		const ImVec2 bar =
+		    begin.x > begin.y ? ImVec2 {begin.x, screen.y} : ImVec2 {screen.x, begin.y};
+		draw->AddRectFilled({0, 0}, bar, black);
+		draw->AddRectFilled({screen.x - bar.x, screen.y - bar.y}, screen, black);
+		// Each layer is a grid whose vertex colors darken it outside the reveal, so the unrevealed
+		// image is black and the background cannot show through the logo.
+		constexpr int COLUMNS = 32;
+		constexpr int ROWS    = 18;
+		for (size_t i = 0; i < layers.size(); ++i) {
+			const auto& layer = layers[i];
+			if (layer.alpha == 0.0f) {
+				continue;
+			}
+			const int   opacity = static_cast<int>(255.0f * alpha * layer.alpha);
+			const float uv0     = 0.5f - 0.5f * layer.span;
+			draw->PushTexture(splash_dds[i]->Texture());
+			draw->PrimReserve(COLUMNS * ROWS * 6, (COLUMNS + 1) * (ROWS + 1));
+			const auto first = draw->_VtxCurrentIdx;
+			for (int row = 0; row <= ROWS; ++row) {
+				for (int column = 0; column <= COLUMNS; ++column) {
+					const float x     = static_cast<float>(column) / COLUMNS;
+					const float y     = static_cast<float>(row) / ROWS;
+					const int   shade = static_cast<int>(255.0f * RevealSplash(age, x, y));
+					draw->PrimWriteVtx({begin.x + size.x * x, begin.y + size.y * y},
+					                   {uv0 + layer.span * x, uv0 + layer.span * y},
+					                   IM_COL32(shade, shade, shade, opacity));
+				}
+			}
+			for (int row = 0; row < ROWS; ++row) {
+				for (int column = 0; column < COLUMNS; ++column) {
+					const auto top    = first + row * (COLUMNS + 1) + column;
+					const auto bottom = top + COLUMNS + 1;
+					for (const auto index: {top, top + 1, bottom, top + 1, bottom + 1, bottom}) {
+						draw->PrimWriteIdx(static_cast<ImDrawIdx>(index));
+					}
+				}
+			}
+			draw->PopTexture();
 		}
 	}
 
@@ -1397,11 +1432,14 @@ struct SystemOverlay::Impl {
 		ImGui::Begin("##SystemDialog", nullptr, flags);
 		ImGui::TextUnformatted(signin ? "Sign in to PlayStation Network" : "Error");
 		ImGui::Separator();
-		const auto error_code = static_cast<uint32_t>(snapshot.error_code);
-		ImGui::TextWrapped("%s", signin ? "PlayStation Network sign-in is unavailable."
-		                         : error_code == 0x80550006u
-		                             ? "You are not signed in to PlayStation Network."
-		                             : "An error has occurred.");
+		const auto  error_code = static_cast<uint32_t>(snapshot.error_code);
+		const char* message    = "An error has occurred.";
+		if (signin) {
+			message = "PlayStation Network sign-in is unavailable.";
+		} else if (error_code == 0x80550006u) {
+			message = "You are not signed in to PlayStation Network.";
+		}
+		ImGui::TextWrapped("%s", message);
 		if (!signin) {
 			ImGui::TextDisabled("Error code: 0x%08X", error_code);
 		}
@@ -1523,32 +1561,33 @@ struct SystemOverlay::Impl {
 			};
 
 			if (skin != TouchParticleSkin::Classic) {
-				const ImU32 glow =
-				    skin == TouchParticleSkin::BlueNeon
-				        ? IM_COL32(0, 115, 255, static_cast<int>(38.0f * alpha))
-				        : (skin == TouchParticleSkin::RedBlue
-				               ? IM_COL32(75, 100, 255, static_cast<int>(55.0f * alpha))
-				               : (skin == TouchParticleSkin::Crimson
-				               ? IM_COL32(255, 70, 0, static_cast<int>(70.0f * alpha))
-				               : IM_COL32(115, 165, 255, static_cast<int>(30.0f * alpha))));
+				ImU32 glow = 0;
+				if (skin == TouchParticleSkin::BlueNeon) {
+					glow = IM_COL32(0, 115, 255, static_cast<int>(38.0f * alpha));
+				} else if (skin == TouchParticleSkin::RedBlue) {
+					glow = IM_COL32(75, 100, 255, static_cast<int>(55.0f * alpha));
+				} else if (skin == TouchParticleSkin::Crimson) {
+					glow = IM_COL32(255, 70, 0, static_cast<int>(70.0f * alpha));
+				} else {
+					glow = IM_COL32(115, 165, 255, static_cast<int>(30.0f * alpha));
+				}
 				draw->AddCircleFilled(center, size + 6.0f, glow);
 			}
-			const ImU32 particle_glow =
-			    skin == TouchParticleSkin::Crimson
-			        ? (particle.icon == TouchParticleIcon::Triangle ||
-			                   particle.icon == TouchParticleIcon::Circle
-			               ? IM_COL32(255, 195, 30, static_cast<int>(135.0f * alpha))
-			               : IM_COL32(255, 95, 0, static_cast<int>(135.0f * alpha)))
-			        : (skin == TouchParticleSkin::RedBlue
-			               ? (particle.icon == TouchParticleIcon::Square ||
-			                          particle.icon == TouchParticleIcon::Cross
-			                      ? IM_COL32(255, 40, 65, static_cast<int>(105.0f * alpha))
-			                      : IM_COL32(35, 125, 255, static_cast<int>(105.0f * alpha)))
-			               : IM_COL32(35, 145, 255,
-			                          static_cast<int>((skin == TouchParticleSkin::BlueNeon
-			                                                ? 100.0f
-			                                                : 65.0f) *
-			                                           alpha)));
+			ImU32 particle_glow = 0;
+			if (skin == TouchParticleSkin::Crimson) {
+				const bool ember = particle.icon == TouchParticleIcon::Triangle ||
+				                   particle.icon == TouchParticleIcon::Circle;
+				particle_glow    = ember ? IM_COL32(255, 195, 30, static_cast<int>(135.0f * alpha))
+				                         : IM_COL32(255, 95, 0, static_cast<int>(135.0f * alpha));
+			} else if (skin == TouchParticleSkin::RedBlue) {
+				const bool red = particle.icon == TouchParticleIcon::Square ||
+				                 particle.icon == TouchParticleIcon::Cross;
+				particle_glow  = red ? IM_COL32(255, 40, 65, static_cast<int>(105.0f * alpha))
+				                     : IM_COL32(35, 125, 255, static_cast<int>(105.0f * alpha));
+			} else {
+				const float strength = skin == TouchParticleSkin::BlueNeon ? 100.0f : 65.0f;
+				particle_glow        = IM_COL32(35, 145, 255, static_cast<int>(strength * alpha));
+			}
 			draw->AddCircleFilled(center, size + 2.0f, particle_glow);
 			switch (particle.icon) {
 				case TouchParticleIcon::Square:
@@ -1612,8 +1651,7 @@ struct SystemOverlay::Impl {
 		}
 		auto* draw = ImGui::GetForegroundDrawList();
 		DrawTouchParticles(draw, now);
-		if (!state.enabled || !state.cursor_visible ||
-		    !state.position_valid || !cursor_initialized) {
+		if (!state.enabled || !state.position_valid || !cursor_initialized) {
 			return;
 		}
 

@@ -27,6 +27,7 @@ bool                               haptics_handles_rumble = false;
 std::array<Rumble, 6>               pad_rumble {};
 std::vector<int>                    closed_pads;
 std::array<std::array<Uint8, 3>, 6> pad_colors {};
+std::array<bool, 6>                 mono_led {};
 } // namespace
 
 namespace Fake {
@@ -66,6 +67,12 @@ void CloseGamepad(SDL_Gamepad* pad) {
 	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
 }
 void Delay(Uint32) {}
+SDL_PropertiesID GetGamepadProperties(SDL_Gamepad* pad) {
+	return static_cast<SDL_PropertiesID>(reinterpret_cast<uintptr_t>(pad));
+}
+bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
+	return std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0 && mono_led[pad];
+}
 } // namespace Fake
 
 #define SDL_GetTicks                Fake::GetTicks
@@ -78,6 +85,8 @@ void Delay(Uint32) {}
 #define SDL_SetGamepadSensorEnabled Fake::SetGamepadSensorEnabled
 #define SDL_CloseGamepad            Fake::CloseGamepad
 #define SDL_Delay                   Fake::Delay
+#define SDL_GetGamepadProperties    Fake::GetGamepadProperties
+#define SDL_GetBooleanProperty      Fake::GetBooleanProperty
 #include "libs/controller.cpp"
 #undef SDL_GetTicks
 #undef SDL_GetGamepadFromID
@@ -89,14 +98,17 @@ void Delay(Uint32) {}
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
+#undef SDL_GetGamepadProperties
+#undef SDL_GetBooleanProperty
 
-namespace Libs::Controller {
-// No virtual headset in these tests (padVr.cpp is not linked here).
-int PadVrPortHand(int) { return -1; }
-int PadVrPort(int, int, int, bool) { return PAD_ERROR_INVALID_ARG; }
-int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
-int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
-} // namespace Libs::Controller
+#include "graphics/presentation/vrInput.h"
+
+namespace Libs::Vr {
+// No headset runtime: each Sense controller reads the first player.
+VrControllerInput OpenXrGetController(int) {
+	return {};
+}
+} // namespace Libs::Vr
 
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
@@ -207,6 +219,25 @@ void TestPadPortOwnership() {
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
 	Shutdown();
+}
+
+void TestSpecialPortWithoutDevice() {
+	Controller controller;
+	const int user = Config::GetUserId();
+	Check(PadOpenExt(user, 2, 0, nullptr) == PAD_ERROR_DEVICE_NOT_CONNECTED,
+	      "a third-party controller port opened without a device");
+	const int special = PadOpen(user, 2, 0, nullptr);
+	Check(special > 1 && PadGetHandle(user, 2, 0) == special,
+	      "the special port did not open its own handle");
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	PadData data {};
+	Check(PadReadState(special, &data) == OK && !data.connected && data.buttons == 0,
+	      "host input reached the special port");
+	Check(PadReadState(1, &data) == OK && data.connected && data.buttons == PAD_BUTTON_CROSS,
+	      "the special port took the standard pad");
+	Check(PadClose(special) == OK && PadGetHandle(user, 2, 0) == PAD_ERROR_NO_HANDLE &&
+	          PadGetHandle(user, 0, 0) == 1,
+	      "closing the special port changed the standard one");
 }
 
 void TestSettingCycles() {
@@ -414,6 +445,18 @@ void TestIndependentOutputsAndPadSwitch() {
 	}
 }
 
+void TestMonoLedPadGetsNoLightBar() {
+	Controller             controller;
+	const PadLightBarParam first {10, 20, 30, 0};
+	const PadLightBarParam second {40, 50, 60, 0};
+	Check(PadSetLightBar(1, &first) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a pad without an LED capability did not receive the light bar");
+	mono_led[1] = true;
+	Check(PadSetLightBar(1, &second) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
+	      "a mono-LED pad received the light bar");
+	mono_led[1] = false;
+}
+
 void TestPlayerUserIds() {
 	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
 	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
@@ -616,7 +659,7 @@ void TestTriggerEffectState() {
 	check_state(2, 5, "feedback at position 0 was suppressed by a dead zone");
 	param.command[0].data[1] = 0;
 	set_effect();
-	check_state(1, 5, "zero-strength feedback reported active");
+	check_state(0, 5, "zero-strength feedback reported an effect state");
 
 	param.command[0]         = {};
 	param.command[0].mode    = 4;
@@ -664,7 +707,7 @@ void TestTriggerEffectState() {
 	check_state(7, 5, "vibration at position 0 was suppressed");
 	param.command[0].data[2] = 0;
 	set_effect();
-	check_state(6, 5, "zero-frequency vibration reported active");
+	check_state(0, 5, "zero-frequency vibration reported an effect state");
 
 	param.command[0]          = {};
 	param.command[0].mode     = 6;
@@ -677,16 +720,21 @@ void TestTriggerEffectState() {
 	check_state(7, 5, "multi-position vibration did not activate at position 9");
 	param.command[0].data[0] = 0;
 	set_effect();
-	check_state(6, 5, "zero-frequency multi-position vibration reported active");
+	check_state(0, 5, "zero-frequency multi-position vibration reported an effect state");
 
 	ResetInputState();
-	check_state(6, 3, "input reset retained a fired weapon");
+	check_state(0, 3, "input reset retained a fired weapon");
 	param.command[0].mode = 0;
 	set_effect();
 	check_state(0, 3, "off mode retained an effect state");
 	Connect(2);
 	Disconnect(1);
 	check_state(0, 0, "switching controllers retained effect states");
+	param.trigger_mask       = 3;
+	param.command[0].mode    = 4;
+	param.command[1].data[2] = 0;
+	set_effect();
+	check_state(0, 0, "forceless multi-position feedback and weapon reported effect states");
 }
 
 void TestUnreadPressSurvivesStickBurst() {
@@ -710,22 +758,107 @@ void TestUnreadPressSurvivesStickBurst() {
 	      "a stick move after a read did not add a sample");
 }
 
+void TestTouchWithoutClick() {
+	Controller controller;
+	PadData    data {};
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, true, 0.2f, 0.5f, false);
+	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 && data.buttons == 0,
+	      "a touch without a click pressed the touch pad button");
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, true, 0.25f, 0.5f);
+	Check(PadReadState(1, &data) == 0 && data.buttons == PAD_BUTTON_TOUCH_PAD,
+	      "a host input touch did not press the touch pad button");
+}
+
+void TestVrControllerInformation() {
+	constexpr int                    left  = PAD_HANDLE_VR_LEFT;
+	constexpr int                    right = PAD_HANDLE_VR_LEFT + 1;
+	PadVrControllerDeviceInformation info {};
+	PadTriggerEffectStateInformation triggers {};
+	Check(PadVrControllerGetDeviceInformation(left, nullptr) == PAD_ERROR_NOT_INITIALIZED &&
+	          PadVrControllerGetTriggerEffectStates(left, right, nullptr) ==
+	              PAD_ERROR_NOT_INITIALIZED &&
+	          PadVrControllerSetVibrationMode(left, 0) == PAD_ERROR_NOT_INITIALIZED,
+	      "an uninitialized library checked a Sense controller call's argument first");
+	Config::ConfigOptions options;
+	options.vr_enabled      = true;
+	options.keyboard_player = 2; // Only host pad 1 connects the first player.
+	Config::Load(options);
+	{
+		Controller controller;
+		const int  user = Config::GetUserId();
+		Check(PadOpen(user, 3, 0, nullptr) == left && PadOpen(user, 4, 0, nullptr) == right,
+		      "the Sense controller ports did not open");
+		// The output starts filled, so every byte, reserve included, must be written.
+		const auto info_is = [&](int handle, uint32_t hand_type, uint8_t dead_zone) {
+			PadVrControllerDeviceInformation expected {};
+			expected.hand_type       = hand_type;
+			expected.stick_dead_zone = dead_zone;
+			expected.connected_count = 1;
+			expected.connected       = hand_type != 0;
+			std::memset(&info, 0xff, sizeof(info));
+			return PadVrControllerGetDeviceInformation(handle, &info) == OK &&
+			       std::memcmp(&info, &expected, sizeof(info)) == 0;
+		};
+		// A rejected handle leaves the output untouched.
+		const auto info_rejected = [&](int handle) {
+			std::memset(&info, 0xff, sizeof(info));
+			const auto filled = info;
+			return PadVrControllerGetDeviceInformation(handle, &info) == PAD_ERROR_INVALID_HANDLE &&
+			       std::memcmp(&info, &filled, sizeof(info)) == 0;
+		};
+		const auto triggers_off = [&] {
+			triggers = {{-1, -1}};
+			return PadVrControllerGetTriggerEffectStates(left, right, &triggers) == OK &&
+			       triggers.state[0] == 0 && triggers.state[1] == 0;
+		};
+		Check(info_is(left, 1, 30) && info_is(right, 2, 30) && triggers_off(),
+		      "connected Sense controllers reported the wrong information");
+		Check(PadVrControllerGetDeviceInformation(1, nullptr) == PAD_ERROR_INVALID_ARG &&
+		          info_rejected(1) &&
+		          PadVrControllerGetTriggerEffectStates(right, left, nullptr) ==
+		              PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerGetTriggerEffectStates(right, left, &triggers) ==
+		              PAD_ERROR_INVALID_HANDLE,
+		      "a Sense controller query accepted a null output or a wrong handle");
+		Check(PadVrControllerSetVibrationMode(left, 1) == OK &&
+		          PadVrControllerSetVibrationMode(right, 5) == OK &&
+		          PadVrControllerSetVibrationMode(1, 0) == PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerSetVibrationMode(1, 6) == PAD_ERROR_INVALID_ARG &&
+		          PadVrControllerSetVibrationMode(1, 1) == PAD_ERROR_INVALID_HANDLE,
+		      "a Sense controller vibration mode or handle was checked wrongly");
+		Disconnect(1);
+		Check(info_is(left, 0, 0) && info_is(right, 0, 0) && triggers_off(),
+		      "disconnected Sense controllers reported the wrong information");
+		Check(PadClose(right) == OK && info_rejected(right) &&
+		          PadVrControllerSetVibrationMode(right, 1) == PAD_ERROR_INVALID_HANDLE &&
+		          PadVrControllerGetTriggerEffectStates(left, right, &triggers) ==
+		              PAD_ERROR_INVALID_HANDLE &&
+		          PadClose(left) == OK,
+		      "a closed Sense controller port kept a usable handle");
+	}
+	Config::Load(Config::ConfigOptions {});
+}
+
 } // namespace
 
 int main() {
 	Config::Initialize();
 	TestPlayerUserIds();
 	TestPadPortOwnership();
+	TestSpecialPortWithoutDevice();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestUnreadPressSurvivesStickBurst();
+	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
+	TestVrControllerInformation();
 	Config::Shutdown();
 	return 0;
 }

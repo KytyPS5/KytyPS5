@@ -37,9 +37,7 @@ IR::ExportTargetKind ExportTargetKindFromTarget(uint32_t target, uint32_t& index
 IR::ExportFlags Translator::AddExportInfo(const Decoder::Instruction& inst) {
 	IR::ExportInfo info;
 	info.kind        = ExportTargetKindFromTarget(inst.exp.target, info.index);
-	info.target      = inst.exp.target;
 	info.en          = inst.exp.en;
-	info.done        = inst.exp.done;
 	info.compr       = inst.exp.compr;
 	info.vm          = inst.exp.vm;
 	const auto index = static_cast<uint32_t>(program.export_info.size());

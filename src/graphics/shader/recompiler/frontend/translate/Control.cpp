@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
@@ -12,12 +14,6 @@ bool IsExecOrVcc(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::VccHi: return true;
 		default: return false;
 	}
-}
-
-Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
-	Decoder::Operand operand;
-	operand.kind = kind;
-	return operand;
 }
 
 } // namespace
@@ -405,15 +401,26 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	    inst.src0.dpp) {
 		EXIT("V_MOVRELS_B32 modifiers are not implemented at pc 0x%08x", inst.pc);
 	}
-	const auto base     = inst.src0.reg;
-	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                    IR::U32(IR::Value(0xffu)));
-	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+	const auto base = inst.src0.reg;
+	const auto m0   = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
+	// A binary search on M0 over the candidates, then v0 for an M0 past them. Each select tests M0
+	// against its upper half's first index, so a bound on M0 rules out the halves above it.
+	std::vector<IR::U32> level;
+	for (uint32_t index = base; index < current_vector_limit; index++) {
+		level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(index)));
 	}
-	WriteOperand(DestinationOperand(inst), selected);
+	level.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(0)));
+	for (uint32_t span = 1u; level.size() > 1u; span <<= 1u) {
+		for (uint32_t i = 1u; i < level.size(); i += 2u) {
+			const auto upper = ir.ULessThan(IR::U32(IR::Value(i * span - 1u)), m0);
+			level[i / 2]     = ir.Select(upper, level[i], level[i - 1]);
+		}
+		if (level.size() % 2u != 0u) {
+			level[level.size() / 2] = level.back();
+		}
+		level.resize((level.size() + 1) / 2);
+	}
+	WriteOperand(DestinationOperand(inst), level[0]);
 }
 
 void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
@@ -427,9 +434,14 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	}
 	const auto base  = inst.dst.reg;
 	const auto value = ReadU32(inst.src0);
-	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
-	                                 IR::U32(IR::Value(0xffu)));
+	const auto m0    = ReadU32(ConditionOperand(Decoder::OperandKind::M0));
+	// Between its first lane write and last lane read a VGPR holds spilled SGPRs, which no
+	// indexed register tuple overlaps, so the first such VGPR above the base ends the tuple.
 	for (uint32_t index = base; index < current_vector_limit; index++) {
+		const auto [first_write, last_read] = lane_spills[index];
+		if (index != base && first_write < current_pc && current_pc < last_read) {
+			break;
+		}
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);

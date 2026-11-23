@@ -5,7 +5,18 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
+                 std::initializer_list<uint32_t> args) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, type, result, GlslStd450(state), opcode, args);
+	return result;
+}
+
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (state.profile.relaxed_float) {
+		return EmitExt(state, TypeF64(state), max_value ? GLSLstd450NMax : GLSLstd450NMin,
+		               {lhs, rhs});
+	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -45,13 +56,6 @@ uint32_t EmitMulHigh(EmitterState& state, uint32_t lhs, uint32_t rhs, bool signe
 
 uint32_t EmitFMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, bool max_value) {
 	return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, a, b, max_value), c, max_value);
-}
-
-uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
-                 std::initializer_list<uint32_t> args) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, type, result, GlslStd450(state), opcode, args);
-	return result;
 }
 
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
@@ -308,7 +312,7 @@ uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 }
 
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, true);
+	auto source = EmitTrigCycleF32(state, arg0, !state.profile.relaxed_float);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }

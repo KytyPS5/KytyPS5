@@ -5,6 +5,7 @@
 #include <deque>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace Common {
 
@@ -19,10 +20,17 @@ class LeastRecentlyUsedCache {
 
 public:
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
-		const auto id   = Build();
-		auto&      item = m_items[id];
-		item.object     = std::move(object);
-		item.tick       = tick;
+		size_t id = 0;
+		if (m_free.empty()) {
+			id = m_items.size();
+			m_items.emplace_back();
+		} else {
+			id = m_free.back();
+			m_free.pop_back();
+		}
+		auto& item  = m_items[id];
+		item.object = std::move(object);
+		item.tick   = tick;
 		Attach(item);
 		return id;
 	}
@@ -40,10 +48,7 @@ public:
 	}
 
 	void Free(size_t id) {
-		auto& item = m_items[id];
-		Detach(item);
-		item.next = nullptr;
-		item.prev = nullptr;
+		Detach(m_items[id]);
 		m_free.push_back(id);
 	}
 
@@ -67,50 +72,34 @@ public:
 	}
 
 private:
-	[[nodiscard]] size_t Build() {
-		if (m_free.empty()) {
-			const auto id = m_items.size();
-			m_items.emplace_back();
-			return id;
-		}
-		const auto id = m_free.front();
-		m_free.pop_front();
-		return id;
-	}
-
 	void Attach(Item& item) {
-		if (m_first == nullptr) {
+		item.prev = m_last;
+		item.next = nullptr;
+		if (m_last != nullptr) {
+			m_last->next = &item;
+		} else {
 			m_first = &item;
 		}
-		if (m_last == nullptr) {
-			m_last = &item;
-			return;
-		}
-		item.prev    = m_last;
-		m_last->next = &item;
-		item.next    = nullptr;
-		m_last       = &item;
+		m_last = &item;
 	}
 
 	void Detach(Item& item) {
 		if (item.prev != nullptr) {
 			item.prev->next = item.next;
+		} else {
+			m_first = item.next;
 		}
 		if (item.next != nullptr) {
 			item.next->prev = item.prev;
-		}
-		if (m_first == &item) {
-			m_first = item.next;
-		}
-		if (m_last == &item) {
+		} else {
 			m_last = item.prev;
 		}
 	}
 
-	std::deque<Item>   m_items;
-	std::deque<size_t> m_free;
-	Item*              m_first = nullptr;
-	Item*              m_last  = nullptr;
+	std::deque<Item>    m_items;
+	std::vector<size_t> m_free;
+	Item*               m_first = nullptr;
+	Item*               m_last  = nullptr;
 };
 
 } // namespace Common

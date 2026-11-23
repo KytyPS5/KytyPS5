@@ -96,15 +96,6 @@ enum class ChannelType : uint32_t {
 	kFloat = 7,
 };
 
-enum class NumberFormat : uint32_t {
-	kUNorm = 0,
-	kSNorm = 1,
-	kUInt  = 4,
-	kSInt  = 5,
-	kFloat = 7,
-	kSrgb  = 9,
-};
-
 enum class ChannelOrder : uint32_t {
 	kStandard    = 0,
 	kAlt         = 1,
@@ -304,23 +295,6 @@ enum class ImageType : uint32_t {
 	kColor2DArray     = 13,
 	kColor2DMsaa      = 14,
 	kColor2DMsaaArray = 15,
-};
-
-enum class DescriptorKind : uint32_t {
-	kBuffer  = 1,
-	kSampler = 2,
-	kUnused  = 3,
-};
-
-enum class ShaderUsageType : uint32_t {
-	kReadOnlyResource  = 0x00,
-	kSampler           = 0x01,
-	kConstantBuffer    = 0x02,
-	kReadWriteResource = 0x04,
-	kGdsMemoryRange    = 0x07,
-	kFetchShader       = 0x12,
-	kVertexBufferTable = 0x17,
-	kExtendedUserData  = 0x1b,
 };
 
 enum class BufferFormat : uint32_t {

@@ -848,30 +848,32 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
-template <spv::Op Reduce, auto Combine>
-static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	using Op = IR::ValueOpcode;
+	const auto [reduce, combine] =
+	    [&]() -> std::pair<spv::Op, uint32_t (*)(EmitterState&, uint32_t, uint32_t)> {
+		switch (inst.Flags<Op>()) {
+			case Op::IAdd32: return {spv::OpGroupNonUniformIAdd, EmitIAdd32};
+			case Op::SMin32: return {spv::OpGroupNonUniformSMin, EmitSMin32};
+			case Op::SMax32: return {spv::OpGroupNonUniformSMax, EmitSMax32};
+			case Op::UMin32: return {spv::OpGroupNonUniformUMin, EmitUMin32};
+			case Op::UMax32: return {spv::OpGroupNonUniformUMax, EmitUMax32};
+			case Op::BitwiseAnd32: return {spv::OpGroupNonUniformBitwiseAnd, EmitBitwiseAnd32};
+			case Op::BitwiseOr32: return {spv::OpGroupNonUniformBitwiseOr, EmitBitwiseOr32};
+			case Op::BitwiseXor32: return {spv::OpGroupNonUniformBitwiseXor, EmitBitwiseXor32};
+			default: ctx.Fail(inst, "has an unsupported reduction");
+		}
+	}();
 	auto& state = ctx.state;
-	auto value = ctx.Arg(inst, 0);
+	auto  value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
-		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+		value = combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(Reduce, TypeU32(state), result,
+	state.builder.AddFunction(reduce, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
 	                          value);
 	return result;
-}
-
-uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMin, EmitUMin32>(ctx, inst);
-}
-
-uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst);
-}
-
-uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseOr, EmitOrU32>(ctx, inst);
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -953,10 +955,18 @@ uint32_t EmitReadRealtimeClock(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
 	const auto clock =
 	    Unary(state, spv::OpReadClockKHR, TypeU64(state), ConstantU32(state, spv::ScopeDevice));
-	// S_MEMREALTIME counts at 100 MHz. Shift the host clock by the most bits that keep its tick at
-	// most 15000 ps (2/3 of 100 MHz): 1 GHz shifts by 3 to 125 MHz; 100 MHz and slower stay.
-	const uint32_t shift = std::bit_width(7500u / period);
-	return EmitShiftRightLogical64(ctx, clock, IR::Value(shift));
+	// S_MEMREALTIME counts at 100 MHz. Divide the host clock by its rate over 100 MHz, rounded:
+	// 1 GHz by 10; under 150 MHz stays. The high word of clock * ceil(2^64 / divisor) is the
+	// quotient or one above it, without a 64-bit division.
+	const uint32_t divisor = (10000u + period / 2u) / period;
+	if (divisor <= 1u) {
+		return clock;
+	}
+	const auto u64     = TypeU64(state);
+	const auto pair    = state.builder.Type(spv::OpTypeStruct, u64, u64);
+	const auto magic   = ConstantU64(state, ~uint64_t {0} / divisor + 1u);
+	const auto product = Binary(state, spv::OpUMulExtended, pair, clock, magic);
+	return EmitNative<spv::OpCompositeExtract, IR::Type::U64>(state, product, 1u);
 }
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {

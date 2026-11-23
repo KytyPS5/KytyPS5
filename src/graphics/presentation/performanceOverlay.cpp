@@ -16,7 +16,9 @@
 #include <cstdio>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
+#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -33,6 +35,25 @@ constexpr float  FRAME_GRAPH_MS    = 50.0f;
 constexpr float  FRAME_TIME_GOOD   = 17.5f;
 constexpr float  FRAME_TIME_MEDIUM = 34.0f;
 constexpr size_t COUNTER_COUNT     = static_cast<size_t>(Counter::Count);
+constexpr auto   HITCH_WINDOW      = std::chrono::seconds(10);
+// At least 50 ms per hitch means at most 200 can finish in a ten-second window.
+constexpr size_t HITCH_HISTORY     = 256;
+
+using CounterTotals = std::array<uint64_t, COUNTER_COUNT>;
+
+CounterTotals ReadCounters() {
+	CounterTotals totals {};
+	for (size_t i = 0; i < totals.size(); i++) {
+		totals[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
+	}
+	return totals;
+}
+
+struct Hitch {
+	Clock::time_point time {};
+	float             ms = 0.0f;
+	CounterTotals     deltas {};
+};
 
 // Tables as wide as their columns; the default fills the window, which an auto-resizing
 // window then never shrinks.
@@ -54,6 +75,43 @@ struct FrameWindow {
 	uint32_t                         guest_height = 0;
 	Clock::time_point                last_flip    = {};
 	Clock::time_point                window_start = {};
+	CounterTotals                    flip_totals {};
+	float                            average_ms = 0.0f;
+	std::array<Hitch, HITCH_HISTORY> hitches {};
+	size_t                           next_hitch = 0;
+
+	void Record(Clock::time_point now, const CounterTotals& totals) {
+		if (window_start == Clock::time_point {}) {
+			window_start = now;
+		}
+		if (last_flip != Clock::time_point {}) {
+			const float ms     = std::chrono::duration<float, std::milli>(now - last_flip).count();
+			intervals_ms[next] = ms;
+			next               = (next + 1) % FRAME_HISTORY;
+			count              = std::min(count + 1, FRAME_HISTORY);
+			max_ms             = std::max(max_ms, ms);
+			if (average_ms > 0.0f && ms > 50.0f && ms >= 2.0f * average_ms) {
+				auto& hitch = hitches[next_hitch];
+				hitch.time  = now;
+				hitch.ms    = ms;
+				// Timers publish on completion; concurrent/nested work can overlap frames.
+				for (size_t i = 0; i < totals.size(); i++) {
+					hitch.deltas[i] = totals[i] - flip_totals[i];
+				}
+				next_hitch = (next_hitch + 1) % HITCH_HISTORY;
+			}
+			average_ms = average_ms > 0.0f ? average_ms * 0.95f + ms * 0.05f : ms;
+		}
+		flip_totals = totals;
+		last_flip   = now;
+		flips++;
+	}
+
+	size_t RecentHitches(Clock::time_point now) const {
+		return std::count_if(hitches.begin(), hitches.end(), [now](const Hitch& hitch) {
+			return hitch.ms > 0.0f && hitch.time <= now && now - hitch.time < HITCH_WINDOW;
+		});
+	}
 };
 
 // Shown values, recomputed once per refresh interval.
@@ -67,6 +125,11 @@ struct Snapshot {
 	uint32_t                            guest_height = 0;
 	std::array<double, COUNTER_COUNT>   rates {};
 	std::array<uint64_t, COUNTER_COUNT> totals {};
+	CounterTotals                       deltas {};
+	uint32_t                            frame_count = 0;
+	size_t                              recent_hitches = 0;
+	Hitch                               last_hitch;
+	std::string                         hitch_activity;
 	uint64_t                            shader_compile_peak_ns  = 0;
 	uint64_t                            pipeline_create_peak_ns = 0;
 	Common::HostStats                   host;
@@ -148,12 +211,18 @@ void EnsureSampler() {
 }
 
 ImU32 FrameTimeColor(double ms) {
-	return ms <= FRAME_TIME_GOOD ? GOOD : ms <= FRAME_TIME_MEDIUM ? MEDIUM : BAD;
+	if (ms <= FRAME_TIME_GOOD) {
+		return GOOD;
+	}
+	return ms <= FRAME_TIME_MEDIUM ? MEDIUM : BAD;
 }
 
 // Green below `warn`, yellow below `bad`, red above.
 ImU32 LevelColor(double value, double warn, double bad) {
-	return value < warn ? GOOD : value < bad ? MEDIUM : BAD;
+	if (value < warn) {
+		return GOOD;
+	}
+	return value < bad ? MEDIUM : BAD;
 }
 
 ImVec4 Color(ImU32 color) {
@@ -334,6 +403,65 @@ void CompilationRows(const Snapshot& shown) {
 	    shown.pipeline_create_peak_ns);
 }
 
+void FrameTimingRows(const Snapshot& shown) {
+	const auto ms = [&](Counter counter) {
+		return static_cast<double>(shown.deltas[static_cast<size_t>(counter)]) / 1e6;
+	};
+	const auto row = [&](const char* label, double first, double second) {
+		Row(label, shown.frame_count > 0
+		               ? Fmt("%.1f / %.1f", first / shown.frame_count, second / shown.frame_count)
+					   : std::string("n/a"));
+	};
+	row("Guest GPU / compile", ms(Counter::GpuThreadBusyNs),
+	    ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs));
+	row("GPU wait / present", ms(Counter::GpuWaitNs), ms(Counter::PresentNs));
+	row("Acquire / overlay", ms(Counter::PresentAcquireNs), ms(Counter::OverlayNs));
+}
+
+std::string HitchActivity(const Hitch& hitch) {
+	const auto delta = [&](Counter counter) {
+		return static_cast<double>(hitch.deltas[static_cast<size_t>(counter)]);
+	};
+	const auto ms = [&](Counter counter) { return delta(counter) / 1e6; };
+	struct Activity {
+		const char* name;
+		double      ms;
+	};
+	std::array activity {
+	    Activity {"compile", ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs)},
+	    Activity {"GPU wait", ms(Counter::GpuWaitNs)},
+	    Activity {"readback", ms(Counter::ColorMetadataReadbackNs)},
+	    Activity {"acquire", ms(Counter::PresentAcquireNs)},
+	    Activity {"overlay", ms(Counter::OverlayNs)},
+	    Activity {"other present",
+		          std::max(0.0, ms(Counter::PresentNs) - ms(Counter::PresentAcquireNs) -
+		                            ms(Counter::OverlayNs))}};
+	std::partial_sort(activity.begin(), activity.begin() + 2, activity.end(),
+	                  [](const Activity& a, const Activity& b) { return a.ms > b.ms; });
+	std::string text;
+	size_t      count = 0;
+	const auto  add   = [&](bool include, const std::string& hint) {
+		if (include && count < 2) {
+			text += (count++ == 0 ? "" : ", ") + hint;
+		}
+	};
+	for (const auto& item: std::span(activity).first<2>()) {
+		add(item.ms >= std::max(1.0, hitch.ms * 0.1), Fmt("%s %.0f ms", item.name, item.ms));
+	}
+	const double uploads =
+	    (delta(Counter::TextureUploadBytes) + delta(Counter::BufferUploadBytes)) /
+	    (1024.0 * 1024.0);
+	const double reads = delta(Counter::GuestFileReadBytes) / (1024.0 * 1024.0);
+	add(delta(Counter::SwapchainRecreations) > 0, "swapchain rebuild");
+	add(uploads >= 8.0, Fmt("uploads %.0f MB", uploads));
+	add(reads >= 1.0, Fmt("file reads %.0f MB", reads));
+	if (text.empty()) {
+		add(ms(Counter::GpuThreadBusyNs) >= std::max(1.0, hitch.ms * 0.1),
+		    Fmt("guest GPU %.0f ms", ms(Counter::GpuThreadBusyNs)));
+	}
+	return text.empty() ? "no clear activity" : text;
+}
+
 void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point now,
              uint64_t generation) {
 	const double seconds = shown.sample_time == Clock::time_point {}
@@ -341,9 +469,13 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	                           : std::chrono::duration<double>(now - shown.sample_time).count();
 	for (size_t i = 0; i < COUNTER_COUNT; i++) {
 		const auto value = Common::DebugCounters::Get(static_cast<Counter>(i));
+		shown.deltas[i] = seconds > 0.0 ? value - shown.totals[i] : 0;
 		shown.rates[i] =
-		    seconds > 0.0 ? static_cast<double>(value - shown.totals[i]) / seconds : 0.0;
+		    seconds > 0.0 ? static_cast<double>(shown.deltas[i]) / seconds : 0.0;
 		shown.totals[i] = value;
+	}
+	if (seconds <= 0.0) {
+		shown.frame_count = 0;
 	}
 	shown.shader_compile_peak_ns  = Common::DebugCounters::Get(Peak::ShaderCompileNs);
 	shown.pipeline_create_peak_ns = Common::DebugCounters::Get(Peak::PipelineCreateNs);
@@ -408,6 +540,14 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("1% low", Fmt("%.1f FPS", shown.low_fps), FrameTimeColor(1000.0 / shown.low_fps));
 		}
 		Row("Worst frame", Fmt("%.1f ms", shown.max_frame_ms), FrameTimeColor(shown.max_frame_ms));
+		Row("Hitches (10 s)", Fmt("%zu", shown.recent_hitches),
+		    shown.recent_hitches > 0 ? MEDIUM : GOOD);
+		if (shown.last_hitch.ms > 0.0f) {
+			Row("Last hitch", Fmt("%.0f ms, %.0f s ago", shown.last_hitch.ms,
+			                     std::chrono::duration<double>(shown.sample_time -
+			                                                   shown.last_hitch.time).count()));
+			Row("  Activity", shown.hitch_activity);
+		}
 		Row("Guest output", shown.guest_width != 0
 		                        ? Fmt("%ux%u", shown.guest_width, shown.guest_height)
 		                        : std::string("n/a"));
@@ -437,7 +577,11 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("Host threads", Fmt("%u", *host.thread_count));
 		}
 		for (const auto& thread: host.busiest_threads) {
-			Row(Fmt("  %.24s", thread.name.c_str()).c_str(), Fmt("%.0f%%", thread.cpu_percent),
+			Row(Fmt("  %.24s", thread.name.c_str()).c_str(),
+			    shown.frame_count > 0 && shown.fps > 0.0
+			        ? Fmt("%.0f%%  ~%.1f ms/frame", thread.cpu_percent,
+			              thread.cpu_percent * 10.0 / shown.fps)
+			        : Fmt("%.0f%%  n/a ms/frame", thread.cpu_percent),
 			    LevelColor(thread.cpu_percent, 70, 95));
 		}
 		if (host.context_switches_per_s) {
@@ -459,14 +603,18 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 	}
 }
 
+std::string GpuName(const Common::HostStats& host, const GraphicContext& graphics) {
+	if (host.gpu_model.empty()) {
+		return graphics.GetPhysicalDeviceProperties().deviceName.data();
+	}
+	return host.gpu_cores ? Fmt("%s (%u cores)", host.gpu_model.c_str(), *host.gpu_cores)
+	                      : host.gpu_model;
+}
+
 void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 	const auto& host = shown.host;
 	if (BeginSection("GPU")) {
-		Row("Device", host.gpu_model.empty()
-		                  ? std::string(graphics.GetPhysicalDeviceProperties().deviceName.data())
-		              : host.gpu_cores
-		                  ? Fmt("%s (%u cores)", host.gpu_model.c_str(), *host.gpu_cores)
-		                  : host.gpu_model);
+		Row("Device", GpuName(host, graphics));
 		Row("Utilization", Percent(host.gpu_percent),
 		    host.gpu_percent ? std::optional(LevelColor(*host.gpu_percent, 80, 95)) : std::nullopt);
 		if (host.gpu_renderer_percent || host.gpu_tiler_percent) {
@@ -493,6 +641,11 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		CompilationRows(shown);
 		ImGui::EndTable();
 	}
+	if (BeginSection("Frame activity (ms/frame)")) {
+		FrameTimingRows(shown);
+		ImGui::EndTable();
+	}
+	ImGui::TextDisabled("Host time; scopes overlap");
 	if (BeginSection("GPU memory")) {
 		if (shown.device_memory) {
 			const double share = shown.device_budget != 0
@@ -597,22 +750,9 @@ void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) n
 		return;
 	}
 	std::scoped_lock lock(g_frame_mutex);
-	const auto       now = Clock::now();
-	if (g_frames.window_start == Clock::time_point {}) {
-		g_frames.window_start = now;
-	}
-	auto& frames = g_frames;
-	if (frames.last_flip != Clock::time_point {}) {
-		const float ms = std::chrono::duration<float, std::milli>(now - frames.last_flip).count();
-		frames.intervals_ms[frames.next] = ms;
-		frames.next                      = (frames.next + 1) % FRAME_HISTORY;
-		frames.count                     = std::min(frames.count + 1, FRAME_HISTORY);
-		frames.max_ms                    = std::max(frames.max_ms, ms);
-	}
-	frames.last_flip    = now;
-	frames.guest_width  = guest_width;
-	frames.guest_height = guest_height;
-	frames.flips++;
+	g_frames.Record(Clock::now(), ReadCounters());
+	g_frames.guest_width  = guest_width;
+	g_frames.guest_height = guest_height;
 }
 
 bool PerformanceOverlayEnabled() noexcept {
@@ -672,6 +812,9 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			shown.fps            = seconds > 0.0 ? frames.flips / seconds : 0.0;
 			shown.frame_ms       = frames.flips > 0 ? seconds * 1000.0 / frames.flips : 0.0;
 			shown.max_frame_ms   = frames.max_ms;
+			shown.frame_count    = frames.flips;
+			shown.recent_hitches = frames.RecentHitches(now);
+			shown.last_hitch = frames.hitches[(frames.next_hitch + HITCH_HISTORY - 1) % HITCH_HISTORY];
 			shown.stalled_s   = frames.last_flip == Clock::time_point {}
 			                        ? 0.0
 			                        : std::chrono::duration<double>(now - frames.last_flip).count();
@@ -681,6 +824,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			frames.max_ms       = 0.0f;
 			frames.window_start = now;
 		}
+		shown.hitch_activity = HitchActivity(shown.last_hitch);
 		shown_details = details;
 		if (shown.history_count > 0) {
 			auto       sorted     = shown.history;

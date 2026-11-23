@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DYNAMICSTATE_H_
 
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -56,7 +55,6 @@ struct DynamicState {
 		bool front_face : 1;
 
 		bool blend_constants       : 1;
-		bool color_write_enables   : 1;
 		bool line_width            : 1;
 		bool feedback_loop_aspects : 1;
 	} dirty_state {};
@@ -92,11 +90,9 @@ struct DynamicState {
 	vk::CullModeFlags cull_mode {};
 	vk::FrontFace     front_face {};
 
-	std::array<float, 4>                               blend_constants {};
-	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enables {};
-	uint32_t                                           num_color_write_enables {};
-	float                                              line_width {};
-	vk::ImageAspectFlags                               feedback_loop_aspects {};
+	std::array<float, 4> blend_constants {};
+	float                line_width {};
+	vk::ImageAspectFlags feedback_loop_aspects {};
 
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
@@ -245,16 +241,6 @@ struct DynamicState {
 		if (blend_constants != blend_constants_) {
 			blend_constants             = blend_constants_;
 			dirty_state.blend_constants = true;
-		}
-	}
-
-	void SetColorWriteEnables(std::span<const vk::Bool32> enables) {
-		EXIT_IF(enables.size() > color_write_enables.size());
-		if (!std::ranges::equal(std::span(color_write_enables).first(num_color_write_enables),
-		                        enables)) {
-			std::ranges::copy(enables, color_write_enables.begin());
-			num_color_write_enables         = static_cast<uint32_t>(enables.size());
-			dirty_state.color_write_enables = true;
 		}
 	}
 

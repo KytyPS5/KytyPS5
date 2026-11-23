@@ -2,10 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -48,24 +50,23 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
+		EXIT_IF(m_device_address == 0);
+		return m_device_address;
+	}
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
-	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
+	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
+		return address >= m_cpu_address && size <= Size() &&
+		       address - m_cpu_address <= Size() - size;
+	}
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-	              uint64_t destination_offset, uint64_t size,
-	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
+	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
@@ -96,13 +97,25 @@ private:
 
 class StreamBuffer final: public Buffer {
 public:
+	// A committed download range, in a buffer of its own when the ring cannot hold it. `owner`
+	// keeps that buffer alive until the host reads it.
+	struct Download {
+		Buffer*                 buffer;
+		uint8_t*                mapped;
+		uint64_t                offset;
+		std::unique_ptr<Buffer> owner;
+	};
+
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	             uint64_t size);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
+	[[nodiscard]] Download                      MapDownload(uint64_t size, uint64_t alignment);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Bytes the ring has moved past; a wrap skips the rest of the lap.
+	[[nodiscard]] uint64_t Position() const noexcept { return m_lap_start + m_offset; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -119,6 +132,7 @@ private:
 	                                                uint64_t requested_upper_bound, bool allow_wait,
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
+	uint64_t              m_lap_start   = 0;
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;

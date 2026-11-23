@@ -137,14 +137,6 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.blend_constants = false;
 		cmdbuf.setBlendConstants(blend_constants.data());
 	}
-	if (dirty_state.color_write_enables) {
-		dirty_state.color_write_enables = false;
-#if !defined(__APPLE__)
-		if (num_color_write_enables != 0) {
-			cmdbuf.setColorWriteEnableEXT(num_color_write_enables, color_write_enables.data());
-		}
-#endif
-	}
 	if (dirty_state.line_width) {
 		dirty_state.line_width = false;
 		cmdbuf.setLineWidth(line_width);

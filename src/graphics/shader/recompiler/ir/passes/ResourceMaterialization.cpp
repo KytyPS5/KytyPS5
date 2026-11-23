@@ -111,6 +111,16 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
 
+// Reads the format's channels in order, a missing Y or Z as 0 and a missing W as 1.
+uint32_t FormatFillSwizzle(Prospero::BufferFormat format) {
+	switch (Format::GetFormatInfo(format).component_count) {
+		case 1: return DstSel(4, 0, 0, 1);
+		case 2: return DstSel(4, 5, 0, 1);
+		case 3: return DstSel(4, 5, 6, 1);
+		default: return ShaderImageIdentitySwizzle;
+	}
+}
+
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	return Prospero::RemapTextureFormat(format) != format ? format
 	                                                      : Prospero::BufferFormat::kInvalid;
@@ -266,7 +276,7 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	const auto* table = Source(program, indirect.table_source);
 	return indirect.sources.empty() && (!indirect.selector || indirect.table_scalar) &&
 	       (indirect.key_count.IsEmpty() || indirect.table_maximum) && indirect.workgroup_axis == UINT32_MAX &&
-	       table != nullptr && table->dword_count == 4u;
+	       table != nullptr && (table->dword_count == 4u || indirect.table_scalar);
 }
 
 bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offset) {
@@ -505,10 +515,13 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		ShaderBufferResource material;
 		if (!DecodeBufferDescriptor(material_value, material) ||
 		    !CanReadIndexedSelector(material, selector->offset)) return false;
-		if (material.Format() != Prospero::BufferFormat::kInvalid && material.NumRecords() != 0u &&
+		const auto records = material.NumRecords();
+		if (material.Format() != Prospero::BufferFormat::kInvalid && records > selector->first_record &&
 		    selector->offset < material.Stride() &&
-		    !read_keys(material.Base48(), material.GetSize(), selector->offset,
-		               material.Stride(), material.NumRecords())) return false;
+		    !read_keys(material.Base48(), material.GetSize(),
+		               uint64_t {selector->first_record} * material.Stride() + selector->offset,
+		               uint64_t {selector->record_step} * material.Stride(),
+		               (records - selector->first_record - 1u) / selector->record_step + 1u)) return false;
 		keys.push_back(0u); // Every out-of-bounds indexed load returns zero.
 	} else {
 		ShaderBufferResource material;
@@ -527,9 +540,11 @@ bool ResolveSelectorKeys(const ResourcePlan& program, const DescriptorSource::In
 		if (count < domain_count) keys.push_back(0u); // An out-of-bounds scalar read returns zero.
 	}
 	if (selector->byte_ranges.empty()) {
-		if (selector->bit_offset != 0u || selector->bit_mask != UINT32_MAX || selector->maximum != UINT32_MAX)
-			for (auto& key: keys)
-				key = std::min((key >> selector->bit_offset) & selector->bit_mask, selector->maximum);
+		for (auto& key: keys) {
+			auto field = (key >> selector->bit_offset) & selector->bit_mask;
+			if (selector->non_negative && static_cast<int32_t>(field) < 0) field = 0u;
+			key = std::min(field, selector->maximum);
+		}
 		if (selector->excluded) std::erase(keys, *selector->excluded);
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -610,6 +625,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		if (table_value.dword_count == 2u) {
 			table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
+			// A bounded address table's heap spans the slots of keys 0 through its maximum.
+			if (byte_keys) {
+				table_base += uint64_t {indirect.table_offset} + (indirect.table_immediate & ~3u);
+				table_size = (uint64_t {*indirect.table_maximum} + 1u) * indirect.table_stride;
+			}
 		} else if (DecodeBufferDescriptor(table_value, table)) {
 			table_base = table.Base48();
 			table_size = table.GetSize();
@@ -673,9 +693,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    : indirect.table_maximum ? indirect.table_stride
 			    : affine ? std::max(uint64_t {1} << std::countr_zero(indirect.table_stride), uint64_t {4})
 			             : 4u;
-			const uint64_t first = ((indirect.table_maximum ? indirect.table_offset
-			    : indirect.table_offset % step) & ~uint64_t {3}) +
-			                       (indirect.table_immediate & ~3u);
+			uint64_t first = 0u;
+			if (table_value.dword_count != 2u)
+				first = ((indirect.table_maximum ? indirect.table_offset : indirect.table_offset % step) &
+				         ~uint64_t {3}) + (indirect.table_immediate & ~3u);
 			if (!indirect.table_maximum) domain /= step;
 			const auto count = table_size >= first + 4u
 			    ? std::min((table_size - first - 4u) / step + 1u, domain)
@@ -923,11 +944,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
 		image.mip_count = ImageMipCount(base, descriptor);
+		// A null T# reads zero; it keeps the dimension and cube its instructions declare.
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
-			image.dimension     = Decoder::ImageDimension::Dim2D;
-			image.cube          = false;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -968,12 +988,30 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
 		        Prospero::TileMode::kDepth;
 		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
-		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
-			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
+		// SKIP_DEGAMMA (S# bit 31) reads sRGB texels as stored.
+		image.skip_degamma = Prospero::IsSrgbFormat(format) &&
+		    std::ranges::any_of(program.info.sampled_pairs, [&](const auto& pair) {
+			    return pair.image == base_index && pair.sampler < snapshot.samplers.size() &&
+			           (snapshot.samplers[pair.sampler].dwords[0] >> 31u) != 0u;
+		    });
+		// The shader decodes direct 8 and 8_8 sRGB textures where the device has no sRGB view.
+		if (!storage && !base.depth_compare && !image.skip_degamma &&
+		    image.indirect_root == ImageResource::NoIndirectImage &&
+		    (format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb)) {
+			image.srgb_decode = format;
 		}
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
 		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
+		// An unconverted storage view applies its swizzle only to stores, which drop the channels
+		// its format lacks, so a swizzle that only fills those is the identity. Indirect table
+		// candidates keep theirs: a table with filtered accesses requires equal swizzles.
+		const auto swizzle = DescriptorImageSwizzle(descriptor);
+		if (image.conversion_format != Prospero::BufferFormat::kInvalid ||
+		    (storage && (image.indirect_root != ImageResource::NoIndirectImage ||
+		                 swizzle != FormatFillSwizzle(format)))) {
+			image.shader_swizzle = swizzle;
+		}
 		image.numeric_class = Prospero::SampledTextureNumericClass(
 		    depth_bits ? Prospero::BufferFormat::k16UNorm : Prospero::RemapTextureFormat(format));
 		if (!storage && format == Prospero::BufferFormat::k11_11_10UNorm) {
@@ -1274,7 +1312,7 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 }
 
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}
@@ -1712,7 +1750,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
+				        // A sample of a T# whose channels all select 0 reads 0 at any address.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+				            (image.sample_access_only && !image.depth_compare &&
+				             DescriptorImageSwizzle(value) == 0u) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
 					        value.dwords.fill(0u);
 				        return true;
@@ -1854,10 +1895,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.mip_count                  = source.mip_count;
 		image.conversion_format          = source.conversion_format;
 		image.shader_swizzle             = source.shader_swizzle;
+		image.srgb_decode                = source.srgb_decode;
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
 		image.indirect_resources.clear();
 	}
@@ -2034,16 +2077,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
-		}
-	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
 			memory.resource = image_remap[memory.resource];
-		}
-	}
-	for (auto& buffer: buffers) {
-		if (buffer.image_alias != BufferResource::NoImageAlias) {
-			buffer.image_alias = image_remap[buffer.image_alias];
 		}
 	}
 	for (auto& pair: sampled_pairs) {

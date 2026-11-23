@@ -52,10 +52,12 @@ struct Lifecycle {
 	static constexpr auto emergency_shutdown = Libs::LibKernel::FileSystem::EmergencyShutdown;
 };
 
-void                  Mount(const std::filesystem::path& folder, const std::string& point);
+void Mount(const std::filesystem::path& folder, const std::string& point, bool read_only = false);
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+// Stats a resolved host path; a directory's size is its packed dirent size.
+int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb);
 // Returns whether d is an open file, directory or device descriptor.
 bool                  IsOpenDescriptor(int d);
 

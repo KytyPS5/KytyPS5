@@ -21,9 +21,8 @@ struct RemoteFile {
 	QString title;
 	QString version;
 	QString format;
-
-	[[nodiscard]] bool IsSupported() const;
-	[[nodiscard]] QUrl Url() const;
+	QString kind;
+	QUrl    url;
 };
 
 struct CatalogResult {
@@ -33,6 +32,7 @@ struct CatalogResult {
 
 [[nodiscard]] CatalogResult ParseIndex(const QByteArray& data, const QString& format,
                                        const QString& title_id);
+[[nodiscard]] CatalogResult ParseModules(const QByteArray& data, const QString& title_id);
 
 class CheatRepository final: public QObject {
 	Q_OBJECT

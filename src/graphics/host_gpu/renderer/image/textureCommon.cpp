@@ -1,13 +1,16 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 namespace Libs::Graphics {
 namespace {
@@ -63,11 +66,20 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 
 } // namespace
 
-RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
+RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   graphics,
+                                                    Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order) {
+	// A host without 4_4_4_4 render targets gets 5_5_5_1: the same size, 1 bit for component 3.
+	if (layout == Prospero::ChannelLayout::k4_4_4_4 && !graphics.r4g4b4a4_render_targets) {
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog("Warning: rendering 4_4_4_4 targets as 5_5_5_1.\n");
+		}
+		layout = Prospero::ChannelLayout::k5_5_5_1;
+	}
 	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
-	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
+	if (encoding.SupportsOrder(order)) {
 		const auto backing_format = encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm
 		                                ? Prospero::RemapTextureFormat(encoding.buffer_format)
 		                                : encoding.buffer_format;

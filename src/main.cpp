@@ -36,6 +36,8 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --audio-output <value>              Report TV, AVReceiver (7.1), SoundBar (5.1),\n"
+	         "                                      or Headphones to games. Default: TV.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
@@ -94,8 +96,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --trophy-duration <seconds>          Trophy toast duration, 5-10. Default: 6.\n");
 	::printf("  --perf-overlay                       Show the performance panel (F2 or Cmd+P).\n");
-	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf("  --playgo-hack                        Report 1000 PlayGo chunks without chunk metadata.\n");
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
+	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable ASCII chars).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -337,6 +340,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.user_name = value;
+		} else if (arg == "--launch-activity") {
+			if (value.empty() || value.size() > 32 ||
+			    !std::ranges::all_of(value, [](char c) { return c >= ' ' && c <= '~'; })) {
+				::printf("invalid activity ID: must contain 1-32 printable ASCII characters\n");
+				return false;
+			}
+			options.config.launch_activity = value;
 		} else if (arg == "--user-id") {
 			if (!ParseUserId(value, options.config.user_id)) {
 				::printf("invalid user ID: %s\n", value.c_str());
@@ -344,6 +354,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--mic") {
 			options.config.audio_input_device = value;
+		} else if (arg == "--audio-output") {
+			if (!ParseEnum(value, options.config.audio_output)) {
+				::printf("invalid audio output: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--controller-color") {
 			Config::ControllerColor color {};
 			if (!ParseControllerColor(value, color)) {

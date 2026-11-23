@@ -68,6 +68,33 @@ void TestLevelUserEventDelivery() {
 	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete user event queue");
 }
 
+void TestLevelEventWakesEveryWaiter() {
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "level-waiters") == OK &&
+	          EventQueue::KernelAddUserEvent(queue, 1) == OK,
+	      "create a queue with a level user event");
+	std::atomic<int> woken {0};
+	auto             wait = [&] {
+		EventQueue::KernelEvent event {};
+		int                     out = 0;
+		if (EventQueue::KernelWaitEqueue(queue, &event, 1, &out, nullptr) == OK && out == 1) {
+			woken++;
+		}
+	};
+	std::thread first(wait);
+	std::thread second(wait);
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	Check(EventQueue::KernelTriggerUserEvent(queue, 1, nullptr) == OK, "trigger the level event");
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+	while (woken < 2 && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+	}
+	Check(woken == 2, "one trigger of a level event wakes every waiter");
+	first.join();
+	second.join();
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete the level-waiters queue");
+}
+
 void TestPeriodicTimerEvents() {
 	using namespace std::chrono_literals;
 	using Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
@@ -544,6 +571,7 @@ void TestConcurrentDelete() {
 
 int main() {
 	TestLevelUserEventDelivery();
+	TestLevelEventWakesEveryWaiter();
 	TestPeriodicTimerEvents();
 	TestDuplicateAddPreservesEventState();
 	TestCallbackStateOutlivesPort();

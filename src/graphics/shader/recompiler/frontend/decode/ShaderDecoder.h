@@ -297,6 +297,7 @@ enum class Opcode {
 	V_MED3_I16,
 	V_MED3_U16,
 	V_SAD_U32,
+	V_MSAD_U8,
 	V_ADD3_U32,
 	V_LSHL_ADD_U32,
 	V_ADD_LSHL_U32,

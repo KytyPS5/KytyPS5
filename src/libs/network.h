@@ -113,6 +113,7 @@ int KYTY_SYSV_ABI SslInit(uint64_t pool_size);
 int KYTY_SYSV_ABI SslTerm(int ssl_ctx_id);
 int KYTY_SYSV_ABI SslGetCaCerts(int ssl_ctx_id, void* ca_certs);
 int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs);
+int KYTY_SYSV_ABI SslGetMemoryPoolStats(int ssl_ctx_id, Net::NetMemoryPoolStats* stats);
 
 } // namespace Ssl
 

@@ -507,16 +507,6 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	return 4;
 }
 
-KYTY_CP_OP_PARSER(CpOpDispatchReset) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0001024);
-
-	cp.Reset();
-
-	return 1;
-}
-
 KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -963,8 +953,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	const uint32_t control = buffer[2];
 
-	auto* indirect_buffer =
-	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
+	// The two low bits of the target DWORD are not address bits.
+	auto* indirect_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[0] & ~0x3u) | (static_cast<uint64_t>(buffer[1]) << 32u));
 	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {
@@ -1280,11 +1271,11 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 }
 
 // A flip block: the tag (flip mode, signed 5-bit buffer index) and bus, the flip argument
-// written to USERDATA_3, then an end-of-pipe RELEASE_MEM with a GL2 writeback whose interrupt
-// carries the port.
-static uint32_t CpFlip(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+// written to USERDATA_3, then a RELEASE_MEM with a GL2 writeback whose interrupt carries the port.
+static uint32_t CpFlip(CommandProcessor& cp, uint32_t user_data_r, const uint32_t* block,
+                       uint32_t remaining_dw) {
 	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::FLIP_PACKET_DW ||
-	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u) ||
+	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, user_data_r) ||
 	                     block[9] != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
 
 	const auto tag = block[1];
@@ -1309,16 +1300,18 @@ static uint32_t CpWaitFlipDone(CommandProcessor& cp, const uint32_t* block, uint
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	// Driver user data has R = 1 in a DCB and R = 0 on a compute queue.
+	if ((KYTY_PM4_R(cmd_id) == 1u || cp.IsAsyncComputeQueue()) &&
+	    buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		switch (buffer[1] & 0xff000000u) {
-			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, buffer, dw);
+			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw);
 			case Pm4::USERDATA_TAG_WAIT_FLIP_DONE: return CpWaitFlipDone(cp, buffer, dw);
 			case Pm4::USERDATA_TAG_RESET_QUEUE:
 				cp.ResetQueue(buffer[1]);
 				return KYTY_PM4_LEN(cmd_id) - 1u;
 			default: break;
 		}
-		if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+		if (Agc::AgcIsInternalDataPacket(cmd_id, buffer)) {
 			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
 	}
@@ -1401,10 +1394,8 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 
 	auto dw_num = (cmd_id >> 16u) & 0x3fffu;
 
-	auto  write_control = buffer[0];
-	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-
-	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
+	cp.WriteData(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u), buffer + 3, dw_num - 2,
+	             buffer[0]);
 
 	return 1 + dw_num;
 }

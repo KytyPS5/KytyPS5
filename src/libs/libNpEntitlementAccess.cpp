@@ -19,7 +19,7 @@ namespace Libs {
 
 namespace LibNpEntitlementAccess {
 
-LIB_VERSION("NpEntitlementAccess", 1, "NpEntitlementAccess", 1, 1);
+LIB_NAME("NpEntitlementAccess", "NpEntitlementAccess");
 
 constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_NOT_INITIALIZED   = -2122514431; // 0x817D0001
 constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_OUT_OF_MEMORY     = -2122514416; // 0x817D0010
@@ -162,9 +162,9 @@ static int np_entitlement_poll_request(int64_t request_id, EntitlementRequestKin
 }
 
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
-    {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
-    {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
-    {{{"_mtqu6"}, {}}, 3, 4}, // GTA V hash 0x9cd1bcad
+    {{{"85y-je"}, {}}, 3, 4},
+    {{{"5d5c48"}, {}}, 3, 4},
+    {{{"_mtqu6"}, {}}, 3, 4},
 };
 
 static NpEntitlementAccessAddcontEntitlementInfo
@@ -515,7 +515,7 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 
 namespace LibNpEntitlementAccessPft {
 
-LIB_VERSION("NpEntitlementAccessPft", 1, "NpEntitlementAccess", 1, 1);
+LIB_NAME("NpEntitlementAccessPft", "NpEntitlementAccess");
 
 // Unknown function; return state 2 for the FC27 investigation.
 static int KYTY_SYSV_ABI NpEntitlementAccessPftUnknowneDXKe9FndlE(uint32_t* state) {

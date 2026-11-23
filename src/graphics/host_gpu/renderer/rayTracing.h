@@ -19,7 +19,7 @@ class RenderContext;
 struct GraphicContext;
 struct RayTracingTestAccess;
 
-// Mirrors guest BVHs (header formats 1, 3 and 10) into host acceleration structures. The guest
+// Mirrors guest BVHs (header formats 1, 3, 6 and 10) into host acceleration structures. The guest
 // builds and refits them on the GPU, so a GPU job reads them there; the host reads back only what
 // sizes the builds. A guest TLAS instance names a (BLAS, subtree root) pair, mirrored as one BLAS
 // over the subtree's prim-record range.
@@ -71,6 +71,7 @@ private:
 		uint32_t                geometry = 0;
 		bool                    known    = false;
 		bool                    dynamic  = false; // Its geometry changed: updated every call.
+		bool                    reshaped = false; // Its records changed: rebuilt every call.
 	};
 
 	struct Pair {
@@ -81,13 +82,14 @@ private:
 		uint32_t                box_capacity = 0;
 		uint32_t                box_count    = 0;
 		uint32_t                links        = 0; // Their link hash.
-		// Range of the last walk, under BLAS topology `topology`.
+		// Range of the last walk, or the header's records at the BLAS root, under BLAS topology
+		// `topology`.
 		uint32_t count          = 0;
 		uint32_t first          = 0;
 		uint32_t topology       = 0;
 		uint32_t geometry       = 0; // BLAS geometry at the last build or update.
 		uint64_t update_serial  = 0;
-		bool     built          = false; // The structure holds the walked range.
+		bool     built          = false; // The structure holds the range.
 		bool     walked         = false;
 		bool     walking        = false;
 		bool     geometry_known = false;

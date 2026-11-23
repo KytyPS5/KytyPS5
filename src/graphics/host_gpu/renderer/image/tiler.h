@@ -80,7 +80,6 @@ private:
 		uint32_t slice_bytes;
 		uint32_t tiled_slice_bytes;
 		uint32_t blocks_per_row;
-		uint32_t surface_z;
 		uint32_t tail_x;
 		uint32_t tail_y;
 		uint32_t num_texels;

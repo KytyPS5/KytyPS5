@@ -166,19 +166,20 @@ struct ShaderSamplerResource {
 	}
 };
 
+// Trivial, as is ShaderVertexDestination: a draw zero-initializes its state in one memset.
 struct ShaderVertexInputBuffer {
-	uint64_t addr        = 0;
-	uint32_t stride      = 0;
-	uint32_t num_records = 0;
-	uint32_t fetch_index = 0;
+	uint64_t addr;
+	uint32_t stride;
+	uint32_t num_records;
+	uint32_t fetch_index;
 };
 
 struct ShaderVertexDestination {
-	int      register_start = 0;
-	int      registers_num  = 0;
-	int      attr_id        = -1;
-	uint32_t fetch_index    = 0;
-	int      buffer_index   = 0;
+	int      register_start;
+	int      registers_num;
+	int      attr_id;
+	uint32_t fetch_index;
+	int      buffer_index;
 };
 
 enum class ShaderStorageUsage {

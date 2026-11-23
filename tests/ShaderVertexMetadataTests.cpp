@@ -1,13 +1,19 @@
+#include "graphics/shader/shaderBindings.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 namespace {
 
 using namespace Libs::Graphics;
+
+// A draw zero-initializes its vertex inputs in one memset only while these types are trivial.
+static_assert(std::is_trivially_default_constructible_v<ShaderVertexDestination> &&
+              std::is_trivially_default_constructible_v<ShaderVertexInputBuffer>);
 
 void Check(bool value, const char* text) {
 	if (!value) {

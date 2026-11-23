@@ -167,8 +167,7 @@ private:
 		PreparedBindings                pixel;
 	};
 
-	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-	                             std::span<RenderColorInfo> colors);
+	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages, DrawTargets& targets);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slot, bool ignore_target_mask = false,
 	                              bool exact_format = false);

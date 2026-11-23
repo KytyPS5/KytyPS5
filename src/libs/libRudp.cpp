@@ -9,7 +9,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Rudp", 1, "Rudp", 1, 1);
+LIB_NAME("Rudp", "Rudp");
 
 namespace Rudp {
 

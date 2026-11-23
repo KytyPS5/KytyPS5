@@ -268,7 +268,7 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.memory_offset_dword += 2u;
 	}
 	bindings.push_data_start_dword =
-	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
+	    state.push_data.StartFor(bindings.ShaderDataDwords(), state.program.stage);
 	counts[static_cast<size_t>(Kind::ShaderData)] =
 	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
@@ -737,8 +737,12 @@ void DefineModule(EmitterState& state) {
 		state.mesh_guest_func = state.builder.AllocateId();
 		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT); // MeshShadingEXT
 		state.builder.RequireExtension("SPV_EXT_mesh_shader");
-		state.builder.AddExecutionMode(state.main_func,
-		                               spv::ExecutionModeOutputTrianglesEXT); // OutputTrianglesEXT
+		constexpr spv::ExecutionMode output_modes[] = {spv::ExecutionModeOutputPoints,
+		                                               spv::ExecutionModeOutputLinesEXT,
+		                                               spv::ExecutionModeOutputTrianglesEXT};
+		state.builder.AddExecutionMode(
+		    state.main_func,
+		    output_modes[state.input_info.vertex->mesh.output_primitive_size - 1u]);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,

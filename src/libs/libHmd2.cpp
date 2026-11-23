@@ -20,7 +20,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Hmd2", 1, "Hmd2", 1, 1);
+LIB_NAME("Hmd2", "Hmd2");
 
 namespace Hmd2 {
 
@@ -38,6 +38,7 @@ constexpr uint32_t REPROJECTION_LAYER_TYPE_VR3D  = 0x10;
 constexpr uint32_t REPROJECTION_LAYER_TYPE_VR2D  = 0x12;
 constexpr uint32_t REPROJECTION_MAX_SOURCE_COUNT = 5;
 constexpr int32_t  GAZE_TRACKING_STATUS_DISABLE  = -1;
+constexpr uint32_t VIBRATION_FREQ_MAX            = 25;
 
 struct SceHmd2InitializeParam {
 	void*   reserved0;
@@ -106,6 +107,21 @@ struct SceHmd2ReprojectionParam {
 	const void* option;
 };
 
+struct SceHmd2ReprojectionStatus {
+	int64_t  flipArg;
+	uint64_t ptcBeginFrame;
+	uint64_t ptcSetParam;
+	uint64_t ptcRequestFlipToReprojection;
+	uint64_t ptcAcceptFlipToReprojection;
+	uint64_t ptcReprojectionStart;
+	uint64_t ptcReprojectionEnd;
+	uint64_t ptcDisplayPredicted;
+	uint64_t ptcLastVblank;
+	uint64_t ptcLastFlip;
+	uint32_t reprojectionCount;
+	uint32_t reserved[5];
+};
+
 struct SceHmd2GazeGetResultParam {
 	uint32_t sizeOfThis;
 	int32_t  handle;
@@ -163,6 +179,7 @@ static_assert(offsetof(SceHmd2GazeResult, gazeDirection) == 20);
 static_assert(offsetof(SceHmd2GazeResult, right) == 44);
 static_assert(sizeof(SceHmd2GazeResultForFoveatedRendering) == 24);
 static_assert(offsetof(SceHmd2GazeResultForFoveatedRendering, gazeDirection) == 8);
+static_assert(sizeof(SceHmd2ReprojectionStatus) == 104);
 
 static std::atomic<bool> g_initialized = false;
 static std::mutex g_reprojection_mutex;
@@ -196,13 +213,13 @@ static int32_t KYTY_SYSV_ABI Hmd2Initialize(const SceHmd2InitializeParam* param)
 
 static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* info) {
 	PRINT_NAME();
-	if (!g_initialized.load()) {
-		return ERROR_NOT_INITIALIZED;
-	}
 	if (info == nullptr) {
 		return ERROR_PARAMETER_NULL;
 	}
 	*info = {};
+	if (!g_initialized.load()) {
+		return ERROR_NOT_INITIALIZED;
+	}
 	if (Config::VrEnabled()) {
 		// Virtual headset defaults: READY, MOUNT, 63 mm lens separation.
 		info->hmuMount               = 1;
@@ -218,6 +235,12 @@ static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* 
 	     info->deviceInfo.panelResolution.width, info->deviceInfo.panelResolution.height,
 	     info->hmuMount);
 	return OK;
+}
+
+static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformationByHandle(int32_t                   handle,
+                                                              SceHmd2DeviceInformation* info) {
+	PRINT_NAME();
+	return handle == HMD_HANDLE ? Hmd2GetDeviceInformation(info) : ERROR_HANDLE_INVALID;
 }
 
 static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView* fov) {
@@ -301,6 +324,17 @@ static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t ind
 	return HMD_HANDLE;
 }
 
+static int32_t KYTY_SYSV_ABI Hmd2SetVibration(int32_t handle, int32_t frequency) {
+	PRINT_NAME();
+	if (handle != HMD_HANDLE) {
+		return ERROR_HANDLE_INVALID;
+	}
+	// A disconnected headset accepts any frequency.
+	return Config::VrEnabled() && static_cast<uint32_t>(frequency) > VIBRATION_FREQ_MAX
+	           ? ERROR_PARAMETER_INVALID
+	           : OK;
+}
+
 static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(int64_t flip_arg) {
 	PRINT_NAME();
 	LOGF("\t flip_arg = %" PRId64 "\n", flip_arg);
@@ -345,6 +379,19 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(int32_t index, int64_t fli
 	LOGF("\t index = %d, flip_arg = %" PRId64 ", layers = %d\n", index, flip_arg,
 	     param->settingCount);
 	return option != nullptr ? ERROR_PARAMETER_INVALID : OK;
+}
+
+// No reprojection pass runs on the host, so every status field is zero.
+static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetStatus(SceHmd2ReprojectionStatus* status) {
+	PRINT_NAME();
+	if (GetReprojectionState() == nullptr) {
+		return ERROR_REPROJECTION_NOT_INITIALIZED;
+	}
+	if (status == nullptr) {
+		return ERROR_PARAMETER_NULL;
+	}
+	*status = {};
+	return OK;
 }
 
 // No eye tracker: report DISABLE, which a PS5 also returns when the user turned eye tracking off.
@@ -433,6 +480,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("c812oYs7Vsc", Hmd2::Hmd2Initialize);
 	LIB_FUNC("bIi4YUfSRys", Hmd2::Hmd2GetDeviceInformation);
+	LIB_FUNC("4BlE4IPXP0Q", Hmd2::Hmd2GetDeviceInformationByHandle);
 	LIB_FUNC("gF8+lvc7GuQ", Hmd2::Hmd2GetFieldOfViewWithoutHandle);
 	LIB_FUNC("U-CnbmeyYaA", Hmd2::Hmd2ReprojectionQueryBufferSizeAlign);
 	LIB_FUNC("-C2nkoEYOnU", Hmd2::Hmd2ReprojectionQueryDisplayBufferSizeAlign);
@@ -440,10 +488,12 @@ LIB_DEFINE(InitHmd2_1) {
 	LIB_FUNC("VVvFh51o20s", Hmd2::Hmd2ReprojectionEnableVrMode);
 	LIB_FUNC("FkQX7rjFomk", Hmd2::Hmd2ReprojectionSetTiming);
 	LIB_FUNC("f3kPeoTZnIE", Hmd2::Hmd2Open);
+	LIB_FUNC("Al4qjNREVQQ", Hmd2::Hmd2SetVibration);
 	LIB_FUNC("Ocf081WpBpA", Hmd2::Hmd2ReprojectionBeginFrame);
 	LIB_FUNC("SVEG+1D7qHA", Hmd2::Hmd2ReprojectionGetPredictedDisplayTime);
 	LIB_FUNC("hA9LshbSkzw", Hmd2::Hmd2ReprojectionSetRenderConfig);
 	LIB_FUNC("xMo9ENEu2E0", Hmd2::Hmd2ReprojectionSetParam);
+	LIB_FUNC("8GkaY2B7opM", Hmd2::Hmd2ReprojectionGetStatus);
 	LIB_FUNC("lAoFUedcfqA", Hmd2::Hmd2GazeGetResult);
 	LIB_FUNC("retc+-uRMhk", Hmd2::Hmd2GazeGetResultForFoveatedRendering);
 }

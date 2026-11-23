@@ -234,9 +234,7 @@ uint32_t              EmitLiveMask(EmitterState& state);
 uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -348,6 +346,7 @@ void                  EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::In
 uint32_t              EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryCandidate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitRayQueryCandidateFrontFace(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitRayQueryConfirm(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;

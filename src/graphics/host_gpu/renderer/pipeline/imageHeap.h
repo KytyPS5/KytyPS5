@@ -2,7 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEHEAP_H_
 
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <deque>
@@ -23,10 +23,12 @@ struct ImageHeapTestAccess;
 
 // Guest image tables that shaders index by GPU-computed offsets, kept resident in one bindless
 // sampled-image array. A table is keyed by its base and follows its descriptor's size. Each view
-// of a table owns device slot words, one per table dword, that select an array element. CPU
-// writes to a table fault in its snapshot, which each draw refreshes once; a view takes the
-// changes when a draw first acquires it. Changes to the images behind elements bump
-// Image::heap_epoch. A smaller table leaves at a suspend point if the frame did not acquire it.
+// of a table owns device slot words, one per table dword, that select an array element; one
+// element serves a descriptor and profile in every view. CPU writes to a table fault in its
+// snapshot, which each draw refreshes once; a view takes the changes when a draw first acquires
+// it. Images behind elements report their changes through Image::heap_changes. A smaller table
+// leaves at a suspend point if the frame did not acquire it, a larger one after
+// LargeTableIdleFrames such frames.
 class ImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
 public:
 	ImageHeap(RenderContext& context, PageManager& page_manager);
@@ -34,10 +36,7 @@ public:
 	KYTY_CLASS_NO_COPY(ImageHeap);
 
 	// Starts a draw or dispatch, before its programs acquire views.
-	void BeginDraw() {
-		++m_draw;
-		Bury();
-	}
+	void BeginDraw() { ++m_draw; }
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	// Image discovery: resolves new elements and rediscovers changed images.
@@ -53,45 +52,46 @@ public:
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
 
-	struct DescriptorHash {
-		size_t operator()(const DescriptorValue& value) const noexcept;
+	struct Key {
+		DescriptorValue value;
+		uint32_t        profile = 0; // Index into m_profiles.
+
+		bool operator==(const Key&) const = default;
 	};
 
+	struct KeyHash {
+		size_t operator()(const Key& key) const noexcept;
+	};
+
+	// A stale element's slots move to a new element of its descriptor, a buried one's to null.
+	enum class State : uint8_t { Live, Stale, Buried };
+
 	struct Element {
-		DescriptorValue value;
-		TextureBinding  binding;
-		uint32_t        kind   = 0;
-		uint32_t        refs   = 0; // Slots of the owning view that select it.
-		bool            stale  = false;
-		uint64_t        serial = 0; // Image::serial of binding.image_id.
+		Key      key;
+		ImageId  image;
+		uint64_t serial = 0; // Image::serial of image.
+		uint32_t kind   = 0;
+		uint32_t refs   = 0; // Slots of all views that select it.
+		State    state  = State::Live;
 	};
 
 	struct Memory;
 
 	struct View {
-		Memory&                             memory;
-		uint64_t                            step  = 0;
-		uint64_t                            first = 0;
-		uint64_t                            count = 0;
-		uint64_t                            limit = 0; // Probes a key domain allows, if fewer.
-		ShaderRecompiler::IR::ImageResource profile;
-		std::vector<uint32_t>               slots; // Plus a trailing null slot.
-		std::vector<uint32_t>               kind_keys;
-		std::vector<DescriptorValue>        kinds; // One representative per kind_keys entry.
-		std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> elements;
-		std::vector<uint32_t>   pending;  // Not yet resolved.
-		std::vector<uint32_t>   released; // No slot selects them after the next upload.
-		std::vector<uint32_t>   away;     // Not yet moved to the read layout.
-		std::vector<uint32_t>   dcc;      // Color metadata clears apply on each discovery.
-		std::vector<uint32_t>   held;     // Another extent holds their address.
-		std::unique_ptr<Buffer> buffer;
-		size_t                  dirty_begin   = 0; // Slots to upload.
-		size_t                  dirty_end     = 0;
-		size_t                  changed_begin = 0; // Table bytes changed since it was probed.
-		size_t                  changed_end   = 0;
-		uint64_t                resolve_epoch = 0;
-		uint64_t                layout_epoch  = 0;
-		uint64_t                held_serial   = 0; // Image::serials when held was last retried.
+		Memory&                      memory;
+		uint64_t                     step    = 0;
+		uint64_t                     first   = 0;
+		uint64_t                     count   = 0;
+		uint64_t                     limit   = 0; // Probes a key domain allows, if fewer.
+		uint32_t                     profile = 0;
+		std::vector<uint32_t>        slots; // Plus a trailing null slot.
+		std::vector<uint32_t>        kind_keys;
+		std::vector<DescriptorValue> kinds; // One representative per kind_keys entry.
+		std::unique_ptr<Buffer>      buffer;
+		size_t                       dirty_begin   = 0; // Slots to upload.
+		size_t                       dirty_end     = 0;
+		size_t                       changed_begin = 0; // Table bytes changed since it was probed.
+		size_t                       changed_end   = 0;
 	};
 
 	struct Memory {
@@ -99,8 +99,9 @@ private:
 		uint64_t                           size = 0;
 		std::vector<uint32_t>              words;
 		std::vector<uint8_t>               dirty_pages; // Unwatched, so unread since a write.
-		std::vector<uint64_t>              dead;        // Per word, a buried descriptor's hash.
+		std::unordered_map<uint32_t, uint64_t> dead;   // Buried words: their descriptor hashes.
 		uint64_t                           draw = 0;    // Last draw that refreshed it.
+		uint32_t                           idle = 0;    // Suspend points since a frame acquired it.
 		std::vector<std::unique_ptr<View>> views;
 	};
 
@@ -113,14 +114,17 @@ private:
 	void     UpdateProbes(View& view, uint64_t begin, uint64_t end);
 	void     UpdateProbe(View& view, uint64_t probe);
 	void     Assign(View& view, size_t slot, uint32_t entry);
-	void     Bury();
-	uint32_t Intern(View& view, uint32_t kind, const DescriptorValue& value);
-	void     Release(View& view, uint32_t entry);
-	void     Unreference(Element& element);
-	Image*   ImageOf(const Element& element) const;
+	uint32_t Intern(View& view, uint32_t kind, const Key& key);
+	void     Release(uint32_t entry);
+	void     Retire();
+	void     Mark(uint32_t index, State state);
+	template <typename Fn>
+	bool     ForEachChanged(Fn&& fn);
+	void     Repoint();
+	void     TakeChanges();
+	ImageId  CurrentImage(const Image::HeapChange& change);
 	uint32_t Allocate();
-	void     Retire(View& view);
-	void     Resize(Memory& memory, uint64_t size);
+	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
 
 	RenderContext&                       m_context;
@@ -130,17 +134,24 @@ private:
 	std::vector<View*>                   m_active; // Acquired since the last commit.
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
-	std::vector<Element>                 m_elements;
-	std::vector<uint32_t>                m_free;
-	std::unordered_map<uint64_t, uint64_t>    m_sightings; // Smaller tables: base, first draw.
-	std::deque<std::pair<uint64_t, uint32_t>> m_retired; // Tick, element.
-	std::vector<std::pair<size_t, size_t>>    m_runs;
-	std::vector<uint32_t>                     m_scratch;
-	std::vector<uint32_t>                     m_writes; // Elements whose descriptors changed.
-	std::vector<GuestRange>                   m_unmapped; // Since the last Bury.
-	vk::DescriptorSetLayout                   m_layout = nullptr;
-	vk::DescriptorPool                        m_pool   = nullptr;
-	vk::DescriptorSet                         m_set    = nullptr;
+	std::vector<ShaderRecompiler::IR::ImageResource>  m_profiles;
+	std::vector<Element>                              m_elements;
+	std::unordered_map<Key, uint32_t, KeyHash>        m_index;
+	std::vector<uint32_t>                             m_free;
+	std::vector<uint32_t>                             m_pending;  // Not yet resolved.
+	std::vector<uint32_t>                             m_released; // Unselected after the upload.
+	std::vector<uint32_t>                             m_held; // Another extent holds the address.
+	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
+	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
+	uint64_t                                          m_held_serial = 0; // Image::serials.
+	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
+	std::vector<std::pair<size_t, size_t>>            m_runs;
+	std::vector<uint32_t>                             m_scratch;
+	std::vector<Image::HeapChange>                    m_changes;
+	std::vector<std::pair<uint32_t, vk::DescriptorImageInfo>> m_writes;
+	vk::DescriptorSetLayout                           m_layout = nullptr;
+	vk::DescriptorPool                                m_pool   = nullptr;
+	vk::DescriptorSet                                 m_set    = nullptr;
 
 	friend struct ImageHeapTestAccess;
 };

@@ -31,7 +31,7 @@ struct Lifecycle {
 
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer);
 
-namespace Gen5 {
+namespace Agc {
 
 struct CommandBuffer;
 struct Label;
@@ -299,16 +299,20 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);
 
 int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address);
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference);
+int KYTY_SYSV_ABI AgcWaitRegMemPatchCompareFunction(uint32_t* cmd, uint8_t compare_function);
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t* cmd, const volatile Label* address);
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data);
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
                                       int32_t display_buffer_index, uint32_t flip_mode,
                                       int64_t flip_arg);
+uint32_t* KYTY_SYSV_ABI AgcAcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+                                      int32_t display_buffer_index, uint32_t flip_mode,
+                                      int64_t flip_arg);
 
-} // namespace Gen5
+} // namespace Agc
 
-namespace Gen5Driver {
+namespace AgcDriver {
 
 int Initialize();
 
@@ -325,6 +329,7 @@ static_assert(offsetof(Packet, dw_num) == 0x8);
 static_assert(offsetof(Packet, flags) == 0xc);
 
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet);
+int KYTY_SYSV_ABI AgcDriverAgrSubmit();
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count);
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet);
@@ -344,7 +349,7 @@ int KYTY_SYSV_ABI  AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, 
 bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress();
 int KYTY_SYSV_ABI  AgcDriverRegisterDefaultOwner();
 
-} // namespace Gen5Driver
+} // namespace AgcDriver
 
 } // namespace Libs::Graphics
 

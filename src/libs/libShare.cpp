@@ -10,7 +10,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Share", 1, "Share", 1, 1);
+LIB_NAME("Share", "Share");
 
 namespace Share {
 

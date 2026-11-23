@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -161,12 +162,10 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
-static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
+static void ShaderApplyAttribSemantics(ShaderVertexInputInfo&          info,
                                        std::span<const ShaderSemantic> input_semantics,
-                                       const uint32_t* attrib, const uint32_t* buffer) {
+                                       uint64_t attrib_address, uint64_t buffer_address) {
 	KYTY_PROFILER_FUNCTION();
-
-	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
@@ -178,21 +177,19 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attrib = 0;
+		LibKernel::Memory::ReadGuestMemory(attrib_address + in.semantic * sizeof(attrib), &attrib,
+		                                   sizeof(attrib));
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t   index       = attrib & 0x1fu;
+		auto     format      = static_cast<Prospero::VertexAttribFormat>((attrib >> 5u) & 0x1ffu);
+		uint32_t offset      = (attrib >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attrib >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
-
-		const auto* sharp = &buffer[index * 4];
-
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
 		auto& r           = info.resources[info.resources_num];
@@ -201,10 +198,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		rd.registers_num  = static_cast<int>(size);
 		rd.attr_id        = static_cast<int>(in.semantic);
 		rd.fetch_index    = fetch_index;
-		r.fields[0]       = sharp[0];
-		r.fields[1]       = sharp[1];
-		r.fields[2]       = sharp[2];
-		r.fields[3]       = sharp[3];
+		LibKernel::Memory::ReadGuestMemory(buffer_address + index * sizeof(r.fields), r.fields,
+		                                   sizeof(r.fields));
 		EXIT_NOT_IMPLEMENTED(r.AddTid());
 		EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
 		if (format != Prospero::VertexAttribFormat::kInvalid) {
@@ -310,14 +305,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		info.fetch_attrib_reg         = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg         = metadata.vertex_buffer_reg;
 
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
+		const auto attrib =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u);
+		const auto buffer =
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u);
 
-		if (attrib == nullptr || buffer == nullptr) {
+		if (attrib == 0 || buffer == 0) {
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;

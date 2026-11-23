@@ -4747,6 +4747,69 @@ public:
             label_clean_stored,
             "a label left a clean cached copy of its page stale");
 
+    // A GPU-thread vertex table read beside GPU-written bytes on their page
+    // takes the backing and leaves those bytes GPU-written.
+    constexpr uint64_t table_gpu_address = fault_base + 0xf200;
+    constexpr uint64_t table_attrib_address = fault_base + 0xf800;
+    constexpr uint64_t table_vsharp_address = fault_base + 0xf900;
+    constexpr std::array<uint32_t, 2> table_attribs{0x0u, 0x1u};
+    std::array<ShaderBufferResource, 2> table_vsharps{};
+    table_vsharps[1].UpdateAddress48(0x123450);
+    Require("GpuCommandLane", "vertex table setup",
+            LibKernel::Memory::TryWriteBacking(table_attrib_address,
+                                               table_attribs.data(),
+                                               sizeof(table_attribs)) &&
+                LibKernel::Memory::TryWriteBacking(table_vsharp_address,
+                                                   table_vsharps.data(),
+                                                   sizeof(table_vsharps)),
+            "the vertex tables could not be written");
+    static const uint32_t table_shader[] = {0xbf810000u};
+    static std::array<uint16_t,
+                      static_cast<size_t>(DirectResourceType::Last) + 1>
+        table_offsets;
+    table_offsets.fill(ILLEGAL_DIRECT_OFFSET);
+    table_offsets[static_cast<size_t>(
+        DirectResourceType::PtrVertexBufferTable)] = 0;
+    table_offsets[static_cast<size_t>(
+        DirectResourceType::PtrVertexAttribDescTable)] = 2;
+    static ShaderUserData table_user_data{
+        .direct_resource_offset = table_offsets.data(),
+        .direct_resource_count = static_cast<uint16_t>(table_offsets.size())};
+    static ShaderSemantic table_semantic{.semantic = 1, .size_in_elements = 1};
+    HW::VertexShaderInfo table_vs{};
+    table_vs.es_regs.data_addr = reinterpret_cast<uint64_t>(table_shader);
+    table_vs.gs_regs.rsrc2.user_sgpr = 4;
+    const std::array<uint64_t, 2> table_pointers{table_vsharp_address,
+                                                 table_attrib_address};
+    std::memcpy(table_vs.gs_user_sgpr.value, table_pointers.data(),
+                sizeof(table_pointers));
+    ShaderMapUserData(table_vs.es_regs.data_addr,
+                      {.user_data = &table_user_data,
+                       .input_semantics = &table_semantic,
+                       .num_input_semantics = 1,
+                       .code_size_bytes = sizeof(table_shader)});
+    bool tables_read = false;
+    bool table_gpu_kept = false;
+    LibKernel::Memory::InstallGpuResources(&resources);
+    gpu.SendCommandSync([&] {
+      (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
+                                      false);
+      buffer_cache.FillBuffer(table_gpu_address, sizeof(uint32_t), 0x7ab1e5u,
+                              false);
+      ShaderVertexInputInfo input{};
+      (void)PrepareProgram(table_vs, HW::Context{}, HW::UserConfig{}, input);
+      tables_read = input.resources_num == 1 &&
+                    std::ranges::equal(input.resources[0].fields,
+                                       table_vsharps[1].fields);
+      table_gpu_kept =
+          buffer_cache.HasGpuDirtyBytes(table_gpu_address, sizeof(uint32_t));
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require("GpuCommandLane", "vertex tables beside GPU-written bytes",
+            tables_read && table_gpu_kept,
+            "a vertex table read beside GPU-written bytes downloaded them or "
+            "read the wrong entries");
+
     // With storage-image readback on, a GL2 writeback copies a tiled image's
     // first shader write, or the first after a CPU write, back to guest
     // memory, and guest accesses wait for the copy; a plain rewrite or a

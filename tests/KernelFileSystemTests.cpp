@@ -498,6 +498,22 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void TestPosixRename(const std::filesystem::path &root) {
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1(&symbols);
+  const auto* symbol = symbols.Find(
+      {"NN01qLRhiqU", "Posix", "libkernel", Loader::SymbolType::Func});
+  Check(symbol != nullptr, "POSIX rename export resolves");
+  const auto rename =
+      reinterpret_cast<int (KYTY_SYSV_ABI *)(const char*, const char*)>(symbol->vaddr);
+  Check(rename("/savedata0/SDATA000.DAT", "/savedata0/POSIX000.DAT") == 0 &&
+            std::filesystem::exists(root / "POSIX000.DAT"),
+        "POSIX rename moves a save file");
+  Check(rename("/savedata0/SDATA000.DAT", "/savedata0/POSIX001.DAT") == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOENT,
+        "POSIX rename of a missing file reports ENOENT");
+}
+
 void TestRandomDevices() {
   namespace Net = Libs::Network::Net;
   for (const auto* path : {"/dev/urandom", "/dev/random"}) {
@@ -3121,6 +3137,7 @@ int main(int argc, char** argv) {
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
+  TestPosixRename(temporary.Path());
   CheckSocketWakeup();
   FileSystem::Shutdown();
   CheckEtherAddressFormatting();

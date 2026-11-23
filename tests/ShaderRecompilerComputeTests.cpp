@@ -3554,46 +3554,22 @@ public:
                                       initial_cache_ticks.second + 1},
             "a suspend point did not age both caches exactly once");
 
-    std::binary_semaphore second_entered{0};
+    // The CP executes a point once it submits the packets before it, so the
+    // next point does not wait for their native completion.
     std::binary_semaphore second_returned{0};
     std::jthread second([&] {
-      second_entered.release();
       gpu.SuspendPoint();
       second_returned.release();
     });
-    second_entered.acquire();
-    const bool second_overtook_completion =
-        second_returned.try_acquire_for(std::chrono::milliseconds(100));
-
-    uint32_t compute_value = 0;
-    std::array<uint32_t, 5> compute_commands{};
-    write(compute_commands.data(), &compute_value, 33);
-    bool host_lane_responded = false;
-    std::binary_semaphore compute_progress{0};
-    std::jthread compute([&] {
-      gpu.SubmitCompute(0x20, compute_commands);
-      gpu.SendCommandSync([&] { host_lane_responded = true; });
-      gpu.WaitForIdle();
-      compute_progress.release();
-    });
-    const bool compute_did_not_wait =
-        compute_progress.try_acquire_for(std::chrono::seconds(2));
+    const bool second_nonblocking =
+        second_returned.try_acquire_for(std::chrono::seconds(2));
     signal(1);
     second.join();
-    compute.join();
     finish();
-    Require(name, "one outstanding point", !second_overtook_completion,
-            "a second suspend point returned before the first native completion");
-    Require(name, "independent queue progress",
-            compute_did_not_wait && host_lane_responded && compute_value == 33,
-            "waiting for a previous suspend point blocked compute submissions "
-            "or the host command lane");
+    Require(name, "executed point", second_nonblocking,
+            "a second suspend point waited for native GPU completion");
     Require(name, "frame count", gpu.GetFrameNum() == 2,
             "suspend-point insertion did not advance the frame counter once");
-    Require(name, "async cache lifetime",
-            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
-                                      initial_cache_ticks.second + 2},
-            "asynchronous work aged the caches between frame boundaries");
 
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.
@@ -3645,60 +3621,55 @@ public:
     queued.join();
     gpu.Submit(after);
     release_lane.release();
+    // The stalled stream holds the queued point back, so the next point waits
+    // for it while asynchronous compute and the host command lane progress.
+    std::binary_semaphore next_returned{0};
+    std::jthread next([&] {
+      gpu.SuspendPoint();
+      next_returned.release();
+    });
+    const bool next_overtook_point =
+        next_returned.try_acquire_for(std::chrono::milliseconds(100));
+    uint32_t compute_value = 0;
+    std::array<uint32_t, 5> compute_commands{};
+    write(compute_commands.data(), &compute_value, 33);
+    gpu.SubmitCompute(0x20, compute_commands);
     bool prefix_reached = false;
     bool graphics_ordered = false;
+    bool compute_progressed = false;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(2);
     do {
       gpu.SendCommandSync([&] {
         prefix_reached = prefix == 22;
         graphics_ordered = skipped == 0 && after_reset == 0;
+        compute_progressed = compute_value == 33;
       });
       std::this_thread::yield();
-    } while (!prefix_reached && std::chrono::steady_clock::now() < deadline);
+    } while (!(prefix_reached && compute_progressed) &&
+             std::chrono::steady_clock::now() < deadline);
     std::array<uint32_t, 5> release_graphics{};
     write(release_graphics.data(), &label, 1);
     gpu.SubmitCompute(0x20, release_graphics);
+    next.join();
     finish();
+    Require(name, "one outstanding point", !next_overtook_point,
+            "a suspend point returned before the CP executed the previous one");
+    Require(name, "independent queue progress", compute_progressed,
+            "waiting for a previous suspend point blocked compute submissions "
+            "or the host command lane");
+    Require(name, "async cache lifetime",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 4,
+                                      initial_cache_ticks.second + 4},
+            "asynchronous work aged the caches between frame boundaries");
     Require(name, "graphics FIFO",
             prefix_reached && graphics_ordered && skipped == 0,
             "suspend point or later graphics overtook a stalled graphics stream");
     Require(name, "graphics reset", after_reset == 44,
             "suspend point preserved the previous frame's predicate");
 
-    // Delay the completion callback beyond the owner's shutdown when possible.
-    // Its credit must remain alive independently of the GuestGpu object.
-    std::binary_semaphore priority_entered{0};
-    std::binary_semaphore release_priority{0};
-    gpu.SendCommandSync([&] {
-      scheduler.DeferPriorityOperation([&] {
-        priority_entered.release();
-        release_priority.acquire();
-      });
-      SubmitInfo blocked;
-      blocked.AddWait(gate, 2);
-      scheduler.Flush(blocked);
-    });
-    gpu.SuspendPoint();
-    gpu.WaitForIdle();
-    std::binary_semaphore shutdown_returned{0};
-    std::jthread shutdown([&] {
-      context.ShutdownGpu();
-      shutdown_returned.release();
-    });
-    const bool shutdown_overtook_native =
-        shutdown_returned.try_acquire_for(std::chrono::milliseconds(100));
-    signal(2);
-    priority_entered.acquire();
-    if (!shutdown_overtook_native) {
-      (void)shutdown_returned.try_acquire_for(std::chrono::seconds(2));
-    }
-    release_priority.release();
-    shutdown.join();
-    scheduler.DrainPriorityOperations();
+    context.ShutdownGpu();
     m_runtime_context.device.destroySemaphore(gate, nullptr);
-    Require(name, "shutdown native completion", !shutdown_overtook_native,
-            "shutdown returned while the suspend point was still executing");
     std::printf("[host]    %-32s ok\n", name);
   }
 

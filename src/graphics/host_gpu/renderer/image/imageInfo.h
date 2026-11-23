@@ -270,7 +270,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
-	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+	if (metadata_address == 0 || (metadata_address & 0xffu) != 0) {
 		return VideoOutCompression::Unsupported;
 	}
 	switch (dcc_control) {

@@ -38,6 +38,14 @@ TEST(VideoOutFormat, SourceFlagsAndRouting) {
 	}
 }
 
+TEST(VideoOutFormat, DccClearColorNeedsCompressedBuffers) {
+	// PPSA28824 sets its R8G8B8A8 register clear color on a DCC 256/64/64 display buffer.
+	EXPECT_EQ(Libs::Graphics::ClassifyVideoOutCompression(true, 0x215468000ull, 0x208, 0x311308),
+	          Libs::Graphics::VideoOutCompression::Dcc256_64_64);
+	EXPECT_EQ(Libs::Graphics::ClassifyVideoOutCompression(false, 0, 0, 0x311308),
+	          Libs::Graphics::VideoOutCompression::Unsupported);
+}
+
 TEST(GpuBlitShaders, MeshIndirectTaskDeclaresLocalSize) {
 	bool local_size    = false;
 	bool local_size_id = false;

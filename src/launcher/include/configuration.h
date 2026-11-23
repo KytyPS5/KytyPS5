@@ -84,8 +84,11 @@ public:
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
-	enum class PssrUpscaler { Linear, DLSS };
+	enum class PssrUpscaler { Linear, DLSS, FSR };
 	Q_ENUM(PssrUpscaler)
+
+	enum class AudioOutput { TV, AVReceiver, SoundBar, Headphones };
+	Q_ENUM(AudioOutput)
 
 	enum class GameStatus { Unknown, InGame, Logo, DoesntBoot, MainMenu };
 	Q_ENUM(GameStatus)
@@ -102,8 +105,11 @@ public:
 	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
 	bool        custom_settings = false;
 	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
+	bool        activity_intent = false; /* launchActivity in sce_sys/param.json gameIntent */
 	GameStatus  game_status     = GameStatus::Unknown;
 	QString     game_comment;
+	// Activity to launch into for one run; not saved.
+	QString launch_activity;
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
@@ -112,6 +118,7 @@ public:
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
+	AudioOutput            audio_output                = AudioOutput::TV;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -126,6 +133,7 @@ public:
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   relaxed_shader_float        = false;
+	bool                   native_rt                   = false;
 	bool                   shader_cache_enabled        = true;
 	bool                   trophy_enabled              = true;
 	int                    trophy_duration_seconds     = 6;
@@ -148,6 +156,7 @@ public:
 	bool                   pro_enabled                 = false;
 	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
 	QString                dlss_folder;
+	QString                fsr_folder;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
@@ -162,6 +171,7 @@ public:
 		user_name                   = other.user_name;
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
+		audio_output                = other.audio_output;
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
@@ -176,6 +186,7 @@ public:
 		tessellation_enabled        = other.tessellation_enabled;
 		occlusion_queries_enabled   = other.occlusion_queries_enabled;
 		relaxed_shader_float        = other.relaxed_shader_float;
+		native_rt                   = other.native_rt;
 		shader_cache_enabled        = other.shader_cache_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		trophy_duration_seconds     = other.trophy_duration_seconds;
@@ -198,6 +209,7 @@ public:
 		pro_enabled                 = other.pro_enabled;
 		pssr_upscaler               = other.pssr_upscaler;
 		dlss_folder                 = other.dlss_folder;
+		fsr_folder                  = other.fsr_folder;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
 		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)
@@ -215,6 +227,7 @@ public:
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
 		pro_supported   = other.pro_supported;
+		activity_intent = other.activity_intent;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}

@@ -16,9 +16,7 @@ static std::string UpdateName(const std::string& str) {
 std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
 	auto library = UpdateName(s.library);
 	auto module  = UpdateName(s.module);
-	return fmt::format("{}[{}_v{}][{}_v{}.{}][{}]", s.name.c_str(), library.c_str(),
-	                   s.library_version, module.c_str(), s.module_version_major,
-	                   s.module_version_minor, magic_enum::enum_name(s.type));
+	return fmt::format("{}[{}][{}][{}]", s.name, library, module, magic_enum::enum_name(s.type));
 }
 
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr) {
@@ -73,19 +71,6 @@ const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType
 	for (const auto& symbol: m_symbols) {
 		if ((vaddr == 0 || symbol.vaddr == vaddr) && symbol.name.starts_with(prefix) &&
 		    symbol.name.ends_with(suffix)) {
-			return &symbol;
-		}
-	}
-
-	return nullptr;
-}
-
-const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolType type) const {
-	auto prefix = name + "[";
-	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
-
-	for (const auto& symbol: m_symbols) {
-		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
 			return &symbol;
 		}
 	}

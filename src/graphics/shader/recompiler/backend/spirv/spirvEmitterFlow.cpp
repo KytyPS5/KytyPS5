@@ -848,30 +848,32 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
-template <spv::Op Reduce, auto Combine>
-static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	using Op = IR::ValueOpcode;
+	const auto [reduce, combine] =
+	    [&]() -> std::pair<spv::Op, uint32_t (*)(EmitterState&, uint32_t, uint32_t)> {
+		switch (inst.Flags<Op>()) {
+			case Op::IAdd32: return {spv::OpGroupNonUniformIAdd, EmitIAdd32};
+			case Op::SMin32: return {spv::OpGroupNonUniformSMin, EmitSMin32};
+			case Op::SMax32: return {spv::OpGroupNonUniformSMax, EmitSMax32};
+			case Op::UMin32: return {spv::OpGroupNonUniformUMin, EmitUMin32};
+			case Op::UMax32: return {spv::OpGroupNonUniformUMax, EmitUMax32};
+			case Op::BitwiseAnd32: return {spv::OpGroupNonUniformBitwiseAnd, EmitBitwiseAnd32};
+			case Op::BitwiseOr32: return {spv::OpGroupNonUniformBitwiseOr, EmitBitwiseOr32};
+			case Op::BitwiseXor32: return {spv::OpGroupNonUniformBitwiseXor, EmitBitwiseXor32};
+			default: ctx.Fail(inst, "has an unsupported reduction");
+		}
+	}();
 	auto& state = ctx.state;
-	auto value = ctx.Arg(inst, 0);
+	auto  value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
-		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+		value = combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(Reduce, TypeU32(state), result,
+	state.builder.AddFunction(reduce, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
 	                          value);
 	return result;
-}
-
-uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMin, EmitUMin32>(ctx, inst);
-}
-
-uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst);
-}
-
-uint32_t EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformBitwiseOr, EmitOrU32>(ctx, inst);
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

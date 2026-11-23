@@ -6,7 +6,7 @@
 
 namespace Libs {
 
-LIB_VERSION("FontFt", 1, "FontFt", 1, 1);
+LIB_NAME("FontFt", "FontFt");
 
 namespace FontFt {
 

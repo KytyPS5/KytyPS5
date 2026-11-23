@@ -436,7 +436,7 @@ TestCase FlatStackApertures(u32 wave_size) {
   test.name = wave_size == 32 ? "FlatStackApertures32" : "FlatStackApertures64";
   auto &code = test.code;
   code = {EncodeSop1(0x04, 8, 237), // private base
-          EncodeSop1(0x0b, 11, InlineU32(1)), // S_BREV_B32 shared aperture, as in GTA.
+          EncodeSop1(0x0b, 11, InlineU32(1)), // S_BREV_B32 shared aperture.
           EncodeVop2(0x1a, 20, InlineU32(2), 0),
           EncodeVop2(0x1b, 22, InlineU32(1), 0),
           EncodeVop2(0x1a, 22, InlineU32(31), 22)};

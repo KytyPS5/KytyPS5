@@ -2,6 +2,8 @@
 
 #include "cheatFile.h"
 
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QRegularExpression>
@@ -20,6 +22,7 @@ constexpr qint64 kFileLimit  = 8 * 1024 * 1024;
 
 const QString kBaseUrl = QStringLiteral(
     "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/");
+const QUrl kModulesUrl(QStringLiteral("https://kytyps5.github.io/KytyPS5-Modules/"));
 
 bool IsFormat(const QString& format) {
 	return format == QStringLiteral("json") || format == QStringLiteral("mc4") ||
@@ -33,10 +36,6 @@ QRegularExpressionMatch MatchName(const QString& name) {
 }
 
 } // namespace
-
-QUrl RemoteFile::Url() const {
-	return QUrl(kBaseUrl + format + QLatin1Char('/') + name);
-}
 
 CatalogResult ParseIndex(const QByteArray& data, const QString& format, const QString& title_id) {
 	CatalogResult result;
@@ -68,11 +67,45 @@ CatalogResult ParseIndex(const QByteArray& data, const QString& format, const QS
 			continue;
 		}
 		seen.insert(name);
-		result.files.append(
-		    {name, trimmed.mid(separator + 1).trimmed(), match.captured(2), format});
+		result.files.append({name, trimmed.mid(separator + 1).trimmed(), match.captured(2), format,
+		                     CheatRepository::tr("Cheat"),
+		                     QUrl(kBaseUrl + format + QLatin1Char('/') + name)});
 	}
 	if (invalid != 0) {
 		result.error = CheatRepository::tr("Skipped %1 invalid cheat index entries.").arg(invalid);
+	}
+	return result;
+}
+
+CatalogResult ParseModules(const QByteArray& data, const QString& title_id) {
+	CatalogResult result;
+	const auto    root = QJsonDocument::fromJson(data).object();
+	if (root.isEmpty()) {
+		result.error = CheatRepository::tr("Invalid module catalog.");
+		return result;
+	}
+	const auto id      = title_id.trimmed().toUpper();
+	int        invalid = 0;
+	for (const auto& [category, kind]:
+	     {std::pair {QStringLiteral("patches"), CheatRepository::tr("Patch")},
+	      std::pair {QStringLiteral("cheats"), CheatRepository::tr("Cheat")}}) {
+		for (const auto& value: root.value(category).toObject().value(id).toArray()) {
+			const auto entry = value.toObject();
+			const auto url =
+			    kModulesUrl.resolved(QUrl(entry.value(QStringLiteral("path")).toString()));
+			if (!kModulesUrl.isParentOf(url)) {
+				invalid++;
+				continue;
+			}
+			result.files.append({entry.value(QStringLiteral("title")).toString(),
+			                     entry.value(QStringLiteral("gameName")).toString(),
+			                     entry.value(QStringLiteral("version")).toString(),
+			                     QStringLiteral("json"), kind, url});
+		}
+	}
+	if (invalid != 0) {
+		result.error =
+		    CheatRepository::tr("Skipped %1 invalid module catalog entries.").arg(invalid);
 	}
 	return result;
 }
@@ -132,26 +165,25 @@ void CheatRepository::Load(const QString& title_id) {
 	CancelFetch();
 	m_files.clear();
 	m_errors.clear();
-	m_pending = 3;
-	for (const auto& format:
-	     {QStringLiteral("json"), QStringLiteral("mc4"), QStringLiteral("shn")}) {
-		auto* reply =
-		    Request(QUrl(kBaseUrl + format + QStringLiteral(".txt")), kIndexLimit,
-		            [this, generation, format, title_id](const QByteArray& data, QString error) {
+	m_pending = 4;
+	auto load = [this, generation](const QString& source, const QUrl& url, auto parse) {
+		m_catalog_replies.append(
+		    Request(url, kIndexLimit,
+			        [this, generation, source, parse](const QByteArray& data, QString error) {
 			            if (generation != m_catalog_generation) {
 				            return;
 			            }
 			            if (error.isEmpty()) {
-				            auto result = ParseIndex(data, format, title_id);
+				            auto result = parse(data);
 				            m_files.append(result.files);
 				            error = result.error;
 			            }
 			            if (!error.isEmpty()) {
-				            m_errors.append(format.toUpper() + QStringLiteral(": ") + error);
+				            m_errors.append(source + QStringLiteral(": ") + error);
 			            }
 			            if (--m_pending == 0) {
 				            std::sort(m_files.begin(), m_files.end(),
-				                      [](const RemoteFile& left, const RemoteFile& right) {
+							          [](const RemoteFile& left, const RemoteFile& right) {
 					                      if (left.version != right.version) {
 						                      return left.version > right.version;
 					                      }
@@ -162,8 +194,16 @@ void CheatRepository::Load(const QString& title_id) {
 				                      });
 				            emit CatalogLoaded(m_files, m_errors.join(QLatin1Char('\n')));
 			            }
-		            });
-		m_catalog_replies.append(reply);
+		            }));
+	};
+	load(tr("Modules"), kModulesUrl.resolved(QUrl(QStringLiteral("index.min.json"))),
+	     [title_id](const QByteArray& data) { return ParseModules(data, title_id); });
+	for (const auto& format:
+	     {QStringLiteral("json"), QStringLiteral("mc4"), QStringLiteral("shn")}) {
+		load(format.toUpper(), QUrl(kBaseUrl + format + QStringLiteral(".txt")),
+		     [format, title_id](const QByteArray& data) {
+			     return ParseIndex(data, format, title_id);
+		     });
 	}
 }
 
@@ -171,7 +211,7 @@ void CheatRepository::Fetch(const RemoteFile& file) {
 	CancelFetch();
 	const auto generation = m_fetch_generation;
 	m_file_reply =
-	    Request(file.Url(), kFileLimit,
+	    Request(file.url, kFileLimit,
 		        [this, generation, format = file.format](QByteArray data, QString error) {
 		            if (generation != m_fetch_generation) {
 			            return;

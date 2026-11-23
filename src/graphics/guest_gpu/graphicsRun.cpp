@@ -182,6 +182,22 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 }
 
+// Pops a pushed context, then resets the register state the operation bits name.
+void CommandProcessor::ResetQueue(uint32_t op) {
+	if ((op & Pm4::ResetQueueOp::PopContext) != 0 && m_saved_ctx.has_value()) {
+		ApplyContextStateOperation(ContextStateOperation::Pop);
+	}
+	if ((op & Pm4::ResetQueueOp::CxState) != 0) {
+		m_ctx.Reset();
+	}
+	if ((op & Pm4::ResetQueueOp::ShState) != 0) {
+		m_sh_ctx.Reset();
+	}
+	if ((op & Pm4::ResetQueueOp::UcState) != 0) {
+		m_ucfg.Reset();
+	}
+}
+
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;
@@ -266,7 +282,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	}
 }
 
-void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
+void CommandProcessor::WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
@@ -279,12 +295,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		case 6: break;
 		default: EXIT("unsupported writeData destination selector 0x%02" PRIx32 "\n", dst_sel);
 	}
-	if (dw_num == 0) {
+
+	// A GDS destination is a 16-bit DWORD offset.
+	if (dst_sel == 6) {
+		for (uint32_t i = 0; i < dw_num; i++, dst += !write_one_address) {
+			m_renderer.GetBufferCache().FillBuffer((dst & 0xffffu) * 4u, 4u, src[i], true);
+		}
 		return;
 	}
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
+	auto* output = reinterpret_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
@@ -330,7 +351,7 @@ void CommandProcessor::GetLodStats(volatile uint32_t* dst, uint32_t size, bool r
 
 void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes) {
-	if (num_bytes == 0 || static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	if (num_bytes == 0) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
@@ -391,6 +412,10 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_state = gpu;
+	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GPU: command processor assigned to the core of logical processor {}.\n", processor));
+	}
 
 	for (;;) {
 		Submission                   submission;
@@ -605,6 +630,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
+		if (!g_cp_op_keeps_draw_window[opcode]) {
+			m_renderer.GetBufferCache().EndDrawWindow();
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -879,11 +907,10 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	m_renderer.GetRenderExecutor().DrawAuto(CurrentBuffer(), args);
 }
 
-void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 	BufferFlush();
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+	m_renderer.GetVideoOut().WaitFlipDone(label);
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,

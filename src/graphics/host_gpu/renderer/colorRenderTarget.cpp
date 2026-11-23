@@ -67,6 +67,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+	if (m_context.GetResolveCache().FindColor(rt_slot, rt, exact_format, r)) {
+		BindRenderTarget(r.image_id);
+		return;
+	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	// TODO(PPSA24156): Replace this 2x MSAA approximation with proper 4-coverage/2-fragment EQAA.
 	const bool approximate_eqaa = rt.attrib.num_samples == 2 && rt.attrib.num_fragments == 1;
@@ -152,7 +156,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const uint32_t width  = rt.attrib2.width + 1;
 	const uint32_t height = rt.attrib2.height + 1;
 	const auto target_format =
-	    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type, rt.info.channel_order);
+	    TextureGetRenderTargetFormat(m_context.GetGraphics(), rt.info.format, rt.info.channel_type,
+	                                 rt.info.channel_order);
 	// A surface with one stored level starts every MIP_LEVEL at the base address, so a level with
 	// mip 0's padded pitch aliases mip 0's top-left texels.
 	uint32_t mip = rt.view.current_mip_level;
@@ -248,6 +253,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+	m_context.GetResolveCache().SetColor(rt_slot, rt, exact_format, r);
 }
 
 } // namespace Libs::Graphics

@@ -10,9 +10,8 @@
 
 namespace Common {
 
+// Call on the main thread before starting other threads.
 void InitializeThreads();
-
-using wait_poll_func_t = void (*)();
 
 namespace Thread {
 
@@ -21,6 +20,13 @@ void SleepNano(uint64_t nanos);
 bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
+// Gives the calling thread the host's top-ranked physical core, which other emulator threads
+// leave. Returns the lowest logical processor it reserves, or -1 when no core is reserved.
+int ReserveCoreForCurrentThread();
+#ifdef __linux__
+// Gives the calling thread the affinity the process started with, which exec keeps.
+void RestoreProcessAffinity();
+#endif
 
 } // namespace Thread
 
@@ -63,8 +69,6 @@ public:
 	void Signal() { m_cv.notify_one(); }
 	void SignalAll() { m_cv.notify_all(); }
 #endif
-
-	static void SetWaitPollCallback(wait_poll_func_t callback);
 
 	KYTY_CLASS_NO_COPY(CondVar);
 

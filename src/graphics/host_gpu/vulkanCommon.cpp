@@ -133,4 +133,19 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
 	return module;
 }
 
+vk::Pipeline CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
+                                   vk::PipelineLayout layout, const char* operation) {
+	const auto                    shader = CompileSPV(code, device);
+	vk::ComputePipelineCreateInfo create {};
+	create.stage.stage    = vk::ShaderStageFlagBits::eCompute;
+	create.stage.module   = shader;
+	create.stage.pName    = "main";
+	create.layout         = layout;
+	vk::Pipeline pipeline = nullptr;
+	const auto   result   = device.createComputePipelines(nullptr, 1, &create, nullptr, &pipeline);
+	device.destroyShaderModule(shader, nullptr);
+	RequireVulkanSuccess(result, operation);
+	return pipeline;
+}
+
 } // namespace Libs::Graphics

@@ -13,7 +13,7 @@ namespace Libs {
 
 namespace LibRtc {
 
-LIB_VERSION("Rtc", 1, "Rtc", 1, 1);
+LIB_NAME("Rtc", "Rtc");
 
 namespace Rtc {
 

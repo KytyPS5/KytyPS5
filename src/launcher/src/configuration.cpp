@@ -25,6 +25,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(user_name);
 	KYTY_CFG_SET(user_id);
 	KYTY_CFG_SET(audio_input_device);
+	KYTY_CFG_SET(audio_output);
 	KYTY_CFG_SET(present_mode);
 	KYTY_CFG_SET(gpu_index);
 	KYTY_CFG_SET(fullscreen_enabled);
@@ -39,6 +40,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(tessellation_enabled);
 	KYTY_CFG_SET(occlusion_queries_enabled);
 	KYTY_CFG_SET(relaxed_shader_float);
+	KYTY_CFG_SET(native_rt);
 	KYTY_CFG_SET(shader_cache_enabled);
 	KYTY_CFG_SET(trophy_enabled);
 	KYTY_CFG_SET(trophy_duration_seconds);
@@ -61,6 +63,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(pro_enabled);
 	KYTY_CFG_SET(pssr_upscaler);
 	KYTY_CFG_SET(dlss_folder);
+	KYTY_CFG_SET(fsr_folder);
 	KYTY_CFG_SET(amd_cpu_enabled);
 	KYTY_CFG_SET(guest_tsc_enabled);
 #if defined(_WIN32)
@@ -83,6 +86,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	                         ? saved_user_id
 	                         : Config::DEFAULT_USER_ID;
 	audio_input_device = s.value("audio_input_device", audio_input_device).toString();
+	KYTY_CFG_GET(audio_output);
 	KYTY_CFG_GET(present_mode);
 	gpu_index = s.value("gpu_index", -1).toInt();
 	if (EnumToText(present_mode).isEmpty()) {
@@ -100,6 +104,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(tessellation_enabled);
 	KYTY_CFG_GET(occlusion_queries_enabled);
 	KYTY_CFG_GET(relaxed_shader_float);
+	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
 	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
@@ -125,6 +130,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(guest_tsc_enabled);
 	KYTY_CFG_GET(pssr_upscaler);
 	KYTY_CFG_GET(dlss_folder);
+	KYTY_CFG_GET(fsr_folder);
 	pro_enabled     = s.value("pro_enabled", false).toBool();
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)

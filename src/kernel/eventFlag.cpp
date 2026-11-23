@@ -1,79 +1,92 @@
 #include "kernel/eventFlag.h"
 
-#include "common/assert.h"
-#include "common/common.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <algorithm>
+#include <cstring>
+#include <vector>
+
 namespace Libs::LibKernel::EventFlag {
 
 LIB_NAME("libkernel", "libkernel");
 
+constexpr uint32_t ATTR_TH_PRIO = 0x02;
+constexpr uint32_t ATTR_MULTI   = 0x20;
+constexpr uint32_t WAIT_AND     = 0x01;
+constexpr uint32_t CLEAR_ALL    = 0x10;
+constexpr uint32_t CLEAR_PAT    = 0x20;
+
 class KernelEventFlagPrivate {
 public:
-	enum class Result { Ok, AlreadyWaiting, TimedOut, Canceled, Deleted };
-
-	enum class ClearMode { None, All, Bits };
-
-	enum class WaitMode { And, Or };
-
-	KernelEventFlagPrivate(const std::string& name, bool single, bool /*fifo*/, uint64_t bits)
-	    : m_name(name), m_single_thread(single), m_bits(bits) {}
-	virtual ~KernelEventFlagPrivate();
+	KernelEventFlagPrivate(uint32_t attr, uint64_t bits): m_attr(attr), m_bits(bits) {}
+	~KernelEventFlagPrivate();
 
 	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
 
-	void   Set(uint64_t bits);
-	void   Clear(uint64_t bits);
-	void   Cancel(uint64_t bits, int* num_waiting_threads);
-	Result Wait(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result,
-	            uint32_t* ptr_micros);
-
-	Result Poll(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result) {
-		uint32_t micros = 0;
-		return Wait(bits, wait_mode, clear_mode, result, &micros);
-	}
+	int  Wait(uint64_t bits, uint32_t mode, uint64_t* result, KernelUseconds* timeout);
+	int  Poll(uint64_t bits, uint32_t mode, uint64_t* result);
+	void Set(uint64_t bits);
+	void Clear(uint64_t bits);
+	int  Cancel(uint64_t bits);
 
 private:
-	enum class Status { Set, Canceled, Deleted };
+	// A waiting thread, on its stack. Whoever releases it decides its outcome.
+	struct Waiter {
+		uint64_t        bits     = 0;
+		uint32_t        mode     = 0;
+		int             priority = 0;
+		uint64_t        result   = 0;
+		int             error    = OK;
+		bool            released = false;
+		Common::CondVar cond_var;
 
-	Common::Mutex   m_mutex;
-	Common::CondVar m_cond_var;
-	Status          m_status          = Status::Set;
-	int             m_waiting_threads = 0;
-	std::string     m_name;
-	bool            m_single_thread = false;
-	uint64_t        m_bits          = 0;
+		void Release(int ret) {
+			error    = ret;
+			released = true;
+			cond_var.Signal();
+		}
+	};
+
+	int  TakeLocked(uint64_t bits, uint32_t mode, uint64_t* result);
+	void ReleaseAll(int error);
+
+	Common::Mutex        m_mutex;
+	Common::CondVar      m_last_waiter_left;
+	std::vector<Waiter*> m_queue;
+	uint32_t             m_attr;
+	uint64_t             m_bits;
+	// Queued and released threads that have not returned yet.
+	int  m_waiters = 0;
+	bool m_deleted = false;
 };
 
 namespace {
 
-struct EventFlagWaitMode {
-	KernelEventFlagPrivate::WaitMode  wait  = KernelEventFlagPrivate::WaitMode::And;
-	KernelEventFlagPrivate::ClearMode clear = KernelEventFlagPrivate::ClearMode::None;
-};
+bool Satisfied(uint64_t pattern, uint64_t bits, uint32_t mode) {
+	return (mode & WAIT_AND) != 0 ? (pattern & bits) == bits : (pattern & bits) != 0;
+}
 
-EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
-	EventFlagWaitMode mode;
-
-	switch (wait_mode & 0xfu) {
-		case 0x01: mode.wait = KernelEventFlagPrivate::WaitMode::And; break;
-		case 0x02: mode.wait = KernelEventFlagPrivate::WaitMode::Or; break;
-		default: EXIT("unknown mode: %u\n", wait_mode);
+uint64_t Cleared(uint64_t pattern, uint64_t bits, uint32_t mode) {
+	if ((mode & CLEAR_ALL) != 0) {
+		return 0;
 	}
+	return (mode & CLEAR_PAT) != 0 ? pattern & ~bits : pattern;
+}
 
-	switch (wait_mode & 0xf0u) {
-		case 0x00: mode.clear = KernelEventFlagPrivate::ClearMode::None; break;
-		case 0x10: mode.clear = KernelEventFlagPrivate::ClearMode::All; break;
-		case 0x20: mode.clear = KernelEventFlagPrivate::ClearMode::Bits; break;
-		default: EXIT("unknown mode: %u\n", wait_mode);
-	}
+// Exactly one of AND and OR, at most one clear mode and a non-empty pattern.
+bool ValidWait(uint64_t bits, uint32_t mode) {
+	return bits != 0 && (mode & 0x03u) != 0 && (mode & 0x03u) != 0x03u && (mode & 0x30u) != 0x30u;
+}
 
-	return mode;
+// A timed wait sleeps ceil(timeout / tick) + 1 ticks of 1 ms from the last tick: at least the
+// timeout, and up to the next tick even for a zero timeout.
+uint64_t TickDeadline(uint64_t now_ns, uint32_t micros) {
+	constexpr uint64_t TICK_NS = 1000000;
+	return (now_ns / TICK_NS + (uint64_t {micros} + 999) / 1000 + 1) * TICK_NS;
 }
 
 } // namespace
@@ -81,190 +94,133 @@ EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
 KernelEventFlagPrivate::~KernelEventFlagPrivate() {
 	Common::LockGuard lock(m_mutex);
 
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Deleted;
-
-	m_cond_var.SignalAll();
-
-	while (m_waiting_threads > 0) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
+	m_deleted = true;
+	ReleaseAll(KERNEL_ERROR_EACCES);
+	while (m_waiters != 0) {
+		m_last_waiter_left.Wait(&m_mutex);
 	}
 }
 
-KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitMode wait_mode,
-                                                            ClearMode clear_mode, uint64_t* result,
-                                                            uint32_t* ptr_micros) {
+// Takes the bits when the wait condition holds; EBUSY when the thread would have to wait.
+int KernelEventFlagPrivate::TakeLocked(uint64_t bits, uint32_t mode, uint64_t* result) {
+	if (m_deleted) {
+		return KERNEL_ERROR_EACCES;
+	}
+	if ((m_attr & ATTR_MULTI) == 0 && m_waiters != 0) {
+		return KERNEL_ERROR_EPERM;
+	}
+	*result = m_bits;
+	if (!Satisfied(m_bits, bits, mode)) {
+		return KERNEL_ERROR_EBUSY;
+	}
+	m_bits = Cleared(m_bits, bits, mode);
+	return OK;
+}
+
+int KernelEventFlagPrivate::Poll(uint64_t bits, uint32_t mode, uint64_t* result) {
 	Common::LockGuard lock(m_mutex);
 
-	uint32_t micros     = 0;
-	bool     infinitely = true;
-	if (ptr_micros != nullptr) {
-		micros     = *ptr_micros;
-		infinitely = false;
+	return TakeLocked(bits, mode, result);
+}
+
+int KernelEventFlagPrivate::Wait(uint64_t bits, uint32_t mode, uint64_t* result,
+                                 KernelUseconds* timeout) {
+	Common::LockGuard lock(m_mutex);
+
+	if (int ret = TakeLocked(bits, mode, result); ret != KERNEL_ERROR_EBUSY) {
+		return ret;
 	}
 
-	uint32_t      elapsed = 0;
-	Common::Timer t;
-
-	auto update_timeout = [&]() {
-		if (ptr_micros != nullptr) {
-			*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
-		}
-	};
-
-	if (m_single_thread && m_waiting_threads > 0) {
-		return Result::AlreadyWaiting;
+	Waiter waiter {.bits = bits, .mode = mode};
+	if ((m_attr & ATTR_TH_PRIO) != 0) {
+		waiter.priority = PthreadGetCurrentPriorityForKernel();
 	}
+	// Behind every waiter of the same or a higher priority; FIFO waiters all have priority 0.
+	m_queue.insert(std::find_if(m_queue.begin(), m_queue.end(),
+	                            [&](const Waiter* w) { return w->priority > waiter.priority; }),
+	               &waiter);
+	m_waiters++;
 
-	while (!((wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
-	         (wait_mode == WaitMode::Or && (m_bits & bits) != 0))) {
-		if ((elapsed >= micros && !infinitely)) {
-			if (result != nullptr) {
-				*result = m_bits;
-			}
-			update_timeout();
-			return Result::TimedOut;
-		}
-
-		m_waiting_threads++;
-
-		if (infinitely) {
-			m_cond_var.Wait(&m_mutex);
+	const uint64_t start    = Common::SteadyNs();
+	const uint64_t deadline = (timeout != nullptr ? TickDeadline(start, *timeout) : UINT64_MAX);
+	for (uint64_t now = start; !waiter.released && now < deadline; now = Common::SteadyNs()) {
+		if (timeout == nullptr) {
+			waiter.cond_var.Wait(&m_mutex);
 		} else {
-			m_cond_var.WaitFor(&m_mutex, micros - elapsed);
-		}
-
-		m_waiting_threads--;
-
-		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
-
-		switch (m_status) {
-			case Status::Canceled:
-				if (result != nullptr) {
-					*result = m_bits;
-				}
-				update_timeout();
-				return Result::Canceled;
-			case Status::Deleted:
-				if (result != nullptr) {
-					*result = m_bits;
-				}
-				update_timeout();
-				return Result::Deleted;
-			case Status::Set: break;
+			waiter.cond_var.WaitFor(&m_mutex, static_cast<uint32_t>((deadline - now + 999) / 1000));
 		}
 	}
-
-	if (result != nullptr) {
-		*result = m_bits;
+	if (!waiter.released) {
+		std::erase(m_queue, &waiter);
+		waiter.result = m_bits;
+		waiter.error  = KERNEL_ERROR_ETIMEDOUT;
 	}
-	update_timeout();
-
-	switch (clear_mode) {
-		case ClearMode::All: m_bits = 0; break;
-		case ClearMode::Bits: m_bits &= ~bits; break;
-		case ClearMode::None: break;
+	if (timeout != nullptr) {
+		const uint64_t elapsed = (Common::SteadyNs() - start) / 1000;
+		*timeout = (elapsed < *timeout ? *timeout - static_cast<KernelUseconds>(elapsed) : 0);
+	}
+	if (--m_waiters == 0 && m_deleted) {
+		m_last_waiter_left.Signal();
 	}
 
-	return Result::Ok;
+	*result = waiter.result;
+	return waiter.error;
 }
 
 void KernelEventFlagPrivate::Set(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
 	m_bits |= bits;
-
-	m_cond_var.SignalAll();
+	// In queue order: a released waiter's clear applies before the next one is tested.
+	for (auto it = m_queue.begin(); it != m_queue.end();) {
+		auto* waiter = *it;
+		if (!Satisfied(m_bits, waiter->bits, waiter->mode)) {
+			++it;
+			continue;
+		}
+		waiter->result = m_bits;
+		m_bits         = Cleared(m_bits, waiter->bits, waiter->mode);
+		waiter->Release(OK);
+		it = m_queue.erase(it);
+	}
 }
 
 void KernelEventFlagPrivate::Clear(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
 	m_bits &= bits;
 }
 
-void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
+int KernelEventFlagPrivate::Cancel(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
+	m_bits = bits;
+	ReleaseAll(KERNEL_ERROR_ECANCELED);
+	return m_waiters;
+}
 
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
+// The released waiters report a zero pattern.
+void KernelEventFlagPrivate::ReleaseAll(int error) {
+	for (auto* waiter: m_queue) {
+		waiter->Release(error);
 	}
-
-	if (num_waiting_threads != nullptr) {
-		*num_waiting_threads = m_waiting_threads;
-	}
-
-	m_status = Status::Canceled;
-	m_bits   = bits;
-
-	m_cond_var.SignalAll();
-
-	while (m_waiting_threads > 0) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Set;
+	m_queue.clear();
 }
 
 int KYTY_SYSV_ABI KernelCreateEventFlag(KernelEventFlag* ef, const char* name, uint32_t attr,
                                         uint64_t init_pattern, const void* param) {
 	PRINT_NAME();
 
-	if (ef == nullptr || name == nullptr) {
+	// Known attributes only, at most one queue order and at most one waiter count.
+	if (ef == nullptr || name == nullptr || param != nullptr || (attr & ~0x33u) != 0 ||
+	    (attr & 0x03u) == 0x03u || (attr & 0x30u) == 0x30u) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	if (param != nullptr || (attr & ~0x33u) != 0) {
-		return KERNEL_ERROR_EINVAL;
+	if (strnlen(name, 32) == 32) {
+		return KERNEL_ERROR_ENAMETOOLONG;
 	}
 
-	bool single = true;
-	bool fifo   = true;
-
-	switch (attr & 0x0fu) {
-		case 0x00:
-		case 0x01: fifo = true; break;
-		case 0x02: fifo = false; break;
-		default: return KERNEL_ERROR_EINVAL;
-	}
-
-	switch (attr & 0xf0u) {
-		case 0x00:
-		case 0x10: single = true; break;
-		case 0x20: single = false; break;
-		default: return KERNEL_ERROR_EINVAL;
-	}
-
-	*ef = new KernelEventFlagPrivate(std::string(name), single, fifo, init_pattern);
+	*ef = new KernelEventFlagPrivate(attr, init_pattern);
 
 	LOGF("\tEventFlag create: %s\n", name);
 
@@ -287,27 +243,18 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
                                       uint64_t* result_pat, KernelUseconds* timeout) {
 	PRINT_NAME();
 
+	if (!ValidWait(bit_pattern, wait_mode)) {
+		return KERNEL_ERROR_EINVAL;
+	}
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	if (bit_pattern == 0) {
-		return KERNEL_ERROR_EINVAL;
+	uint64_t  pattern = 0;
+	const int ret     = ef->Wait(bit_pattern, wait_mode, &pattern, timeout);
+	if (result_pat != nullptr) {
+		*result_pat = pattern;
 	}
-
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
-
-	int ret = OK;
-
-	switch (result) {
-		case KernelEventFlagPrivate::Result::Ok: ret = OK; break;
-		case KernelEventFlagPrivate::Result::AlreadyWaiting: ret = KERNEL_ERROR_EPERM; break;
-		case KernelEventFlagPrivate::Result::TimedOut: ret = KERNEL_ERROR_ETIMEDOUT; break;
-		case KernelEventFlagPrivate::Result::Canceled: ret = KERNEL_ERROR_ECANCELED; break;
-		case KernelEventFlagPrivate::Result::Deleted: ret = KERNEL_ERROR_EACCES; break;
-	}
-
 	return ret;
 }
 
@@ -315,27 +262,18 @@ int KYTY_SYSV_ABI KernelPollEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
                                       uint64_t* result_pat) {
 	PRINT_NAME();
 
+	if (!ValidWait(bit_pattern, wait_mode)) {
+		return KERNEL_ERROR_EINVAL;
+	}
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	if (bit_pattern == 0) {
-		return KERNEL_ERROR_EINVAL;
+	uint64_t  pattern = 0;
+	const int ret     = ef->Poll(bit_pattern, wait_mode, &pattern);
+	if (result_pat != nullptr) {
+		*result_pat = pattern;
 	}
-
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Poll(bit_pattern, mode.wait, mode.clear, result_pat);
-
-	int ret = OK;
-
-	switch (result) {
-		case KernelEventFlagPrivate::Result::Ok: ret = OK; break;
-		case KernelEventFlagPrivate::Result::AlreadyWaiting: ret = KERNEL_ERROR_EPERM; break;
-		case KernelEventFlagPrivate::Result::TimedOut:
-		case KernelEventFlagPrivate::Result::Canceled:
-		case KernelEventFlagPrivate::Result::Deleted: ret = KERNEL_ERROR_EBUSY; break;
-	}
-
 	return ret;
 }
 
@@ -371,7 +309,10 @@ int KYTY_SYSV_ABI KernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	ef->Cancel(set_pattern, num_wait_threads);
+	const int waiters = ef->Cancel(set_pattern);
+	if (num_wait_threads != nullptr) {
+		*num_wait_threads = waiters;
+	}
 
 	return OK;
 }

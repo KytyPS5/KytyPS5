@@ -13,7 +13,7 @@
 
 namespace Libs {
 
-LIB_VERSION("PlayGo", 1, "PlayGo", 1, 0);
+LIB_NAME("PlayGo", "PlayGo");
 
 namespace PlayGo {
 
@@ -53,12 +53,8 @@ union PlayGoOptionalChunk {
 	uint64_t scenarios;
 };
 
-static bool ensure_chunks_loaded() {
-	return g_chunks_num != 0 || Loader::SystemContentGetChunksNum(&g_chunks_num);
-}
-
 static bool is_valid_chunk(uint16_t chunk_id) {
-	return ensure_chunks_loaded() && chunk_id < g_chunks_num;
+	return chunk_id < g_chunks_num;
 }
 
 static bool is_valid_locus(int8_t locus) {
@@ -98,9 +94,9 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
-		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
-		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
+	// An application package always has chunk 0, which holds its file system.
+	if (!Loader::SystemContentGetChunksNum(&g_chunks_num)) {
+		g_chunks_num = Config::PlayGoHackEnabled() ? PLAYGO_DEFAULT_CHUNKS_NUM : 1;
 	}
 
 	return OK;
@@ -120,9 +116,6 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	}
 	if (param != nullptr) {
 		return PLAYGO_ERROR_INVALID_ARGUMENT;
-	}
-	if (!ensure_chunks_loaded()) {
-		return PLAYGO_ERROR_NOT_SUPPORT_PLAYGO;
 	}
 
 	*out_handle = PLAYGO_HANDLE;
@@ -155,7 +148,6 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 	if (number_of_entries == 0) {
 		return PLAYGO_ERROR_BAD_SIZE;
 	}
-	ensure_chunks_loaded();
 
 	for (uint32_t i = 0; i < number_of_entries; i++) {
 		LOGF("\t chunk_ids[%u] = %" PRIu16 "\n", i, chunk_ids[i]);
@@ -224,7 +216,6 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	if (out_chunk_id_list != nullptr && number_of_entries == 0) {
 		return PLAYGO_ERROR_BAD_SIZE;
 	}
-	ensure_chunks_loaded();
 
 	// A null output buffer asks for the total chunk count.
 	if (out_chunk_id_list == nullptr) {

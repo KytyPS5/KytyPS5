@@ -32,8 +32,8 @@ struct Fixture {
 	AjmBatchInfo              batch {};
 
 	explicit Fixture(uint32_t channels = 1, AjmSampleEncoding encoding = AjmSampleEncoding::S16,
-	                 uint64_t flags = 0x1000)
-	    : channels(channels) {
+	                 uint64_t flags = 0x1000, uint32_t mapping_family = 0)
+	    : channels(channels), mapping_family(mapping_family) {
 		Check(AjmInstanceCreate(1, 24, flags | channels | (uint64_t(encoding) << 7), &instance) ==
 		          OK,
 		      "create Opus instance");
@@ -374,11 +374,87 @@ void MappingFamilies() {
 
 	f.mapping_family = 2;
 	f.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
+	f.channels       = 3;
+	f.mapping_family = 0;
+	f.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
+	f.channels       = 9;
+	f.mapping_family = 1;
+	f.Initialize(AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL);
+	f.channels = 6;
+	f.Initialize(AJM_RESULT_TOO_MANY_CHANNELS | AJM_RESULT_FATAL);
+}
+
+// Family 1 surround streams decode in element order: each output channel matches the reference
+// decoder's channel with the same index.
+void SurroundFamily(uint32_t channels) {
+	int           error = 0, streams = 0, coupled = 0;
+	unsigned char mapping[8];
+	auto*         encoder =
+	    opus_multistream_surround_encoder_create(48000, static_cast<int>(channels), 1, &streams,
+		                                         &coupled, mapping, OPUS_APPLICATION_AUDIO, &error);
+	Check(encoder != nullptr && error == OPUS_OK, "create surround test encoder");
+	auto* reference = opus_multistream_decoder_create(48000, static_cast<int>(channels), streams,
+	                                                  coupled, mapping, &error);
+	Check(reference != nullptr && error == OPUS_OK, "create surround reference decoder");
+	Fixture              f(channels, AjmSampleEncoding::S16, 0, 1);
+	std::vector<int16_t> pcm(960 * channels), expected(960 * channels), actual(960 * channels);
+	std::vector<double>  distance(channels * channels);
+	std::vector<uint8_t> packet(4096);
+	for (int p = 0; p < 4; ++p) {
+		for (size_t i = 0; i < pcm.size(); ++i) {
+			const auto c = i % channels;
+			pcm[i] = static_cast<int16_t>((4000 + 1000 * c) *
+			                              std::sin((i / channels + p * 960) * (0.03 + 0.017 * c)));
+		}
+		const int size = opus_multistream_encode(encoder, pcm.data(), 960, packet.data() + 2, 4094);
+		Check(size > 0, "encode surround test packet");
+		packet[0] = static_cast<uint8_t>(size);
+		packet[1] = static_cast<uint8_t>(size >> 8);
+		Check(opus_multistream_decode(reference, packet.data() + 2, size, expected.data(), 960,
+		                              0) == 960,
+		      "reference surround decode");
+		const auto decoded = f.Decode(packet.data(), size + 2, actual.data(), actual.size() * 2);
+		Check(decoded.stream.size_consumed == size + 2 &&
+		          decoded.stream.size_produced == static_cast<int>(actual.size() * 2),
+		      "family 1 decodes the whole surround packet");
+		for (size_t i = 0; i < actual.size(); ++i) {
+			for (uint32_t r = 0; r < channels; ++r) {
+				distance[(i % channels) * channels + r] +=
+				    std::abs(actual[i] - expected[i - i % channels + r]);
+			}
+		}
+	}
+	opus_multistream_encoder_destroy(encoder);
+	opus_multistream_decoder_destroy(reference);
+	for (uint32_t c = 0; c < channels; ++c) {
+		const auto* row = distance.data() + c * channels;
+		Check(std::min_element(row, row + channels) - row == c,
+		      "family 1 keeps each channel in element order");
+	}
+}
+
+void Mp3ParseFrame() {
+	// MPEG-1 Layer III, 128 kbps, 44.1 kHz, joint stereo, no CRC.
+	std::array<uint8_t, 4>  frame = {0xff, 0xfb, 0x90, 0x64};
+	AjmDecMp3ParseFrameInfo info;
+	std::memset(&info, 0xff, sizeof(info));
+	Check(AjmDecMp3ParseFrame(frame.data(), frame.size(), 1, &info) == OK, "parse MP3 frame");
+	Check(info.frame_size == 417 && info.num_channels == 2 && info.samples_per_channel == 1152 &&
+	          info.bitrate == 128000 && info.sample_rate == 44100 && info.encoder_delay == 0 &&
+	          info.num_frames == 0 && info.total_samples == 0 && info.ofl_type == 0,
+	      "MP3 frame info");
+	Check(AjmDecMp3ParseFrame(frame.data(), frame.size(), 0, nullptr) ==
+	          AJM_ERROR_INVALID_PARAMETER,
+	      "MP3 parse without output");
+	frame[1] = 0xfd;
+	Check(AjmDecMp3ParseFrame(frame.data(), frame.size(), 0, &info) == AJM_ERROR_INVALID_PARAMETER,
+	      "MP3 parse of a Layer II frame");
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+	Mp3ParseFrame();
 	const auto packet = Encode(1, 1);
 	SmallOutputs(packet);
 	SmallOutputs(packet, 312);
@@ -395,6 +471,9 @@ int main(int argc, char** argv) {
 	FormatChangeRequiresReset();
 	EndPersistsUntilReset(packet);
 	MappingFamilies();
+	for (uint32_t channels = 3; channels <= 8; ++channels) {
+		SurroundFamily(channels);
+	}
 	if (argc >= 2) {
 		std::ifstream        file(argv[1], std::ios::binary);
 		std::vector<uint8_t> real_packet((std::istreambuf_iterator<char>(file)), {});

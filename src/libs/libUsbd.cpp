@@ -6,7 +6,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Usbd", 1, "Usbd", 1, 1);
+LIB_NAME("Usbd", "Usbd");
 
 namespace Usbd {
 

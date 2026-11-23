@@ -18798,6 +18798,31 @@ public:
                     released_depth.load_clear_aspects == vk::ImageAspectFlagBits::eDepth,
                 "a stencil-only image adopted as a depth target's stencil plane kept owning its "
                 "settled HTile, so a new image over that HTile skipped its initial clear");
+        constexpr uint64_t heir_htile_address = base + 0x720000;
+        auto heir_depth_target = depth_over_stencil_only;
+        heir_depth_target.z_read_base_addr = base + 0x700000;
+        heir_depth_target.z_write_base_addr = base + 0x700000;
+        heir_depth_target.htile_data_base_addr = heir_htile_address;
+        auto heir_stencil_target = stencil_only_target;
+        heir_stencil_target.stencil_read_base_addr = base + 0x740000;
+        heir_stencil_target.stencil_write_base_addr = base + 0x740000;
+        heir_stencil_target.htile_data_base_addr = heir_htile_address;
+        const auto heir = bind_depth_target(heir_depth_target, depth_only_control);
+        const auto heir_owner = bind_depth_target(heir_stencil_target, stencil_only_control);
+        const bool heir_meta_cleared = texture_cache.ClearMeta(heir_htile_address);
+        retire(heir_owner);
+        const bool heir_kept_clear = texture_cache.IsMetaCleared(heir_htile_address, 0) &&
+                                     texture_cache.TouchMeta(heir_htile_address, 0, false);
+        retire(heir);
+        heir_depth_target.z_read_base_addr = base + 0x760000;
+        heir_depth_target.z_write_base_addr = base + 0x760000;
+        const auto after_heir = bind_depth_target(heir_depth_target, depth_only_control);
+        Require(name, "deleting the HTile owner passes the range to its heir",
+                heir_meta_cleared && heir_kept_clear &&
+                    after_heir.load_clear_aspects == vk::ImageAspectFlagBits::eDepth,
+                "deleting the HTile owner dropped the pending clear, or kept owning the range so "
+                "deleting the image still over it kept its settled clear state and a new image "
+                "over that HTile skipped its initial clear");
         RenderExecutorTestAccess::ResetBindings(executor);
         registers.SetDepthRenderTarget(stencil_only_target);
         registers.SetDepthControl(stencil_only_control);

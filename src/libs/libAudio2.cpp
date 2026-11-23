@@ -915,8 +915,10 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 
 int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state) {
 	PRINT_NAME();
-	EXIT_NOT_IMPLEMENTED(state == nullptr);
-	std::memset(state, 0, sizeof(AudioOut2SystemState));
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	state->loudness = AUDIO_OUT_STATE_LOUDNESS_MIN;
 	return OK;
 }
 

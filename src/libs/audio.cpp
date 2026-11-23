@@ -940,8 +940,7 @@ int KYTY_SYSV_ABI AudioOutGetSystemState(AudioOutSystemState* state) {
 		return AUDIO_OUT_ERROR_INVALID_POINTER;
 	}
 
-	// Loudness is undefined until measurement starts; no measurement is emulated.
-	*state = {};
+	*state = {AUDIO_OUT_STATE_LOUDNESS_MIN};
 
 	return OK;
 }

@@ -957,6 +957,21 @@ void TestBlockedPushOnlyHoldsItsContext() {
 	AudioOut2::AudioOut2ContextDestroy(other);
 }
 
+void TestSystemState() {
+	struct SystemState {
+		float    loudness;
+		uint32_t pad;
+		uint64_t reserved[7];
+	} state;
+	std::memset(&state, 0xab, sizeof(state));
+	auto* result = reinterpret_cast<AudioOut2::AudioOut2SystemState*>(&state);
+	Check(AudioOut2::AudioOut2GetSystemState(result) == OK && state.loudness == -70.0f &&
+	          state.pad == 0xabababab && state.reserved[6] == 0xababababababababull,
+	      "system state did not write only the -70 loudness");
+	Check(AudioOut2::AudioOut2GetSystemState(nullptr) == static_cast<int32_t>(0x80268001u),
+	      "null system state was accepted");
+}
+
 void SetAudioOutput(Config::AudioOutput output) {
 	Config::ConfigOptions options;
 	options.audio_output = output;
@@ -1148,6 +1163,7 @@ int main() {
 	TestObjectBusRouting();
 	TestBlockedPushOnlyHoldsItsContext();
 	TestAudioOutputs();
+	TestSystemState();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;

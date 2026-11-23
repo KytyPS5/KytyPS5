@@ -15,6 +15,9 @@ constexpr int AUDIO_OUT_PORT_TYPE_VIBRATION = 10;
 constexpr int AUDIO_OUT_PORT_TYPE_AUDIO3D   = 126;
 constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
 
+// System loudness reads its minimum unless a loudness measurement is started.
+constexpr float AUDIO_OUT_STATE_LOUDNESS_MIN = -70.0f;
+
 } // namespace Libs::Audio
 
 namespace Libs::Audio::AudioInternal {

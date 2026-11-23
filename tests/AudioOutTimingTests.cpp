@@ -455,6 +455,14 @@ void TestChannelGains() {
 	      "connected controller did not receive channel gains");
 }
 
+void TestSystemState() {
+	Libs::Audio::AudioOut::AudioOutSystemState state;
+	std::memset(&state, 0xab, sizeof(state));
+	Check(Libs::Audio::AudioOut::AudioOutGetSystemState(&state) == OK && state.loudness == -70.0f &&
+	          state.reserved8[0] == 0 && state.reserved64[2] == 0,
+	      "system state is not a -70 loudness with zeroed reserved fields");
+}
+
 void TestPortState() {
 	namespace AudioOut = Libs::Audio::AudioOut;
 	Fixture f;
@@ -497,6 +505,7 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestSystemState();
 	TestPortState();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");

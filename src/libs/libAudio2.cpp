@@ -901,7 +901,7 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	std::memset(state, 0, sizeof(AudioOut2PortState));
 	state->output          = 1;
 	state->num_channels    = 2;
-	state->volume          = 127;
+	state->volume          = -1;
 	state->reroute_counter = 0;
 	state->flags           = 0;
 
@@ -909,6 +909,10 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	if (auto* port_state = audioout2_find_port_locked(port); port_state != nullptr) {
 		const auto type     = audioout2_port_type_to_audio_out_type(port_state->port_type);
 		state->num_channels = audioout2_data_format_channels(port_state->data_format);
+		// Only pad speaker ports report a volume.
+		if (type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+			state->volume = 127;
+		}
 		// Main-route ports report the output's channels, channel ports at most their own.
 		if (type == AUDIO_OUT_PORT_TYPE_MAIN || type == AUDIO_OUT_PORT_TYPE_BGM) {
 			const auto main     = AudioInternal::GetMainOutput();

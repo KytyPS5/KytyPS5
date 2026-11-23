@@ -925,7 +925,8 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 
 	state->reroute_counter = 0;
-	state->volume          = 127;
+	// Only pad speaker ports report a volume.
+	state->volume = type == AUDIO_OUT_PORT_TYPE_PADSPK ? 127 : -1;
 
 	switch (type) {
 		case AUDIO_OUT_PORT_TYPE_MAIN:

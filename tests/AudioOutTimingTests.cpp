@@ -454,9 +454,26 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+void TestPortStateVolume() {
+	namespace AudioOut = Libs::Audio::AudioOut;
+	Fixture f;
+	Libs::Audio::Initialize();
+	const int main = AudioOut::AudioOutOpen(1000, 0, 0, 256, 48000, 4);
+	const int pad  = AudioOut::AudioOutOpen(1000, 4, 0, 256, 48000, 4);
+	AudioOut::AudioOutPortState state {};
+	Check(AudioOut::AudioOutGetPortState(main, &state) == OK && state.volume == -1,
+	      "main port reported a volume");
+	Check(AudioOut::AudioOutGetPortState(pad, &state) == OK && state.volume == 127,
+	      "pad speaker port lost its volume");
+	AudioOut::AudioOutClose(main);
+	AudioOut::AudioOutClose(pad);
+	Libs::Audio::Shutdown();
+}
 } // namespace
 
 int main() {
+	Config::Initialize();
 	TestPrimingAndSteadyCadence();
 	TestUnderrunAndStalledQueueRecovery();
 	TestFallbackClockAndLongGap();
@@ -468,6 +485,7 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestPortStateVolume();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

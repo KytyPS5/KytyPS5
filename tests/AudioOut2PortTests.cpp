@@ -987,10 +987,11 @@ void TestAudioOutputs() {
 	param.port_type     = 3;
 	const auto pad      = CreatePort(context, param);
 	const auto check_port = [](AudioOut2::AudioOut2PortHandle port, uint16_t output,
-	                           uint8_t channels, const char* message) {
+	                           uint8_t channels, int16_t volume, const char* message) {
 		PortState state {};
 		Check(AudioOut2::AudioOut2PortGetState(port, AsState(&state)) == OK &&
-		          state.output == output && state.num_channels == channels,
+		          state.output == output && state.num_channels == channels &&
+		          state.volume == volume,
 		      message);
 	};
 
@@ -1012,13 +1013,13 @@ void TestAudioOutputs() {
 			Check((expected.bits & 0x10) == 0 || info.angles[4] == Angle {90, 0},
 			      "side left speaker is not at 90 degrees");
 		}
-		check_port(stereo, expected.port_output, 2,
+		check_port(stereo, expected.port_output, 2, -1,
 		           "stereo main port state does not match the audio output");
-		check_port(surround, expected.port_output, expected.channels,
+		check_port(surround, expected.port_output, expected.channels, -1,
 		           "8-channel main port is not limited to the output's channels");
-		check_port(object, expected.port_output, expected.channels,
+		check_port(object, expected.port_output, expected.channels, -1,
 		           "object port does not report the output's channels");
-		check_port(pad, 1, 1, "pad speaker port followed the main output");
+		check_port(pad, 1, 1, 127, "pad speaker port followed the main output or lost its volume");
 	}
 
 	Check(AudioOut2::AudioOut2GetSpeakerInfo(nullptr, 0) == static_cast<int32_t>(0x8026800Cu),

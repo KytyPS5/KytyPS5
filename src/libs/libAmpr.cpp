@@ -584,8 +584,6 @@ struct CommandBufferState {
 	uint64_t buffer           = 0;
 	uint64_t size             = 0;
 	uint64_t write_offset     = 0;
-	bool     header_validated = false;
-	bool     buffer_validated = false;
 	struct ReadFileCommand {
 		uint32_t file_id     = 0;
 		uint64_t destination = 0;
@@ -676,15 +674,6 @@ static void EraseCommandBufferStateLocked(uint64_t command_buffer) {
 	}
 }
 
-static bool AddU64(uint64_t a, uint64_t b, uint64_t* out) {
-	if (out == nullptr || std::numeric_limits<uint64_t>::max() - a < b) {
-		return false;
-	}
-
-	*out = a + b;
-	return true;
-}
-
 static bool IsValidAprFileOffset(uint64_t file_offset) {
 	return file_offset < APR_MAX_FILE_OFFSET;
 }
@@ -714,32 +703,8 @@ static void WriteCommandBufferUnchecked(uint64_t addr, const T& value) {
 	std::memcpy(reinterpret_cast<void*>(addr), &value, sizeof(value));
 }
 
-static bool ValidateCommandBufferHeader(uint64_t            command_buffer,
-                                        CommandBufferState* state = nullptr) {
-	if (state != nullptr && state->header_validated) {
-		return true;
-	}
-	if (!AprShared::IsValidGuestRange(command_buffer, COMMAND_BUFFER_SIZE, true)) {
-		return false;
-	}
-	if (state != nullptr) {
-		state->header_validated = true;
-	}
-	return true;
-}
-
-static bool ValidateCommandBufferBacking(CommandBufferState* state) {
-	if (state == nullptr || state->buffer == 0 || state->size == 0) {
-		return false;
-	}
-	if (state->buffer_validated) {
-		return true;
-	}
-	if (!AprShared::IsValidGuestRange(state->buffer, state->size, true)) {
-		return false;
-	}
-	state->buffer_validated = true;
-	return true;
+static bool ValidateCommandBufferHeader(uint64_t command_buffer) {
+	return AprShared::IsValidGuestRange(command_buffer, COMMAND_BUFFER_SIZE, true);
 }
 
 static bool LoadCommandBufferStateFromGuest(uint64_t command_buffer, CommandBufferState* state) {
@@ -753,7 +718,6 @@ static bool LoadCommandBufferStateFromGuest(uint64_t command_buffer, CommandBuff
 	loaded.size = ReadCommandBufferUnchecked<uint32_t>(command_buffer + COMMAND_BUFFER_SIZE_OFFSET);
 	loaded.write_offset =
 	    ReadCommandBufferUnchecked<uint32_t>(command_buffer + COMMAND_BUFFER_OFFSET_OFFSET);
-	loaded.header_validated = true;
 	*state                  = loaded;
 	return true;
 }
@@ -777,34 +741,27 @@ static bool GetOrCreateCommandBufferStateLocked(uint64_t               command_b
 	return true;
 }
 
-static bool EnsureCommandBufferRecordSpace(uint64_t command_buffer, CommandBufferState* state,
-                                           uint64_t record_size) {
-	if (state == nullptr || record_size == 0 ||
-	    !ValidateCommandBufferHeader(command_buffer, state) || state->buffer == 0 ||
-	    record_size > state->size || state->write_offset > state->size - record_size) {
-		return false;
+static int CheckCommandBufferRecordSpace(const CommandBufferState& state, uint64_t record_size) {
+	if (state.buffer == 0) {
+		return LibKernel::KERNEL_ERROR_EPERM;
 	}
-
-	return ValidateCommandBufferBacking(state);
+	if (record_size > state.size || state.write_offset > state.size - record_size) {
+		return LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	if (!AprShared::IsValidGuestRange(state.buffer, state.size, true)) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	return OK;
 }
 
-static bool CommitCommandBufferRecord(uint64_t command_buffer, CommandBufferState* state,
+static void CommitCommandBufferRecord(uint64_t command_buffer, CommandBufferState& state,
                                       uint64_t record_size) {
-	if (state == nullptr) {
-		return false;
-	}
-
-	state->write_offset += record_size;
-	if (state->write_offset > std::numeric_limits<uint32_t>::max()) {
-		return false;
-	}
-
+	state.write_offset += record_size;
 	WriteCommandBufferUnchecked(command_buffer + COMMAND_BUFFER_OFFSET_OFFSET,
-	                            static_cast<uint32_t>(state->write_offset));
+	                            static_cast<uint32_t>(state.write_offset));
 	const auto num =
 	    ReadCommandBufferUnchecked<int32_t>(command_buffer + COMMAND_BUFFER_NUM_OFFSET);
 	WriteCommandBufferUnchecked(command_buffer + COMMAND_BUFFER_NUM_OFFSET, num + 1);
-	return true;
 }
 
 static void UpdateCommandBufferTypeFlagsUnchecked(uint64_t command_buffer, uint32_t set_bits,
@@ -872,8 +829,6 @@ static bool WriteCommandBufferPointers(uint64_t command_buffer, uint64_t buffer,
 	state.buffer           = buffer;
 	state.size             = size;
 	state.write_offset     = write_offset;
-	state.header_validated = true;
-	state.buffer_validated = false;
 	state.commands.clear();
 	state.gather_scatter_valid       = false;
 	state.gather_scatter_file_id     = 0;
@@ -963,18 +918,18 @@ static bool InitializeAprReservedState(uint64_t command_buffer, uint64_t reserve
 	return WriteGuestZero64Validated(reserved_state0) && WriteGuestZero64Validated(reserved_state1);
 }
 
-static bool AppendReadFileRecord(uint64_t command_buffer, uint8_t opcode, uint32_t file_id,
-                                 uint64_t destination, uint64_t size, uint64_t file_offset,
-                                 uint64_t record_size) {
+static int AppendReadFileRecord(uint64_t command_buffer, uint8_t opcode, uint32_t file_id,
+                                uint64_t destination, uint64_t size, uint64_t file_offset,
+                                uint64_t record_size) {
 	std::scoped_lock      lock(g_command_buffer_mutex);
 	CommandBufferIterator it;
 	if (!GetOrCreateCommandBufferStateLocked(command_buffer, &it)) {
-		return false;
+		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
 	auto& state = it->second;
-	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
-		return false;
+	if (const int result = CheckCommandBufferRecordSpace(state, record_size); result != OK) {
+		return result;
 	}
 
 	const auto record_offset = state.write_offset;
@@ -983,18 +938,13 @@ static bool AppendReadFileRecord(uint64_t command_buffer, uint8_t opcode, uint32
 	std::memcpy(reinterpret_cast<void*>(state.buffer + record_offset), &opcode, sizeof(opcode));
 	state.commands.push_back({record_offset, CommandBufferState::ReadFileCommand {
 	                                             file_id, destination, size, file_offset}});
-	if (!CommitCommandBufferRecord(command_buffer, &state, record_size)) {
-		return false;
-	}
-	state.gather_scatter_valid   = true;
-	state.gather_scatter_file_id = file_id;
-	if (!AddU64(destination, size, &state.gather_scatter_destination) ||
-	    !AddU64(file_offset, size, &state.gather_scatter_file_offset)) {
-		state.gather_scatter_valid = false;
-		return false;
-	}
+	CommitCommandBufferRecord(command_buffer, state, record_size);
+	state.gather_scatter_valid       = true;
+	state.gather_scatter_file_id     = file_id;
+	state.gather_scatter_destination = destination + size;
+	state.gather_scatter_file_offset = file_offset + size;
 	UpdateCommandBufferTypeFlagsUnchecked(command_buffer, APR_TYPE_GATHER_SCATTER_VALID, 0);
-	return true;
+	return OK;
 }
 
 static bool AppendKernelEventRecord(uint64_t command_buffer, uint64_t eq, int32_t id,
@@ -1013,7 +963,7 @@ static bool AppendKernelEventRecord(uint64_t command_buffer, uint64_t eq, int32_
 	}
 
 	auto& state = it->second;
-	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, KERNEL_EVENT_RECORD_SIZE)) {
+	if (CheckCommandBufferRecordSpace(state, KERNEL_EVENT_RECORD_SIZE) != OK) {
 		return false;
 	}
 
@@ -1022,7 +972,8 @@ static bool AppendKernelEventRecord(uint64_t command_buffer, uint64_t eq, int32_
 	            record.size());
 	state.commands.push_back(
 	    {record_offset, CommandBufferState::KernelEventCommand {eq, id, data}});
-	return CommitCommandBufferRecord(command_buffer, &state, KERNEL_EVENT_RECORD_SIZE);
+	CommitCommandBufferRecord(command_buffer, state, KERNEL_EVENT_RECORD_SIZE);
+	return true;
 }
 
 static bool ValidateAmmMapArgs(uint64_t va, uint64_t size) {
@@ -1100,14 +1051,15 @@ static uint32_t* AppendCommandRecord(uint64_t                        command_buf
 	}
 
 	auto& state = it->second;
-	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
+	if (CheckCommandBufferRecordSpace(state, record_size) != OK) {
 		return nullptr;
 	}
 
 	auto* record_addr = reinterpret_cast<uint32_t*>(state.buffer + state.write_offset);
 	std::memset(record_addr, 0, static_cast<size_t>(record_size));
 	state.commands.push_back({state.write_offset, std::move(command)});
-	return CommitCommandBufferRecord(command_buffer, &state, record_size) ? record_addr : nullptr;
+	CommitCommandBufferRecord(command_buffer, state, record_size);
+	return record_addr;
 }
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
@@ -1327,13 +1279,14 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	}
 
 	auto& state = it->second;
-	if (!EnsureCommandBufferRecordSpace(command_buffer, &state, record_size)) {
+	if (CheckCommandBufferRecordSpace(state, record_size) != OK) {
 		return false;
 	}
 
 	std::memset(reinterpret_cast<void*>(state.buffer + state.write_offset), 0,
 	            static_cast<size_t>(record_size));
-	return CommitCommandBufferRecord(command_buffer, &state, record_size);
+	CommitCommandBufferRecord(command_buffer, state, record_size);
+	return true;
 }
 
 static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
@@ -1533,10 +1486,8 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFile(void*    command_buffer, uint6
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	const auto append_ok = AppendReadFileRecord(reinterpret_cast<uint64_t>(command_buffer), 0x17,
-	                                            file_id, destination_addr, size, file_offset,
-	                                            AprReadFileRecordSize(file_offset));
-	return append_ok ? OK : LibKernel::KERNEL_ERROR_EFAULT;
+	return AppendReadFileRecord(reinterpret_cast<uint64_t>(command_buffer), 0x17, file_id,
+	                            destination_addr, size, file_offset, AprReadFileRecordSize(file_offset));
 }
 
 static uint64_t AlignUp4(uint64_t value) {
@@ -2022,9 +1973,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer,
 
 	return AppendReadFileRecord(command_buffer_addr, 0x18, state.gather_scatter_file_id,
 	                            state.gather_scatter_destination, size, file_offset,
-	                            AprReadGatherRecordSize(file_offset))
-	           ? OK
-	           : LibKernel::KERNEL_ERROR_EFAULT;
+	                            AprReadGatherRecordSize(file_offset));
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileScatter(void* command_buffer, uint64_t, uint64_t,
@@ -2047,9 +1996,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFileScatter(void* command_buffer, u
 
 	return AppendReadFileRecord(command_buffer_addr, 0x19, state.gather_scatter_file_id,
 	                            destination_addr, size, state.gather_scatter_file_offset,
-	                            READ_SCATTER_RECORD_SIZE)
-	           ? OK
-	           : LibKernel::KERNEL_ERROR_EFAULT;
+	                            READ_SCATTER_RECORD_SIZE);
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferReadFileGatherScatter(void* command_buffer, uint64_t,
@@ -2075,9 +2022,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFileGatherScatter(void* command_buf
 
 	return AppendReadFileRecord(command_buffer_addr, 0x1a, state.gather_scatter_file_id,
 	                            destination_addr, size, file_offset,
-	                            AprReadGatherScatterRecordSize(file_offset))
-	           ? OK
-	           : LibKernel::KERNEL_ERROR_EFAULT;
+	                            AprReadGatherScatterRecordSize(file_offset));
 }
 
 static int KYTY_SYSV_ABI AprCommandBufferResetGatherScatterState(void* command_buffer, uint64_t,

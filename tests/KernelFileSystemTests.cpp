@@ -1881,6 +1881,18 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             "bounded write preserves all sixty-four literal bits");
     }
   }
+  reset(1, 24);
+  auto *short_batch = buffers[0].header.data();
+  std::array<char, 3> read_output {};
+  const auto append_read = [&]() {
+    return read_file(short_batch, reinterpret_cast<uint64_t>(&short_batch[3]),
+                     reinterpret_cast<uint64_t>(&short_batch[4]), file_id,
+                     read_output.data(), read_output.size(), 0);
+  };
+  Check(append_read() == OK && offset(short_batch) == 20 &&
+            append_read() == Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+            offset(short_batch) == 20,
+        "APR reports a full batch so the caller can retry the pending read");
   reset(1, 768);
   std::array<std::array<char, 3>, 16> batch_output {};
   std::array<uint64_t, 16> batch_fences {};

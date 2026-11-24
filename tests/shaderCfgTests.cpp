@@ -1404,6 +1404,68 @@ void TestRebasedTextureMipViews() {
         "sparse view accepted a different mip-tail origin");
 }
 
+void TestMipViewPastMaxMip() {
+  const auto make = [](Prospero::BufferFormat format, Prospero::TileMode tile, uint32_t width,
+                       uint32_t height, uint32_t levels) {
+    ImageInfo info {};
+    info.data.address  = 0x100000000ull;
+    info.guest_format  = format;
+    info.type          = Prospero::ImageType::kColor2D;
+    info.extent        = {width, height, 1};
+    info.resources     = {levels, 1};
+    info.tile_mode     = tile;
+    info.samples       = 1;
+    return info;
+  };
+
+  {
+    // No Man's Sky compresses mip 1 through a T# that declares one level (256x256 -> 128x128).
+    auto     info = make(Prospero::BufferFormat::k32_32UInt, Prospero::TileMode::kStandard4KB, 256,
+                         256, 2);
+    uint32_t base = 1;
+    const bool ok = ResolveTextureMipView(info, 1, false, 1, base);
+    Check(ok && info.extent.width == 128 && info.extent.height == 128 &&
+              info.resources.levels == 1 && info.data.size == 0x20000 && base == 0,
+          "a view past MAX_MIP did not rebase to its own 128x128 chain");
+  }
+  {
+    // The same chain's mip 4 sits in the tail and is not an independent 16x16 image.
+    auto     info = make(Prospero::BufferFormat::k32_32UInt, Prospero::TileMode::kStandard4KB, 256,
+                         256, 5);
+    uint32_t base = 4;
+    Check(!ResolveTextureMipView(info, 1, false, 1, base),
+          "a tail mip past MAX_MIP was accepted as its own chain");
+  }
+
+  const Prospero::BufferFormat formats[] = {
+      Prospero::BufferFormat::k8_8_8_8UNorm,
+      Prospero::BufferFormat::k10_10_10_2UNorm,
+      Prospero::BufferFormat::k16_16_16_16Float,
+  };
+  for (const auto format : formats) {
+    for (const bool metadata : {false, true}) {
+      auto chain = make(format, Prospero::TileMode::kRenderTarget, 1920, 1080, 6);
+      chain.UpdateSize();
+      auto     info = make(format, Prospero::TileMode::kRenderTarget, 1920, 1080, 7);
+      uint32_t base = 6;
+      const bool ok = ResolveTextureMipView(info, 6, metadata, 1, base);
+      char       msg[320];
+      std::snprintf(msg, sizeof(msg),
+                    "1920x1080 render target mip 6 past MAX_MIP format=%u meta=%d ok=%d "
+                    "extent=%ux%u levels=%u base=%u size=%llu chain=%llu",
+                    static_cast<unsigned>(format), metadata ? 1 : 0, ok ? 1 : 0, info.extent.width,
+                    info.extent.height, info.resources.levels, base,
+                    static_cast<unsigned long long>(info.data.size),
+                    static_cast<unsigned long long>(chain.data.size));
+      // The standalone mip is not this chain's mip 6, so the view stays on the 1920x1080
+      // image and must not grow past the six stored levels (Astro Bot's PS logo).
+      Check(ok && info.extent.width == 1920 && info.extent.height == 1080 &&
+                info.data.size == chain.data.size,
+            msg);
+    }
+  }
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -13618,6 +13680,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestMipViewPastMaxMip();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();

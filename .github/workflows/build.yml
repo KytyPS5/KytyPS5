@@ -316,7 +316,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
-            clang \
+            clang-19 \
             glslang-tools \
             libasound2-dev \
             libdbus-1-dev \
@@ -355,7 +355,7 @@ jobs:
           git --version
           cmake --version
           ninja --version
-          clang++ --version
+          clang++-19 --version
           ld.lld --version
           glslangValidator --version
           echo "Qt6_DIR=$Qt6_DIR"
@@ -371,8 +371,8 @@ jobs:
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER=clang-19 \
+            -DCMAKE_CXX_COMPILER=clang++-19 \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log

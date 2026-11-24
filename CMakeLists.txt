@@ -336,9 +336,9 @@ if (KYTY_CLANG_CL)
 endif()
 
 # Keep the renderer's OpenAL headers and compile definitions private.
-set(spatial_renderer_src "${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp")
-list(REMOVE_ITEM kyty_emulator_src "${spatial_renderer_src}")
-add_library(kyty_spatial_audio STATIC "${spatial_renderer_src}")
+set(spatial_renderer_src "${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp" "${KYTY_SOURCE_DIR}/libs/audio3d.cpp")
+list(REMOVE_ITEM kyty_emulator_src ${spatial_renderer_src})
+add_library(kyty_spatial_audio STATIC ${spatial_renderer_src})
 target_link_libraries(kyty_spatial_audio PRIVATE common OpenAL::OpenAL)
 
 set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static kyty_spatial_audio imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
@@ -515,7 +515,7 @@ target_link_libraries(audio_out2_port_tests common fmt::fmt kyty_spatial_audio)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
-target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
+target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static kyty_spatial_audio)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
 
 add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
@@ -535,7 +535,7 @@ target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
-target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus kyty_spatial_audio)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL

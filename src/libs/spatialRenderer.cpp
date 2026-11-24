@@ -7,13 +7,24 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <numbers>
+#include <utility>
 
 namespace Libs::Audio {
 
 bool SpatialPosition::IsFinite() const {
 	return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+bool SpatialAttributes::SetSpread(const void* value, size_t size) {
+	float angle;
+	if (!value || size != sizeof(angle)) return false;
+	std::memcpy(&angle, value, sizeof(angle));
+	if (!std::isfinite(angle) || angle < 0) return false;
+	spread = std::min(angle, 2 * std::numbers::pi_v<float>);
+	return true;
 }
 
 bool SpatialAttributes::ValidAmbisonics(uint32_t channel) {
@@ -28,10 +39,10 @@ struct SpatialRenderer::Impl {
 	ALCdevice*                        device  = nullptr;
 	ALCcontext*                       context = nullptr;
 	uint32_t                          frames = 0, channels = 0;
-	std::vector<Voice>                voices;
+	std::vector<Voice>                voices, retiring;
 	std::array<Voice, 2>              bformat;
 	std::array<std::vector<float>, 2> beds;
-	std::vector<float>                mono;
+	std::vector<float>                mono, silence;
 	bool                              draining = false;
 
 	void Release(Voice& voice) {
@@ -42,7 +53,15 @@ struct SpatialRenderer::Impl {
 
 	void Update(Voice& voice, std::span<const float> samples, int order, bool acn,
 	            SpatialAttributes attributes = {}) {
-		if (voice.source && (samples.empty() || order != voice.order)) Release(voice);
+		if (voice.source && (samples.empty() || order != voice.order)) {
+			// OpenAL fades a stopped voice. Give it silence instead of another turn
+			// of the last grain, while letting its convolution history decay.
+			silence.resize(size_t(frames) * (voice.order + 1) * (voice.order + 1));
+			alBufferSubDataDirectSOFT(context, voice.buffer,
+			                          voice.order ? AL_FORMAT_BFORMAT3D_FLOAT32 : AL_FORMAT_MONO_FLOAT32,
+			                          silence.data(), 0, static_cast<ALsizei>(silence.size() * sizeof(float)));
+			retiring.push_back(std::exchange(voice, {}));
+		}
 		if (samples.empty()) return;
 		const auto format = order ? AL_FORMAT_BFORMAT3D_FLOAT32 : AL_FORMAT_MONO_FLOAT32;
 		const auto bytes  = static_cast<ALsizei>(samples.size_bytes());
@@ -144,7 +163,7 @@ std::shared_ptr<SpatialRenderer> SpatialRenderer::Open(uint32_t frames, uint32_t
 	return renderer->m_handle ? renderer : nullptr;
 }
 
-bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector<float>& output) {
+bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector<float>& output, bool include_silence) {
 	std::array<int, 2> orders {};
 	bool               fed = false;
 	for (const auto& obj: objects) {
@@ -158,7 +177,7 @@ bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector
 		}
 	}
 	output.clear();
-	if (!fed && !m->draining) return true;
+	if (!include_silence && !fed && !m->draining) return true;
 	for (size_t i = 0; i < orders.size(); ++i) {
 		const auto n = orders[i] + 1;
 		m->beds[i].assign(orders[i] ? size_t(m->frames) * n * n : 0, 0);
@@ -167,7 +186,7 @@ bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector
 		const auto& obj   = objects[i];
 		const auto  ch    = obj.attributes.ambisonics;
 		const bool  point = ch == UINT32_MAX && !obj.pcm.empty();
-		if (!point && m->voices[i].source) m->Release(m->voices[i]);
+		if (!point) m->Update(m->voices[i], {}, 0, false);
 		if (obj.pcm.empty()) continue;
 		const bool acn = ch >= 64;
 		if (point) m->mono.assign(m->frames, 0);
@@ -187,8 +206,10 @@ bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector
 	}
 	output.resize(size_t(m->frames) * m->channels);
 	alcRenderSamplesSOFT(m->device, output.data(), m->frames);
+	for (auto& voice: m->retiring) m->Release(voice);
+	m->retiring.clear();
 	m->draining = fed || std::any_of(output.begin(), output.end(), [](float s) { return s != 0; });
-	if (!m->draining) output.clear();
+	if (!include_silence && !m->draining) output.clear();
 	return alGetErrorDirect(m->context) == AL_NO_ERROR && alcGetError(m->device) == ALC_NO_ERROR;
 }
 } // namespace Libs::Audio

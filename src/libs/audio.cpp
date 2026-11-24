@@ -1,3 +1,4 @@
+#include "libs/audio3d.h"
 #include "libs/audio.h"
 
 #include "common/assert.h"
@@ -212,6 +213,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Audio3d::Shutdown();
 	delete g_audio;
 	g_audio = nullptr;
 }

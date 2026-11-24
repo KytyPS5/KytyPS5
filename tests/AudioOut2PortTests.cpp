@@ -998,9 +998,10 @@ void TestSystemState() {
 	      "null system state was accepted");
 }
 
-void SetAudioOutput(Config::AudioOutput output) {
+void SetAudioOutput(Config::AudioOutput output, bool spatial = false) {
 	Config::ConfigOptions options;
 	options.audio_output = output;
+	options.audio_3d_enabled = spatial;
 	Config::Load(options);
 }
 
@@ -1032,6 +1033,46 @@ void TestSpatialLayouts() {
 			Check(LastSample(back, channels, 4) > LastSample(back, channels, 0),
 			      "rear-left source failed to reach surround speakers");
 		}
+		AudioOut2::AudioOut2ContextDestroy(ctx);
+	}
+}
+
+void TestHeadphoneRendering() {
+	for (const bool spatial: {false, true}) {
+		SetAudioOutput(Config::AudioOutput::Headphones, spatial);
+		const auto ctx = CreateContext(1, 1);
+		auto param = MakeParam(0x100);
+		param.port_type = 0x100;
+		const auto port = CreatePort(ctx, param);
+		PortState state {};
+		SpeakerInfo info {};
+		Check(AudioOut2::AudioOut2PortGetState(port, AsState(&state)) == OK &&
+		      state.flags == unsigned(spatial) && state.num_channels == (spatial ? 8 : 2),
+		      "wrong 3D headphone port state");
+		Check(AudioOut2::AudioOut2GetSpeakerInfo(AsInfo(&info), 1) == OK && info.type == 3 &&
+		      info.flags == unsigned(spatial) && info.available_bits == (spatial ? 0xffu : 3u) &&
+		      info.angles[0][0] == (spatial ? 30 : 90), "wrong headphone speaker layout");
+		uint32_t mask;
+		for (const bool modern: {false, true}) {
+			g_sdk_version = modern ? 0x09000000 : 0x08000000;
+			Check(AudioOut2::AudioOut2UserGetSupportedAttributes(g_user_handle, nullptr, &mask) == OK &&
+			      mask == ((spatial ? 0x3f7fu : 0xe53u) & (modern ? ~0u : 0x7ffu)), "wrong 3D attribute mask");
+		}
+		std::array<float, 512> pcm {};
+		pcm[64] = 0.5f;
+		SetAttribute(port, 3, std::array{-1.f, 0.f, 0.f});
+		SetPcm(port, pcm.data());
+		const auto bytes = PushPcm(ctx, 512 * 2 * sizeof(float)).at(0);
+		std::array<float, 1024> samples;
+		std::memcpy(samples.data(), bytes.data(), bytes.size());
+		std::array<float, 2> energy {};
+		std::array<int, 2> taps {};
+		for (size_t i = 0; i < samples.size(); ++i) {
+			energy[i % 2] += samples[i] * samples[i];
+			taps[i % 2] += std::abs(samples[i]) > 1e-5f;
+		}
+		Check(taps[0] > 8 && taps[1] > 8 && energy[0] > energy[1] && energy[1] > 0,
+		      "headphones did not convolve the impulse for both ears");
 		AudioOut2::AudioOut2ContextDestroy(ctx);
 	}
 }
@@ -1229,6 +1270,7 @@ int main() {
 	TestObjectBusRouting();
 	TestBlockedPushOnlyHoldsItsContext();
 	TestSpatialLayouts();
+	TestHeadphoneRendering();
 	TestAudioOutputs();
 	TestSystemState();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");

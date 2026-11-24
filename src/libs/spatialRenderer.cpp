@@ -129,8 +129,8 @@ std::shared_ptr<SpatialRenderer> SpatialRenderer::Open(uint32_t frames, uint32_t
 	                        static_cast<int>(max_objects),
 	                        ALC_STEREO_SOURCES,
 	                        2,
-	                        ALC_HRTF_SOFT,
-	                        ALC_FALSE,
+	                        ALC_OUTPUT_MODE_SOFT,
+	                        Config::GetAudioOutput() == Config::AudioOutput::Headphones ? ALC_STEREO_HRTF_SOFT : ALC_STEREO_BASIC_SOFT,
 	                        ALC_OUTPUT_LIMITER_SOFT,
 	                        ALC_FALSE,
 	                        0};

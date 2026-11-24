@@ -36,6 +36,7 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --audio-3d                          Enable 3D audio support for games.\n");
 	::printf("  --audio-output <value>              Report TV, AVReceiver (7.1), SoundBar (5.1),\n"
 	         "                                      or Headphones to games. Default: TV.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
@@ -194,6 +195,7 @@ struct Flag {
 static constexpr Flag FLAGS[] = {
     {"--rd", &ConfigOptions::renderdoc_enabled},
     {"--fullscreen", &ConfigOptions::fullscreen_enabled},
+    {"--audio-3d", &ConfigOptions::audio_3d_enabled},
     {"--hdr", &ConfigOptions::hdr_enabled},
     {"--hide-cursor", &ConfigOptions::hide_cursor_enabled},
     {"--stretch", &ConfigOptions::stretch_enabled},

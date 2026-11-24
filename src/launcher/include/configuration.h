@@ -119,6 +119,7 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	AudioOutput            audio_output                = AudioOutput::TV;
+	bool                   audio_3d_enabled            = false;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -172,6 +173,7 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		audio_output                = other.audio_output;
+		audio_3d_enabled            = other.audio_3d_enabled;
 		present_mode                = other.present_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;

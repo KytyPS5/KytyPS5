@@ -882,7 +882,22 @@ public:
 	}
 	int Start(uint64_t ms = 0) {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
-		return StartImpl(ms);
+		const auto       rc = StartImpl(ms);
+		if (rc == 0 && events != nullptr) {
+			events->Post(AVPLAYER_EVENT_STATE_PLAY);
+		}
+		return rc;
+	}
+	int Add(bool start) {
+		std::scoped_lock lifecycle_lock(lifecycle_mutex);
+		const auto       rc = start ? StartImpl(0) : 0;
+		if (events != nullptr) {
+			const std::array<EventQueue::Event, 2> added {
+			    {{AVPLAYER_EVENT_STATE_READY, std::nullopt},
+			     {AVPLAYER_EVENT_STATE_PLAY, std::nullopt}}};
+			events->Post(std::span(added).first(start && rc == 0 ? 2 : 1));
+		}
+		return rc;
 	}
 	int StartImpl(uint64_t ms, bool paused_after_start = false, bool show_seek_frame = false) {
 		{
@@ -963,22 +978,32 @@ public:
 	}
 	int Pause() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
-		std::lock_guard  lock(mutex);
-		if (state != State::Playing) {
-			return AVPLAYER_ERROR_OPERATION_FAILED;
+		{
+			std::lock_guard lock(mutex);
+			if (state != State::Playing) {
+				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
+			paused     = true;
+			pause_time = std::chrono::steady_clock::now();
 		}
-		paused     = true;
-		pause_time = std::chrono::steady_clock::now();
+		if (events != nullptr) {
+			events->Post(AVPLAYER_EVENT_STATE_PAUSE);
+		}
 		return 0;
 	}
 	void Resume() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
-		std::lock_guard  lock(mutex);
-		if (paused) {
-			paused_extra += std::chrono::steady_clock::now() - pause_time;
+		{
+			std::lock_guard lock(mutex);
+			if (paused) {
+				paused_extra += std::chrono::steady_clock::now() - pause_time;
+			}
+			paused                   = false;
+			seek_video_frame_pending = false;
 		}
-		paused                   = false;
-		seek_video_frame_pending = false;
+		if (events != nullptr) {
+			events->Post(AVPLAYER_EVENT_STATE_PLAY);
+		}
 	}
 	void SetLoop(bool v) { loop = v; }
 	void SetSync(uint32_t v) {
@@ -1846,13 +1871,8 @@ static int add_source(AvPlayerInternal* h, const std::string& filename, AvPlayer
 		return rc;
 	}
 	s->SetSync(h->sync_mode);
-	h->source     = std::move(s);
-	const auto rc = h->auto_start ? h->source->Start() : 0;
-
-	const std::array<EventQueue::Event, 2> events {
-	    {{AVPLAYER_EVENT_STATE_READY, std::nullopt}, {AVPLAYER_EVENT_STATE_PLAY, std::nullopt}}};
-	h->events->Post(std::span(events).first(h->auto_start && rc == 0 ? 2 : 1));
-	return rc;
+	h->source = std::move(s);
+	return h->source->Add(h->auto_start);
 }
 static void log_init_common(const AvPlayerMemAllocator& mem, const AvPlayerFileReplacement& file,
                             const AvPlayerEventReplacement& event, AvPlayerDebuglevels debug_level,
@@ -1995,11 +2015,7 @@ int KYTY_SYSV_ABI AvPlayerStart(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
-	auto rc = h->source->Start();
-	if (rc == 0) {
-		h->events->Post(AVPLAYER_EVENT_STATE_PLAY);
-	}
-	return rc;
+	return h->source->Start();
 }
 int KYTY_SYSV_ABI AvPlayerStartEx(AvPlayerInternal* h, const void* start_info_ex) {
 	PRINT_NAME();
@@ -2010,11 +2026,7 @@ int KYTY_SYSV_ABI AvPlayerStartEx(AvPlayerInternal* h, const void* start_info_ex
 	    start_info_ex == nullptr
 	        ? 0
 	        : static_cast<const AvPlayerStartInfoEx*>(start_info_ex)->start_time_milliseconds;
-	auto rc = h->source->Start(ms);
-	if (rc == 0) {
-		h->events->Post(AVPLAYER_EVENT_STATE_PLAY);
-	}
-	return rc;
+	return h->source->Start(ms);
 }
 int KYTY_SYSV_ABI AvPlayerStop(AvPlayerInternal* h) {
 	PRINT_NAME();
@@ -2028,11 +2040,7 @@ int KYTY_SYSV_ABI AvPlayerPause(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
-	auto rc = h->source->Pause();
-	if (rc == 0) {
-		h->events->Post(AVPLAYER_EVENT_STATE_PAUSE);
-	}
-	return rc;
+	return h->source->Pause();
 }
 int KYTY_SYSV_ABI AvPlayerResume(AvPlayerInternal* h) {
 	PRINT_NAME();
@@ -2040,7 +2048,6 @@ int KYTY_SYSV_ABI AvPlayerResume(AvPlayerInternal* h) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
 	h->source->Resume();
-	h->events->Post(AVPLAYER_EVENT_STATE_PLAY);
 	return 0;
 }
 int KYTY_SYSV_ABI AvPlayerSetLooping(AvPlayerInternal* h, Bool loop) {

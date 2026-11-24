@@ -571,7 +571,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto          view_base    = static_cast<uint32_t>(base_level);
 	auto pixel_format = surface_format.vk_format;
 	if (resource.depth_compare) {
-		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
+		if (const auto* depth_format = FindGuestDepthFormatPolicy(format);
+		    depth_format && depth_format->depth_attachment_format != vk::Format::eUndefined) {
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}

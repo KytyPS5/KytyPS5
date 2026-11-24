@@ -18400,6 +18400,85 @@ public:
           "valid PS5 texture-compatibility policy changed logical depth image "
           "identity or discovery side effects");
 
+      vk::MemoryBarrier2 readback_host_barrier{};
+      readback_host_barrier.sType = vk::StructureType::eMemoryBarrier2;
+      readback_host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+      readback_host_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      readback_host_barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      readback_host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      vk::DependencyInfo readback_dependency{};
+      readback_dependency.sType = vk::StructureType::eDependencyInfo;
+      readback_dependency.memoryBarrierCount = 1;
+      readback_dependency.pMemoryBarriers = &readback_host_barrier;
+
+      // PPSA14002 clears S8 while the Z test is enabled with no depth plane.
+      {
+        auto stencil_target = phased_depth_target;
+        stencil_target.z_info.format = Prospero::DepthFormat::kInvalid;
+        stencil_target.z_read_base_addr = stencil_target.z_write_base_addr = 0;
+        stencil_target.stencil_read_base_addr = stencil_target.stencil_write_base_addr = base + 0xf60000;
+        stencil_target.htile_data_base_addr = base + 0xf70000;
+        stencil_target.size = {3, 3, true};
+        registers.SetDepthControl({.stencil_enable = true, .z_enable = true});
+        registers.SetRenderControl({.stencil_clear_enable = true});
+        registers.SetStencilClearValue(0x5a);
+        const auto acquire = [&](const HW::DepthRenderTarget& target, RenderDepthInfo& depth) {
+          registers.SetDepthRenderTarget(target);
+          RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+          return RenderExecutorTestAccess::AcquireRenderTargets(executor, scheduler.Current(),
+                                                                &no_disjoint_color, 0, depth);
+        };
+        RenderDepthInfo stencil{};
+        auto rendering = acquire(stencil_target, stencil);
+        Require(name, "HTile stencil-only target",
+                stencil.stencil_test_enable && !stencil.depth_test_enable &&
+                    stencil.desc.info.metadata.stencil_compressed &&
+                    stencil.desc.info.data == stencil.desc.info.stencil &&
+                    !rendering.depth_stencil_attachment.has_depth &&
+                    rendering.depth_stencil_attachment.stencil_clear,
+                "a stencil clear required an absent depth plane or lost its HTile state");
+        scheduler.Current().BeginRendering(rendering);
+        scheduler.Current().EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+
+        auto sampled_stencil = storage_descriptor;
+        sampled_stencil.dwords[0] = static_cast<uint32_t>(stencil_target.stencil_read_base_addr >> 8u);
+        sampled_stencil.dwords[1] = (static_cast<uint32_t>(stencil_format) << 20u) | (3u << 30u);
+        sampled_stencil.dwords[2] = 3u << 14u;
+        sampled_stencil.dwords[3] = DstSel(4, 0, 0, 1) |
+            (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+        auto sampled = RenderExecutorTestAccess::ResolveTexture(executor, sampled_resource, sampled_stencil);
+        Require(name, "sampled standalone stencil",
+                sampled.image_id == stencil.image_id && texture_cache.FindTexture(sampled.image_id, sampled.desc),
+                "sampling a stencil target created a separate color image");
+
+        auto combined_target = stencil_target;
+        combined_target.z_info.format = Prospero::DepthFormat::kZ32F;
+        combined_target.z_read_base_addr = combined_target.z_write_base_addr = base + 0xf90000;
+        registers.SetRenderControl({});
+        RenderDepthInfo combined{};
+        (void)acquire(combined_target, combined);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        rendering = acquire(stencil_target, stencil);
+        Require(name, "combined target's stencil rebound alone",
+                stencil.image_id == combined.image_id && !rendering.depth_stencil_attachment.has_depth &&
+                    rendering.depth_stencil_attachment.has_stencil && !rendering.depth_stencil_attachment.stencil_clear,
+                "the stencil view lost its combined owner or exposed its depth aspect");
+        auto readback = CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array copies{vk::BufferImageCopy{0, 0, 0,
+            {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {4, 1, 1}}};
+        texture_cache.GetImage(stencil.image_id).Download(copies, readback.buffer, 0, 4);
+        scheduler.Current().Handle().pipelineBarrier2(readback_dependency);
+        scheduler.Finish();
+        Require(name, "preserved standalone stencil writes", ReadBuffer(name, readback, 1)[0] == 0x5a5a5a5au,
+                "stencil rebinding replaced GPU-written texels with stale guest memory");
+        DestroyBuffer(&readback);
+        RenderExecutorTestAccess::ResetBindings(executor);
+        registers.SetDepthControl(phased_depth_control);
+        registers.SetRenderControl(phased_render_control);
+      }
+
       // A single-level target has no mip tail; its selected mip, however small, is drawn at its
       // address with that mip's extent.
       HW::DepthRenderTarget mip_target{};
@@ -18718,17 +18797,7 @@ public:
         texture_cache.GetImage(depth_only.image_id).Download(
             std::span{&copy, 1}, bounds_readback.buffer, 0, bounds_readback.size);
       }
-      vk::MemoryBarrier2 bounds_host_barrier{};
-      bounds_host_barrier.sType = vk::StructureType::eMemoryBarrier2;
-      bounds_host_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-      bounds_host_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-      bounds_host_barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
-      bounds_host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
-      vk::DependencyInfo bounds_dependency{};
-      bounds_dependency.sType = vk::StructureType::eDependencyInfo;
-      bounds_dependency.memoryBarrierCount = 1;
-      bounds_dependency.pMemoryBarriers = &bounds_host_barrier;
-      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Current().Handle().pipelineBarrier2(readback_dependency);
       scheduler.Finish();
       const auto bounds_result = ReadBuffer(name, bounds_readback, depth_texels * 2);
       Require(name, "deferred HTile clear occurs once",
@@ -18815,7 +18884,7 @@ public:
         texture_cache.GetImage(high_slice.image_id).Download(
             std::span{&copy, 1}, high_slice_readback.buffer, 0, high_slice_readback.size);
       }
-      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Current().Handle().pipelineBarrier2(readback_dependency);
       scheduler.Finish();
       Require(name, "high HTile slice contents and neighbor",
               ReadBuffer(name, high_slice_readback, 4) == std::vector<uint32_t>{
@@ -18969,7 +19038,7 @@ public:
         texture_cache.GetImage(copy_destination.image_id)
             .Download(copies, copy_readback.buffer, 0, copy_readback.size);
       }
-      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Current().Handle().pipelineBarrier2(readback_dependency);
       scheduler.Finish();
       const auto copy_result = ReadBuffer(
           name, copy_readback,
@@ -54347,6 +54416,7 @@ void CheckPs5DepthRegisterDecoding() {
 void CheckDepthAttachmentWrites() {
   RenderDepthInfo target{};
   target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+  target.desc.view_info.aspect = ImageAspectMask(target.desc.view_info.format);
   Require("DepthAttachmentWrites", "disabled depth test",
           !target.AttachmentWriteAspects(),
           "disabled depth testing claimed a depth write");
@@ -54397,6 +54467,7 @@ void CheckDepthAttachmentWrites() {
           "stencil attachment clear did not claim stencil");
 
   target.desc.view_info.format = vk::Format::eD32Sfloat;
+  target.desc.view_info.aspect = ImageAspectMask(target.desc.view_info.format);
   Require("DepthAttachmentWrites", "missing stencil aspect",
           !target.AttachmentWriteAspects(),
           "depth-only format claimed a stencil write");
@@ -54406,6 +54477,7 @@ void CheckDepthAttachmentWrites() {
 void CheckDepthFeedbackAspects() {
   RenderDepthInfo target{};
   target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+  target.desc.view_info.aspect = ImageAspectMask(target.desc.view_info.format);
   target.desc.view_info.base_level = 1;
   target.desc.view_info.level_count = 2;
   target.desc.view_info.base_layer = 3;
@@ -54518,6 +54590,7 @@ void CheckDynamicRenderingState() {
 
   RenderDepthInfo attachment{};
   attachment.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+  attachment.desc.view_info.aspect = ImageAspectMask(attachment.desc.view_info.format);
   Require("DynamicRenderingState", "read-only depth/stencil layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
@@ -54559,6 +54632,7 @@ void CheckDepthTargetFootprints() {
     vk::Format expected;
   };
   constexpr AttachmentFormatCase attachment_cases[] = {
+      {"S8", Prospero::DepthFormat::kInvalid, true, vk::Format::eS8Uint},
       {"Z16", Prospero::DepthFormat::kZ16, false, vk::Format::eD16Unorm},
       {"Z16S8", Prospero::DepthFormat::kZ16, true, vk::Format::eD16UnormS8Uint},
       {"Z32", Prospero::DepthFormat::kZ32F, false, vk::Format::eD32Sfloat},
@@ -54577,6 +54651,12 @@ void CheckDepthTargetFootprints() {
           FindDepthFormatPolicy(static_cast<Prospero::DepthFormat>(2u)) ==
               nullptr,
           "PS5 depth/stencil attachment mapping changed");
+  Require("DepthTargetFootprints", "2560x1440 S8 with HTile",
+          TileGetDepthSize(2560, 1440, Prospero::DepthFormat::kInvalid,
+                           Prospero::StencilFormat::k8UInt, true, stencil, htile, depth) &&
+              depth.size == 0 && depth.align == 0 && stencil.size == 0x3c0000 &&
+              stencil.align == 65536 && htile.size == 0x48000 && htile.align == 32768,
+          "the captured stencil-only surface has the wrong plane footprints");
   Require("DepthTargetFootprints", "1920x1080 Z16S8 without HTile",
           TileGetDepthSize(1920, 1080, Prospero::DepthFormat::kZ16,
                            Prospero::StencilFormat::k8UInt, false, stencil,
@@ -54659,7 +54739,7 @@ void CheckDepthTargetFootprints() {
   for (const auto &test : transfer_cases) {
     Require("DepthTargetFootprints", test.name,
             DepthAspectTransferFormat(test.attachment) == test.transfer &&
-                DepthAspectTransferBytes(test.attachment) == test.bytes,
+                DepthStencilTransferBytes(test.attachment) == test.bytes,
             "combined depth transfer-plane layout changed");
   }
   struct PromotionCase {

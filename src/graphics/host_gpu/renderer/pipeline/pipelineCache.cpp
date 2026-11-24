@@ -925,7 +925,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const bool with_depth =
 	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
 	if (with_depth) {
-		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
+		const auto aspects       = depth.desc.view_info.aspect;
 		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;

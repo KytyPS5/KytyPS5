@@ -71,6 +71,28 @@ struct ImageLinearLayout {
 	uint64_t slice_stride = 0;
 };
 
+[[nodiscard]] inline constexpr vk::ImageAspectFlags ImageAspectMask(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eX8D24UnormPack32:
+		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
+		case vk::Format::eS8Uint: return vk::ImageAspectFlagBits::eStencil;
+		case vk::Format::eD16UnormS8Uint:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32SfloatS8Uint:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		default: return vk::ImageAspectFlagBits::eColor;
+	}
+}
+
+// The primary guest range of a combined image contains depth. Stencil has its own range.
+[[nodiscard]] inline constexpr vk::ImageAspectFlagBits DataAspect(vk::Format format) noexcept {
+	const auto aspects = ImageAspectMask(format);
+	if (aspects & vk::ImageAspectFlagBits::eDepth) return vk::ImageAspectFlagBits::eDepth;
+	return aspects == vk::ImageAspectFlagBits::eStencil ? vk::ImageAspectFlagBits::eStencil
+	                                                    : vk::ImageAspectFlagBits::eColor;
+}
+
 struct ImageInfo {
 	GuestRange                   data;
 	GuestRange                   stencil;
@@ -111,6 +133,9 @@ struct ImageInfo {
 		}
 	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
+	[[nodiscard]] constexpr bool HasSeparateStencil() const noexcept {
+		return HasStencil() && pixel_format != vk::Format::eS8Uint;
+	}
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
 	}
@@ -160,7 +185,12 @@ struct DepthFormatPolicy {
 	std::array<vk::Format, 3> stencil_attachment_formats;
 };
 
-inline constexpr std::array<DepthFormatPolicy, 2> DEPTH_FORMAT_POLICIES {{
+inline constexpr std::array<DepthFormatPolicy, 3> DEPTH_FORMAT_POLICIES {{
+    {Prospero::DepthFormat::kInvalid,
+     Prospero::BufferFormat::k8UInt,
+     1,
+     vk::Format::eUndefined,
+     {vk::Format::eS8Uint, vk::Format::eUndefined, vk::Format::eUndefined}},
     {Prospero::DepthFormat::kZ16,
      Prospero::BufferFormat::k16UNorm,
      2,
@@ -225,10 +255,11 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 }
 
 inline bool ImageInfo::IsDepth() const noexcept {
-	return DepthAspectTransferFormat(pixel_format) != vk::Format::eUndefined;
+	return ImageAspectMask(pixel_format) != vk::ImageAspectFlagBits::eColor;
 }
 
-[[nodiscard]] inline constexpr uint32_t DepthAspectTransferBytes(vk::Format format) noexcept {
+[[nodiscard]] inline constexpr uint32_t DepthStencilTransferBytes(vk::Format format) noexcept {
+	if (format == vk::Format::eS8Uint) return 1;
 	switch (DepthAspectTransferFormat(format)) {
 		case vk::Format::eD16Unorm: return 2;
 		case vk::Format::eX8D24UnormPack32:
@@ -239,7 +270,8 @@ inline bool ImageInfo::IsDepth() const noexcept {
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
 	const auto* policy = FindGuestDepthFormatPolicy(info.guest_format);
-	return policy != nullptr && info.bytes_per_block == policy->bytes_per_element &&
+	return policy != nullptr && info.pixel_format != vk::Format::eUndefined &&
+	       info.bytes_per_block == policy->bytes_per_element &&
 	       (info.HasStencil() ? IsStencilAttachmentFormat(*policy, info.pixel_format)
 	                          : info.pixel_format == policy->depth_attachment_format);
 }
@@ -248,7 +280,7 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	if (!IsSupportedDepthTargetFormat(info)) {
 		return false;
 	}
-	const auto transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
+	const auto transfer_bytes = DepthStencilTransferBytes(info.pixel_format);
 	return transfer_bytes == info.bytes_per_block ||
 	       (info.bytes_per_block == sizeof(uint16_t) && transfer_bytes == sizeof(uint32_t));
 }

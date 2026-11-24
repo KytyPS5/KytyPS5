@@ -479,11 +479,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	if (depth.image_id) {
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
+		const auto  aspects    = depth.desc.view_info.aspect;
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
 		depth.load_clear_aspects = {};
-		if (depth.depth_clear_enable || meta_clear)
+		if (depth.depth_clear_enable || (meta_clear && (aspects & vk::ImageAspectFlagBits::eDepth)))
 			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
 		// Apply pending clears to compressed stencil as well as depth.
 		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
@@ -533,7 +534,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.width               = std::min(state.width, depth.desc.info.extent.width);
 		state.height              = std::min(state.height, depth.desc.info.extent.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
-		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
 		attachment.image_layout   = layout;

@@ -10,8 +10,7 @@ namespace Libs::Graphics {
 
 namespace ImageViewOps {
 
-[[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
-[[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
+[[nodiscard]] bool FormatsCompatible(vk::Format base, vk::Format view) noexcept;
 
 [[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {
 	switch (format) {
@@ -27,8 +26,9 @@ namespace ImageViewOps {
 
 [[nodiscard]] inline bool IsSupportedSampledDepthFormat(vk::Format image_format,
                                                         vk::Format view_format) noexcept {
-	return DepthAspectTransferFormat(image_format) != vk::Format::eUndefined &&
-	       ImageViewOps::IsFormatDepthCompatible(view_format);
+	return (image_format == vk::Format::eS8Uint && view_format == vk::Format::eR8Uint) ||
+	       (DepthAspectTransferFormat(image_format) != vk::Format::eUndefined &&
+	        ImageViewOps::IsFormatDepthCompatible(view_format));
 }
 
 [[noreturn]] inline void UnsupportedColorView(const char* usage, vk::Format image_format,

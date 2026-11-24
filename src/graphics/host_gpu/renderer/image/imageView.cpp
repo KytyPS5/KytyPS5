@@ -37,12 +37,7 @@ namespace {
 }
 
 [[nodiscard]] bool IsValidAspect(const VulkanImage& image, vk::ImageAspectFlags aspect) {
-	const auto depth_format = DepthAspectTransferFormat(image.format);
-	if (depth_format == vk::Format::eUndefined) {
-		return aspect == vk::ImageAspectFlagBits::eColor;
-	}
-	const auto supported = ImageViewOps::DepthAspectMask(image.format);
-	return static_cast<bool>(aspect) && !(aspect & ~supported);
+	return static_cast<bool>(aspect) && !(aspect & ~ImageAspectMask(image.format));
 }
 
 } // namespace
@@ -251,18 +246,6 @@ enum CompatibilityClass : uint32_t {
 
 } // namespace
 
-vk::ImageAspectFlags DepthAspectMask(vk::Format format) {
-	switch (format) {
-		case vk::Format::eD16Unorm:
-		case vk::Format::eD32Sfloat: return vk::ImageAspectFlagBits::eDepth;
-		case vk::Format::eD16UnormS8Uint:
-		case vk::Format::eD24UnormS8Uint:
-		case vk::Format::eD32SfloatS8Uint:
-			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-		default: EXIT("unsupported depth/stencil image format: %d\n", static_cast<int>(format));
-	}
-}
-
 bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 	if (base == view) {
 		return true;
@@ -278,7 +261,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
-	const auto  image_aspect = FullAspectMask(image.format);
+	const auto  image_aspect = ImageAspectMask(image.format);
 	if (image_aspect & vk::ImageAspectFlagBits::eDepth &&
 	    ImageViewOps::IsFormatDepthCompatible(normalized.format)) {
 		normalized.format = image.format;

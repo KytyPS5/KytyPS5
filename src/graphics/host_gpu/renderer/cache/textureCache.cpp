@@ -452,8 +452,9 @@ void TextureCache::RefreshCopySource(ImageId id) {
 
 bool TextureCache::CopyD16(Image& destination, Image& source) {
 	// Converts guest D16 between a four-byte host depth aspect and two-byte color or D16 depth.
-	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
-	if (source_wide == (DepthAspectTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
+	const bool source_wide = DepthStencilTransferBytes(source.backing.format) == sizeof(uint32_t);
+	if (source_wide ==
+	    (DepthStencilTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
 		return false;
 	}
 	auto& depth  = source_wide ? source : destination;
@@ -615,7 +616,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	// Depth bytes sampled through a color format no depth view provides (16_UINT, 8_8_UNORM)
 	// need a color copy of the whole single-sample depth layout.
 	const bool raw_depth_texture =
-	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasStencil() &&
+	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasSeparateStencil() &&
 	    !requested.HasMetadata() && cached.backing.samples == 1 && requested.samples == 1 &&
 	    requested.pitch == cached.info.pitch &&
 	    (requested.resources == cached.info.resources || retain_cached_layout) &&
@@ -942,7 +943,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
 		}
 	}
-	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
+	const auto transfer_bytes = DepthStencilTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
 		const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 		EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
@@ -1230,6 +1231,20 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	TouchImage(record);
 	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
 		m_resolve_cache.Invalidate();
+		// A standalone stencil target can become the stencil plane of this combined target.
+		// Preserve its last GPU writes before the record begins referring to its new owner.
+		if (!record.depth_id && record.backing.format == vk::Format::eS8Uint &&
+		    record.IsGpuModified()) {
+			RefreshImage(association);
+			EXIT_NOT_IMPLEMENTED(record.backing.samples != 1 || depth.backing.samples != 1);
+			const auto linear = m_tiler.GetScratchBuffer(record.info.LinearSize());
+			auto       copies = record.info.BufferCopies(linear.offset);
+			record.Download(copies, linear.buffer, linear.offset, linear.size);
+			for (auto& copy: copies) {
+				copy.imageSubresource.baseArrayLayer += depth.stencil_subresources.base_layer;
+			}
+			depth.Upload(copies, linear.buffer, linear.offset, linear.size);
+		}
 		ImageInfo plane {};
 		plane.data         = stencil;
 		plane.pixel_format = vk::Format::eS8Uint;
@@ -1357,6 +1372,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
+		if (desc.type == BindingType::DepthTarget && image.depth_id) {
+			// The combined attachment already owns this stencil plane.
+			desc.view_info.base_layer += image.stencil_subresources.base_layer;
+			result                = image.depth_id;
+			desc.view_info.format = m_slot_images[result].backing.format;
+		}
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
 	}
@@ -1429,8 +1450,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
 	RefreshImage(id);
-	if (image.info.HasStencil() &&
-	    desc.info.data.address >= image.info.stencil.address &&
+	if (image.info.HasSeparateStencil() && desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
 		if (const auto stencil_id = FindStencilPlane(image, image.info.stencil)) {
 			RefreshImage(stencil_id);
@@ -1471,7 +1491,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	if (desc.info.HasStencil()) {
+	if (desc.info.HasSeparateStencil()) {
 		const auto layers = image.info.resources.layers;
 		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
 		        desc.info.data.address < image.info.data.address);
@@ -1483,7 +1503,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             static_cast<uint32_t>(offset / slice_size),
 		                             desc.info.resources.layers};
 	}
-	image.info.stencil = desc.info.stencil;
+	if (desc.info.pixel_format == image.info.pixel_format) {
+		image.info.stencil = desc.info.stencil;
+	}
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
@@ -1497,8 +1519,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
-	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+	if (image.info.HasSeparateStencil()) {
+		if (desc.info.HasSeparateStencil()) {
+			RefreshImage(AssociateStencil(id, desc.info.stencil));
+		} else {
+			const auto plane = FindStencilPlane(image, desc.info.stencil);
+			if (plane) RefreshImage(plane);
+		}
 	}
 	return image.FindView(desc.view_info);
 }
@@ -1511,7 +1538,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
-	if (image.info.HasStencil()) {
+	if (image.info.HasSeparateStencil()) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
@@ -1556,8 +1583,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			}
 		} else if (!owner.depth_id && owner.info.data.address == address &&
 		           owner.info.data.size == size) {
-			candidate = owner.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
-			                                 : vk::ImageAspectFlagBits::eColor;
+			candidate = DataAspect(owner.info.pixel_format);
 		}
 		if (!candidate) {
 			continue;
@@ -1566,7 +1592,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			return false;
 		}
 		selected     = candidate_id;
-		stencil_id   = candidate == vk::ImageAspectFlagBits::eStencil ? id : ImageId {};
+		stencil_id   = owner.depth_id ? id : ImageId {};
 		aspect       = candidate;
 		subresources = candidate_subresources;
 	}
@@ -1602,8 +1628,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
-	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
-	                                          : vk::ImageAspectFlagBits::eColor;
+	const auto aspects = ImageAspectMask(image.backing.format);
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
 	const auto layers = image.info.IsVolume()
 	                        ? std::max(image.info.extent.depth >> range.baseMipLevel, 1u)
@@ -1624,7 +1649,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 			EXIT("TextureCache: image clear retained guest ownership\n");
 		}
 	}
-	if (image.info.HasStencil() && (range.aspectMask & vk::ImageAspectFlagBits::eStencil)) {
+	if (image.info.HasSeparateStencil() && (range.aspectMask & vk::ImageAspectFlagBits::eStencil)) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		if (!full_subresources) {
 			RefreshImage(stencil_id);
@@ -1700,7 +1725,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
 	const auto     full_slice_size  = info.LinearLayout().slice_stride;
-	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
+	const auto     transfer_bytes   = DepthStencilTransferBytes(info.pixel_format);
 	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
 	                     texels_per_slice > UINT64_MAX / transfer_bytes ||

@@ -844,48 +844,38 @@ bool TileGetDepthSize(uint32_t width, uint32_t height, Prospero::DepthFormat z_f
                       Prospero::StencilFormat stencil_format, bool htile,
                       TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
                       TileSizeAlign& depth_size, uint32_t num_fragments_log2) {
-	// Prospero derives uncompressed depth/stencil as independent 64 KiB block surfaces.
-	if (width > 0 && width <= 16384 && height > 0 && height <= 16384 &&
-	    (z_format == Prospero::DepthFormat::kZ16 || z_format == Prospero::DepthFormat::kZ32F) &&
-	    (stencil_format == Prospero::StencilFormat::kInvalid ||
-	     stencil_format == Prospero::StencilFormat::k8UInt) &&
-	    num_fragments_log2 <= 3) {
-		const uint32_t depth_bytes          = z_format == Prospero::DepthFormat::kZ16 ? 2u : 4u;
-		uint32_t       depth_block_width    = 0;
-		uint32_t       depth_block_height   = 0;
-		uint32_t       stencil_block_width  = 0;
-		uint32_t       stencil_block_height = 0;
-		const bool     valid_blocks =
-		    Gen5Msaa64KBBlockSizeFromElementBytes(depth_bytes, num_fragments_log2,
-		                                          &depth_block_width, &depth_block_height) &&
-		    (stencil_format == Prospero::StencilFormat::kInvalid ||
-		     Gen5Msaa64KBBlockSizeFromElementBytes(1, num_fragments_log2, &stencil_block_width,
-		                                           &stencil_block_height));
-		const uint32_t fragments = 1u << num_fragments_log2;
-		const uint64_t depth_bytes_total =
-		    valid_blocks ? static_cast<uint64_t>(Common::AlignUp(width, depth_block_width)) *
-		                       Common::AlignUp(height, depth_block_height) * depth_bytes * fragments
-		                 : 0;
-		const uint64_t stencil_bytes_total =
-		    stencil_format == Prospero::StencilFormat::k8UInt && valid_blocks
-		        ? static_cast<uint64_t>(Common::AlignUp(width, stencil_block_width)) *
-		              Common::AlignUp(height, stencil_block_height) * fragments
-		        : 0;
-		TileSizeAlign calculated_htile {};
-		const bool    htile_valid = !htile || TileGetHtileSize(width, height, calculated_htile);
-		if (depth_bytes_total <= UINT32_MAX && stencil_bytes_total <= UINT32_MAX && htile_valid) {
-			depth_size   = {static_cast<uint32_t>(depth_bytes_total), 65536};
-			stencil_size = stencil_format == Prospero::StencilFormat::k8UInt
-			                   ? TileSizeAlign {static_cast<uint32_t>(stencil_bytes_total), 65536}
-			                   : TileSizeAlign {};
-			htile_size   = calculated_htile;
-			return true;
-		}
+	// Each enabled plane uses its own 64 KiB block shape.
+	depth_size = stencil_size = htile_size = {};
+	if (width == 0 || width > 16384 || height == 0 || height > 16384 || num_fragments_log2 > 3 ||
+	    (z_format == Prospero::DepthFormat::kInvalid &&
+	     stencil_format == Prospero::StencilFormat::kInvalid)) {
+		return false;
 	}
-	depth_size   = TileSizeAlign();
-	htile_size   = TileSizeAlign();
-	stencil_size = TileSizeAlign();
-	return false;
+	const auto plane_size = [&](uint32_t bytes, TileSizeAlign& size) {
+		const auto pitch = TileGetRenderTargetPitch(width, bytes, num_fragments_log2);
+		return TileGetRenderTargetSize(width, height, pitch, bytes, size, num_fragments_log2);
+	};
+	TileSizeAlign depth {}, stencil {};
+	switch (z_format) {
+		case Prospero::DepthFormat::kInvalid: break;
+		case Prospero::DepthFormat::kZ16:
+			if (!plane_size(2, depth)) return false;
+			break;
+		case Prospero::DepthFormat::kZ32F:
+			if (!plane_size(4, depth)) return false;
+			break;
+		default: return false;
+	}
+	if (stencil_format != Prospero::StencilFormat::kInvalid &&
+	    (stencil_format != Prospero::StencilFormat::k8UInt || !plane_size(1, stencil))) {
+		return false;
+	}
+	if (htile && !TileGetHtileSize(width, height, htile_size)) {
+		return false;
+	}
+	depth_size   = depth;
+	stencil_size = stencil;
+	return true;
 }
 
 uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
@@ -909,7 +899,7 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 	if (height == 0 || pitch == 0 ||
 	    !Gen5Msaa64KBBlockSizeFromElementBytes(bytes_per_element, num_fragments_log2, &block_width,
 	                                           &block_height) ||
-	    pitch != TileGetRenderTargetPitch(width, bytes_per_element, num_fragments_log2)) {
+	    pitch != Common::AlignUp(static_cast<uint64_t>(width), block_width)) {
 		return false;
 	}
 	const uint64_t padded_height = Common::AlignUp(static_cast<uint64_t>(height), block_height);

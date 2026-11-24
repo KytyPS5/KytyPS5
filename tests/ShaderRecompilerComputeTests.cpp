@@ -231,14 +231,16 @@ struct RecordedCommandCounter {
   static inline uint32_t barriers = 0;
   static inline uint32_t indirect_barriers = 0;
   static inline uint32_t copies = 0;
+  static inline uint32_t image_copies = 0;
   static inline VertexBuffers vertex_buffers;
   static inline PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
   static inline PFN_vkCmdCopyBuffer copy_buffer = nullptr;
+  static inline PFN_vkCmdCopyImage copy_image = nullptr;
   static inline PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers = nullptr;
 
   RecordedCommandCounter() {
     auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
-    barriers = indirect_barriers = copies = 0;
+    barriers = indirect_barriers = copies = image_copies = 0;
     vertex_buffers = {};
     bind_vertex_buffers = std::exchange(
         dispatcher.vkCmdBindVertexBuffers2,
@@ -255,6 +257,10 @@ struct RecordedCommandCounter {
       indirect_barriers += std::get<2>(std::tie(args...)) == VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
       pipeline_barrier(args...);
     });
+    copy_image = std::exchange(dispatcher.vkCmdCopyImage, [](auto... args) {
+      ++image_copies;
+      copy_image(args...);
+    });
     copy_buffer = std::exchange(dispatcher.vkCmdCopyBuffer, [](auto... args) {
       ++copies;
       copy_buffer(args...);
@@ -262,6 +268,7 @@ struct RecordedCommandCounter {
   }
   ~RecordedCommandCounter() {
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier = pipeline_barrier;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyImage = copy_image;
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyBuffer = copy_buffer;
     VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindVertexBuffers2 = bind_vertex_buffers;
   }
@@ -8754,7 +8761,11 @@ public:
         htile_storage.info.resources.layers = layers;
         htile_storage.info.mip_layout[0].size = htile_storage.info.data.size;
         htile_storage.view_info.layer_count = layers;
+        const RecordedCommandCounter counter;
         const auto id = texture_cache.FindImage(htile_storage);
+        Require(name, "HTile array copy commands",
+                counter.image_copies == (layers == 1 ? 1u : 0u),
+                "the depth array did not convert in a single image copy");
         const auto &owner = texture_cache.GetImage(id);
         Require(name, "HTile depth storage prefix layout",
                 id != htile_depth_image &&
@@ -8796,7 +8807,16 @@ public:
       depth_prefix.info.metadata.range.size = 2 * 0x8000;
       depth_prefix.view_info.base_layer = 1;
       depth_prefix.view_info.layer_count = 1;
-      const auto prefix_id = texture_cache.FindImage(depth_prefix);
+      // Exercise the buffer fallback in the reverse direction.
+      ImageId prefix_id{};
+      {
+        const RecordedCommandCounter counter;
+        m_runtime_context.maintenance8_enabled = false;
+        prefix_id = texture_cache.FindImage(depth_prefix);
+        m_runtime_context.maintenance8_enabled = true;
+        Require(name, "HTile array copy without maintenance8", counter.image_copies == 0,
+                "a cross-aspect image copy requires maintenance8");
+      }
       const auto prefix_view = texture_cache.FindDepthTarget(prefix_id, depth_prefix);
       const auto &prefix_owner = texture_cache.GetImage(prefix_id);
       Require(name, "HTile depth prefix after storage",

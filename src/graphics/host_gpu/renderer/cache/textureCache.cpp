@@ -526,6 +526,23 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	return true;
 }
 
+// maintenance8 allows bitwise copies between these color formats and a depth or stencil aspect.
+static bool CanCopyAspectToColor(vk::Format depth, vk::Format color) {
+	switch (DepthStencilTransferBytes(depth)) {
+		case 1:
+			return color == vk::Format::eR8Uint || color == vk::Format::eR8Sint ||
+			       color == vk::Format::eR8Unorm || color == vk::Format::eR8Snorm;
+		case 2:
+			return color == vk::Format::eR16Uint || color == vk::Format::eR16Sint ||
+			       color == vk::Format::eR16Unorm || color == vk::Format::eR16Snorm ||
+			       color == vk::Format::eR16Sfloat;
+		case 4:
+			return color == vk::Format::eR32Uint || color == vk::Format::eR32Sint ||
+			       color == vk::Format::eR32Sfloat;
+		default: return false;
+	}
+}
+
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
@@ -547,7 +564,11 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
-	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)) ||
+	     (m_graphics.maintenance8_enabled && source_depth != dest_depth &&
+	      source.backing.image_type == destination.backing.image_type &&
+	      CanCopyAspectToColor(source_depth ? source.backing.format : destination.backing.format,
+	                           source_depth ? destination.backing.format : source.backing.format)));
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {

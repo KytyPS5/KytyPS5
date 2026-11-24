@@ -4950,21 +4950,90 @@ public:
         Require("GpuCommandLane", "storage readback past the download ring",
                 release(1u << 9u, large_address, written),
                 "an image larger than the download ring was not read back");
-        // Without storage readback, an image enrolled for linear readback is
-        // copied back at the suspend point only, without trapping its pages.
+        // Without storage readback, a GL2 writeback arms on-demand CPU read
+        // tracking without proactively copying or blocking guest writes, while
+        // an actual guest CPU read downloads the image on demand.
         TextureCacheTestAccess::SetStorageReadback(texture_cache, false);
         TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
         constexpr uint64_t enrolled_address = fault_base + 0x38000;
         const auto enrolled = shader_write(enrolled_address, {8, 8, 1}, linear);
+        auto enrolled_packet = make_interrupt_packet(0, 0, nullptr, 0, 0);
+        enrolled_packet[1] |= (1u << 9u) << 12u;
+        Pm4Execution enrolled_execution;
         const bool left =
-            release(1u << 9u, enrolled_address, stale) &&
-            TextureCacheTestAccess::PendingDownload(texture_cache, enrolled);
+            processor->Process(enrolled_execution, enrolled_packet) ==
+                Pm4ProcessResult::Complete &&
+            TextureCacheTestAccess::PendingDownload(texture_cache, enrolled) &&
+            !TextureCacheTestAccess::WriteBacksPending(texture_cache);
+        std::array<uint32_t, 4> enrolled_read{};
+        std::memcpy(enrolled_read.data(),
+                    reinterpret_cast<const void *>(enrolled_address),
+                    sizeof(enrolled_read));
         texture_cache.ProcessDownloadImages();
         Require("GpuCommandLane", "linear readback without storage readback",
-                left &&
+                left && enrolled_read == written &&
                     !TextureCacheTestAccess::WriteBacksPending(texture_cache),
-                "without storage readback, a GL2 release copied an image back "
-                "or a download blocked guest accesses");
+                "without storage readback, a GL2 release proactively copied "
+                "an image back, or an on-demand CPU read saw stale texels");
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
+
+        // With all opt-in readback flags disabled, a tiled render-target write
+        // followed by a GL2 writeback still materializes on a guest CPU read.
+        constexpr uint64_t tiled_on_demand_address = fault_base + 0x24000;
+        (void)shader_write(tiled_on_demand_address, {8, 8, 1},
+                           Prospero::TileMode::kRenderTarget);
+        Require("GpuCommandLane", "on-demand tiled image readback",
+                release(1u << 9u, tiled_on_demand_address, written),
+                "a tiled GPU-written image was not materialized on CPU read");
+
+        // A full-image CPU invalidation drops the read-watcher without
+        // downloading, whereas a partial CPU write or a CPU write beside a
+        // GPU-written image on the same page preserves the unwritten texels.
+        constexpr uint64_t full_overwrite_address = fault_base + 0x28000;
+        const auto full_overwrite_image =
+            shader_write(full_overwrite_address, {8, 8, 1}, linear);
+        Pm4Execution overwrite_execution;
+        (void)processor->Process(overwrite_execution, enrolled_packet);
+        Common::DebugCounters::SetEnabled(true);
+        const auto dl_start = Common::DebugCounters::Get(
+            Common::DebugCounters::Counter::TextureDownloadBytes);
+        texture_cache.InvalidateMemory(
+            full_overwrite_address,
+            texture_cache.GetImage(full_overwrite_image).info.data.size);
+        const auto dl_full =
+            Common::DebugCounters::Get(
+                Common::DebugCounters::Counter::TextureDownloadBytes) -
+            dl_start;
+        Common::DebugCounters::SetEnabled(false);
+        Require("GpuCommandLane", "on-demand readback skips covered overwrite",
+                dl_full == 0,
+                "a whole-image CPU overwrite triggered a GPU image download");
+
+        constexpr uint64_t partial_write_address = fault_base + 0x2c000;
+        (void)shader_write(partial_write_address, {8, 8, 1}, linear);
+        (void)shader_write(partial_write_address + 0x800, {8, 4, 1}, linear);
+        Pm4Execution partial_execution;
+        (void)processor->Process(partial_execution, enrolled_packet);
+        constexpr uint32_t cpu_patch = 0xdeadbeefu;
+        std::memcpy(reinterpret_cast<void *>(partial_write_address), &cpu_patch,
+                    sizeof(cpu_patch));
+        std::array<uint32_t, 4> partial_head{};
+        std::array<uint32_t, 4> sibling_read{};
+        std::memcpy(partial_head.data(),
+                    reinterpret_cast<const void *>(partial_write_address),
+                    sizeof(partial_head));
+        std::memcpy(sibling_read.data(),
+                    reinterpret_cast<const void *>(partial_write_address + 0x800),
+                    sizeof(sibling_read));
+        Require("GpuCommandLane",
+                "on-demand readback preserves partial and shared-page writes",
+                partial_head[0] == cpu_patch &&
+                    partial_head[1] == written[1] &&
+                    partial_head[2] == written[2] &&
+                    partial_head[3] == written[3] && sibling_read == written,
+                "a partial CPU write or shared-page write lost GPU texels");
+
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, true);
         // With storage readback too, linear readback still queues a rewrite,
         // and a GL2 writeback copies it back.
         TextureCacheTestAccess::SetStorageReadback(texture_cache, true);

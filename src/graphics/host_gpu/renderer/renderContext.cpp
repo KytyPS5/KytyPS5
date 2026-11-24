@@ -75,7 +75,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		const bool image_read = m_texture_cache.ReadMemory(fault_vaddr, fault_size);
+		if (!image_read || m_buffer_cache.IsRegionGpuModified(fault_vaddr, fault_size)) {
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		}
 	}
 	return true;
 }

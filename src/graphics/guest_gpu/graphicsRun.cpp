@@ -951,11 +951,15 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
 	// downloads GPU-written bytes under the label before the store.
 	const auto write_label = [this, address](const void* value, uint64_t size) {
-		const auto vaddr   = reinterpret_cast<uint64_t>(address);
-		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+		const auto vaddr    = reinterpret_cast<uint64_t>(address);
+		auto&      buffers  = m_renderer.GetBufferCache();
+		auto&      textures = m_renderer.GetTextureCache();
+		const bool beside_gpu_bytes =
+		    GuestRange {vaddr, size}.Valid() &&
+		    (buffers.IsRegionGpuModified(vaddr, size) ||
+		     textures.IsRegionGpuModified(vaddr, size)) &&
+		    !buffers.HasGpuDirtyBytes(vaddr, size) && !textures.HasGpuDirtyBytes(vaddr, size);
+		if (!beside_gpu_bytes || !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
 			std::memcpy(address, value, size);
 		}
 	};

@@ -817,6 +817,10 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
+		auto& textures = GetGpuResources().GetTextureCache();
+		if (textures.HasGpuDirtyBytes(vaddr, size)) {
+			(void)textures.ReadMemory(vaddr, size);
+		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
@@ -828,7 +832,8 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 void ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    !Graphics::GuestGpu::IsGpuThread() ||
-	    !GetGpuResources().GetBufferCache().IsRegionGpuModified(vaddr, size) ||
+	    (!GetGpuResources().GetBufferCache().IsRegionGpuModified(vaddr, size) &&
+	     !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) ||
 	    !TryReadBufferBacking(vaddr, data, size)) {
 		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
 	}

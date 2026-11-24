@@ -36009,6 +36009,64 @@ TestCase VectorVopcCmpxNleF16CapturedSdwaExecMask() {
   return test;
 }
 
+TestCase VectorVopcCmpxNgeF16SgprSdwaExecMask(u32 denorm_mode) {
+  using O = ShaderOpcode;
+  constexpr u32 positive_negative_one = 0xbc003c00u;
+  constexpr u32 sentinel = 0x89abcdefu;
+  struct CompareCase {
+    u32 value, expected, exec = 1;
+    bool vop3 = false;
+    u32 rhs = positive_negative_one;
+  };
+  const u32 preserve = denorm_mode == 1 || denorm_mode == 3;
+  const std::array<CompareCase, 19> cases{{
+      {0x00003c00u, 0}, {0x00003800u, 1}, {0x00004000u, 0},
+      {0x00007e00u, 1}, {0x00007c01u, 1}, {0x00007c00u, 0},
+      {0x0000fc00u, 1}, {0x00008000u, 1}, {0x3c003800u, 1},
+      {0x38003c00u, 0}, {0xfc00bc00u, 1}, {0x00003800u, 0, 0},
+      {0x0000bc00u, 0, 1, true}, {0x00003c00u, 1, 1, true},
+      {0, preserve, 1, false, 0x0001u},       // +0 < minimum positive subnormal
+      {0x83ffu, preserve, 1, false, 0},       // negative subnormal < +0
+      {0x0001u, preserve, 1, true, 0},        // VOP3 negates the positive subnormal
+      {0, 1, 1, false, 0x0400u},             // minimum normal survives every mode
+      {0, 1, 1, false, 0x7e00u},             // NaN in the scalar source is unordered
+  }};
+  TestCase test;
+  constexpr const char *names[] = {"VectorVopcCmpxNgeF16Denorm0", "VectorVopcCmpxNgeF16Denorm1",
+                                   "VectorVopcCmpxNgeF16Denorm2", "VectorVopcCmpxNgeF16SgprSdwaExecMask"};
+  test.name = names[denorm_mode];
+  test.compute_info.float_mode = static_cast<uint8_t>(denorm_mode << 6u);
+  for (const auto &entry : cases) test.initial.push_back(entry.value);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 4, 30);
+    AppendSMovLiteral(&code, 106, entry.rhs);
+    AppendSMovLiteral(&code, 107, sentinel);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    if (entry.vop3) {
+      AppendVop3(&code, 0xf9, 126, Vgpr(4), 106, 0, 0, 0, false, 0, 1);
+    } else {
+      code.insert(code.end(), {0x7df2d4f9u, 0x86060004u});
+    }
+    code.push_back(EncodeSMovB32(8, 126));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = test.expected.size();
+    code.push_back(EncodeVop1(0x01, 0, 8));
+    AppendStoreVgpr(&code, 0, out);
+    AppendStoreSgprPair(&code, 106, out + 1u);
+    test.expected.insert(test.expected.end(), {entry.expected, entry.rhs, sentinel});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_NGE_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMPX_NGE_F16", cases.size()}};
+  test.required_spirv = {"OpFUnordLessThan"};
+  return test;
+}
+
 TestCase VectorCompareInvertedMaskSelect() {
   using O = ShaderOpcode;
 
@@ -50013,6 +50071,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpUF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxNleF16CapturedSdwaExecMask);
+  for (u32 mode = 0; mode < 4; ++mode) {
+    cases.push_back(VectorVopcCmpxNgeF16SgprSdwaExecMask(mode));
+  }
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
@@ -57895,6 +57956,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVopcCmpNgtF16CapturedSdwaAndEdges());
     RunCase(&vulkan, VectorVopcCmpxNgtF16CapturedSdwaExecMask());
     RunCase(&vulkan, VectorVopcCmpxNleF16CapturedSdwaExecMask());
+    for (u32 mode = 0; mode < 4; ++mode) {
+      RunCase(&vulkan, VectorVopcCmpxNgeF16SgprSdwaExecMask(mode));
+    }
     RunCase(&vulkan, VectorCompareF16Ops());
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, VectorVop3FloatCompareNegSourceModifier());

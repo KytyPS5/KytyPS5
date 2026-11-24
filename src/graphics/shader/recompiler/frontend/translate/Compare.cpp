@@ -52,13 +52,15 @@ void Translator::EmitInteger16Compare(const Decoder::Instruction& inst, IR::Valu
 void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                   bool half) {
 	const auto type = IR::ArgTypeOf(opcode, 0);
-	const auto lhs =
-	    half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, type);
-	const auto rhs =
-	    half ? IR::Value(ReadF16AsF32(inst.src1)) : ReadOperand(inst.src1, type);
-	const IR::FPCompareFlags flags{
-	    .flush_input_denorms = !half && type == IR::Type::F32 && flush_f32_inputs};
-	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false);
+	const auto read = [&](const Decoder::Operand& operand) -> IR::Value {
+		if (half) return ReadF16LaneAsF32(operand, false, ShaderFlushF16Inputs(float_mode));
+		return ReadOperand(operand, type);
+	};
+	const bool flush_f32 = !half && type == IR::Type::F32 && program.stage == ShaderType::Compute &&
+	                       (float_mode & 0x10u) == 0;
+	const auto result = ir.Emit(opcode, {read(inst.src0), read(inst.src1)},
+	                            IR::FPCompareFlags{.flush_input_denorms = flush_f32});
+	EmitCompareResult(inst, IR::U1(result), false);
 }
 
 void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered,

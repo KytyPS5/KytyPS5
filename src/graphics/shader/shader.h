@@ -33,6 +33,9 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
+// MODE bit 6 enables FP16 and FP64 input denormals independently of output flushing.
+constexpr bool ShaderFlushF16Inputs(uint8_t float_mode) { return (float_mode & 0x40u) == 0; }
+
 struct ShaderModule;
 
 struct ShaderStageRuntime {
@@ -148,6 +151,7 @@ struct ShaderVertexInputInfo {
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
+	uint8_t                 float_mode          = 0xc0;
 	uint32_t                scratch_size_dwords = 0;
 	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
 	uint32_t                lds_size_dwords     = 0;
@@ -186,6 +190,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;
+	uint8_t                                        float_mode                   = 0xc0;
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;

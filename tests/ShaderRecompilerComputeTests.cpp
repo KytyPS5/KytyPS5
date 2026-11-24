@@ -1569,9 +1569,10 @@ struct TestCase {
   std::vector<u32> storage_buffer_offsets;
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
-  std::optional<uint64_t> fault_free_address;
-  // A BDA load from this unbacked address must record its page.
-  std::optional<uint64_t> fault_address;
+  struct {
+    uint64_t address = 0;
+    std::vector<u32> words;
+  } faults;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -21049,20 +21050,20 @@ public:
                           &barrier, 0, nullptr);
     }
     Buffer fault_result;
-    const auto fault_address =
-        test.fault_address ? test.fault_address : test.fault_free_address;
-    if (fault_address) {
+    const auto fault_words = static_cast<u32>(test.faults.words.size());
+    if (fault_words != 0) {
       Require(test.name, "fault check", uses_bda, "fault check requires BDA");
-      fault_result = CreateHostBuffer(test.name, sizeof(u32),
-                                     vk::BufferUsageFlagBits::eTransferDst, {});
+      fault_result =
+          CreateHostBuffer(test.name, fault_words * sizeof(u32),
+                           vk::BufferUsageFlagBits::eTransferDst, {});
       const vk::MemoryBarrier ready{
           .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
           .dstAccessMask = vk::AccessFlagBits::eTransferRead};
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
       const vk::BufferCopy region{
-          (BufferCache::PageIndex(*fault_address) >> 5u) * sizeof(u32), 0,
-          sizeof(u32)};
+          (BufferCache::PageIndex(test.faults.address) >> 5u) * sizeof(u32), 0,
+          fault_words * sizeof(u32)};
       cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
       const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
                                         .dstAccessMask = vk::AccessFlagBits::eHostRead};
@@ -21070,14 +21071,15 @@ public:
                           {}, 1, &readable, 0, nullptr, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
-    if (fault_address) {
-      const u32 expected_fault =
-          test.fault_address
-              ? 1u << (BufferCache::PageIndex(*test.fault_address) & 31u)
-              : 0u;
-      Require(test.name, "fault check",
-              ReadBuffer(test.name, fault_result, 1)[0] == expected_fault,
-              "an access recorded a suppressed page or missed an unbacked one");
+    if (fault_words != 0) {
+      const auto words = ReadBuffer(test.name, fault_result, fault_words);
+      for (u32 i = 0; i < fault_words; ++i) {
+        Require(test.name, "fault check",
+                words[i] == test.faults.words[i],
+                "fault word " + std::to_string(i) + " = " +
+                    std::to_string(words[i]) + ", expected " +
+                    std::to_string(test.faults.words[i]));
+      }
       DestroyBuffer(&fault_result);
     }
     for (const auto view : sampled_mip_views) {
@@ -37669,7 +37671,7 @@ TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 0}};
-  test.fault_free_address = GuestBase + 0x100000u;
+  test.faults = {GuestBase + 0x100000u, {0u}};
   test.compute_info.threads_num[0] = 1;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.wave_size = wave;
@@ -39935,7 +39937,7 @@ TestCase GlobalLoadShortD16Captured(u32 wave_size, bool high = false) {
   }
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 4u * passes * wave_size}};
-  if (high) test.fault_free_address = uint64_t{Marker} + 0x70u;
+  if (high) test.faults = {uint64_t{Marker} + 0x70u, {0u}};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -40304,6 +40306,44 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   return test;
 }
 
+// Every lane of one wave loads from its own unmapped page. All pages share
+// fault-bitmap words, so the lanes' bits must be merged atomically rather than
+// stored over each other.
+TestCase GlobalLoadFaultsReportEveryLanePage(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr uint64_t Unmapped = GuestBase + 0x100000u;
+  static_assert(((Unmapped >> BufferCache::CACHING_PAGEBITS) & 31u) == 0u);
+  std::vector<u32> code;
+  code.push_back(
+      EncodeVop2(0x1a, 1, InlineU32(BufferCache::CACHING_PAGEBITS), 0));
+  AppendVMovLiteral(&code, 2, static_cast<u32>(Unmapped));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(2), 1));
+  AppendVMovU32(&code, 5, static_cast<u32>(Unmapped >> 32u));
+  code.push_back(EncodeFlat0(0x0c, 2));
+  code.push_back(EncodeFlat1(3, 0x7d, 0, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 32u ? "GlobalLoadFaultsReportEveryLanePage32"
+                               : "GlobalLoadFaultsReportEveryLanePage64";
+  test.code = std::move(code);
+  test.initial.assign(wave_size, 0xdeadbeefu);
+  test.expected.assign(wave_size, 0u);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.faults = {Unmapped, {0xffffffffu, wave_size == 64u ? 0xffffffffu : 0u, 0u}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_LSHLREV_B32,   O::V_MOV_B32,          O::V_ADD_NC_U32,
+                  O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   using O = ShaderOpcode;
 
@@ -40333,7 +40373,8 @@ TestCase GlobalLoadRecordsUnbackedPage() {
   auto test = GlobalSignedImmediateRebasesBeforeSaddr();
   test.name = "GlobalLoadRecordsUnbackedPage";
   test.expected = {0u};
-  test.fault_address = test.bda_mappings.front().guest_base + 4;
+  const auto address = test.bda_mappings.front().guest_base + 4;
+  test.faults = {address, {1u << (BufferCache::PageIndex(address) & 31u)}};
   test.bda_mappings.front().guest_base += BufferCache::CACHING_PAGESIZE;
   return test;
 }
@@ -50380,6 +50421,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(GlobalLoadShortD16HiMergesOldDestination(64));
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(32));
   cases.push_back(FlatLoadShortD16HiIntoAddressHighVgpr(64));
+  cases.push_back(GlobalLoadFaultsReportEveryLanePage(32));
+  cases.push_back(GlobalLoadFaultsReportEveryLanePage(64));
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(GlobalLoadRecordsUnbackedPage);
@@ -58251,6 +58294,8 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, GlobalLoadShortD16HiMergesOldDestination(wave));
       RunCase(&vulkan, FlatLoadShortD16HiIntoAddressHighVgpr(wave));
     }
+    RunCase(&vulkan, GlobalLoadFaultsReportEveryLanePage(32));
+    RunCase(&vulkan, GlobalLoadFaultsReportEveryLanePage(64));
     RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());

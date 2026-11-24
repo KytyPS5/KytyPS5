@@ -16341,7 +16341,8 @@ public:
   void CheckCubeFaceStorage() {
     constexpr const char *name = "CubeFaceStorage";
     constexpr uintptr_t base = 0x0000000204700000ull;
-    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t tile_size = 0x10000;
+    constexpr uint64_t allocation_size = (1 + 2 * 6) * tile_size;
     constexpr std::array<uint32_t, 6> half_red{0x3c00, 0x4000, 0x4200,
                                              0x4400, 0x4500, 0x4600};
     EnsureRuntimeContext();
@@ -16349,13 +16350,13 @@ public:
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
                 0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
-                allocation_size, allocation_size, 0, &direct_offset) == 0,
+                allocation_size, tile_size, 0, &direct_offset) == 0,
             "cube-face allocation failed");
     void *mapped = reinterpret_cast<void *>(base);
     Require(name, "direct mapping",
             Libs::LibKernel::Memory::KernelMapDirectMemory(
                 &mapped, allocation_size, 0x3, 0x10, direct_offset,
-                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+                tile_size) == 0 && mapped == reinterpret_cast<void *>(base),
             "cube-face mapping failed");
     std::memset(mapped, 0, allocation_size);
     {
@@ -16435,6 +16436,84 @@ public:
           }
         }
       }
+      // Planet Zoo writes an 8x8 packed-float array, then copies its faces through
+      // packed-UInt descriptors with DEPTH and BASE_ARRAY both set to the face.
+      ShaderRecompiler::IR::DescriptorValue packed{};
+      packed.dword_count = 8;
+      packed.dwords = {
+          static_cast<uint32_t>((base + tile_size) >> 8u),
+          (static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10Float) << 20u) | (3u << 30u),
+          0x0001c001u,
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u) |
+              (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 20u) | DstSel(4, 5, 6, 7),
+          5, 0x00700000u, 0, 0};
+      ShaderRecompiler::IR::ImageResource array_resource{};
+      array_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      array_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      array_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+      array_resource.written = true;
+      const auto owner = RenderExecutorTestAccess::ResolveTexture(executor, array_resource, packed);
+      Require(name, "packed array backing", owner.image_id &&
+                  cache.GetImage(owner.image_id).backing.layers == 6 &&
+                  cache.GetImage(owner.image_id).backing.format == vk::Format::eB10G11R11UfloatPack32 &&
+                  cache.FindTexture(owner.image_id, owner.desc) != nullptr,
+              "packed float array did not create its six-layer native image");
+
+      ShaderRecompiler::IR::ImageResource face_resource{};
+      face_resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      face_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      face_resource.conversion_format = Prospero::BufferFormat::k11_11_10UInt;
+      auto packed_face = packed;
+      packed_face.dwords[1] =
+          (static_cast<uint32_t>(face_resource.conversion_format) << 20u) | (3u << 30u);
+      for (uint32_t face = 0; face < 6; ++face) {
+        packed_face.dwords[4] = face | (face << 16u);
+        for (bool storage : {false, true}) {
+          face_resource.resource_class = storage ? ShaderRecompiler::IR::ImageResourceClass::Storage
+                                                 : ShaderRecompiler::IR::ImageResourceClass::Sampled;
+          face_resource.read = !storage;
+          face_resource.written = storage;
+          const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, face_resource, packed_face);
+          const auto &view = binding.desc.view_info;
+          Require(name, "packed face view", binding.image_id == owner.image_id &&
+                      view.format == vk::Format::eR32Uint && view.type == vk::ImageViewType::e2D &&
+                      view.base_layer == face && view.layer_count == 1 &&
+                      cache.FindTexture(binding.image_id, binding.desc) != nullptr,
+                  std::string(storage ? "storage" : "sampled") + " view of face " +
+                      std::to_string(face) + " did not select the packed array layer");
+        }
+      }
+
+      // The destination can first appear as a one-layer UInt image. Its GPU
+      // contents must survive the subsequent six-layer float descriptor.
+      packed.dwords[0] = packed_face.dwords[0] = static_cast<uint32_t>((base + 7 * tile_size) >> 8u);
+      packed_face.dwords[4] = 0;
+      face_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      face_resource.read = false;
+      face_resource.written = true;
+      const auto first = RenderExecutorTestAccess::ResolveTexture(executor, face_resource, packed_face);
+      Require(name, "one-layer UInt destination", first.image_id &&
+                  cache.FindTexture(first.image_id, first.desc) != nullptr &&
+                  cache.GetImage(first.image_id).backing.layers == 1 &&
+                  cache.GetImage(first.image_id).backing.format == vk::Format::eR32Uint,
+              "first destination face did not bind a one-layer raw image");
+      constexpr uint32_t texel = 0x781c03c0u;
+      vk::ClearValue clear{};
+      clear.color.uint32[0] = texel;
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), first.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      array_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      array_resource.read = true;
+      array_resource.written = false;
+      const auto grown = RenderExecutorTestAccess::ResolveTexture(executor, array_resource, packed);
+      Require(name, "sampled float array after raw write", grown.image_id &&
+                  grown.desc.view_info.format == vk::Format::eB10G11R11UfloatPack32 &&
+                  grown.desc.view_info.layer_count == 6 &&
+                  cache.FindTexture(grown.image_id, grown.desc) != nullptr &&
+                  ReadCachedTexel(name, context, grown.image_id) == std::vector<u32>{texel} &&
+                  ReadCachedTexel(name, context, grown.image_id, {}, {1, 1, 1}, 5) ==
+                      std::vector<u32>{0},
+              "float array growth lost the GPU-written face or failed to initialize the last face");
       RenderExecutorTestAccess::ResetBindings(executor);
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();

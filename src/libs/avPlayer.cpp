@@ -952,12 +952,12 @@ public:
 				std::lock_guard lock(mutex);
 				ResetNoLock();
 			}
+			if (was_playing && events != nullptr) {
+				events->Post(AVPLAYER_EVENT_STATE_STOP);
+			}
 		}
 		if (was_playing_video) {
 			::printf("AvPlayer video stopped\n");
-		}
-		if (was_playing && events != nullptr) {
-			events->Post(AVPLAYER_EVENT_STATE_STOP);
 		}
 		return 0;
 	}

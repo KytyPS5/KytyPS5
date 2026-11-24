@@ -235,7 +235,7 @@ bool TextureCache::ReleaseIdleImages(GuestRange requested) {
 		}
 		auto* image = m_slot_images.try_get(id);
 		if (image == nullptr || !image->registered || image->depth_id ||
-		    image->backing.image == nullptr ||
+		    image->backing.image == nullptr || image->tick_accessed_last == m_gc_tick ||
 		    image->heap_refs.load(std::memory_order_relaxed) != 0u || image->binding.is_bound ||
 		    image->binding.is_target || image->usage.video_out ||
 		    image->Overlaps(requested.address, requested.size)) {

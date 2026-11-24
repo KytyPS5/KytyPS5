@@ -1979,20 +1979,23 @@ void TestClampedRangeIsLoggedWhenItChanges() {
 	Config::ConfigOptions options;
 	options.printf_direction   = Config::LogDirection::File;
 	options.printf_output_file = log_path;
-	Config::Load(options);
-	Log::Initialize();
 	const std::array<std::pair<uint64_t, uint64_t>, 5> calls {{{base + page / 2, page / 2},
 	                                                          {base + page / 2, page / 2},
 	                                                          {base + page / 2, page / 2},
 	                                                          {base + page / 4, 3 * page / 4},
 	                                                          {base + page / 2, page / 2}}};
 	std::array<uint64_t, calls.size()> results {};
+	uint64_t                           silent_result = 0;
 	std::thread([&] {
+		silent_result = ClampRangeSize(calls[0].first, page);
+		Config::Load(options);
+		Log::Initialize();
 		for (size_t i = 0; i < calls.size(); ++i) {
 			results[i] = ClampRangeSize(calls[i].first, page);
 		}
 	}).join();
 	Log::Flush();
+	Check(test, silent_result == calls[0].second, "range clamp did not stop at the hole while logging was silent");
 	for (size_t i = 0; i < calls.size(); ++i) {
 		Check(test, results[i] == calls[i].second, "range clamp did not stop at the hole");
 	}

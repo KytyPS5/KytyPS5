@@ -7,6 +7,7 @@
 #include "common/platform/sysFileIO.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <dirent.h>
 #include <filesystem>
 #include <sys/stat.h>
@@ -35,6 +36,23 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read)
 	size_t r = fread(data, 1, size, f.f);
 	if (bytes_read != nullptr) {
 		*bytes_read = r;
+	}
+}
+
+void SysFileReadEx(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read, int* err) {
+	if (err != nullptr) {
+		*err = 0;
+	}
+	errno = 0;
+	clearerr(f.f);
+	const size_t r = fread(data, 1, size, f.f);
+	if (bytes_read != nullptr) {
+		*bytes_read = static_cast<uint32_t>(r);
+	}
+	// A guest page made read-only by the resource tracker fails here with EFAULT, because the
+	// files are unbuffered. The caller retries through a host bounce buffer.
+	if (r < size && std::ferror(f.f) != 0 && err != nullptr) {
+		*err = errno != 0 ? errno : EIO;
 	}
 }
 

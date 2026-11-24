@@ -2924,6 +2924,86 @@ void TestMprotectSkipsUncommittedRanges() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// A guest file read checks its destination before the first host read (IsKnownUnwritable) and
+// before a bounce copy after the host read failed (IsGuestWritable).
+void TestGuestReadDestinationChecks() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test    = "GuestReadDestinationChecks";
+	constexpr uint64_t page    = SceKernelPageSize;
+	constexpr int      GpuRw   = 0x30;
+	void*              reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 5 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	for (const auto offset: {0 * page, 1 * page, 3 * page, 4 * page}) {
+		void* address = reinterpret_cast<void*>(base + offset);
+		CheckOk(test,
+		        KernelMapNamedFlexibleMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed,
+		                                     "read_dst"),
+		        "KernelMapNamedFlexibleMemory");
+	}
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base + page), page, SceKernelProtCpuRead),
+	        "make page 1 CPU read-only");
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(base + 3 * page), page, GpuRw),
+	        "make page 3 GPU read-write only");
+	CheckOk(test, KernelMunmap(base + 4 * page, page), "leave a hole at page 4");
+
+	Check(test, !IsKnownUnwritable(base, page) && IsGuestWritable(base, page),
+	      "CPU read-write memory");
+	Check(test, IsKnownUnwritable(base + page, page) && !IsGuestWritable(base + page, page),
+	      "CPU read-only memory");
+	Check(test, IsKnownUnwritable(base, 2 * page) && !IsGuestWritable(base, 2 * page),
+	      "a range reaching CPU read-only memory");
+	Check(test, IsKnownUnwritable(base + 2 * page, 16) && !IsGuestWritable(base + 2 * page, 16),
+	      "reserved memory");
+	// The host maps it read-write.
+	Check(test, !IsKnownUnwritable(base + 3 * page, page) && IsGuestWritable(base + 3 * page, page),
+	      "GPU read-write memory");
+	// Not described by the map: the host read itself reports EFAULT there, and the bounce copy
+	// rejects it.
+	Check(test,
+	      !IsKnownUnwritable(base + 4 * page, page) && !IsGuestWritable(base + 4 * page, page),
+	      "a hole in the map");
+	std::vector<uint8_t> host(page);
+	const auto           host_addr = reinterpret_cast<uint64_t>(host.data());
+	Check(test, !IsKnownUnwritable(host_addr, page) && !IsGuestWritable(host_addr, page),
+	      "a host buffer outside the map");
+	Check(test, !IsKnownUnwritable(base, 0) && IsGuestWritable(base + 2 * page, 0),
+	      "an empty range");
+
+	const auto runtime = AllocateRuntimeMemory(0, page, Common::VirtualMemory::Mode::ReadWrite,
+	                                           "read_dst_runtime");
+	Check(test, runtime != 0, "AllocateRuntimeMemory");
+	Check(test, !IsKnownUnwritable(runtime, page) && IsGuestWritable(runtime, page),
+	      "read-write runtime memory");
+	Check(test, ProtectGuestMemory(runtime, page, Common::VirtualMemory::Mode::Read),
+	      "ProtectGuestMemory");
+	Check(test, IsKnownUnwritable(runtime, page) && !IsGuestWritable(runtime, page),
+	      "read-only runtime memory");
+	Check(test, FreeGuestMemory(runtime, page), "FreeGuestMemory(runtime)");
+
+	// A read-only program segment stays host-writable.
+	const auto program =
+	    AllocateProgramMemory(0, page, Common::VirtualMemory::Mode::ReadWrite, "read_dst_program");
+	Check(test, program != 0, "AllocateProgramMemory");
+	SetProgramMemoryProtection(program, page, Common::VirtualMemory::Mode::Read);
+	Check(test, !IsKnownUnwritable(program, page) && !IsGuestWritable(program, page),
+	      "read-only program memory");
+	// Protecting it again gives the host the guest protection: read-only is then unwritable.
+	Check(test, ProtectGuestMemory(program, page, Common::VirtualMemory::Mode::Read),
+	      "ProtectGuestMemory(program)");
+	Check(test, IsKnownUnwritable(program, page), "program memory made read-only");
+	SetProgramMemoryProtection(program, page, Common::VirtualMemory::Mode::Read);
+	Check(test, !IsKnownUnwritable(program, page), "program memory made host-writable again");
+	CheckOk(test, KernelMprotect(reinterpret_cast<void*>(program), page, SceKernelProtCpuRead),
+	        "KernelMprotect(program)");
+	Check(test, IsKnownUnwritable(program, page), "program memory made read-only by mprotect");
+	Check(test, FreeGuestMemory(program, page), "FreeGuestMemory(program)");
+
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReplacementGpuUnmaps() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test    = "FixedReplacementGpuUnmaps";
@@ -6410,6 +6490,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMunmapRoundsToPages);
 	RunTest(TestRangeNamesCoverWholePages);
 	RunTest(TestMprotectSkipsUncommittedRanges);
+	RunTest(TestGuestReadDestinationChecks);
 	RunTest(TestFixedReplacementGpuUnmaps);
 	RunTest(TestFixedReserveValidatesBeforeUnmapping);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);

@@ -136,8 +136,8 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-// Copies guest memory like a direct read, except that the GPU thread reads a page holding
-// GPU-written bytes through the backing, which waits only when the copied bytes are GPU-written.
+// The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
+// A buffer readback is needed only for GPU-written bytes in the requested range.
 void                   ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);

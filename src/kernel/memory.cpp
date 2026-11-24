@@ -829,6 +829,7 @@ void ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
 	    !Graphics::GuestGpu::IsGpuThread() ||
 	    !GetGpuResources().GetBufferCache().IsRegionGpuModified(vaddr, size) ||
+	    GetGpuResources().GetTextureCache().WriteBackTick(vaddr, size) != 0 ||
 	    !TryReadBufferBacking(vaddr, data, size)) {
 		std::memcpy(data, reinterpret_cast<const void*>(vaddr), size);
 	}

@@ -5011,6 +5011,19 @@ public:
                         Pm4ProcessResult::Complete &&
                     release(0, silent_address, written),
                 "a GL2-writeback release without a signal copied nothing back");
+        constexpr uint64_t args_address = fault_base + 0x39000;
+        (void)buffer_cache.ObtainBuffer(args_address + 0xc00, 4, true, false);
+        (void)shader_write(args_address, {8, 8, 1}, linear);
+        Require("GpuCommandLane", "pending command data",
+                texture_cache.WriteBackImages() &&
+                    texture_cache.WriteBackTick(args_address, sizeof(written)) != 0 &&
+                    buffer_cache.IsRegionGpuModified(args_address, sizeof(written)) &&
+                    !buffer_cache.HasGpuDirtyBytes(args_address, sizeof(written)),
+                "the pending image and neighboring buffer did not share a tracked page");
+        std::array<uint32_t, 4> args{};
+        LibKernel::Memory::ReadGuestMemory(args_address, args.data(), sizeof(args));
+        Require("GpuCommandLane", "command data from a pending image",
+                args == written, "the command processor read stale image data");
         (void)shader_write(shared_page, {8, 8, 1}, linear);
         (void)shader_write(shared_page + 0x800, {8, 4, 1}, linear);
         resources.GetCommandScheduler().DeferPriorityOperation(
@@ -13766,7 +13779,10 @@ public:
                 "empty arguments did not retain independent byte ownership");
         const auto tick = scheduler.CurrentTick();
         for (size_t i = 0; i < empty_dimensions.size(); ++i) {
-          processor.DispatchIndirect(empty_args + i * sizeof(empty_dimensions[0]), 0x41u);
+          const auto address = empty_args + i * sizeof(empty_dimensions[0]);
+          processor.DispatchIndirect(address, 0x41u);
+          processor.DispatchIndirect(
+              address, 0x41u | Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS);
         }
         Require(name, "empty dispatch avoids readback",
                 scheduler.CurrentTick() == tick &&

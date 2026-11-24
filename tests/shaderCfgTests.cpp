@@ -1579,6 +1579,12 @@ constexpr uint32_t EncodeVopc(uint32_t opcode, uint32_t src0, uint32_t src1) {
          (src0 & 0x1ffu);
 }
 
+constexpr uint32_t EncodeVop1Sdwa(uint32_t src0, uint32_t dst_sel,
+                                  uint32_t dst_unused, uint32_t src0_sel = 6) {
+  return (src0 & 0xffu) | ((dst_sel & 0x7u) << 8u) |
+         ((dst_unused & 0x3u) << 11u) | ((src0_sel & 0x7u) << 16u);
+}
+
 constexpr uint32_t EncodeVopcSdwa(uint32_t src0, uint32_t sdst = 0,
                                   uint32_t sd = 0, uint32_t src0_sel = 6,
                                   uint32_t src1_sel = 6, uint32_t src0_sext = 0,
@@ -4017,6 +4023,29 @@ void TestPixelAncillaryLayerInput() {
         "DPP write retained the old ancillary register value");
   CheckSpirvBinaryValidates(dpp_result.spirv);
 
+  constexpr uint32_t cvt_f16_f32 = 0x0a;
+  constexpr uint32_t sdwa_source = 249;
+  constexpr uint32_t sdwa_word1 = 5;
+  constexpr uint32_t sdwa_preserve = 2;
+  uint32_t high_word[] = {
+      EncodeSop1(0x04, 8, 126),
+      EncodeSop1(0x0a, 10, 126),
+      EncodeSop1(0x04, 126, 10),
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4),
+      EncodeVop1(cvt_f16_f32, 5, sdwa_source),
+      EncodeVop1Sdwa(2, sdwa_word1, sdwa_preserve),
+      EncodeVop3Word0(0x148, 7), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 16),
+      EncodeVop1(0x01, 5, 3 + 256),
+      EncodeSop1(0x04, 126, 8),
+      EncodeExp0(0x00, 0x7), EncodeExp1(5, 6, 7, 0), EncodeSopp(0x01),
+  };
+  auto high_word_result = RecompileForTest(high_word, options);
+  Check(ProgramHasInput(high_word_result.program, StageInputKind::SampleId) &&
+            !ProgramHasInput(high_word_result.program,
+                             StageInputKind::PackedAncillary),
+        "high-word write kept ancillary bits that are never read");
+  CheckSpirvBinaryValidates(high_word_result.spirv);
+
   const uint32_t loop[] = {
       EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
       EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
@@ -4073,6 +4102,13 @@ void TestPixelAncillaryLayerInput() {
   dpp[3] = EncodeVop1Dpp(6); // Without BOUND_CTRL, lanes with inactive sources keep the value.
   ExpectFatal([&] { (void)RecompileForTest(dpp, options); },
               "DPP write without BOUND_CTRL silently replaced the ancillary value");
+  high_word[8] = EncodeVop3Word1(5 + 256, 128, 128 + 16);
+  ExpectFatal([&] { (void)RecompileForTest(high_word, options); },
+              "low ancillary word kept by a high-word write was silently replaced");
+  high_word[8] = EncodeVop3Word1(5 + 256, 128 + 16, 128 + 16);
+  high_word[9] = EncodeSopp(0x00);
+  ExpectFatal([&] { (void)RecompileForTest(high_word, options); },
+              "ancillary word with a written high half was exported whole");
 #endif
 }
 

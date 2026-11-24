@@ -190,6 +190,21 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+if(TARGET OpenAL AND CLANG)
+	set(_kyty_openal_fix_header "${CMAKE_CURRENT_BINARY_DIR}/openal_nonblocking_fix.h")
+	file(GENERATE OUTPUT "${_kyty_openal_fix_header}" CONTENT
+		"#pragma once\n#include \"opthelpers.h\"\n#undef NONBLOCKING\n#define NONBLOCKING\n"
+	)
+	if(KYTY_CLANG_CL)
+		target_compile_options(OpenAL PRIVATE
+			$<$<COMPILE_LANGUAGE:CXX>:/FI${_kyty_openal_fix_header}>
+		)
+	else()
+		target_compile_options(OpenAL PRIVATE
+			"$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${_kyty_openal_fix_header}>"
+		)
+	endif()
+endif()
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS

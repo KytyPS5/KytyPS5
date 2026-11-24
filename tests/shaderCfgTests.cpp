@@ -4041,6 +4041,27 @@ void TestPixelAncillaryLayerInput() {
         "ancillary regression did not retain its scalar loop");
   CheckSpirvBinaryValidates(loop_result.spirv);
 
+  uint32_t nested_loops[] = {
+      EncodeSMovB32(2, 128),
+      EncodeSMovB32(3, 128),
+      EncodeSop2(0x00, 3, 3, 129),
+      EncodeSopc(0x0a, 3, 131),
+      EncodeSopp(0x05, 0xfffdu),
+      EncodeSop2(0x00, 2, 2, 129),
+      EncodeSopc(0x0a, 2, 131),
+      EncodeSopp(0x05, 0xfff9u),
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4),
+      EncodeVopc(0x01, 128, 2),
+      EncodeSop1(0x24, 8, 106),
+      EncodeVop1(0x01, 5, 6 + 256),
+      EncodeExp0(0x00, 0x3), EncodeExp1(5, 6, 0, 0), EncodeSopp(0x01),
+  };
+  auto nested_result = RecompileForTest(nested_loops, options);
+  Check(ProgramHasInput(nested_result.program, StageInputKind::SampleId) &&
+            !ProgramHasInput(nested_result.program, StageInputKind::PackedAncillary),
+        "overwrite after nested loops retained the ancillary register value");
+  CheckSpirvBinaryValidates(nested_result.spirv);
+
   const uint32_t unused[] = {EncodeSopp(0x01)};
   auto unused_result = RecompileForTest(unused, options);
   Check(!ProgramHasInput(unused_result.program, StageInputKind::Layer) &&
@@ -4073,6 +4094,9 @@ void TestPixelAncillaryLayerInput() {
   dpp[3] = EncodeVop1Dpp(6); // Without BOUND_CTRL, lanes with inactive sources keep the value.
   ExpectFatal([&] { (void)RecompileForTest(dpp, options); },
               "DPP write without BOUND_CTRL silently replaced the ancillary value");
+  nested_loops[12] = EncodeSopp(0x00);
+  ExpectFatal([&] { (void)RecompileForTest(nested_loops, options); },
+              "raw ancillary export after nested loops was silently replaced");
 #endif
 }
 

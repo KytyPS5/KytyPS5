@@ -8789,6 +8789,23 @@ public:
               "partial storage conversion lost native depth data outside its view");
       DestroyBuffer(&htile_readback);
 
+      auto depth_prefix = htile_depth;
+      depth_prefix.info.resources.layers = 2;
+      depth_prefix.info.data.size = 2 * htile_slice_size;
+      depth_prefix.info.mip_layout[0].size = depth_prefix.info.data.size;
+      depth_prefix.info.metadata.range.size = 2 * 0x8000;
+      depth_prefix.view_info.base_layer = 1;
+      depth_prefix.view_info.layer_count = 1;
+      const auto prefix_id = texture_cache.FindImage(depth_prefix);
+      const auto prefix_view = texture_cache.FindDepthTarget(prefix_id, depth_prefix);
+      const auto &prefix_owner = texture_cache.GetImage(prefix_id);
+      Require(name, "HTile depth prefix after storage",
+              prefix_view != nullptr && prefix_owner.info.data == htile_depth.info.data &&
+                  prefix_owner.info.metadata.range == depth_prefix.info.metadata.range &&
+                  ReadCachedTexel(name, context, prefix_id, {}, {1, 1, 1}, htile_layers - 1) ==
+                      std::vector<u32>{std::bit_cast<u32>(0.25f)},
+              "rebinding a depth prefix discarded the remaining storage layers");
+
       auto layered_stencil_desc = MakeLinearDesc(
           base + 0x27d4000, 6 * 4 * sizeof(float),
           vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,

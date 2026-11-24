@@ -2744,12 +2744,15 @@ private:
 	}
 
 	void FoldBoundedLoopSelectors() {
-		const auto fold = [&](const Inst& compare, const auto& bounds, const Block* header) {
+		const auto enters = [&](const EdgePredicate& edge, const Inst& compare, const Inst* mask) {
+			return edge.positive && Implies(edge.condition, Value(const_cast<Inst*>(&compare))) &&
+			       (mask == nullptr || Implies(edge.condition, Value(const_cast<Inst*>(mask))));
+		};
+		const auto fold = [&](const Inst& compare, const auto& bounds, const Block* header,
+		                      const Inst* mask = nullptr) {
 			for (auto* block: m_program.blocks) {
 				if (!GuardedOnEntry(block, [&](const Block* at) { return at == header; },
-				    [&](const EdgePredicate& edge) {
-					    return edge.positive && Implies(edge.condition, Value(const_cast<Inst*>(&compare)));
-				    })) continue;
+				    [&](const EdgePredicate& edge) { return enters(edge, compare, mask); })) continue;
 				for (auto& inst: *block)
 					if (inst.GetOpcode() == ValueOpcode::SelectU32 &&
 					    SelectorPredicateFalse(inst.Arg(0), bounds)) inst.ReplaceUsesWith(inst.Arg(2));
@@ -2758,6 +2761,7 @@ private:
 		for (auto* header: m_program.blocks) {
 			for (auto& induction: *header) {
 				const Inst* carried = nullptr;
+				const Inst* mask = nullptr;
 				uint32_t maximum = 0;
 				if (const auto* compare = DescendingLoop(Value(&induction), nullptr, maximum)) {
 					const std::array bounds {std::pair {static_cast<const Inst*>(&induction), maximum}};
@@ -2773,7 +2777,25 @@ private:
 					    carried->NumArgs() != 2u || carried->NumPhiBlocks() != 2u ||
 					    carried->PhiBlock(0) != induction.PhiBlock(0) ||
 					    carried->PhiBlock(1) != induction.PhiBlock(1)) return false;
+					mask = nullptr;
 					maximum = SelectorMaximum(carried->Arg(initial));
+					const auto* step = induction.Arg(initial ^ 1u).Resolve().TryInstruction();
+					for (const auto& lanes: *header) {
+						if (maximum != UINT32_MAX || lanes.GetOpcode() != ValueOpcode::Phi) break;
+						if (lanes.GetType() != Type::U1 || lanes.NumArgs() != 2u ||
+						    lanes.PhiBlock(0) != induction.PhiBlock(0) ||
+						    lanes.PhiBlock(1) != induction.PhiBlock(1) ||
+						    !Implies(lanes.Arg(initial ^ 1u), Value(const_cast<Inst*>(&lanes))) ||
+						    !GuardedOnEntry(
+						        step->Parent(), [&](const Block* at) { return at == header; },
+						        [&](const EdgePredicate& edge) {
+							        return enters(edge, test, &lanes);
+						        }))
+							continue;
+						mask = &lanes;
+						maximum =
+						    SelectorMaximum(carried->Arg(initial), {}, 0u, lanes.Arg(initial));
+					}
 					if (maximum == 0u || maximum == UINT32_MAX) return false;
 					const std::array assumptions {std::pair {static_cast<const Inst*>(&induction), maximum - 1u},
 					                             std::pair {carried, maximum}};
@@ -2786,7 +2808,8 @@ private:
 				// Native scalar branches advance the zero/+1 induction uniformly, so
 				// even an any-lane bound test limits it by the largest carried bound.
 				// Per-lane edges instead require the comparison on every executing lane.
-				fold(*compare, assumptions, header);
+				fold(*compare, std::span(assumptions).first(mask == nullptr ? 2u : 1u), header,
+				     mask);
 			}
 		}
 	}

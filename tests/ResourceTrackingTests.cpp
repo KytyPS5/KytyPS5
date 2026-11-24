@@ -9246,6 +9246,113 @@ void TestBoundedRelativeRegisterReads() {
         "a loop bound on M0 left an impossible relative read");
 }
 
+void TestMaskedRelativeRegisterWrites() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant {
+    Bounded, BoundClobber, DescriptorClobber, WideEntry, UnmaskedEdge, WideningMask, BoundSelect, UnmaskedLatch
+  };
+  for (const auto variant : {Variant::Bounded, Variant::BoundClobber, Variant::DescriptorClobber,
+                             Variant::WideEntry, Variant::UnmaskedEdge, Variant::WideningMask,
+                             Variant::BoundSelect, Variant::UnmaskedLatch}) {
+    const bool unmasked_latch = variant == Variant::UnmaskedLatch;
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *test = fixture.AddBlock();
+    auto *gate = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(test);
+    test->AddBranch(exit);
+    test->AddBranch(gate);
+    gate->AddBranch(body);
+    if (unmasked_latch) gate->AddBranch(latch);
+    body->AddBranch(latch);
+    latch->AddBranch(header);
+    entry->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = test};
+    test->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = exit, .false_block = gate};
+    gate->terminator = {.kind = unmasked_latch ? CFG::TerminatorKind::ConditionalBranch
+                                               : CFG::TerminatorKind::Branch,
+                        .true_block = body, .false_block = unmasked_latch ? latch : nullptr};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch};
+    latch->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto launched = fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(32u)});
+    const auto capped = fixture.Emit(ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::ULessThan32, {lane, Value(8u)}), Value(5u),
+         fixture.Emit(ValueOpcode::UMin32, {Value(5u), fixture.UserData(4u)})});
+    const auto initial_bound = fixture.Emit(ValueOpcode::SelectU32,
+                                            {launched, capped, fixture.UserData(5u)});
+    const auto initial_records = fixture.UserData(2u);
+    const auto base = fixture.UserData(0u);
+    auto &counter = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &bound = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &records = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &mask = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+    const auto in_range = fixture.Emit(ValueOpcode::ULessThan32,
+                                       {Value(&counter), Value(&bound)}, 0, test);
+    const auto active = fixture.Emit(ValueOpcode::LogicalAnd, {Value(&mask), in_range}, 0, test);
+    const auto executing = variant == Variant::UnmaskedEdge ? in_range : active;
+    test->condition = fixture.Emit(ValueOpcode::LogicalNot,
+        {fixture.Emit(ValueOpcode::ConditionRef, {unmasked_latch ? in_range : executing},
+                      CFG::BranchCondition::ExecNonZero, test)}, 0, test);
+    if (unmasked_latch)
+      gate->condition = fixture.Emit(ValueOpcode::ConditionRef, {active},
+                                     CFG::BranchCondition::ExecNonZero, gate);
+    const auto m0 = fixture.Emit(ValueOpcode::IMul32, {Value(&counter), Value(3u)}, 0, gate);
+    const auto relative_write = [&](Value old_value, uint32_t offset, Value active_lanes, Block *at) {
+      const auto selected = fixture.Emit(ValueOpcode::IEqual32, {m0, Value(offset)}, 0, at);
+      const auto write = fixture.Emit(ValueOpcode::LogicalAnd, {active_lanes, selected}, 0, at);
+      return fixture.Emit(ValueOpcode::SelectU32, {write, lane, old_value}, 0, at);
+    };
+    const auto records_write = variant == Variant::BoundSelect
+        ? fixture.Emit(ValueOpcode::SelectU32,
+                       {fixture.Emit(ValueOpcode::IEqual32, {Value(&bound), Value(7u)}, 0, body), lane,
+                        Value(&records)}, 0, body)
+        : relative_write(Value(&records), variant == Variant::DescriptorClobber ? 12u : 18u, executing, body);
+    const auto bound_write = unmasked_latch
+        ? relative_write(Value(&bound), 21u, Value(true), latch)
+        : relative_write(Value(&bound), variant == Variant::BoundClobber ? 12u : 22u, executing, body);
+    bound.AddPhiOperand(entry, initial_bound);
+    bound.AddPhiOperand(latch, bound_write);
+    records.AddPhiOperand(entry, initial_records);
+    records.AddPhiOperand(latch, records_write);
+    mask.AddPhiOperand(entry, variant == Variant::WideEntry ? Value(true) : launched);
+    mask.AddPhiOperand(latch, variant == Variant::WideningMask ? in_range : active);
+    counter.AddPhiOperand(entry, Value(0u));
+    counter.AddPhiOperand(latch, fixture.Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)}, 0,
+                                              unmasked_latch ? latch : body));
+    const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+        {base, Value(4u << 16u), Value(&records), Value(0x16204u)},
+        MemoryFlags{0, 0x3e8}, exit);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        fixture.AddMemory(memory, 0x3e8), exit);
+    if (variant != Variant::Bounded) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "masked relative register proof discarded a possible loop clobber");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    const std::array<uint32_t, 3> user_data{0x1000u, 0u, 72u};
+    SrtRuntime runtime{.user_data = user_data};
+    DescriptorValue descriptor;
+    Check(EvaluateSrtDescriptor(plan, runtime, fixture.program.info.buffers[0].source, descriptor) &&
+              descriptor.dwords[2] == 72u,
+          "relative writes beyond the masked loop bound left a false descriptor dependency");
+  }
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -10054,6 +10161,7 @@ int main() {
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("bounded relative register reads", TestBoundedRelativeRegisterReads);
+    Run("masked relative register writes", TestMaskedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);

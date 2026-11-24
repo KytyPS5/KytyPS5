@@ -4771,6 +4771,26 @@ public:
     bool walker_unmapped_zero = false;
     LibKernel::Memory::InstallGpuResources(&resources);
     gpu.SendCommandSync([&] {
+      constexpr uint64_t fill = fault_base + 0x22000;
+      constexpr uint32_t bytes = 2 * TRACKER_PAGE_SIZE;
+      (void)buffer_cache.FindBuffer(fill, bytes);
+      (void)buffer_cache.ObtainBufferForImage(fill, bytes);
+      Require("GpuCommandLane", "watched CPU fill setup",
+              !buffer_cache.IsRegionCpuModified(fill, bytes) &&
+                  !buffer_cache.IsRegionGpuModified(fill, bytes),
+              "the fill destination was not fully write-watched");
+      Common::DebugCounters::SetEnabled(true);
+      const auto faults = Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+      buffer_cache.FillBuffer(fill, bytes, 0xababababu, false);
+      const auto after = Common::DebugCounters::Get(Common::DebugCounters::Counter::GpuFaults);
+      Common::DebugCounters::SetEnabled(false);
+      const auto *words = reinterpret_cast<const uint32_t *>(fill);
+      Require("GpuCommandLane", "CPU fill of watched pages",
+              after == faults && std::all_of(words, words + bytes / sizeof(*words),
+                                             [](uint32_t word) { return word == 0xababababu; }) &&
+                  buffer_cache.IsRegionCpuModified(fill, 1) &&
+                  buffer_cache.IsRegionCpuModified(fill + bytes - 1, 1),
+              "the fill faulted, left a page clean, or wrote incorrect bytes");
       (void)buffer_cache.ObtainBuffer(table_gpu_address, sizeof(uint32_t), true,
                                       false);
       buffer_cache.FillBuffer(table_gpu_address, sizeof(uint32_t), 0x7ab1e5u,

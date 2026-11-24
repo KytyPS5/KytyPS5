@@ -8012,7 +8012,10 @@ public:
       std::vector<u32> mip_guest(0x2000 / sizeof(u32));
       std::iota(mip_guest.begin(), mip_guest.end(), 0x51000000u);
       ImageId previous{};
-      for (const uint32_t width : {32u, 64u, 32u}) {
+      // Change both extent and physical mip count at one guest address. The 64-wide
+      // chain shifts mip zero by a tile; the 32-wide chain shifts it within a tile.
+      for (const auto [width, levels] : {std::pair{32u, 7u}, {64u, 7u}, {64u, 1u},
+                                         {64u, 7u}, {32u, 7u}, {32u, 1u}, {32u, 7u}}) {
         if (previous) {
           Require(name, "mip-layout CPU overwrite",
                   resources.HandleFault(PageFaultAccess::Write,
@@ -8027,9 +8030,9 @@ public:
                 TileGetTiledTextureLayout(
                     {.format = Prospero::BufferFormat::kBc3Srgb,
                      .tile_mode = Prospero::TileMode::kStandard4KB,
-                     .width = width, .height = 64, .levels = 7}, surface, mips) &&
-                    surface.first_tail_level == (width == 32 ? 0u : 1u) &&
-                    surface.total_size == (width == 32 ? 0x1000u : 0x2000u),
+                     .width = width, .height = 64, .levels = levels}, surface, mips) &&
+                    surface.first_tail_level == (width == 32 && levels > 1 ? 0u : 1u) &&
+                    surface.total_size == (width == 64 && levels > 1 ? 0x2000u : 0x1000u),
                 "BC3 width change did not move mip zero into or out of the tail");
         ImageDesc desc{};
         desc.type = BindingType::Texture;
@@ -8037,18 +8040,18 @@ public:
         desc.info.pixel_format = vk::Format::eBc3SrgbBlock;
         desc.info.guest_format = Prospero::BufferFormat::kBc3Srgb;
         desc.info.extent = {width, 64, 1};
-        desc.info.resources = {7, 1};
+        desc.info.resources = {levels, 1};
         desc.info.pitch = 64;
         desc.info.bytes_per_block = 16;
         desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
         desc.view_info.format = desc.info.pixel_format;
         desc.view_info.type = vk::ImageViewType::e2D;
-        desc.view_info.level_count = 7;
+        desc.view_info.level_count = levels;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
         desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
         std::vector<vk::BufferImageCopy> copies;
         std::vector<u32> expected;
-        for (uint32_t level = 0; level < 7; level++) {
+        for (uint32_t level = 0; level < levels; level++) {
           const auto &layout = mips[level];
           desc.info.mip_layout[level] = {layout.offset, layout.size,
                                          layout.pitch, layout.height};
@@ -8091,8 +8094,8 @@ public:
                 ReadBuffer(name, readback, expected.size()) == expected,
                 "cached native copying contaminated the requested guest mip layout");
         DestroyBuffer(&readback);
-        if (width == 64) {
-          // Leave only the larger backing so shrinking must reject its layout.
+        if (previous) {
+          // Force the next lookup to resolve against the current layout.
           TextureCacheTestAccess::DeleteImage(texture_cache, previous);
         }
         previous = id;

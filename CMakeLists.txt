@@ -336,7 +336,11 @@ if (KYTY_CLANG_CL)
 endif()
 
 # Keep the renderer's OpenAL headers and compile definitions private.
-set(spatial_renderer_src "${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp" "${KYTY_SOURCE_DIR}/libs/audio3d.cpp")
+set(spatial_renderer_src
+	"${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audio3d.cpp"
+	"${KYTY_SOURCE_DIR}/libs/audioSpeakerArray.cpp"
+)
 list(REMOVE_ITEM kyty_emulator_src ${spatial_renderer_src})
 add_library(kyty_spatial_audio STATIC ${spatial_renderer_src})
 target_link_libraries(kyty_spatial_audio PRIVATE common OpenAL::OpenAL)

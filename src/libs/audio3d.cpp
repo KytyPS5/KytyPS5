@@ -33,13 +33,11 @@ enum Attribute : uint32_t {
 struct Port {
 	std::mutex                       mutex;
 	std::condition_variable          changed;
-	std::shared_ptr<SpatialRenderer> renderer;
+	std::unique_ptr<SpatialRenderer> renderer;
 	uint32_t                         frames = 0;
 	std::vector<SpatialObject>       objects;
 	std::vector<uint32_t>            ids;
-	uint32_t                         serial            = 0;
-	float                            late_reverb_level = 0, downmix_spread_radius = 2;
-	int                              height_aware = 0;
+	uint32_t                         serial = 0;
 	std::vector<std::vector<float>>  grains;
 	size_t                           read = 0, queued = 0, playable = 0;
 	bool                             closed = false;
@@ -210,9 +208,7 @@ int KYTY_SYSV_ABI Audio3dObjectSetAttributes(uint32_t id, uint32_t object, size_
 					return INVALID_PARAMETER;
 				break;
 			case Position:
-				if (!a.value || a.size != sizeof(spatial.position)) return INVALID_PARAMETER;
-				std::memcpy(&spatial.position, a.value, a.size);
-				if (!spatial.position.IsFinite()) return INVALID_PARAMETER;
+				if (!spatial.SetPosition(a.value, a.size)) return INVALID_PARAMETER;
 				break;
 			case Spread:
 				if (!spatial.SetSpread(a.value, a.size)) return INVALID_PARAMETER;
@@ -223,10 +219,7 @@ int KYTY_SYSV_ABI Audio3dObjectSetAttributes(uint32_t id, uint32_t object, size_
 				if (!std::isfinite(gain) || gain < 0) return INVALID_PARAMETER;
 				break;
 			case Ambisonics:
-				if (!a.value || a.size != sizeof(spatial.ambisonics)) return INVALID_PARAMETER;
-				std::memcpy(&spatial.ambisonics, a.value, a.size);
-				if (spatial.ambisonics != UINT32_MAX && spatial.ambisonics >= 16)
-					return INVALID_PARAMETER;
+				if (!spatial.SetAmbisonics(a.value, a.size, false)) return INVALID_PARAMETER;
 				break;
 		}
 	}
@@ -257,16 +250,9 @@ int KYTY_SYSV_ABI Audio3dPortGetAttributesSupported(uint32_t id, uint32_t* caps,
 
 int KYTY_SYSV_ABI Audio3dPortSetAttribute(uint32_t id, uint32_t attribute, const void* value,
                                           size_t size) {
-	auto p = FindPort(id);
-	if (!p) return INVALID_PORT;
-	if (!value || size != 4) return INVALID_PARAMETER;
-	std::lock_guard lock(p->mutex);
-	switch (attribute) {
-		case 0x10001: std::memcpy(&p->late_reverb_level, value, size); break;
-		case 0x10002: std::memcpy(&p->downmix_spread_radius, value, size); break;
-		case 0x10003: std::memcpy(&p->height_aware, value, size); break;
-		default: return INVALID_PARAMETER;
-	}
+	if (!FindPort(id)) return INVALID_PORT;
+	// The legacy reverb and downmix port controls are accepted by the ABI.
+	if (!value || size != 4 || attribute < 0x10001 || attribute > 0x10003) return INVALID_PARAMETER;
 	return OK;
 }
 

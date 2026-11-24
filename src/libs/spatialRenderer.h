@@ -1,5 +1,7 @@
 #pragma once
 
+#include "libs/audio.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -8,19 +10,14 @@
 
 namespace Libs::Audio {
 
-struct SpatialPosition {
-	float x, y, z;
-
-	bool IsFinite() const;
-};
-
 struct SpatialAttributes {
-	SpatialPosition position {};
-	float           spread     = 0;
-	uint32_t        ambisonics = UINT32_MAX;
+	AudioOut2::AudioOut2Position position {};
+	float                        spread     = 0;
+	uint32_t                     ambisonics = UINT32_MAX;
 
-	bool        SetSpread(const void* value, size_t size);
-	static bool ValidAmbisonics(uint32_t channel);
+	bool SetPosition(const void* value, size_t size);
+	bool SetSpread(const void* value, size_t size);
+	bool SetAmbisonics(const void* value, size_t size, bool allow_acn);
 };
 
 struct SpatialObject {
@@ -33,7 +30,7 @@ struct SpatialObject {
 // One loopback context and one SDL submission handle per object bus.
 class SpatialRenderer {
 public:
-	static std::shared_ptr<SpatialRenderer> Open(uint32_t frames, uint32_t max_objects);
+	static std::unique_ptr<SpatialRenderer> Open(uint32_t frames, uint32_t max_objects);
 	~SpatialRenderer();
 	int  OutputHandle() const { return m_handle; }
 	bool Render(std::span<const SpatialObject> objects, std::vector<float>& output,

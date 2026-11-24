@@ -14,8 +14,22 @@
 
 namespace Libs::Audio {
 
-bool SpatialPosition::IsFinite() const {
+bool AudioOut2::AudioOut2Position::IsFinite() const {
 	return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+double AudioOut2::AudioOut2Position::Length() const {
+	return std::hypot(double(x), double(y), double(z));
+}
+
+AudioOut2::AudioOut2Position AudioOut2::AudioOut2Position::operator/(double divisor) const {
+	return {float(x / divisor), float(y / divisor), float(z / divisor)};
+}
+
+bool SpatialAttributes::SetPosition(const void* value, size_t size) {
+	if (!value || size != sizeof(position)) return false;
+	std::memcpy(&position, value, size);
+	return position.IsFinite();
 }
 
 bool SpatialAttributes::SetSpread(const void* value, size_t size) {
@@ -27,8 +41,11 @@ bool SpatialAttributes::SetSpread(const void* value, size_t size) {
 	return true;
 }
 
-bool SpatialAttributes::ValidAmbisonics(uint32_t channel) {
-	return channel == UINT32_MAX || channel < 16 || (channel >= 64 && channel < 100);
+bool SpatialAttributes::SetAmbisonics(const void* value, size_t size, bool allow_acn) {
+	if (!value || size != sizeof(ambisonics)) return false;
+	std::memcpy(&ambisonics, value, size);
+	return ambisonics == UINT32_MAX || ambisonics < 16 ||
+	       (allow_acn && ambisonics >= 64 && ambisonics < 100);
 }
 
 struct SpatialRenderer::Impl {
@@ -57,9 +74,10 @@ struct SpatialRenderer::Impl {
 			// OpenAL fades a stopped voice. Give it silence instead of another turn
 			// of the last grain, while letting its convolution history decay.
 			silence.resize(size_t(frames) * (voice.order + 1) * (voice.order + 1));
-			alBufferSubDataDirectSOFT(context, voice.buffer,
-			                          voice.order ? AL_FORMAT_BFORMAT3D_FLOAT32 : AL_FORMAT_MONO_FLOAT32,
-			                          silence.data(), 0, static_cast<ALsizei>(silence.size() * sizeof(float)));
+			alBufferSubDataDirectSOFT(
+			    context, voice.buffer,
+			    voice.order ? AL_FORMAT_BFORMAT3D_FLOAT32 : AL_FORMAT_MONO_FLOAT32, silence.data(),
+			    0, static_cast<ALsizei>(silence.size() * sizeof(float)));
 			retiring.push_back(std::exchange(voice, {}));
 		}
 		if (samples.empty()) return;
@@ -68,7 +86,12 @@ struct SpatialRenderer::Impl {
 		const bool start  = !voice.source;
 		if (start) {
 			alGenSourcesDirect(context, 1, &voice.source);
+			if (!voice.source) return;
 			alGenBuffersDirect(context, 1, &voice.buffer);
+			if (!voice.buffer) {
+				Release(voice);
+				return;
+			}
 			if (order) {
 				alBufferiDirect(context, voice.buffer, AL_AMBISONIC_LAYOUT_SOFT,
 				                acn ? AL_ACN_SOFT : AL_FUMA_SOFT);
@@ -86,19 +109,14 @@ struct SpatialRenderer::Impl {
 			alBufferSubDataDirectSOFT(context, voice.buffer, format, samples.data(), 0, bytes);
 		}
 		if (!order) {
-			auto [x, y, z]        = attributes.position;
-			const double distance = std::hypot(double(x), double(y), double(z));
-			if (distance > 0) {
-				x /= distance;
-				y /= distance;
-				z /= distance;
-			}
+			auto dir = attributes.position;
+			if (const double length = dir.Length(); length > 0) dir = dir / length;
 			// Invert OpenAL Soft's apparent angle of a sphere at unit distance.
 			constexpr float pi    = std::numbers::pi_v<float>;
 			const float     angle = attributes.spread;
 			const float     radius =
 			    angle <= pi ? std::sin(angle * 0.5f) : pi / std::max(2 * pi - angle, 1e-6f);
-			alSource3fDirect(context, voice.source, AL_POSITION, x, y, -z);
+			alSource3fDirect(context, voice.source, AL_POSITION, dir.x, dir.y, -dir.z);
 			alSourcefDirect(context, voice.source, AL_SOURCE_RADIUS, radius);
 		}
 		if (start) alSourcePlayDirect(context, voice.source);
@@ -119,15 +137,15 @@ SpatialRenderer::~SpatialRenderer() {
 	if (m->device) alcCloseDevice(m->device);
 }
 
-std::shared_ptr<SpatialRenderer> SpatialRenderer::Open(uint32_t frames, uint32_t max_objects) {
+std::unique_ptr<SpatialRenderer> SpatialRenderer::Open(uint32_t frames, uint32_t max_objects) {
 	if (!frames || frames > std::numeric_limits<ALsizei>::max() / (36 * sizeof(float))) return {};
-	auto  renderer = std::shared_ptr<SpatialRenderer>(new SpatialRenderer);
+	auto  renderer = std::unique_ptr<SpatialRenderer>(new SpatialRenderer);
 	auto& m        = *renderer->m;
 	m.device       = alcLoopbackOpenDeviceSOFT(nullptr);
 	if (!m.device) return {};
-	m.channels = AudioInternal::GetMainOutput().channels;
+	m.channels    = AudioInternal::GetMainOutput().channels;
 	ALCint layout = ALC_STEREO_SOFT;
-	auto format = AudioInternal::Format::FloatStereo;
+	auto   format = AudioInternal::Format::FloatStereo;
 	switch (m.channels) {
 		case 6:
 			layout = ALC_5POINT1_SOFT;
@@ -147,9 +165,11 @@ std::shared_ptr<SpatialRenderer> SpatialRenderer::Open(uint32_t frames, uint32_t
 	                        ALC_MONO_SOURCES,
 	                        static_cast<int>(max_objects),
 	                        ALC_STEREO_SOURCES,
-	                        2,
+	                        4, // Two B-format conventions, with a retiring buffer on order changes.
 	                        ALC_OUTPUT_MODE_SOFT,
-	                        Config::GetAudioOutput() == Config::AudioOutput::Headphones ? ALC_STEREO_HRTF_SOFT : ALC_STEREO_BASIC_SOFT,
+	                        Config::GetAudioOutput() == Config::AudioOutput::Headphones
+	                            ? ALC_STEREO_HRTF_SOFT
+	                            : ALC_STEREO_BASIC_SOFT,
 	                        ALC_OUTPUT_LIMITER_SOFT,
 	                        ALC_FALSE,
 	                        0};
@@ -160,10 +180,12 @@ std::shared_ptr<SpatialRenderer> SpatialRenderer::Open(uint32_t frames, uint32_t
 	m.voices.resize(max_objects);
 	renderer->m_handle =
 	    AudioInternal::AudioOutOpen(AUDIO_OUT_PORT_TYPE_MAIN, frames, 48000, format);
-	return renderer->m_handle ? renderer : nullptr;
+	if (!renderer->m_handle) return {};
+	return renderer;
 }
 
-bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector<float>& output, bool include_silence) {
+bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector<float>& output,
+                             bool include_silence) {
 	std::array<int, 2> orders {};
 	bool               fed = false;
 	for (const auto& obj: objects) {
@@ -188,12 +210,16 @@ bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector
 		const bool  point = ch == UINT32_MAX && !obj.pcm.empty();
 		if (!point) m->Update(m->voices[i], {}, 0, false);
 		if (obj.pcm.empty()) continue;
+		const auto* f32 = reinterpret_cast<const float*>(obj.pcm.data());
+		if (point && obj.is_float && obj.gain == 1) {
+			m->Update(m->voices[i], {f32, m->frames}, 0, false, obj.attributes);
+			continue;
+		}
 		const bool acn = ch >= 64;
 		if (point) m->mono.assign(m->frames, 0);
 		auto&        dst    = point ? m->mono : m->beds[acn];
 		const size_t stride = dst.size() / m->frames;
 		const auto   offset = point ? 0u : (acn ? ch - 64 : ch);
-		const auto*  f32    = reinterpret_cast<const float*>(obj.pcm.data());
 		const auto*  s16    = reinterpret_cast<const int16_t*>(obj.pcm.data());
 		for (uint32_t j = 0; j < m->frames; ++j) {
 			const float sample = (obj.is_float ? f32[j] : s16[j] / 32768.0f) * obj.gain;
@@ -206,10 +232,12 @@ bool SpatialRenderer::Render(std::span<const SpatialObject> objects, std::vector
 	}
 	output.resize(size_t(m->frames) * m->channels);
 	alcRenderSamplesSOFT(m->device, output.data(), m->frames);
-	for (auto& voice: m->retiring) m->Release(voice);
+	for (auto& voice: m->retiring)
+		m->Release(voice);
 	m->retiring.clear();
 	m->draining = fed || std::any_of(output.begin(), output.end(), [](float s) { return s != 0; });
 	if (!include_silence && !m->draining) output.clear();
-	return alGetErrorDirect(m->context) == AL_NO_ERROR && alcGetError(m->device) == ALC_NO_ERROR;
+	const auto error = alGetErrorDirect(m->context);
+	return alcGetError(m->device) == ALC_NO_ERROR && error == AL_NO_ERROR;
 }
 } // namespace Libs::Audio

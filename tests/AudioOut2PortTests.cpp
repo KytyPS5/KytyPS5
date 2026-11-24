@@ -369,9 +369,13 @@ void TestObjectPortCapacityPerContext() {
 	Check(AudioOut2::AudioOut2PortSetAttributes(last_ports[0], nullptr, 0) == invalid_port,
 	      "destroyed context retained its object handles");
 	const auto replacement = CreateContext(4, 512);
-	for (size_t i = 0; i < 512; i++) {
-		CreatePort(replacement, object);
-	}
+	std::array<float, 512> quiet;
+	quiet.fill(.25f / 512);
+	for (size_t i = 0; i < 512; i++)
+		SetPcm(CreatePort(replacement, object), quiet.data());
+	const auto combined = PushPcm(replacement, 512 * 2 * sizeof(float));
+	Check(std::abs(LastSample(combined.at(0), 2, 0) - center) < 1e-5f,
+	      "512 simultaneous objects lost voices or changed gain");
 	Check(AudioOut2::AudioOut2PortSetAttributes(last_ports[0], nullptr, 0) == invalid_port,
 	      "reused context accepted an old object handle");
 	for (size_t i = 1; i < contexts.size(); i++) {
@@ -870,7 +874,8 @@ void TestObjectGainAndAmbisonics() {
 		auto render = [&](uint32_t channel) {
 			const Pcm input {pcm};
 			const float gain = 0.5f;
-			const Attribute attributes[] {{0, 0, &input, sizeof(input)}, {1, 0, &gain, sizeof(gain)},
+			const Attribute attributes[] {{0, 0, &input, sizeof(input)},
+			                              {1, 0, &gain, sizeof(gain)},
 			                              {8, 0, &channel, sizeof(channel)}};
 			Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
 			      "object attributes could not be set atomically with PCM first");
@@ -881,16 +886,18 @@ void TestObjectGainAndAmbisonics() {
 		Check(std::abs(mono[0] - 0.5f * center) < 1e-5f, "object gain ignored");
 		const auto w = render(0), acn_w = render(64);
 		Check(w[0] > 0.05f && std::abs(w[0] - w[1]) < 1e-5f &&
-		      std::abs(w[0] - std::sqrt(2.0f) * acn_w[0]) < 1e-4f, "wrong B-format W scaling");
+		          std::abs(w[0] - std::sqrt(2.0f) * acn_w[0]) < 1e-4f,
+		      "wrong B-format W scaling");
 		const auto y = render(2), acn_y = render(65);
-		Check(y[0] > 0.05f && std::abs(y[0]+y[1]) < 1e-4f &&
-		      std::abs(y[0]-acn_y[0]) < 1e-4f, "wrong B-format left/right axis");
+		Check(y[0] > 0.05f && std::abs(y[0] + y[1]) < 1e-4f && std::abs(y[0] - acn_y[0]) < 1e-4f,
+		      "wrong B-format left/right axis");
 		const auto high = render(99);
 		Check(std::isfinite(high[0]) && std::isfinite(high[1]), "invalid fifth-order decode");
 		SetAttribute(object, 8, UINT32_MAX);
 		SetAttribute(object, 1, 0.0f);
 		SetPcm(object, pcm);
-		Check(std::abs(LastSample(PushPcm(context, output_bytes).at(0), 2, 0)) < 1e-6f, "zero gain did not mute object");
+		Check(std::abs(LastSample(PushPcm(context, output_bytes).at(0), 2, 0)) < 1e-6f,
+		      "zero gain did not mute object");
 		// A refused advance keeps the attributes the PCM locked.
 		Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 		SetPcm(object, pcm);
@@ -937,7 +944,8 @@ void TestObjectBusRouting() {
 	CheckSamples(PushPcm(context, bytes).at(0), {mix}, "object output depended on bed PCM");
 	AudioOut2::AudioOut2ContextDestroy(context);
 	Check(LiveDeviceCount() == 1, "context destroy closed another context's object device");
-	CheckSamples(PushPcm(other_context, bytes).at(0), {2 * mix}, "other context lost its object PCM");
+	CheckSamples(PushPcm(other_context, bytes).at(0), {2 * mix},
+	             "other context lost its object PCM");
 	AudioOut2::AudioOut2ContextDestroy(other_context);
 	Check(AudioOut2::AudioOut2UserDestroy(other_user) == OK, "second user destroy failed");
 	Check(LiveDeviceCount() == 0, "object bus device leaked");
@@ -1006,24 +1014,25 @@ void SetAudioOutput(Config::AudioOutput output, bool spatial = false) {
 }
 
 void TestSpatialLayouts() {
-	for (auto output: {Config::AudioOutput::TV, Config::AudioOutput::SoundBar, Config::AudioOutput::AVReceiver}) {
+	for (auto output: {Config::AudioOutput::TV, Config::AudioOutput::SoundBar,
+	                   Config::AudioOutput::AVReceiver}) {
 		SetAudioOutput(output);
-		const size_t channels = Libs::Audio::AudioInternal::GetMainOutput().channels;
-		const auto ctx = CreateContext(2, 1);
-		auto param = MakeParam(0x100);
-		param.port_type = 0x100;
-		const auto port = CreatePort(ctx, param);
+		const size_t channels       = Libs::Audio::AudioInternal::GetMainOutput().channels;
+		const auto   ctx            = CreateContext(2, 1);
+		auto         param          = MakeParam(0x100);
+		param.port_type             = 0x100;
+		const auto             port = CreatePort(ctx, param);
 		std::array<float, 512> pcm;
 		pcm.fill(0.25f);
 		auto render = [&](float x, float z, float spread) {
-			SetAttribute(port, 3, std::array{x, 0.0f, z});
+			SetAttribute(port, 3, std::array {x, 0.0f, z});
 			SetAttribute(port, 4, spread);
 			SetPcm(port, pcm.data());
 			return PushPcm(ctx, pcm.size() * channels * sizeof(float)).at(0);
 		};
 		const auto left = render(-1, 1, 0), right = render(1, 1, 0);
 		Check(LastSample(left, channels, 0) > 2 * LastSample(left, channels, 1) &&
-		      LastSample(right, channels, 1) > 2 * LastSample(right, channels, 0),
+		          LastSample(right, channels, 1) > 2 * LastSample(right, channels, 0),
 		      "objects failed to move across front speakers");
 		const auto wide = render(1, 1, 7);
 		Check(std::abs(LastSample(wide, channels, 0) - LastSample(wide, channels, 1)) < 1e-4f,
@@ -1040,33 +1049,37 @@ void TestSpatialLayouts() {
 void TestHeadphoneRendering() {
 	for (const bool spatial: {false, true}) {
 		SetAudioOutput(Config::AudioOutput::Headphones, spatial);
-		const auto ctx = CreateContext(1, 1);
-		auto param = MakeParam(0x100);
-		param.port_type = 0x100;
-		const auto port = CreatePort(ctx, param);
-		PortState state {};
+		const auto ctx   = CreateContext(1, 1);
+		auto       param = MakeParam(0x100);
+		param.port_type  = 0x100;
+		const auto  port = CreatePort(ctx, param);
+		PortState   state {};
 		SpeakerInfo info {};
 		Check(AudioOut2::AudioOut2PortGetState(port, AsState(&state)) == OK &&
-		      state.flags == unsigned(spatial) && state.num_channels == (spatial ? 8 : 2),
+		          state.flags == unsigned(spatial) && state.num_channels == (spatial ? 8 : 2),
 		      "wrong 3D headphone port state");
 		Check(AudioOut2::AudioOut2GetSpeakerInfo(AsInfo(&info), 1) == OK && info.type == 3 &&
-		      info.flags == unsigned(spatial) && info.available_bits == (spatial ? 0xffu : 3u) &&
-		      info.angles[0][0] == (spatial ? 30 : 90), "wrong headphone speaker layout");
+		          info.flags == unsigned(spatial) &&
+		          info.available_bits == (spatial ? 0xffu : 3u) &&
+		          info.angles[0][0] == (spatial ? 30 : 90),
+		      "wrong headphone speaker layout");
 		uint32_t mask;
 		for (const bool modern: {false, true}) {
 			g_sdk_version = modern ? 0x09000000 : 0x08000000;
-			Check(AudioOut2::AudioOut2UserGetSupportedAttributes(g_user_handle, nullptr, &mask) == OK &&
-			      mask == ((spatial ? 0x3f7fu : 0xe53u) & (modern ? ~0u : 0x7ffu)), "wrong 3D attribute mask");
+			Check(AudioOut2::AudioOut2UserGetSupportedAttributes(g_user_handle, nullptr, &mask) ==
+			              OK &&
+			          mask == ((spatial ? 0x3f7fu : 0xe53u) & (modern ? ~0u : 0x7ffu)),
+			      "wrong 3D attribute mask");
 		}
 		std::array<float, 512> pcm {};
 		pcm[64] = 0.5f;
-		SetAttribute(port, 3, std::array{-1.f, 0.f, 0.f});
+		SetAttribute(port, 3, std::array {-1.f, 0.f, 0.f});
 		SetPcm(port, pcm.data());
-		const auto bytes = PushPcm(ctx, 512 * 2 * sizeof(float)).at(0);
+		const auto              bytes = PushPcm(ctx, 512 * 2 * sizeof(float)).at(0);
 		std::array<float, 1024> samples;
 		std::memcpy(samples.data(), bytes.data(), bytes.size());
 		std::array<float, 2> energy {};
-		std::array<int, 2> taps {};
+		std::array<int, 2>   taps {};
 		for (size_t i = 0; i < samples.size(); ++i) {
 			energy[i % 2] += samples[i] * samples[i];
 			taps[i % 2] += std::abs(samples[i]) > 1e-5f;
@@ -1075,6 +1088,103 @@ void TestHeadphoneRendering() {
 		      "headphones did not convolve the impulse for both ears");
 		AudioOut2::AudioOut2ContextDestroy(ctx);
 	}
+}
+
+void TestSpeakerArrayCoefficients() {
+	using namespace AudioOut2;
+	constexpr int invalid = static_cast<int32_t>(0x80268001u);
+	// The game chooses the ordering. Here right precedes left.
+	std::array<AudioOut2Position, 2> speakers {{{1, 0, 1}, {-1, 0, 1}}};
+	std::vector<uint8_t>             memory(AudioOut2GetSpeakerArrayMemorySize(2, 0, 1));
+	AudioOut2SpeakerArrayParam       params {speakers.data(), 2, 0, memory.data(), memory.size()};
+	float                            acn_w = 0, acn_y = 0;
+	for (uint32_t ordering: {0u, 1u}) {
+		AudioOut2AmbisonicsDecodeParam decode {ordering};
+		AudioOut2SpeakerArrayHandle    handle {};
+		Check(AudioOut2SpeakerArrayCreate(&handle, &params, &decode) == OK,
+		      "speaker array create failed");
+		auto original = speakers;
+		speakers.fill({});
+		std::array<float, 2> gains {};
+		auto                 pan = [&](AudioOut2Position p, float spread, bool height) {
+			Check(AudioOut2GetSpeakerArrayCoefficients(handle, p, spread, gains.data(), 2, height,
+			                                           .1f) == OK,
+			      "VBAP query failed");
+			Check(std::abs(std::hypot(gains[0], gains[1]) - 1) < 1e-5f, "panning changed power");
+		};
+		pan(original[0], 0, false);
+		Check(gains[0] > .999f && gains[1] < .001f, "VBAP lost copied speaker directions or order");
+		pan(original[1], 0, false);
+		Check(gains[1] > .999f && gains[0] < .001f, "VBAP failed to isolate the left speaker");
+		pan(original[1], 6.284f, false);
+		Check(std::abs(gains[0] - gains[1]) < 1e-5f, "full spread was directional");
+		pan({0, 1, 0}, 0, true);
+		Check(std::abs(gains[0] - gains[1]) < 1e-5f,
+		      "height-aware source overhead was directional");
+		pan({}, 0, false);
+		Check(std::abs(gains[0] - gains[1]) < 1e-5f, "near-field source was directional");
+		auto ambi = [&](uint32_t channel) {
+			Check(AudioOut2GetSpeakerArrayAmbisonicsCoefficients(handle, channel, gains.data(),
+			                                                     2) == OK,
+			      "ambisonics query failed");
+		};
+		ambi(ordering ? 0 : 64);
+		Check(gains[0] > 0 && std::abs(gains[0] - gains[1]) < 1e-4f,
+		      "W did not feed both speakers equally");
+		if (ordering)
+			Check(std::abs(gains[0] - std::sqrt(2.f) * acn_w) < 1e-4f, "wrong FuMa W scale");
+		else
+			acn_w = gains[0];
+		ambi(ordering ? 2 : 65);
+		Check(gains[1] > .1f && std::abs(gains[0] + gains[1]) < 1e-4f, "wrong left/right harmonic");
+		if (ordering)
+			Check(std::abs(gains[1] - acn_y) < 1e-4f, "FuMa and ACN axes differ");
+		else
+			acn_y = gains[1];
+		ambi(ordering ? 15 : 99);
+		Check(std::isfinite(gains[0]) && std::isfinite(gains[1]), "nonfinite higher-order decoder");
+		Check(AudioOut2GetSpeakerArrayAmbisonicsCoefficients(handle, ordering ? 64 : 0,
+		                                                     gains.data(), 2) == invalid &&
+		          AudioOut2GetSpeakerArrayCoefficients(handle, {}, 0, gains.data(), 1, 0, .1f) ==
+		              invalid,
+		      "invalid coefficient query accepted");
+		Check(AudioOut2SpeakerArrayDestroy(handle) == OK &&
+		          AudioOut2SpeakerArrayDestroy(handle) == invalid,
+		      "destroyed speaker array remained live");
+		speakers = original;
+	}
+	std::array<AudioOut2Position, 4> tetra {{{1, 1, 1}, {-1, -1, 1}, {-1, 1, -1}, {1, -1, -1}}};
+	std::vector<uint8_t>             work(AudioOut2GetSpeakerArrayMemorySize(4, 1, 0));
+	params = {tetra.data(), 4, 1, work.data(), work.size()};
+	AudioOut2SpeakerArrayHandle handle {};
+	Check(AudioOut2SpeakerArrayCreate(&handle, &params, nullptr) == OK,
+	      "3D speaker array create failed");
+	std::array<float, 4> gains {};
+	for (size_t i = 0; i < tetra.size(); ++i) {
+		Check(AudioOut2GetSpeakerArrayCoefficients(handle, tetra[i], 0, gains.data(), 4, 1, .1f) ==
+		              OK &&
+		          gains[i] > .9999f,
+		      "3D VBAP did not reproduce a speaker direction");
+	}
+	Check(AudioOut2GetSpeakerArrayCoefficients(handle, {1, -1, 1}, 0, gains.data(), 4, 0, .1f) ==
+	              OK &&
+	          gains[0] > .5f && gains[1] > .5f && gains[2] < 1e-5f && gains[3] > .5f,
+	      "3D VBAP selected the wrong face");
+	Check(AudioOut2GetSpeakerArrayAmbisonicsCoefficients(handle, 64, gains.data(), 4) == invalid,
+	      "VBAP-only array returned a decoder");
+	AudioOut2SpeakerArrayDestroy(handle);
+
+	std::array<AudioOut2Position, 4> open {{{1, 0, 1}, {-1, 0, 1}, {0, 0, -1}, {0, 1, 0}}};
+	params.positions       = open.data();
+	params.correction_type = 1;
+	params.correction_gain = 1;
+	Check(AudioOut2SpeakerArrayCreate(&handle, &params, nullptr) == OK, "open hull create failed");
+	Check(AudioOut2GetSpeakerArrayCoefficients(handle, {0, -1, 0}, 0, gains.data(), 4, 1, .1f) ==
+	              OK &&
+	          std::abs(gains[0] - 1 / std::sqrt(3.f)) < 1e-5f && gains[0] == gains[1] &&
+	          gains[0] == gains[2] && gains[3] == 0,
+	      "virtual bottom did not reach just the horizontal tier");
+	AudioOut2SpeakerArrayDestroy(handle);
 }
 
 void TestAudioOutputs() {
@@ -1271,6 +1381,7 @@ int main() {
 	TestBlockedPushOnlyHoldsItsContext();
 	TestSpatialLayouts();
 	TestHeadphoneRendering();
+	TestSpeakerArrayCoefficients();
 	TestAudioOutputs();
 	TestSystemState();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");

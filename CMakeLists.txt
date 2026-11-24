@@ -191,6 +191,23 @@ config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 if(TARGET OpenAL AND CLANG)
+	function(kyty_patch_openal_source rel_path out_name search_str replace_str)
+		set(_orig "${KYTY_THIRD_PARTY_DIR}/openal-soft/${rel_path}")
+		set(_patched "${CMAKE_CURRENT_BINARY_DIR}/${out_name}")
+		file(READ "${_orig}" _src)
+		string(REPLACE "${search_str}" "${replace_str}" _src "${_src}")
+		file(WRITE "${_patched}.tmp" "${_src}")
+		execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+			"${_patched}.tmp" "${_patched}"
+		)
+		file(REMOVE "${_patched}.tmp")
+		set_source_files_properties("${_orig}"
+			DIRECTORY "${KYTY_THIRD_PARTY_DIR}/openal-soft"
+			PROPERTIES HEADER_FILE_ONLY TRUE
+		)
+		target_sources(OpenAL PRIVATE "${_patched}")
+	endfunction()
+
 	set(_kyty_openal_fix_header "${CMAKE_CURRENT_BINARY_DIR}/openal_nonblocking_fix.h")
 	file(GENERATE OUTPUT "${_kyty_openal_fix_header}" CONTENT
 		"#pragma once\n#include \"opthelpers.h\"\n#undef NONBLOCKING\n#define NONBLOCKING\n"
@@ -200,30 +217,24 @@ if(TARGET OpenAL AND CLANG)
 			$<$<COMPILE_LANGUAGE:CXX>:/FI${_kyty_openal_fix_header}>
 		)
 		# MSVC STL 14.52+ breaks template argument deduction for &std::unique_ptr::operator* in views::transform.
-		set(_kyty_openal_alc_orig "${KYTY_THIRD_PARTY_DIR}/openal-soft/alc/alc.cpp")
-		set(_kyty_openal_alc_patched "${CMAKE_CURRENT_BINARY_DIR}/openal_alc_patched.cpp")
-		file(READ "${_kyty_openal_alc_orig}" _kyty_openal_alc_src)
-		string(REPLACE
+		target_include_directories(OpenAL PRIVATE "${KYTY_THIRD_PARTY_DIR}/openal-soft/alc")
+		kyty_patch_openal_source("alc/alc.cpp" "openal_alc_patched.cpp"
 			"std::views::transform(&ContextBase::EffectSlotCluster::operator*)"
 			"std::views::transform([](auto &c) -> auto& { return *c; })"
-			_kyty_openal_alc_src
-			"${_kyty_openal_alc_src}"
 		)
-		file(WRITE "${_kyty_openal_alc_patched}.tmp" "${_kyty_openal_alc_src}")
-		execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-			"${_kyty_openal_alc_patched}.tmp" "${_kyty_openal_alc_patched}"
-		)
-		file(REMOVE "${_kyty_openal_alc_patched}.tmp")
-		set_source_files_properties("${_kyty_openal_alc_orig}"
-			DIRECTORY "${KYTY_THIRD_PARTY_DIR}/openal-soft"
-			PROPERTIES HEADER_FILE_ONLY TRUE
-		)
-		target_include_directories(OpenAL PRIVATE "${KYTY_THIRD_PARTY_DIR}/openal-soft/alc")
-		target_sources(OpenAL PRIVATE "${_kyty_openal_alc_patched}")
 	else()
 		target_compile_options(OpenAL PRIVATE
 			"$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${_kyty_openal_fix_header}>"
 		)
+		if(LINUX)
+			# Clang <= 19 with libstdc++ 14 rejects is_constructible_v on std::array of a nested struct with NSDMIs.
+			foreach(_effect_name IN ITEMS chorus distortion pshifter fshifter)
+				kyty_patch_openal_source("alc/effects/${_effect_name}.cpp" "openal_${_effect_name}_patched.cpp"
+					"mUpsampler.emplace()"
+					"mUpsampler.emplace(decltype(mUpsampler)::value_type{})"
+				)
+			endforeach()
+		endif()
 	endif()
 endif()
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")

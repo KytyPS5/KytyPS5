@@ -54,6 +54,9 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Ends the draw window, whose draws share the stream copies of CPU-written ranges.
+	void                   EndDrawWindow() noexcept { m_draw_window++; }
+	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -113,6 +116,17 @@ private:
 		size_t  end;
 	};
 
+	// The stream copy of a CPU-written range, in a slot picked by its address.
+	struct StreamCopy {
+		uint64_t vaddr    = 0;
+		uint64_t size     = 0;
+		uint64_t window   = 0;
+		uint64_t tick     = 0;
+		uint64_t offset   = 0;
+		uint64_t position = 0;
+	};
+	static constexpr uint32_t STREAM_COPY_BITS = 10;
+
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
@@ -154,6 +168,8 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	std::array<StreamCopy, 1u << STREAM_COPY_BITS>    m_stream_copies {};
+	uint64_t                                          m_draw_window = 0;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;

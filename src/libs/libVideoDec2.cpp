@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/alignment.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
@@ -12,7 +13,7 @@
 
 namespace Libs {
 
-LIB_VERSION("Videodec2", 1, "Videodec2", 1, 1);
+LIB_NAME("Videodec2", "Videodec2");
 
 namespace VideoDec2 {
 
@@ -42,7 +43,11 @@ constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
 constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_HEVC       = 974921;
+constexpr uint32_t VIDEODEC2_HEVC_PROFILE_MAIN10   = 2;
+constexpr uint32_t VIDEODEC2_VP9_PROFILE_2         = 2;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
+constexpr size_t   VIDEODEC2_COMPUTE_MEMORY_SIZE   = 0x495300;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
 using Videodec2Decoder      = void*;
@@ -66,6 +71,23 @@ struct Videodec2DecoderConfigInfo {
 	uint8_t               reserved0;
 	uint8_t               reserved1;
 	void*                 extra_config_info;
+};
+
+struct Videodec2HevcExtraConfigInfo {
+	size_t   this_size;
+	int32_t  tier_type;
+	int8_t   max_bit_depth_luma;
+	int8_t   max_bit_depth_chroma;
+	uint16_t reserved0;
+	int32_t  max_temporal_id_to_decode;
+	uint32_t hdr_frame_format;
+	uint32_t gpu_load_level;
+};
+
+struct Videodec2Vp9ExtraConfigInfo {
+	size_t   this_size;
+	int8_t   max_bit_depth;
+	uint32_t hdr_frame_format;
 };
 
 struct Videodec2DecoderMemoryInfo {
@@ -116,6 +138,19 @@ struct Videodec2FrameBuffer {
 using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
 using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
 
+// The HEVC picture information up to its bit depths.
+struct Videodec2HevcPictureInfoHead {
+	size_t   this_size;
+	bool     is_valid;
+	uint64_t pts_data;
+	uint64_t dts_data;
+	uint64_t attached_data;
+	uint32_t pic_width_in_luma_samples;
+	uint32_t pic_height_in_luma_samples;
+	uint8_t  bit_depth_luma_minus8;
+	uint8_t  bit_depth_chroma_minus8;
+};
+
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
 	size_t cpu_gpu_memory_size;
@@ -136,11 +171,14 @@ using DecoderState = Decoder::Instance;
 static_assert(sizeof(Videodec2ComputeMemoryInfo) == 24);
 static_assert(sizeof(Videodec2ComputeConfigInfo) == 16);
 static_assert(sizeof(Videodec2DecoderConfigInfo) == 72);
+static_assert(sizeof(Videodec2HevcExtraConfigInfo) == 32);
+static_assert(sizeof(Videodec2Vp9ExtraConfigInfo) == 16);
 static_assert(sizeof(Videodec2DecoderMemoryInfo) == 72);
 static_assert(sizeof(Videodec2InputData) == 48);
 static_assert(sizeof(Videodec2OutputInfo) == 56);
 static_assert(sizeof(Videodec2FrameBuffer) == 32);
 static_assert(sizeof(Videodec2AvcPictureInfo) == 120);
+static_assert(offsetof(Videodec2HevcPictureInfoHead, bit_depth_luma_minus8) == 48);
 
 static std::mutex                g_decoder_mutex;
 static std::unordered_set<void*> g_decoders;
@@ -203,7 +241,7 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 	output_info->frame_buffer_size = decoded.buffer_size;
 	if (output_info->this_size == sizeof(Videodec2OutputInfo)) {
 		output_info->frame_format         = VIDEODEC2_FRAME_FORMAT_DEFAULT;
-		output_info->frame_pitch_in_bytes = decoded.pitch;
+		output_info->frame_pitch_in_bytes = decoded.pitch_in_bytes;
 	}
 }
 
@@ -253,7 +291,7 @@ QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
 		return VIDEODEC2_ERROR_STRUCT_SIZE;
 	}
 
-	compute_memory_info->cpu_gpu_memory_size = VIDEODEC2_MIN_MEMORY_SIZE;
+	compute_memory_info->cpu_gpu_memory_size = VIDEODEC2_COMPUTE_MEMORY_SIZE;
 	compute_memory_info->cpu_gpu_memory      = nullptr;
 
 	return OK;
@@ -286,7 +324,7 @@ static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
 		return VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 	}
 
-	if (compute_memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	if (compute_memory_info->cpu_gpu_memory_size < VIDEODEC2_COMPUTE_MEMORY_SIZE) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -304,15 +342,29 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
+// Without extra configuration, the 10-bit profiles decode at 10 bits.
+static bool HasTenBitOutput(const Videodec2DecoderConfigInfo& config) {
+	if (config.codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
+		const auto* vp9 = static_cast<const Videodec2Vp9ExtraConfigInfo*>(config.extra_config_info);
+		return vp9 != nullptr ? vp9->max_bit_depth > 8 : config.profile == VIDEODEC2_VP9_PROFILE_2;
+	}
+	const auto* hevc = static_cast<const Videodec2HevcExtraConfigInfo*>(config.extra_config_info);
+	return config.codec_type == VIDEODEC2_CODEC_TYPE_HEVC &&
+	       config.profile == VIDEODEC2_HEVC_PROFILE_MAIN10 &&
+	       (hevc == nullptr || hevc->max_bit_depth_luma != 8 || hevc->max_bit_depth_chroma != 8);
+}
+
 static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
-	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
-	    config.max_frame_height <= 0) {
+	if (config.max_frame_width <= 0 || config.max_frame_height <= 0) {
 		return VIDEODEC2_MIN_MEMORY_SIZE;
 	}
-	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
-	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
-	const auto height = (static_cast<size_t>(config.max_frame_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
+	// Semi-planar output with a 256-byte pitch, 2 bytes per 10-bit sample and the height aligned
+	// to 16 lines (64 for VP9), then 4096 bytes of picture information (8192 for VP9).
+	const auto width  = static_cast<size_t>(config.max_frame_width);
+	const auto height = static_cast<size_t>(config.max_frame_height);
+	const bool vp9    = config.codec_type == VIDEODEC2_CODEC_TYPE_VP9;
+	const auto pitch  = Common::AlignUp(HasTenBitOutput(config) ? 2 * width : width, 256);
+	return pitch * Common::AlignUp(height, vp9 ? 64 : 16) * 3 / 2 + (vp9 ? 8192 : 4096);
 }
 
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
@@ -565,6 +617,13 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {
 			return result;
+		}
+		auto* picture = static_cast<Videodec2HevcPictureInfoHead*>(first_picture_info);
+		if (picture->this_size >= sizeof(Videodec2HevcPictureInfoHead)) {
+			picture->pic_width_in_luma_samples  = decoded.width;
+			picture->pic_height_in_luma_samples = decoded.height;
+			picture->bit_depth_luma_minus8      = decoded.bit_depth - 8;
+			picture->bit_depth_chroma_minus8    = decoded.bit_depth - 8;
 		}
 	}
 

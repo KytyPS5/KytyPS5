@@ -286,6 +286,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x358u, Opcode::V_MED3_I16},
     {0x359u, Opcode::V_MED3_U16},
     {0x15du, Opcode::V_SAD_U32},
+    {0x171u, Opcode::V_MSAD_U8},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
     {0x12fu, Opcode::V_CVT_PKRTZ_F16_F32},

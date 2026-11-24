@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -138,6 +139,63 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	                     vk::Result::eSuccess);
 }
 
+// Formats with a narrower host variant drop the components the shader does not read.
+static vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
+	switch (format) {
+		case vk::Format::eR32G32B32A32Sfloat:
+			switch (used_components) {
+				case 1: return vk::Format::eR32Sfloat;
+				case 2: return vk::Format::eR32G32Sfloat;
+				case 3: return vk::Format::eR32G32B32Sfloat;
+				default: return format;
+			}
+		case vk::Format::eR32G32B32Sfloat:
+			switch (used_components) {
+				case 1: return vk::Format::eR32Sfloat;
+				case 2: return vk::Format::eR32G32Sfloat;
+				default: return format;
+			}
+		case vk::Format::eR16G16B16A16Sfloat:
+			switch (used_components) {
+				case 1: return vk::Format::eR16Sfloat;
+				case 2: return vk::Format::eR16G16Sfloat;
+				default: return format;
+			}
+		case vk::Format::eR8G8B8A8Unorm:
+			switch (used_components) {
+				case 1: return vk::Format::eR8Unorm;
+				case 2: return vk::Format::eR8G8Unorm;
+				default: return format;
+			}
+		case vk::Format::eR8G8B8A8Snorm:
+			return used_components == 2 ? vk::Format::eR8G8Snorm : format;
+		case vk::Format::eR8G8B8A8Uint:
+			switch (used_components) {
+				case 1: return vk::Format::eR8Uint;
+				case 2: return vk::Format::eR8G8Uint;
+				default: return format;
+			}
+		default: return format;
+	}
+}
+
+// The host format of a vertex input attribute; 0 used components keeps every component.
+static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
+	switch (raw_format) {
+		// Temporary: invalid PS5 buffer format 113 (VertexAttribFormat::k16_16SInt).
+		case 113: return NarrowInputFormat(vk::Format::eR32G32B32A32Sfloat, used_components);
+		case 121: return vk::Format::eR16G16Sfloat;
+		default: break;
+	}
+	const auto guest_format = static_cast<Prospero::BufferFormat>(raw_format);
+	const auto format       = VulkanFormat(guest_format);
+	if (format == vk::Format::eUndefined ||
+	    ShaderRecompiler::Format::GetFormatInfo(guest_format).component_count == 0) {
+		EXIT("unknown vertex format: fmt = %u\n", raw_format);
+	}
+	return NarrowInputFormat(format, used_components);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
@@ -206,7 +264,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		input_attr[index].binding  = vertex_input.attributes[index].binding;
 		input_attr[index].location = index;
 		input_attr[index].offset   = vertex_input.attributes[index].offset;
-		input_attr[index].format   = vertex.vertex_formats[index];
+		input_attr[index].format   = InputFormat(vertex_input.attributes[index].format,
+		                                         vertex.info.info.vertex_fetch_components[index]);
 	}
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};

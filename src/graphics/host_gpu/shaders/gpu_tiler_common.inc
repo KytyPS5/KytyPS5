@@ -19,7 +19,6 @@ struct Mip {
 	uint slice_bytes;
 	uint tiled_slice_bytes;
 	uint blocks_per_row;
-	uint surface_z;
 	uint tail_x;
 	uint tail_y;
 	uint num_texels;
@@ -74,7 +73,7 @@ void main() {
 
 	uvec3 extent = block_extent();
 	uvec3 block = p / extent;
-	uvec3 swizzle = p + uvec3(params.tail_x, params.tail_y, params.surface_z);
+	uvec3 swizzle = p + uvec3(params.tail_x, params.tail_y, 0u);
 
 	uint block_index = block.y * params.blocks_per_row + block.x;
 	uint tiled = block.z * params.tiled_slice_bytes + block_index * BLOCK_BYTES +

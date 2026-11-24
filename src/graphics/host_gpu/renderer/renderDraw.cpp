@@ -830,8 +830,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
-	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
-	// compiled.
+	// Vertex programs the host cannot run are not compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
@@ -1105,7 +1104,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
+	PrepareGraphicsBindings(stages, m_targets);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	vk::DeviceAddress     mesh_indices = 0;

@@ -159,6 +159,7 @@ struct ImageResource {
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
+	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
 	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
@@ -382,12 +383,17 @@ struct PushData {
 		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
 	}
 
-	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
-		return size != 0 && start <= DwordCount && size <= DwordCount - start;
-	}
-	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
-		return CanFit(cursor, size) ? cursor : NoStart;
-	}
+	// The dwords [begin, end) no stage has taken. The pixel stage takes the end, so where the
+	// other stages start does not depend on its size.
+	struct Window {
+		uint32_t begin = 0;
+		uint32_t end   = DwordCount;
+
+		[[nodiscard]] constexpr uint32_t StartFor(uint32_t size, ShaderType stage) const {
+			if (size == 0 || size > end - begin) return NoStart;
+			return stage == ShaderType::Pixel ? end - size : begin;
+		}
+	};
 };
 
 static_assert(sizeof(PushData) == 128);
@@ -511,9 +517,12 @@ struct Bindings {
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
 	}
-	void AdvancePushData(uint32_t& cursor) const {
-		if (UsesPushData()) {
-			cursor = push_data_start_dword + ShaderDataDwords();
+	void AdvancePushData(PushData::Window& window, ShaderType stage) const {
+		if (!UsesPushData()) return;
+		if (stage == ShaderType::Pixel) {
+			window.end = push_data_start_dword;
+		} else {
+			window.begin = push_data_start_dword + ShaderDataDwords();
 		}
 	}
 
@@ -530,6 +539,7 @@ struct ShaderInfo {
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
+	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
 	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
@@ -568,6 +578,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	bool                            reads_queue_id                = false; // HW_ID2 QUEUE or ME.
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

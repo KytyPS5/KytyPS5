@@ -36,8 +36,8 @@ struct SceFVector3 {
 	float z;
 };
 
-// The headset video-out port registers SceHmd2ReprojectionBuffer objects. The eye texture of their
-// first layer is the surface the game flips; both eyes sit side by side in it.
+// The headset video-out port registers SceHmd2ReprojectionBuffer objects. The first texture of
+// their first source, the left eye of a VR3D layer, is the surface the game flips.
 struct ReprojectionSurface {
 	uint64_t address;
 	uint32_t width;

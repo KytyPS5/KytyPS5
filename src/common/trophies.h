@@ -85,6 +85,8 @@ struct Progress {
 [[nodiscard]] std::filesystem::path PackagePath(uint32_t service_label);
 [[nodiscard]] std::filesystem::path UdsPackagePath(uint32_t service_label);
 [[nodiscard]] UdsRules              LoadUdsRules(const std::filesystem::path& path);
+// Activity IDs from the activity enums of a UDS package.
+[[nodiscard]] std::set<std::string> LoadActivityIds(const std::filesystem::path& path);
 [[nodiscard]] UdsResult ApplyUdsEvent(const Package& package, UnlockData& unlocks,
                                       std::string_view                         event_name,
                                       const std::map<std::string, UdsInteger>& properties);

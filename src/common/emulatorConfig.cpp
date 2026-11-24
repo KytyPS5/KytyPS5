@@ -52,6 +52,10 @@ const std::string& GetAudioInputDevice() {
 	return g_config->audio_input_device;
 }
 
+AudioOutput GetAudioOutput() {
+	return g_config->audio_output;
+}
+
 const std::optional<ControllerColor>& GetControllerColor() {
 	return g_config->controller_color;
 }
@@ -267,6 +271,10 @@ bool PlayGoHackEnabled() {
 
 bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
+}
+
+const std::string& GetLaunchActivity() {
+	return g_config->launch_activity;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

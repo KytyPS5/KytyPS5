@@ -37,6 +37,7 @@ struct GraphicContext {
 	bool                               ray_query_enabled                     = false;
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
+	bool                               r4g4b4a4_render_targets               = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               sampler_filter_minmax_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;

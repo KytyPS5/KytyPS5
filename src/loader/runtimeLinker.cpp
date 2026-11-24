@@ -22,7 +22,6 @@
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
-#include "loader/jit.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -43,7 +42,10 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <pthread.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <asm/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -59,34 +61,8 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
-static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
-	if (block == nullptr || block->ptr == nullptr) {
-		return;
-	}
-
-	if (block->free_func != nullptr) {
-		block->free_func(block->ptr);
-	} else if (block->vm_alloc) {
-		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
-		                                                  block->alloc_size));
-	} else {
-		delete[] block->ptr;
-	}
-
-	block->ptr        = nullptr;
-	block->free_func  = nullptr;
-	block->vm_alloc   = false;
-	block->alloc_size = 0;
-}
-
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
-}
-
-ThreadLocalStorage::~ThreadLocalStorage() {
-	for (auto& [_, block]: tlss) {
-		FreeTlsBlock(&block);
-	}
 }
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
@@ -219,9 +195,7 @@ constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 static uint64_t g_invalid_memory    = 0;
 
-static Program*              g_tls_main_program        = nullptr;
-static thread_local Program* g_tls_cached_main_program = nullptr;
-static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
+static Program* g_tls_main_program = nullptr;
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
@@ -648,7 +622,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
+bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
@@ -667,13 +641,22 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+		        info->exception_address)) {
+			// The backing serves an SRT walker load, so false sharing with GPU-written bytes
+			// needs no readback. Otherwise the load retries once its fault is handled, or
+			// reads zero.
+			uint32_t value = 0;
+			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
+			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+				return true;
+			}
+			Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 			return true;
 		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
-			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}
@@ -782,11 +765,8 @@ static void GetDynModules(Elf64* elf, T* out, const char* names, Elf64_Sxword ta
 	GetDynValues(elf, &needed_modules, tag);
 	for (auto need: needed_modules) {
 		ModuleId id {};
-		// id.id            = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
-		id.version_major = static_cast<int>((need >> 40u) & 0xffu);
-		id.version_minor = static_cast<int>((need >> 32u) & 0xffu);
-		id.name          = names + (need & 0xffffffff);
+		id.name = names + (need & 0xffffffff);
 		out->push_back(id);
 	}
 }
@@ -797,10 +777,8 @@ static void GetDynLibs(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) 
 	GetDynValues(elf, &needed_modules, tag);
 	for (auto need: needed_modules) {
 		LibraryId id {};
-		// id.id      = static_cast<int>((need >> 48u) & 0xffffu);
 		EncodeId64(static_cast<uint16_t>((need >> 48u) & 0xffffu), &id.id);
-		id.version = static_cast<int>((need >> 32u) & 0xffffu);
-		id.name    = names + (need & 0xffffffff);
+		id.name = names + (need & 0xffffffff);
 		out->push_back(id);
 	}
 }
@@ -923,23 +901,107 @@ static void ForEachRelocation(Program* program, auto&& func) {
 	}
 }
 
-static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
-	EXIT_IF(g_tls_main_program == nullptr);
+// Guest code reads its TCB from fs:[0], which the host owns, so PatchGuestCode rewrites those reads
+// to gs:[TcbGsOffset()]. On Linux the gs base is the TCB, whose first qword points to itself;
+// Windows (TEB TLS slots) and macOS (TSD slots) hold the TCB in a host slot at that offset.
+struct TlsBlock {
+	uint8_t* ptr  = nullptr;
+	uint64_t size = 0;
+};
 
-	if (g_tls_cached_main_program == g_tls_main_program && g_tls_cached_main_tcb != nullptr) {
-		return g_tls_cached_main_tcb;
-	}
+struct Tcb {
+	Tcb*                   self;
+	std::vector<TlsBlock>* dtv; // indexed by ThreadLocalStorage::index
+};
 
-	g_tls_cached_main_program = g_tls_main_program;
-	g_tls_cached_main_tcb =
-	    RuntimeLinker::TlsGetAddr(g_tls_main_program) + g_tls_main_program->tls.tcb_offset;
-	return g_tls_cached_main_tcb;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Allocated before main: host libraries loaded later can use up the slots at a fixed TEB offset.
+static const DWORD g_tcb_slot = TlsAlloc();
+
+static uint32_t TcbGsOffset() {
+	return 0x1480 + 8 * g_tcb_slot;
 }
 
-static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(program->elf == nullptr);
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	EXIT_IF(g_tcb_slot >= 64); // later slots are not at a fixed TEB offset
+	EXIT_IF(TlsSetValue(g_tcb_slot, tcb) == 0);
+}
+#elif defined(__APPLE__)
+static pthread_key_t TcbKey() {
+	static const pthread_key_t key = [] {
+		pthread_key_t k {};
+		EXIT_IF(pthread_key_create(&k, nullptr) != 0);
+		return k;
+	}();
+	return key;
+}
 
+static uint32_t TcbGsOffset() {
+	return 8 * TcbKey();
+}
+
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	EXIT_IF(pthread_setspecific(TcbKey(), tcb) != 0);
+}
+#else
+static uint32_t TcbGsOffset() {
+	return 0;
+}
+
+void RuntimeLinker::SetThreadTcb(void* tcb) {
+	EXIT_IF(syscall(SYS_arch_prctl, ARCH_SET_GS, tcb) != 0);
+}
+#endif
+
+void* RuntimeLinker::GetThreadTcb() {
+	void* tcb = nullptr;
+	asm volatile("movq %%gs:(%1), %0" : "=r"(tcb) : "r"(static_cast<uint64_t>(TcbGsOffset())));
+	return tcb;
+}
+
+static TlsBlock AllocateTlsBlock(const ThreadLocalStorage& tls, uint64_t size) {
+	auto* ptr = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
+	EXIT_IF(ptr == nullptr);
+	std::memcpy(ptr, reinterpret_cast<const void*>(tls.image_vaddr), tls.init_size);
+	std::memset(ptr + tls.init_size, 0, size - tls.init_size);
+	return {ptr, size};
+}
+
+void RuntimeLinker::CreateThreadTls() {
+	constexpr uint64_t TCB_SIZE = 0x40;
+
+	const auto tls =
+	    g_tls_main_program != nullptr ? g_tls_main_program->tls : ThreadLocalStorage {};
+	const auto block = AllocateTlsBlock(tls, tls.image_size + TCB_SIZE);
+	auto*      tcb   = reinterpret_cast<Tcb*>(block.ptr + tls.image_size);
+	tcb->self        = tcb;
+	tcb->dtv         = new std::vector<TlsBlock> {block};
+	SetThreadTcb(tcb);
+}
+
+void RuntimeLinker::DeleteThreadTls() {
+	auto* dtv = static_cast<Tcb*>(GetThreadTcb())->dtv;
+	for (const auto& block: *dtv) {
+		EXIT_IF(block.ptr != nullptr && !Libs::LibKernel::Memory::FreeGuestMemory(
+		                                    reinterpret_cast<uint64_t>(block.ptr), block.size));
+	}
+	delete dtv;
+}
+
+uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
+	auto&      dtv   = *static_cast<Tcb*>(GetThreadTcb())->dtv;
+	const auto index = program->tls.index;
+	if (index >= dtv.size()) {
+		dtv.resize(index + 1);
+	}
+	if (dtv[index].ptr == nullptr) {
+		dtv[index] = AllocateTlsBlock(program->tls, program->tls.image_size);
+	}
+	return dtv[index].ptr;
+}
+
+void RuntimeLinker::PatchGuestCode(uint64_t address, uint64_t size) {
 	if (size >= 12) {
 		// Replace guest stack-canary/errno stores through fs:[0x28] with nops.
 		// Windows x64 cannot host guest FS directly, and an unpatched shared-library access faults
@@ -964,53 +1026,16 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
-	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
-	    size >= Jit::Call9::GetSize()) {
-		// Replace:
-		//   66 66 66
-		//   mov <reg>, qword ptr fs:[0x00]
-		// with:
-		//   call <handler>
-		//   mov <reg>,rax
-		//   nop ...
-		const uint8_t tls_pattern[5]       = {0x64, 0x48, 0x8B, 0x00, 0x25};
-		const uint8_t zero_displacement[4] = {};
-
-		EXIT_IF(Jit::Call9::GetSize() != 9);
-
-		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
-		auto* end_ptr   = start_ptr + size - Jit::Call9::GetSize();
-
-		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
-			auto*  inst_ptr     = ptr;
-			size_t prefix_count = 0;
-			while (prefix_count < 3 && inst_ptr < start_ptr + size && *inst_ptr == 0x66) {
-				inst_ptr++;
-				prefix_count++;
-			}
-
-			if (inst_ptr + Jit::Call9::GetSize() > start_ptr + size) {
-				break;
-			}
-
-			const uint8_t modrm = inst_ptr[3];
-			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
-			    inst_ptr[4] == tls_pattern[4] &&
-			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
-				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
-
-				const auto reg = (modrm >> 3u) & 7u;
-				EXIT_NOT_IMPLEMENTED(reg == 4u);
-
-				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
-				// overwrite it. Call9 starts with REX.W to neutralize genuine 0x66
-				// prefixes on AMD processors (before it could turn E8 into callw 16bit).
-				auto* code = new (inst_ptr) Jit::Call9;
-				code->SetFunc(reg == 0
-				                  ? program->tls.handler_vaddr
-				                  : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg));
-				ptr += prefix_count + Jit::Call9::GetSize() - 1;
-			}
+	// mov r64, qword ptr fs:[0] -> mov r64, qword ptr gs:[TcbGsOffset()]
+	const uint32_t offset  = TcbGsOffset();
+	auto*          end_ptr = reinterpret_cast<uint8_t*>(address + size);
+	for (auto* ptr = reinterpret_cast<uint8_t*>(address); ptr + 9 <= end_ptr; ptr++) {
+		if (ptr[0] == 0x64 && (ptr[1] & 0xfbu) == 0x48 && ptr[2] == 0x8b &&
+		    (ptr[3] & 0xc7u) == 0x04 && ptr[4] == 0x25 &&
+		    (ptr[5] | ptr[6] | ptr[7] | ptr[8]) == 0) {
+			ptr[0] = 0x65;
+			std::memcpy(ptr + 5, &offset, sizeof(offset));
+			ptr += 8;
 		}
 	}
 }
@@ -1274,6 +1299,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	CreateThreadTls();
 	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
@@ -1321,10 +1347,8 @@ void RuntimeLinker::Clear() {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
 	}
-	g_tls_main_program        = nullptr;
-	g_tls_cached_main_program = nullptr;
-	g_tls_cached_main_tcb     = nullptr;
-	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	g_tls_main_program  = nullptr;
+	g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 }
 
@@ -1342,95 +1366,40 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 		*bind_self = false;
 	}
 
-	if (ids.size() == 3) {
-		const LibraryId* l = FindLibrary(*program, ids.at(1));
-		const ModuleId*  m = FindModule(*program, ids.at(2));
-
-		auto resolve_by_nid = [this, type](const std::string& nid, SymbolRecord* out) -> bool {
-			EXIT_IF(out == nullptr);
-
-			if (m_symbols != nullptr) {
-				if (const auto* rec = m_symbols->FindByNid(nid, type); rec != nullptr) {
-					*out = *rec;
-					return true;
-				}
-			}
-
-			for (auto* p: m_programs) {
-				if (p != nullptr && p->export_symbols != nullptr) {
-					if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
-						*out = *rec;
-						return true;
-					}
-				}
-			}
-
-			return false;
-		};
-
-		if (l != nullptr && m != nullptr) {
-			SymbolResolve sr {};
-			sr.name                 = ids.at(0);
-			sr.library              = l->name;
-			sr.library_version      = l->version;
-			sr.module               = m->name;
-			sr.module_version_major = m->version_major;
-			sr.module_version_minor = m->version_minor;
-			sr.type                 = type;
-
-			const SymbolRecord* rec = nullptr;
-
-			if (m_symbols != nullptr) {
-				rec = m_symbols->Find(sr);
-			}
-
-			if (rec == nullptr) {
-				for (auto* p: m_programs) {
-					const auto& libs = p->dynamic_info->export_libs;
-					const auto& modules = p->dynamic_info->export_modules;
-					if (p->export_symbols == nullptr ||
-					    std::find(libs.begin(), libs.end(), *l) == libs.end() ||
-					    std::find(modules.begin(), modules.end(), *m) == modules.end()) {
-						continue;
-					}
-					rec = p->export_symbols->Find(sr);
-					if (rec != nullptr) {
-						if (bind_self != nullptr) {
-							*bind_self = (p == program);
-						}
-						break;
-					}
-				}
-			}
-
-			if (rec == nullptr) {
-				if (resolve_by_nid(sr.name, out_info)) {
-					LOGF("PS5 NID fallback: %s -> %s\n", sr.name.c_str(), out_info->name.c_str());
-					return;
-				}
-			}
-
-			if (rec != nullptr) {
-				*out_info = *rec;
-			} else {
-				out_info->vaddr    = 0;
-				out_info->name     = SymbolDatabase::GenerateName(sr);
-				out_info->dbg_name = "";
-			}
-		} else {
-			if (resolve_by_nid(ids.at(0), out_info)) {
-				LOGF("PS5 NID fallback: %s -> %s (missing lib/module metadata)\n",
-				     ids.at(0).c_str(), out_info->name.c_str());
-				return;
-			}
-
-			EXIT("l == nullptr || m == nullptr");
-		}
-	} else {
-		out_info->vaddr    = 0;
-		out_info->name     = name;
-		out_info->dbg_name = "";
+	*out_info = {.name = name};
+	if (ids.size() != 3) {
+		return;
 	}
+
+	// The PS5 binds an import by NID, library name and module name.
+	const LibraryId* l = FindLibrary(*program, ids.at(1));
+	const ModuleId*  m = FindModule(*program, ids.at(2));
+	EXIT_IF(l == nullptr || m == nullptr);
+
+	auto find = [&](const SymbolResolve& key) {
+		if (const auto* rec = m_symbols->Find(key); rec != nullptr) {
+			*out_info = *rec;
+			return true;
+		}
+		for (auto* p: m_programs) {
+			if (const auto* rec = p->export_symbols->Find(key); rec != nullptr) {
+				*out_info = *rec;
+				if (bind_self != nullptr) {
+					*bind_self = (p == program);
+				}
+				return true;
+			}
+		}
+		return false;
+	};
+
+	const SymbolResolve sr {ids.at(0), l->name, m->name, type};
+	// libc exports the LibcInternal functions under the same NIDs; it serves a LibcInternal import
+	// nothing else exports.
+	if (find(sr) || (l->name == "libSceLibcInternal" && find({sr.name, "libc", "libc", type}))) {
+		return;
+	}
+	out_info->name = SymbolDatabase::GenerateName(sr);
 }
 
 uint64_t RuntimeLinker::ReadFromElf(Program* program, uint64_t vaddr) {
@@ -1476,6 +1445,13 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 	}
 
 	return nullptr;
+}
+
+std::vector<int32_t> RuntimeLinker::GetProgramIds() {
+	Common::LockGuard    lock(m_mutex);
+	std::vector<int32_t> ids(m_programs.size());
+	std::ranges::transform(m_programs, ids.begin(), &Program::unique_id);
+	return ids;
 }
 
 Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {
@@ -1580,60 +1556,6 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 	return result;
 }
 
-uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
-	EXIT_IF(program == nullptr);
-
-	Common::LockGuard lock(program->tls.mutex);
-
-	auto& tls = program->tls.tlss[Common::Thread::GetThreadIdUnique()];
-
-	if (tls.ptr == nullptr) {
-		constexpr uint64_t TCB_SIZE  = 0x40;
-		constexpr uint64_t TCB_ALIGN = 0x20;
-
-		const auto tcb_offset =
-		    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
-		const auto alloc_size = AlignUp(tcb_offset, TCB_ALIGN) + TCB_SIZE;
-		tls.ptr        = reinterpret_cast<uint8_t*>(Libs::LibKernel::Memory::AllocateRuntimeMemory(
-		    0, alloc_size, Common::VirtualMemory::Mode::ReadWrite, "thread_local_storage"));
-		tls.free_func  = nullptr;
-		tls.vm_alloc   = true;
-		tls.alloc_size = alloc_size;
-
-		EXIT_IF(tls.ptr == nullptr);
-
-		std::memset(tls.ptr, 0, alloc_size);
-
-		if (!program->tls.init_image.empty()) {
-			std::memcpy(tls.ptr, program->tls.init_image.data(), program->tls.init_image.size());
-		} else {
-			std::memcpy(tls.ptr, reinterpret_cast<void*>(program->tls.image_vaddr),
-			            program->tls.init_size);
-		}
-
-		auto* tcb = reinterpret_cast<uint64_t*>(tls.ptr + tcb_offset);
-		tcb[0]    = reinterpret_cast<uint64_t>(tcb);
-	}
-
-	return tls.ptr;
-}
-
-void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
-	EXIT_IF(program == nullptr);
-
-	if (thread_id == Common::Thread::GetThreadIdUnique() && g_tls_cached_main_program == program) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
-	}
-
-	Common::LockGuard lock(program->tls.mutex);
-
-	if (auto it = program->tls.tlss.find(thread_id); it != program->tls.tlss.end()) {
-		FreeTlsBlock(&it->second);
-		program->tls.tlss.erase(it);
-	}
-}
-
 constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
 
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
@@ -1686,9 +1608,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
-	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
-	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
-	program->mapped_size = program->base_size_aligned + tls_handler_size;
+	program->mapped_size   = program->base_size_aligned;
 	const bool emulate_amd = Config::AmdCpuEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
@@ -1720,10 +1640,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
 		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
 	}
-	if (!is_shared) {
-		program->tls.handler_vaddr =
-		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
-	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
 
@@ -1733,9 +1649,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	     "base_size_aligned      = 0x%016" PRIx64 "\n"
 	     "mapped_size            = 0x%016" PRIx64 "\n",
 	     program->base_vaddr, program->base_size, program->base_size_aligned, program->mapped_size);
-	if (!is_shared) {
-		LOGF("tls_handler_size       = 0x%016" PRIx64 "\n", tls_handler_size);
-	}
 
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
@@ -1765,7 +1678,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                     mode == Common::VirtualMemory::Mode::NoAccess);
 
 			if (Common::VirtualMemory::IsExecute(mode)) {
-				PatchProgram(program, segment_addr, segment_memory_size);
+				PatchGuestCode(segment_addr, segment_memory_size);
 				executable_segments.emplace_back(segment_addr, segment_file_size);
 			}
 
@@ -1785,14 +1698,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->tls.image_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 			program->tls.init_size   = std::min(phdr[i].p_filesz, GetAlignedSize(phdr + i));
 			program->tls.image_size  = GetAlignedSize(phdr + i);
-			program->tls.tcb_offset  = program->tls.image_size;
+			program->tls.index       = is_shared ? static_cast<uint32_t>(program->unique_id) : 0;
 
 			LOGF("tls addr = 0x%016" PRIx64 "\n"
 			     "tls init   = %" PRIu64 "\n"
-			     "tls size   = %" PRIu64 "\n"
-			     "tls offset = %" PRIu64 "\n",
-			     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size,
-			     program->tls.tcb_offset);
+			     "tls size   = %" PRIu64 "\n",
+			     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size);
 		}
 
 		if (phdr[i].p_type == PT_OS_PROCPARAM) {
@@ -1874,7 +1785,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	if (!is_shared) {
-		SetupTlsHandler(program);
+		g_tls_main_program = program;
 	}
 
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
@@ -1884,10 +1795,6 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	auto program = std::unique_ptr<Program>(p);
 	if (g_tls_main_program == program.get()) {
 		g_tls_main_program = nullptr;
-	}
-	if (g_tls_cached_main_program == program.get()) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
 	}
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&
@@ -2044,12 +1951,6 @@ void RuntimeLinker::Relocate(Program* program) {
 			program->rela_bits[bit_index >> 3u] |= 1u << (bit_index & 7u);
 		}
 	});
-
-	if (program->tls.image_vaddr != 0 && program->tls.init_size != 0 &&
-	    program->tls.init_image.empty()) {
-		const auto* src = reinterpret_cast<const uint8_t*>(program->tls.image_vaddr);
-		program->tls.init_image.assign(src, src + program->tls.init_size);
-	}
 }
 
 const ModuleId* RuntimeLinker::FindModule(const Program& program, const std::string& id) {
@@ -2126,12 +2027,9 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 				    (type == STT_FUNC || type == STT_OBJECT || type == STT_NOTYPE) &&
 				    is_export == (sym->st_value != 0)) {
 					SymbolResolve sr {};
-					sr.name                 = ids.at(0);
-					sr.library              = l->name;
-					sr.library_version      = l->version;
-					sr.module               = m->name;
-					sr.module_version_major = m->version_major;
-					sr.module_version_minor = m->version_minor;
+					sr.name    = ids.at(0);
+					sr.library = l->name;
+					sr.module  = m->name;
 					switch (type) {
 						case STT_NOTYPE: sr.type = SymbolType::NoType; break;
 						case STT_FUNC: sr.type = SymbolType::Func; break;
@@ -2146,45 +2044,6 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 
 	syms(program, program->export_symbols.get(), true);
 	syms(program, program->import_symbols.get(), false);
-}
-
-void RuntimeLinker::SetupTlsHandler(Program* program) {
-	EXIT_IF(program == nullptr);
-	EXIT_IF(g_tls_main_program != nullptr);
-	EXIT_IF(program->elf == nullptr);
-	EXIT_IF(program->elf->IsShared());
-	EXIT_IF(program->tls.handler_vaddr == 0);
-
-	g_tls_main_program = program;
-
-	auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
-
-	code->SetFunc(TlsMainGetAddr);
-
-	for (uint8_t reg = 1; reg < 8; reg++) {
-		if (reg == 4) {
-			continue;
-		}
-
-		auto* stub = new (reinterpret_cast<void*>(program->tls.handler_vaddr +
-		                                          Jit::TlsRegStub::GetOffset(reg))) Jit::TlsRegStub;
-		stub->SetFunc(program->tls.handler_vaddr);
-		stub->SetOutputReg(reg);
-	}
-
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,
-	                                                     Jit::SafeCall::GetSize(),
-	                                                     Common::VirtualMemory::Mode::Execute));
-	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
-	                                             Jit::SafeCall::GetSize());
-}
-
-void RuntimeLinker::DeleteTlss(int thread_id) {
-	Common::LockGuard lock(m_mutex);
-
-	for (auto* p: m_programs) {
-		DeleteTls(p, thread_id);
-	}
 }
 
 void RuntimeLinker::SetApplicationHeapApi(void* const api[10]) {

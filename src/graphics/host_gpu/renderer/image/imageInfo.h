@@ -44,6 +44,13 @@ struct ImageSubresources {
 	auto     operator<=>(const ImageSubresources&) const = default;
 };
 
+// The level and first layer of a container that a single-level image occupies, or -1.
+struct ImageSubresource {
+	int32_t mip                                       = -1;
+	int32_t layer                                     = -1;
+	bool    operator==(const ImageSubresource&) const = default;
+};
+
 struct ImageSubresourceRange {
 	uint32_t base_level                                      = 0;
 	uint32_t level_count                                     = 1;
@@ -52,21 +59,16 @@ struct ImageSubresourceRange {
 	auto     operator<=>(const ImageSubresourceRange&) const = default;
 };
 
-struct ImageMipInfo {
-	// Guest mip chains run backwards within each layer or volume block-slice.
-	// Tail levels share an offset and use tail_x/tail_y within that block.
-	uint64_t offset                                 = 0;
-	uint64_t size                                   = 0;
-	// Padded dimensions in storage elements (compressed blocks for BC formats).
-	uint32_t pitch                                  = 0;
-	uint32_t height                                 = 0;
-	uint64_t linear_offset                          = 0;
-	uint64_t linear_size                            = 0; // Per transfer slice.
-	uint32_t linear_pitch                           = 0; // Storage elements.
-	uint32_t tail_x                                 = 0;
-	uint32_t tail_y                                 = 0;
-	uint32_t surface_z                              = 0;
-	auto     operator<=>(const ImageMipInfo&) const = default;
+// Transfer layout of detiled or guest-linear texels; tiled colors pack it mip-major.
+struct ImageLinearLayout {
+	struct Mip {
+		uint64_t offset = 0;
+		uint64_t size   = 0; // Per transfer slice.
+		uint32_t pitch  = 0; // Addressable elements.
+	};
+	std::array<Mip, 16> mips {};
+	// Nonzero for guest-linear and depth-plane transfers.
+	uint64_t slice_stride = 0;
 };
 
 struct ImageInfo {
@@ -84,15 +86,15 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
-	std::array<ImageMipInfo, 16> mip_layout {};
-	TileTextureBlockLayout       tiling;
-	uint64_t                     tiled_slice_stride = 0;
-	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
-	uint64_t linear_slice_stride = 0;
-	uint32_t first_tail_level    = 16;
+	// Records of levels [0, resources.levels); an array image's level sizes span every layer.
+	std::array<TileMipLayout, 16> mip_layout {};
+	TileTextureBlockLayout        tiling;
+	uint64_t                      tiled_slice_stride = 0;
+	uint32_t                      first_tail_level   = 16;
 
 	void                                           UpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
+	[[nodiscard]] ImageLinearLayout                LinearLayout() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
@@ -132,18 +134,7 @@ struct ImageInfo {
 		       bytes_per_block == other.bytes_per_block &&
 		       GetColorTransform() == other.GetColorTransform();
 	}
-	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
-		if (container.resources.levels > container.mip_layout.size()) {
-			return -1;
-		}
-		for (uint32_t level = 0; level < container.resources.levels; level++) {
-			if (SliceOf(container, static_cast<int32_t>(level)) >= 0) {
-				return static_cast<int32_t>(level);
-			}
-		}
-		return -1;
-	}
-	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept;
+	[[nodiscard]] ImageSubresource SubresourceOf(const ImageInfo& container) const noexcept;
 };
 
 struct ImageViewInfo {
@@ -273,7 +264,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 		           ? VideoOutCompression::Uncompressed
 		           : VideoOutCompression::Unsupported;
 	}
-	if (metadata_address == 0 || (metadata_address & 0xffu) != 0 || dcc_clear_color != 0) {
+	if (metadata_address == 0 || (metadata_address & 0xffu) != 0) {
 		return VideoOutCompression::Unsupported;
 	}
 	switch (dcc_control) {
@@ -311,6 +302,25 @@ inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT210
 		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return true;
 		default: return false;
 	}
+}
+
+// Overlay shader source flags of a VideoOut buffer: PQ (4) and linear (8).
+[[nodiscard]] constexpr uint32_t VideoOutSourceFlags(uint64_t format) {
+	const uint32_t pq = IsHdrVideoOutPixelFormat(format) ? 4u : 0u;
+	switch (format) {
+		case 0x8100000622000000ull:
+		case 0x8100000600000000ull:
+		case 0xc001000622000000ull:
+		case 0xc001000600000000ull:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return pq | 8u;
+		default: return pq;
+	}
+}
+
+// Linear sources, and PQ sources on an SDR target, are drawn through the overlay shader.
+[[nodiscard]] constexpr bool VideoOutSourceNeedsDraw(uint32_t source_flags, bool hdr_target) {
+	return (source_flags & 8u) != 0 || ((source_flags & 4u) != 0 && !hdr_target);
 }
 
 inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{

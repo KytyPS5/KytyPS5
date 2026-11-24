@@ -4,7 +4,7 @@
 
 namespace Libs {
 
-LIB_VERSION("WebBrowserDialog", 1, "WebBrowserDialog", 1, 1);
+LIB_NAME("WebBrowserDialog", "WebBrowserDialog");
 
 namespace WebBrowserDialog {
 
@@ -20,6 +20,7 @@ static int KYTY_SYSV_ABI WebBrowserDialogGetStatus() {
 
 LIB_DEFINE(InitWebBrowserDialog_1) {
 	LIB_FUNC("CFTG6a8TjOU", WebBrowserDialog::WebBrowserDialogGetStatus);
+	LIB_FUNC("h1dR-t5ISgg", WebBrowserDialog::WebBrowserDialogGetStatus);
 }
 
 } // namespace Libs

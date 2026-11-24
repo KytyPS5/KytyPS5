@@ -454,9 +454,46 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+
+void TestSystemState() {
+	Libs::Audio::AudioOut::AudioOutSystemState state;
+	std::memset(&state, 0xab, sizeof(state));
+	Check(Libs::Audio::AudioOut::AudioOutGetSystemState(&state) == OK && state.loudness == -70.0f &&
+	          state.reserved8[0] == 0 && state.reserved64[2] == 0,
+	      "system state is not a -70 loudness with zeroed reserved fields");
+}
+
+void TestPortState() {
+	namespace AudioOut = Libs::Audio::AudioOut;
+	Fixture f;
+	Libs::Audio::Initialize();
+	const auto check = [](int type, uint32_t param, uint16_t output, uint8_t channel, int16_t volume,
+	                      const char* message) {
+		const int port = AudioOut::AudioOutOpen(1000, type, 0, 256, 48000, param);
+		AudioOut::AudioOutPortState state {};
+		Check(AudioOut::AudioOutGetPortState(port, &state) == OK && state.output == output &&
+		          state.channel == channel && state.volume == volume,
+		      message);
+		AudioOut::AudioOutClose(port);
+	};
+	check(0, 4, 1, 2, -1, "main port is not on the primary output");
+	check(2, 4, 1, 2, -1, "voice port did not follow the main output");
+	check(3, 4, 0, 0, -1, "personal port played without headphones");
+	check(3, 4 | 0x20000, 1, 2, -1, "mixed personal port is not on the primary output");
+	check(4, 4, 4, 1, 127, "pad speaker port is not on the controller");
+	check(10, 4, 4, 2, -1, "vibration port is not on the controller");
+	check(127, 4, 1, 2, -1, "aux port is not on the primary output");
+	Config::ConfigOptions options;
+	options.audio_output = Config::AudioOutput::Headphones;
+	Config::Load(options);
+	check(0, 4, 0x40, 2, -1, "main port is not on headphones");
+	check(3, 4, 0x40, 2, -1, "personal port is not on headphones");
+	Libs::Audio::Shutdown();
+}
 } // namespace
 
 int main() {
+	Config::Initialize();
 	TestPrimingAndSteadyCadence();
 	TestUnderrunAndStalledQueueRecovery();
 	TestFallbackClockAndLongGap();
@@ -468,6 +505,8 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestSystemState();
+	TestPortState();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

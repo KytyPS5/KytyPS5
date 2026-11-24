@@ -435,12 +435,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	physical.UpdateSize();
 	info.UpdateSize();
 	const auto same_mip = [&](uint32_t target, uint32_t source) {
-		const auto& left  = physical.mip_layout[target];
-		const auto& right = info.mip_layout[source];
-		return left.offset == right.offset && left.size == right.size &&
-		       left.pitch == right.pitch && left.height == right.height &&
-		       left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-		       left.surface_z == right.surface_z &&
+		return physical.mip_layout[target] == info.mip_layout[source] &&
 		       physical.MipExtent(target) == info.MipExtent(source);
 	};
 	if (physical.first_tail_level == info.first_tail_level &&
@@ -618,13 +613,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		desc.info.UpdateSize();
 	}
-	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
+	// their layout.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
+	const auto alignment = desc.info.DataAlignment();
+	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
+	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -731,18 +727,28 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
+	prepared.image_sources.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	auto& resolve_cache = m_context.GetResolveCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		auto& image = prepared.images[i];
 		if (program.info.images[i].heap) {
-			prepared.images[i] = {};
+			image = {};
 			continue;
 		}
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
+		auto& source = prepared.image_sources[i];
+		// ResolveTexture counts mip stats.
+		if (m_lod_stats || source.module != runtime.module->id ||
+		    source.value != snapshot.images[i] ||
+		    !resolve_cache.Reuse(image.image_id, image.desc.stamp)) {
+			source       = {snapshot.images[i], runtime.module->id};
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			binding.mip_views.swap(image.mip_views);
+			binding.mip_views.clear();
+			image = std::move(binding);
+		}
+		BindImage(image.image_id, image.desc.type == TextureCache::BindingType::Storage);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -807,11 +813,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				const auto  limit =
 				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 				    (graphics.StorageMinAlignment() - 1);
-				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
-			}
-			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
-			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+				size = Libs::LibKernel::Memory::ClampRangeSize(
+				    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
+			} else if (size >= (uint64_t {1} << 30u)) {
+				//  PPSA18026
+				// Finite descriptors can span sparse PRT holes; oversized pool windows are mapped
+				// in pieces, so they end at their last committed range.
+				size = Libs::LibKernel::Memory::ClampRangeSize(address, size, true);
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
@@ -890,7 +898,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
-                                             std::span<RenderColorInfo> colors) {
+                                             DrawTargets&                       targets) {
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
 	FindBuffers(stages);
@@ -908,7 +916,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
+	for (auto& target: std::span {targets.colors, targets.color_count}) {
 		EXIT_IF(!target.image_id);
 		auto& old_image = cache.m_slot_images[target.image_id];
 		if (!old_image.registered || old_image.binding.needs_rebind) {
@@ -917,6 +925,25 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			target.desc.view_info.base_layer = target.guest_array_layer;
 			target.image_id = cache.FindImage(target.desc);
 			BindRenderTarget(target.image_id);
+		}
+	}
+	// A sampled view can grow the depth image into a larger one at the same address.
+	if (auto& depth = targets.depth; depth.image_id) {
+		auto& old_image = cache.m_slot_images[depth.image_id];
+		if (!old_image.registered || old_image.binding.needs_rebind) {
+			old_image.binding = {};
+			depth.image_id    = cache.FindImage(depth.desc);
+			BindRenderTarget(depth.image_id);
+			// Depth found again from a color copy frees the image a binding of this draw holds.
+			for (auto* stage: stages) {
+				for (const auto& binding: stage->images) {
+					const auto* bound = cache.m_slot_images.try_get(binding.image_id);
+					if (binding.image_id &&
+					    (bound == nullptr || !bound->registered || bound->binding.needs_rebind)) {
+						EXIT("TextureCache: depth target rediscovery replaced a bound image\n");
+					}
+				}
+			}
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only

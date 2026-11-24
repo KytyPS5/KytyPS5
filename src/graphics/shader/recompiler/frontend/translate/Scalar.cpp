@@ -19,10 +19,12 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
 		case O::S_GETREG_B32:
-			if (!graphics_compute || (inst.src0.value != 0x1818u && inst.src0.value != 0x0a18u))
-				EXIT("unsupported S_GETREG_B32 at pc 0x%08x: selector=0x%04x graphics_compute=%u",
-				     inst.pc, inst.src0.value, static_cast<unsigned>(graphics_compute));
+			if (program.stage != ShaderType::Compute ||
+			    (inst.src0.value != 0x1818u && inst.src0.value != 0x0a18u))
+				EXIT("unsupported S_GETREG_B32 at pc 0x%08x: selector=0x%04x stage=%d", inst.pc,
+				     inst.src0.value, static_cast<int>(program.stage));
 			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
+			program.info.reads_queue_id = true;
 			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
 			return;
 		case O::S_SETREG_B32: EmitControlNop(); return;

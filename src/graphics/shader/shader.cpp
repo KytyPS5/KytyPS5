@@ -329,6 +329,7 @@ static void ShaderGetStaticInputInfoPS(
 	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
+	ps_info.float_mode          = regs.ps_regs.rsrc1.float_mode;
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
 
@@ -431,7 +432,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
-	key.push_back(info.wave_size);
+	key.push_back(info.wave_size | (uint32_t {ShaderFlushF16Inputs(info.float_mode)} << 8u));
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
@@ -494,7 +495,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.input_num);
-	key.push_back(info.wave_size);
+	key.push_back(info.wave_size | (uint32_t {ShaderFlushF16Inputs(info.float_mode)} << 8u));
 	key.push_back(info.ps_system_input_base);
 	key.push_back(info.custom_interpolation_mask);
 	key.push_back(info.ps_perspective_center_vgpr);
@@ -562,6 +563,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged || native_ngg ? 8u : 0u);
+	info.float_mode = regs.gs_regs.rsrc1.float_mode;
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
@@ -674,13 +676,16 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 		EXIT("failed to prepare local shader program\n");
 	}
 	// LS and HS share the HS wave; the TES runs in the GS wave.
+	input_info[0].float_mode          = regs.hs_regs.rsrc1.float_mode;
 	input_info[0].logical_stage       = ShaderType::Local;
 	input_info[0].wave_size           = (stages & 0x00200000u) != 0 ? 32u : 64u;
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
 	input_info[1].wave_size           = input_info[0].wave_size;
+	input_info[1].float_mode          = input_info[0].float_mode;
 	input_info[1].scratch_size_dwords = control.scratch_size_dwords;
 	input_info[2].logical_stage       = ShaderType::TessellationEvaluation;
 	input_info[2].wave_size           = (stages & 0x00400000u) != 0 ? 32u : 64u;
+	input_info[2].float_mode          = regs.gs_regs.rsrc1.float_mode;
 	input_info[2].scratch_size_dwords = evaluation.scratch_size_dwords;
 	input_info[2].pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 

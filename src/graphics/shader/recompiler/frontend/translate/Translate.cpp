@@ -500,8 +500,14 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 	return IR::U64(ReadOperand(operand, IR::Type::U64));
 }
 
-IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane) {
-	const auto bits     = Read16LaneBits(operand, high_lane);
+IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane,
+                                     bool flush_denorms) {
+	auto bits = Read16LaneBits(operand, high_lane);
+	if (flush_denorms) {
+		const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7c00u)));
+		const auto sign     = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x8000u)));
+		bits = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0u))), sign, bits);
+	}
 	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}));
 	const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16, {half_u16}));
 	return IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
@@ -1002,20 +1008,25 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
+	uint8_t float_mode;
 	switch (options.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local:
 		case ShaderType::TessellationControl:
 		case ShaderType::TessellationEvaluation:
+			float_mode            = options.input_info.vertex->float_mode;
 			result.scratch_dwords = options.input_info.vertex->scratch_size_dwords;
 			break;
 		case ShaderType::Mesh:
+			float_mode            = options.input_info.vertex->float_mode;
 			result.scratch_dwords = options.input_info.vertex->mesh.scratch_size_dwords;
 			break;
 		case ShaderType::Pixel:
+			float_mode            = options.input_info.pixel->float_mode;
 			result.scratch_dwords = options.input_info.pixel->scratch_size_dwords;
 			break;
 		case ShaderType::Compute:
+			float_mode            = options.input_info.compute->float_mode;
 			result.scratch_dwords = options.input_info.compute->scratch_size_dwords;
 			break;
 		default:
@@ -1428,11 +1439,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                            IR::StageInputKind::BaseInstance));
 		}
 	}
-	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
-	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
 		auto*      block = blocks_by_id.at(cfg_block.id);
-		Translator translator(result, block, vector_limit, lane_spills, flush_f32_inputs);
+		Translator translator(result, block, vector_limit, lane_spills, float_mode);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

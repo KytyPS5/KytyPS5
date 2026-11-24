@@ -2530,6 +2530,18 @@ void TestFloatComparisonInputModes() {
     }
     Check(comparisons == 2, "comparison input-mode fixture did not translate both precisions");
   }
+
+  const auto check_graphics_keys = [](auto input) {
+    input.float_mode = 0;
+    const auto flush_key = MakeStageStaticKey(input);
+    for (const uint8_t mode : {0x40, 0x80, 0xc0}) {
+      input.float_mode = mode;
+      Check((MakeStageStaticKey(input) == flush_key) == (mode == 0x80),
+            "graphics shaders must specialize on the FP16 input denormal bit");
+    }
+  };
+  check_graphics_keys(ShaderVertexInputInfo{});
+  check_graphics_keys(ShaderPixelInputInfo{});
 }
 
 void CheckNewDecoderUnsupported(const uint32_t *shader, uint32_t words,
@@ -7327,7 +7339,7 @@ void TestGraphicsComputeGetreg() {
       program.stage = ShaderType::Compute;
       program.wave_size = wave;
       IR::Block block;
-      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, false);
+      Frontend::Translator translator(program, &block, 1, Frontend::NoLaneSpills, 0xc0);
       translator.TranslateInstruction(decoded);
       Check(program.info.reads_queue_id, "GETREG did not record its queue read");
       bool wrote_vcc = false;

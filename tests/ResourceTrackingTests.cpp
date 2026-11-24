@@ -3282,7 +3282,8 @@ void TestUniformizedMaterialImageKeys() {
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
     if (packed && !proved)
-      Check(indirect && !indirect->selector && indirect->key_count == Value(16384u),
+      Check(indirect && !indirect->selector && indirect->table_maximum == 16383u &&
+                indirect->table_scalar && indirect->key_count.IsEmpty(),
             "packed selector accepted an unproved OR guard, offset domain, or field extraction");
     else if (packed)
       Check(indirect && indirect->selector && indirect->selector->stride == 16u &&
@@ -7977,8 +7978,13 @@ void TestQueryOnlyImageWaterfall() {
       const auto plan = ExtractResourcePlan(fixture->program);
       Check(!plan.info.images.empty() && std::ranges::all_of(plan.info.images, [&](const auto &image) {
         const auto &table = plan.descriptor_sources[image.source].indirect_descriptor;
-        return table && !table->selector && table->table_stride == 32u && table->key_count == Value(0x4000u);
-      }), "query-only waterfall lost the clamped address-table bound of its EXEC predicate");
+        return table && !table->selector && table->table_stride == 32u &&
+               (image.sample_access_only
+                    ? table->table_maximum == 0x3fffu && table->table_scalar && table->key_count.IsEmpty()
+                    : table->key_count == Value(0x4000u));
+      }) && std::ranges::count_if(plan.info.images, [](const auto &image) { return image.sample_access_only; }) ==
+                (variant == Variant::QueryThenSample ? 1 : 0),
+            "query-only waterfall lost the clamped address-table bound of its EXEC predicate");
     }
     CheckFatal([&] { make(Variant::WiderExec, loop)->PlanAndTrack(); }, "not a valid runtime value",
                "query waterfall accepted a bound its EXEC predicate does not prove");

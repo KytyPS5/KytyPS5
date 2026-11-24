@@ -697,9 +697,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
-		     create.extent.width, create.extent.height, create.extent.depth,
-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
+		return;
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, backing.image,
@@ -730,9 +728,14 @@ uint64_t Image::HashGuestEdges() const {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	ReleaseBacking();
+}
+
+void Image::ReleaseBacking() {
 	for (const auto& cached: views) {
 		m_graphics.device.destroyImageView(cached.view, nullptr);
 	}
+	views.clear();
 	if (backing.image != nullptr) {
 		m_graphics.DeleteImage(backing);
 	}

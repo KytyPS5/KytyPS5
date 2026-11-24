@@ -2392,6 +2392,107 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckImageAllocationPressure() {
+    constexpr const char *name = "ImageAllocationPressure";
+    constexpr uintptr_t base = 0x0000000230000000ull;
+    constexpr uint32_t width = 1024;
+    constexpr uint32_t height = 2048;
+    constexpr uint64_t image_size = uint64_t{width} * height * sizeof(uint32_t);
+    constexpr uint64_t size = image_size * 2;
+    constexpr VkDeviceSize slack = 256ull << 20;
+    constexpr VkDeviceSize hole = 1ull << 20;
+    constexpr uint32_t written = 0x5a3c5a3cu;
+    constexpr uint32_t stale = 0;
+    EnsureRuntimeContext();
+    VmaBudget runtime[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(m_runtime_context.allocator, runtime);
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> limits{};
+    for (uint32_t heap = 0; heap < m_memory_properties.memoryHeapCount; ++heap) {
+      limits[heap] = runtime[heap].statistics.blockBytes + slack;
+    }
+    GraphicContext graphics;
+    InitRuntimeContext(graphics, limits.data());
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "pressure test allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "pressure test mapping failed");
+    std::vector<VmaAllocation> fillers;
+    {
+      RenderContext context(graphics);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      const auto fill = [&](VkDeviceSize margin) {
+        for (uint32_t type = 0; type < m_memory_properties.memoryTypeCount; ++type) {
+          const VkMemoryRequirements requirements{hole, 1, 1u << type};
+          const VmaAllocationCreateInfo create{.flags = VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT};
+          for (VmaAllocation filler{}; vmaAllocateMemory(graphics.allocator, &requirements, &create,
+                                                         &filler, nullptr) == VK_SUCCESS;) {
+            fillers.push_back(filler);
+          }
+        }
+        for (uint32_t type = 0; type < m_memory_properties.memoryTypeCount; ++type) {
+          VmaBudget used[VK_MAX_MEMORY_HEAPS]{};
+          vmaGetHeapBudgets(graphics.allocator, used);
+          const auto heap = m_memory_properties.memoryTypes[type].heapIndex;
+          const auto free = limits[heap] - used[heap].statistics.blockBytes;
+          if (free <= margin) {
+            continue;
+          }
+          const VkMemoryRequirements requirements{free - margin, 1, 1u << type};
+          const VmaAllocationCreateInfo create{.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT};
+          if (VmaAllocation filler{}; vmaAllocateMemory(graphics.allocator, &requirements, &create,
+                                                        &filler, nullptr) == VK_SUCCESS) {
+            fillers.push_back(filler);
+          }
+        }
+      };
+      fill(image_size * 2);
+      auto desc = MakeLinearDesc(base, image_size, vk::Format::eR8G8B8A8Unorm,
+                                 Prospero::BufferFormat::k8_8_8_8UNorm,
+                                 Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      const auto idle = cache.FindImage(desc);
+      Require(name, "written image",
+              cache.ClearImageFromBuffer(scheduler.Current(), base, image_size, written),
+              "failed to write the image the allocation retires");
+      LibKernel::Memory::WriteBacking(base, &stale, sizeof(stale));
+      VmaAllocationInfo allocation{};
+      vmaGetAllocationInfo(graphics.allocator, cache.GetImage(idle).backing.allocation,
+                           &allocation);
+      fill(allocation.size / 2);
+      TextureCacheTestAccess::SkipFrames(cache, 1);
+      desc.info.data.address += image_size;
+      const auto created = cache.FindImage(desc);
+      Require(name, "retired idle image",
+              created && cache.GetImage(created).backing.image != nullptr &&
+                  !TextureCacheTestAccess::Contains(cache, idle),
+              "the new image did not take the memory of the idle one");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      uint32_t published = 0;
+      LibKernel::Memory::TryReadBacking(base, &published, sizeof(published));
+      Require(name, "published GPU write", published == written,
+              "the retired image dropped its GPU write");
+      for (const auto filler : fillers) {
+        vmaFreeMemory(graphics.allocator, filler);
+      }
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    vmaDestroyAllocator(graphics.allocator);
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "pressure test release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // The video-out layer shader converts PQ and linear-nit main-bus frames for an SDR swapchain.
   void CheckVideoOutHdr10ToSdr() {
     constexpr const char *name = "VideoOutHdr10ToSdr";
@@ -24669,26 +24770,32 @@ private:
     Require("VulkanHarness", "guest fault handler",
             Exception::InstallHandler(Loader::KytyExceptionHandler),
             "failed to install the production guest-memory fault route");
-    m_runtime_context.instance = m_instance;
-    m_runtime_context.physical_device = m_physical_device;
-    m_runtime_context.device = m_device;
+    InitRuntimeContext(m_runtime_context, nullptr);
+    m_renderer = std::make_unique<RenderContext>(m_runtime_context);
+  }
+
+  void InitRuntimeContext(GraphicContext &context,
+                          const VkDeviceSize *heap_size_limits) {
+    context.instance = m_instance;
+    context.physical_device = m_physical_device;
+    context.device = m_device;
     vk::PhysicalDeviceProperties2 properties{};
-    properties.pNext = &m_runtime_context.mesh_shader_properties;
+    properties.pNext = &context.mesh_shader_properties;
     m_physical_device.getProperties2(&properties);
-    m_runtime_context.physical_device_properties = properties.properties;
-    m_runtime_context.physical_device_memory_properties = m_memory_properties;
-    m_runtime_context.queue_family = m_queue_family;
-    m_runtime_context.queue = m_queue;
-    m_runtime_context.shader_image_int64_atomics_enabled = true;
-    m_runtime_context.maintenance8_enabled = true;
-    m_runtime_context.r8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8Srgb);
-    m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
-    m_runtime_context.conditional_rendering_enabled = true;
-    m_runtime_context.sampler_filter_minmax_enabled = true;
-    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
-    m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
-    m_runtime_context.mesh_shader_enabled = true;
-    m_runtime_context.subgroup_size = SubgroupSize();
+    context.physical_device_properties = properties.properties;
+    context.physical_device_memory_properties = m_memory_properties;
+    context.queue_family = m_queue_family;
+    context.queue = m_queue;
+    context.shader_image_int64_atomics_enabled = true;
+    context.maintenance8_enabled = true;
+    context.r8_srgb_views = context.SamplesFiltered(vk::Format::eR8Srgb);
+    context.r8g8_srgb_views = context.SamplesFiltered(vk::Format::eR8G8Srgb);
+    context.conditional_rendering_enabled = true;
+    context.sampler_filter_minmax_enabled = true;
+    context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    context.provoking_vertex_last_enabled = m_rasterization_supported;
+    context.mesh_shader_enabled = true;
+    context.subgroup_size = SubgroupSize();
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -24698,7 +24805,7 @@ private:
     };
     const auto block_texel_view_props =
         m_physical_device.getImageFormatProperties2(block_texel_view_info);
-    m_runtime_context.supports_block_texel_view =
+    context.supports_block_texel_view =
         block_texel_view_props.result == vk::Result::eSuccess;
 
     VmaVulkanFunctions functions{};
@@ -24714,11 +24821,11 @@ private:
     allocator_info.pVulkanFunctions = &functions;
     allocator_info.vulkanApiVersion = VK_API_VERSION_1_3;
     allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    allocator_info.pHeapSizeLimit = heap_size_limits;
     RequireVk("VulkanHarness", "runtime context",
-              static_cast<vk::Result>(vmaCreateAllocator(
-                  &allocator_info, &m_runtime_context.allocator)),
+              static_cast<vk::Result>(
+                  vmaCreateAllocator(&allocator_info, &context.allocator)),
               "vmaCreateAllocator");
-    m_renderer = std::make_unique<RenderContext>(m_runtime_context);
   }
 
   void Init() {
@@ -58763,6 +58870,11 @@ int main(int argc, char **argv) {
     vulkan.CheckResolveCache();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-allocation-pressure-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageAllocationPressure();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
     CheckStorageTextureLinearUploadLayout();
     CheckStorageTextureDepthTileUploadLayout();
@@ -59387,6 +59499,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckStreamCopyWindow();
   vulkan.CheckResolveCache();
+  vulkan.CheckImageAllocationPressure();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

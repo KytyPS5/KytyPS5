@@ -334,7 +334,7 @@ jobs:
             libxrandr-dev \
             libxss-dev \
             libxtst-dev \
-            lld \
+            lld-19 \
             pkg-config \
             wayland-protocols
 
@@ -357,7 +357,7 @@ jobs:
           cmake --version
           ninja --version
           clang++-19 --version
-          ld.lld --version
+          ld.lld-19 --version
           glslangValidator --version
           echo "Qt6_DIR=$Qt6_DIR"
 

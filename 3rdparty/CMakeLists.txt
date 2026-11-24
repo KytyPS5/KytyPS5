@@ -1,5 +1,35 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+# Spatial audio renders synchronously to memory. SDL owns playback.
+function(kyty_add_openal)
+	set(LIBTYPE STATIC)
+	set(ALSOFT_UTILS OFF)
+	set(ALSOFT_EXAMPLES OFF)
+	set(ALSOFT_INSTALL OFF)
+	set(ALSOFT_ENABLE_MODULES OFF)
+	# Clang cannot infer nonblocking on libstdc++ 16 std::variant::emplace.
+	set(HAVE_WFUNCTION_EFFECTS OFF)
+	set(ALSOFT_EAX OFF)
+	set(ALSOFT_RTKIT OFF)
+	foreach(backend PIPEWIRE PULSEAUDIO ALSA OSS SOLARIS SNDIO WASAPI DSOUND WINMM JACK
+	                COREAUDIO OBOE OPENSL PORTAUDIO WAVE)
+		set(ALSOFT_BACKEND_${backend} OFF)
+	endforeach()
+	if(MSVC)
+		string(APPEND CMAKE_CXX_FLAGS " /EHsc /GR")
+	else()
+		string(APPEND CMAKE_CXX_FLAGS " -fexceptions -frtti")
+	endif()
+	# OpenAL builds its private copy of fmt.
+	get_directory_property(kyty_includes INCLUDE_DIRECTORIES)
+	set_directory_properties(PROPERTIES INCLUDE_DIRECTORIES "")
+	add_subdirectory(openal-soft EXCLUDE_FROM_ALL)
+	set_directory_properties(PROPERTIES INCLUDE_DIRECTORIES "${kyty_includes}")
+endfunction()
+kyty_add_openal()
+install(FILES openal-soft/COPYING openal-soft/BSD-3Clause openal-soft/LICENSE-pffft
+	DESTINATION licenses/openal-soft)
+
 add_subdirectory(cpuinfo)
 
 include(FetchContent)

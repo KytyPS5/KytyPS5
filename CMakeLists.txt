@@ -335,7 +335,13 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
+# Keep the renderer's OpenAL headers and compile definitions private.
+set(spatial_renderer_src "${KYTY_SOURCE_DIR}/libs/spatialRenderer.cpp")
+list(REMOVE_ITEM kyty_emulator_src "${spatial_renderer_src}")
+add_library(kyty_spatial_audio STATIC "${spatial_renderer_src}")
+target_link_libraries(kyty_spatial_audio PRIVATE common OpenAL::OpenAL)
+
+set(kyty_emulator_link_libraries common Vulkan::Headers SPIRV-Tools-static SDL3::SDL3-static kyty_spatial_audio imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader libzstd_static)
 
 # Linux system libraries.
 if(LINUX)
@@ -505,7 +511,7 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
-target_link_libraries(audio_out2_port_tests common fmt::fmt)
+target_link_libraries(audio_out2_port_tests common fmt::fmt kyty_spatial_audio)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")

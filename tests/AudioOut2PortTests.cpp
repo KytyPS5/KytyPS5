@@ -303,6 +303,12 @@ void CheckSamples(const std::vector<uint8_t>& pcm, std::initializer_list<float> 
 	}
 }
 
+float LastSample(const std::vector<uint8_t>& pcm, size_t channels, size_t ch) {
+	float sample;
+	std::memcpy(&sample, pcm.data() + pcm.size() - (channels - ch) * sizeof(float), sizeof(float));
+	return sample;
+}
+
 void TestSlotReuse() {
 	const auto context = CreateContext();
 	const auto param   = MakeParam();
@@ -340,6 +346,7 @@ void TestObjectPortCapacityPerContext() {
 		CreatePort(contexts[i], MakeParam());
 	}
 
+	float center = 0;
 	for (size_t i = 0; i < contexts.size(); i++) {
 		const auto stale = last_ports[i];
 		AudioOut2::AudioOut2PortDestroy(stale);
@@ -351,7 +358,9 @@ void TestObjectPortCapacityPerContext() {
 		pcm.fill(0.25f * static_cast<float>(i + 1));
 		SetPcm(last_ports[i], pcm.data());
 		const auto  output   = PushPcm(contexts[i], 512 * 2 * sizeof(float));
-		const float expected = pcm[0] * 0.70710678f;
+		if (i == 0) center = LastSample(output.at(0), 2, 0);
+		Check(center > 0.1f, "centered object is silent");
+		const float expected = center * float(i + 1);
 		Check(output.size() == 1, "last object port did not reach its context's mixer");
 		CheckSamples(output[0], {expected, expected}, "object audio crossed context boundaries");
 	}
@@ -836,12 +845,6 @@ void TestPortGainAndValidation() {
 }
 
 void TestObjectGainAndAmbisonics() {
-	constexpr float half_power = 0.70710678f;
-	struct Coefficients { uint32_t channel; float left; float right; };
-	constexpr Coefficients cases[] {{UINT32_MAX, half_power, half_power}, {0, 1.0f, 1.0f},
-	                               {1, 0.0f, 0.0f}, {2, half_power, -half_power}, {3, 0.0f, 0.0f},
-	                               {64, half_power, half_power}, {65, half_power, -half_power},
-	                               {66, 0.0f, 0.0f}, {99, 0.0f, 0.0f}};
 	for (const auto format: {0x100u, 0x101u}) {
 		const auto context = CreateContext(1, 1);
 		auto param = MakeParam(format);
@@ -859,24 +862,35 @@ void TestObjectGainAndAmbisonics() {
 		SetAttribute(object, 8, 65u);
 		const auto output = PushPcm(context, output_bytes);
 		Check(output.size() == 1, "object-only push did not output exactly once");
-		CheckSamples(output[0], {0.5f * half_power, 0.5f * half_power},
-		             "object PCM ownership, default gain, or attribute freeze failed");
+		const float center = LastSample(output[0], 2, 0);
+		Check(center > 0.1f, "object PCM ownership or attribute freeze failed");
+		CheckSamples(output[0], {center, center}, "default object is asymmetric");
 		std::fill(floating.begin(), floating.end(), 0.5f);
 		std::fill(integer.begin(), integer.end(), 16384);
-		for (const auto& test: cases) {
+		auto render = [&](uint32_t channel) {
 			const Pcm input {pcm};
 			const float gain = 0.5f;
 			const Attribute attributes[] {{0, 0, &input, sizeof(input)}, {1, 0, &gain, sizeof(gain)},
-			                              {8, 0, &test.channel, sizeof(test.channel)}};
+			                              {8, 0, &channel, sizeof(channel)}};
 			Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
 			      "object attributes could not be set atomically with PCM first");
-			CheckSamples(PushPcm(context, output_bytes).at(0), {0.25f * test.left, 0.25f * test.right},
-			             "object gain or ambisonics decoded incorrectly or accumulated across pushes");
-		}
+			const auto samples = PushPcm(context, output_bytes).at(0);
+			return std::array {LastSample(samples, 2, 0), LastSample(samples, 2, 1)};
+		};
+		const auto mono = render(UINT32_MAX);
+		Check(std::abs(mono[0] - 0.5f * center) < 1e-5f, "object gain ignored");
+		const auto w = render(0), acn_w = render(64);
+		Check(w[0] > 0.05f && std::abs(w[0] - w[1]) < 1e-5f &&
+		      std::abs(w[0] - std::sqrt(2.0f) * acn_w[0]) < 1e-4f, "wrong B-format W scaling");
+		const auto y = render(2), acn_y = render(65);
+		Check(y[0] > 0.05f && std::abs(y[0]+y[1]) < 1e-4f &&
+		      std::abs(y[0]-acn_y[0]) < 1e-4f, "wrong B-format left/right axis");
+		const auto high = render(99);
+		Check(std::isfinite(high[0]) && std::isfinite(high[1]), "invalid fifth-order decode");
 		SetAttribute(object, 8, UINT32_MAX);
 		SetAttribute(object, 1, 0.0f);
 		SetPcm(object, pcm);
-		CheckSamples(PushPcm(context, output_bytes).at(0), {0.0f}, "zero gain did not mute object");
+		Check(std::abs(LastSample(PushPcm(context, output_bytes).at(0), 2, 0)) < 1e-6f, "zero gain did not mute object");
 		// A refused advance keeps the attributes the PCM locked.
 		Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 		SetPcm(object, pcm);
@@ -915,13 +929,15 @@ void TestObjectBusRouting() {
 	Check(output.size() == 3, "object bus was missing or queued more than once");
 	CheckSamples(output[0], {0.125f}, "objects modified first bed");
 	CheckSamples(output[1], {0.125f}, "objects modified second bed");
-	CheckSamples(output[2], {0.35355339f}, "MAIN objects failed to mix across users or leaked contexts");
+	const float mix = LastSample(output[2], 2, 0);
+	Check(mix > 0.1f, "object bus is silent");
+	CheckSamples(output[2], {mix}, "MAIN objects failed to mix across users or leaked contexts");
 	SetPcm(object, object_pcm.data());
 	SetPcm(other_user_object, object_pcm.data());
-	CheckSamples(PushPcm(context, bytes).at(0), {0.35355339f}, "object output depended on bed PCM");
+	CheckSamples(PushPcm(context, bytes).at(0), {mix}, "object output depended on bed PCM");
 	AudioOut2::AudioOut2ContextDestroy(context);
 	Check(LiveDeviceCount() == 1, "context destroy closed another context's object device");
-	CheckSamples(PushPcm(other_context, bytes).at(0), {0.70710678f}, "other context lost its object PCM");
+	CheckSamples(PushPcm(other_context, bytes).at(0), {2 * mix}, "other context lost its object PCM");
 	AudioOut2::AudioOut2ContextDestroy(other_context);
 	Check(AudioOut2::AudioOut2UserDestroy(other_user) == OK, "second user destroy failed");
 	Check(LiveDeviceCount() == 0, "object bus device leaked");
@@ -986,6 +1002,38 @@ void SetAudioOutput(Config::AudioOutput output) {
 	Config::ConfigOptions options;
 	options.audio_output = output;
 	Config::Load(options);
+}
+
+void TestSpatialLayouts() {
+	for (auto output: {Config::AudioOutput::TV, Config::AudioOutput::SoundBar, Config::AudioOutput::AVReceiver}) {
+		SetAudioOutput(output);
+		const size_t channels = Libs::Audio::AudioInternal::GetMainOutput().channels;
+		const auto ctx = CreateContext(2, 1);
+		auto param = MakeParam(0x100);
+		param.port_type = 0x100;
+		const auto port = CreatePort(ctx, param);
+		std::array<float, 512> pcm;
+		pcm.fill(0.25f);
+		auto render = [&](float x, float z, float spread) {
+			SetAttribute(port, 3, std::array{x, 0.0f, z});
+			SetAttribute(port, 4, spread);
+			SetPcm(port, pcm.data());
+			return PushPcm(ctx, pcm.size() * channels * sizeof(float)).at(0);
+		};
+		const auto left = render(-1, 1, 0), right = render(1, 1, 0);
+		Check(LastSample(left, channels, 0) > 2 * LastSample(left, channels, 1) &&
+		      LastSample(right, channels, 1) > 2 * LastSample(right, channels, 0),
+		      "objects failed to move across front speakers");
+		const auto wide = render(1, 1, 7);
+		Check(std::abs(LastSample(wide, channels, 0) - LastSample(wide, channels, 1)) < 1e-4f,
+		      "full spread did not envelop the listener");
+		if (channels > 2) {
+			const auto back = render(-1, -1, 0);
+			Check(LastSample(back, channels, 4) > LastSample(back, channels, 0),
+			      "rear-left source failed to reach surround speakers");
+		}
+		AudioOut2::AudioOut2ContextDestroy(ctx);
+	}
 }
 
 void TestAudioOutputs() {
@@ -1158,7 +1206,9 @@ int main() {
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
 	TestUserSupportedAttributes();
 	TestSlotReuse();
+	SetAudioOutput(Config::AudioOutput::TV);
 	TestObjectPortCapacityPerContext();
+	SetAudioOutput(Config::AudioOutput::AVReceiver);
 	TestContextPortLimits();
 	TestContextCapacityParameters();
 	TestFullTableRecovers();
@@ -1174,9 +1224,11 @@ int main() {
 	TestQueueLevelResults();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestPortGainAndValidation();
+	SetAudioOutput(Config::AudioOutput::TV);
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
 	TestBlockedPushOnlyHoldsItsContext();
+	TestSpatialLayouts();
 	TestAudioOutputs();
 	TestSystemState();
 	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");

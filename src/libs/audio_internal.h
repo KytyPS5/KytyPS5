@@ -33,6 +33,7 @@ enum class Format {
 	Signed16bit8ChStd,
 	Float8ChStd,
 	Float12Ch,
+	Float6Ch,
 };
 
 struct OutputParam {

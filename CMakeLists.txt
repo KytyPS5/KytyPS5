@@ -199,6 +199,27 @@ if(TARGET OpenAL AND CLANG)
 		target_compile_options(OpenAL PRIVATE
 			$<$<COMPILE_LANGUAGE:CXX>:/FI${_kyty_openal_fix_header}>
 		)
+		# MSVC STL 14.52+ breaks template argument deduction for &std::unique_ptr::operator* in views::transform.
+		set(_kyty_openal_alc_orig "${KYTY_THIRD_PARTY_DIR}/openal-soft/alc/alc.cpp")
+		set(_kyty_openal_alc_patched "${CMAKE_CURRENT_BINARY_DIR}/openal_alc_patched.cpp")
+		file(READ "${_kyty_openal_alc_orig}" _kyty_openal_alc_src)
+		string(REPLACE
+			"std::views::transform(&ContextBase::EffectSlotCluster::operator*)"
+			"std::views::transform([](auto &c) -> auto& { return *c; })"
+			_kyty_openal_alc_src
+			"${_kyty_openal_alc_src}"
+		)
+		file(WRITE "${_kyty_openal_alc_patched}.tmp" "${_kyty_openal_alc_src}")
+		execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+			"${_kyty_openal_alc_patched}.tmp" "${_kyty_openal_alc_patched}"
+		)
+		file(REMOVE "${_kyty_openal_alc_patched}.tmp")
+		set_source_files_properties("${_kyty_openal_alc_orig}"
+			DIRECTORY "${KYTY_THIRD_PARTY_DIR}/openal-soft"
+			PROPERTIES HEADER_FILE_ONLY TRUE
+		)
+		target_include_directories(OpenAL PRIVATE "${KYTY_THIRD_PARTY_DIR}/openal-soft/alc")
+		target_sources(OpenAL PRIVATE "${_kyty_openal_alc_patched}")
 	else()
 		target_compile_options(OpenAL PRIVATE
 			"$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${_kyty_openal_fix_header}>"

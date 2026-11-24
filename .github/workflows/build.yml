@@ -317,6 +317,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
             clang-19 \
+            llvm-19 \
             glslang-tools \
             libasound2-dev \
             libdbus-1-dev \

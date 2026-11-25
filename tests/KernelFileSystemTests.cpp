@@ -959,18 +959,24 @@ void TestFsync() {
       {"juWbTNM+8hw", "Posix", "libkernel", Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fsync export resolves");
   const auto fsync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(symbol->vaddr);
+  const auto* data_sync = symbols.Find(
+      {"30Rh4ixbKy4", "libkernel", "libkernel", Loader::SymbolType::Func});
+  Check(data_sync != nullptr, "sceKernelFdatasync export resolves");
+  const auto fdatasync = reinterpret_cast<int (KYTY_SYSV_ABI *)(int)>(data_sync->vaddr);
   Check(fsync(std::numeric_limits<int>::min()) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "invalid fsync descriptor reports POSIX EBADF");
 
   constexpr char Path[] = "/savedata0/fsync.dat";
   const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
-  Check(fd >= 3 && FileSystem::KernelWrite(fd, "save", 4) == 4 && fsync(fd) == OK &&
-            FileSystem::KernelLseek(fd, 0, 1) == 4,
-        "fsync flushes a writable file without changing its offset");
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, "save", 4) == 4 &&
+            fdatasync(fd) == OK && fsync(fd) == OK && FileSystem::KernelLseek(fd, 0, 1) == 4,
+        "both sync calls flush a writable file without changing its offset");
   Check(FileSystem::KernelClose(fd) == OK && fsync(fd) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "closed fsync descriptor reports POSIX EBADF");
+  Check(fdatasync(fd) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "closed fdatasync descriptor reports the kernel error");
 
   for (const auto& [path, flags] : {std::pair {"/savedata0", 0x00020000}, std::pair {Path, 0},
                                     std::pair {"/dev/urandom", 0x2}}) {

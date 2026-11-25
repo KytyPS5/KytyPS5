@@ -2969,7 +2969,7 @@ private:
 		const auto index = inst.Flags<MemoryFlags>().index;
 		if (index >= m_program.memory_info.size()) return false;
 		const auto& memory = m_program.memory_info[index];
-		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.idxen == memory.offen ||
+		if (memory.kind != ResourceKind::Buffer || memory.typed || (memory.idxen && memory.offen) ||
 		    (memory.idxen && (memory.offset != 0u || inst.Arg(2).Resolve() != Value(0u))) ||
 		    inst.Arg(3).Resolve() != Value(0u)) return false;
 		if (opcode == ValueOpcode::StoreBufferU32)

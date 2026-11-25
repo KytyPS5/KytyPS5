@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -84,6 +85,10 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject*, uint64_t, uint64_t*);
 int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject**);
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t, uint64_t*);
 } // namespace Libs::Fiber
+
+namespace Libs {
+void InitLibKernel_1(Loader::SymbolDatabase* symbols);
+} // namespace Libs
 
 namespace Libs::DbgAddressSanitizer {
 void TestRegisterMemoryCallbacks();
@@ -6175,6 +6180,362 @@ void TestGuestTlsGetAddrUsesPerThreadBlocks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestCodeRangeFollowsAllocation() {
+	constexpr const char* test               = "GuestCodeRangeFollowsAllocation";
+	constexpr uint64_t    module_step        = 0x10000000;
+	constexpr uint64_t    code_size          = 0x4000;
+	constexpr uint64_t    past_eight_modules = 0x980000000;
+	constexpr int         max_modules        = 16;
+	uint64_t              earlier_module     = 0;
+	for (int i = 0; i < max_modules && earlier_module < past_eight_modules; i++) {
+		earlier_module = Loader::TestMapGuestCode(code_size, 0);
+		Check(test, earlier_module != 0, "an earlier module was not mapped");
+	}
+	Check(test, Loader::IsGuestCodeAddress(earlier_module),
+	      "a module past the first eight module addresses is not guest code");
+	const auto code = Loader::TestMapGuestCode(code_size, module_step);
+	Check(test, code != 0, "the guest code was not mapped");
+	Check(test, Loader::IsGuestCodeAddress(code) && Loader::IsGuestCodeAddress(code + code_size - 1),
+	      "code mapped past an occupied module address is not guest code");
+}
+
+struct SignalTarget {
+	Libs::LibKernel::Pthread     thread = nullptr;
+	std::vector<uint8_t>         stack  = std::vector<uint8_t>(1024 * 1024);
+	std::atomic<std::thread::id> id {};
+	std::atomic<uint64_t>        progress {0};
+	std::atomic<bool>            stop {false};
+	uint64_t                     guest_code = 0;
+	std::atomic<uint8_t>         guest_stop {0};
+};
+
+using RaiseExceptionFunc   = int(KYTY_SYSV_ABI*)(Libs::LibKernel::Pthread, int);
+using InstallExceptionFunc = int(KYTY_SYSV_ABI*)(int, void*);
+using RemoveExceptionFunc  = int(KYTY_SYSV_ABI*)(int);
+
+InstallExceptionFunc g_install_exception_handler = nullptr;
+RemoveExceptionFunc  g_remove_exception_handler  = nullptr;
+
+std::atomic<std::thread::id> g_raised_signal_thread {};
+std::atomic<bool>            g_raised_signal_entered {false};
+std::atomic<bool>            g_raised_signal_release {false};
+std::atomic<bool>            g_raised_signal_polls {false};
+std::atomic<int>             g_raised_signal_depth {0};
+std::atomic<int>             g_raised_signal_max_depth {0};
+std::atomic<int>             g_raised_signal_entries {0};
+
+void* KYTY_SYSV_ABI RunSignalTarget(void* arg) {
+	auto& target = *static_cast<SignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	while (!target.stop) {
+		target.progress++;
+		Libs::LibKernel::KernelUsleep(100);
+	}
+	return nullptr;
+}
+
+void* KYTY_SYSV_ABI RunGuestSpinTarget(void* arg) {
+	using GuestSpin = void(KYTY_SYSV_ABI*)(std::atomic<uint64_t>*, std::atomic<uint8_t>*);
+	auto& target = *static_cast<SignalTarget*>(arg);
+	target.id    = std::this_thread::get_id();
+	reinterpret_cast<GuestSpin>(target.guest_code)(&target.progress, &target.guest_stop);
+	return nullptr;
+}
+
+void KYTY_SYSV_ABI HoldRaisedSignal(int /*signum*/, void* /*context*/) {
+	const int depth = ++g_raised_signal_depth;
+	if (depth > g_raised_signal_max_depth) {
+		g_raised_signal_max_depth = depth;
+	}
+	g_raised_signal_thread = std::this_thread::get_id();
+	g_raised_signal_entries++;
+	g_raised_signal_entered = true;
+	while (!g_raised_signal_release) {
+		if (g_raised_signal_polls) {
+			Libs::LibKernel::KernelUsleep(100);
+		} else {
+			std::this_thread::yield();
+		}
+	}
+	g_raised_signal_depth--;
+}
+
+template <typename Predicate>
+bool WaitUntil(Predicate ready) {
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ready()) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			return false;
+		}
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+RaiseExceptionFunc RaisedSignalSetup(const char* test) {
+	using namespace Libs::LibKernel;
+	static RaiseExceptionFunc raise_exception = nullptr;
+	if (raise_exception != nullptr) {
+		return raise_exception;
+	}
+	Common::Singleton<Loader::RuntimeLinker>::Instance();
+	Initialize();
+	PthreadInitSelfForMainThread();
+	static Loader::SymbolDatabase symbols;
+	Libs::InitLibKernel_1(&symbols);
+	const auto* install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
+	const auto* raise_symbol   = symbols.FindByNid("il03nluKfMk", Loader::SymbolType::Func);
+	const auto* remove_symbol  = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
+	Check(test, install_symbol != nullptr && raise_symbol != nullptr && remove_symbol != nullptr,
+	      "the exception exports do not resolve");
+	const auto install =
+	    reinterpret_cast<int(KYTY_SYSV_ABI*)(int, void*)>(install_symbol->vaddr);
+	CheckOk(test, install(30, reinterpret_cast<void*>(HoldRaisedSignal)), "install handler");
+	g_install_exception_handler = install;
+	g_remove_exception_handler  = reinterpret_cast<RemoveExceptionFunc>(remove_symbol->vaddr);
+	raise_exception = reinterpret_cast<RaiseExceptionFunc>(raise_symbol->vaddr);
+	return raise_exception;
+}
+
+void ResetRaisedSignal(bool polls) {
+	g_raised_signal_thread    = std::thread::id {};
+	g_raised_signal_entered   = false;
+	g_raised_signal_release   = false;
+	g_raised_signal_polls     = polls;
+	g_raised_signal_max_depth = 0;
+	g_raised_signal_entries   = 0;
+}
+
+void StartSignalTarget(const char* test, SignalTarget& target,
+                       Libs::LibKernel::pthread_entry_func_t entry) {
+	using namespace Libs::LibKernel;
+	PthreadAttr attr = nullptr;
+	CheckOk(test, PthreadAttrInit(&attr), "PthreadAttrInit");
+	CheckOk(test, PthreadAttrSetstack(&attr, target.stack.data(), target.stack.size()),
+	        "PthreadAttrSetstack");
+	CheckOk(test, PthreadCreate(&target.thread, &attr, entry, &target, "SignalTarget"),
+	        "PthreadCreate");
+	CheckOk(test, PthreadAttrDestroy(&attr), "PthreadAttrDestroy");
+	Check(test, WaitUntil([&target] { return target.progress.load() != 0; }),
+	      "the target thread did not start");
+}
+
+void TestRaisedSignalHoldsTarget() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalHoldsTarget";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(false);
+	StartSignalTarget(test, target, RunSignalTarget);
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	const auto progress = target.progress.load();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const bool held      = target.progress.load() == progress;
+	const bool on_target = g_raised_signal_thread.load() == target.id.load();
+	g_raised_signal_release = true;
+	target.stop             = true;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, on_target, "the handler ran on another thread than its target");
+	Check(test, held, "the target kept running while its handler held");
+}
+
+void TestRaisedSignalInterruptsGuestCode() {
+	using namespace Libs::LibKernel;
+	constexpr const char*             test = "RaisedSignalInterruptsGuestCode";
+	constexpr std::array<uint8_t, 11> spin {0x48, 0xff, 0x07, 0xf3, 0x90, 0x80,
+	                                        0x3e, 0x00, 0x74, 0xf6, 0xc3};
+	const auto                        raise_exception = RaisedSignalSetup(test);
+	static SignalTarget               target;
+	target.guest_code = Loader::TestMapGuestCode(spin.size(), 0);
+	Check(test, target.guest_code != 0, "the guest code was not mapped");
+	std::memcpy(reinterpret_cast<void*>(target.guest_code), spin.data(), spin.size());
+	ResetRaisedSignal(false);
+	StartSignalTarget(test, target, RunGuestSpinTarget);
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	const auto progress = target.progress.load();
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	const bool held      = target.progress.load() == progress;
+	const bool on_target = g_raised_signal_thread.load() == target.id.load();
+	g_raised_signal_release = true;
+	target.guest_stop       = 1;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, on_target, "the handler ran on another thread than its target");
+	Check(test, held, "the guest code kept running while its handler held");
+}
+
+void TestRaisedSignalLeavesTargetSleepIntact() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalLeavesTargetSleepIntact";
+	constexpr int         rounds          = 50;
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	StartSignalTarget(test, target, RunSignalTarget);
+	for (int round = 0; round < rounds; round++) {
+		ResetRaisedSignal(true);
+		CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+		Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+		      "the handler did not run");
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		g_raised_signal_release = true;
+		const auto progress     = target.progress.load();
+		Check(test, WaitUntil([progress] { return target.progress.load() != progress; }),
+		      "the target's sleep did not end after its handler slept");
+	}
+	target.stop = true;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+}
+
+void TestRaisedSignalWaitsForItsHandler() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalWaitsForItsHandler";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(true);
+	StartSignalTarget(test, target, RunSignalTarget);
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	Check(test, WaitUntil([] { return g_raised_signal_entered.load(); }),
+	      "the handler did not run");
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception again");
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	g_raised_signal_release = true;
+	const bool delivered    = WaitUntil([] { return g_raised_signal_entries.load() == 2; });
+	target.stop             = true;
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, g_raised_signal_max_depth.load() == 1, "a raised signal ran inside its own handler");
+	Check(test, delivered, "the signal raised during its handler was not delivered after it");
+}
+
+void* KYTY_SYSV_ABI ReturnAtOnce(void* arg) {
+	static_cast<SignalTarget*>(arg)->progress = 1;
+	return nullptr;
+}
+
+void TestRaisedSignalSkipsExitedTarget() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalSkipsExitedTarget";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(false);
+	g_raised_signal_release = true;
+	StartSignalTarget(test, target, ReturnAtOnce);
+	int result = OK;
+	WaitUntil([&result, raise_exception] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		result = raise_exception(target.thread, 30);
+		return result != OK;
+	});
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	Check(test, result == KERNEL_ERROR_ESRCH, "a raise to an exited thread did not fail with ESRCH");
+}
+
+std::atomic<bool>             g_mutex_wait_held {false};
+std::atomic<bool>             g_mutex_wait_raised {false};
+Libs::LibKernel::PthreadMutex g_signal_mutex = nullptr;
+
+void HoldMutexWaitUntilRaised() {
+	if (g_mutex_wait_held.exchange(true)) {
+		return;
+	}
+	WaitUntil([] { return g_mutex_wait_raised.load(); });
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+void* KYTY_SYSV_ABI LockSignalMutex(void* arg) {
+	auto& target    = *static_cast<SignalTarget*>(arg);
+	target.id       = std::this_thread::get_id();
+	target.progress = 1;
+	if (Libs::LibKernel::PthreadMutexLock(&g_signal_mutex) == OK) {
+		Libs::LibKernel::PthreadMutexUnlock(&g_signal_mutex);
+	}
+	return nullptr;
+}
+
+void TestRaisedSignalRunsOutsideMutexLock() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test            = "RaisedSignalRunsOutsideMutexLock";
+	const auto            raise_exception = RaisedSignalSetup(test);
+	static SignalTarget   target;
+	ResetRaisedSignal(false);
+	g_mutex_wait_held   = false;
+	g_mutex_wait_raised = false;
+	CheckOk(test, PthreadMutexInit(&g_signal_mutex, nullptr, "SignalMutex"), "PthreadMutexInit");
+	CheckOk(test, PthreadMutexLock(&g_signal_mutex), "PthreadMutexLock");
+	TestSetMutexWaitHook(HoldMutexWaitUntilRaised);
+	StartSignalTarget(test, target, LockSignalMutex);
+	Check(test, WaitUntil([] { return g_mutex_wait_held.load(); }),
+	      "the target did not wait for the mutex");
+	CheckOk(test, raise_exception(target.thread, 30), "raise exception");
+	g_mutex_wait_raised = true;
+	std::atomic<bool> watchdog_released {false};
+	std::thread       watchdog([&watchdog_released] {
+		if (!WaitUntil([] { return g_raised_signal_release.load(); })) {
+			watchdog_released       = true;
+			g_raised_signal_release = true;
+		}
+	});
+	const int busy          = PthreadMutexTrylock(&g_signal_mutex);
+	g_raised_signal_release = true;
+	watchdog.join();
+	const bool entered = WaitUntil([] { return g_raised_signal_entered.load(); });
+	TestSetMutexWaitHook(nullptr);
+	CheckOk(test, PthreadMutexUnlock(&g_signal_mutex), "PthreadMutexUnlock");
+	CheckOk(test, PthreadJoin(target.thread, nullptr), "PthreadJoin");
+	CheckOk(test, PthreadMutexDestroy(&g_signal_mutex), "PthreadMutexDestroy");
+	Check(test, !watchdog_released, "the handler ran while its target held the mutex's lock");
+	Check(test, busy == KERNEL_ERROR_EBUSY, "trylock of the held mutex did not report EBUSY");
+	Check(test, entered, "the handler did not run");
+	Check(test, g_raised_signal_thread.load() == target.id.load(),
+	      "the handler ran on another thread than its target");
+}
+
+Loader::Program                g_static_object_program;
+Loader::Program                g_other_static_object_program;
+Libs::LibKernel::PthreadRwlock g_static_rwlock = nullptr;
+std::atomic<bool>              g_registry_probe_done {false};
+std::atomic<bool>              g_registry_free_in_handler {false};
+std::atomic<int>               g_registry_handler_entries {0};
+std::thread                    g_registry_probe;
+
+void KYTY_SYSV_ABI ProbeStaticObjectRegistry(int /*signum*/, void* /*context*/) {
+	g_registry_handler_entries++;
+	g_registry_probe = std::thread([] {
+		Libs::LibKernel::PthreadDeleteStaticObjects(&g_other_static_object_program);
+		g_registry_probe_done = true;
+	});
+	g_registry_free_in_handler = WaitUntil([] { return g_registry_probe_done.load(); });
+}
+
+int ReplaceExceptionHandler(int signum, void* handler) {
+	const int removed = g_remove_exception_handler(signum);
+	return removed != OK ? removed : g_install_exception_handler(signum, handler);
+}
+
+void TestRaisedSignalRunsOutsideStaticObjectRegistry() {
+	using namespace Libs::LibKernel;
+	constexpr const char* test = "RaisedSignalRunsOutsideStaticObjectRegistry";
+	RaisedSignalSetup(test);
+	CheckOk(test, ReplaceExceptionHandler(30, reinterpret_cast<void*>(ProbeStaticObjectRegistry)),
+	        "install probe handler");
+	TestSetStaticObjectProgram(&g_static_object_program);
+	CheckOk(test, PthreadRwlockRdlock(&g_static_rwlock), "PthreadRwlockRdlock");
+	TestSetStaticObjectProgram(nullptr);
+	CheckOk(test, PthreadRwlockUnlock(&g_static_rwlock), "PthreadRwlockUnlock");
+	Check(test, PthreadQueuePendingSignal(PthreadSelfOrNull(), 30), "queue a pending signal");
+	PthreadDeleteStaticObjects(&g_static_object_program);
+	if (g_registry_probe.joinable()) {
+		g_registry_probe.join();
+	}
+	CheckOk(test, ReplaceExceptionHandler(30, reinterpret_cast<void*>(HoldRaisedSignal)),
+	        "restore handler");
+	Check(test, g_registry_handler_entries.load() == 1, "the pending signal did not run once");
+	Check(test, g_registry_free_in_handler.load(),
+	      "the handler ran while the static object registry was locked");
+}
+
 int RunTrinityTests();
 
 int main(int argc, char** argv) {
@@ -6385,6 +6746,14 @@ int main(int argc, char** argv) {
 	RunTest(TestAsanShadowLifetimeAcrossRangeEdits);
 	RunTest(TestAsanAliasedPhysicalRelease);
 	RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
+	RunTest(TestGuestCodeRangeFollowsAllocation);
+	RunTest(TestRaisedSignalHoldsTarget);
+	RunTest(TestRaisedSignalInterruptsGuestCode);
+	RunTest(TestRaisedSignalLeavesTargetSleepIntact);
+	RunTest(TestRaisedSignalWaitsForItsHandler);
+	RunTest(TestRaisedSignalSkipsExitedTarget);
+	RunTest(TestRaisedSignalRunsOutsideMutexLock);
+	RunTest(TestRaisedSignalRunsOutsideStaticObjectRegistry);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

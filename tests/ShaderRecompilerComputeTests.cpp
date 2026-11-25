@@ -2317,6 +2317,7 @@ public:
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
   void SkipComputeCase() { ++m_skipped_compute_cases; }
   [[nodiscard]] bool RobustPipelinesSupported() const { return m_robust_pipelines; }
+  [[nodiscard]] bool DerivativeQuadsSupported() const { return m_derivative_quads; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] u32 SkippedComputeCaseCount() const { return m_skipped_compute_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
@@ -24658,6 +24659,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_robust_pipelines = true;
+  bool m_derivative_quads = true;
   u32   m_skipped_cases          = 0;
   u32   m_skipped_compute_cases  = 0;
 
@@ -24891,9 +24893,14 @@ private:
             "shaderStorageImageWriteWithoutFormat is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderImageGatherExtended == true &&
-                available_features.shaderResourceMinLod == true &&
-                available_derivatives.computeDerivativeGroupQuads == true,
-            "image gather, MinLod or compute derivative quads are not supported");
+                available_features.shaderResourceMinLod == true,
+            "image gather or MinLod are not supported");
+    m_derivative_quads = available_derivatives.computeDerivativeGroupQuads == true;
+    if (!m_derivative_quads) {
+      std::printf(
+          "[host]    ComputeDerivativeQuads    unavailable, compute derivative cases "
+          "will be skipped\n");
+    }
     Require("VulkanHarness", "dispatch",
             available_features11.storageBuffer16BitAccess == true &&
                 available_features12.storageBuffer8BitAccess == true,
@@ -24990,7 +24997,7 @@ private:
     device_features13.synchronization2 = true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
-    derivatives.computeDerivativeGroupQuads = true;
+    derivatives.computeDerivativeGroupQuads = m_derivative_quads;
     // Requesting a feature the device does not support fails device creation, so the
     // rasterization feature chain is only chained in when every part is available.
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
@@ -25487,6 +25494,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.profile->robust_buffer_access && vulkan != nullptr &&
       !vulkan->RobustPipelinesSupported()) {
     std::printf("[compute] %-32s skipped, no byte-granular robustBufferAccess2\n", test.name);
+    vulkan->SkipComputeCase();
+    return;
+  }
+  if (compiled.program.info.compute_derivatives && vulkan != nullptr &&
+      !vulkan->DerivativeQuadsSupported()) {
+    std::printf("[compute] %-32s skipped, no compute derivative quads\n", test.name);
     vulkan->SkipComputeCase();
     return;
   }

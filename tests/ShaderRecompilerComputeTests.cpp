@@ -37618,6 +37618,40 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
+TestCase BufferStoreDwordx2WorkgroupDescriptors() {
+  TestCase test;
+  test.name = "BufferStoreDwordx2WorkgroupDescriptors";
+  test.has_user_data = test.has_compute_info = true;
+  test.user_data[0] = 128u;
+  test.compute_info.workgroup_register = 10u;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.wave_size = test.compute_info.threads_num[0] = 32u;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.dispatch_x = 3u;
+  auto &code = test.code;
+  code = {EncodeSopc(0x0a, 10, InlineU32(2)), 0u, // Group 2 skips the table.
+          EncodeSop2(0x31, 4, 10, 255), 0x2a0u,
+          EncodeSmem0(0x02, 12), EncodeSmem1(0u, 4), EncodeSopp(0x0c, 0),
+          EncodeVop1(0x01, 2, 10), EncodeVop1(0x01, 3, InlineU32(7)),
+          EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(2, 3, 0)};
+  code[1] = EncodeSopp(0x04, code.size() - 2u);
+  AppendEnd(&code);
+  test.initial.assign(2064u, 0xdeadbeefu);
+  for (u32 row = 0; row < 2u; ++row) {
+    const u32 output = 4096u * (row + 1u);
+    const std::array descriptor{output, 8u << 16u, 2u, 0x5204u};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + (test.user_data[0] + 0x2a0u + row * 16u) / 4u);
+    test.storage_buffer_ranges.emplace_back(output, row == 0u ? 16u : 12u);
+  }
+  test.expected = test.initial;
+  for (const auto &[output, bytes] : test.storage_buffer_ranges)
+    for (u32 word = 0; word < bytes / 4u; ++word)
+      test.expected[output / 4u + word] = word % 2u == 0u ? output / 4096u - 1u : 7u;
+  return test;
+}
+
 TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
   const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
@@ -50425,6 +50459,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
+  AddCase(BufferStoreDwordx2WorkgroupDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
@@ -58413,6 +58448,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
     CheckBoundedFormattedBufferCopy(vulkan);
+    RunCase(&vulkan, BufferStoreDwordx2WorkgroupDescriptors());
     CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
     CheckBoundedRecordBufferAccess(vulkan);

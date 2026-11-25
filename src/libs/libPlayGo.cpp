@@ -94,9 +94,8 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	// An application package always has chunk 0, which holds its file system.
 	if (!Loader::SystemContentGetChunksNum(&g_chunks_num)) {
-		g_chunks_num = Config::PlayGoHackEnabled() ? PLAYGO_DEFAULT_CHUNKS_NUM : 1;
+		g_chunks_num = Config::PlayGoHackEnabled() ? PLAYGO_DEFAULT_CHUNKS_NUM : 0;
 	}
 
 	return OK;
@@ -116,6 +115,10 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	}
 	if (param != nullptr) {
 		return PLAYGO_ERROR_INVALID_ARGUMENT;
+	}
+
+	if (g_chunks_num == 0) {
+		return PLAYGO_ERROR_NOT_STARTED;
 	}
 
 	*out_handle = PLAYGO_HANDLE;

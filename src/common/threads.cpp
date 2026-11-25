@@ -87,21 +87,37 @@ constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
+using TimerHandle = std::unique_ptr<void, decltype(&CloseHandle)>;
+
 // High-resolution waitable timers need Windows 10 1803, the floor MapViewOfFile3 already sets.
+static TimerHandle CreateSleepTimer() {
+	return {CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+	                               TIMER_ALL_ACCESS),
+	        &CloseHandle};
+}
+
+static void WaitForTimer(HANDLE timer, uint64_t units_100ns) {
+	LARGE_INTEGER due_time {};
+	due_time.QuadPart = -static_cast<LONGLONG>(units_100ns);
+	if (SetWaitableTimerEx(timer, &due_time, 0, nullptr, nullptr, nullptr, 0) != 0) {
+		WaitForSingleObject(timer, INFINITE);
+	}
+}
+
 static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
 	}
-	// Closed when the thread exits.
-	thread_local const std::unique_ptr<void, decltype(&CloseHandle)> timer {
-	    CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-		                       TIMER_ALL_ACCESS),
-	    &CloseHandle};
-	LARGE_INTEGER due_time {};
-	due_time.QuadPart = -static_cast<LONGLONG>(units_100ns);
-	if (SetWaitableTimerEx(timer.get(), &due_time, 0, nullptr, nullptr, nullptr, 0) != 0) {
-		WaitForSingleObject(timer.get(), INFINITE);
+	thread_local bool timer_in_use = false;
+	if (timer_in_use) {
+		WaitForTimer(CreateSleepTimer().get(), units_100ns);
+		return;
 	}
+	timer_in_use = true;
+	// Closed when the thread exits.
+	thread_local const TimerHandle timer = CreateSleepTimer();
+	WaitForTimer(timer.get(), units_100ns);
+	timer_in_use = false;
 }
 
 // IWYU pragma: no_include <minwindef.h>
